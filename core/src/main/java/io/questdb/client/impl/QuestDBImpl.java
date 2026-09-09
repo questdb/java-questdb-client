@@ -149,6 +149,29 @@ public final class QuestDBImpl implements QuestDB {
             SenderConnectionListener connectionListener,
             BackgroundDrainerListener drainerListener
     ) {
+        this(ingestConfig, queryConfig, senderMin, senderMax, queryMin, queryMax, acquireTimeoutMillis, idleTimeoutMillis, maxLifetimeMillis, housekeeperIntervalMillis, queryCloseTimeoutMillis, senderFactory, connectHook, tokenProvider, errorHandler, connectionListener, drainerListener, io.questdb.client.SenderError.Policy.REJECT_AND_CONTINUE, true, null);
+    }
+
+    public QuestDBImpl(
+            String ingestConfig,
+            String queryConfig,
+            int senderMin,
+            int senderMax,
+            int queryMin,
+            int queryMax,
+            long acquireTimeoutMillis,
+            long idleTimeoutMillis,
+            long maxLifetimeMillis,
+            long housekeeperIntervalMillis,
+            long queryCloseTimeoutMillis,
+            IntFunction<Sender> senderFactory,
+            Consumer<QwpQueryClient> connectHook,
+            HttpTokenProvider tokenProvider,
+            SenderErrorHandler errorHandler,
+            SenderConnectionListener connectionListener,
+            BackgroundDrainerListener drainerListener,
+            io.questdb.client.SenderError.Policy schemaMismatchPolicy, boolean dlqEnabled, String dlqDir
+    ) {
         SenderPool builtSenderPool = null;
         QueryClientPool builtQueryPool = null;
         PoolHousekeeper builtHousekeeper = null;
@@ -160,7 +183,8 @@ public final class QuestDBImpl implements QuestDB {
                     // build() never blocks on a slow / reachable-but-not-acking
                     // server; the housekeeper drives it via runStartupRecoveryStep().
                     true,
-                    errorHandler, connectionListener, drainerListener, tokenProvider);
+                    errorHandler, connectionListener, drainerListener, tokenProvider,
+                    schemaMismatchPolicy, dlqEnabled, dlqDir);
             builtQueryPool = new QueryClientPool(
                     queryConfig, queryMin, queryMax, acquireTimeoutMillis,
                     idleTimeoutMillis, maxLifetimeMillis, connectHook, null, tokenProvider);

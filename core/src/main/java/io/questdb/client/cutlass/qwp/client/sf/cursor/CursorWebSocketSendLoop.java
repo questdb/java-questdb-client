@@ -236,6 +236,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * Throttle "reconnect attempt N failed" WARN logs to one per 5 s.
      */
     private static final long RECONNECT_LOG_THROTTLE_NANOS = 5_000_000_000L;
+    private static final long SCHEMA_PRESERVE_RETRY_INITIAL_NANOS = 100_000_000L;
+    private static final long SCHEMA_PRESERVE_RETRY_MAX_NANOS = 5_000_000_000L;
     // Test seam: when true, recovery mirror seeding throws immediately AFTER
     // ensureSentDictCapacity has grown (and therefore taken ownership of) the mirror,
     // standing in for the copyRecoveredSymbolSuffix-adjacent failure that leaves a
@@ -317,6 +319,18 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // by category. Includes both retriable and terminal outcomes — i.e. every
     // server-side rejection observed regardless of how the loop reacted.
     private final AtomicLong totalServerErrors = new AtomicLong();
+    private final AtomicLong schemaFramesRetired = new AtomicLong();
+    private final AtomicLong schemaRejections = new AtomicLong();
+    private final AtomicLong dlqFilesWritten = new AtomicLong();
+    private final AtomicLong dlqBytesWritten = new AtomicLong();
+    private final AtomicLong dlqWriteFailures = new AtomicLong();
+    private volatile SenderError.Policy schemaMismatchPolicy = SenderError.Policy.TERMINAL;
+    private volatile SchemaRejectionState schemaRejectionState;
+    private volatile RejectedMiniSlotArchive schemaPreserver;
+    private SenderError preservedSchemaNotification;
+    private long preparedSchemaFirstFsn = -1L;
+    private long preparedSchemaLastFsn = -1L;
+    private int schemaPreserveFailures;
     // Delta symbol dictionary catch-up state (see swapClient).
     // ALWAYS active -- in memory mode, in disk mode, and (critically) even when the
     // per-slot persisted dictionary failed to open. sentDictCount is this loop's model
@@ -348,6 +362,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // freed.
     private boolean sentDictBytesOwned;
     private int sentDictCount;
+    // Cold-path scratch used only when a locally retired range carried symbol
+    // deltas that later frames still reference. Reused across retirements.
+    private long skippedFrameScratchAddr;
+    private int skippedFrameScratchCapacity;
     // True when replay frames can start above dictionary id zero and therefore
     // depend on a catch-up on a fresh connection. Delta-enabled live engines
     // always have this dependency. A recovered delta slot whose dictionary
@@ -508,6 +526,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // and by the I/O thread afterwards -- never concurrently.
     private long orphanSkipStartFsn = -1L;
     private long orphanSkipTipFsn = -1L;
+    private boolean recoveredOrphanReportLookedUp;
+    private SenderError recoveredOrphanReport;
     // Poison-frame detector state (I/O thread only). poisonFsn is the FSN of the
     // frame implicated by the most recent server-active rejection: the NACK-named
     // frame, or the OK-level head-of-line frame (highestOkFsn+1) for a
@@ -557,6 +577,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // advance neither), so replay cannot launder the counter. Pacing only --
     // this counter NEVER escalates to a terminal (Invariant B).
     private int zeroProgressRecycles;
+    // Schema retirement is local progress, not acceptance. Keep a separate
+    // reconnect dose until a real server ACK arrives.
+    private int schemaRecyclesWithoutAck;
     private long progressAtLastExemptRecycle = Long.MIN_VALUE;
     // Poison-frame detector threshold for this loop. Constructor-configured
     // (connect-string key max_frame_rejections); defaults to
@@ -1402,6 +1425,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             releaseSentDictBytes();
         }
         if (loopNeverRan) {
+            releaseSkippedFrameScratch();
             freeCatchUpFrameBuffer();
         }
     }
@@ -1557,6 +1581,44 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      */
     public void setErrorDispatcher(SenderErrorDispatcher dispatcher) {
         this.errorDispatcher = dispatcher;
+    }
+
+    public void setSchemaRejectionState(SchemaRejectionState state) {
+        if (state != null) {
+            state.setEngine(engine);
+        }
+        this.schemaRejectionState = state;
+    }
+
+    public void setSchemaMismatchPolicy(SenderError.Policy policy) {
+        if (policy != SenderError.Policy.TERMINAL && policy != SenderError.Policy.REJECT_AND_CONTINUE) {
+            throw new IllegalArgumentException("schema mismatch policy must be TERMINAL or REJECT_AND_CONTINUE");
+        }
+        this.schemaMismatchPolicy = policy;
+    }
+
+    public void setRejectionArchive(RejectedMiniSlotArchive preserver) {
+        this.schemaPreserver = preserver;
+    }
+
+    public long getDlqWriteFailures() {
+        return dlqWriteFailures.get();
+    }
+
+    public long getDlqFilesWritten() {
+        return dlqFilesWritten.get();
+    }
+
+    public long getDlqBytesWritten() {
+        return dlqBytesWritten.get();
+    }
+
+    public long getSchemaFramesRetired() {
+        return schemaFramesRetired.get();
+    }
+
+    public long getSchemaRejections() {
+        return schemaRejections.get();
     }
 
     /**
@@ -2228,12 +2290,21 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             releasePendingEntry(pendingDurable.pollFirst());
         }
         if (highest != Long.MIN_VALUE) {
-            long fsn = fsnAtZero + highest;
+            long fsn = clampAckBeforeSchemaStop(fsnAtZero + highest);
             if (engine.acknowledge(fsn)) {
                 totalDurableTrimAdvances.incrementAndGet();
                 dispatchProgress(fsn);
             }
         }
+    }
+
+    private long clampAckBeforeSchemaStop(long fsn) {
+        SchemaRejectionState state = schemaRejectionState;
+        if (state == null) {
+            return fsn;
+        }
+        long stop = state.stopFsn();
+        return stop >= 0 && fsn >= stop ? stop - 1L : fsn;
     }
 
     /**
@@ -2299,6 +2370,18 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         if (dose > 0) {
             int strikes = Math.max(poisonStrikes, 1);
             dose <<= Math.min(strikes - 1, 6);
+            if (reconnectMaxBackoffMillis > 0 && dose > reconnectMaxBackoffMillis) {
+                dose = reconnectMaxBackoffMillis;
+            }
+        }
+        connectLoop(initial, "reconnect", dose);
+    }
+
+    private void failSchemaPaced(Throwable initial) {
+        int level = schemaRecyclesWithoutAck++;
+        long dose = reconnectInitialBackoffMillis;
+        if (dose > 0) {
+            dose <<= Math.min(level, 6);
             if (reconnectMaxBackoffMillis > 0 && dose > reconnectMaxBackoffMillis) {
                 dose = reconnectMaxBackoffMillis;
             }
@@ -2457,6 +2540,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             if (sentDictBytesAddr != 0) {
                 releaseSentDictBytes();
             }
+            releaseSkippedFrameScratch();
             freeCatchUpFrameBuffer();
             shutdownLatch.countDown();
             Runnable closeCallback = delegatedClose;
@@ -2916,6 +3000,69 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * Extends the reconnect dictionary mirror with deltas carried only by a
+     * range that is about to be skipped locally. Call before acknowledging the
+     * range: once trim hides it, successor frames may be impossible to replay.
+     * This is a rejection cold path and performs no work during normal sends.
+     */
+    void catchUpSkippedRange(long firstFsn, long lastFsn) {
+        if (firstFsn < 0 || lastFsn < firstFsn) {
+            throw new IllegalArgumentException("invalid skipped range [first="
+                    + firstFsn + ", last=" + lastFsn + ']');
+        }
+        for (long fsn = firstFsn; fsn <= lastFsn; fsn++) {
+            int payloadLen = engine.liveFramePayloadLength(fsn);
+            if (payloadLen < 0) {
+                throw new LineSenderException("store-and-forward frame disappeared before retirement [fsn="
+                        + fsn + ']');
+            }
+            ensureSkippedFrameScratch(payloadLen);
+            if (!engine.copyLiveFrame(fsn, skippedFrameScratchAddr, skippedFrameScratchCapacity)) {
+                throw new LineSenderException("store-and-forward frame disappeared before retirement [fsn="
+                        + fsn + ']');
+            }
+            int deltaStart = frameDeltaStart(skippedFrameScratchAddr, payloadLen);
+            if (deltaStart > sentDictCount) {
+                throw new LineSenderException("skipped store-and-forward frame has a symbol dictionary gap [fsn="
+                        + fsn + ", deltaStart=" + deltaStart + ", dictionarySize=" + sentDictCount + ']');
+            }
+            if (deltaStart >= 0) {
+                accumulateSentDict(skippedFrameScratchAddr, payloadLen, deltaStart);
+            }
+            if (fsn == Long.MAX_VALUE) {
+                break;
+            }
+        }
+    }
+
+    @TestOnly
+    public void catchUpSkippedRangeForTest(long firstFsn, long lastFsn) {
+        catchUpSkippedRange(firstFsn, lastFsn);
+    }
+
+    private void ensureSkippedFrameScratch(int required) {
+        if (required <= skippedFrameScratchCapacity) {
+            return;
+        }
+        skippedFrameScratchAddr = skippedFrameScratchAddr == 0
+                ? Unsafe.malloc(required, MemoryTag.NATIVE_DEFAULT)
+                : Unsafe.realloc(
+                        skippedFrameScratchAddr,
+                        skippedFrameScratchCapacity,
+                        required,
+                        MemoryTag.NATIVE_DEFAULT);
+        skippedFrameScratchCapacity = required;
+    }
+
+    private void releaseSkippedFrameScratch() {
+        if (skippedFrameScratchAddr != 0) {
+            Unsafe.free(skippedFrameScratchAddr, skippedFrameScratchCapacity, MemoryTag.NATIVE_DEFAULT);
+        }
+        skippedFrameScratchAddr = 0;
+        skippedFrameScratchCapacity = 0;
+    }
+
+    /**
      * Decodes the varint at {@code [p, limit)} and returns {@code (value << 3) | bytes},
      * or {@code -1} when it is truncated or runs past a canonical length.
      * <p>
@@ -3269,6 +3416,20 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         return sentDictCount;
     }
 
+    /** I/O-thread cold-path snapshot used by preserved rejection copies. */
+    public byte[] snapshotSentDictionary() {
+        byte[] snapshot = new byte[sentDictBytesLen];
+        if (sentDictBytesLen > 0) {
+            Unsafe.getUnsafe().copyMemory(
+                    null, sentDictBytesAddr, snapshot, Unsafe.BYTE_OFFSET, sentDictBytesLen);
+        }
+        return snapshot;
+    }
+
+    public int sentDictionaryCount() {
+        return sentDictCount;
+    }
+
     @TestOnly
     public int zeroProgressRecycles() {
         return zeroProgressRecycles;
@@ -3353,6 +3514,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         return trySendOne();
     }
 
+    @TestOnly
+    public boolean tryRetireSchemaRangeForTest() {
+        return tryRetireSchemaRange();
+    }
+
     private void ensureCatchUpFrameCapacity(int required) {
         if (catchUpFrameCapacity >= required) {
             return;
@@ -3396,6 +3562,32 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * scheduling fairness.
      */
     private boolean trySendOne() {
+        SchemaRejectionState rejectionState = schemaRejectionState;
+        if (rejectionState != null) {
+            long stopFsn = rejectionState.stopFsn();
+            if (stopFsn >= 0 && fsnAtZero + nextWireSeq >= stopFsn) {
+                if (!tryRetireSchemaRange()) {
+                    return false;
+                }
+                if (nextWireSeq > 0) {
+                    fail(new LineSenderException(
+                            "recycling connection after retiring schema-rejected range"));
+                    return false;
+                }
+                try {
+                    positionCursorForStart();
+                } catch (CatchUpSendException e) {
+                    // Match the recovered-orphan re-anchor path below. The
+                    // retired range changed the FSN/wire-sequence mapping, so
+                    // a failed dictionary catch-up must recycle through the
+                    // normal catch-up policy instead of escaping ioLoop as an
+                    // unrelated generic reconnect failure.
+                    fail(isCatchUpCapGap(e) ? e : e.getCause());
+                    return false;
+                }
+                return true;
+            }
+        }
         if (orphanSkipTipFsn >= 0 && fsnAtZero + nextWireSeq >= orphanSkipStartFsn) {
             // The send cursor reached the orphaned deferred tail. Its frames
             // belong to an aborted transaction and must never be transmitted
@@ -3592,12 +3784,128 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         if (orphanSkipTipFsn < 0) {
             return true;
         }
+        if (engine.ackedFsn() < orphanSkipStartFsn - 1L) {
+            return false;
+        }
+        RejectedMiniSlotArchive archive = schemaPreserver;
+        if (archive != null) {
+            if (!recoveredOrphanReportLookedUp) {
+                recoveredOrphanReport = archive.findRecoveredOrphanReport(
+                        engine, orphanSkipStartFsn, orphanSkipTipFsn);
+                recoveredOrphanReportLookedUp = true;
+            }
+            if (recoveredOrphanReport != null) {
+                SenderErrorDispatcher dispatcher = errorDispatcher;
+                if (dispatcher == null || !dispatcher.tryOfferSchema(recoveredOrphanReport)) {
+                    return false;
+                }
+            }
+        }
         if (!engine.retireRecoveredOrphanTailIfReady()) {
             return false;
         }
         orphanSkipStartFsn = -1L;
         orphanSkipTipFsn = -1L;
+        recoveredOrphanReport = null;
         return true;
+    }
+
+    private boolean tryRetireSchemaRange() {
+        SchemaRejectionState state = schemaRejectionState;
+        if (state == null) {
+            return true;
+        }
+        SchemaRejectionState.Range range = state.sealedRange();
+        if (range == null || engine.ackedFsn() < range.firstFsn - 1L) {
+            return false;
+        }
+        SenderErrorDispatcher dispatcher = errorDispatcher;
+        if (dispatcher == null) {
+            return false;
+        }
+        SenderError notification = preservedSchemaNotification != null
+                ? preservedSchemaNotification
+                : range.error;
+        RejectedMiniSlotArchive preserver = schemaPreserver;
+        try {
+            prepareSkippedRange(range);
+        } catch (LineSenderException e) {
+            LOG.error("could not retain dictionary coverage for schema-rejected range [{}, {}]; "
+                            + "keeping queued bytes and stopping the sender",
+                    range.firstFsn, range.lastFsn, e);
+            recordFatal(e);
+            dispatchError(range.error.withAppliedPolicy(SenderError.Policy.TERMINAL));
+            return false;
+        }
+        if (preserver != null && preservedSchemaNotification == null) {
+            byte[] dictionary = snapshotSentDictionary();
+            final RejectedMiniSlotArchive.Result result;
+            try {
+                result = preserver.preserve(engine, range.error,
+                        dictionary.length == 0 ? null : dictionary, sentDictCount);
+            } catch (LineSenderException | IllegalArgumentException | ArithmeticException e) {
+                LineSenderException fatal = e instanceof LineSenderException
+                        ? (LineSenderException) e
+                        : new LineSenderException("invalid schema-rejected preservation range", e);
+                LOG.error("could not preserve schema-rejected store-and-forward range [{}, {}]; "
+                                + "keeping queued bytes and stopping the sender",
+                        range.firstFsn, range.lastFsn, e);
+                recordFatal(fatal);
+                dispatchError(range.error.withAppliedPolicy(SenderError.Policy.TERMINAL));
+                return false;
+            } catch (RuntimeException e) {
+                long failures = dlqWriteFailures.incrementAndGet();
+                schemaPreserveFailures++;
+                long delay = SCHEMA_PRESERVE_RETRY_INITIAL_NANOS
+                        << Math.min(schemaPreserveFailures - 1, 6);
+                LOG.warn("could not preserve schema-rejected store-and-forward range [{}, {}]; "
+                                + "keeping source bytes stopped and retrying (failure {})",
+                        range.firstFsn, range.lastFsn, failures, e);
+                parkWhileRunning(Math.min(delay, SCHEMA_PRESERVE_RETRY_MAX_NANOS));
+                return false;
+            }
+            if (!result.reused) {
+                dlqFilesWritten.incrementAndGet();
+                dlqBytesWritten.addAndGet(result.bytesWritten);
+            }
+            notification = range.error.withRejectedPath(result.path);
+            preservedSchemaNotification = notification;
+            schemaPreserveFailures = 0;
+            if (!running) {
+                // close() may have stopped the loop while the synchronous copy
+                // was blocked in storage. Keep the source range mapped and let
+                // the existing delegated I/O-thread cleanup release the engine.
+                return false;
+            }
+        }
+        if (!dispatcher.tryOfferSchema(notification)) {
+            return false;
+        }
+        engine.acknowledge(range.lastFsn);
+        dispatchProgress(range.lastFsn);
+        schemaFramesRetired.addAndGet(range.lastFsn - range.firstFsn + 1L);
+        preservedSchemaNotification = null;
+        preparedSchemaFirstFsn = -1L;
+        preparedSchemaLastFsn = -1L;
+        state.completeRetirement(range.lastFsn);
+        return true;
+    }
+
+    private void prepareSkippedRange(SchemaRejectionState.Range range) {
+        if (preparedSchemaFirstFsn == range.firstFsn && preparedSchemaLastFsn == range.lastFsn) {
+            return;
+        }
+        catchUpSkippedRange(range.firstFsn, range.lastFsn);
+        preparedSchemaFirstFsn = range.firstFsn;
+        preparedSchemaLastFsn = range.lastFsn;
+    }
+
+    private void parkWhileRunning(long nanos) {
+        long deadline = System.nanoTime() + nanos;
+        long remaining;
+        while (running && (remaining = deadline - System.nanoTime()) > 0L) {
+            LockSupport.parkNanos(remaining);
+        }
     }
 
     /**
@@ -3881,6 +4189,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                             wireSeq, highestSent);
                 }
                 totalAcks.incrementAndGet();
+                schemaRecyclesWithoutAck = 0;
                 long okFsn = fsnAtZero + capped;
                 if (okFsn > highestOkFsn) {
                     highestOkFsn = okFsn;
@@ -3913,8 +4222,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     drainPendingDurable();
                     return;
                 }
-                if (engine.acknowledge(fsnAtZero + capped)) {
-                    dispatchProgress(fsnAtZero + capped);
+                long ackFsn = clampAckBeforeSchemaStop(fsnAtZero + capped);
+                if (engine.acknowledge(ackFsn)) {
+                    dispatchProgress(ackFsn);
                 }
                 return;
             }
@@ -4009,6 +4319,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             String tableName = response.getTableEntryCount() == 1
                     ? response.getTableName(0)
                     : null;
+            // REJECT_AND_CONTINUE is legal only for an exact data frame sent
+            // on this connection. A pre-send NACK has no retirement target;
+            // fail closed while preserving every queued byte.
+            if (policy == SenderError.Policy.REJECT_AND_CONTINUE) {
+                policy = SenderError.Policy.TERMINAL;
+            }
             SenderError err = new SenderError(
                     category,
                     policy,
@@ -4059,7 +4375,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         private void handleServerRejection(long wireSeq) {
             byte status = response.getStatus();
             SenderError.Category category = classify(status);
-            SenderError.Policy policy = defaultPolicyFor(category);
+            SenderError.Policy policy = category == SenderError.Category.SCHEMA_MISMATCH
+                    ? schemaMismatchPolicy
+                    : defaultPolicyFor(category);
             // Same sanity clamp as the success branch above: do not trust a
             // rejection wireSeq beyond what we've actually sent. The clamped
             // value is only used to attribute an FSN to the error report --
@@ -4134,6 +4452,74 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     System.nanoTime()
             );
             totalServerErrors.incrementAndGet();
+
+            if (policy == SenderError.Policy.REJECT_AND_CONTINUE) {
+                // Retirement requires an exact data sequence sent on this
+                // connection. Never feed the reporting clamp into data loss.
+                if (wireSeq < 0 || wireSeq > highestSent || fsn <= engine.ackedFsn()) {
+                    SenderError terminal = new SenderError(
+                            category, SenderError.Policy.TERMINAL, status & 0xff,
+                            response.getErrorMessage(), wireSeq, fsn, fsn,
+                            tableName, System.nanoTime());
+                    recordFatal(new LineSenderServerException(terminal));
+                    dispatchError(terminal);
+                    return;
+                }
+                SchemaRejectionState state = schemaRejectionState;
+                if (state == null) {
+                    SenderError terminal = err.withAppliedPolicy(SenderError.Policy.TERMINAL);
+                    recordFatal(new LineSenderServerException(terminal));
+                    dispatchError(terminal);
+                    return;
+                }
+                long floor = engine.ackedFsn() + 1L;
+                long first = floor;
+                // Walk forward once so each segment's cold lookup cache can advance
+                // linearly, even for a rejected prefix containing many small frames.
+                for (long predecessor = floor; predecessor < fsn; predecessor++) {
+                    int flags = engine.liveQwpFrameFlags(predecessor);
+                    if (flags < 0) {
+                        SenderError terminal = err.withAppliedPolicy(SenderError.Policy.TERMINAL);
+                        recordFatal(new LineSenderServerException(terminal));
+                        dispatchError(terminal);
+                        return;
+                    }
+                    if ((flags & QwpConstants.FLAG_DEFER_COMMIT) == 0) {
+                        first = predecessor + 1L;
+                    }
+                }
+                final boolean installed;
+                try {
+                    installed = state.reject(fsn, first, err);
+                } catch (IllegalStateException e) {
+                    LOG.error("could not resolve schema-rejected store-and-forward range at fsn {}; "
+                            + "keeping queued bytes and stopping the sender", fsn, e);
+                    recordFatal(new LineSenderException(
+                            "could not resolve schema-rejected store-and-forward range at fsn " + fsn, e));
+                    SenderError terminal = new SenderError(
+                            category, SenderError.Policy.TERMINAL, status & 0xff,
+                            response.getErrorMessage(), wireSeq, fsn, fsn,
+                            tableName, System.nanoTime());
+                    dispatchError(terminal);
+                    return;
+                }
+                if (!installed) {
+                    LOG.error("received a schema rejection at fsn {} while another schema-rejected "
+                                    + "range is pending retirement; keeping queued bytes and stopping the sender",
+                            fsn);
+                    SenderError terminal = new SenderError(
+                            category, SenderError.Policy.TERMINAL, status & 0xff,
+                            response.getErrorMessage(), wireSeq, fsn, fsn,
+                            tableName, System.nanoTime());
+                    recordFatal(new LineSenderServerException(terminal));
+                    dispatchError(terminal);
+                    return;
+                }
+                schemaRejections.incrementAndGet();
+                failSchemaPaced(new LineSenderException(
+                        "recycling connection after schema rejection at fsn " + fsn));
+                return;
+            }
 
             if (policy == SenderError.Policy.TERMINAL) {
                 // Terminal: stash the typed payload BEFORE dispatching to the

@@ -36,15 +36,19 @@ import org.jetbrains.annotations.Nullable;
  * <ul>
  *   <li>Asynchronously via {@link SenderErrorHandler} registered on the builder.</li>
  *   <li>Synchronously as the payload of a {@link LineSenderServerException} thrown
- *       from the next producer-thread API call after a {@link Policy#TERMINAL} error has
+ *       from the next producer-thread API call after a {@link Policy#TERMINAL} or
+ *       owned {@link Policy#REJECT_AND_CONTINUE} error has
  *       been latched.</li>
  * </ul>
  *
  * <p>The {@code [fromFsn, toFsn]} span is the load-bearing correlation key — join it to
  * whatever the producer thread logged alongside the published-sequence value returned by
- * the sender to identify the rejected data. Background orphan-drainer reports use
- * {@link #NO_MESSAGE_SEQUENCE} for both bounds because those FSNs belong to another sender
- * engine and must not be joined to the live producer's rows.
+ * the sender to identify the rejected data. A schema report recovered from a completed
+ * preserved copy retains the recovered queue's local FSN span; use the archive path to
+ * identify its queue. Such a report is reconstructed only for the exact still-live orphan
+ * range whose deterministic archive exists and passes structural validation. Other
+ * background reports use {@link #NO_MESSAGE_SEQUENCE}. Never join an orphan's FSNs to the
+ * live producer's rows.
  *
  * @see SenderErrorHandler
  * @see LineSenderServerException
@@ -69,6 +73,8 @@ public final class SenderError {
     private final int serverStatusByte;
     private final String tableName;
     private final long toFsn;
+    private final long rejectedFsn;
+    private final String rejectedPath;
     public SenderError(
             @NotNull Category category,
             @NotNull Policy appliedPolicy,
@@ -96,6 +102,16 @@ public final class SenderError {
             long detectedAtNanos,
             @Nullable String quarantinedPath
     ) {
+        this(category, appliedPolicy, serverStatusByte, serverMessage, messageSequence,
+                fromFsn, toFsn, tableName, detectedAtNanos, quarantinedPath, toFsn, null);
+    }
+
+    private SenderError(Category category, Policy appliedPolicy, int serverStatusByte,
+                        String serverMessage, long messageSequence, long fromFsn, long toFsn,
+                        String tableName, long detectedAtNanos, String quarantinedPath,
+                        long rejectedFsn, String rejectedPath) {
+        this.rejectedFsn = rejectedFsn;
+        this.rejectedPath = rejectedPath;
         this.category = category;
         this.appliedPolicy = appliedPolicy;
         this.serverStatusByte = serverStatusByte;
@@ -127,6 +143,37 @@ public final class SenderError {
                 System.nanoTime(), quarantinedPath);
     }
 
+    /** Local FSN named by the NACK, distinct from the full retired span. */
+    public long getRejectedFsn() {
+        return rejectedFsn;
+    }
+
+    /** Completed preserved-copy directory, or null when this report has no available copy. */
+    public @Nullable String getRejectedPath() {
+        return rejectedPath;
+    }
+
+    /** Internal copy operation used when a singleton error is resolved to a retirement span. */
+    public SenderError withRejectionSpan(long first, long last) {
+        return new SenderError(category, Policy.REJECT_AND_CONTINUE, serverStatusByte,
+                serverMessage, messageSequence, first, last, tableName, detectedAtNanos,
+                quarantinedPath, rejectedFsn, rejectedPath);
+    }
+
+    /** Returns a new error after the preserved copy has been published. */
+    public SenderError withRejectedPath(String path) {
+        return new SenderError(category, appliedPolicy, serverStatusByte, serverMessage,
+                messageSequence, fromFsn, toFsn, tableName, detectedAtNanos,
+                quarantinedPath, rejectedFsn, path);
+    }
+
+    /** Internal copy operation used when a fail-closed fallback changes policy. */
+    public SenderError withAppliedPolicy(Policy policy) {
+        return new SenderError(category, policy, serverStatusByte, serverMessage,
+                messageSequence, fromFsn, toFsn, tableName, detectedAtNanos,
+                quarantinedPath, rejectedFsn, rejectedPath);
+    }
+
     /**
      * @return the policy the I/O loop actually applied — RETRIABLE / RETRIABLE_OTHER means
      * the batch stays in the store-and-forward log and is replayed after a reconnect (no data
@@ -145,7 +192,9 @@ public final class SenderError {
     }
 
     /**
-     * @return wall-clock-independent receipt time on the I/O thread, from {@link System#nanoTime()}.
+     * @return the value of {@link System#nanoTime()} when the original process received the
+     * rejection. A report reconstructed from a preserved copy retains that raw value; it cannot
+     * be compared or ordered against {@code nanoTime()} values from the recovering process.
      */
     public long getDetectedAtNanos() {
         return detectedAtNanos;
@@ -153,16 +202,18 @@ public final class SenderError {
 
     /**
      * @return inclusive lower bound of the FSN span for the rejected batch — correlation key for producer-side logs.
-     * For {@link Category#DATA_LOSS} and background orphan-drainer reports this is
-     * {@link #NO_MESSAGE_SEQUENCE} — the span is unknown or does not belong to the live sender.
+     * For {@link Category#DATA_LOSS} and non-schema background reports this is
+     * {@link #NO_MESSAGE_SEQUENCE}. Recovered schema reports retain the orphan queue's local span.
      */
     public long getFromFsn() {
         return fromFsn;
     }
 
     /**
-     * @return server's per-frame messageSequence as mirrored back in the rejection frame, or
-     * {@link #NO_MESSAGE_SEQUENCE} for {@link Category#PROTOCOL_VIOLATION} (WS close frames carry no QWP sequence).
+     * @return the server's per-frame message sequence mirrored in a live rejection, or
+     * {@link #NO_MESSAGE_SEQUENCE} when no QWP sequence exists. A schema report reconstructed
+     * from a preserved copy uses its persisted rejected FSN here because the original wire
+     * sequence is not stored; use {@link #getRejectedFsn()} for that local correlation value.
      */
     public long getMessageSequence() {
         return messageSequence;
@@ -205,8 +256,8 @@ public final class SenderError {
 
     /**
      * @return inclusive upper bound of the FSN span for the rejected batch.
-     * For {@link Category#DATA_LOSS} and background orphan-drainer reports this is
-     * {@link #NO_MESSAGE_SEQUENCE} — the span is unknown or does not belong to the live sender.
+     * For {@link Category#DATA_LOSS} and non-schema background reports this is
+     * {@link #NO_MESSAGE_SEQUENCE}. Recovered schema reports retain the orphan queue's local span.
      */
     public long getToFsn() {
         return toFsn;
@@ -302,24 +353,23 @@ public final class SenderError {
     }
 
     /**
-     * Policy applied by the client when a category fires. Resolution precedence (highest first):
-     * builder {@code errorPolicyResolver} → builder per-category {@code errorPolicy} →
-     * connect-string per-category {@code on_*_error} → connect-string global {@code on_server_error}
-     * → spec defaults.
+     * Policy applied by the client. Schema mismatch can be overridden through
+     * the schemaMismatchPolicy builder setting; other categories use their defaults.
+     * Reserved on_* connection-string settings do not implement a general resolver.
      *
-     * <p>There is no silent-drop policy by design: the client never discards
-     * data without telling anyone. A rejected batch is replayed
-     * ({@link #RETRIABLE} / {@link #RETRIABLE_OTHER}), halts the sender loudly
-     * with the bytes preserved on disk ({@link #TERMINAL}), or — the one case
-     * where the bytes can never be sent — is abandoned in place and announced
-     * as {@link #ABANDONED}, which is precisely what keeps the abandonment
-     * non-silent.
+     * <p>QWP builders default schema mismatches to {@link #REJECT_AND_CONTINUE}:
+     * retire the affected span after preserving it when configured, notify the
+     * handler, and fail its owning handle. Other errors replay, halt with bytes
+     * retained, or report explicit abandonment. Rejection notifications are retained
+     * while running. On restart, a completed preserved copy reconstructs a notification
+     * only for its exact still-live recovered orphan range; a crash or shutdown can still
+     * lose callbacks before publication or after retirement.
      *
      * <p>{@link Category#PROTOCOL_VIOLATION} is forced {@link #TERMINAL},
      * {@link Category#UNKNOWN} is forced {@link #RETRIABLE} (fail open: a
      * status byte from a newer server must degrade to retry, not to a dead
      * sender), and {@link Category#DATA_LOSS} is forced {@link #ABANDONED};
-     * user overrides for these categories are ignored.
+     * the schema policy override cannot change these categories.
      */
     public enum Policy {
         /**
@@ -358,6 +408,12 @@ public final class SenderError {
          * select it or override it away. It reports a fact about bytes already
          * abandoned, not a choice about how to react.
          */
-        ABANDONED
+        ABANDONED,
+        /**
+         * Retire the rejected span and continue independent queued work. The owning
+         * handle fails until returned or rebuilt. Retirement is not server acceptance;
+         * a preserved copy is available only when export is enabled and completes.
+         */
+        REJECT_AND_CONTINUE
     }
 }

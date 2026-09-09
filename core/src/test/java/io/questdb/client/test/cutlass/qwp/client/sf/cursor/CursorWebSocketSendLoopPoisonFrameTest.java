@@ -29,24 +29,32 @@ import io.questdb.client.LineSenderServerException;
 import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SchemaRejectionState;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.RejectedMiniSlotArchive;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher;
 import io.questdb.client.network.PlainSocketFactory;
-import io.questdb.client.std.Files;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
+import io.questdb.client.test.tools.DelegatingFilesFacade;
 import io.questdb.client.test.tools.TestUtils;
-import org.junit.After;
 import org.junit.Before;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -76,32 +84,13 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
 
     private String tmpDir;
 
-    @Before
-    public void setUp() {
-        tmpDir = Paths.get(System.getProperty("java.io.tmpdir"),
-                "qdb-cursor-poison-" + System.nanoTime()).toString();
-        assertEquals(0, Files.mkdir(tmpDir, Files.DIR_MODE_DEFAULT));
-    }
+    @Rule
+    public final TemporaryFolder temp = new TemporaryFolder();
 
-    @After
-    public void tearDown() {
-        if (tmpDir == null) return;
-        long find = Files.findFirst(tmpDir);
-        if (find > 0) {
-            try {
-                int rc = 1;
-                while (rc > 0) {
-                    String name = Files.utf8ToString(Files.findName(find));
-                    if (name != null && !".".equals(name) && !"..".equals(name)) {
-                        Files.remove(tmpDir + "/" + name);
-                    }
-                    rc = Files.findNext(find);
-                }
-            } finally {
-                Files.findClose(find);
-            }
-        }
-        Files.remove(tmpDir);
+    @Before
+    public void setUp() throws Exception {
+        // Preservation tests create nested archives; the rule cleans those too.
+        tmpDir = temp.newFolder("slot").getAbsolutePath();
     }
 
     @Test
@@ -148,6 +137,227 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                         assertEquals(SenderError.Policy.TERMINAL,
                                 e.getServerError().getAppliedPolicy());
                     }
+                }
+            } finally {
+                closeAll(clients);
+            }
+        });
+    }
+
+    @Test
+    public void testSecondSchemaNackWhileRetirementPendingFailsClosedAfterDurableReplayOk() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            List<WebSocketClient> clients = new ArrayList<>();
+            try (CursorSendEngine engine = newEngine()) {
+                appendFrames(engine, 2);
+                SchemaRejectionState state = new SchemaRejectionState();
+                state.setEngine(engine);
+                state.beginLease(1L, 0L, false);
+                SenderError first = new SenderError(SenderError.Category.SCHEMA_MISMATCH,
+                        SenderError.Policy.REJECT_AND_CONTINUE, 3, "first mismatch", 1L,
+                        1L, 1L, null, System.nanoTime());
+                assertTrue(state.reject(1L, 1L, first));
+                try (CursorWebSocketSendLoop loop = newDurableLoop(engine, clients)) {
+                    loop.setSchemaMismatchPolicy(SenderError.Policy.REJECT_AND_CONTINUE);
+                    loop.setSchemaRejectionState(state);
+
+                    assertEquals("retirement must wait for the durable predecessor", -1L, engine.ackedFsn());
+
+                    setSentCount(loop, 2);
+                    deliverOk(loop, 0L, names("trades"), txns(7L));
+                    assertEquals("an OK without its durable ACK must not release the predecessor",
+                            -1L, engine.ackedFsn());
+                    deliverSchemaNack(loop, 1L, "second mismatch");
+
+                    try {
+                        loop.checkError();
+                        fail("a second schema rejection cannot replace an unresolved retirement range");
+                    } catch (LineSenderServerException e) {
+                        assertEquals(SenderError.Category.SCHEMA_MISMATCH,
+                                e.getServerError().getCategory());
+                    }
+                    assertEquals("fail-closed fallback must preserve every source frame",
+                            -1L, engine.ackedFsn());
+                    assertEquals(1L, state.stopFsn());
+                }
+            } finally {
+                closeAll(clients);
+            }
+        });
+    }
+
+    @Test
+    public void testSkippedRangeFailureLatchesInsteadOfReconnect() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            List<WebSocketClient> clients = new ArrayList<>();
+            try (CursorSendEngine engine = newEngine()) {
+                appendFrames(engine, 1);
+                SchemaRejectionState state = new SchemaRejectionState();
+                state.setEngine(engine);
+                state.beginLease(1L, 0L, false);
+                SenderError error = new SenderError(SenderError.Category.SCHEMA_MISMATCH,
+                        SenderError.Policy.REJECT_AND_CONTINUE, 3, "missing range frame", 1L,
+                        1L, 1L, null, System.nanoTime());
+                assertTrue(state.reject(1L, 1L, error));
+                assertTrue(engine.acknowledge(0L));
+                AtomicReference<SenderError> reported = new AtomicReference<>();
+                try (CursorWebSocketSendLoop loop = newDurableLoop(engine, clients);
+                     io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher dispatcher =
+                             new io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher(reported::set)) {
+                    loop.setSchemaRejectionState(state);
+                    loop.setErrorDispatcher(dispatcher);
+                    assertFalse(loop.tryRetireSchemaRangeForTest());
+
+                    try {
+                        loop.checkError();
+                        fail("a skipped-range inconsistency must latch terminal");
+                    } catch (LineSenderException e) {
+                        assertTrue(e.getMessage().contains("frame disappeared before retirement"));
+                    }
+                    assertEquals("the inconsistent range must remain unacknowledged",
+                            0L, engine.ackedFsn());
+                    long deadline = System.nanoTime() + 5_000_000_000L;
+                    while (reported.get() == null && System.nanoTime() < deadline) {
+                        Thread.yield();
+                    }
+                    assertEquals("the callback must describe the fail-closed policy actually applied",
+                            SenderError.Policy.TERMINAL, reported.get().getAppliedPolicy());
+                    assertEquals(1L, reported.get().getFromFsn());
+                    assertEquals(1L, reported.get().getToFsn());
+                }
+            } finally {
+                closeAll(clients);
+            }
+        });
+    }
+
+    @Test
+    public void testPreservationFailureRetriesThenRetiresWithoutTerminal() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                appendFrames(engine, 1);
+                SchemaRejectionState state = new SchemaRejectionState();
+                state.setEngine(engine);
+                state.beginLease(1L, 0L, false);
+                SenderError error = new SenderError(SenderError.Category.SCHEMA_MISMATCH,
+                        SenderError.Policy.REJECT_AND_CONTINUE, 3, "mismatch", 0L,
+                        0L, 0L, null, System.nanoTime());
+                assertTrue(state.reject(0L, 0L, error));
+                FailFirstTemporaryMkdirFacade ff = new FailFirstTemporaryMkdirFacade();
+                AtomicReference<SenderError> reported = new AtomicReference<>();
+                RejectedMiniSlotArchive preserver = new RejectedMiniSlotArchive(
+                        ff, tmpDir);
+                try (SenderErrorDispatcher dispatcher = new SenderErrorDispatcher(reported::set);
+                     CursorWebSocketSendLoop loop = newDurableLoop(engine, new ArrayList<>())) {
+                    loop.setSchemaRejectionState(state);
+                    loop.setRejectionArchive(preserver);
+                    loop.setErrorDispatcher(dispatcher);
+
+                    assertFalse(loop.tryRetireSchemaRangeForTest());
+                    assertEquals(1L, loop.getDlqWriteFailures());
+                    assertEquals(-1L, engine.ackedFsn());
+                    assertEquals(null, loop.getTerminalError());
+                    assertEquals(null, reported.get());
+
+                    long successDeadline = System.nanoTime() + 5_000_000_000L;
+                    assertTrue(loop.tryRetireSchemaRangeForTest());
+                    assertEquals(0L, engine.ackedFsn());
+                    assertEquals(null, loop.getTerminalError());
+                    while (reported.get() == null && System.nanoTime() < successDeadline) Thread.yield();
+                    assertEquals(SenderError.Policy.REJECT_AND_CONTINUE,
+                            reported.get().getAppliedPolicy());
+                    assertTrue(reported.get().getRejectedPath() != null);
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testFullSchemaNotificationFifoDoesNotRepeatPreservation() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                appendFrames(engine, 1);
+                SchemaRejectionState state = new SchemaRejectionState();
+                state.setEngine(engine);
+                state.beginLease(1L, 0L, false);
+                SenderError error = new SenderError(SenderError.Category.SCHEMA_MISMATCH,
+                        SenderError.Policy.REJECT_AND_CONTINUE, 3, "mismatch", 0L,
+                        0L, 0L, null, System.nanoTime());
+                assertTrue(state.reject(0L, 0L, error));
+                CountingPreserveFacade ff = new CountingPreserveFacade(tmpDir + "/rejected");
+                        CountDownLatch handlerEntered = new CountDownLatch(1);
+                CountDownLatch releaseHandler = new CountDownLatch(1);
+                try (SenderErrorDispatcher dispatcher = new SenderErrorDispatcher(ignored -> {
+                    handlerEntered.countDown();
+                    try {
+                        releaseHandler.await();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }); CursorWebSocketSendLoop loop = newDurableLoop(engine, new ArrayList<>())) {
+                    assertTrue(dispatcher.tryOfferSchema(error));
+                    assertTrue(handlerEntered.await(5, TimeUnit.SECONDS));
+                    for (int i = 1; i < SenderErrorDispatcher.DEFAULT_CAPACITY; i++) {
+                        assertTrue(dispatcher.tryOfferSchema(error));
+                    }
+                    loop.setSchemaRejectionState(state);
+                    loop.setRejectionArchive(new RejectedMiniSlotArchive(ff, tmpDir));
+                    loop.setErrorDispatcher(dispatcher);
+
+                    assertFalse(loop.tryRetireSchemaRangeForTest());
+                    int syncsAfterPreserve = ff.rejectedRootSyncs;
+                    assertTrue(syncsAfterPreserve > 0);
+                    assertFalse(loop.tryRetireSchemaRangeForTest());
+                    assertEquals("a cached notification must avoid archive validation and fsync",
+                            syncsAfterPreserve, ff.rejectedRootSyncs);
+                    assertEquals(-1L, engine.ackedFsn());
+
+                    releaseHandler.countDown();
+                    long deadline = System.nanoTime() + 5_000_000_000L;
+                    while (dispatcher.getPendingSchemaNotifications()
+                            >= SenderErrorDispatcher.DEFAULT_CAPACITY
+                            && System.nanoTime() < deadline) {
+                        Thread.yield();
+                    }
+                    assertTrue(loop.tryRetireSchemaRangeForTest());
+                    assertEquals(0L, engine.ackedFsn());
+                } finally {
+                    releaseHandler.countDown();
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testTransactionalCloserScanFailureFromNackLatchesWithoutReconnect() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            List<WebSocketClient> clients = new ArrayList<>();
+            try (CursorSendEngine engine = newEngine()) {
+                appendDeferredFrame(engine);
+                SchemaRejectionState state = new SchemaRejectionState();
+                state.beginLease(1L, 0L, true);
+                state.endLease(1L, 1L); // Inject an advertised tail including missing frame 1.
+                state.setEngine(engine);
+                AtomicReference<SenderError> reported = new AtomicReference<>();
+                try (CursorWebSocketSendLoop loop = newDurableLoop(engine, clients);
+                     SenderErrorDispatcher dispatcher = new SenderErrorDispatcher(reported::set)) {
+                    loop.setSchemaMismatchPolicy(SenderError.Policy.REJECT_AND_CONTINUE);
+                    loop.setSchemaRejectionState(state);
+                    loop.setErrorDispatcher(dispatcher);
+                    setSentCount(loop, 1L);
+                    deliverSchemaNack(loop, 0L, "transaction mismatch");
+                    try {
+                        loop.checkError();
+                        fail("transactional closer scan failure must latch terminal");
+                    } catch (LineSenderException e) {
+                        assertTrue(e.getMessage().contains("could not resolve schema-rejected"));
+                    }
+                    assertEquals("terminal path must not enter reconnect", 0L,
+                            loop.getTotalReconnectAttempts());
+                    assertEquals(-1L, engine.ackedFsn());
+                    long deadline = System.nanoTime() + 5_000_000_000L;
+                    while (reported.get() == null && System.nanoTime() < deadline) Thread.yield();
+                    assertEquals(SenderError.Policy.TERMINAL, reported.get().getAppliedPolicy());
                 }
             } finally {
                 closeAll(clients);
@@ -880,6 +1090,36 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
     // harness
     // ---------------------------------------------------------------------
 
+    private static final class FailFirstTemporaryMkdirFacade extends DelegatingFilesFacade {
+        private boolean failed;
+
+        @Override
+        public int mkdir(String path, int mode) {
+            if (!failed && path.contains("/rejected/.tmp-")) {
+                failed = true;
+                return -1;
+            }
+            return super.mkdir(path, mode);
+        }
+    }
+
+    private static final class CountingPreserveFacade extends DelegatingFilesFacade {
+        private final String rejectedRoot;
+        private int rejectedRootSyncs;
+
+        private CountingPreserveFacade(String rejectedRoot) {
+            this.rejectedRoot = rejectedRoot;
+        }
+
+        @Override
+        public int fsyncDir(String path) {
+            if (rejectedRoot.equals(path)) {
+                rejectedRootSyncs++;
+            }
+            return super.fsyncDir(path);
+        }
+    }
+
     /**
      * In-memory transport emulating a healthy server that deterministically
      * NACKs the head frame: accepts the connection, waits for one send on
@@ -1056,6 +1296,19 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
         }
     }
 
+    private static void appendDeferredFrame(CursorSendEngine engine) {
+        long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+        try {
+            Unsafe.getUnsafe().setMemory(buf, 16, (byte) 0);
+            Unsafe.getUnsafe().putInt(buf, io.questdb.client.cutlass.qwp.protocol.QwpConstants.MAGIC_MESSAGE);
+            Unsafe.getUnsafe().putByte(buf + io.questdb.client.cutlass.qwp.protocol.QwpConstants.HEADER_OFFSET_FLAGS,
+                    io.questdb.client.cutlass.qwp.protocol.QwpConstants.FLAG_DEFER_COMMIT);
+            engine.appendBlocking(buf, 16);
+        } finally {
+            Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
     private static long buildErrorPayload(long wireSeq, byte status, String message) {
         // Error frame: status(1) + sequence(8) + msgLen(2) + bytes
         byte[] msg = message.getBytes(StandardCharsets.UTF_8);
@@ -1131,6 +1384,18 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
     private static void deliverRetriableNack(CursorWebSocketSendLoop loop, long wireSeq,
                                              String msg) throws Exception {
         long packed = buildErrorPayload(wireSeq, WebSocketResponse.STATUS_WRITE_ERROR, msg);
+        long ptr = packed & 0xFFFFFFFFFFFFL;
+        int size = (int) (packed >>> 48);
+        try {
+            invokeOnBinaryMessage(loop, ptr, size);
+        } finally {
+            Unsafe.free(ptr, size, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    private static void deliverSchemaNack(CursorWebSocketSendLoop loop, long wireSeq,
+                                          String msg) throws Exception {
+        long packed = buildErrorPayload(wireSeq, WebSocketResponse.STATUS_SCHEMA_MISMATCH, msg);
         long ptr = packed & 0xFFFFFFFFFFFFL;
         int size = (int) (packed >>> 48);
         try {

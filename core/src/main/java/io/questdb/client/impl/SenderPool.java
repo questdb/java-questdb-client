@@ -34,6 +34,7 @@ import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerListener;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderErrorHandler;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLockContentionException;
 import io.questdb.client.std.Files;
@@ -154,6 +155,9 @@ public final class SenderPool implements AutoCloseable {
     private final SenderConnectionListener connectionListener;
     private final BackgroundDrainerListener drainerListener;
     private final SenderErrorHandler errorHandler;
+    private final SenderError.Policy schemaMismatchPolicy;
+    private final boolean dlqEnabled;
+    private final String dlqDir;
     private final long idleTimeoutMillis;
     private final HttpTokenProvider tokenProvider;
     // Delivery channel for recovery-delegate errors that pass the
@@ -483,6 +487,18 @@ public final class SenderPool implements AutoCloseable {
                 drainerListener, null, null, null, tokenProvider, null);
     }
 
+    SenderPool(String configurationString, int minSize, int maxSize,
+               long acquireTimeoutMillis, long idleTimeoutMillis, long maxLifetimeMillis,
+               IntFunction<Sender> senderFactory, boolean deferStartupRecovery,
+               SenderErrorHandler errorHandler, SenderConnectionListener connectionListener,
+               BackgroundDrainerListener drainerListener, HttpTokenProvider tokenProvider,
+               SenderError.Policy schemaMismatchPolicy, boolean dlqEnabled, String dlqDir) {
+        this(configurationString, minSize, maxSize, acquireTimeoutMillis, idleTimeoutMillis,
+                maxLifetimeMillis, senderFactory, deferStartupRecovery, errorHandler,
+                connectionListener, drainerListener, null, null, null, tokenProvider, null,
+                schemaMismatchPolicy, dlqEnabled, dlqDir);
+    }
+
     private SenderPool(
             String configurationString,
             int minSize,
@@ -501,9 +517,34 @@ public final class SenderPool implements AutoCloseable {
             HttpTokenProvider tokenProvider,
             Runnable beforeFailedRecoveryJoinHook
     ) {
+        this(configurationString, minSize, maxSize, acquireTimeoutMillis, idleTimeoutMillis, maxLifetimeMillis, senderFactory, deferStartupRecovery, errorHandler, connectionListener, drainerListener, postFactoryHook, recoveryThreadFactory, recoveryWaiter, tokenProvider, beforeFailedRecoveryJoinHook, SenderError.Policy.REJECT_AND_CONTINUE, true, null);
+    }
+
+    private SenderPool(
+            String configurationString,
+            int minSize,
+            int maxSize,
+            long acquireTimeoutMillis,
+            long idleTimeoutMillis,
+            long maxLifetimeMillis,
+            IntFunction<Sender> senderFactory,
+            boolean deferStartupRecovery,
+            SenderErrorHandler errorHandler,
+            SenderConnectionListener connectionListener,
+            BackgroundDrainerListener drainerListener,
+            Runnable postFactoryHook,
+            ThreadFactory recoveryThreadFactory,
+            Runnable recoveryWaiter,
+            HttpTokenProvider tokenProvider,
+            Runnable beforeFailedRecoveryJoinHook,
+            SenderError.Policy schemaMismatchPolicy, boolean dlqEnabled, String dlqDir
+    ) {
         if (minSize < 0 || maxSize < 1 || minSize > maxSize) {
             throw new IllegalArgumentException("invalid pool sizing: min=" + minSize + ", max=" + maxSize);
         }
+        this.schemaMismatchPolicy = schemaMismatchPolicy;
+        this.dlqEnabled = dlqEnabled;
+        this.dlqDir = dlqDir;
         this.errorHandler = errorHandler;
         this.connectionListener = connectionListener;
         this.drainerListener = drainerListener;
@@ -544,9 +585,21 @@ public final class SenderPool implements AutoCloseable {
         this.storeAndForward = probe.isStoreAndForwardEnabled();
         this.slotBaseId = this.storeAndForward ? probe.getConfiguredSenderId() : null;
         this.sfDir = this.storeAndForward ? probe.getConfiguredSfDir() : null;
+        if (schemaMismatchPolicy == SenderError.Policy.REJECT_AND_CONTINUE
+                && dlqEnabled && (dlqDir != null || sfDir != null)) {
+            String destination = dlqDir != null ? dlqDir : sfDir;
+            try {
+                java.nio.file.Files.createDirectories(java.nio.file.Paths.get(destination));
+            } catch (java.io.IOException e) {
+                throw new io.questdb.client.cutlass.line.LineSenderException(e)
+                        .put("could not create schema preservation destination ").put(destination);
+            }
+            io.questdb.client.cutlass.qwp.client.sf.cursor.RejectedMiniSlotArchive.probeDirectory(
+                    io.questdb.client.std.FilesFacade.INSTANCE, destination);
+        }
         this.slotInUse = this.storeAndForward ? new boolean[maxSize] : null;
-        this.recoveryErrorDispatcher = (errorHandler != null && this.storeAndForward)
-                ? new SenderErrorDispatcher(errorHandler, SenderErrorDispatcher.DEFAULT_CAPACITY,
+        this.recoveryErrorDispatcher = this.storeAndForward
+                ? new SenderErrorDispatcher(errorHandler != null ? errorHandler : DefaultSenderErrorHandler.INSTANCE, SenderErrorDispatcher.DEFAULT_CAPACITY,
                         "qdb-sf-pool-recovery-errors")
                 : null;
         // Pre-warm minSize connections. Pre-warm runs single-threaded in the
@@ -1123,7 +1176,9 @@ public final class SenderPool implements AutoCloseable {
                 // on a timeout: a server that fails to ack within the budget
                 // will very likely do the same for every remaining slot -- the
                 // same reasoning as the build-failure case above.
-                if (!recoverer.delegate().drain(remainingMillis)) {
+                if (!(recoverer.delegate() instanceof QwpWebSocketSender
+                        ? ((QwpWebSocketSender) recoverer.delegate()).drainResolved(remainingMillis)
+                        : recoverer.delegate().drain(remainingMillis))) {
                     if (warnSlotOnce(slotIndex)) {
                         LOG.warn("startup SF recovery: drain did not ack slot {} "
                                 + "within {}ms; deferring this and remaining slots",
@@ -1228,6 +1283,7 @@ public final class SenderPool implements AutoCloseable {
                     // wrapper handed out can be told apart from any prior,
                     // now-stale borrow of the same slot.
                     s.bumpGeneration();
+                    s.beginSchemaLease();
                     return new PooledSender(s, s.generation());
                 }
                 if (all.size() + inFlightCreations + closingSlots + leakedSlots + recoveringSlots < maxSize) {
@@ -1296,6 +1352,7 @@ public final class SenderPool implements AutoCloseable {
                     }
                     all.add(created);
                     created.bumpGeneration();
+                    created.beginSchemaLease();
                     inFlightCreations--;
                     creationFinished.signalAll();
                     return new PooledSender(created, created.generation());
@@ -1649,11 +1706,15 @@ public final class SenderPool implements AutoCloseable {
                     // twice and hand it to two borrowers writing into one delegate.
                     return;
                 }
+                io.questdb.client.LineSenderServerException schemaFailure = s.endSchemaLease();
                 s.bumpGeneration();
                 s.markIdleAt(System.currentTimeMillis());
                 assert !available.contains(s) : "slot already present in available deque on giveBack";
                 available.addLast(s);
                 slotReleased.signal();
+                if (schemaFailure != null) {
+                    throw schemaFailure;
+                }
                 return;
             }
         } finally {
@@ -2039,7 +2100,11 @@ public final class SenderPool implements AutoCloseable {
             builder.errorHandler(new SenderErrorHandler() {
                 @Override
                 public void onError(SenderError error) {
-                    if (isRecoveryEventUserRelevant(error)) {
+                    if (error.getAppliedPolicy() == SenderError.Policy.REJECT_AND_CONTINUE) {
+                        // Already on the delegate's reliable dispatcher: a second lossy hop
+                        // would defeat the schema FIFO's delivery guarantee.
+                        (errorHandler != null ? errorHandler : DefaultSenderErrorHandler.INSTANCE).onError(error);
+                    } else if (isRecoveryEventUserRelevant(error)) {
                         recoveryErrorDispatcher.offer(error);
                     }
                 }
@@ -2049,6 +2114,10 @@ public final class SenderPool implements AutoCloseable {
     }
 
     private Sender.LineSenderBuilder applyTokenProvider(Sender.LineSenderBuilder builder) {
+        builder.schemaMismatchPolicy(schemaMismatchPolicy).dlqEnabled(dlqEnabled);
+        if (dlqDir != null) {
+            builder.dlqDirectory(dlqDir);
+        }
         if (tokenProvider != null) {
             builder.httpTokenProvider(tokenProvider);
         }

@@ -59,7 +59,7 @@ public final class DefaultSenderErrorHandler implements SenderErrorHandler {
         // Single template; SLF4J fans out the levels so the call site stays
         // identical and the message format is reviewable in one place.
         String fmt = "server rejected batch [category={}, policy={}, status=0x{}, "
-                + "fsn=[{},{}], table={}, seq={}, msg={}]";
+                + "fsn=[{},{}], table={}, seq={}, msg={}, preserved={}]";
         Object[] args = new Object[]{
                 e.getCategory(),
                 e.getAppliedPolicy(),
@@ -68,10 +68,12 @@ public final class DefaultSenderErrorHandler implements SenderErrorHandler {
                 e.getToFsn(),
                 e.getTableName() == null ? "(multi)" : e.getTableName(),
                 e.getMessageSequence(),
-                e.getServerMessage()
+                e.getServerMessage(),
+                e.getRejectedPath()
         };
         if (e.getAppliedPolicy() == SenderError.Policy.TERMINAL
-                || e.getAppliedPolicy() == SenderError.Policy.ABANDONED) {
+                || e.getAppliedPolicy() == SenderError.Policy.ABANDONED
+                || e.getAppliedPolicy() == SenderError.Policy.REJECT_AND_CONTINUE) {
             LOG.error(fmt, args);
         } else {
             LOG.warn(fmt, args);

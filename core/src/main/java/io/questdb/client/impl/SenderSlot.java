@@ -25,6 +25,7 @@
 package io.questdb.client.impl;
 
 import io.questdb.client.Sender;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 
 /**
  * One reusable {@link SenderPool} slot: owns a real {@link Sender} delegate, its
@@ -68,6 +69,9 @@ final class SenderSlot {
         this.slotIndex = slotIndex;
         this.createdAtMillis = System.currentTimeMillis();
         this.idleSinceMillis = this.createdAtMillis;
+        if (delegate instanceof QwpWebSocketSender) {
+            ((QwpWebSocketSender) delegate).prepareSchemaPoolSlot();
+        }
     }
 
     /**
@@ -77,6 +81,19 @@ final class SenderSlot {
      */
     void bumpGeneration() {
         generation++;
+    }
+
+    void beginSchemaLease() {
+        if (delegate instanceof QwpWebSocketSender) {
+            ((QwpWebSocketSender) delegate).beginSchemaLease(generation);
+        }
+    }
+
+    io.questdb.client.LineSenderServerException endSchemaLease() {
+        if (delegate instanceof QwpWebSocketSender) {
+            return ((QwpWebSocketSender) delegate).endSchemaLease();
+        }
+        return null;
     }
 
     long createdAtMillis() {

@@ -888,6 +888,30 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
+     * Reads the QWP header flags for a currently live frame. Returns {@code -1}
+     * when the FSN is outside the live ring or the payload is not a valid QWP
+     * message. The ring monitor protects the mapped bytes from trim/unmap for
+     * the duration of this bounded header read.
+     */
+    public int liveQwpFrameFlags(long fsn) {
+        return ring.liveQwpFrameFlags(fsn);
+    }
+
+    /** Returns the payload length for a currently live frame, or {@code -1}. */
+    public int liveFramePayloadLength(long fsn) {
+        return ring.liveFramePayloadLength(fsn);
+    }
+
+    /**
+     * Copies one currently live frame payload into caller-owned native memory.
+     * The copy runs under the ring monitor, so trim cannot hide or unmap the
+     * segment midway through it and the I/O cursor's single pin is untouched.
+     */
+    public boolean copyLiveFrame(long fsn, long dstAddr, int dstCapacity) {
+        return ring.copyLiveFrame(fsn, dstAddr, dstCapacity);
+    }
+
+    /**
      * I/O thread accessor: the current active mmap'd segment.
      */
     public MmapSegment activeSegment() {

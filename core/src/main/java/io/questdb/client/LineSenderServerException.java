@@ -65,6 +65,7 @@ public class LineSenderServerException extends LineSenderException {
         if (status != SenderError.NO_STATUS_BYTE) {
             sb.append(" (status=0x").append(Integer.toHexString(status & 0xFF)).append(')');
         }
+        sb.append(" rejectedFsn=").append(e.getRejectedFsn());
         sb.append(" fsn=[").append(e.getFromFsn()).append(',').append(e.getToFsn()).append(']');
         if (e.getTableName() != null) {
             sb.append(" table=").append(e.getTableName());

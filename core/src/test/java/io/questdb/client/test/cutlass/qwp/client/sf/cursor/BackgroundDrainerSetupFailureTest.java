@@ -24,12 +24,16 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.RejectedMiniSlotArchive;
+import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.std.Files;
+import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.tools.TestUtils;
@@ -40,6 +44,7 @@ import org.junit.Test;
 
 import java.nio.file.Paths;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class BackgroundDrainerSetupFailureTest {
 
@@ -56,6 +61,82 @@ public class BackgroundDrainerSetupFailureTest {
     @After
     public void tearDown() {
         removeRecursive(slotPath);
+    }
+
+    @Test
+    public void testPreservedOrphanReportsBeforeRetirementWithoutConnecting() throws Exception {
+        assertOrphanRetiresOffline(true);
+    }
+
+    @Test
+    public void testUnreportedOrphanRetiresWithoutConnectingWhenPreservationEnabled() throws Exception {
+        assertOrphanRetiresOffline(false);
+    }
+
+    private void assertOrphanRetiresOffline(boolean archive) throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String archivedPath = null;
+            try (CursorSendEngine original = new CursorSendEngine(slotPath, SEGMENT_BYTES)) {
+                long frame = Unsafe.malloc(QwpConstants.HEADER_SIZE, MemoryTag.NATIVE_DEFAULT);
+                try {
+                    Unsafe.getUnsafe().setMemory(frame, QwpConstants.HEADER_SIZE, (byte) 0);
+                    Unsafe.getUnsafe().putInt(frame, QwpConstants.MAGIC_MESSAGE);
+                    Unsafe.getUnsafe().putByte(frame + QwpConstants.HEADER_OFFSET_FLAGS,
+                            QwpConstants.FLAG_DEFER_COMMIT);
+                    original.appendBlocking(frame, QwpConstants.HEADER_SIZE);
+                } finally {
+                    Unsafe.free(frame, QwpConstants.HEADER_SIZE, MemoryTag.NATIVE_DEFAULT);
+                }
+                if (archive) {
+                    SenderError error = new SenderError(
+                            SenderError.Category.SCHEMA_MISMATCH,
+                            SenderError.Policy.REJECT_AND_CONTINUE, 3, "bad schema", 0, 0, 0, null, 1);
+                    archivedPath = new RejectedMiniSlotArchive(FilesFacade.INSTANCE, slotPath).preserve(original, error, null, 0).path;
+                }
+            }
+            AtomicReference<SenderError> report = new AtomicReference<>();
+            AtomicReference<Thread> callbackThread = new AtomicReference<>();
+            BackgroundDrainer drainer = new BackgroundDrainer(slotPath, SEGMENT_BYTES, Long.MAX_VALUE,
+                    () -> { throw new AssertionError("orphan-only retirement must not connect"); },
+                    5_000L, 1L, 10L, true, 200L);
+            drainer.configureSchemaMismatch(SenderError.Policy.REJECT_AND_CONTINUE, true, null,
+                    e -> { report.set(e); callbackThread.set(Thread.currentThread()); });
+            drainer.run();
+            Assert.assertEquals(BackgroundDrainer.DrainOutcome.SUCCESS, drainer.outcome());
+            Assert.assertFalse(OrphanScanner.isCandidateOrphan(slotPath));
+            if (archive) {
+                SenderError recovered = report.get();
+                Assert.assertNotNull(recovered);
+                Assert.assertEquals(0, recovered.getFromFsn());
+                Assert.assertEquals(0, recovered.getToFsn());
+                Assert.assertEquals(archivedPath, recovered.getRejectedPath());
+                Assert.assertNotEquals(Thread.currentThread(), callbackThread.get());
+                Assert.assertTrue(java.nio.file.Files.isDirectory(Paths.get(archivedPath)));
+            } else {
+                Assert.assertNull(report.get());
+            }
+        });
+    }
+
+    @Test
+    public void testPreservationDestinationFailureDoesNotQuarantine() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            seedUnackedFrame();
+            String blocked = slotPath + "/blocked-destination";
+            java.nio.file.Files.createFile(Paths.get(blocked));
+            BackgroundDrainer drainer = new BackgroundDrainer(slotPath, SEGMENT_BYTES,
+                    Long.MAX_VALUE, () -> { throw new AssertionError("must fail before connect"); },
+                    5_000L, 1L, 10L, true, 200L);
+            drainer.configureSchemaMismatch(SenderError.Policy.REJECT_AND_CONTINUE,
+                    true, blocked, null);
+            drainer.run();
+            Assert.assertEquals(BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
+            Assert.assertFalse(Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+            Assert.assertTrue("storage outage must leave source recoverable", OrphanScanner.isCandidateOrphan(slotPath));
+            try (CursorSendEngine ignored = new CursorSendEngine(slotPath, SEGMENT_BYTES)) {
+                Assert.assertTrue(ignored.publishedFsn() >= 0);
+            }
+        });
     }
 
     @Test
@@ -243,7 +324,7 @@ public class BackgroundDrainerSetupFailureTest {
             // client's reseal-after-recovery did.
             int fd = Files.openRW(p0Path);
             Assert.assertTrue("openRW must succeed", fd >= 0);
-            long junk = Unsafe.malloc(12, MemoryTag.NATIVE_DEFAULT);
+            long junk = Unsafe.malloc(QwpConstants.HEADER_SIZE, MemoryTag.NATIVE_DEFAULT);
             try {
                 for (int i = 0; i < 3; i++) {
                     Unsafe.getUnsafe().putInt(junk + i * 4L, 0xCAFEBABE);

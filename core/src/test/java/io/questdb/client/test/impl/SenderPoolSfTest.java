@@ -2615,8 +2615,8 @@ public class SenderPoolSfTest {
     @Test
     public void testConcurrentFirstBorrowsWithMinZeroRaceOnSfDir() throws Exception {
         // C2 regression: senderPoolMin(0) means no single-threaded pre-warm,
-        // so the shared parent sf_dir is NOT created at construction (the
-        // constructor probe only parses the config). The first concurrent
+        // so no slot is created at construction. Remove the empty directory
+        // left by the eager DLQ destination probe to exercise concurrent
         // borrows then race into build() -> Files.mkdir(sfDir) outside the
         // pool lock. Pre-fix, the mkdir loser got a non-zero rc (EEXIST) and
         // its borrow() threw "could not create sf_dir" on a perfectly healthy
@@ -2629,9 +2629,10 @@ public class SenderPoolSfTest {
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
                 String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
-                // minSize=0 -> no pre-warm -> sf_dir absent until first borrow.
+                // minSize=0 -> no slots; the destination probe creates only the root.
                 try (SenderPool pool = new SenderPool(config, 0, 4, 10_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
-                    Assert.assertFalse("sf_dir must not exist before the first borrow",
+                    java.nio.file.Files.delete(java.nio.file.Paths.get(sfDir));
+                    Assert.assertFalse("test must restore the first-directory creation race",
                             Files.exists(sfDir));
 
                     final int threads = 4;

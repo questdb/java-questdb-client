@@ -141,8 +141,63 @@ try (Sender sender = db.borrowSender()) {
 You can also let the client flush batches for you with the `auto_flush_rows` / `auto_flush_interval` config keys, e.g.
 `ws::addr=localhost:9000;auto_flush_rows=10000;auto_flush_interval=1000;`.
 
-**Confirm a batch is durably received.** Over QWP each flush returns a frame sequence number (FSN); `awaitAckedFsn`
-blocks until the server has acknowledged it. With `sf_dir`, rows in the store-and-forward log replay after reconnect
+**Schema errors and preserved copies.** With QuestDB 10.0.0 or later, QWP schema mismatches use
+`SenderError.Policy.REJECT_AND_CONTINUE`: the owning borrowed sender fails, but
+returning it and borrowing again lets the slot continue. Close and rebuild a
+standalone sender after its error. Preservation runs on the I/O thread. Slow
+disk I/O can delay close; if its
+shutdown budget expires, cleanup retains the slot lock until that thread exits,
+so rebuilding immediately may require a retry.
+Other error categories keep their existing policies. Select `.schemaMismatchPolicy(SenderError.Policy.TERMINAL)` on either
+builder to retain the old preserve-and-halt behavior.
+
+With `sf_dir`, rejected frames are copied to `<sf_dir>/<slot>/rejected/` before
+retirement. A split flush can also retire valid deferred frames preceding the
+bad frame; these are included in the copy. After restart, transaction mode is
+unknown, so retirement conservatively includes the whole recovered commit group.
+The asynchronous `errorHandler`
+receives `error.getRejectedPath()` only after the directory is complete. The
+producer exception carries the trigger FSN and affected range, but its path may
+be null while copying is pending. Notifications are retained in a separate
+256-entry queue per slot; a full queue pauses that slot's retirement. Crashes
+and shutdown can still lose queued notifications.
+
+Use `.dlqDirectory(path)` for a different base directory or a memory-only
+sender; copies go under `path/<slot>/rejected/`. Memory-only senders without an
+explicit destination retire without a preserved copy. `.dlqEnabled(false)` disables
+preservation and accepts permanent loss of retired rows. These are builder
+options. A configured destination is checked at build time; later storage
+failures pause retirement and retry the copy while keeping the source frames.
+A second schema rejection while an earlier range is pending, or an invalid
+retirement range/dictionary, logs an error and falls back to `TERMINAL`.
+Preserved payloads use the binary store-and-forward format; `rejection.properties`
+contains human-readable error metadata. A source queue namespace, the source
+segment's persisted generation token, and the exact FSN range determine the archive
+directory. A retry or restart for that same live range removes its exact crashed
+staging directory and reuses a structurally valid completed copy.
+
+Startup does not scan archive directories. If recovery finds an orphan tail, it
+checks only that range's deterministic archive path. A completed copy whose
+metadata, segment, manifest, watermark, and optional dictionary validate produces
+an asynchronous `SenderError` before the tail retires. A missing or damaged copy
+is ignored so archive output cannot block live-queue recovery. Unrelated and
+legacy `.tmp-*` directories are left untouched. A crash before publication or
+after retirement but before callback delivery can still lose the notification.
+Copy an archive to a separate working directory before replaying it, because
+normal queue cleanup removes drained data. Replay after fixing the schema can
+duplicate rows that the server committed before the error.
+
+Completed copies are never automatically deleted and can contain a full symbol dictionary
+each. Quarantining a damaged live slot also moves its archives; use the `DATA_LOSS`
+event's quarantine path to locate copies whose reported paths have moved.
+Monitor `getDlqBytesWritten()`, `getDlqFilesWritten()` and free disk space
+(the counters are available on `QwpWebSocketSender`). TLS does not encrypt these
+files at rest. With preservation disabled, a persistent schema problem can
+retire data indefinitely; keep your source data and monitor the error handler.
+
+**Wait for queue progress.** Over QWP each flush returns a frame sequence number (FSN); `awaitAckedFsn`
+blocks until that sequence is resolved. Resolution includes server acknowledgements and locally retired rejected
+frames, so observe the error handler as well; a successful wait alone does not prove every row was ingested. With `sf_dir`, rows in the store-and-forward log replay after reconnect
 or a producer-process restart. For periodic host-power-loss checkpoints, also configure
 `sf_durability=periodic;sf_sync_interval_millis=5000;`.
 
@@ -152,8 +207,8 @@ try (Sender sender = db.borrowSender()) {
         sender.table("trades").symbol("symbol", t.symbol).doubleColumn("price", t.price).atNow();
     }
     long fsn = sender.flushAndGetSequence();          // publish the batch, get its sequence number
-    if (sender.awaitAckedFsn(fsn, 30_000)) {          // block up to 30s for the server ack
-        // batch acknowledged by the server
+    if (sender.awaitAckedFsn(fsn, 30_000)) {          // block up to 30s for resolved progress
+        // queue resolved through fsn; check rejection notifications for ingestion errors
     } else {
         // not yet acked within the timeout; it stays buffered and replays on reconnect
     }

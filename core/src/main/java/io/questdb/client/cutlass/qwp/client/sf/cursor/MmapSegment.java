@@ -24,6 +24,7 @@
 
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.std.Crc32c;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.FilesFacade;
@@ -35,7 +36,9 @@ import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.security.SecureRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * One mmap-backed SF segment file. The user thread (the single producer)
@@ -48,7 +51,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * On-disk layout — header and frame format:
  * <pre>
  *   [u32 magic 'SF01'] [u8 ver=1] [u8 flags]   [u16 reserved=0]
- *   [u64 baseSeq]      [u64 createdMicros]                        24-byte header
+ *   [u64 baseSeq]      [u64 generationToken]                     24-byte header
  *   frame, frame, ...                                              each frame:
  *                                                                  [u32 crc32c]
  *                                                                  [u32 payloadLen]
@@ -75,6 +78,11 @@ public final class MmapSegment implements QuietCloseable {
     // soft downgrade (see syncPublished) and must not spam the log once per
     // barrier when RLIMIT_MEMLOCK or the platform says no.
     private static final AtomicBoolean MLOCK_REFUSAL_WARNED = new AtomicBoolean();
+    // Consecutive values cannot repeat within one JVM before 64-bit wrap. A
+    // cryptographically random starting point makes a collision with a token
+    // persisted by another process a 1-in-2^64 event for any fixed token.
+    private static final AtomicLong NEXT_GENERATION_TOKEN =
+            new AtomicLong(new SecureRandom().nextLong());
     private static final int RECOVERY_BUFFER_SIZE = 64 * 1024;
 
     private final FilesFacade filesFacade;
@@ -106,6 +114,12 @@ public final class MmapSegment implements QuietCloseable {
     // ring monitor. volatile is the cheapest correct fix.
     private volatile long frameCount;
     private long mmapAddress;
+    // Cold live-frame lookups normally walk forward by FSN (archive/rejection
+    // scans). Remember one validated frame so each lookup does not rescan the
+    // immutable published prefix from HEADER_SIZE. These fields are accessed
+    // under SegmentRing's monitor; the producer never touches them.
+    private long liveLookupIndex;
+    private long liveLookupOffset = HEADER_SIZE;
     // publishedCursor: written by producer, read by consumer (I/O thread). Volatile
     // because the consumer must see writes in publication order — once the
     // producer bumps publishedCursor, every byte before it is fully written.
@@ -241,7 +255,7 @@ public final class MmapSegment implements QuietCloseable {
             Unsafe.getUnsafe().putByte(addr + 5, manifestRequired ? MANIFEST_REQUIRED_FLAG : (byte) 0); // flags
             Unsafe.getUnsafe().putShort(addr + 6, (short) 0); // reserved
             Unsafe.getUnsafe().putLong(addr + 8, baseSeq);
-            Unsafe.getUnsafe().putLong(addr + 16, Os.currentTimeMicros());
+            Unsafe.getUnsafe().putLong(addr + 16, nextGenerationToken());
             return new MmapSegment(ff, displayPath, fd, addr, sizeBytes, baseSeq,
                     HEADER_SIZE, 0, false, 0L);
         } catch (Throwable t) {
@@ -279,7 +293,7 @@ public final class MmapSegment implements QuietCloseable {
             Unsafe.getUnsafe().putByte(addr + 5, (byte) 0);
             Unsafe.getUnsafe().putShort(addr + 6, (short) 0);
             Unsafe.getUnsafe().putLong(addr + 8, baseSeq);
-            Unsafe.getUnsafe().putLong(addr + 16, Os.currentTimeMicros());
+            Unsafe.getUnsafe().putLong(addr + 16, nextGenerationToken());
             return new MmapSegment(null, null, -1, addr, sizeBytes, baseSeq,
                     HEADER_SIZE, 0, true, 0L);
         } catch (Throwable t) {
@@ -750,6 +764,81 @@ public final class MmapSegment implements QuietCloseable {
      */
     public long frameCount() {
         return frameCount;
+    }
+
+    /** Immutable, opaque segment generation token stored in the segment header. */
+    public long generationToken() {
+        return Unsafe.getUnsafe().getLong(mmapAddress + 16);
+    }
+
+    private static long nextGenerationToken() {
+        return NEXT_GENERATION_TOKEN.getAndIncrement();
+    }
+
+    int liveFramePayloadLength(long fsn) {
+        long offset = liveFrameOffset(fsn);
+        return offset < 0 ? -1 : Unsafe.getUnsafe().getInt(mmapAddress + offset + 4);
+    }
+
+    boolean copyLiveFrame(long fsn, long dstAddr, int dstCapacity) {
+        long offset = liveFrameOffset(fsn);
+        if (offset < 0) {
+            return false;
+        }
+        int payloadLen = Unsafe.getUnsafe().getInt(mmapAddress + offset + 4);
+        if (payloadLen > dstCapacity) {
+            throw new IllegalArgumentException("destination is too small [required="
+                    + payloadLen + ", capacity=" + dstCapacity + ']');
+        }
+        if (payloadLen > 0) {
+            Unsafe.getUnsafe().copyMemory(mmapAddress + offset + FRAME_HEADER_SIZE, dstAddr, payloadLen);
+        }
+        return true;
+    }
+
+    int liveQwpFrameFlags(long fsn) {
+        long offset = liveFrameOffset(fsn);
+        if (offset < 0) {
+            return -1;
+        }
+        int payloadLen = Unsafe.getUnsafe().getInt(mmapAddress + offset + 4);
+        long payload = mmapAddress + offset + FRAME_HEADER_SIZE;
+        if (payloadLen < QwpConstants.HEADER_SIZE
+                || Unsafe.getUnsafe().getInt(payload) != QwpConstants.MAGIC_MESSAGE) {
+            return -1;
+        }
+        return Unsafe.getUnsafe().getByte(payload + QwpConstants.HEADER_OFFSET_FLAGS) & 0xff;
+    }
+
+    private long liveFrameOffset(long fsn) {
+        long index = fsn - baseSeq;
+        long frames = frameCount;
+        if (index < 0 || index >= frames) {
+            return -1L;
+        }
+        long published = publishedCursor;
+        long i = 0;
+        long offset = HEADER_SIZE;
+        if (index >= liveLookupIndex) {
+            i = liveLookupIndex;
+            offset = liveLookupOffset;
+        }
+        for (; i <= index; i++) {
+            if (offset + FRAME_HEADER_SIZE > published) {
+                return -1L;
+            }
+            int payloadLen = Unsafe.getUnsafe().getInt(mmapAddress + offset + 4);
+            if (payloadLen < 0 || payloadLen > published - offset - FRAME_HEADER_SIZE) {
+                return -1L;
+            }
+            if (i == index) {
+                liveLookupIndex = i;
+                liveLookupOffset = offset;
+                return offset;
+            }
+            offset += FRAME_HEADER_SIZE + payloadLen;
+        }
+        return -1L;
     }
 
     /**
