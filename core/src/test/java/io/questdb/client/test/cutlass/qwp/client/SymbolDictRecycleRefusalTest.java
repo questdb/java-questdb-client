@@ -86,8 +86,10 @@ public class SymbolDictRecycleRefusalTest {
                         + ";symbol_dict_reset_threshold=2"
                         + ";symbol_dict_reset_max_wait_millis=0;";
 
-                try (Sender sender = Sender.fromConfig(cfg)) {
+                // ackGate closes before sender, so an early failure still lets close() drain
+                try (Sender sender = Sender.fromConfig(cfg); AutoCloseable ackGate = handler::releaseAcks) {
                     QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    awaitHandshakes(server, 1);
 
                     sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
                     sender.table("t").symbol("s", "b").longColumn("v", 1L).atNow();
@@ -150,8 +152,9 @@ public class SymbolDictRecycleRefusalTest {
                         + ";symbol_dict_reset_max_wait_millis=0"
                         + ";auto_flush_rows=10;";
 
-                try (Sender sender = Sender.fromConfig(cfg)) {
+                try (Sender sender = Sender.fromConfig(cfg); AutoCloseable ackGate = handler::releaseAcks) {
                     QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    awaitHandshakes(server, 1);
 
                     sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
                     sender.table("t").symbol("s", "b").longColumn("v", 1L).atNow();
@@ -228,6 +231,7 @@ public class SymbolDictRecycleRefusalTest {
 
                 try (Sender sender = Sender.fromConfig(cfg)) {
                     QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    awaitHandshakes(server, 1);
 
                     // Start a row but do not commit it: symbol() registers "a"
                     // into the dictionary immediately, yet the row itself stays
@@ -316,6 +320,7 @@ public class SymbolDictRecycleRefusalTest {
 
                 try (Sender sender = Sender.fromConfig(cfg)) {
                     QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    awaitHandshakes(server, 1);
                     ws.setDeferCommit(true);
 
                     sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
@@ -404,6 +409,7 @@ public class SymbolDictRecycleRefusalTest {
                     // (ensureConnected() only runs later, inside atNow()'s
                     // sendRow()) -- must defer quietly, not NPE.
                     sender.table("t").longColumn("v", 1L).atNow();
+                    awaitHandshakes(server, 1);
                     Assert.assertTrue("still armed -- deferred, not consumed",
                             sender.isResetArmed());
                     Assert.assertEquals(0, sender.getSymbolDictEpoch());
@@ -515,6 +521,24 @@ public class SymbolDictRecycleRefusalTest {
                 }
             }
         });
+    }
+
+    /**
+     * Polls (5s deadline) until the server has completed at least
+     * {@code expected} handshakes, then asserts exactly that many. The server
+     * counts a handshake on its own thread AFTER writing the 101, while the
+     * client returns from the upgrade as soon as it has READ it, so a bare
+     * {@code handshakeCount()} check right after a connect, or after a flush
+     * whose ack is deliberately withheld, can observe the count one step
+     * behind. Once an ack has been awaited the count is settled: the ack is
+     * sent from that same server thread, after the increment.
+     */
+    private static void awaitHandshakes(TestWebSocketServer server, int expected) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 5_000;
+        while (System.currentTimeMillis() < deadline && server.handshakeCount() < expected) {
+            Thread.sleep(10);
+        }
+        Assert.assertEquals(expected, server.handshakeCount());
     }
 
     /**
