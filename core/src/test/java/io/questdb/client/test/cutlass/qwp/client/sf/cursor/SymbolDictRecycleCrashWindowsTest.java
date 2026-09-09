@@ -28,6 +28,7 @@ import io.questdb.client.Sender;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
 import io.questdb.client.std.Files;
 import io.questdb.client.test.cutlass.qwp.client.QwpWireTestUtils;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
@@ -180,6 +181,9 @@ public class SymbolDictRecycleCrashWindowsTest {
     private static final List<String> FRESH_REBUILD_FILES = Arrays.asList(
             ".ack-watermark", ".lock", ".lock.pid", ".symbol-dict",
             "sf-0000000000000000.sfa", "sf-initial.sfa", "sf-manifest.bin");
+
+    /** The reusable lock pair: never removed by any close() in this suite, and {@code .lock} is range-locked on Windows while a sender holds the slot. */
+    private static final List<String> LOCK_FILES = Arrays.asList(".lock", ".lock.pid");
 
     @Rule
     public final TemporaryFolder temporaryFolder = TemporaryFolder.builder().assureDeletion().build();
@@ -354,12 +358,13 @@ public class SymbolDictRecycleCrashWindowsTest {
                     Assert.assertEquals(1, ws.getSymbolDictEpoch());
 
                     // The manager worker provisions the fresh engine's hot-spare
-                    // segment asynchronously (its own service pass, off the
-                    // producer thread), so the slot is not guaranteed to have
-                    // settled to its steady rebuilt-engine file set the instant
-                    // table() returns. Wait for it before snapshotting -- a
-                    // mid-provision snapshot could capture a zero-magic spare
-                    // that recovery would then hard-fail on.
+                    // segment asynchronously and links its file under the final
+                    // name BEFORE sizing or stamping it, so a name-level wait can
+                    // still snapshot an empty or zero-magic spare that recovery
+                    // hard-fails on. Wait for the ring to report the spare
+                    // installed (only after create + header sync), then pin the
+                    // resulting file set.
+                    awaitHotSpareInstalled(ws.getCursorEngineForTesting());
                     awaitExactFileSet(slot, FRESH_REBUILD_FILES);
 
                     // The true pre-first-flush crash image, frozen before the
@@ -605,10 +610,35 @@ public class SymbolDictRecycleCrashWindowsTest {
                 expected, listDir(dir));
     }
 
-    /** Copies every file directly inside {@code dir} (by name -> bytes) for later {@link #restoreDir}. */
+    /**
+     * Polls (5s deadline) until the engine's ring reports an installed hot
+     * spare. The segment manager links the spare's file under its final name
+     * before pre-allocating and stamping it, so a directory listing settles
+     * before the file is readable; {@code installHotSpare} runs only after
+     * create + header sync, which is the barrier a byte-level snapshot needs.
+     */
+    private static void awaitHotSpareInstalled(CursorSendEngine engine) throws InterruptedException {
+        SegmentRing ring = engine.getRingForTesting();
+        long deadline = System.currentTimeMillis() + 5_000;
+        while (System.currentTimeMillis() < deadline && ring.getHotSpareForTesting() == null) {
+            Thread.sleep(20);
+        }
+        Assert.assertNotNull("the manager worker must install the rebuilt engine's hot spare "
+                + "before the slot can be snapshotted", ring.getHotSpareForTesting());
+    }
+
+    /**
+     * Copies every file directly inside {@code dir} (by name -> bytes) for later
+     * {@link #restoreDir}, except {@link #LOCK_FILES}: no close in this suite
+     * removes them, so they need no restoring, and on Windows {@code .lock} is
+     * under a mandatory range lock while the sender is open, so reading it fails.
+     */
     private static Map<String, byte[]> snapshotDir(String dir) throws IOException {
         Map<String, byte[]> snapshot = new LinkedHashMap<>();
         for (String name : listDir(dir)) {
+            if (LOCK_FILES.contains(name)) {
+                continue;
+            }
             snapshot.put(name, java.nio.file.Files.readAllBytes(Paths.get(dir, name)));
         }
         return snapshot;
