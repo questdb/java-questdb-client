@@ -112,6 +112,7 @@ public class SymbolDictRecycleHealingTest {
                             + acksBeforeRecycle + " after=" + ws.getTotalAcks(),
                             ws.getTotalAcks() > acksBeforeRecycle);
                     long framesSentAfterFirstRecycle = ws.getTotalFramesSent();
+                    long acksAfterFirstRecycle = ws.getTotalAcks();
                     // The anti-thrash floor (resetFloorSymbols = 2x the first swap's
                     // dictSizeAtSwap = 4) keeps c,d (2 symbols, == threshold but < floor)
                     // from re-arming on their own; a manual request bypasses the floor by
@@ -131,6 +132,9 @@ public class SymbolDictRecycleHealingTest {
                     Assert.assertTrue("frames sent must carry across the second recycle too: after first="
                             + framesSentAfterFirstRecycle + " now=" + ws.getTotalFramesSent(),
                             ws.getTotalFramesSent() > framesSentAfterFirstRecycle);
+                    Assert.assertTrue("acks must carry across the second recycle too: after first="
+                            + acksAfterFirstRecycle + " now=" + ws.getTotalAcks(),
+                            ws.getTotalAcks() > acksAfterFirstRecycle);
                     // A recycle's own reconnect runs on the I/O loop's ASYNC path, whose
                     // first attempt counts as a reconnect attempt and, on success, a
                     // reconnect -- two recycles, so at least two of each.

@@ -5888,7 +5888,7 @@ public class QwpWebSocketSender implements Sender {
             } else {
                 // Full-dict mode has no cross-batch dictionary state to
                 // preserve, and an unknown server cap cannot size chunks:
-                // same drop as before.
+                // drop the baseline; the next flush re-registers from 0.
                 sentMaxSymbolId = -1;
             }
             return;

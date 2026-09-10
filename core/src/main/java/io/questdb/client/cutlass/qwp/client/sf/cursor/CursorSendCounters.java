@@ -38,10 +38,10 @@ import java.util.concurrent.atomic.AtomicLong;
  * background drainers) starts on a fresh instance of its own, so its getters
  * behave exactly as they did when the counters were per-instance fields.
  * <p>
- * Each field is written by exactly one thread -- the loop's I/O thread for the
- * six loop counters, the producer thread for {@link #backpressureStalls} -- and
- * read by any monitor thread; {@link AtomicLong} makes every read a single
- * atomic load, so a value sampled across a recycle is never a torn sum.
+ * Every field is incremented atomically from whichever I/O thread (or the
+ * caller thread inside a synchronous {@code start()}) is active, and read by
+ * any monitor thread; each read is one atomic load, so a value sampled across
+ * a recycle is never a torn sum.
  */
 public final class CursorSendCounters {
     /** ACK frames received and applied; {@code CursorWebSocketSendLoop#getTotalAcks()}. */

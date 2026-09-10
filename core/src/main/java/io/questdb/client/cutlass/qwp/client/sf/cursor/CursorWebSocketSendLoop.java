@@ -1579,6 +1579,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         if (ioThread != null) {
             throw new IllegalStateException("adoptCounters must run before start()");
         }
+        if (shared == counters) {
+            return;
+        }
         shared.addAll(counters);
         counters = shared;
     }

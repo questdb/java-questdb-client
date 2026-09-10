@@ -997,6 +997,83 @@ public class SymbolDictRecycleTest {
         });
     }
 
+    /**
+     * The memory-mode half of the coverage invariant {@link
+     * #testResumePartialPublishClampsWatermarkToCoverage()}'s javadoc argues but
+     * cannot exercise on an SF slot: with no persisted dictionary,
+     * {@code QwpWebSocketSender.reclaimUnsentSymbolIds}' floor IS the watermark
+     * itself (no {@code pd.size()} to raise it), so a watermark left BELOW the
+     * ringed coverage would let {@code reset()} reclaim an id a chunk already on
+     * the ring defines, and a later row could rebind it to a different string.
+     * Drives {@code reset()} after the same faulted resume and asserts only the
+     * two ringed symbols survive -- the assertion the SF twin cannot make, since
+     * the persisted dictionary's size pins its reclaim floor at 3 whatever the
+     * watermark reads.
+     */
+    @Test(timeout = 60_000L)
+    public void testResumePartialPublishInMemoryModeKeepsReclaimFloorAtCoverage() throws Exception {
+        assertMemoryLeak(() -> {
+            ChunkCaptureHandler handler = new ChunkCaptureHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.setAdvertisedMaxBatchSize(2048);
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + server.getPort() + ";";
+                try (Sender sender = Sender.fromConfig(cfg)) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    Assert.assertTrue("memory mode is always delta", ws.isDeltaDictEnabledForTest());
+                    String[] longSymbols = {longSymbol('a'), longSymbol('b'), longSymbol('c')};
+                    for (int i = 0; i < longSymbols.length; i++) {
+                        sender.table("t").symbol("s", longSymbols[i]).longColumn("v", i).atNow();
+                        sender.flush();
+                        Assert.assertTrue("setup: flush " + i + " must drain", sender.drain(5_000));
+                    }
+                    Assert.assertEquals("setup: baseline covers the three long symbols",
+                            2, ws.getSentMaxSymbolIdForTesting());
+
+                    ws.forceCloseLoopAbandonForTesting();
+                    AtomicInteger chunkCalls = new AtomicInteger();
+                    ws.setChunkPublishFaultForTesting(() -> {
+                        if (chunkCalls.incrementAndGet() == 3) {
+                            throw new RuntimeException("injected mid-publish chunk fault");
+                        }
+                    });
+                    try {
+                        // The resume degrades inside this call; it must NOT throw. The
+                        // staged "d" row itself is never flushed -- reset() below discards it.
+                        sender.table("t").symbol("s", "d").longColumn("v", 3L).atNow();
+                    } finally {
+                        ws.setChunkPublishFaultForTesting(null);
+                    }
+                    Assert.assertEquals("exactly three chunk publishes must have been attempted",
+                            3, chunkCalls.get());
+                    Assert.assertEquals("watermark must equal the ringed coverage (chunks [0..0], [1..1])",
+                            1, ws.getSentMaxSymbolIdForTesting());
+                    Assert.assertFalse("the orphaned chunks' deferred group must be closed",
+                            ws.hasDeferredMessagesForTesting());
+
+                    // The reclaim-floor half: abandon the staged row and reclaim
+                    // everything above the watermark. With no persisted dictionary to
+                    // raise the floor, only the two symbols the ring actually holds
+                    // (longA, longB) may survive.
+                    sender.reset();
+                    Assert.assertEquals("reclaim floor must sit at coverage + 1: ids at or below "
+                                    + "the watermark are on the ring",
+                            2, ws.getGlobalSymbolDictionaryForTest().size());
+
+                    sender.table("t").symbol("s", "e").longColumn("v", 4L).atNow();
+                    long fsn = sender.flushAndGetSequence();
+                    Assert.assertTrue("the post-reset batch must land on the fresh loop",
+                            sender.awaitAckedFsn(fsn, 10_000));
+                    Assert.assertEquals("chunks [0..1] replayed, then the data frame defines id 2 = e",
+                            Arrays.asList(longSymbols[0], longSymbols[1], "e"), handler.dict());
+                    Assert.assertEquals("the reclaimed id must restart the delta at coverage + 1",
+                            2, handler.firstDataFrameDeltaStart);
+                }
+            }
+        });
+    }
+
     private static String longSymbol(char c) {
         char[] chars = new char[1500];
         Arrays.fill(chars, c);

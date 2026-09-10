@@ -1944,11 +1944,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         /**
          * Number of distinct symbols the sender's dictionary may accumulate before
          * {@link #symbolDictReset(boolean)} triggers a recycle. Each recycle raises
-         * the effective bar to at least {@code max(threshold, 2 x dictionary size at the swap)}
-         * -- the bar never drops, a manual {@link Sender#resetSymbolDictionary()} swap included --
+         * the effective bar to {@code max(threshold, 2 x dictionary size at the swap)},
          * capped at half of {@link QwpConstants#MAX_SYMBOL_DICTIONARY_SIZE}, so a
          * bounded live set larger than the threshold recycles once and settles
-         * instead of recycling on every refill. Must be greater than
+         * instead of recycling on every refill. The bar never drops, a manual
+         * {@link Sender#resetSymbolDictionary()} swap included. Must be greater than
          * {@code 0} and no larger than half of {@link QwpConstants#MAX_SYMBOL_DICTIONARY_SIZE}
          * (the re-arm floor's own cap): arming happens at a flush tail and the swap at the
          * next drained {@code table(...)} call, so a threshold nearer the protocol cap would

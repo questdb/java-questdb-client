@@ -1632,13 +1632,28 @@ public final class CursorSendEngine implements QuietCloseable {
 
     /**
      * Replaces this engine's counters with the sender's shared, sender-lifetime
-     * instance, folding anything already counted into it. Producer thread
+     * instance, folding this engine's own backpressure-stall count into it
+     * (the other counters are the loop's, and an engine handed between
+     * senders must not carry a previous sender's totals). Producer thread
      * only, before the first {@link #appendBlocking} on this engine -- the
      * same attach window {@link #setSlotLockReleaseListener} uses.
      */
     public void adoptCounters(CursorSendCounters shared) {
-        shared.addAll(counters);
+        if (shared == counters) {
+            return;
+        }
+        shared.backpressureStalls.addAndGet(counters.backpressureStalls.get());
         counters = shared;
+    }
+
+    /**
+     * The engine's current counters holder -- the DEFAULT instance until
+     * {@link #adoptCounters} replaces it. Test-only seam to observe what
+     * {@link #adoptCounters} folds and what it leaves alone.
+     */
+    @TestOnly
+    public CursorSendCounters getCountersForTesting() {
+        return counters;
     }
 
     /**
