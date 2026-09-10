@@ -273,6 +273,25 @@ public class SymbolDictRecycleArmingTest {
 
                     sender.resetSymbolDictionary();
                     Assert.assertTrue("the advisory request bypasses the floor", ws.isResetArmed());
+
+                    // manual swap #3 runs inside this table() with dictSizeAtSwap == 4
+                    // (g,h,i,j): 2 x 4 == the current floor, so this step alone cannot
+                    // tell a lowered floor from a kept one -- it only proves the manual
+                    // swap runs and that the floor did not move.
+                    sender.table("t").symbol("s", "k").longColumn("v", 5L).atNow();
+                    Assert.assertEquals(3, ws.getSymbolDictEpoch());
+                    Assert.assertEquals("2 x 4 == floor 8: unchanged either way",
+                            8, ws.getResetFloorSymbolsForTesting());
+
+                    // epoch 3 holds one symbol (k). A manual swap here sets the floor to
+                    // 2 x 1 = 2 if the valve can lower it; the floor must stay at 8.
+                    Assert.assertTrue(sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+                    sender.resetSymbolDictionary();
+                    Assert.assertTrue("manual request arms below the floor", ws.isResetArmed());
+                    sender.table("t").symbol("s", "l").longColumn("v", 6L).atNow();
+                    Assert.assertEquals(4, ws.getSymbolDictEpoch());
+                    Assert.assertEquals("a manual swap at dictionary size 1 must not lower the floor",
+                            8, ws.getResetFloorSymbolsForTesting());
                 }
             }
         });

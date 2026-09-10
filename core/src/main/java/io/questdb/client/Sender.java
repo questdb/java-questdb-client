@@ -705,6 +705,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * is the only trigger point: a caller that never starts another row
      * never recycles. No-op on transports without a symbol dictionary.
      * <p>
+     * The request bypasses the anti-thrash re-arm floor for that one swap and
+     * does not lower it: the floor only ever rises, so a scheduled manual
+     * reset cannot re-open the automatic recycle's doubling ladder.
+     * <p>
      * Also a permanent no-op on a sender configured with
      * {@code symbol_dict_reset=off} ({@link LineSenderBuilder#symbolDictReset(boolean)}):
      * that knob gates the arming path this request feeds, so the request is
@@ -1940,7 +1944,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         /**
          * Number of distinct symbols the sender's dictionary may accumulate before
          * {@link #symbolDictReset(boolean)} triggers a recycle. Each recycle raises
-         * the effective bar to {@code max(threshold, 2 x dictionary size at the swap)},
+         * the effective bar to at least {@code max(threshold, 2 x dictionary size at the swap)}
+         * -- the bar never drops, a manual {@link Sender#resetSymbolDictionary()} swap included --
          * capped at half of {@link QwpConstants#MAX_SYMBOL_DICTIONARY_SIZE}, so a
          * bounded live set larger than the threshold recycles once and settles
          * instead of recycling on every refill. Must be greater than

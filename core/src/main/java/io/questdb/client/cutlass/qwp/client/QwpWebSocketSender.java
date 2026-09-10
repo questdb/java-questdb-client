@@ -485,7 +485,9 @@ public class QwpWebSocketSender implements Sender {
     // re-arming after at most ~log2(liveSet/threshold) swaps, while a
     // genuinely unbounded-cardinality producer keeps recycling: the floor is
     // capped at half the protocol cap so it can never double into the hard
-    // stop. Never lowered -- a shrunken working set simply stops arming.
+    // stop. Never lowered -- a shrunken working set simply stops arming, and a
+    // manual resetSymbolDictionary() swap bypasses the floor for its own swap
+    // without lowering it (max() at the commit).
     private int resetFloorSymbols;
     // Wall-clock time (System.nanoTime()) at which resetArmed last flipped
     // false -> true. Recorded by armIfEligible so maybeBlockForStarvedReset's
@@ -5425,9 +5427,13 @@ public class QwpWebSocketSender implements Sender {
         symbolDictEpoch++;
         resetArmed = false;
         manualResetRequested = false;
-        // Anti-thrash floor: see resetFloorSymbols.
-        resetFloorSymbols = Math.min(dictSizeAtSwap * 2,
-                QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE / 2);
+        // Anti-thrash floor: see resetFloorSymbols. max() keeps "never lowered"
+        // true for the manual valve too: resetSymbolDictionary() bypasses the
+        // size gate in armIfEligible, so its swap can run at a dictionary far
+        // below the floor, and 2 x that size would otherwise re-open the
+        // doubling ladder the floor exists to close.
+        resetFloorSymbols = Math.max(resetFloorSymbols, Math.min(dictSizeAtSwap * 2,
+                QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE / 2));
         // Deliberately re-derived (not carried over): the healing half
         // of the recycle contract -- a sender that degraded to full
         // frames heals back into delta mode once the underlying fault
