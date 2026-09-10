@@ -86,6 +86,11 @@ public class SymbolDictRecycleHealingTest {
                     sender.table("t").symbol("s", "b").longColumn("v", 1L).atNow();
                     long fsn1 = sender.flushAndGetSequence();
                     Assert.assertTrue(sender.awaitAckedFsn(fsn1, 5_000));
+                    long framesSentBeforeRecycle = ws.getTotalFramesSent();
+                    long acksBeforeRecycle = ws.getTotalAcks();
+                    Assert.assertTrue("setup: the first flush must have been sent and acked, got sent="
+                            + framesSentBeforeRecycle + " acks=" + acksBeforeRecycle,
+                            framesSentBeforeRecycle >= 1 && acksBeforeRecycle >= 1);
                     Assert.assertTrue("armed: 2 distinct symbols crossed threshold=2", ws.isResetArmed());
 
                     // Ring drained -> this table() call recycles synchronously: epoch 1.
@@ -97,6 +102,16 @@ public class SymbolDictRecycleHealingTest {
                     sender.table("t").symbol("s", "d").longColumn("v", 3L).atNow();
                     long fsn2 = sender.flushAndGetSequence();
                     Assert.assertTrue(sender.awaitAckedFsn(fsn2, 5_000));
+                    // Sender-lifetime, not per-loop: the rebuilt loop must keep counting
+                    // where the outgoing one stopped, so a monitor differencing these
+                    // never sees a negative delta across a recycle.
+                    Assert.assertTrue("frames sent must carry across the recycle: before="
+                            + framesSentBeforeRecycle + " after=" + ws.getTotalFramesSent(),
+                            ws.getTotalFramesSent() > framesSentBeforeRecycle);
+                    Assert.assertTrue("acks must carry across the recycle: before="
+                            + acksBeforeRecycle + " after=" + ws.getTotalAcks(),
+                            ws.getTotalAcks() > acksBeforeRecycle);
+                    long framesSentAfterFirstRecycle = ws.getTotalFramesSent();
                     // The anti-thrash floor (resetFloorSymbols = 2x the first swap's
                     // dictSizeAtSwap = 4) keeps c,d (2 symbols, == threshold but < floor)
                     // from re-arming on their own; a manual request bypasses the floor by
@@ -113,6 +128,16 @@ public class SymbolDictRecycleHealingTest {
 
                     long fsn3 = sender.flushAndGetSequence();
                     Assert.assertTrue(sender.awaitAckedFsn(fsn3, 5_000));
+                    Assert.assertTrue("frames sent must carry across the second recycle too: after first="
+                            + framesSentAfterFirstRecycle + " now=" + ws.getTotalFramesSent(),
+                            ws.getTotalFramesSent() > framesSentAfterFirstRecycle);
+                    // A recycle's own reconnect runs on the I/O loop's ASYNC path, whose
+                    // first attempt counts as a reconnect attempt and, on success, a
+                    // reconnect -- two recycles, so at least two of each.
+                    Assert.assertTrue("attempts=" + ws.getTotalReconnectAttempts(),
+                            ws.getTotalReconnectAttempts() >= 2);
+                    Assert.assertTrue("reconnects=" + ws.getTotalReconnectsSucceeded(),
+                            ws.getTotalReconnectsSucceeded() >= 2);
                 }
             }
         });

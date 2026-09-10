@@ -42,6 +42,7 @@ import io.questdb.client.cutlass.line.array.LongArray;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerListener;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerPool;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendCounters;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderConnectionListener;
@@ -289,12 +290,19 @@ public class QwpWebSocketSender implements Sender {
     private String currentTableName;
     // Cursor SF engine: the producer (user thread) writes encoded QWP frames
     // into the engine's mmap'd ring; the cursorSendLoop is the I/O thread
-    // that walks the ring and sends frames. Volatile since the recycle
-    // started reassigning it (non-null -> null -> non-null on the producer
-    // thread): the monitoring accessors (getAckedFsn, awaitAckedFsn) read it
-    // from a monitor thread, same reasoning as symbolDictEpoch.
+    // that walks the ring and sends frames. Both volatile since the recycle
+    // started reassigning them (non-null -> null -> non-null on the producer
+    // thread): the monitoring accessors (getAckedFsn, awaitAckedFsn, the
+    // error-check paths) read them from a monitor thread, same reasoning as
+    // symbolDictEpoch.
     private volatile CursorSendEngine cursorEngine;
-    private CursorWebSocketSendLoop cursorSendLoop;
+    private volatile CursorWebSocketSendLoop cursorSendLoop;
+    // Sender-lifetime observability counters (see CursorSendCounters). Every
+    // loop generation and every attached engine adopts this instance before
+    // use, so the getTotal* accessors survive a symbol-dictionary recycle
+    // with no arithmetic at the swap. Final: the reference never moves, and
+    // monitor threads read through the AtomicLongs.
+    private final CursorSendCounters counters = new CursorSendCounters();
     private boolean deferCommit;
     // Test seam: runs once when awaitDeferredEngineClose() actually begins
     // parking (positive witness that the await engaged rather than
@@ -2644,17 +2652,13 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Total binary frames whose ACKs have been received and applied, since
-     * the last symbol-dictionary recycle.
-     * <p>
-     * Reads the live cursor I/O loop, which a symbol-dictionary recycle
-     * rebuilds, so the count restarts at 0 on every recycle: a monitor
-     * differencing it across one sees a negative delta. Correlate with the
-     * lifetime-scoped {@link #getSymbolDictEpoch()}, which never resets.
+     * Total binary frames whose ACKs have been received and applied since this
+     * sender started. Sender-lifetime: carried across symbol-dictionary
+     * recycles (the rebuilt I/O loop adopts the same counters) and retained
+     * after {@link #close()}.
      */
     public long getTotalAcks() {
-        CursorWebSocketSendLoop l = cursorSendLoop;
-        return l == null ? 0L : l.getTotalAcks();
+        return counters.acks.get();
     }
 
     /**
@@ -2682,18 +2686,13 @@ public class QwpWebSocketSender implements Sender {
     /**
      * Cumulative number of times {@code appendBlocking} hit a full engine
      * ring and parked waiting for the segment manager or the wire to free
-     * space, since the last symbol-dictionary recycle. One increment per
-     * blocking call, not per spin. Returns 0 when the cursor engine has not
-     * been allocated yet.
-     * <p>
-     * Reads the live cursor engine, which a symbol-dictionary recycle
-     * rebuilds, so the count restarts at 0 on every recycle: a monitor
-     * differencing it across one sees a negative delta. Correlate with the
-     * lifetime-scoped {@link #getSymbolDictEpoch()}, which never resets.
+     * space, since this sender started. One increment per blocking call, not
+     * per spin. Sender-lifetime: carried across symbol-dictionary recycles
+     * (every attached engine adopts the same counters) and retained after
+     * {@link #close()}, where it used to read 0 once the engine was released.
      */
     public long getTotalBackpressureStalls() {
-        CursorSendEngine e = cursorEngine;
-        return e == null ? 0L : e.getTotalBackpressureStalls();
+        return counters.backpressureStalls.get();
     }
 
     /**
@@ -2718,76 +2717,55 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Count of frames re-sent during post-reconnect catch-up windows since the
-     * last symbol-dictionary recycle. Zero in steady state; a sustained nonzero
-     * rate signals flapping where every reconnect replays meaningful work.
-     * <p>
-     * Reads the live cursor I/O loop, which a symbol-dictionary recycle
-     * rebuilds, so the count restarts at 0 on every recycle: a monitor
-     * differencing it across one sees a negative delta. Correlate with the
-     * lifetime-scoped {@link #getSymbolDictEpoch()}, which never resets.
+     * Count of frames re-sent during post-reconnect catch-up windows since
+     * this sender started. Zero in steady state; a sustained nonzero rate
+     * signals flapping where every reconnect replays meaningful work.
+     * Sender-lifetime: carried across symbol-dictionary recycles and retained
+     * after {@link #close()}.
      */
     public long getTotalFramesReplayed() {
-        CursorWebSocketSendLoop l = cursorSendLoop;
-        return l == null ? 0L : l.getTotalFramesReplayed();
+        return counters.framesReplayed.get();
     }
 
     /**
-     * Binary frames the cursor I/O loop has issued to the wire since the last
-     * symbol-dictionary recycle.
-     * <p>
-     * Reads the live cursor I/O loop, which a symbol-dictionary recycle
-     * rebuilds, so the count restarts at 0 on every recycle: a monitor
-     * differencing it across one sees a negative delta. Correlate with the
-     * lifetime-scoped {@link #getSymbolDictEpoch()}, which never resets.
+     * Binary frames the cursor I/O loop has issued to the wire since this
+     * sender started, replays included. Sender-lifetime: carried across
+     * symbol-dictionary recycles and retained after {@link #close()}.
      */
     public long getTotalFramesSent() {
-        CursorWebSocketSendLoop l = cursorSendLoop;
-        return l == null ? 0L : l.getTotalFramesSent();
+        return counters.framesSent.get();
     }
 
     /**
-     * Number of reconnect attempts the cursor I/O loop has issued since the
-     * last symbol-dictionary recycle -- succeeded plus failed. Diverges from
+     * Number of reconnect attempts the cursor I/O loop has issued since this
+     * sender started -- succeeded plus failed. Diverges from
      * {@link #getTotalReconnectsSucceeded} when the server is flapping.
-     * Returns 0 if no I/O loop is running.
-     * <p>
-     * Reads the live cursor I/O loop, which a symbol-dictionary recycle
-     * rebuilds, so the count restarts at 0 on every recycle: a monitor
-     * differencing it across one sees a negative delta. Correlate with the
-     * lifetime-scoped {@link #getSymbolDictEpoch()}, which never resets.
+     * Sender-lifetime: carried across symbol-dictionary recycles and retained
+     * after {@link #close()}. A recycle's own reconnect runs on the I/O loop's
+     * asynchronous connect path, whose first attempt counts here, so every
+     * completed recycle adds at least one even with no outage.
      */
     public long getTotalReconnectAttempts() {
-        CursorWebSocketSendLoop l = cursorSendLoop;
-        return l == null ? 0L : l.getTotalReconnectAttempts();
+        return counters.reconnectAttempts.get();
     }
 
     /**
-     * Number of successful reconnects since the last symbol-dictionary
-     * recycle. Returns 0 if no I/O loop is running.
-     * <p>
-     * Reads the live cursor I/O loop, which a symbol-dictionary recycle
-     * rebuilds, so the count restarts at 0 on every recycle: a monitor
-     * differencing it across one sees a negative delta. Correlate with the
-     * lifetime-scoped {@link #getSymbolDictEpoch()}, which never resets.
+     * Number of successful reconnects since this sender started.
+     * Sender-lifetime: carried across symbol-dictionary recycles and retained
+     * after {@link #close()}. A recycle's own reconnect counts as one, so every
+     * completed recycle adds at least one even with no outage.
      */
     public long getTotalReconnectsSucceeded() {
-        CursorWebSocketSendLoop l = cursorSendLoop;
-        return l == null ? 0L : l.getTotalReconnects();
+        return counters.reconnects.get();
     }
 
     /**
-     * Errors the I/O loop has observed since the last symbol-dictionary
-     * recycle (retriable and terminal combined).
-     * <p>
-     * Reads the live cursor I/O loop, which a symbol-dictionary recycle
-     * rebuilds, so the count restarts at 0 on every recycle: a monitor
-     * differencing it across one sees a negative delta. Correlate with the
-     * lifetime-scoped {@link #getSymbolDictEpoch()}, which never resets.
+     * Errors the I/O loop has observed since this sender started (retriable
+     * and terminal combined). Sender-lifetime: carried across symbol-dictionary
+     * recycles and retained after {@link #close()}.
      */
     public long getTotalServerErrors() {
-        CursorWebSocketSendLoop l = cursorSendLoop;
-        return l == null ? 0L : l.getTotalServerErrors();
+        return counters.serverErrors.get();
     }
 
     /**
@@ -3204,10 +3182,18 @@ public class QwpWebSocketSender implements Sender {
             seedGlobalDictionaryFromPersisted(engine.getPersistedSymbolDict());
         }
         if (engine != null) {
+            engine.adoptCounters(counters);
             engine.setSlotLockReleaseListener(this::onSlotLockReleased);
         }
     }
 
+    /**
+     * Injects a loop for tests. Deliberately does NOT adopt the sender's
+     * counters: callers start the loop before injecting it, which
+     * {@link CursorWebSocketSendLoop#adoptCounters} refuses, and none of them
+     * reads a {@code getTotal*} accessor -- the sender-side counters simply
+     * never see this loop's counts.
+     */
     @TestOnly
     public void setCursorSendLoopForTesting(CursorWebSocketSendLoop loop) {
         cursorSendLoop = loop;
@@ -4722,6 +4708,10 @@ public class QwpWebSocketSender implements Sender {
                     catchUpCapGapMinEscalationWindowMillis,
                     CursorWebSocketSendLoop.ReconnectPolicy.FOREGROUND,
                     fsnEpochBase);
+            // Sender-lifetime counters: adopted before start(), like the
+            // dispatchers, so the fresh loop keeps counting where the recycle's
+            // outgoing loop stopped.
+            cursorSendLoop.adoptCounters(counters);
             // Plug the async-delivery sink before start() so the I/O thread
             // never observes a null dispatcher between recordFatal and
             // notification — the test for null in dispatchError handles
@@ -5440,6 +5430,7 @@ public class QwpWebSocketSender implements Sender {
         // clears; a persistent fault just degrades the fresh engine
         // again on its first append (SymbolDictRecycleHealingTest).
         deltaDictEnabled = rebuilt.isDeltaDictEnabled();
+        rebuilt.adoptCounters(counters);
         cursorEngine = rebuilt;
         ownsCursorEngine = true;
         cursorEngine.setSlotLockReleaseListener(this::onSlotLockReleased);
