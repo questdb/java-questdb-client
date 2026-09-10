@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendCounters;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import org.junit.Assert;
@@ -130,6 +131,40 @@ public class CursorWebSocketSendLoopZeroBackoffTest {
                 Assert.assertNull(
                         "plain connect failures must not latch a terminal (Invariant B)",
                         loop.getTerminalError());
+            } finally {
+                loop.close();
+            }
+        }
+    }
+
+    /**
+     * The sender hands every loop generation its own sender-lifetime counters
+     * before start(); a swap under a running I/O thread could lose increments,
+     * so adoption after start() is refused.
+     */
+    @Test(timeout = 30_000)
+    public void adoptCountersSharesBeforeStartAndRefusesAfter() throws Exception {
+        try (CursorSendEngine engine = new CursorSendEngine(
+                sfDir.getRoot().getAbsolutePath(), 16_384)) {
+            CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
+                    null, engine, 0, 1_000_000L,
+                    () -> {
+                        throw new IOException("connection refused (test)");
+                    },
+                    0,
+                    1);
+            CursorSendCounters shared = new CursorSendCounters();
+            shared.framesSent.set(7);
+            loop.adoptCounters(shared);
+            Assert.assertEquals("getter must read the adopted instance", 7, loop.getTotalFramesSent());
+            try {
+                loop.start();
+                try {
+                    loop.adoptCounters(new CursorSendCounters());
+                    Assert.fail("adoptCounters after start() must be refused");
+                } catch (IllegalStateException expected) {
+                    Assert.assertTrue(expected.getMessage(), expected.getMessage().contains("before start()"));
+                }
             } finally {
                 loop.close();
             }

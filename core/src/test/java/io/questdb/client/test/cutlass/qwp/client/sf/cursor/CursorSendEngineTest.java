@@ -26,6 +26,7 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendCounters;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
@@ -419,6 +420,18 @@ public class CursorSendEngineTest {
                 Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
             }
         });
+    }
+
+    @Test
+    public void testAdoptCountersSharesTheInstanceAndFoldsPriorCounts() throws Exception {
+        try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096)) {
+            CursorSendCounters shared = new CursorSendCounters();
+            shared.backpressureStalls.set(5);
+            engine.adoptCounters(shared);
+            assertEquals("getter must read the adopted instance", 5, engine.getTotalBackpressureStalls());
+            shared.backpressureStalls.incrementAndGet();
+            assertEquals("getter must read the shared instance, not a copy", 6, engine.getTotalBackpressureStalls());
+        }
     }
 
     @Test
