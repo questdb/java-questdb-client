@@ -801,17 +801,17 @@ public class SymbolDictRecycleTest {
     }
 
     /**
-     * When the resume's re-registration fails after its chunks are already on
-     * the ring, it must degrade to the shipped behaviour -- drop the baseline,
-     * stay usable -- AND close the chunks' deferred-commit group itself: a
-     * commit failure is not covered by publishDictionaryChunks' internal
-     * orphan handling, and an open group clamps ackedFsn forever. This test
-     * does NOT claim the fallback heals the over-cap population -- there the
-     * next flush is still rejected; it pins that the failure path wedges
-     * nothing and the sender keeps working where it can.
+     * When the resume's re-registration fails AFTER its chunks are all on the
+     * ring (the commit path), the baseline must be KEPT -- the ring's coverage
+     * is full, so the fresh loop's mirror will hold exactly what the watermark
+     * says -- AND the chunks' deferred-commit group must be closed: a commit
+     * failure is not covered by publishDictionaryChunks' internal orphan
+     * handling, and an open group clamps ackedFsn forever. The next flush then
+     * continues the delta from the kept baseline instead of re-registering
+     * from 0.
      */
     @Test(timeout = 60_000L)
-    public void testResumePublishFailureFallsBackToBaselineDrop() throws Exception {
+    public void testResumeCommitFailureKeepsWatermarkAndClosesDebt() throws Exception {
         assertMemoryLeak(() -> {
             String sfDir = temporaryFolder.getRoot().toPath().resolve("resume-fallback").toString();
             ChunkCaptureHandler handler = new ChunkCaptureHandler();
@@ -829,7 +829,8 @@ public class SymbolDictRecycleTest {
                     sender.table("t").symbol("s", "b").longColumn("v", 2L).atNow();
                     sender.flush();
                     Assert.assertTrue("setup: baseline must be established", sender.drain(5_000));
-                    Assert.assertTrue(ws.getSentMaxSymbolIdForTesting() >= 0);
+                    int n = ws.getSentMaxSymbolIdForTesting();
+                    Assert.assertTrue("setup: delta baseline advanced", n >= 0);
 
                     ws.forceCloseLoopAbandonForTesting();
                     ws.setResumeCommitFaultForTesting(() -> {
@@ -841,25 +842,29 @@ public class SymbolDictRecycleTest {
                     } finally {
                         ws.setResumeCommitFaultForTesting(null);
                     }
-                    Assert.assertEquals("fallback must drop the baseline",
-                            -1, ws.getSentMaxSymbolIdForTesting());
-                    Assert.assertFalse("fallback must close the chunks' deferred group",
+                    Assert.assertEquals("commit-path failure must keep the baseline (coverage is full)",
+                            n, ws.getSentMaxSymbolIdForTesting());
+                    Assert.assertFalse("the failure path must close the chunks' deferred group",
                             ws.hasDeferredMessagesForTesting());
                     long fsn = sender.flushAndGetSequence();
-                    Assert.assertTrue("next send must work (full re-registration path)",
-                            sender.awaitAckedFsn(fsn, 10_000));
+                    Assert.assertTrue("next send must land on the fresh loop", sender.awaitAckedFsn(fsn, 10_000));
+                    Assert.assertEquals("re-registered chunks then the new symbol, in order",
+                            Arrays.asList("a", "b", "c"), handler.dict());
+                    Assert.assertEquals("first data frame must continue the delta from the kept baseline",
+                            n + 1, handler.firstDataFrameDeltaStart);
                 }
             }
         });
     }
 
     /**
-     * The mirror of {@link #testResumePublishFailureFallsBackToBaselineDrop()}
+     * The mirror of {@link #testResumeCommitFailureKeepsWatermarkAndClosesDebt()}
      * for the resume's Error arm: an Error injected between the chunk publish
      * and the commit must still close the chunks' deferred-commit group and
-     * drop the baseline (the Error arm rethrows instead of swallowing, but it
-     * closes the same debt the Throwable arm does), and the Error itself must
-     * propagate out of {@code table()} rather than being absorbed.
+     * keep the baseline (coverage is full) (the Error arm rethrows instead of
+     * swallowing, but it closes the same debt the Throwable arm does), and the
+     * Error itself must propagate out of {@code table()} rather than being
+     * absorbed.
      */
     @Test(timeout = 60_000L)
     public void testResumeCommitErrorStillClosesDebt() throws Exception {
@@ -877,7 +882,8 @@ public class SymbolDictRecycleTest {
                     sender.table("t").symbol("s", "b").longColumn("v", 2L).atNow();
                     sender.flush();
                     Assert.assertTrue("setup: baseline must be established", sender.drain(5_000));
-                    Assert.assertTrue(ws.getSentMaxSymbolIdForTesting() >= 0);
+                    int n = ws.getSentMaxSymbolIdForTesting();
+                    Assert.assertTrue("setup: delta baseline advanced", n >= 0);
 
                     ws.forceCloseLoopAbandonForTesting();
                     ws.setResumeCommitFaultForTesting(() -> {
@@ -898,16 +904,103 @@ public class SymbolDictRecycleTest {
                     } finally {
                         ws.setResumeCommitFaultForTesting(null);
                     }
-                    Assert.assertEquals("the Error arm must drop the baseline too",
-                            -1, ws.getSentMaxSymbolIdForTesting());
+                    Assert.assertEquals("the Error arm must keep the baseline too (coverage is full)",
+                            n, ws.getSentMaxSymbolIdForTesting());
                     Assert.assertFalse("the Error arm must close the chunks' deferred group too",
                             ws.hasDeferredMessagesForTesting());
+                    // The Error propagated out of table() before any row was staged, so
+                    // stage one now -- otherwise flushAndGetSequence() returns -1 and the
+                    // await below proves nothing.
+                    sender.table("t").symbol("s", "c").longColumn("v", 3L).atNow();
                     long fsn = sender.flushAndGetSequence();
-                    Assert.assertTrue("next send must work (full re-registration path)",
-                            sender.awaitAckedFsn(fsn, 10_000));
+                    Assert.assertTrue("next send must land on the fresh loop", sender.awaitAckedFsn(fsn, 10_000));
+                    Assert.assertEquals("re-registered chunks then the new symbol, in order",
+                            Arrays.asList("a", "b", "c"), handler.dict());
+                    Assert.assertEquals("first data frame must continue the delta from the kept baseline",
+                            n + 1, handler.firstDataFrameDeltaStart);
                 }
             }
         });
+    }
+
+    /**
+     * A resume re-registration that fails part-way -- a prefix of the chunks
+     * on the ring, the rest not -- must leave the delta baseline at exactly the
+     * ringed coverage. Above it, the orphan commit that closes the chunks'
+     * group would carry a delta start the fresh loop's mirror cannot reach and
+     * its replay guard would fail the loop with a false "host crash"; below
+     * it, reclaimUnsentSymbolIds could hand a ringed id to a different string.
+     * Three ~1500-byte symbols against a 2048-byte cap need three chunks; the
+     * fault hits the THIRD so the follow-up data frame (everything above
+     * coverage plus the new symbol) still fits the cap.
+     * <p>
+     * This test does NOT claim the resume heals a remainder wider than the
+     * cap: the re-registration is one-shot and delta mode ships no chunks on
+     * the ordinary flush path, so such an epoch stays wedged on the split
+     * pre-flight -- a narrower population than before the clamp, which
+     * re-shipped all of [0..sentMaxSymbolId] on the next flush.
+     */
+    @Test(timeout = 60_000L)
+    public void testResumePartialPublishClampsWatermarkToCoverage() throws Exception {
+        assertMemoryLeak(() -> {
+            String sfDir = temporaryFolder.getRoot().toPath().resolve("resume-partial").toString();
+            ChunkCaptureHandler handler = new ChunkCaptureHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.setAdvertisedMaxBatchSize(2048);
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + server.getPort() + ";sf_dir=" + sfDir + ";";
+                try (Sender sender = Sender.fromConfig(cfg)) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    Assert.assertTrue("precondition: SF slot must give delta mode",
+                            ws.isDeltaDictEnabledForTest());
+                    // One long symbol per flush: a single frame carrying all three
+                    // (~4.5 KB) would trip the split pre-flight at cap 2048.
+                    String[] longSymbols = {longSymbol('a'), longSymbol('b'), longSymbol('c')};
+                    for (int i = 0; i < longSymbols.length; i++) {
+                        sender.table("t").symbol("s", longSymbols[i]).longColumn("v", i).atNow();
+                        sender.flush();
+                        Assert.assertTrue("setup: flush " + i + " must drain", sender.drain(5_000));
+                    }
+                    Assert.assertEquals("setup: baseline covers the three long symbols",
+                            2, ws.getSentMaxSymbolIdForTesting());
+
+                    ws.forceCloseLoopAbandonForTesting();
+                    AtomicInteger chunkCalls = new AtomicInteger();
+                    ws.setChunkPublishFaultForTesting(() -> {
+                        if (chunkCalls.incrementAndGet() == 3) {
+                            throw new RuntimeException("injected mid-publish chunk fault");
+                        }
+                    });
+                    try {
+                        // The resume degrades inside this call; it must NOT throw.
+                        sender.table("t").symbol("s", "d").longColumn("v", 3L).atNow();
+                    } finally {
+                        ws.setChunkPublishFaultForTesting(null);
+                    }
+                    Assert.assertEquals("exactly three chunk publishes must have been attempted",
+                            3, chunkCalls.get());
+                    Assert.assertEquals("watermark must equal the ringed coverage (chunks [0..0], [1..1])",
+                            1, ws.getSentMaxSymbolIdForTesting());
+                    Assert.assertFalse("the orphaned chunks' deferred group must be closed",
+                            ws.hasDeferredMessagesForTesting());
+
+                    long fsn = sender.flushAndGetSequence();
+                    Assert.assertTrue("the post-abandon batch must land on the fresh loop",
+                            sender.awaitAckedFsn(fsn, 10_000));
+                    Assert.assertEquals("chunks [0..1] replayed, then the data frame re-ships id 2 and adds id 3",
+                            Arrays.asList(longSymbols[0], longSymbols[1], longSymbols[2], "d"), handler.dict());
+                    Assert.assertEquals("first data frame's delta must start at coverage + 1",
+                            2, handler.firstDataFrameDeltaStart);
+                }
+            }
+        });
+    }
+
+    private static String longSymbol(char c) {
+        char[] chars = new char[1500];
+        Arrays.fill(chars, c);
+        return new String(chars);
     }
 
     /**

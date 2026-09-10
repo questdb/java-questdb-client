@@ -572,6 +572,11 @@ public class QwpWebSocketSender implements Sender {
     // commit, so a commit-path failure is reachable deterministically.
     @TestOnly
     private volatile Runnable resumeCommitFaultForTesting;
+    // Test seam: runs at the top of every publishDictionaryChunk() call, so a
+    // mid-publish failure (a prefix of the chunks on the ring, the rest not)
+    // is reachable deterministically.
+    @TestOnly
+    private volatile Runnable chunkPublishFaultForTesting;
     // Incremented once per completed symbol-dictionary recycle. 0 until the
     // first recycle commits. volatile: this is public API (see
     // getSymbolDictEpoch()), and a monitoring thread is its obvious reader.
@@ -598,9 +603,12 @@ public class QwpWebSocketSender implements Sender {
     // Lifetime-monotonic in delta mode -- it is NOT reset on reconnect, because
     // the I/O thread re-registers the full dictionary via a catch-up frame before
     // replaying, so the producer's delta baseline stays valid across the wire
-    // boundary. It drops back to -1 only where the LOOP ITSELF is replaced and
-    // its catch-up mirror dies with it: the recycle's swap commit, and the
-    // CLOSE_LOOP resume (see resumeRecycleIfPending). Used only when
+    // boundary. It restarts at -1 at the recycle's swap commit (fresh
+    // dictionary). The CLOSE_LOOP resume re-registers [0..sentMaxSymbolId]
+    // onto the ring and keeps it; if that publish fails part-way,
+    // publishDictionaryChunks clamps it to the chunks that reached the ring
+    // (-1 when none did), so it always equals the ringed coverage -- the
+    // invariant reclaimUnsentSymbolIds' floor relies on. Used only when
     // deltaDictEnabled; ignored in full-dict mode.
     private int sentMaxSymbolId = -1;
     // When true, auto-flush sends messages with FLAG_DEFER_COMMIT and only
@@ -2339,6 +2347,11 @@ public class QwpWebSocketSender implements Sender {
     @TestOnly
     public void setResumeCommitFaultForTesting(Runnable fault) {
         this.resumeCommitFaultForTesting = fault;
+    }
+
+    @TestOnly
+    public void setChunkPublishFaultForTesting(Runnable fault) {
+        this.chunkPublishFaultForTesting = fault;
     }
 
     /**
@@ -5780,8 +5793,10 @@ public class QwpWebSocketSender implements Sender {
      * Advances an abandoned recycle. CLOSE_LOOP finishes killing the old
      * loop (no swap -- the old engine and dictionary are intact and the
      * armed recycle re-fires from a later barrier, once the reconnect the
-     * next send drives has restored {@code connected}); it drops the
-     * producer's delta baseline with the dead loop's catch-up mirror, see
+     * next send drives has restored {@code connected}); it re-registers the
+     * producer's delta baseline onto the ring as deferred dictionary chunks
+     * so the fresh loop's catch-up mirror is rebuilt from the ring, and on a
+     * mid-publish failure clamps that baseline to what reached the ring, see
      * below. REBUILD completes the await/rebuild/commit tail; because the
      * commit swaps the dictionary, it refuses while producer state could
      * carry old-dictionary symbol ids (staged rows or a row in progress) --
@@ -5814,7 +5829,7 @@ public class QwpWebSocketSender implements Sender {
             // degrading every later flush to a full re-registration (which a
             // dictionary over the server batch cap can never ship at all).
             // recycleResume is cleared BEFORE the publish: a throw below must
-            // degrade to the plain baseline drop, never leave this arm
+            // degrade (the watermark tracks the ringed coverage), never leave this arm
             // reachable with a null loop.
             recycleResume = RecycleResume.NONE;
             // Snapshot the volatile cap ONCE, as flushPendingRows and sendRow do:
@@ -5833,51 +5848,42 @@ public class QwpWebSocketSender implements Sender {
                     // sentMaxSymbolId is KEPT: the ring now carries what the
                     // dead loop's mirror had.
                 } catch (Error e) {
-                    // publishDictionaryChunks closes its own chunk debt when the
-                    // Error originates INSIDE it, but an Error from the
+                    // The watermark is already right whichever half threw:
+                    // publishDictionaryChunks clamped it to the chunks that
+                    // reached the ring before rethrowing, and an Error from the
                     // commitFault seam or from sendCommitMessage() lands here
-                    // AFTER publishDictionaryChunks already returned with chunks
-                    // on the ring and hasDeferredMessages set -- close that debt
-                    // too (best-effort, commitOrphanedDictionaryChunks never
-                    // throws) exactly as the Throwable arm does. Drop the
-                    // baseline either way: a survivor would see a kept watermark
-                    // ahead of the ring's partial coverage, and the next flush
-                    // would trip the server's gap check. The Error itself is
-                    // never swallowed.
-                    // The drop is safe even though [0..sentMaxSymbolId] is now
-                    // ringed: in SF mode pd.size() >= sentMaxSymbolId+1 keeps
-                    // reclaimUnsentSymbolIds's floor above every ringed id; in
-                    // memory mode there is no crash-replay contract, and any
-                    // post-reset redefinition is FIFO-ordered after these
-                    // rowless chunk frames -- either way nothing is invalidated.
+                    // AFTER the publish returned with full coverage, so the
+                    // watermark == the ring's coverage == what the fresh loop's
+                    // mirror will hold. The only debt left is the chunks' open
+                    // deferred group when sendCommitMessage itself failed: close
+                    // it best-effort (commitOrphanedDictionaryChunks never
+                    // throws), exactly as the Throwable arm does; the next data
+                    // frame closes it too if this attempt fails. The Error
+                    // itself is never swallowed.
                     if (hasDeferredMessages) {
                         commitOrphanedDictionaryChunks(e);
                     }
-                    sentMaxSymbolId = -1;
                     throw e;
                 } catch (Throwable t) {
                     // Cap rejection, seal/buffer-recycle timeout, or
                     // appendBlocking's backpressure deadline (no drainer is
                     // attached here, so a full ring parks until the deadline):
-                    // degrade to the plain baseline drop. A failure of
-                    // sendCommitMessage itself is NOT covered by
+                    // publishDictionaryChunks already clamped the watermark to
+                    // the ringed coverage (-1 when nothing reached the ring, so
+                    // the next flush re-registers from 0). A failure of
+                    // sendCommitMessage itself lands here with full coverage
+                    // ringed and the watermark kept; it is NOT covered by
                     // publishDictionaryChunks' internal orphan handling (that
                     // fires only when a chunk publish throws), so close the
                     // deferred group's commit debt here -- an open group would
                     // clamp ackedFsn for the connection's whole life.
-                    // The drop is safe even though [0..sentMaxSymbolId] is now
-                    // ringed: in SF mode pd.size() >= sentMaxSymbolId+1 keeps
-                    // reclaimUnsentSymbolIds's floor above every ringed id; in
-                    // memory mode there is no crash-replay contract, and any
-                    // post-reset redefinition is FIFO-ordered after these
-                    // rowless chunk frames -- either way nothing is invalidated.
                     if (hasDeferredMessages) {
                         commitOrphanedDictionaryChunks(t);
                     }
-                    sentMaxSymbolId = -1;
                     LOG.warn("symbol dictionary re-registration after an abandoned recycle "
-                            + "failed; falling back to a full re-registration on the next "
-                            + "flush [epoch={}]", symbolDictEpoch, t);
+                            + "failed; the delta baseline now covers the chunks that reached "
+                            + "the ring [epoch={}, sentMaxSymbolId={}]",
+                            symbolDictEpoch, sentMaxSymbolId, t);
                 }
             } else {
                 // Full-dict mode has no cross-batch dictionary state to
@@ -6206,16 +6212,21 @@ public class QwpWebSocketSender implements Sender {
      * For the full-dict caller the baseline is deliberately NOT persisted into
      * {@code sentMaxSymbolId}: full-dict mode carries no cross-batch dictionary
      * state, so every batch re-registers. The delta-mode caller (the CLOSE_LOOP
-     * resume) keeps its baseline itself -- these chunks re-register exactly the
-     * ids that baseline already covers.
+     * resume) keeps its baseline itself when the publish completes -- these
+     * chunks re-register exactly the ids that baseline already covers -- and
+     * when it does not, the catch below clamps that baseline to the chunks
+     * that reached the ring before closing their group, so the watermark always
+     * equals the ringed coverage.
      * <p>
-     * All-or-nothing in both directions. Every entry is validated against the cap
-     * BEFORE any chunk is published, so a symbol too large to ship at all throws with
-     * nothing on the ring; and neither caller publishes a chunk for a batch that will
-     * be rejected: the full-dict fallback caller ({@code flushPendingRows}) has
-     * already proven the batch's bodies fit an empty delta before calling here, and
-     * the delta-mode resume caller ({@code resumeRecycleIfPending}) ships no data
-     * frames in the group at all, so there is nothing to prove.
+     * Nothing reaches the ring for an unshippable batch: every entry is validated
+     * against the cap BEFORE any chunk is published, so a symbol too large to ship
+     * at all throws with nothing on the ring; and neither caller publishes a chunk
+     * for a batch that will be rejected: the full-dict fallback caller
+     * ({@code flushPendingRows}) has already proven the batch's bodies fit an empty
+     * delta before calling here, and the delta-mode resume caller
+     * ({@code resumeRecycleIfPending}) ships no data frames in the group at all. A
+     * failure mid-publish leaves a prefix of the chunks ringed with their group
+     * closed by the orphan commit.
      */
     private void publishDictionaryChunks(int cap, int from, int batchMaxId) {
         // Delta-mode callers (the CLOSE_LOOP resume re-registration) may only
@@ -6225,36 +6236,39 @@ public class QwpWebSocketSender implements Sender {
         // deltaDictEnabled off while pd froze) ship self-sufficient chunk
         // groups and carry no such contract.
         assert !deltaDictEnabled || isChunkRangeDurable(batchMaxId);
-        // Pass one: prove every entry is shippable on its own, before anything
-        // reaches the ring. A symbol wider than the cap cannot be split across
-        // frames, so it can never be registered and the batch is unshippable --
-        // say that plainly rather than let it surface as an unexplained oversized
-        // frame from the chunk loop below.
-        for (int id = from; id <= batchMaxId; id++) {
-            long soloFrameBytes = (long) QwpConstants.HEADER_SIZE
-                    + NativeBufferWriter.varintSize(id)
-                    + NativeBufferWriter.varintSize(1)
-                    + dictionaryEntryWireBytes(id);
-            if (soloFrameBytes > cap) {
-                throw new BatchTooLargeForCapException("a single symbol value is too large for the server batch cap")
-                        .put(" [symbolId=").put(id)
-                        .put(", frameBytes=").put(soloFrameBytes)
-                        .put(", serverMaxBatchSize=").put(cap).put(']')
-                        .put("; a symbol value cannot be split across frames -- shorten it, "
-                                + "raise the server's maximum batch size, or use a varchar "
-                                + "column instead of symbol for this data");
-            }
-        }
-        // Pass two publishes. Every chunk is a DEFERRED frame, so from the first
-        // successful publish onward this method owns a commit debt: if a later chunk
-        // throws (sealAndSwapBuffer's buffer-recycle timeout, or appendBlocking's
-        // backpressure deadline when the ring is at sf_max_total_bytes), the chunks
-        // already on the ring have no rollback and nothing downstream will close their
-        // group. Close it here instead -- see commitOrphanedDictionaryChunks.
+        // chunkStart is the first id of the chunk in flight: every id below it
+        // is on the ring, nothing at or above it is. Declared outside the try
+        // so the catch can size the coverage that actually landed.
         int chunkStart = from;
         long chunkBytes = 0;
         boolean anyChunkPublished = false;
         try {
+            // Pass one: prove every entry is shippable on its own, before anything
+            // reaches the ring. A symbol wider than the cap cannot be split across
+            // frames, so it can never be registered and the batch is unshippable --
+            // say that plainly rather than let it surface as an unexplained oversized
+            // frame from the chunk loop below.
+            for (int id = from; id <= batchMaxId; id++) {
+                long soloFrameBytes = (long) QwpConstants.HEADER_SIZE
+                        + NativeBufferWriter.varintSize(id)
+                        + NativeBufferWriter.varintSize(1)
+                        + dictionaryEntryWireBytes(id);
+                if (soloFrameBytes > cap) {
+                    throw new BatchTooLargeForCapException("a single symbol value is too large for the server batch cap")
+                            .put(" [symbolId=").put(id)
+                            .put(", frameBytes=").put(soloFrameBytes)
+                            .put(", serverMaxBatchSize=").put(cap).put(']')
+                            .put("; a symbol value cannot be split across frames -- shorten it, "
+                                    + "raise the server's maximum batch size, or use a varchar "
+                                    + "column instead of symbol for this data");
+                }
+            }
+            // Pass two publishes. Every chunk is a DEFERRED frame, so from the first
+            // successful publish onward this method owns a commit debt: if a later chunk
+            // throws (sealAndSwapBuffer's buffer-recycle timeout, or appendBlocking's
+            // backpressure deadline when the ring is at sf_max_total_bytes), the chunks
+            // already on the ring have no rollback and nothing downstream will close their
+            // group. Close it in the catch instead -- see commitOrphanedDictionaryChunks.
             for (int id = from; id <= batchMaxId; id++) {
                 int entryBytes = dictionaryEntryWireBytes(id);
                 // Size the frame this entry WOULD produce, with the count varint the
@@ -6274,6 +6288,22 @@ public class QwpWebSocketSender implements Sender {
             }
             publishDictionaryChunk(chunkStart, batchMaxId);
         } catch (Throwable t) {
+            if (deltaDictEnabled) {
+                // The delta-mode caller (the CLOSE_LOOP resume) re-registers
+                // [0..sentMaxSymbolId] from a watermark the ring may now cover
+                // only partially. Clamp it to the coverage that landed so the
+                // orphan commit below, reclaimUnsentSymbolIds' floor and every
+                // later delta anchor at what the fresh loop's mirror will hold:
+                // above it the replay guard fails the loop with a false "host
+                // crash", below it a ringed id could be reclaimed and rebound.
+                // publishDictionaryChunk cannot throw with its frame already
+                // appended (sealAndSwapBuffer's throw sites precede the append),
+                // so chunkStart - 1 is exact; a pre-flight rejection leaves it
+                // at from - 1 (nothing ringed, the mirror is gone, the next
+                // flush re-registers from 0). Full-dict mode never reads the
+                // watermark as a baseline and never reclaims -- leave it alone.
+                sentMaxSymbolId = Math.min(sentMaxSymbolId, chunkStart - 1);
+            }
             if (anyChunkPublished) {
                 commitOrphanedDictionaryChunks(t);
             }
@@ -6300,6 +6330,10 @@ public class QwpWebSocketSender implements Sender {
      * batch's data frames.
      */
     private void publishDictionaryChunk(int startId, int endId) {
+        Runnable chunkFault = chunkPublishFaultForTesting;
+        if (chunkFault != null) {
+            chunkFault.run();
+        }
         encoder.setDeferCommit(true);
         // confirmedMaxId = startId - 1 makes beginMessage emit deltaStart = startId,
         // deltaCount = endId - startId + 1.
