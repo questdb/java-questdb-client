@@ -398,6 +398,7 @@ public class TestWebSocketServer implements Closeable {
             while (running.get()) {
                 try {
                     Socket clientSocket = serverSocket.accept();
+                    clientSocket.setTcpNoDelay(true);
                     ClientHandler clientHandler = new ClientHandler(clientSocket);
                     clients.add(clientHandler);
                     clientHandler.start();
@@ -446,15 +447,40 @@ public class TestWebSocketServer implements Closeable {
         public void close() {
             running.set(false);
             try {
+                // FIN after the frames already written, never an RST: closing with unread input
+                // resets the connection and purges anything still queued for the peer.
+                socket.shutdownOutput();
+                if (readThread == Thread.currentThread()) {
+                    drainInput();
+                }
+            } catch (IOException e) {
+                // ignore
+            }
+            try {
                 socket.close();
             } catch (IOException e) {
                 // ignore
             }
-            if (readThread != null) {
+            if (readThread != null && readThread != Thread.currentThread()) {
                 try {
                     readThread.join(5000);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
+                }
+            }
+        }
+
+        private void drainInput() throws IOException {
+            socket.setSoTimeout(20);
+            byte[] scratch = new byte[8192];
+            long deadlineNanos = System.nanoTime() + 200_000_000L;
+            while (System.nanoTime() < deadlineNanos) {
+                try {
+                    if (in.read(scratch) < 0) {
+                        return;
+                    }
+                } catch (SocketTimeoutException e) {
+                    return;
                 }
             }
         }
