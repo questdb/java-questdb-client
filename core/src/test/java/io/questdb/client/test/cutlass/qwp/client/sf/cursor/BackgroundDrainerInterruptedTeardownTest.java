@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
@@ -171,7 +172,7 @@ public class BackgroundDrainerInterruptedTeardownTest {
 
             final BackgroundDrainer drainer = new BackgroundDrainer(
                     tmpDir, SEGMENT_BYTES, Long.MAX_VALUE, factory,
-                    5_000L, 10L, 50L, false, 0L);
+                    5_000L, 10L, 50L, DurableAckTiers.NONE, 0L);
 
             Thread runner = new Thread(drainer::run, "drainer-runner");
             runner.setDaemon(true);

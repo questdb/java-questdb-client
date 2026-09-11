@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.line.LineSenderException;
@@ -1173,7 +1174,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                             }
                             throw new AssertionError("unexpected reconnect call " + call);
                         },
-                        0L, 0L, false,
+                        0L, 0L, DurableAckTiers.NONE,
                         CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                         CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
                         0L, TimeUnit.HOURS.toMillis(1),
@@ -1327,7 +1328,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                 () -> {
                     throw new UnsupportedOperationException("test loop is never started");
                 },
-                100L, 5_000L, false,
+                100L, 5_000L, DurableAckTiers.NONE,
                 CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                 CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
                 0L, capGapWindowMillis,
@@ -1344,7 +1345,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                 () -> {
                     throw new UnsupportedOperationException("test loop is never started");
                 },
-                100L, 5_000L, false,
+                100L, 5_000L, DurableAckTiers.NONE,
                 CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                 CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
                 0L, 0L);
@@ -1433,7 +1434,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                             observedAnchor[0] = loopRef[0].catchUpCapGapFirstNanos();
                             return new CatchUpCapturingClient(0);
                         },
-                        100L, 5_000L, false,
+                        100L, 5_000L, DurableAckTiers.NONE,
                         CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                         CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
                         0L, 0L,

@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerPool;
@@ -115,7 +116,7 @@ public class BackgroundDrainerPoolConnectPhaseCloseTest {
                     /* reconnectMaxDurationMillis */ 60_000L,
                     /* reconnectInitialBackoffMillis */ LONG_BACKOFF_MILLIS,
                     /* reconnectMaxBackoffMillis */ LONG_BACKOFF_MILLIS,
-                    /* requestDurableAck */ false,
+                    /* durableAckTiers */ DurableAckTiers.NONE,
                     /* durableAckKeepaliveIntervalMillis */ 0L);
             final BackgroundDrainerPool pool = new BackgroundDrainerPool(1);
             pool.submit(drainer);
