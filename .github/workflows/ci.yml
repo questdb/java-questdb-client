@@ -139,7 +139,22 @@ jobs:
           grep -q '^io\.questdb\.client@' module.txt
           javac -cp "$jar_file" -d smoke-classes \
             core/src/test/java/io/questdb/client/test/std/DoubleFormatSmoke.java
-          java -cp "$jar_file:smoke-classes" io.questdb.client.test.std.DoubleFormatSmoke
+          # The FdBig double formatter reaches jdk.internal.math.FDBigInteger by
+          # setting AccessibleObject.override at an offset Unsafe derives from the
+          # object header size. Run the smoke under each object-header layout so a
+          # regression to a hard-coded offset fails a BLOCKING leg (25, 26), not
+          # only the non-blocking 27-ea canary. Compact object headers (JEP 450)
+          # are a product flag on JDK 25/26 and default-on from 27; the
+          # +IgnoreUnrecognizedVMOptions guard keeps the flags harmless on any JDK.
+          run_smoke() { # <label> <jvm flags...>
+            local label="$1"; shift
+            echo "::group::DoubleFormatSmoke [$label]"
+            java "$@" -cp "$jar_file:smoke-classes" io.questdb.client.test.std.DoubleFormatSmoke
+            echo "::endgroup::"
+          }
+          run_smoke "default"           -XX:+IgnoreUnrecognizedVMOptions
+          run_smoke "compact-headers"   -XX:+IgnoreUnrecognizedVMOptions -XX:+UseCompactObjectHeaders
+          run_smoke "uncompressed-oops" -XX:+IgnoreUnrecognizedVMOptions -XX:-UseCompressedOops -XX:-UseCompressedClassPointers
 
   # The client is also consumed as a submodule of the main questdb repo, which
   # builds on JDK 25, and contributors build on the newest GA JDK (issue #96
