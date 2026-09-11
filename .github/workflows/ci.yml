@@ -91,20 +91,36 @@ jobs:
   # PACKAGED jar on a modern JDK, so take the jar built by build-jdk8 and prove
   # on JDK 25 that (a) the automatic module name is io.questdb.client and
   # (b) slow-path double formatting resolves the META-INF/versions/11 bridge.
-  mrjar-smoke-jdk25:
-    name: MRJAR smoke (JDK 8 jar on JDK 25)
+  # Runs the JDK 8-built jar (the shipped artifact) on every newer JDK the
+  # client must work on. The double formatter reaches into jdk.internal.math
+  # via the META-INF/versions/11 bridge, and a JDK-internal change there is
+  # only visible when the packaged jar is EXECUTED on that JDK: issue #96
+  # (JDK 26 made FDBigInteger package-private) passed every JDK 8/11/25 check
+  # and broke only at runtime on 26. The EA entry is an early warning for the
+  # next release and does not fail the workflow.
+  mrjar-smoke:
+    name: MRJAR smoke (JDK 8 jar on JDK ${{ matrix.java }})
     needs: build-jdk8
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ["25", "26"]
+        experimental: [false]
+        include:
+          - java: "27-ea"
+            experimental: true
     steps:
       - name: Check out
         uses: actions/checkout@v4
 
-      - name: Set up JDK 25
+      - name: Set up JDK ${{ matrix.java }}
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "25"
+          java-version: ${{ matrix.java }}
 
       - name: Download JDK 8-built client jar
         uses: actions/download-artifact@v4
@@ -123,23 +139,28 @@ jobs:
           java -cp "$jar_file:smoke-classes" io.questdb.client.test.std.DoubleFormatSmoke
 
   # The client is also consumed as a submodule of the main questdb repo, which
-  # builds on JDK 25. Guard against JDK 25 compile breakage (main + test
-  # sources, both modules) and confirm the javadoc jar builds on JDK 25 too
+  # builds on JDK 25, and contributors build on the newest GA JDK (issue #96
+  # was "does not compile on JDK 26"). Guard against compile breakage on both
+  # (main + test sources, both modules) and confirm the javadoc jar builds too
   # (-P javadoc attaches it at the package phase). Do NOT run the tests -- the
   # parent repo runs them against a real server.
-  compile-jdk25:
-    name: Compile & javadoc smoke (JDK 25)
+  compile-modern-jdk:
+    name: Compile & javadoc smoke (JDK ${{ matrix.java }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ["25", "26"]
     steps:
       - name: Check out
         uses: actions/checkout@v4
 
-      - name: Set up JDK 25
+      - name: Set up JDK ${{ matrix.java }}
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "25"
+          java-version: ${{ matrix.java }}
           cache: maven
 
       - name: Compile (main + test) and build javadoc (no tests run)
