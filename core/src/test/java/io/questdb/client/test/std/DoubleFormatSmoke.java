@@ -33,8 +33,9 @@ import io.questdb.client.std.str.StringSink;
  * {@code FDBigInteger} from a different JDK-internal package on Java 8 vs 9+;
  * a jar packaged with the wrong bridge dies here with
  * {@code NoClassDefFoundError: sun/misc/FDBigInteger} (the 1.3.5-1.3.7
- * regression). Run by {@link JarPackagingIT} on the build JDK and by CI on
- * JDK 25 against the JDK 8-built jar.
+ * regression). Run by {@link JarPackagingIT} on the build JDK (plus any JDKs
+ * in {@code QUESTDB_SMOKE_JDKS}), and by CI against the JDK 8-built jar on
+ * JDK 25, 26 and 27-ea under several object-header layouts.
  */
 public final class DoubleFormatSmoke {
 

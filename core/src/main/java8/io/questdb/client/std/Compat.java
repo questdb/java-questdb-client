@@ -61,11 +61,4 @@ public final class Compat {
      */
     public static void onSpinWait() {
     }
-
-    /**
-     * No-op on Java 8: {@code sun.misc} is open, so {@code FDBigInteger} needs
-     * no module export. Present for symmetry with the Java 9+ variant.
-     */
-    static void exportFdBigInteger() {
-    }
 }
