@@ -265,12 +265,13 @@ public class SymbolDictRecycleTest {
                     // rebuilt slot's structure instead: exactly the well-known set of state
                     // files a brand-new (never-recovered) slot has, nothing left over from
                     // the outgoing epoch's segments.
+                    // The hot spare is provisioned by the segment-manager worker, so await it.
                     List<String> freshSlotFiles = Arrays.asList(
                             ".ack-watermark", ".lock", ".lock.pid", ".symbol-dict",
                             "sf-0000000000000000.sfa", "sf-initial.sfa", "sf-manifest.bin");
                     Assert.assertEquals("post-recycle slot must contain exactly a fresh engine's "
                                     + "own state files",
-                            freshSlotFiles, listDir(slot));
+                            freshSlotFiles, awaitDir(slot, freshSlotFiles));
                     Assert.assertEquals("post-recycle dictionary must start empty, not continue "
                                     + "the outgoing epoch's 2 entries",
                             0, after.getPersistedSymbolDict().size());
@@ -1123,6 +1124,21 @@ public class SymbolDictRecycleTest {
         }
         long f = sender.flushAndGetSequence();
         Assert.assertTrue(sender.awaitAckedFsn(f, 5_000));
+    }
+
+    /**
+     * Polls {@link #listDir(String)} until it equals {@code expected} or 5 s pass, and
+     * returns the last listing either way so the caller's assertEquals reports the
+     * actual contents on timeout.
+     */
+    private static List<String> awaitDir(String dir, List<String> expected) throws InterruptedException {
+        long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        List<String> names = listDir(dir);
+        while (!expected.equals(names) && System.nanoTime() < deadlineNanos) {
+            Thread.sleep(20L);
+            names = listDir(dir);
+        }
+        return names;
     }
 
     private static void awaitKind(List<SenderConnectionEvent.Kind> kinds, SenderConnectionEvent.Kind kind)
