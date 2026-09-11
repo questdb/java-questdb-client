@@ -150,9 +150,16 @@ final class FdBig {
     }
 
     /**
-     * Resolves {@code owner.name(params)} into a direct method handle whose
-     * type is {@code erased} (the bignum type replaced by {@code Object}),
-     * without the caller needing access to {@code owner}.
+     * Resolves {@code owner.name(params)} to a method handle of type
+     * {@code erased} (the bignum type replaced by {@code Object}), without the
+     * caller needing access to {@code owner}. {@code unreflect} yields a direct
+     * handle; {@link MethodHandle#asType} then conforms it to the erased type.
+     * For the handles that narrow an {@code Object} parameter back to the bignum
+     * type that wraps the direct handle in a cast-inserting adapter (a
+     * {@code BoundMethodHandle}); only the two {@code valueOf*} handles, which
+     * merely widen the return to {@code Object}, stay direct. Either way C2
+     * inlines the chain and folds the casts, so every call costs the same as a
+     * direct call and allocates nothing (verified by JMH {@code gc.alloc.rate.norm}).
      */
     private static MethodHandle handle(
             MethodHandles.Lookup lookup,
