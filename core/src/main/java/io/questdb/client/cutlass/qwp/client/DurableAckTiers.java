@@ -33,10 +33,11 @@ package io.questdb.client.cutlass.qwp.client;
  *   <li>{@link #REPLICATED} — the server emits {@code STATUS_DURABLE_ACK}
  *       frames once commits reach the object store (failover-safe).</li>
  * </ul>
- * {@link #LEGACY_TRUE} is a modifier bit recording that the request travels
- * as the shipped literal {@code "true"} header value, whose grant the server
- * confirms with the historical {@code "enabled"} token. It always combines
- * with {@link #REPLICATED} — the shipped meaning of the legacy opt-in.
+ * {@link #LEGACY_TRUE} is a modifier bit for requests made through the
+ * boolean {@code requestDurableAck(true)} API or the {@code on} config
+ * value: the request header carries the literal {@code "true"} and the
+ * server confirms the grant with the {@code "enabled"} token. It always
+ * combines with {@link #REPLICATED}.
  * <p>
  * The server grants the full requested set or denies the request entirely
  * (no confirmation header); it never substitutes a weaker guarantee. The
@@ -48,8 +49,8 @@ public final class DurableAckTiers {
     public static final int NONE = 0;
     public static final int LOCAL = 1;
     public static final int REPLICATED = 2;
-    // Modifier bit, only ever combined with REPLICATED: send the legacy "true"
-    // request token and expect the historical "enabled" confirmation.
+    // Modifier bit, only ever combined with REPLICATED: send the "true"
+    // request token and expect the "enabled" confirmation.
     public static final int LEGACY_TRUE = 4;
 
     private DurableAckTiers() {
@@ -78,8 +79,8 @@ public final class DurableAckTiers {
     /**
      * The X-QWP-Durable-Ack confirmation token the server must echo for this
      * request, or null when no tier is requested. A legacy request expects
-     * the historical {@code "enabled"} token; explicit requests expect their
-     * own token set back verbatim.
+     * the {@code "enabled"} token; explicit tier requests expect their own
+     * token set back verbatim.
      */
     public static String expectedConfirmToken(int tiers) {
         if ((tiers & LEGACY_TRUE) != 0) {
@@ -108,8 +109,8 @@ public final class DurableAckTiers {
 
     /**
      * Parses a {@code request_durable_ack} value into a tier set, or -1 for
-     * an unrecognized value. {@code on} is the legacy alias for the
-     * replicated tier (its shipped meaning); {@code off} is {@link #NONE}.
+     * an unrecognized value. {@code on} maps to the replicated tier with
+     * {@link #LEGACY_TRUE} set; {@code off} is {@link #NONE}.
      */
     public static int parseConfigValue(CharSequence value) {
         if (value == null) {
@@ -136,8 +137,8 @@ public final class DurableAckTiers {
 
     /**
      * The X-QWP-Request-Durable-Ack header value for a tier set, or null when
-     * no tier is requested. A legacy set sends the shipped literal
-     * {@code "true"} so old servers keep recognizing it.
+     * no tier is requested. A legacy set sends the literal {@code "true"},
+     * the only request value servers without tier support recognize.
      */
     public static String requestHeaderValue(int tiers) {
         if ((tiers & LEGACY_TRUE) != 0) {

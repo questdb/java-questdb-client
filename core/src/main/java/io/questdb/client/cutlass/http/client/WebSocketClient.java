@@ -816,9 +816,9 @@ public abstract class WebSocketClient implements QuietCloseable {
                 }
                 String value = response.substring(valueStart, lineEnd).trim();
                 // The server echoes the granted set verbatim (or the
-                // historical "enabled" token for a legacy "true" request);
-                // anything else is a partial or foreign grant and counts as
-                // a denial -- all-or-nothing, never a silent downgrade.
+                // "enabled" token for a legacy "true" request); anything
+                // else is a partial or foreign grant and counts as a
+                // denial -- all-or-nothing, never a silent downgrade.
                 return value.equalsIgnoreCase(expectedToken);
             }
         }

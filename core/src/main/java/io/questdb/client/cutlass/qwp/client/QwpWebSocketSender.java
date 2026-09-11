@@ -856,11 +856,12 @@ public class QwpWebSocketSender implements Sender {
     }
 
     // ------------------------------------------------------------------
-    // Binary-compatibility overloads. The durable-ack parameter was retyped
-    // from boolean to the DurableAckTiers bitmask; callers compiled against
-    // earlier releases still link against these boolean variants, which map
-    // true to the legacy "true" request (the replicated tier, confirmed by
-    // the historical "enabled" token) -- the shipped meaning of the opt-in.
+    // Boolean durable-ack overloads. Each maps its boolean flag onto the
+    // DurableAckTiers bitmask the master entry point takes: true becomes
+    // the legacy request (REPLICATED | LEGACY_TRUE -- header value "true",
+    // confirmed by the "enabled" token), false becomes NONE. They keep
+    // binary compatibility for callers linked against the boolean
+    // signatures.
     // ------------------------------------------------------------------
 
     public static QwpWebSocketSender connect(

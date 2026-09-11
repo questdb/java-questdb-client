@@ -2782,9 +2782,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         /**
          * Opts the connection in for STATUS_DURABLE_ACK frames, using the
          * legacy "true" request token. Equivalent to
-         * {@code requestDurableAck("on")}: the shipped meaning is the
-         * replicated tier, so servers without primary replication deny the
-         * request and the sender fails at connect.
+         * {@code requestDurableAck("on")}: requests the replicated tier, so
+         * servers without primary replication deny the request and the
+         * sender fails at connect.
          * <p>
          * This setting is only supported for WebSocket transport.
          *
