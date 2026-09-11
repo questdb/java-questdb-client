@@ -987,6 +987,10 @@ public final class FileTokenStore implements TokenStore {
 
 
     private static void replaceTarget(Path tmp, Path target) throws IOException {
+        replaceTarget(tmp, target, null);
+    }
+
+    private static void replaceTarget(Path tmp, Path target, Runnable beforeRetryForTesting) throws IOException {
         // atomically rename tmp over target. On Windows a concurrent reader in any process holding target open
         // can make the rename fail transiently with AccessDeniedException (a sharing violation); retry a few
         // times on a short backoff before giving up, so a routine read/write overlap does not needlessly degrade
@@ -1009,6 +1013,10 @@ public final class FileTokenStore implements TokenStore {
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     break;
+                }
+                // Tests clear a real permission denial before the next move attempt.
+                if (beforeRetryForTesting != null) {
+                    beforeRetryForTesting.run();
                 }
             }
             try {
