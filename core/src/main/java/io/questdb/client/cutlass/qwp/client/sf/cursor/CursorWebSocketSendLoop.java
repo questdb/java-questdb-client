@@ -1502,6 +1502,18 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * The highest local-fsync seqTxn reported for the table via
+     * {@code STATUS_LOCAL_DURABLE_ACK}, or -1 when none arrived. Meaningful
+     * when both tiers are requested: the local frontier runs ahead of the
+     * replicated trim, and this exposes that early progress per table. In
+     * local-only mode the local acks feed the trim watermarks directly and
+     * this map stays empty.
+     */
+    public long getLocalDurableTableWatermark(CharSequence tableName) {
+        return localDurableTableWatermarks.get(tableName);
+    }
+
+    /**
      * Total times a durable-ack frame caused {@link CursorSendEngine#acknowledge}
      * to advance. Always 0 when {@code durableAckMode} is false. A non-zero
      * value bounded below {@code getTotalDurableAcks} is normal -- many
