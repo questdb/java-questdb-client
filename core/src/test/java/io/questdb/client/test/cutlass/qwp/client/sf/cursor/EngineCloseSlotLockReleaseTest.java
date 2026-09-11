@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
@@ -200,7 +201,7 @@ public class EngineCloseSlotLockReleaseTest {
             // A fresh slot: publishedFsn() < 0, so the rollback close takes the fully-drained arm.
             CursorSendEngine engine = new CursorSendEngine(slotDir, 4L * 1024 * 1024);
             try {
-                QwpWebSocketSender.connect("localhost", refusedPort, null, 0, 0, 0L, null, false, engine);
+                QwpWebSocketSender.connect("localhost", refusedPort, null, 0, 0, 0L, null, DurableAckTiers.NONE, engine);
                 fail("connect to a refused port must fail and roll back");
             } catch (LineSenderException expected) {
                 // the connect()-rollback path ran and closed the engine

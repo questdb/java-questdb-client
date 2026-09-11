@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.LineSenderServerException;
 import io.questdb.client.SenderError;
@@ -348,7 +349,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                         CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                         factory,
                         initialBackoffMillis, 1_000L,
-                        false,
+                        DurableAckTiers.NONE,
                         CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                         // Keep the detector out of the way: this test measures
                         // pacing, not escalation.
@@ -415,7 +416,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                         CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                         factory,
                         initialBackoffMillis, 1_000L,
-                        false,
+                        DurableAckTiers.NONE,
                         CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                         // Keep the detector out of the way: this test measures
                         // close-path pacing, not escalation -- escalation is
@@ -482,7 +483,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                         CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                         factory,
                         initialBackoffMillis, 1_000L,
-                        false,
+                        DurableAckTiers.NONE,
                         CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                         // Detector out of the way -- orderly closes must not
                         // strike anyway; this test measures pacing.
@@ -552,7 +553,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                         CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                         factory,
                         initialBackoffMillis, 1_000L,
-                        false,
+                        DurableAckTiers.NONE,
                         CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                         1_000_000);
                 try {
@@ -1212,7 +1213,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                     clients.add(c);
                     return c;
                 },
-                5L, 10L, true,
+                5L, 10L, DurableAckTiers.REPLICATED,
                 CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                 MAX_REJECTIONS);
         // The loop is driven directly by the test, not by its own I/O thread,
@@ -1239,7 +1240,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                     clients.add(c);
                     return c;
                 },
-                initialBackoffMillis, 5 * initialBackoffMillis, true,
+                initialBackoffMillis, 5 * initialBackoffMillis, DurableAckTiers.REPLICATED,
                 CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                 1_000_000);
         loop.setRunningForTest(true);
@@ -1263,7 +1264,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                     clients.add(c);
                     return c;
                 },
-                5L, 10L, true,
+                5L, 10L, DurableAckTiers.REPLICATED,
                 CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                 maxRejections, windowMillis);
         loop.setRunningForTest(true);

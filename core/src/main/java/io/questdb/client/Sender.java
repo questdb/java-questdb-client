@@ -34,6 +34,7 @@ import io.questdb.client.cutlass.line.LineTcpSenderV3;
 import io.questdb.client.cutlass.line.http.AbstractLineHttpSender;
 import io.questdb.client.cutlass.line.tcp.DelegatingTlsChannel;
 import io.questdb.client.cutlass.line.tcp.PlainTcpLineChannel;
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.cutlass.qwp.client.QwpUdpSender;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
@@ -1145,7 +1146,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         // max backoff (default 5_000) for the cursor I/O loop's exponential
         // retry-with-jitter loop.
         private long reconnectMaxDurationMillis = PARAMETER_NOT_SET_EXPLICITLY;
-        private boolean requestDurableAck;
+        private int durableAckTiers = DurableAckTiers.NONE;
         private int retryTimeoutMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private boolean transactional;
         private String senderId = DEFAULT_SENDER_ID;
@@ -1698,7 +1699,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                                     actualAutoFlushBytes,
                                     actualAutoFlushIntervalNanos,
                                     wsAuthHeader,
-                                    requestDurableAck,
+                                    durableAckTiers,
                                     cursorEngine,
                                     actualCloseFlushTimeoutMillis,
                                     actualReconnectMaxDurationMillis,
@@ -2779,9 +2780,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
-         * Opts the connection in for STATUS_DURABLE_ACK frames. When enabled,
-         * servers with primary replication will emit per-table durable-upload
-         * watermarks as WAL data reaches the object store.
+         * Opts the connection in for STATUS_DURABLE_ACK frames, using the
+         * legacy "true" request token. Equivalent to
+         * {@code requestDurableAck("on")}: the shipped meaning is the
+         * replicated tier, so servers without primary replication deny the
+         * request and the sender fails at connect.
          * <p>
          * This setting is only supported for WebSocket transport.
          *
@@ -2789,10 +2792,48 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * @return this instance for method chaining
          */
         public LineSenderBuilder requestDurableAck(boolean enabled) {
+            return requestDurableAckTiers(enabled
+                    ? DurableAckTiers.REPLICATED | DurableAckTiers.LEGACY_TRUE
+                    : DurableAckTiers.NONE);
+        }
+
+        /**
+         * Requests durable-ack streams by tier set. Accepted values:
+         * {@code off}, {@code on} (legacy alias for the replicated tier),
+         * {@code local}, {@code replicated}, {@code local,replicated}.
+         * <ul>
+         *   <li>{@code local} -- the server emits STATUS_LOCAL_DURABLE_ACK
+         *       frames once commits are fdatasync-durable on its disk; the
+         *       sender trims its store-and-forward copy on them.</li>
+         *   <li>{@code replicated} -- the server emits STATUS_DURABLE_ACK
+         *       frames once commits reach the object store; the sender trims
+         *       on them.</li>
+         *   <li>{@code local,replicated} -- both streams; the sender trims on
+         *       the replicated ack (the strongest requested guarantee) and
+         *       receives local acks as early progress signals.</li>
+         * </ul>
+         * The server grants the full requested set or denies the request
+         * entirely (the sender then fails at connect); it never substitutes
+         * a weaker guarantee.
+         * <p>
+         * This setting is only supported for WebSocket transport.
+         *
+         * @param tiers the requested tier set
+         * @return this instance for method chaining
+         */
+        public LineSenderBuilder requestDurableAck(CharSequence tiers) {
+            int parsed = DurableAckTiers.parseConfigValue(tiers);
+            if (parsed < 0) {
+                throw new LineSenderException("invalid request_durable_ack [value=").put(tiers).put(", allowed-values=[on, off, local, replicated, local,replicated]]");
+            }
+            return requestDurableAckTiers(parsed);
+        }
+
+        private LineSenderBuilder requestDurableAckTiers(int tiers) {
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
                 throw new LineSenderException("request_durable_ack is only supported for WebSocket transport");
             }
-            this.requestDurableAck = enabled;
+            this.durableAckTiers = tiers;
             return this;
         }
 
@@ -3762,13 +3803,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         throw new LineSenderException("request_durable_ack is only supported for WebSocket transport");
                     }
                     pos = getValue(configurationString, pos, sink, "request_durable_ack");
-                    if (Chars.equalsIgnoreCase("on", sink)) {
-                        requestDurableAck(true);
-                    } else if (Chars.equalsIgnoreCase("off", sink)) {
-                        requestDurableAck(false);
-                    } else {
-                        throw new LineSenderException("invalid request_durable_ack [value=").put(sink).put(", allowed-values=[on, off]]");
+                    int tiers = DurableAckTiers.parseConfigValue(sink);
+                    if (tiers < 0) {
+                        throw new LineSenderException("invalid request_durable_ack [value=").put(sink).put(", allowed-values=[on, off, local, replicated, local,replicated]]");
                     }
+                    requestDurableAckTiers(tiers);
                 } else if (Chars.equals("transaction", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException("transaction is only supported for WebSocket transport");
@@ -4180,13 +4219,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 }
                 s = view.getStr("request_durable_ack");
                 if (s != null) {
-                    if (s.equalsIgnoreCase("on")) {
-                        requestDurableAck(true);
-                    } else if (s.equalsIgnoreCase("off")) {
-                        requestDurableAck(false);
-                    } else {
-                        throw new LineSenderException("invalid request_durable_ack [value=").put(s).put(", allowed-values=[on, off]]");
+                    int tiers = DurableAckTiers.parseConfigValue(s);
+                    if (tiers < 0) {
+                        throw new LineSenderException("invalid request_durable_ack [value=").put(s).put(", allowed-values=[on, off, local, replicated, local,replicated]]");
                     }
+                    requestDurableAckTiers(tiers);
                 }
                 s = view.getStr("drain_orphans");
                 if (s != null) {
@@ -4306,7 +4343,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             m.put("auto_flush_interval", autoFlushIntervalMillis);
             m.put("max_name_len", maxNameLength);
             m.put("transaction", transactional);
-            m.put("request_durable_ack", requestDurableAck);
+            m.put("request_durable_ack", DurableAckTiers.configValue(durableAckTiers));
             m.put("sender_id", senderId);
             m.put("sf_dir", sfDir);
             m.put("sf_max_segment_bytes", sfMaxSegmentBytes);
@@ -4400,7 +4437,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         .put(", requestedCapacity=").put(bufferCapacity)
                         .put("]");
             }
-            if (requestDurableAck && protocol != PROTOCOL_WEBSOCKET) {
+            if (durableAckTiers != DurableAckTiers.NONE && protocol != PROTOCOL_WEBSOCKET) {
                 throw new LineSenderException("request_durable_ack is only supported for WebSocket transport");
             }
             if (protocol == PROTOCOL_HTTP) {

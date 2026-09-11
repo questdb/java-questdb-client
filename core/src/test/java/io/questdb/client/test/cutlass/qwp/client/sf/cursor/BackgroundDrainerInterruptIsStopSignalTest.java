@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.std.Files;
@@ -120,7 +121,7 @@ public class BackgroundDrainerInterruptIsStopSignalTest {
                     firstAttempt.countDown();
                     throw new IOException("connection refused (test)");
                 },
-                5_000L, 1L, 10L, false, 0L);
+                5_000L, 1L, 10L, DurableAckTiers.NONE, 0L);
 
         Thread runner = new Thread(drainer::run, "drainer-runner");
         runner.setDaemon(true);

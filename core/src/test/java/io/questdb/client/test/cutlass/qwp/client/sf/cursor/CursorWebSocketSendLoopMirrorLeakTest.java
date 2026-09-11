@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
@@ -340,7 +341,7 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
                     throw new IOException("no reconnect in this test");
                 },
                 0, 1,
-                false, 0L, 3, 0L, 0L,
+                DurableAckTiers.NONE, 0L, 3, 0L, 0L,
                 CursorWebSocketSendLoop.ReconnectPolicy.ORPHAN);
     }
 

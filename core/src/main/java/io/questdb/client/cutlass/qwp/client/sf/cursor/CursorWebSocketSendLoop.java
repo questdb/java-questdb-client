@@ -34,6 +34,7 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.NativeBufferWriter;
 import io.questdb.client.cutlass.qwp.client.QwpAuthFailedException;
 import io.questdb.client.cutlass.qwp.client.QwpCredentialUnavailableException;
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.cutlass.qwp.client.QwpDurableAckMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpIngressRoleRejectedException;
 import io.questdb.client.cutlass.qwp.client.QwpRoleMismatchException;
@@ -256,6 +257,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // (default), the loop trims on OK as it always has and ignores any
     // STATUS_DURABLE_ACK frames that might still arrive (logs a warning).
     private final boolean durableAckMode;
+    // True when the local tier is requested without the replicated one: the
+    // trim trigger is then STATUS_LOCAL_DURABLE_ACK. Any request including
+    // the replicated tier trims on STATUS_DURABLE_ACK (strongest requested
+    // wins) and treats local acks as progress signals only.
+    private final boolean isLocalAckTrimming;
     // Per-table cumulative durable-upload watermarks, populated only when
     // durableAckMode is true. Updated from STATUS_DURABLE_ACK frame entries
     // (each entry is monotonically non-decreasing per spec). Reset on every
@@ -263,6 +269,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // by the server -- holding stale watermarks across the wire boundary
     // would falsely advance trim before re-confirmation.
     private final CharSequenceLongHashMap durableTableWatermarks = new CharSequenceLongHashMap();
+    // Per-table local-fsync watermarks from STATUS_LOCAL_DURABLE_ACK frames
+    // when BOTH tiers are requested. Progress observability only -- the trim
+    // path never reads it (the replicated ack drives the trim). In local-only
+    // mode local acks feed durableTableWatermarks directly instead.
+    private final CharSequenceLongHashMap localDurableTableWatermarks = new CharSequenceLongHashMap();
     // Pre-converted to nanos. Consulted only by the orphan terminal policy. Zero disables
     // the dwell entirely (count-only escalation at MAX_CATCHUP_CAP_GAP_ATTEMPTS); the
     // user-facing 5-minute default is applied at the config layer.
@@ -299,6 +310,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // Counters for observability of the durable-ack path. Both are zero
     // when durableAckMode is false.
     private final AtomicLong totalDurableAcks = new AtomicLong();
+    private final AtomicLong totalLocalDurableAcks = new AtomicLong();
     private final AtomicLong totalDurableTrimAdvances = new AtomicLong();
     // Cumulative count of frames the loop has re-sent during post-reconnect
     // catch-up windows. Bumped once per frame on every iteration that
@@ -603,13 +615,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                                    long reconnectMaxBackoffMillis) {
         this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
                 reconnectInitialBackoffMillis,
-                reconnectMaxBackoffMillis, false);
+                reconnectMaxBackoffMillis, DurableAckTiers.NONE);
     }
 
     /**
      * Same as the seven-arg constructor but with explicit control over
-     * durable-ack-driven trim. {@code durableAckMode = true} switches the loop
-     * to trim only on {@link WebSocketResponse#STATUS_DURABLE_ACK} frames; OK
+     * durable-ack-driven trim. A non-empty {@code durableAckTiers} set
+     * ({@link DurableAckTiers}) switches the loop to trim only on the
+     * strongest requested tier's ack frames; OK
      * frames are queued until their per-table seqTxns are covered by a durable
      * watermark. The default (false) preserves the historical OK-driven trim
      * and ignores any durable-ack frames that arrive (logging a warning, since
@@ -620,10 +633,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                                    ReconnectFactory reconnectFactory,
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis,
-                                   boolean durableAckMode) {
+                                   int durableAckTiers) {
         this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
                 reconnectInitialBackoffMillis,
-                reconnectMaxBackoffMillis, durableAckMode,
+                reconnectMaxBackoffMillis, durableAckTiers,
                 DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS);
     }
 
@@ -639,11 +652,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                                    ReconnectFactory reconnectFactory,
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis,
-                                   boolean durableAckMode,
+                                   int durableAckTiers,
                                    long durableAckKeepaliveIntervalMillis) {
         this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
                 reconnectInitialBackoffMillis,
-                reconnectMaxBackoffMillis, durableAckMode,
+                reconnectMaxBackoffMillis, durableAckTiers,
                 durableAckKeepaliveIntervalMillis, DEFAULT_MAX_HEAD_FRAME_REJECTIONS);
     }
 
@@ -661,12 +674,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                                    ReconnectFactory reconnectFactory,
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis,
-                                   boolean durableAckMode,
+                                   int durableAckTiers,
                                    long durableAckKeepaliveIntervalMillis,
                                    int maxHeadFrameRejections) {
         this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
                 reconnectInitialBackoffMillis,
-                reconnectMaxBackoffMillis, durableAckMode,
+                reconnectMaxBackoffMillis, durableAckTiers,
                 durableAckKeepaliveIntervalMillis, maxHeadFrameRejections, 0L);
     }
 
@@ -681,13 +694,13 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                                    ReconnectFactory reconnectFactory,
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis,
-                                   boolean durableAckMode,
+                                   int durableAckTiers,
                                    long durableAckKeepaliveIntervalMillis,
                                    int maxHeadFrameRejections,
                                    long poisonMinEscalationWindowMillis) {
         this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
                 reconnectInitialBackoffMillis,
-                reconnectMaxBackoffMillis, durableAckMode,
+                reconnectMaxBackoffMillis, durableAckTiers,
                 durableAckKeepaliveIntervalMillis, maxHeadFrameRejections,
                 poisonMinEscalationWindowMillis, 0L);
     }
@@ -714,14 +727,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                                    ReconnectFactory reconnectFactory,
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis,
-                                   boolean durableAckMode,
+                                   int durableAckTiers,
                                    long durableAckKeepaliveIntervalMillis,
                                    int maxHeadFrameRejections,
                                    long poisonMinEscalationWindowMillis,
                                    long catchUpCapGapMinEscalationWindowMillis) {
         this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
                 reconnectInitialBackoffMillis,
-                reconnectMaxBackoffMillis, durableAckMode,
+                reconnectMaxBackoffMillis, durableAckTiers,
                 durableAckKeepaliveIntervalMillis, maxHeadFrameRejections,
                 poisonMinEscalationWindowMillis, catchUpCapGapMinEscalationWindowMillis,
                 CatchUpCapGapPolicy.RETRY_FOREVER);
@@ -737,7 +750,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                                    ReconnectFactory reconnectFactory,
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis,
-                                   boolean durableAckMode,
+                                   int durableAckTiers,
                                    long durableAckKeepaliveIntervalMillis,
                                    int maxHeadFrameRejections,
                                    long poisonMinEscalationWindowMillis,
@@ -898,7 +911,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         this.reconnectFactory = reconnectFactory;
         this.reconnectInitialBackoffMillis = reconnectInitialBackoffMillis;
         this.reconnectMaxBackoffMillis = reconnectMaxBackoffMillis;
-        this.durableAckMode = durableAckMode;
+        this.durableAckMode = durableAckTiers != DurableAckTiers.NONE;
+        this.isLocalAckTrimming = DurableAckTiers.isTrimOnLocalAck(durableAckTiers);
         // Saturate, never multiply raw -- the same hazard the cap-gap dwell above
         // guards. A raw multiply wraps a large millisecond value NEGATIVE, and both of
         // these read as "elapsed >= window", so a negative makes the gate trivially
@@ -941,7 +955,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                                    ReconnectFactory reconnectFactory,
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis,
-                                   boolean durableAckMode,
+                                   int durableAckTiers,
                                    long durableAckKeepaliveIntervalMillis,
                                    int maxHeadFrameRejections,
                                    long poisonMinEscalationWindowMillis,
@@ -949,7 +963,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                                    ReconnectPolicy reconnectPolicy) {
         this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
                 reconnectInitialBackoffMillis,
-                reconnectMaxBackoffMillis, durableAckMode,
+                reconnectMaxBackoffMillis, durableAckTiers,
                 durableAckKeepaliveIntervalMillis, maxHeadFrameRejections,
                 poisonMinEscalationWindowMillis, catchUpCapGapMinEscalationWindowMillis,
                 catchUpPolicyFor(reconnectPolicy));
@@ -1478,6 +1492,16 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * Total {@code STATUS_LOCAL_DURABLE_ACK} frames received since the loop
+     * started. Always 0 unless the local tier was requested. In local-only
+     * mode these frames drive the trim; with both tiers requested they are
+     * progress signals and the count grows independently of trims.
+     */
+    public long getTotalLocalDurableAcks() {
+        return totalLocalDurableAcks.get();
+    }
+
+    /**
      * Total times a durable-ack frame caused {@link CursorSendEngine#acknowledge}
      * to advance. Always 0 when {@code durableAckMode} is false. A non-zero
      * value bounded below {@code getTotalDurableAcks} is normal -- many
@@ -1681,6 +1705,23 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * Records per-table local-fsync watermarks from a
+     * STATUS_LOCAL_DURABLE_ACK frame when both tiers are requested. Progress
+     * observability only: the trim path is driven by the replicated ack.
+     */
+    private void applyLocalDurableAckProgress() {
+        int n = response.getTableEntryCount();
+        for (int i = 0; i < n; i++) {
+            String name = response.getTableName(i);
+            long seqTxn = response.getTableSeqTxn(i);
+            long current = localDurableTableWatermarks.get(name);
+            if (seqTxn > current) {
+                localDurableTableWatermarks.put(name, seqTxn);
+            }
+        }
+    }
+
+    /**
      * Drives the very first connect attempt on the I/O thread, used in the
      * async-initial-connect mode (constructed with {@code client == null}).
      * Reuses the same retry+backoff machinery as {@link #fail(Throwable)}.
@@ -1704,6 +1745,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             releasePendingEntry(pendingDurable.pollFirst());
         }
         durableTableWatermarks.clear();
+        localDurableTableWatermarks.clear();
         // Reset the keepalive throttle so the new connection can prod the
         // server immediately rather than waiting out the leftover interval
         // from before the reconnect.
@@ -3930,6 +3972,24 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 }
                 totalDurableAcks.incrementAndGet();
                 applyDurableAck();
+                return;
+            }
+            if (response.isLocalDurableAck()) {
+                if (!durableAckMode) {
+                    LOG.warn("received STATUS_LOCAL_DURABLE_ACK frame without opt-in -- ignoring");
+                    return;
+                }
+                totalLocalDurableAcks.incrementAndGet();
+                if (isLocalAckTrimming) {
+                    // Local is the strongest requested tier, so its ack is
+                    // this connection's trim trigger -- same watermark and
+                    // drain path the replicated ack drives otherwise.
+                    applyDurableAck();
+                } else {
+                    // Both tiers requested: the replicated ack trims; the
+                    // local ack is an early progress signal only.
+                    applyLocalDurableAckProgress();
+                }
                 return;
             }
             // Application-layer rejection by the server. Classify by status
