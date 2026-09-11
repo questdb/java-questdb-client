@@ -855,6 +855,365 @@ public class QwpWebSocketSender implements Sender {
                 catchUpCapGapMinEscalationWindowMillis);
     }
 
+    // ------------------------------------------------------------------
+    // Binary-compatibility overloads. The durable-ack parameter was retyped
+    // from boolean to the DurableAckTiers bitmask; callers compiled against
+    // earlier releases still link against these boolean variants, which map
+    // true to the legacy "true" request (the replicated tier, confirmed by
+    // the historical "enabled" token) -- the shipped meaning of the opt-in.
+    // ------------------------------------------------------------------
+
+    public static QwpWebSocketSender connect(
+            String host,
+            int port,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            String authorizationHeader,
+            boolean requestDurableAck,
+            CursorSendEngine cursorEngine
+    ) {
+        return connect(
+                host,
+                port,
+                tlsConfig,
+                autoFlushRows,
+                autoFlushBytes,
+                autoFlushIntervalNanos,
+                authorizationHeader,
+                requestDurableAck
+                        ? DurableAckTiers.REPLICATED | DurableAckTiers.LEGACY_TRUE
+                        : DurableAckTiers.NONE,
+                cursorEngine
+        );
+    }
+
+    public static QwpWebSocketSender connect(
+            String host,
+            int port,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            String authorizationHeader,
+            boolean requestDurableAck,
+            CursorSendEngine cursorEngine,
+            long closeFlushTimeoutMillis
+    ) {
+        return connect(
+                host,
+                port,
+                tlsConfig,
+                autoFlushRows,
+                autoFlushBytes,
+                autoFlushIntervalNanos,
+                authorizationHeader,
+                requestDurableAck
+                        ? DurableAckTiers.REPLICATED | DurableAckTiers.LEGACY_TRUE
+                        : DurableAckTiers.NONE,
+                cursorEngine,
+                closeFlushTimeoutMillis
+        );
+    }
+
+    public static QwpWebSocketSender connect(
+            String host,
+            int port,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            String authorizationHeader,
+            boolean requestDurableAck,
+            CursorSendEngine cursorEngine,
+            long closeFlushTimeoutMillis,
+            long reconnectMaxDurationMillis,
+            long reconnectInitialBackoffMillis,
+            long reconnectMaxBackoffMillis
+    ) {
+        return connect(
+                host,
+                port,
+                tlsConfig,
+                autoFlushRows,
+                autoFlushBytes,
+                autoFlushIntervalNanos,
+                authorizationHeader,
+                requestDurableAck
+                        ? DurableAckTiers.REPLICATED | DurableAckTiers.LEGACY_TRUE
+                        : DurableAckTiers.NONE,
+                cursorEngine,
+                closeFlushTimeoutMillis,
+                reconnectMaxDurationMillis,
+                reconnectInitialBackoffMillis,
+                reconnectMaxBackoffMillis
+        );
+    }
+
+    public static QwpWebSocketSender connect(
+            String host,
+            int port,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            String authorizationHeader,
+            boolean requestDurableAck,
+            CursorSendEngine cursorEngine,
+            long closeFlushTimeoutMillis,
+            long reconnectMaxDurationMillis,
+            long reconnectInitialBackoffMillis,
+            long reconnectMaxBackoffMillis,
+            Sender.InitialConnectMode initialConnectMode
+    ) {
+        return connect(
+                host,
+                port,
+                tlsConfig,
+                autoFlushRows,
+                autoFlushBytes,
+                autoFlushIntervalNanos,
+                authorizationHeader,
+                requestDurableAck
+                        ? DurableAckTiers.REPLICATED | DurableAckTiers.LEGACY_TRUE
+                        : DurableAckTiers.NONE,
+                cursorEngine,
+                closeFlushTimeoutMillis,
+                reconnectMaxDurationMillis,
+                reconnectInitialBackoffMillis,
+                reconnectMaxBackoffMillis,
+                initialConnectMode
+        );
+    }
+
+    public static QwpWebSocketSender connect(
+            String host,
+            int port,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            String authorizationHeader,
+            boolean requestDurableAck,
+            CursorSendEngine cursorEngine,
+            long closeFlushTimeoutMillis,
+            long reconnectMaxDurationMillis,
+            long reconnectInitialBackoffMillis,
+            long reconnectMaxBackoffMillis,
+            Sender.InitialConnectMode initialConnectMode,
+            SenderErrorHandler errorHandler,
+            int errorInboxCapacity
+    ) {
+        return connect(
+                host,
+                port,
+                tlsConfig,
+                autoFlushRows,
+                autoFlushBytes,
+                autoFlushIntervalNanos,
+                authorizationHeader,
+                requestDurableAck
+                        ? DurableAckTiers.REPLICATED | DurableAckTiers.LEGACY_TRUE
+                        : DurableAckTiers.NONE,
+                cursorEngine,
+                closeFlushTimeoutMillis,
+                reconnectMaxDurationMillis,
+                reconnectInitialBackoffMillis,
+                reconnectMaxBackoffMillis,
+                initialConnectMode,
+                errorHandler,
+                errorInboxCapacity
+        );
+    }
+
+    public static QwpWebSocketSender connect(
+            String host,
+            int port,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            String authorizationHeader,
+            boolean requestDurableAck,
+            CursorSendEngine cursorEngine,
+            long closeFlushTimeoutMillis,
+            long reconnectMaxDurationMillis,
+            long reconnectInitialBackoffMillis,
+            long reconnectMaxBackoffMillis,
+            Sender.InitialConnectMode initialConnectMode,
+            SenderErrorHandler errorHandler,
+            int errorInboxCapacity,
+            long durableAckKeepaliveIntervalMillis
+    ) {
+        return connect(
+                host,
+                port,
+                tlsConfig,
+                autoFlushRows,
+                autoFlushBytes,
+                autoFlushIntervalNanos,
+                authorizationHeader,
+                requestDurableAck
+                        ? DurableAckTiers.REPLICATED | DurableAckTiers.LEGACY_TRUE
+                        : DurableAckTiers.NONE,
+                cursorEngine,
+                closeFlushTimeoutMillis,
+                reconnectMaxDurationMillis,
+                reconnectInitialBackoffMillis,
+                reconnectMaxBackoffMillis,
+                initialConnectMode,
+                errorHandler,
+                errorInboxCapacity,
+                durableAckKeepaliveIntervalMillis
+        );
+    }
+
+    public static QwpWebSocketSender connect(
+            List<Endpoint> endpoints,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            String authorizationHeader,
+            boolean requestDurableAck,
+            CursorSendEngine cursorEngine,
+            long closeFlushTimeoutMillis,
+            long reconnectMaxDurationMillis,
+            long reconnectInitialBackoffMillis,
+            long reconnectMaxBackoffMillis,
+            Sender.InitialConnectMode initialConnectMode,
+            SenderErrorHandler errorHandler,
+            int errorInboxCapacity,
+            long durableAckKeepaliveIntervalMillis,
+            long authTimeoutMs
+    ) {
+        return connect(
+                endpoints,
+                tlsConfig,
+                autoFlushRows,
+                autoFlushBytes,
+                autoFlushIntervalNanos,
+                authorizationHeader,
+                requestDurableAck
+                        ? DurableAckTiers.REPLICATED | DurableAckTiers.LEGACY_TRUE
+                        : DurableAckTiers.NONE,
+                cursorEngine,
+                closeFlushTimeoutMillis,
+                reconnectMaxDurationMillis,
+                reconnectInitialBackoffMillis,
+                reconnectMaxBackoffMillis,
+                initialConnectMode,
+                errorHandler,
+                errorInboxCapacity,
+                durableAckKeepaliveIntervalMillis,
+                authTimeoutMs
+        );
+    }
+
+    public static QwpWebSocketSender connect(
+            List<Endpoint> endpoints,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            String authorizationHeader,
+            boolean requestDurableAck,
+            CursorSendEngine cursorEngine,
+            long closeFlushTimeoutMillis,
+            long reconnectMaxDurationMillis,
+            long reconnectInitialBackoffMillis,
+            long reconnectMaxBackoffMillis,
+            Sender.InitialConnectMode initialConnectMode,
+            SenderErrorHandler errorHandler,
+            int errorInboxCapacity,
+            long durableAckKeepaliveIntervalMillis,
+            long authTimeoutMs,
+            int connectTimeoutMs,
+            SenderConnectionListener connectionListener,
+            int connectionListenerInboxCapacity
+    ) {
+        return connect(
+                endpoints,
+                tlsConfig,
+                autoFlushRows,
+                autoFlushBytes,
+                autoFlushIntervalNanos,
+                authorizationHeader,
+                requestDurableAck
+                        ? DurableAckTiers.REPLICATED | DurableAckTiers.LEGACY_TRUE
+                        : DurableAckTiers.NONE,
+                cursorEngine,
+                closeFlushTimeoutMillis,
+                reconnectMaxDurationMillis,
+                reconnectInitialBackoffMillis,
+                reconnectMaxBackoffMillis,
+                initialConnectMode,
+                errorHandler,
+                errorInboxCapacity,
+                durableAckKeepaliveIntervalMillis,
+                authTimeoutMs,
+                connectTimeoutMs,
+                connectionListener,
+                connectionListenerInboxCapacity
+        );
+    }
+
+    public static QwpWebSocketSender connect(
+            List<Endpoint> endpoints,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            String authorizationHeader,
+            boolean requestDurableAck,
+            CursorSendEngine cursorEngine,
+            long closeFlushTimeoutMillis,
+            long reconnectMaxDurationMillis,
+            long reconnectInitialBackoffMillis,
+            long reconnectMaxBackoffMillis,
+            Sender.InitialConnectMode initialConnectMode,
+            SenderErrorHandler errorHandler,
+            int errorInboxCapacity,
+            long durableAckKeepaliveIntervalMillis,
+            long authTimeoutMs,
+            int connectTimeoutMs,
+            SenderConnectionListener connectionListener,
+            int connectionListenerInboxCapacity,
+            int maxFrameRejections,
+            long poisonMinEscalationWindowMillis,
+            long catchUpCapGapMinEscalationWindowMillis
+    ) {
+        return connect(
+                endpoints,
+                tlsConfig,
+                autoFlushRows,
+                autoFlushBytes,
+                autoFlushIntervalNanos,
+                authorizationHeader,
+                requestDurableAck
+                        ? DurableAckTiers.REPLICATED | DurableAckTiers.LEGACY_TRUE
+                        : DurableAckTiers.NONE,
+                cursorEngine,
+                closeFlushTimeoutMillis,
+                reconnectMaxDurationMillis,
+                reconnectInitialBackoffMillis,
+                reconnectMaxBackoffMillis,
+                initialConnectMode,
+                errorHandler,
+                errorInboxCapacity,
+                durableAckKeepaliveIntervalMillis,
+                authTimeoutMs,
+                connectTimeoutMs,
+                connectionListener,
+                connectionListenerInboxCapacity,
+                maxFrameRejections,
+                poisonMinEscalationWindowMillis,
+                catchUpCapGapMinEscalationWindowMillis
+        );
+    }
+
+
     /**
      * Master connect entry point — also accepts the poison-frame detector
      * threshold ({@code max_frame_rejections}): consecutive server-active

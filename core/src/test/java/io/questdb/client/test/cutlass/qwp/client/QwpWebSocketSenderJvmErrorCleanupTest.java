@@ -185,7 +185,7 @@ public class QwpWebSocketSenderJvmErrorCleanupTest {
         // tail -- narrowing the try block later trips one of the two.
         QwpWebSocketSender sender = newBareSender();
         QwpHostHealthTracker tracker = wireEndpoints(sender, 1);
-        setField(sender, "requestDurableAck", true);
+        setField(sender, "durableAckTiers", DurableAckTiers.REPLICATED | DurableAckTiers.LEGACY_TRUE);
         OutOfMemoryError oom = new OutOfMemoryError("simulated allocation failure");
         StubClient stub = newStubClient();
         stub.durableAckCheckError = oom;
