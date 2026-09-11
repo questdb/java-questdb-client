@@ -96,8 +96,11 @@ jobs:
   # via the META-INF/versions/11 bridge, and a JDK-internal change there is
   # only visible when the packaged jar is EXECUTED on that JDK: issue #96
   # (JDK 26 made FDBigInteger package-private) passed every JDK 8/11/25 check
-  # and broke only at runtime on 26. The EA entry is an early warning for the
-  # next release and does not fail the workflow.
+  # and broke only at runtime on 26; JDK 27 compact object headers (JEP 450,
+  # default-on) then shifted the AccessibleObject.override offset the bridge
+  # relies on -- both are exercised here. The 27-ea entry is a forward canary:
+  # it should be green, and does not fail the workflow because EA is a moving
+  # target -- a red run means the next JDK needs attention.
   mrjar-smoke:
     name: MRJAR smoke (JDK 8 jar on JDK ${{ matrix.java }})
     needs: build-jdk8

@@ -56,18 +56,18 @@ import java.lang.reflect.Method;
  * The handles are {@code static final} and invoked via {@code invokeExact}
  * with erased ({@code Object}) signatures, so the JIT treats them as
  * constants and inlines the calls: the slow path costs the same as a direct
- * call did before. The technique works unchanged on JDK 9 through 26.
+ * call did before. The technique works on JDK 9 through 27.
  * <p>
- * Known boundary: JDK 27-ea neutralises step 3 -- the {@code Unsafe} write to
- * {@code override} no longer takes effect, so {@code isAccessible()} stays
- * false and {@code unreflect} falls back to this class's own lookup, which
- * cannot see the package-private class. No reflective/Unsafe variant reaches
- * a JDK-internal type there (the previous {@code --add-exports} export hack
- * relied on the same primitive and is equally dead); only a launch-time
- * {@code --add-opens} works, which a library cannot impose on its consumers.
- * The durable fix for JDK 27+ is to drop the JDK-internal dependency and carry
- * a self-contained bignum. The non-blocking {@code mrjar-smoke} 27-ea CI job
- * tracks this and will turn green once that lands.
+ * JDK 27 needs no change here, but it exposed a latent bug in
+ * {@link Unsafe#makeAccessible}: compact object headers (JEP 450, enabled by
+ * default in JDK 27) shrink the object header to 8 bytes, so the
+ * {@code override} field that step 3 writes moved from offset 12/16 to 8.
+ * {@code Unsafe} now derives that offset by measuring the first-field boundary
+ * instead of hard-coding it, which tracks compact, compressed, uncompressed
+ * and 32-bit layouts alike. The remaining long-term liability is
+ * {@code sun.misc.Unsafe} itself being removed from a future JDK; the durable
+ * answer then is a self-contained bignum that needs no JDK-internal access at
+ * all. The {@code mrjar-smoke} 27-ea CI job guards the current behaviour.
  */
 final class FdBig {
     private static final MethodHandle ADD_AND_CMP;           // (Object, Object, Object) int
