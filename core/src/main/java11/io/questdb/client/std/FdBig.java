@@ -56,7 +56,18 @@ import java.lang.reflect.Method;
  * The handles are {@code static final} and invoked via {@code invokeExact}
  * with erased ({@code Object}) signatures, so the JIT treats them as
  * constants and inlines the calls: the slow path costs the same as a direct
- * call did before. The technique works unchanged on every JDK from 9 up.
+ * call did before. The technique works unchanged on JDK 9 through 26.
+ * <p>
+ * Known boundary: JDK 27-ea neutralises step 3 -- the {@code Unsafe} write to
+ * {@code override} no longer takes effect, so {@code isAccessible()} stays
+ * false and {@code unreflect} falls back to this class's own lookup, which
+ * cannot see the package-private class. No reflective/Unsafe variant reaches
+ * a JDK-internal type there (the previous {@code --add-exports} export hack
+ * relied on the same primitive and is equally dead); only a launch-time
+ * {@code --add-opens} works, which a library cannot impose on its consumers.
+ * The durable fix for JDK 27+ is to drop the JDK-internal dependency and carry
+ * a self-contained bignum. The non-blocking {@code mrjar-smoke} 27-ea CI job
+ * tracks this and will turn green once that lands.
  */
 final class FdBig {
     private static final MethodHandle ADD_AND_CMP;           // (Object, Object, Object) int
