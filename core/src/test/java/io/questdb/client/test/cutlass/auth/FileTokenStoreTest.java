@@ -73,8 +73,7 @@ import static io.questdb.client.test.tools.TestUtils.repeat;
 /**
  * Coverage for {@link FileTokenStore}.
  * <p>
- * PLATFORM SCOPE. CI runs Linux only, so the store's Windows-motivated arms are covered here to the extent a
- * POSIX host can reach them, and no further:
+ * PLATFORM SCOPE. POSIX hosts cover the store's Windows-motivated arms only to the extent described below:
  * <ul>
  *     <li>the {@code AccessDeniedException} retry in {@code replaceTarget} - the sharing violation a Windows
  *     reader holding the target open produces - IS exercised, by denying the rename with directory
@@ -765,47 +764,34 @@ public class FileTokenStoreTest {
         Assume.assumeFalse("a root process bypasses the directory permissions this denial relies on",
                 "root".equals(System.getProperty("user.name")));
         assertMemoryLeak(() -> {
-            // replaceTarget retries a denied rename because on WINDOWS a concurrent reader holding the target
-            // open makes the atomic replace fail transiently with AccessDeniedException. CI is Linux-only, so
-            // the denial is produced the one way a POSIX host can: rename(2) needs write permission on the
-            // containing directory, so taking it away denies the move exactly as the sharing violation does,
-            // and restoring it mid-retry stands in for the Windows reader closing its handle.
+            // A POSIX directory permission denial produces the same AccessDeniedException as a Windows
+            // sharing violation. Clear it on the calling thread after the first denied move.
             Path dir = storeDir();
             createStoreDir(dir);
             Path tmp = Files.write(dir.resolve("payload.tmp"), "NEW".getBytes(StandardCharsets.UTF_8));
             Path target = Files.write(dir.resolve("payload.json"), "OLD".getBytes(StandardCharsets.UTF_8));
 
-            Method replaceTarget = FileTokenStore.class.getDeclaredMethod("replaceTarget", Path.class, Path.class);
+            Method replaceTarget = FileTokenStore.class.getDeclaredMethod(
+                    "replaceTarget", Path.class, Path.class, Runnable.class);
             replaceTarget.setAccessible(true);
-            Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("r-x------"));
-            // Prove the denial is real on THIS host before the test rests on it. Without this the whole test
-            // passes vacuously wherever the mode bits do not bite - the first attempt inside replaceTarget
-            // simply succeeds and no retry is ever exercised.
-            try {
-                Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-                Assert.fail("the rename must be denied while the store directory is not writable");
-            } catch (AccessDeniedException expected) {
-                // exactly what a Windows sharing violation produces, and what the retry loop is written for
-            }
-            Thread reopener = new Thread(() -> {
-                // after the first backoff (20ms) but well inside the 5-attempt budget
-                Os.sleep(30);
+            AtomicInteger retries = new AtomicInteger();
+            Runnable clearDenial = () -> {
+                retries.incrementAndGet();
                 try {
                     Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("rwx------"));
                 } catch (IOException e) {
                     throw new AssertionError("could not restore the directory permissions", e);
                 }
-            }, "denial-clearer");
-            reopener.setDaemon(true);
-            reopener.start();
+            };
+            Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("r-x------"));
             try {
-                replaceTarget.invoke(null, tmp, target);
+                replaceTarget.invoke(null, tmp, target, clearDenial);
             } finally {
-                reopener.join(10_000);
-                // whatever happened above, leave the tree deletable
+                // Leave the tree deletable even if the move or the retry hook fails.
                 Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("rwx------"));
             }
 
+            Assert.assertEquals("the first move must be denied and the first retry must succeed", 1, retries.get());
             Assert.assertEquals("the retry must complete the replace once the denial clears",
                     "NEW", new String(Files.readAllBytes(target), StandardCharsets.UTF_8));
             Assert.assertFalse("an atomic move consumes the temp file", Files.exists(tmp));
