@@ -26,6 +26,7 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendCounters;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
@@ -419,6 +420,33 @@ public class CursorSendEngineTest {
                 Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
             }
         });
+    }
+
+    @Test
+    public void testAdoptCountersSharesTheInstanceAndFoldsOnlyItsOwnCounter() throws Exception {
+        try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096)) {
+            // Seed the engine's DEFAULT holder with a foreign total on a counter the
+            // engine never writes, so the fold's scope -- backpressureStalls only,
+            // not the whole holder -- is observable.
+            engine.getCountersForTesting().framesSent.set(99);
+            engine.getCountersForTesting().backpressureStalls.set(2);
+
+            CursorSendCounters shared = new CursorSendCounters();
+            shared.backpressureStalls.set(5);
+            engine.adoptCounters(shared);
+            assertEquals("only the engine-owned counter is folded", 7, shared.backpressureStalls.get());
+            assertEquals("framesSent is the loop's counter, not the engine's -- must not be folded",
+                    0, shared.framesSent.get());
+            assertEquals("getter must read the adopted instance", 7, engine.getTotalBackpressureStalls());
+
+            // Idempotent: re-adopting the same instance must not fold again.
+            engine.adoptCounters(shared);
+            assertEquals("a second adoptCounters on the same holder must be a no-op",
+                    7, shared.backpressureStalls.get());
+
+            shared.backpressureStalls.incrementAndGet();
+            assertEquals("getter must read the shared instance, not a copy", 8, engine.getTotalBackpressureStalls());
+        }
     }
 
     @Test

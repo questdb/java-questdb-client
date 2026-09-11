@@ -45,6 +45,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegmentCorruptionExcep
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SfRecoveryException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SfSanitizedResidueException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.UnreplayableSlotException;
+import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.impl.ConfStringParser;
 import io.questdb.client.impl.ConfigString;
 import io.questdb.client.impl.ConfigView;
@@ -611,8 +612,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
 
     /**
      * Highest frame sequence number (FSN) the server has acknowledged.
-     * Returns {@code -1} when no batch has been published yet, and on transports that
-     * do not track FSNs (HTTP, TCP, UDP).
+     * Returns {@code -1} while nothing has ever been published in this
+     * sender's lifetime, and always on transports that do not track FSNs
+     * (HTTP, TCP, UDP). On a live sender the value never collapses back to
+     * {@code -1}: after a symbol-dictionary recycle the accessor keeps
+     * reporting the last pre-swap durable watermark until the fresh epoch
+     * publishes. (After {@code close()} the reading is unspecified.)
      * <br>
      * Snapshot accessor: for a bounded blocking wait, use
      * {@link #awaitAckedFsn(long, long)}.
@@ -688,6 +693,32 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      */
     Sender longColumn(CharSequence name, long value);
 
+
+    /**
+     * Advisory request to start a fresh symbol-dictionary epoch. The reset
+     * runs at the next {@code table(...)} call that finds all published data
+     * acknowledged and no row in progress. A request outstanding longer than
+     * {@link LineSenderBuilder#symbolDictResetMaxWaitMillis(long)} pauses one
+     * {@code table(...)} call for up to that long to drain the backlog; if
+     * the backlog still does not drain, the request stays pending and may be
+     * deferred indefinitely under sustained saturation. {@code table(...)}
+     * is the only trigger point: a caller that never starts another row
+     * never recycles. No-op on transports without a symbol dictionary.
+     * <p>
+     * The request bypasses the anti-thrash re-arm floor for that one swap and
+     * does not lower it: the floor only ever rises, so a scheduled manual
+     * reset cannot re-open the automatic recycle's doubling ladder.
+     * <p>
+     * Also a permanent no-op on a sender configured with
+     * {@code symbol_dict_reset=off} ({@link LineSenderBuilder#symbolDictReset(boolean)}):
+     * that knob gates the arming path this request feeds, so the request is
+     * accepted and never acted on.
+     * <p>
+     * Call on the producing thread only: like every other {@code Sender}
+     * method, this mutates producer-side state and is not thread-safe.
+     */
+    default void resetSymbolDictionary() {
+    }
 
     /**
      * Clear the internal buffers, discarding any unsent data.
@@ -1088,6 +1119,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private int maxFrameRejections = PARAMETER_NOT_SET_EXPLICITLY;
         private long poisonMinEscalationWindowMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private long catchUpCapGapMinEscalationWindowMillis = PARAMETER_NOT_SET_EXPLICITLY;
+        private boolean symbolDictReset = QwpWebSocketSender.DEFAULT_SYMBOL_DICT_RESET_ENABLED;
+        private int symbolDictResetThreshold = PARAMETER_NOT_SET_EXPLICITLY;
+        private long symbolDictResetMaxWaitMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private String httpPath;
         private String httpSettingsPath;
         private int httpTimeout = PARAMETER_NOT_SET_EXPLICITLY;
@@ -1547,6 +1581,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         catchUpCapGapMinEscalationWindowMillis != PARAMETER_NOT_SET_EXPLICITLY
                                 ? catchUpCapGapMinEscalationWindowMillis
                                 : CursorWebSocketSendLoop.DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS;
+                int actualSymbolDictResetThreshold = symbolDictResetThreshold != PARAMETER_NOT_SET_EXPLICITLY
+                        ? symbolDictResetThreshold
+                        : QwpWebSocketSender.DEFAULT_SYMBOL_DICT_RESET_THRESHOLD_SYMBOLS;
+                long actualSymbolDictResetMaxWaitMillis = symbolDictResetMaxWaitMillis != PARAMETER_NOT_SET_EXPLICITLY
+                        ? symbolDictResetMaxWaitMillis
+                        : QwpWebSocketSender.DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS;
 
                 // sfDir is the parent (group root); the actual slot lives
                 // under sfDir/senderId. This is what the engine sees — the
@@ -1601,77 +1641,21 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 try (SlotLock logicalSlotLock = slotPath == null
                         ? null
                         : SlotLock.acquireLogical(slotPath)) {
-                    // The constructor's own recovery seed can also fail terminally, and
-                    // not only as UnreplayableSlotException: when SegmentRing.openExisting
-                    // had to skip an unreadable segment it throws SfRecoveryException (it
-                    // constructs UnreplayableSlotException nowhere), and where it cannot
-                    // even prove the chain's identity -- no manifest -- it quarantines the
-                    // corrupt files and returns an EMPTY recovery rather than refusing.
-                    // Either way the frame range cannot be shown already-acked, so recovery
-                    // sets the slot aside rather than risk seeding the ack cursor past
-                    // frames that were never delivered. All three types below are load
-                    // bearing; narrowing this catch to UnreplayableSlotException would
-                    // restore the permanent build() brick for the segment-skip case. That verdict gets
-                    // the exact same quarantine-and-continue treatment as the connect()-time
-                    // verdict below -- constructing cursorEngine is not inside the loop below,
-                    // so a throw here would otherwise escape build() entirely, uncaught.
-                    // quarantineTornSlot(null, ...) renames the WHOLE slot directory aside
-                    // (not just the unreadable segment file) before building the replacement
-                    // at the original slotPath, so the replacement starts on a genuinely empty
-                    // directory with nothing left to skip -- it cannot throw the same way
-                    // twice, which is what makes looping unnecessary here.
-                    boolean quarantined = false;
-                    CursorSendEngine cursorEngine;
-                    try {
-                        try {
-                            cursorEngine = new CursorSendEngine(
-                                    slotPath, actualSfMaxSegmentBytes,
-                                    actualSfMaxTotalBytes, actualSfAppendDeadlineNanos,
-                                    actualSfSyncIntervalNanos);
-                        } catch (SfSanitizedResidueException first) {
-                            // NOT terminal, and it must be intercepted ahead of its
-                            // SfRecoveryException parent below. Recovery durably zeroed
-                            // proven-dead sealed residue BEFORE failing closed, so the
-                            // chain on disk is already healed: quarantining here would
-                            // set aside a slot whose backlog replays perfectly. Retry
-                            // once over the healed chain; a repeat is genuine and takes
-                            // the terminal arm.
-                            LOG.info("sf slot {}: sealed residue sanitized during recovery ({}); "
-                                            + "retrying over the healed chain",
-                                    slotPath, first.getMessage());
-                            cursorEngine = new CursorSendEngine(
-                                    slotPath, actualSfMaxSegmentBytes,
-                                    actualSfMaxTotalBytes, actualSfAppendDeadlineNanos,
-                                    actualSfSyncIntervalNanos);
-                        }
-                    } catch (UnreplayableSlotException | SfRecoveryException
-                             | MmapSegmentCorruptionException e) {
-                        // The terminal recovery verdicts, and the only ones build()
-                        // sets a slot aside for. UnreplayableSlotException says the
-                        // symbol dictionary cannot be rebuilt from any source;
-                        // SfRecoveryException and MmapSegmentCorruptionException say
-                        // the durable chain itself is proven corrupt or incomplete.
-                        // None of the three clears on a retry, and senderId is stable
-                        // with a not-fully-drained slot retained on close -- so
-                        // without this arm every restart re-recovers the same slot and
-                        // throws again, and the application cannot construct a Sender
-                        // at all, not even to BUFFER new rows.
-                        //
-                        // Deliberately NOT catching plain MmapSegmentException or
-                        // SfOperationalException: those are operational (EMFILE,
-                        // ENOMEM, an unreadable-but-possibly-intact file). Aborting
-                        // startup on them is correct; quarantining on them would
-                        // convert a transient into the permanent loss of a healthy
-                        // slot's durable frames.
-                        if (slotPath == null) {
-                            throw e;
-                        }
-                        quarantined = true;
-                        cursorEngine = quarantineTornSlot(
-                                null, e, sfDir, senderId, slotPath, actualSfMaxSegmentBytes,
-                                actualSfMaxTotalBytes, actualSfAppendDeadlineNanos,
-                                actualSfSyncIntervalNanos, errorHandler);
-                    }
+                    // Recovery-verdict handling lives in constructEngineOnSlotLocked.
+                    ConstructedEngine constructed = constructEngineOnSlotLocked(
+                            sfDir, senderId, slotPath,
+                            actualSfMaxSegmentBytes, actualSfMaxTotalBytes,
+                            actualSfAppendDeadlineNanos, actualSfSyncIntervalNanos,
+                            errorHandler);
+                    // Seeded from constructEngineOnSlotLocked's own verdict, not
+                    // hardcoded false: if construction already quarantined this
+                    // slot, the connect loop below must count that as the one
+                    // quarantine build() allows per attempt (see its "quarantined
+                    // || slotPath == null" guard) rather than starting blind and
+                    // risking a second quarantineTornSlot pass on what should be
+                    // an immediate close-and-rethrow.
+                    boolean quarantined = constructed.quarantined;
+                    CursorSendEngine cursorEngine = constructed.engine;
                     int actualErrorInboxCapacity = errorInboxCapacity != PARAMETER_NOT_SET_EXPLICITLY
                             ? errorInboxCapacity
                             : io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher.DEFAULT_CAPACITY;
@@ -1714,7 +1698,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                                     actualConnectionListenerInboxCapacity,
                                     actualMaxFrameRejections,
                                     actualPoisonMinEscalationWindowMillis,
-                                    actualCatchUpCapGapMinEscalationWindowMillis
+                                    actualCatchUpCapGapMinEscalationWindowMillis,
+                                    symbolDictReset,
+                                    actualSymbolDictResetThreshold,
+                                    actualSymbolDictResetMaxWaitMillis
                             );
                         } catch (UnreplayableSlotException e) {
                             // The one failure build() recovers from. The slot's frames reference ids
@@ -1767,6 +1754,24 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 // dispatcher daemon, drainer pool, microbatch buffers and
                 // WebSocketClient inside the abandoned `connected`.
                 connected.setTransactional(transactional);
+                final String rebuildSfDir = sfDir;
+                final String rebuildSenderId = senderId;
+                final SenderErrorHandler buildTimeHandler = errorHandler;
+                connected.setEngineRebuildFactory(new QwpWebSocketSender.EngineRebuildFactory() {
+                    @Override
+                    public CursorSendEngine rebuild() {
+                        return rebuild(buildTimeHandler);
+                    }
+
+                    @Override
+                    public CursorSendEngine rebuild(SenderErrorHandler liveHandler) {
+                        return LineSenderBuilder.constructEngineOnSlot(
+                                rebuildSfDir, rebuildSenderId, slotPath,
+                                actualSfMaxSegmentBytes, actualSfMaxTotalBytes,
+                                actualSfAppendDeadlineNanos, actualSfSyncIntervalNanos,
+                                liveHandler);
+                    }
+                });
                 try {
                     // Install the drainer listener BEFORE startOrphanDrainers
                     // below: drainers must see the listener at submit time so
@@ -1899,6 +1904,116 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 throw new LineSenderException("catch_up_cap_gap_min_escalation_window_millis must be >= 0: ").put(millis);
             }
             this.catchUpCapGapMinEscalationWindowMillis = millis;
+            return this;
+        }
+
+        /**
+         * Enables periodic recycling (rebuilding) of the sender's symbol dictionary
+         * once it reaches {@link #symbolDictResetThreshold(int)} distinct symbols,
+         * so a long-lived sender's dictionary does not grow without bound.
+         * <p>
+         * The recycle itself runs at a {@code table()} call that finds the backlog
+         * already acknowledged. A recycle armed longer than
+         * {@link #symbolDictResetMaxWaitMillis(long)} without such a call pauses
+         * one {@code table()} call for up to that long to drain the backlog; if
+         * the backlog still does not drain, the recycle stays armed and under
+         * sustained saturation may be deferred indefinitely (see
+         * {@link Sender#resetSymbolDictionary()}).
+         * <p>
+         * Switching it off also disables the manual valve:
+         * {@link Sender#resetSymbolDictionary()} becomes a permanent no-op,
+         * because arming gates on this knob.
+         * <p>
+         * Switching it off removes the only bound on dictionary growth below
+         * the hard cap ({@link io.questdb.client.cutlass.qwp.protocol.QwpConstants#MAX_SYMBOL_DICTIONARY_SIZE},
+         * 2,000,000). Servers released before QuestDB 10.0.0 cap the
+         * dictionary at 1,000,000 and reject anything beyond it as a terminal
+         * parse error, so with the recycle off against a pre-10.0.0 server
+         * keep symbol cardinality below 1M.
+         * <p>
+         * Default {@code true} (on). WebSocket transport only.
+         */
+        public LineSenderBuilder symbolDictReset(boolean enabled) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("symbol_dict_reset is only supported for WebSocket transport");
+            }
+            this.symbolDictReset = enabled;
+            return this;
+        }
+
+        /**
+         * Number of distinct symbols the sender's dictionary may accumulate before
+         * {@link #symbolDictReset(boolean)} triggers a recycle. Each recycle raises
+         * the effective bar to {@code max(threshold, 2 x dictionary size at the swap)},
+         * capped at half of {@link QwpConstants#MAX_SYMBOL_DICTIONARY_SIZE}, so a
+         * bounded live set larger than the threshold recycles once and settles
+         * instead of recycling on every refill. The bar never drops, a manual
+         * {@link Sender#resetSymbolDictionary()} swap included. Must be greater than
+         * {@code 0} and no larger than half of {@link QwpConstants#MAX_SYMBOL_DICTIONARY_SIZE}
+         * (the re-arm floor's own cap): arming happens at a flush tail and the swap at the
+         * next drained {@code table(...)} call, so a threshold nearer the protocol cap would
+         * hit the cap error before any recycle could run.
+         * <p>
+         * Default {@code 100_000}. WebSocket transport only.
+         */
+        public LineSenderBuilder symbolDictResetThreshold(int threshold) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("symbol_dict_reset_threshold is only supported for WebSocket transport");
+            }
+            if (threshold <= 0 || threshold > QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE / 2) {
+                throw new LineSenderException("symbol_dict_reset_threshold must be > 0 and <= ")
+                        .put(QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE / 2).put(": ").put(threshold);
+            }
+            this.symbolDictResetThreshold = threshold;
+            return this;
+        }
+
+        /**
+         * Upper bound, in milliseconds, on how long a triggered symbol-dictionary
+         * recycle stays armed before it may block the calling thread to force
+         * progress. Once a recycle has been armed for longer than this window
+         * without an opportunistic (idle) drain, the NEXT row-start call
+         * ({@code table(...)}) BLOCKS the producing thread for up to this many
+         * millis waiting for the outstanding backlog to drain, then recycles
+         * before returning. A producer that keeps frames in flight at every row
+         * start never exposes a drained instant on its own; on a healthy link
+         * the pause is about one acknowledgement round trip, because the paused
+         * producer stops refilling the backlog. If the backlog still has not
+         * drained by the deadline (an outage, or a producer that outruns the
+         * wire), that call gives up (logging a warning) and the recycle stays
+         * armed for a later opportunistic retry. At most one blocking wait
+         * happens per armed window, so an outage costs the producer one bounded
+         * pause, and a timeout during that one wait leaves the recycle waiting
+         * for a row start that finds the backlog drained on its own.
+         * <p>
+         * {@code 0} disables blocking entirely (opportunistic-only): the recycle
+         * then only ever runs when a {@code table(...)} call finds the backlog
+         * already drained, and under sustained load it may be deferred
+         * indefinitely. To detect a recycle that never finds its drained
+         * instant, sample {@code QwpWebSocketSender.isResetArmed()} together
+         * with {@code getSymbolDictEpoch()} and
+         * {@code getSymbolDictResetStarvationTimeouts()}: armed staying
+         * {@code true} while the epoch does not advance means no row start
+         * observes a drained backlog. Either raise this value, or drain
+         * explicitly ({@code drain(...)}) at a quiet point of your choosing.
+         * <p>
+         * The default is kept below the sender pool's acquire timeout: a pooled
+         * sender inherits an armed recycle at give-back, and the next borrower
+         * may pay this wait while holding its lease.
+         * <p>
+         * Default {@code 2_000}. WebSocket transport only.
+         */
+        public LineSenderBuilder symbolDictResetMaxWaitMillis(long maxWaitMillis) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("symbol_dict_reset_max_wait_millis is only supported for WebSocket transport");
+            }
+            if (maxWaitMillis < 0) {
+                throw new LineSenderException("symbol_dict_reset_max_wait_millis must be >= 0: ").put(maxWaitMillis);
+            }
+            if (maxWaitMillis > Long.MAX_VALUE / 1_000_000L) {
+                throw new LineSenderException("symbol_dict_reset_max_wait_millis is out of range: ").put(maxWaitMillis);
+            }
+            this.symbolDictResetMaxWaitMillis = maxWaitMillis;
             return this;
         }
 
@@ -3200,6 +3315,135 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
+         * Result of {@link #constructEngineOnSlotLocked}: the constructed engine, plus
+         * whether construction itself had to quarantine a torn slot to produce it.
+         * {@link #build} folds {@code quarantined} into its own connect-loop retry
+         * guard, so a construction-time quarantine still counts toward the one
+         * quarantine build() allows per attempt -- the invariant a single shared
+         * {@code quarantined} local enforced before this method existed.
+         */
+        static final class ConstructedEngine {
+            final CursorSendEngine engine;
+            final boolean quarantined;
+
+            ConstructedEngine(CursorSendEngine engine, boolean quarantined) {
+                this.engine = engine;
+                this.quarantined = quarantined;
+            }
+        }
+
+        /**
+         * Constructs a {@code CursorSendEngine} on {@code slotPath}, quarantining a torn
+         * slot exactly as {@link #build}'s connect loop does when the constructor itself
+         * hits a terminal recovery verdict. Assumes the caller already holds
+         * {@code slotPath}'s logical lock (or {@code slotPath == null}, memory mode).
+         */
+        static ConstructedEngine constructEngineOnSlotLocked(
+                String sfDir, String senderId, String slotPath,
+                long maxSegmentBytes, long maxTotalBytes,
+                long appendDeadlineNanos, long syncIntervalNanos,
+                SenderErrorHandler errorHandler) {
+            // The constructor's own recovery seed can also fail terminally, and
+            // not only as UnreplayableSlotException: when SegmentRing.openExisting
+            // had to skip an unreadable segment it throws SfRecoveryException (it
+            // constructs UnreplayableSlotException nowhere), and where it cannot
+            // even prove the chain's identity -- no manifest -- it quarantines the
+            // corrupt files and returns an EMPTY recovery rather than refusing.
+            // Either way the frame range cannot be shown already-acked, so recovery
+            // sets the slot aside rather than risk seeding the ack cursor past
+            // frames that were never delivered. All three types below are load
+            // bearing; narrowing this catch to UnreplayableSlotException would
+            // restore the permanent build() brick for the segment-skip case. That verdict gets
+            // the same quarantine-and-continue treatment as build()'s connect()-time
+            // verdict; for build() the construction runs outside its retry loop, and
+            // for a recycle rebuild there is no loop at all.
+            // quarantineTornSlot(null, ...) renames the WHOLE slot directory aside
+            // (not just the unreadable segment file) before building the replacement
+            // at the original slotPath, so the replacement starts on a genuinely empty
+            // directory with nothing left to skip -- it cannot throw the same way
+            // twice, which is what makes looping unnecessary here.
+            boolean quarantined = false;
+            CursorSendEngine cursorEngine;
+            try {
+                try {
+                    cursorEngine = new CursorSendEngine(
+                            slotPath, maxSegmentBytes,
+                            maxTotalBytes, appendDeadlineNanos,
+                            syncIntervalNanos);
+                } catch (SfSanitizedResidueException first) {
+                    // NOT terminal, and it must be intercepted ahead of its
+                    // SfRecoveryException parent below. Recovery durably zeroed
+                    // proven-dead sealed residue BEFORE failing closed, so the
+                    // chain on disk is already healed: quarantining here would
+                    // set aside a slot whose backlog replays perfectly. Retry
+                    // once over the healed chain; a repeat is genuine and takes
+                    // the terminal arm.
+                    LOG.info("sf slot {}: sealed residue sanitized during recovery ({}); "
+                                    + "retrying over the healed chain",
+                            slotPath, first.getMessage());
+                    cursorEngine = new CursorSendEngine(
+                            slotPath, maxSegmentBytes,
+                            maxTotalBytes, appendDeadlineNanos,
+                            syncIntervalNanos);
+                }
+            } catch (UnreplayableSlotException | SfRecoveryException
+                     | MmapSegmentCorruptionException e) {
+                // The terminal recovery verdicts, and the only ones build()
+                // sets a slot aside for. UnreplayableSlotException says the
+                // symbol dictionary cannot be rebuilt from any source;
+                // SfRecoveryException and MmapSegmentCorruptionException say
+                // the durable chain itself is proven corrupt or incomplete.
+                // None of the three clears on a retry, and senderId is stable
+                // with a not-fully-drained slot retained on close -- so
+                // without this arm every restart re-recovers the same slot and
+                // throws again, and the application cannot construct a Sender
+                // at all, not even to BUFFER new rows.
+                //
+                // Deliberately NOT catching plain MmapSegmentException or
+                // SfOperationalException: those are operational (EMFILE,
+                // ENOMEM, an unreadable-but-possibly-intact file). Aborting
+                // startup on them is correct; quarantining on them would
+                // convert a transient into the permanent loss of a healthy
+                // slot's durable frames.
+                if (slotPath == null) {
+                    throw e;
+                }
+                quarantined = true;
+                cursorEngine = quarantineTornSlot(
+                        null, e, sfDir, senderId, slotPath, maxSegmentBytes,
+                        maxTotalBytes, appendDeadlineNanos,
+                        syncIntervalNanos, errorHandler);
+            }
+            return new ConstructedEngine(cursorEngine, quarantined);
+        }
+
+        /**
+         * {@link #constructEngineOnSlotLocked} wrapped in its own narrow acquisition of
+         * {@code slotPath}'s logical lock. {@link #build} itself does not call this --
+         * its own lock spans the connect loop too, see the comment at its call site --
+         * this entry point is for callers that only need a freshly (re)built engine on
+         * an already-owned slot, such as a symbol-dictionary epoch rebuild. Recovery
+         * verdicts still quarantine here exactly as they do under {@link #build} --
+         * that happens inside {@link #constructEngineOnSlotLocked}. Only the
+         * quarantined FLAG is discarded: it exists to seed {@code build}'s connect-loop
+         * retry guard, and a recycle rebuild has no such loop. A rebuild that fails
+         * outright does not latch the sender terminal either; the recycle abandons and
+         * retries on the next send.
+         */
+        static CursorSendEngine constructEngineOnSlot(
+                String sfDir, String senderId, String slotPath,
+                long maxSegmentBytes, long maxTotalBytes,
+                long appendDeadlineNanos, long syncIntervalNanos,
+                SenderErrorHandler errorHandler) {
+            try (SlotLock logicalSlotLock = slotPath == null
+                    ? null : SlotLock.acquireLogical(slotPath)) {
+                return constructEngineOnSlotLocked(sfDir, senderId, slotPath,
+                        maxSegmentBytes, maxTotalBytes, appendDeadlineNanos,
+                        syncIntervalNanos, errorHandler).engine;
+            }
+        }
+
+        /**
          * Sets a slot aside that either connect() (a symbol dictionary that cannot cover its
          * surviving frames, {@code UnreplayableSlotException}) or the
          * {@code CursorSendEngine} constructor itself (a corrupt or incomplete durable
@@ -3307,10 +3551,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             // caller must be able to act on, and LOG.error alone cannot carry it: this client
             // ships slf4j-api with no binding, so an embedding app with no provider gets a NOP
             // logger and the loss is announced nowhere. Deliver it programmatically too, so an
-            // errorHandler can alert / page / record it. Dispatched synchronously here because
-            // the async SenderErrorDispatcher belongs to the connected sender, which does not
-            // exist yet at build time. A throwing handler must not turn a contained outage back
-            // into a failed build, so swallow anything it raises.
+            // errorHandler can alert / page / record it. Dispatched synchronously here: at
+            // build time the async SenderErrorDispatcher does not exist yet, and at a recycle
+            // rebuild a data-loss notice must not be dropped under its inbox pressure. A
+            // throwing handler must not turn a contained outage back into a failed build, so
+            // swallow anything it raises.
             if (errorHandler != null) {
                 try {
                     errorHandler.onError(SenderError.dataLoss(
@@ -3866,6 +4111,30 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     }
                     pos = getValue(configurationString, pos, sink, "catch_up_cap_gap_min_escalation_window_millis");
                     catchUpCapGapMinEscalationWindowMillis(parseLongValue(sink, "catch_up_cap_gap_min_escalation_window_millis"));
+                } else if (Chars.equals("symbol_dict_reset", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("symbol_dict_reset is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "symbol_dict_reset");
+                    if (Chars.equalsIgnoreCase("on", sink)) {
+                        symbolDictReset(true);
+                    } else if (Chars.equalsIgnoreCase("off", sink)) {
+                        symbolDictReset(false);
+                    } else {
+                        throw new LineSenderException("invalid symbol_dict_reset [value=").put(sink).put(", allowed-values=[on, off]]");
+                    }
+                } else if (Chars.equals("symbol_dict_reset_threshold", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("symbol_dict_reset_threshold is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "symbol_dict_reset_threshold");
+                    symbolDictResetThreshold(parseIntValue(sink, "symbol_dict_reset_threshold"));
+                } else if (Chars.equals("symbol_dict_reset_max_wait_millis", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("symbol_dict_reset_max_wait_millis is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "symbol_dict_reset_max_wait_millis");
+                    symbolDictResetMaxWaitMillis(parseLongValue(sink, "symbol_dict_reset_max_wait_millis"));
                 } else if (Chars.equals("initial_connect_retry", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException("initial_connect_retry is only supported for WebSocket transport");
@@ -4141,6 +4410,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 if (view.has("catch_up_cap_gap_min_escalation_window_millis")) {
                     catchUpCapGapMinEscalationWindowMillis(wsLong(view, v, "catch_up_cap_gap_min_escalation_window_millis"));
                 }
+                if (view.has("symbol_dict_reset_threshold")) {
+                    symbolDictResetThreshold(wsInt(view, v, "symbol_dict_reset_threshold"));
+                }
+                if (view.has("symbol_dict_reset_max_wait_millis")) {
+                    symbolDictResetMaxWaitMillis(wsLong(view, v, "symbol_dict_reset_max_wait_millis"));
+                }
                 if (view.has("sf_append_deadline_millis")) {
                     sfAppendDeadlineMillis(wsLong(view, v, "sf_append_deadline_millis"));
                 }
@@ -4208,6 +4483,16 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         initialConnectMode(InitialConnectMode.ASYNC);
                     } else {
                         throw new LineSenderException("invalid initial_connect_retry [value=").put(s).put(", allowed-values=[on, off, true, false, sync, async]]");
+                    }
+                }
+                s = view.getStr("symbol_dict_reset");
+                if (s != null) {
+                    if (s.equalsIgnoreCase("on")) {
+                        symbolDictReset(true);
+                    } else if (s.equalsIgnoreCase("off")) {
+                        symbolDictReset(false);
+                    } else {
+                        throw new LineSenderException("invalid symbol_dict_reset [value=").put(s).put(", allowed-values=[on, off]]");
                     }
                 }
                 return this;
@@ -4325,6 +4610,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             m.put("max_frame_rejections", maxFrameRejections);
             m.put("poison_min_escalation_window_millis", poisonMinEscalationWindowMillis);
             m.put("catch_up_cap_gap_min_escalation_window_millis", catchUpCapGapMinEscalationWindowMillis);
+            m.put("symbol_dict_reset", symbolDictReset);
+            m.put("symbol_dict_reset_threshold", symbolDictResetThreshold);
+            m.put("symbol_dict_reset_max_wait_millis", symbolDictResetMaxWaitMillis);
             m.put("error_inbox_capacity", errorInboxCapacity);
             m.put("connection_listener_inbox_capacity", connectionListenerInboxCapacity);
             m.put("token", httpToken);

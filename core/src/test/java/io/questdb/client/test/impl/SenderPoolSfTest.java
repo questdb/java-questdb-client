@@ -139,6 +139,37 @@ public class SenderPoolSfTest {
     }
 
     @Test
+    public void testResetSymbolDictionaryForwardsToPooledDelegate() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                try (SenderPool pool = new SenderPool(config, 1, 1, 5_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    PooledSender pooled = pool.borrow();
+                    try {
+                        QwpWebSocketSender delegate =
+                                (QwpWebSocketSender) pooled.getDelegateForTesting();
+                        Assert.assertFalse("setup: nothing may be armed before the manual request",
+                                delegate.isResetArmed());
+                        // The pooled wrapper must forward the manual valve to the
+                        // live delegate; inheriting Sender's default no-op would
+                        // silently drop the request.
+                        pooled.resetSymbolDictionary();
+                        Assert.assertTrue("resetSymbolDictionary() must reach the pooled delegate",
+                                delegate.isResetArmed());
+                    } finally {
+                        pooled.close();
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
     public void testGrowToMaxAllSfSendersCoexist() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             CountingAckHandler handler = new CountingAckHandler();
