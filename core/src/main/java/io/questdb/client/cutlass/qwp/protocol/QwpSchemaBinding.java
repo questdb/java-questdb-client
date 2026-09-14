@@ -616,6 +616,9 @@ public final class QwpSchemaBinding {
                 case ColumnType.CHAR:
                     column.addShort((short) stringToChar(value));
                     break;
+                case ColumnType.DATE:
+                    appendStringDate(column, name, value, targetType);
+                    break;
                 case ColumnType.TIMESTAMP_MICRO:
                 case ColumnType.TIMESTAMP_NANO:
                     appendStringTimestamp(column, name, value, targetType);
@@ -1411,6 +1414,24 @@ public final class QwpSchemaBinding {
             column.addGeoHash(hash >>> (chars * 5 - precision), precision);
         } catch (NumericException e) {
             throw error(INVALID_VALUE, name, "STRING", targetType, "invalid GEOHASH text");
+        }
+    }
+
+    private void appendStringDate(
+            QwpTableBuffer.ColumnBuffer column,
+            CharSequence name,
+            CharSequence value,
+            int targetType
+    ) {
+        try {
+            long millis = QwpSchemaTimestampParser.parseDate(value);
+            if (millis == Long.MIN_VALUE) {
+                column.addNull();
+            } else {
+                column.addLong(millis);
+            }
+        } catch (NumericException e) {
+            throw error(INVALID_VALUE, name, "STRING", targetType, "invalid DATE text");
         }
     }
 

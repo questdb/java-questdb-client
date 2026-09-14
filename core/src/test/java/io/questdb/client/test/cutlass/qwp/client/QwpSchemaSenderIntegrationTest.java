@@ -872,6 +872,55 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test
+    public void testStringToDateUsesExactTargetWireAndRollback() throws Exception {
+        assertMemoryLeak(() -> {
+            LongTextSchemaHandler handler = new LongTextSchemaHandler(1141, 1151, ColumnType.DATE);
+            try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
+                sender.table("events").stringColumn("value", null);
+                sender.binaryColumn("value", new byte[]{1}).atNow();
+
+                sender.table("events").stringColumn("failed_b", "123e4567-e89b-12d3-a456-426614174000");
+                try {
+                    sender.stringColumn("value", "not-a-date");
+                    Assert.fail("expected DATE parse error");
+                } catch (LineSenderSchemaException e) {
+                    Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
+                }
+
+                sender.stringColumn("value", "1969-12-31").atNow();
+                sender.flush();
+                new FrameReader(handler.awaitDataFrame())
+                        .stringDateTable("events", 1141, 1151, -86_400_000L);
+                Assert.assertEquals(2, handler.describeRequests.get());
+            }
+        });
+    }
+
+    @Test
+    public void testDateGenerationRemainsPinnedBeforeVarcharRebind() throws Exception {
+        assertMemoryLeak(() -> {
+            LongTextSchemaHandler handler = new LongTextSchemaHandler(1161, 1171, ColumnType.DATE);
+            try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
+                sender.table("events").stringColumn("value", "1970-01-01").atNow();
+                handler.targetType = ColumnType.VARCHAR;
+                handler.version = 1172;
+                sender.table("events");
+                try {
+                    sender.stringColumn("value", "native-a");
+                    Assert.fail("expected target-changing schema refresh");
+                } catch (LineSenderSchemaException e) {
+                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                }
+                sender.stringColumn("value", "native-a").atNow();
+                sender.flush();
+                new FrameReader(handler.awaitDataFrame())
+                        .twoDateAndVarcharBlocks("events", 1161, 1171, 1172);
+                Assert.assertEquals(2, handler.describeRequests.get());
+            }
+        });
+    }
+
+    @Test
     public void testVarcharGenerationRemainsPinnedBeforeTimestampRebind() throws Exception {
         assertMemoryLeak(() -> {
             LongTextSchemaHandler handler = new LongTextSchemaHandler(321, 331, ColumnType.VARCHAR);
@@ -2839,6 +2888,36 @@ public class QwpSchemaSenderIntegrationTest {
             byte[] actual = new byte[expected.length];
             in.get(actual);
             Assert.assertArrayEquals(expected, actual);
+            eof();
+        }
+
+        private void stringDateTable(
+                String table, int tableId, long version, long expectedValue
+        ) {
+            messageHeader(1);
+            Assert.assertEquals(0, varint());
+            Assert.assertEquals(0, varint());
+            schemaBlockHeader(table, tableId, version, 2, "value", QwpConstants.TYPE_DATE);
+            Assert.assertEquals(1, u8());
+            Assert.assertEquals(1, u8());
+            Assert.assertEquals(expectedValue, i64());
+            eof();
+        }
+
+        private void twoDateAndVarcharBlocks(
+                String table, int tableId, long firstVersion, long secondVersion
+        ) {
+            messageHeader(2);
+            Assert.assertEquals(0, varint());
+            Assert.assertEquals(0, varint());
+            schemaBlockHeader(table, tableId, firstVersion, 1, "value", QwpConstants.TYPE_DATE);
+            Assert.assertEquals(0, u8());
+            Assert.assertEquals(0, i64());
+            schemaBlockHeader(table, tableId, secondVersion, 1, "value", QwpConstants.TYPE_VARCHAR);
+            Assert.assertEquals(0, u8());
+            Assert.assertEquals(0, in.getInt());
+            Assert.assertEquals(8, in.getInt());
+            Assert.assertEquals("native-a", stringBytes(8));
             eof();
         }
 

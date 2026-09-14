@@ -196,7 +196,7 @@ public class QwpSchemaBindingStringNumericTest {
     public void testUnsupportedParameterizedUnknownAndDesignatedTargets() {
         try (QwpTableBuffer buffer = new QwpTableBuffer("t")) {
             QwpSchemaBinding binding = binding(buffer, -1,
-                    column("bool", ColumnType.BOOLEAN), column("date", ColumnType.DATE),
+                    column("bool", ColumnType.BOOLEAN), column("date", ColumnType.DATE, new byte[]{1}),
                     column("future", ColumnType.INT, new byte[]{1}),
                     column("flagged", ColumnType.LONG | 0x10000));
             assertSchemaError(LineSenderSchemaException.Reason.INVALID_VALUE, "bool", "BOOLEAN", () -> binding.stringColumn("bool", "2"));

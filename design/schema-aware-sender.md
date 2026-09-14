@@ -1,10 +1,10 @@
 # Schema-aware sender: schema-directed encoding
 
-Status: implemented on the development branch, revision 66. Scope: QWP v1 over
+Status: implemented on the development branch, revision 67. Scope: QWP v1 over
 WebSocket, with an automatically negotiated schema extension, legacy-server
 compatibility and companion server changes. The committed baseline contains the
-protocol, Sender integration and conversions through iteration 2.42. Iteration
-2.43 (INT-to-IPv4) is locally validated. A released-binary
+protocol, Sender integration and conversions through iteration 2.43. Iteration
+2.44 (STRING-to-DATE) is locally validated. A released-binary
 compatibility gate is implemented and locally green. The remaining public-setter
 conversion contract is not complete.
 
@@ -39,9 +39,9 @@ server-side failures can still reject a batch.
 
 ## Implementation status
 
-Current checkpoint: iteration 2.43 adds INT input to an IPv4 target. Its
-pre-iteration baseline is client `1630c04775` and server `50d487e8b5`, whose
-submodule pins that exact client revision. INT-to-IPv4 is the current locally
+Current checkpoint: iteration 2.44 adds STRING input to a DATE target. Its
+pre-iteration baseline is client `19557e2f` and server `5338ac0845`, whose
+submodule pins that exact client revision. STRING-to-DATE is the current locally
 validated increment.
 The wider conversion inventory below is not complete; this is not release acceptance.
 
@@ -187,6 +187,21 @@ for IPv4, so this is not a general integer/address conversion. Exact-wire tests,
 public-Sender ingestion, partial-row rollback, parameter rejection and a
 DECIMAL-to-IPv4 schema rebind cover the slice. D064 records the decision and
 evidence.
+
+STRING input now selects target-native DATE wire representation after local
+parsing. It preserves the server's current five-step grammar order: PostgreSQL
+date-time, date-only, date with zone, date-time with milliseconds and zone,
+UTC date-time with exactly three fractional digits, then raw epoch
+milliseconds. `Long.MIN_VALUE`, whether parsed as raw text or produced by
+calendar arithmetic, becomes a bitmap NULL. The parser reuses the existing
+timestamp calendar and timezone tables with millisecond arithmetic; it does
+not add a general format compiler or allocate a date object per value. A narrow
+guard rejects an extreme negative-year/named-zone case where the current server
+throws an unchecked exception instead of returning a conversion error. A
+53-case shared corpus, a 100,015-input differential over the server's normal
+return/error domain, exact wire checks, public-Sender ingestion, partial-row
+rollback and a DATE-to-VARCHAR generation rebind cover the slice. D065 records
+the decision and evidence.
 
 Iteration 2.15 is accepted as a bounded, unreleased Sender integration.
 Public setters select the negotiated mode, use server-directed conversions,
@@ -964,8 +979,8 @@ when the table or column is absent.
 ## Conversion backlog (server-source audit)
 
 Cross-checked on 2026-09-11 after iteration 2.13, with implemented coverage
-refreshed through iteration 2.43 on 2026-09-14. The pre-iteration baseline is
-client `1630c04775` and server `50d487e8b5`, whose submodule pins that exact
+refreshed through iteration 2.44 on 2026-09-14. The pre-iteration baseline is
+client `19557e2f` and server `5338ac0845`, whose submodule pins that exact
 client revision. The original audit bases were client
 `981bdb02a471f3b290c89b8e78cbc422610e329e` and server
 `12a33d651e51e2682e7a448c8db5168fc72dfad3`. The matrix is a source audit;
@@ -1000,7 +1015,7 @@ non-null conversion. Known compatibility exceptions above still apply.
 | `intColumn` (INT) | Numeric, DATE, timestamps, text, SYMBOL, decimals, IPv4 | None |
 | `longColumn` (LONG) | Numeric, text, SYMBOL, DATE, timestamps, decimals | None |
 | `floatColumn`, `doubleColumn` (FLOAT, DOUBLE) | Numeric, text, SYMBOL, decimals | None |
-| `stringColumn` (VARCHAR) | BOOLEAN, numeric, text, SYMBOL, UUID, BINARY, timestamps, CHAR, LONG256, geohash, decimals | DATE |
+| `stringColumn` (VARCHAR) | BOOLEAN, numeric, text, SYMBOL, UUID, BINARY, DATE, timestamps, CHAR, LONG256, geohash, decimals | None |
 | `symbol` (SYMBOL) | Text, SYMBOL | None |
 | `timestampColumn(long, unit)` (TIMESTAMP or TIMESTAMP_NANOS) | Timestamps, text | None |
 | `timestampColumn(Instant)` (currently TIMESTAMP micros in legacy Sender) | Timestamps, preserving nanos for the schema-mode nano target; text | None |
@@ -1019,7 +1034,8 @@ DATE also exists as a wire input, but there is no public WebSocket `dateColumn`
 setter. The server accepts DATE-to-DATE and DATE-to-text only. Neither has a
 binding entrypoint today; record this wire-only coverage without adding a new
 public API just to mirror the protocol. DATE **targets** from existing integer
-setters are implemented in iteration 2.40; STRING-to-DATE remains missing.
+setters are implemented in iteration 2.40; STRING-to-DATE is implemented in
+iteration 2.44.
 
 The binding still lacks target representation selection for arrays and rejects
 extension parameters. Adding array append code alone therefore does not
@@ -1730,6 +1746,14 @@ They do not change the compatibility contract.
     INT null and IPv4 zero to the target bitmap, then append every other bit
     pattern through the existing IPv4 column. Do not add address parsing,
     widening, an address object or a general numeric-to-IPv4 rule.
+26. **Extend the fixed temporal parser, not the abstraction surface.** DATE
+    needs the server's five fixed parse attempts and millisecond arithmetic.
+    Reuse the timestamp parser's calendar and timezone metadata, while keeping
+    DATE's grammar order, raw-millisecond fallback and null sentinel explicit.
+    Do not add a format compiler, `Instant`/date object allocation, retained
+    parser state or another conversion registry. Reject the one proven
+    extreme-year/named-zone server crash precisely; do not turn it into a
+    general defensive validation layer.
 
 These opportunities do not justify a per-setter opt-out, raw-value fallback or
 send-time transformation. Partial activation is permitted on the unreleased
@@ -1745,7 +1769,7 @@ implementation and its tests together. Do not wait for negotiation,
 compatibility and all converters to be implemented before exercising the
 complete client-to-server path. Reuse the existing test infrastructure.
 
-### Plan after iteration 2.43
+### Plan after iteration 2.44
 
 The permanent compatibility gate is implemented. It launches released and
 current artifacts as separate processes and checks these observable contracts:
@@ -1794,12 +1818,18 @@ target width through the established exact integer-decimal tail. The target's
 declared precision and scale control rescaling and storage; no new decimal
 representation or server production code was added.
 
-Iteration 2.43 is complete locally: INT selects target-native IPv4 storage,
+Iteration 2.43 is committed: INT selects target-native IPv4 storage,
 normalizing the INT and IPv4 null sentinels without adding parsing, allocation
 or a general numeric/address conversion.
 
-The next bounded slice is STRING-to-DATE parsing. DOUBLE arrays follow only
-after rank metadata is proven end to end.
+Iteration 2.44 is complete locally: STRING parses through the server's fixed
+DATE grammar sequence and selects target-native DATE storage. Calendar and
+timezone mechanics are reused from the existing fixed timestamp parser; no
+general date-format framework was added.
+
+The final intentional conversion slice is DOUBLE-array identity. Implement it
+only after proving the rank metadata and every public array representation end
+to end; rank and shape validation are part of the conversion contract.
 BINARY-to-parser conversions, LONG_ARRAY, non-ASCII
 CHAR-to-VARCHAR and malformed decimal metadata remain server-contract decisions,
 not client implementation backlog.

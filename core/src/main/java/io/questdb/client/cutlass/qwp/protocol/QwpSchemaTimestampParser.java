@@ -26,13 +26,19 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * Source-faithful parser for the eleven formats accepted by QWP STRING-to-timestamp conversion.
- * The grammar and computation mirror the fixed formats in the server's
- * {@code MicrosFormatUtils} and {@code GenericMicrosFormat}; this is deliberately
- * not a general date-format compiler.
+ * Source-faithful parser for the fixed formats accepted by QWP STRING-to-timestamp
+ * and STRING-to-DATE conversion. The grammar and computation mirror the server's
+ * {@code MicrosFormatUtils}, {@code DateFormatUtils} and generic format parsers;
+ * this is deliberately not a general date-format compiler.
  */
 final class QwpSchemaTimestampParser {
     private static final long DAY = 86_400_000_000L;
+    private static final long DATE_DAY = 86_400_000L;
+    private static final long DATE_HOUR = 3_600_000L;
+    private static final long DATE_MINUTE = 60_000L;
+    private static final long DATE_SECOND = 1_000L;
+    private static final long[] DATE_MONTH_COMMON = dateMonthStarts(false);
+    private static final long[] DATE_MONTH_LEAP = dateMonthStarts(true);
     private static final int DAYS_0000_TO_1970 = 719527;
     private static final long HOUR = 3_600_000_000L;
     private static final long MINUTE = 60_000_000L;
@@ -56,6 +62,82 @@ final class QwpSchemaTimestampParser {
         } catch (NumericException ignored) {
         }
         throw failure;
+    }
+
+    static long parseDate(CharSequence value) throws NumericException {
+        NumericException failure = NumericException.instance();
+        try {
+            return parsePgDate(value);
+        } catch (NumericException ignored) {
+        }
+        try {
+            return parseUtcDate(value);
+        } catch (NumericException ignored) {
+        }
+        try {
+            return Numbers.parseLong(value);
+        } catch (NumericException ignored) {
+        }
+        throw failure;
+    }
+
+    private static long parsePgDate(CharSequence value) throws NumericException {
+        int n = value.length();
+        int dash = indexOf(value, '-', n > 0 && value.charAt(0) == '-' ? 1 : 0, n);
+        if (dash < 1) {
+            throw NumericException.instance();
+        }
+        int year = greedyInt(value, 0, dash);
+        if (dash == 2) {
+            year += REFERENCE_CENTURY;
+        }
+        int pos = dash + 1;
+        int month = fixedInt(value, pos, pos += 2, n);
+        require(value, pos++, n, '-');
+        int day = fixedInt(value, pos, pos += 2, n);
+        if (pos == n) {
+            return computeDate(year, month, day, 0, 0, 0, 0, null);
+        }
+        require(value, pos++, n, ' ');
+        int tail = pos;
+        try {
+            int hour = fixedInt(value, pos, pos += 2, n);
+            require(value, pos++, n, ':');
+            int minute = fixedInt(value, pos, pos += 2, n);
+            require(value, pos++, n, ':');
+            int second = fixedInt(value, pos, pos += 2, n);
+            int millis = 0;
+            if (pos < n && value.charAt(pos) == '.') {
+                long parsed = greedyMillis(value, pos + 1, n);
+                millis = (int) parsed;
+                pos += 1 + (int) (parsed >>> 32);
+            }
+            return computeDate(year, month, day, hour, minute, second, millis,
+                    ZoneMatcher.parse(value, pos, n));
+        } catch (NumericException ignored) {
+            return computeDate(year, month, day, 0, 0, 0, 0,
+                    ZoneMatcher.parse(value, tail, n));
+        }
+    }
+
+    private static long parseUtcDate(CharSequence value) throws NumericException {
+        int n = value.length();
+        int pos = 0;
+        int year = fixedInt(value, pos, pos += 4, n);
+        require(value, pos++, n, '-');
+        int month = fixedInt(value, pos, pos += 2, n);
+        require(value, pos++, n, '-');
+        int day = fixedInt(value, pos, pos += 2, n);
+        require(value, pos++, n, 'T');
+        int hour = fixedInt(value, pos, pos += 2, n);
+        require(value, pos++, n, ':');
+        int minute = fixedInt(value, pos, pos += 2, n);
+        require(value, pos++, n, ':');
+        int second = fixedInt(value, pos, pos += 2, n);
+        require(value, pos++, n, '.');
+        int millis = fixedInt(value, pos, pos += 3, n);
+        return computeDate(year, month, day, hour, minute, second, millis,
+                ZoneMatcher.parse(value, pos, n));
     }
 
     private static long parseIso(CharSequence value) throws NumericException {
@@ -204,6 +286,27 @@ final class QwpSchemaTimestampParser {
         return zone == null ? out : out - zone.offset(out, p.year);
     }
 
+    private static long computeDate(
+            int year,
+            int month,
+            int day,
+            int hour,
+            int minute,
+            int second,
+            int millis,
+            ZoneMatcher.Zone zone
+    ) throws NumericException {
+        boolean leap = CommonUtils.isLeapYear(year);
+        if (month < 1 || month > 12 || day < 1 || day > CommonUtils.getDaysPerMonth(month, leap)
+                || hour < 0 || hour > 24 || minute < 0 || minute > 59
+                || second < 0 || second > 59) {
+            throw NumericException.instance();
+        }
+        long out = dateYearMillis(year, leap) + dateMonthMillis(month, leap) + (day - 1L) * DATE_DAY
+                + (hour % 24L) * DATE_HOUR + minute * DATE_MINUTE + second * DATE_SECOND + millis;
+        return zone == null ? out : out - zone.offsetMillis(out, year);
+    }
+
     private static int parseFixedYear(CharSequence s, int pos, int hi, Parsed p) throws NumericException {
         int width = pos < hi && s.charAt(pos) == '-' ? 5 : 4;
         p.year = width == 5
@@ -272,6 +375,56 @@ final class QwpSchemaTimestampParser {
             result[i] = result[i - 1] + CommonUtils.getDaysPerMonth(i, leap) * DAY;
         }
         return result;
+    }
+
+    private static long[] dateMonthStarts(boolean leap) {
+        long[] result = new long[12];
+        for (int i = 1; i < 12; i++) {
+            result[i] = result[i - 1] + CommonUtils.getDaysPerMonth(i, leap) * DATE_DAY;
+        }
+        return result;
+    }
+
+    private static long dateMonthMillis(int month, boolean leap) {
+        return (leap ? DATE_MONTH_LEAP : DATE_MONTH_COMMON)[month - 1];
+    }
+
+    private static long dateYearMillis(int year, boolean leap) {
+        int leapYears = year / 100;
+        if (year < 0) {
+            leapYears = ((year + 3) >> 2) - leapYears + ((leapYears + 3) >> 2) - 1;
+        } else {
+            leapYears = (year >> 2) - leapYears + (leapYears >> 2);
+            if (leap) {
+                leapYears--;
+            }
+        }
+        return (year * 365L + leapYears - DAYS_0000_TO_1970) * DATE_DAY;
+    }
+
+    private static int dateDayOfWeek(long millis) {
+        long d;
+        if (millis > -1) {
+            d = millis / DATE_DAY;
+        } else {
+            d = (millis - (DATE_DAY - 1)) / DATE_DAY;
+            if (d < -3) {
+                return 7 + (int) ((d + 4) % 7);
+            }
+        }
+        return 1 + (int) ((d + 3) % 7);
+    }
+
+    private static long nextDateOrSame(long millis, int dow) {
+        int current = dateDayOfWeek(millis);
+        return current <= dow ? millis + (dow - current) * DATE_DAY
+                : millis + (7 - current + dow) * DATE_DAY;
+    }
+
+    private static long previousDateOrSame(long millis, int dow) {
+        int current = dateDayOfWeek(millis);
+        return current >= dow ? millis - (current - dow) * DATE_DAY
+                : millis - (7 + current - dow) * DATE_DAY;
     }
 
     private static long monthMicros(int month, boolean leap) {
@@ -561,6 +714,36 @@ final class QwpSchemaTimestampParser {
                 return rules.getOffset(instant).getTotalSeconds() * SECOND;
             }
 
+            private long offsetMillis(long epoch, int year) throws NumericException {
+                if (fixedOffset != Long.MIN_VALUE) {
+                    return fixedOffset / 1000L;
+                }
+                long cutoffMillis = cutoff == Long.MIN_VALUE ? Long.MIN_VALUE : cutoff / 1000L;
+                if (!recurring.isEmpty() && epoch > cutoffMillis) {
+                    // The server's recurring-rule cache rejects negative year keys. This can
+                    // only be reached after full-width DATE arithmetic wraps past its cutoff;
+                    // reject it as an invalid value instead of silently accepting bytes that
+                    // the server's STRING conversion cannot produce.
+                    if (year < 0) {
+                        throw NumericException.instance();
+                    }
+                    long after = 0;
+                    for (ZoneOffsetTransitionRule rule : recurring) {
+                        long transition = transitionEpochMillis(rule, year);
+                        long before = rule.getOffsetBefore().getTotalSeconds() * DATE_SECOND;
+                        if (epoch < transition) {
+                            return before;
+                        }
+                        after = rule.getOffsetAfter().getTotalSeconds() * DATE_SECOND;
+                    }
+                    return after;
+                }
+                if (epoch > cutoffMillis) {
+                    return lastWall / 1000L;
+                }
+                return rules.getOffset(Instant.ofEpochMilli(epoch)).getTotalSeconds() * DATE_SECOND;
+            }
+
             private static long transitionEpoch(ZoneOffsetTransitionRule rule, int year) {
                 boolean leap = CommonUtils.isLeapYear(year);
                 int month = rule.getMonth().getValue();
@@ -593,6 +776,42 @@ final class QwpSchemaTimestampParser {
                     timestamp += (before - rule.getStandardOffset().getTotalSeconds()) * SECOND;
                 }
                 return timestamp - before * SECOND;
+            }
+
+            private static long transitionEpochMillis(ZoneOffsetTransitionRule rule, int year) {
+                boolean leap = CommonUtils.isLeapYear(year);
+                int month = rule.getMonth().getValue();
+                int dom = rule.getDayOfMonthIndicator();
+                int dow = rule.getDayOfWeek() == null ? -1 : rule.getDayOfWeek().getValue();
+                long timestamp;
+                if (dom < 0) {
+                    timestamp = dateYearMillis(year, leap) + dateMonthMillis(month, leap)
+                            + (CommonUtils.getDaysPerMonth(month, leap) + dom) * DATE_DAY
+                            + rule.getLocalTime().getHour() * DATE_HOUR
+                            + rule.getLocalTime().getMinute() * DATE_MINUTE
+                            + rule.getLocalTime().getSecond() * DATE_SECOND;
+                    if (dow > -1) {
+                        timestamp = previousDateOrSame(timestamp, dow);
+                    }
+                } else {
+                    timestamp = dateYearMillis(year, leap) + dateMonthMillis(month, leap) + (dom - 1L) * DATE_DAY
+                            + rule.getLocalTime().getHour() * DATE_HOUR
+                            + rule.getLocalTime().getMinute() * DATE_MINUTE
+                            + rule.getLocalTime().getSecond() * DATE_SECOND;
+                    if (dow > -1) {
+                        timestamp = nextDateOrSame(timestamp, dow);
+                    }
+                }
+                if (rule.isMidnightEndOfDay()) {
+                    timestamp += DATE_DAY;
+                }
+                int before = rule.getOffsetBefore().getTotalSeconds();
+                if (rule.getTimeDefinition() == ZoneOffsetTransitionRule.TimeDefinition.UTC) {
+                    timestamp += before * DATE_SECOND;
+                } else if (rule.getTimeDefinition() == ZoneOffsetTransitionRule.TimeDefinition.STANDARD) {
+                    timestamp += (before - rule.getStandardOffset().getTotalSeconds()) * DATE_SECOND;
+                }
+                return timestamp - before * DATE_SECOND;
             }
         }
     }

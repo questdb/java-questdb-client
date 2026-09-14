@@ -7653,3 +7653,68 @@ target-native IPv4 representation before persistence. Exact public wire tests
 prove those bytes, while the unchanged schema-frame replay suite remains green.
 An INT-specific recovery test would repeat the already covered opaque-frame
 persistence contract.
+
+## D065 — STRING-to-DATE mirrors the fixed server grammar before buffering
+
+Status: iteration 2.44 implemented and locally validated, 2026-09-14. Design
+revision 67. The pre-iteration baseline is client `19557e2f` and server
+`5338ac0845`, whose submodule pins that exact client revision. Neither
+repository is committed by this decision record.
+
+`stringColumn` now accepts an ordinary DATE target in schema mode. It attempts
+the same formats, in the same order, as the current server's
+`DateFormatUtils.parseDate`: PostgreSQL date-time, date-only, date plus zone,
+date-time with milliseconds plus zone, UTC date-time with exactly three
+fractional digits, then a raw signed epoch-millisecond long. Successful values
+are appended as target-native `TYPE_DATE`; `Long.MIN_VALUE` becomes an explicit
+bitmap NULL. Missing columns still infer VARCHAR. A parameterized DATE and a
+designated DATE remain rejected.
+
+The implementation extends the existing fixed timestamp parser with DATE's
+five parse attempts and millisecond calendar/timezone arithmetic. It reuses the
+same immutable JDK-derived timezone metadata and performs no per-value date
+object allocation. It does not add a general format compiler, converter
+registry, retained parser state, protocol field or server production change.
+One precise guard rejects negative parsed years that wrap beyond a dynamic
+zone's recurring-rule cutoff. Current server source otherwise reaches
+`ConcurrentIntHashMap` with a negative year key and throws unchecked
+`IllegalArgumentException`; schema mode must report a typed invalid value
+instead of accepting bytes the legacy conversion cannot produce. This is a
+bounded compatibility guard, not a general defensive layer.
+
+Client and server consume the same 53-case corpus, SHA-256
+`048c9360eb48eeda7785c7a0accc72ef3f87361ea9219fc7c6bddafa92f2f3a9`.
+It covers raw long forms and the null sentinel, every grammar, numeric and
+named zones, daylight-saving gaps and overlaps, hour 24, greedy fractional
+milliseconds, year zero and negative years, wrapping arithmetic, invalid
+calendar/time fields, missing or unknown zones, trailing input and Unicode
+digits. A deterministic 100,015-input differential matches the current server
+through its normal return/error domain. The server's unchecked extreme-year
+named-zone crash is separately pinned as a local typed rejection.
+
+Component tests assert exact DATE wire type, bitmap and raw millisecond values
+for the corpus, plus duplicate, omission, rollback, reset, inference and target
+metadata errors. Public socket tests prove exact target wire and rollback, and
+that a completed DATE block retains its schema snapshot before the next block
+rebinds to VARCHAR. Real-server tests write every valid corpus value through
+public Sender calls, wait for ACK, drain WAL and compare exact raw DATE values
+and nullness; a second A/error/C test proves partial-row cancellation. The
+existing successful DATE coercion test and its now-local public rejection test
+also pass: four focused server tests total.
+
+Expanded client acceptance passes 443 tests with zero failures, errors or
+skips. Packaged-JAR verification passes the three DATE component tests and both
+packaging integration tests. The released-binary matrix passes current client
+to QuestDB 10.0.1 in legacy mode, client 1.3.9 to current server in legacy mode,
+and current client to current server in schema mode. Current artifact hashes
+are client `58836b2fb469c87e264ff2d5f1a7f17f8e6ff9ad5ace3f6f0e5014034b44022d`
+and server `dec115136d83b45f4f390bee7b50337fb0da7ee93cd6ae6c0427c0794fe31ce9d`;
+the run used `/mnt/pcie5/qwp-string-date-compat/run.OpLD7e`.
+
+The full `QwpSenderE2ETest` remains diagnostic: its intentional conversion
+error count falls from 33 to 32 because both DATE tests are now green. That run
+also encountered two independent server `No space left` errors and produced
+cascading assertion failures, so its unrelated failure count is not acceptance
+evidence. The final intentional conversion implementation left is ranked
+DOUBLE-array identity. BINARY parser paths, LONG_ARRAY, non-ASCII CHAR text and
+malformed decimal metadata remain explicit server-contract decisions.
