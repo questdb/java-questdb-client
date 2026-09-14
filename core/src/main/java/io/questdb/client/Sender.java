@@ -674,6 +674,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     /**
      * Add a LONG256 column value, packed as four 64-bit words, least-significant first
      * (so the 256-bit value is {@code (l3 << 192) | (l2 << 128) | (l1 << 64) | l0}).
+     * In schema-aware mode, setting all four words to {@link Long#MIN_VALUE}
+     * writes SQL NULL. Any other combination, including a partial match, is a value.
+     * Legacy mode preserves its existing behavior: the four words are emitted as
+     * native LONG256 wire data and server-side null/conversion handling applies.
      *
      * @param name name of the column
      * @param l0   bits 0..63 (least significant)

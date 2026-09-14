@@ -474,6 +474,30 @@ public final class QwpSchemaBinding {
         return this;
     }
 
+    public QwpSchemaBinding long256Column(CharSequence name, long l0, long l1, long l2, long l3) {
+        buffer.requireSchemaBinding(this);
+        int index = targetIndex(name, "LONG256");
+        int targetType = targetType(index, ColumnType.LONG256);
+        QwpTableBuffer.ColumnBuffer column = targetColumn(name, "LONG256", index, targetType);
+        if (column == null) {
+            return this;
+        }
+        if (targetType != ColumnType.LONG256
+                && targetType != ColumnType.STRING
+                && targetType != ColumnType.VARCHAR) {
+            throw unsupported(name, "LONG256", targetType, "conversion is not implemented");
+        }
+        if (l0 == Long.MIN_VALUE && l1 == Long.MIN_VALUE
+                && l2 == Long.MIN_VALUE && l3 == Long.MIN_VALUE) {
+            column.addNull();
+        } else if (targetType == ColumnType.LONG256) {
+            column.addLong256(l0, l1, l2, l3);
+        } else {
+            column.addString(formatLong256(l0, l1, l2, l3));
+        }
+        return this;
+    }
+
     public QwpSchemaBinding shortColumn(CharSequence name, short value) {
         return integerNumericColumn(name, value, "SHORT", ColumnType.SHORT, false);
     }
@@ -1106,6 +1130,32 @@ public final class QwpSchemaBinding {
             sink.clear();
         }
         Numbers.append(sink, value, false);
+        return sink;
+    }
+
+    private CharSequence formatLong256(long l0, long l1, long l2, long l3) {
+        StringSink sink = numericTextSink;
+        if (sink == null) {
+            numericTextSink = sink = new StringSink(66);
+        } else {
+            sink.clear();
+        }
+        sink.putAscii("0x");
+        if (l3 != 0) {
+            Numbers.appendHex(sink, l3, false);
+            Numbers.appendHex(sink, l2, true);
+            Numbers.appendHex(sink, l1, true);
+            Numbers.appendHex(sink, l0, true);
+        } else if (l2 != 0) {
+            Numbers.appendHex(sink, l2, false);
+            Numbers.appendHex(sink, l1, true);
+            Numbers.appendHex(sink, l0, true);
+        } else if (l1 != 0) {
+            Numbers.appendHex(sink, l1, false);
+            Numbers.appendHex(sink, l0, true);
+        } else {
+            Numbers.appendHex(sink, l0, false);
+        }
         return sink;
     }
 

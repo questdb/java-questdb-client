@@ -1,10 +1,10 @@
 # Schema-aware sender: schema-directed encoding
 
-Status: implemented on the development branch, revision 60. Scope: QWP v1 over
+Status: implemented on the development branch, revision 61. Scope: QWP v1 over
 WebSocket, with an automatically negotiated schema extension, legacy-server
 compatibility and companion server changes. The committed baseline contains the
-protocol, Sender integration and conversions through iteration 2.38. Iteration
-2.39a (IPv4 identity and text targets) is locally validated. A released-binary
+protocol, Sender integration and conversions through iteration 2.39a. Iteration
+2.39b (LONG256 identity and text targets) is locally validated. A released-binary
 compatibility gate is implemented and locally green. The remaining public-setter
 conversion contract is not complete.
 
@@ -39,9 +39,9 @@ server-side failures can still reject a batch.
 
 ## Implementation status
 
-Current checkpoint: iteration 2.39a adds both `ipv4Column` overloads for IPv4,
-STRING and VARCHAR targets. Its pre-iteration baseline is client `edf6f346` and
-server `fea4d4a6c0`; the IPv4 slice is the current locally validated increment.
+Current checkpoint: iteration 2.39b adds `long256Column` for LONG256, STRING and
+VARCHAR targets. Its pre-iteration baseline is client `21168def` and server
+`d7b94647ae`; the LONG256 slice is the current locally validated increment.
 The wider conversion inventory below is not complete; this is not release acceptance.
 
 The standing compatibility gate now runs three real process combinations:
@@ -122,6 +122,16 @@ bitmap NULL for every target. A Java null text reference remains a no-op. Exact
 legacy dotted aliases such as `".0.0.0.0."` remain accepted and normalize to
 NULL. Malformed input fails locally with `INVALID_VALUE`, including strings
 made only of dots.
+
+`long256Column` now uses the server schema in schema mode. A LONG256 target
+keeps the four limbs in native 32-byte form; STRING and VARCHAR receive the
+server's canonical lowercase `0x` text through the reusable numeric sink. Four
+`Long.MIN_VALUE` limbs become an explicit bitmap NULL for every supported
+target, while any partial match remains a value. Missing columns still infer
+LONG256. Legacy mode keeps its existing native wire data and server-side
+conversion behavior. Shared client/server vectors, exact wire checks, public
+Sender ingestion, rollback, schema rebind, legacy framing and persisted-frame
+replay cover the slice. D059 records the decision and evidence.
 
 Iteration 2.15 is accepted as a bounded, unreleased Sender integration.
 Public setters select the negotiated mode, use server-directed conversions,
@@ -941,7 +951,7 @@ non-null conversion. Known compatibility exceptions above still apply.
 | `uuidColumn` (UUID) | UUID, text | None |
 | `charColumn` (CHAR) | CHAR | Text; non-ASCII text output needs the decision below |
 | `ipv4Column(int)` and `ipv4Column(CharSequence)` (IPv4; text parsed locally) | IPv4, text | None |
-| `long256Column` (LONG256) | None | LONG256, text |
+| `long256Column` (LONG256) | LONG256, text | None |
 | `binaryColumn` (byte array, `DirectByteSlice`, native pointer/length; BINARY) | BINARY | Parser-reachable targets remain deferred; see boundaries below |
 | `decimalColumn(Decimal64/128/256)` (DECIMAL64/128/256) | All decimals from each source width, text | None |
 | `decimalColumn(CharSequence)` (locally parsed DECIMAL256) | All decimals, text | None; this is not the `stringColumn` parser path |
@@ -1040,6 +1050,13 @@ new casts or copy the unresolved behaviours below.
   `"0.0.0.0"` are rejected, but dotted aliases that parse to zero normalize to
   NULL. Both STRING and VARCHAR receive target-native VARCHAR wire data; no
   server-side second conversion is required.
+- **LONG256:** four `Long.MIN_VALUE` limbs are the source null sentinel in
+  schema mode and become an explicit bitmap NULL for LONG256 and text targets;
+  a partial match remains a value. LONG256 keeps the four little-endian limbs.
+  STRING and VARCHAR receive direct VARCHAR wire data formatted as lowercase
+  `0x` text with the most-significant nonzero limb first, even-byte leading
+  width and 16 hex digits for each lower limb. Legacy native wire behavior is
+  unchanged, including its bitmap-dependent server-side text conversion.
 - **Geohashes:** wire precision must equal target bits; no native GEOHASH narrowing is
   accepted. `stringColumn` uses `GeoHashes.fromStringTruncatingNl`: empty means
   null, parse at most the first 12 base32 characters, require enough bits and
@@ -1620,6 +1637,11 @@ They do not change the compatibility contract.
     IPv4 targets and the existing reusable numeric sink for canonical text.
     Normalize zero to the target bitmap before append. Do not add an address
     object, parser fork, converter registry or per-row string allocation.
+20. **Keep LONG256 as four primitive limbs.** Reuse the native 32-byte column
+    for identity and the existing numeric sink plus hex appenders for text.
+    Normalize the four-limb sentinel to the target bitmap before append. Do not
+    add `BigInteger`, a LONG256 object, a formatter registry, retained source
+    values or per-row string allocation.
 
 These opportunities do not justify a per-setter opt-out, raw-value fallback or
 send-time transformation. Partial activation is permitted on the unreleased
@@ -1635,7 +1657,7 @@ implementation and its tests together. Do not wait for negotiation,
 compatibility and all converters to be implemented before exercising the
 complete client-to-server path. Reuse the existing test infrastructure.
 
-### Plan after iteration 2.39a
+### Plan after iteration 2.39b
 
 The permanent compatibility gate is implemented. It launches released and
 current artifacts as separate processes and checks these observable contracts:
@@ -1666,10 +1688,10 @@ code.
 The next implementation slice is:
 
 1. **Iteration group 2.39 — fixed-width identity and text targets.** IPv4 to
-   IPv4/STRING/VARCHAR is implemented in 2.39a. Next, land LONG256 to
-   LONG256/STRING/VARCHAR, then GEOHASH to the exact same-precision
-   GEOHASH/STRING/VARCHAR as separate reviewable slices. Each slice gets its own
-   public-Sender real-server E2E, exact target wire checks, null/omission
+   IPv4/STRING/VARCHAR is implemented in 2.39a, and LONG256 to
+   LONG256/STRING/VARCHAR is implemented in 2.39b. Next, land GEOHASH to the
+   exact same-precision GEOHASH/STRING/VARCHAR as a separate reviewable slice.
+   It gets a public-Sender real-server E2E, exact target wire checks, null/omission
    decisions, rollback, refresh and SF replay. Preserve geohash bit precision
    and the existing public overload semantics; do not use this group to approve
    unrelated parser paths.

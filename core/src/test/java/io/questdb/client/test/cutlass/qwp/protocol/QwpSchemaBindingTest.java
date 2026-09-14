@@ -1278,6 +1278,136 @@ public class QwpSchemaBindingTest {
         }
     }
 
+    @Test
+    public void testLong256ConformanceCorpusUsesExactTargetWire() throws Exception {
+        assertMemoryLeak(() -> {
+            InputStream stream = QwpSchemaBindingTest.class.getResourceAsStream(
+                    "/io/questdb/client/cutlass/qwp/long256-conversions.tsv");
+            Assert.assertNotNull(stream);
+            int count = 0;
+            try (BufferedReader lines = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))) {
+                Assert.assertEquals("# case_id\tinput_l0\tinput_l1\tinput_l2\tinput_l3\toutcome\texpected_text", lines.readLine());
+                String line;
+                while ((line = lines.readLine()) != null) {
+                    String[] fields = line.split("\t", -1);
+                    Assert.assertEquals(line, 7, fields.length);
+                    long l0 = Long.parseLong(fields[1]);
+                    long l1 = Long.parseLong(fields[2]);
+                    long l2 = Long.parseLong(fields[3]);
+                    long l3 = Long.parseLong(fields[4]);
+                    for (int targetType : new int[]{ColumnType.LONG256, ColumnType.STRING, ColumnType.VARCHAR}) {
+                        try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                             QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                            QwpSchemaBinding rows = rows(buffer, column("value", targetType));
+                            rows.long256Column("value", l0, l1, l2, l3);
+                            buffer.nextRow();
+                            byte wireType = targetType == ColumnType.LONG256
+                                    ? QwpConstants.TYPE_LONG256
+                                    : QwpConstants.TYPE_VARCHAR;
+                            int size = encoder.encodeSchema(buffer);
+                            Reader reader = tableReader(encoder, size, 1, wireType);
+                            if ("NULL".equals(fields[5])) {
+                                Assert.assertEquals("-", fields[6]);
+                                Assert.assertEquals(1, reader.byteValue());
+                                Assert.assertEquals(1, reader.byteValue());
+                                if (wireType == QwpConstants.TYPE_VARCHAR) {
+                                    Assert.assertEquals(0, reader.intValue());
+                                }
+                            } else {
+                                Assert.assertEquals("VALUE", fields[5]);
+                                Assert.assertEquals(0, reader.byteValue());
+                                if (wireType == QwpConstants.TYPE_LONG256) {
+                                    Assert.assertEquals(l0, reader.longValue());
+                                    Assert.assertEquals(l1, reader.longValue());
+                                    Assert.assertEquals(l2, reader.longValue());
+                                    Assert.assertEquals(l3, reader.longValue());
+                                } else {
+                                    Assert.assertEquals(0, reader.intValue());
+                                    Assert.assertEquals(fields[6].length(), reader.intValue());
+                                    Assert.assertEquals(fields[6], reader.ascii(fields[6].length()));
+                                }
+                            }
+                            Assert.assertEquals(size, reader.position());
+                        } catch (AssertionError e) {
+                            throw new AssertionError("case_id=" + fields[0] + ", target="
+                                    + ColumnType.nameOf(targetType) + ": " + e.getMessage(), e);
+                        }
+                    }
+                    count++;
+                }
+            }
+            Assert.assertEquals(8, count);
+        });
+    }
+
+    @Test
+    public void testLong256DuplicateNullOmissionRollbackAndMissingInference() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                QwpSchemaBinding rows = rows(buffer,
+                        column("value", ColumnType.LONG256), column("bad", ColumnType.UUID));
+                rows.long256Column("value", 1, 2, 3, 4)
+                        .long256Column("value", Long.MIN_VALUE, Long.MIN_VALUE, Long.MIN_VALUE, Long.MIN_VALUE);
+                buffer.nextRow();
+                buffer.nextRow();
+                rows.long256Column("value", 5, 6, 7, 8);
+                assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+                        () -> rows.long256Column("bad", 9, 10, 11, 12));
+                rollbackCurrentRow(buffer);
+                rows.long256Column("value", Long.MIN_VALUE, Long.MIN_VALUE, Long.MIN_VALUE, Long.MIN_VALUE);
+                buffer.nextRow();
+
+                int size = encoder.encodeSchema(buffer);
+                Reader reader = tableReader(encoder, size, 3, QwpConstants.TYPE_LONG256);
+                Assert.assertEquals(1, reader.byteValue());
+                Assert.assertEquals(0x06, reader.byteValue());
+                Assert.assertEquals(1, reader.longValue());
+                Assert.assertEquals(2, reader.longValue());
+                Assert.assertEquals(3, reader.longValue());
+                Assert.assertEquals(4, reader.longValue());
+                Assert.assertEquals(size, reader.position());
+            }
+
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                QwpSchemaBinding rows = new QwpSchemaBinding(buffer, result(QwpSchemaProtocol.RESULT_MISSING));
+                rows.long256Column("value", Long.MIN_VALUE, Long.MIN_VALUE, Long.MIN_VALUE, Long.MIN_VALUE);
+                buffer.nextRow();
+                Assert.assertEquals(1, buffer.getColumnDefs().length);
+                Assert.assertEquals(QwpConstants.TYPE_LONG256, buffer.getColumnDefs()[0].getTypeCode());
+                int size = encoder.encodeSchema(buffer);
+                Reader reader = tableReader(encoder, size, -1, -1, 1, QwpConstants.TYPE_LONG256);
+                Assert.assertEquals(1, reader.byteValue());
+                Assert.assertEquals(1, reader.byteValue());
+                Assert.assertEquals(size, reader.position());
+            }
+        });
+    }
+
+    @Test
+    public void testLong256DuplicatePrecedesUnsupportedAndRejectsParameterizedDesignatedTargets() {
+        try (QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+            QwpSchemaBinding rows = rows(buffer,
+                    column("bad", ColumnType.UUID),
+                    column("parameterized", ColumnType.LONG256, new byte[]{1}));
+            rows.uuidColumn("bad", 1, 2)
+                    .long256Column("bad", 3, 4, 5, 6);
+            buffer.nextRow();
+            assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+                    () -> rows.long256Column("bad", 3, 4, 5, 6));
+            rollbackCurrentRow(buffer);
+            assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+                    () -> rows.long256Column("parameterized", 1, 2, 3, 4));
+        }
+        try (QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+            QwpSchemaBinding rows = new QwpSchemaBinding(buffer,
+                    known(0, column("ts", ColumnType.TIMESTAMP_MICRO)));
+            assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+                    () -> rows.long256Column("ts", 1, 2, 3, 4));
+        }
+    }
+
     private static void assertCtorReason(int result, LineSenderSchemaException.Reason reason, String message) {
         try (QwpTableBuffer buffer = new QwpTableBuffer("t");
              QwpWebSocketEncoder encoder = new QwpWebSocketEncoder()) {

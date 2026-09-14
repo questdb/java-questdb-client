@@ -2575,6 +2575,12 @@ public class QwpWebSocketSender implements Sender {
 
     /**
      * Adds a LONG256 column value to the current row.
+     * <p>
+     * In schema-aware mode, setting all four limbs to {@link Long#MIN_VALUE}
+     * writes SQL NULL. Any other limb combination, including a partial match,
+     * is a value. Legacy mode preserves its existing behavior: the four limbs
+     * are emitted as native LONG256 wire data and server-side null/conversion
+     * handling applies.
      *
      * @param columnName the column name
      * @param l0         the least significant 64 bits
@@ -2583,19 +2589,23 @@ public class QwpWebSocketSender implements Sender {
      * @param l3         the most significant 64 bits
      * @return this sender for method chaining
      */
+    @Override
     public QwpWebSocketSender long256Column(CharSequence columnName, long l0, long l1, long l2, long l3) {
         checkNotClosed();
         checkTableSelected();
         try {
             QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
-                binding.unsupportedColumn(columnName, "LONG256");
+                binding.long256Column(columnName, l0, l1, l2, l3);
                 return this;
             }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_LONG256, true);
             if (col != null) {
                 col.addLong256(l0, l1, l2, l3);
             }
+        } catch (LineSenderSchemaException e) {
+            rollbackRow();
+            throw refreshAfterSchemaRejection(e, columnName);
         } catch (RuntimeException | Error e) {
             rollbackRow();
             throw e;

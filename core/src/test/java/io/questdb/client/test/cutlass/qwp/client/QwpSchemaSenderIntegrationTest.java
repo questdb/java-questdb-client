@@ -910,6 +910,65 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test
+    public void testLong256TargetsUsePinnedTargetWireAndRollback() throws Exception {
+        assertMemoryLeak(() -> {
+            int[] targets = {ColumnType.LONG256, ColumnType.STRING, ColumnType.VARCHAR};
+            for (int target : targets) {
+                LongTextSchemaHandler handler = new LongTextSchemaHandler(251 + target, 261, target);
+                try (TestWebSocketServer server = schemaServer(handler);
+                     Sender sender = sender(server)) {
+                    sender.table("events")
+                            .long256Column("value", Long.MIN_VALUE, Long.MIN_VALUE, Long.MIN_VALUE, Long.MIN_VALUE)
+                            .long256Column("value", 9, 10, 11, 12)
+                            .atNow();
+
+                    sender.table("events").long256Column("value", 5, 6, 7, 8);
+                    try {
+                        sender.long256Column("failed_b", 9, 10, 11, 12);
+                        Assert.fail("expected LONG256 to UUID rejection");
+                    } catch (LineSenderSchemaException e) {
+                        Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
+                    }
+
+                    sender.long256Column("value", 1, 2, 3, 4).atNow();
+                    sender.flush();
+
+                    new FrameReader(handler.awaitDataFrame()).long256TargetTable(
+                            "events", 251 + target, 261, target, 1, 2, 3, 4);
+                    Assert.assertEquals(2, handler.describeRequests.get());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testLong256GenerationRemainsNativeBeforeVarcharRebind() throws Exception {
+        assertMemoryLeak(() -> {
+            LongTextSchemaHandler handler = new LongTextSchemaHandler(281, 291, ColumnType.LONG256);
+            try (TestWebSocketServer server = schemaServer(handler);
+                 Sender sender = sender(server)) {
+                sender.table("events").long256Column("value", 1, 2, 3, 4).atNow();
+
+                handler.targetType = ColumnType.VARCHAR;
+                handler.version = 292;
+                sender.table("events");
+                try {
+                    sender.stringColumn("value", "not-long256");
+                    Assert.fail("expected target-changing schema refresh");
+                } catch (LineSenderSchemaException e) {
+                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                }
+                sender.long256Column("value", 5, 6, 7, 8).atNow();
+                sender.flush();
+
+                new FrameReader(handler.awaitDataFrame()).twoNativeLong256AndVarcharBlocks(
+                        "events", 281, 291, 292);
+                Assert.assertEquals(2, handler.describeRequests.get());
+            }
+        });
+    }
+
+    @Test
     public void testLongToTextTargetsUsePinnedTargetWireAndRollback() throws Exception {
         assertMemoryLeak(() -> {
             int[] targets = {ColumnType.STRING, ColumnType.VARCHAR, ColumnType.SYMBOL};
@@ -1211,6 +1270,24 @@ public class QwpSchemaSenderIntegrationTest {
                 Assert.assertEquals(0, frame[QwpConstants.HEADER_OFFSET_FLAGS] & QwpConstants.FLAG_SCHEMA);
                 new FrameReader(frame).legacyIpv4Table(
                         "events", "value", 0xc0a80101, 0x0a141e28);
+                Assert.assertEquals(0, handler.describeRequests.get());
+            }
+        });
+    }
+
+    @Test
+    public void testOldPeerUsesLegacyLong256WireAndNeverDescribes() throws Exception {
+        assertMemoryLeak(() -> {
+            SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 1, 1);
+            try (TestWebSocketServer server = legacyServer(handler);
+                 Sender sender = sender(server)) {
+                sender.table("events").long256Column("value", 1, 2, 3, 4).atNow();
+                sender.table("events").long256Column(
+                        "value", Long.MIN_VALUE, Long.MIN_VALUE, Long.MIN_VALUE, Long.MIN_VALUE).atNow();
+                sender.flush();
+                byte[] frame = handler.awaitDataFrame();
+                Assert.assertEquals(0, frame[QwpConstants.HEADER_OFFSET_FLAGS] & QwpConstants.FLAG_SCHEMA);
+                new FrameReader(frame).legacyLong256Table("events", "value");
                 Assert.assertEquals(0, handler.describeRequests.get());
             }
         });
@@ -1778,6 +1855,29 @@ public class QwpSchemaSenderIntegrationTest {
             eof();
         }
 
+        private void legacyLong256Table(String table, String column) {
+            Assert.assertEquals(QwpConstants.MAGIC_MESSAGE, in.getInt());
+            Assert.assertEquals(QwpConstants.VERSION, u8());
+            Assert.assertEquals(0, u8() & QwpConstants.FLAG_SCHEMA);
+            Assert.assertEquals(1, in.getShort() & 0xffff);
+            Assert.assertEquals(in.remaining() - Integer.BYTES, in.getInt());
+            Assert.assertEquals(0, varint());
+            Assert.assertEquals(0, varint());
+            Assert.assertEquals(table, string());
+            Assert.assertEquals(2, varint());
+            Assert.assertEquals(1, varint());
+            Assert.assertEquals(column, string());
+            Assert.assertEquals(QwpConstants.TYPE_LONG256, u8());
+            Assert.assertEquals(0, u8());
+            for (long value : new long[]{1, 2, 3, 4}) {
+                Assert.assertEquals(value, i64());
+            }
+            for (int i = 0; i < 4; i++) {
+                Assert.assertEquals(Long.MIN_VALUE, i64());
+            }
+            eof();
+        }
+
         private void longTextTable(
                 String table,
                 int tableId,
@@ -1830,6 +1930,39 @@ public class QwpSchemaSenderIntegrationTest {
                 Assert.assertEquals(0, in.getInt());
                 Assert.assertEquals(9, in.getInt());
                 Assert.assertEquals("255.1.2.3", stringBytes(9));
+            }
+            eof();
+        }
+
+        private void long256TargetTable(
+                String table,
+                int tableId,
+                long version,
+                int targetType,
+                long l0,
+                long l1,
+                long l2,
+                long l3
+        ) {
+            messageHeader(1);
+            Assert.assertEquals(0, varint());
+            Assert.assertEquals(0, varint());
+            byte wireType = targetType == ColumnType.LONG256
+                    ? QwpConstants.TYPE_LONG256
+                    : QwpConstants.TYPE_VARCHAR;
+            schemaBlockHeader(table, tableId, version, 2, "value", wireType);
+            Assert.assertEquals(1, u8());
+            Assert.assertEquals(1, u8());
+            if (wireType == QwpConstants.TYPE_LONG256) {
+                Assert.assertEquals(l0, i64());
+                Assert.assertEquals(l1, i64());
+                Assert.assertEquals(l2, i64());
+                Assert.assertEquals(l3, i64());
+            } else {
+                String expected = "0x04000000000000000300000000000000020000000000000001";
+                Assert.assertEquals(0, in.getInt());
+                Assert.assertEquals(expected.length(), in.getInt());
+                Assert.assertEquals(expected, stringBytes(expected.length()));
             }
             eof();
         }
@@ -2084,6 +2217,26 @@ public class QwpSchemaSenderIntegrationTest {
             Assert.assertEquals(0, in.getInt());
             Assert.assertEquals(11, in.getInt());
             Assert.assertEquals("not-long256", stringBytes(11));
+            eof();
+        }
+
+        private void twoNativeLong256AndVarcharBlocks(
+                String table, int tableId, long firstVersion, long secondVersion
+        ) {
+            messageHeader(2);
+            Assert.assertEquals(0, varint());
+            Assert.assertEquals(0, varint());
+            schemaBlockHeader(table, tableId, firstVersion, 1, "value", QwpConstants.TYPE_LONG256);
+            Assert.assertEquals(0, u8());
+            for (long value : new long[]{1, 2, 3, 4}) {
+                Assert.assertEquals(value, i64());
+            }
+            schemaBlockHeader(table, tableId, secondVersion, 1, "value", QwpConstants.TYPE_VARCHAR);
+            Assert.assertEquals(0, u8());
+            String expected = "0x08000000000000000700000000000000060000000000000005";
+            Assert.assertEquals(0, in.getInt());
+            Assert.assertEquals(expected.length(), in.getInt());
+            Assert.assertEquals(expected, stringBytes(expected.length()));
             eof();
         }
 

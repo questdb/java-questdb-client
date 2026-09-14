@@ -7238,3 +7238,91 @@ The final SOL review found no production correctness, compatibility, allocation
 or complexity blocker. It corrected one design sentence that named the server's
 IPv4 formatter as though it existed in the client, and requested the explicit
 old-peer setter test above. Re-review found both corrections complete.
+
+## D059 — LONG256 uses target-native wire data
+
+Status: iteration 2.39b implemented and locally validated, 2026-09-14. Design
+revision 61. The pre-iteration baseline is client `21168def` and server
+`d7b94647ae`; neither repository is committed by this decision record.
+
+The public `long256Column` setter now participates in schema mode. A LONG256
+target receives the four input limbs directly in the existing 32-byte wire
+layout. STRING and VARCHAR targets receive direct VARCHAR wire data in the
+server's canonical lowercase `0x` form: the most-significant nonzero limb is
+written first with even-byte leading width, and each lower limb is padded to 16
+hex digits. The implementation keeps four primitive longs and reuses the
+binding's numeric text sink and existing hex appenders. It adds no `BigInteger`,
+LONG256 object, converter registry, retained source value, server production
+change or per-row string allocation.
+
+Four `Long.MIN_VALUE` limbs are the source null sentinel in schema mode and are
+encoded as an explicit bitmap NULL for LONG256, STRING and VARCHAR targets. Any
+partial match remains a value. This removes a legacy row-context dependency:
+without a bitmap the server cursor recognizes the four-limb sentinel as null,
+but with a bitmap it treats only marked rows as null, so the same unmarked
+sentinel converted to text becomes an empty non-null string. Schema mode makes
+the intended null explicit before target conversion. Legacy mode deliberately
+keeps its native LONG256 wire data and existing server-side behavior. The public
+Javadoc states this qualification instead of promising uniform legacy results.
+
+Target selection and duplicate suppression happen before formatting. Known
+unsupported, parameterized and designated targets keep typed rejection;
+Sender applies the established partial-row rollback and one-refresh lifecycle.
+A confirmed missing column still infers native LONG256. A later schema
+generation changes only subsequent buffers: exact scripted-wire coverage proves
+an already buffered LONG256 block stays native before a new VARCHAR block is
+created. An old peer receives the original unflagged native LONG256 frame and no
+DESCRIBE.
+
+The shared eight-row corpus covers zero, the highest nonzero `l0`, `l1`, `l2`
+and `l3` formatter branches, all-one limbs, a partial sentinel, the high sign
+bit and the full sentinel null. The client and server resources are
+byte-identical with SHA-256
+`a634074af646eb961768599e73727a4a1ab0cd0916dc97a86a8ee4a027723275`.
+Component tests assert exact target type, payload and bitmap bytes plus
+duplicate, omission, rollback, inference and rejection order. Public socket
+tests cover exact schema and legacy frames, rollback and generation rebind. The
+real-server corpus uses one Sender and one flush across LONG256, STRING and
+VARCHAR tables, with an omitted first value to force late column creation and
+two explicit bitmap-null positions. Separate E2E tests cover A/error/C row
+recovery, missing-table inference and inspection plus replay of the persisted
+target-native frame. A raw legacy fixture pins the bitmap-dependent server
+behavior instead of making the schema test silently replace it.
+
+Final focused validation on JDK 25 passes 96 client tests and nine server tests
+with zero failures, errors or skips. The client set is
+`QwpSchemaBindingTest,QwpSchemaSenderIntegrationTest`. The server set is
+`QwpSchemaLong256E2ETest,QwpSchemaTextSourceNullE2ETest` plus
+`QwpSenderE2ETest.testSchemaModePreservesUuidAndLong256NullsForTextTargets`.
+An expanded client regression covering the table buffer, encoder, Sender,
+constants, prior STRING-to-LONG256 and UUID-to-text bindings, recovered-frame
+analysis and schema replay passes 283 tests with zero failures, errors or skips.
+All test roots were created under `/mnt/pcie5` by setting `java.io.tmpdir` at
+test-JVM startup through `JAVA_TOOL_OPTIONS`.
+
+An exploratory run of the full `QwpSenderE2ETest` is not green: 137 tests
+produced three failures and 41 errors. The LONG256 test changed by this slice
+passed. Observed errors include still-missing inventory entries such as
+INT-to-IPv4, STRING-to-DATE and LONG_ARRAY, but this run was not fully
+classified and is not presented as regression evidence. It confirms the
+standing release status: the conversion contract remains incomplete even
+though the bounded LONG256 slice is accepted.
+
+The first server corpus run appeared to return an empty table. The server log
+disproved a QWP rejection: LONG256 had applied all eight rows, while the next
+STRING WAL apply failed with `errno=28` because shared `/tmp` was full. Passing
+`-Djava.io.tmpdir` as an ordinary Maven property did not fix the environment;
+`strace -f -yy -e trace=fallocate` showed that Surefire's JVM had cached
+`/tmp/junit...` before that property was applied. Supplying it at JVM startup
+moved the actual database files to `/mnt/pcie5`, where all three eight-row WAL
+applications and queries passed before the final corpus branch was added. The
+final nine-row version passes as part of the focused server gate. No production
+or test-shape workaround follows from the environmental failure. In particular,
+the final test restores the simpler and stronger one-Sender, one-flush shape.
+
+Independent adversarial review found and closed two issues before acceptance:
+the initial Javadoc overstated legacy null semantics, and the seven-row corpus
+missed the separate `l1` formatting branch. Re-review found both resolved and no
+remaining correctness, compatibility, allocation or complexity issue in this
+slice. The wider conversion inventory remains open; the next bounded slice is
+native GEOHASH identity and text output with exact target precision.
