@@ -333,6 +333,58 @@ public final class QwpSchemaBinding {
         return floatingNumericColumn(name, value, "FLOAT");
     }
 
+    public QwpSchemaBinding geoHashColumn(CharSequence name, long bits, int precisionBits) {
+        buffer.requireSchemaBinding(this);
+        if (precisionBits < 1 || precisionBits > 60) {
+            throw error(INVALID_VALUE, name, "GEOHASH", null,
+                    "invalid GEOHASH precision: " + precisionBits + " (must be 1-60)");
+        }
+        int sourceType = ColumnType.getGeoHashTypeWithBits(precisionBits);
+        int index = targetIndex(name, "GEOHASH");
+        int targetType = targetType(index, sourceType);
+        QwpTableBuffer.ColumnBuffer column = targetColumn(name, "GEOHASH", index, targetType);
+        if (column == null) {
+            return this;
+        }
+        long value = bits & ((1L << precisionBits) - 1L);
+        if (ColumnType.isGeoHash(targetType)) {
+            int targetBits = ColumnType.getGeoHashBits(targetType);
+            if (targetBits != precisionBits) {
+                throw unsupported(name, "GEOHASH", targetType,
+                        "GEOHASH precision mismatch [sourceBits=" + precisionBits + ", targetBits=" + targetBits + ']');
+            }
+            column.addGeoHash(value, precisionBits);
+        } else if (targetType == ColumnType.STRING || targetType == ColumnType.VARCHAR) {
+            column.addString(formatGeoHash(value, precisionBits));
+        } else {
+            throw unsupported(name, "GEOHASH", targetType, "conversion is not implemented");
+        }
+        return this;
+    }
+
+    public QwpSchemaBinding geoHashColumn(CharSequence name, CharSequence value) {
+        buffer.requireSchemaBinding(this);
+        if (value == null) {
+            throw error(INVALID_VALUE, name, "GEOHASH", null,
+                    "GEOHASH string cannot be null; omit the setter to write NULL");
+        }
+        int length = value.length();
+        if (length == 0) {
+            throw error(INVALID_VALUE, name, "GEOHASH", null, "GEOHASH string cannot be empty");
+        }
+        if (length > 12) {
+            throw error(INVALID_VALUE, name, "GEOHASH", null,
+                    "GEOHASH string exceeds 12 characters: " + length);
+        }
+        final long bits;
+        try {
+            bits = Numbers.parseGeoHashBase32(value, 0, length);
+        } catch (NumericException e) {
+            throw error(INVALID_VALUE, name, "GEOHASH", null, "invalid GEOHASH string");
+        }
+        return geoHashColumn(name, bits, length * 5);
+    }
+
     public QwpSchemaBinding intColumn(CharSequence name, int value) {
         return integerNumericColumn(name, value, "INT", ColumnType.INT, value == Integer.MIN_VALUE);
     }
@@ -1155,6 +1207,19 @@ public final class QwpSchemaBinding {
             Numbers.appendHex(sink, l0, true);
         } else {
             Numbers.appendHex(sink, l0, false);
+        }
+        return sink;
+    }
+
+    private CharSequence formatGeoHash(long value, int precisionBits) {
+        StringSink sink = numericTextSink;
+        if (sink == null) {
+            numericTextSink = sink = new StringSink(60);
+        } else {
+            sink.clear();
+        }
+        for (int bit = precisionBits - 1; bit >= 0; bit--) {
+            sink.putAscii(((value >>> bit) & 1) == 0 ? '0' : '1');
         }
         return sink;
     }

@@ -34,6 +34,7 @@ import io.questdb.client.cutlass.qwp.protocol.QwpSchemaResponse;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
 import io.questdb.client.cutlass.qwp.protocol.QwpSchemaBinding;
 import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.Numbers;
 import io.questdb.client.std.Unsafe;
 import org.junit.Assert;
 import org.junit.Test;
@@ -1406,6 +1407,205 @@ public class QwpSchemaBindingTest {
             assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
                     () -> rows.long256Column("ts", 1, 2, 3, 4));
         }
+    }
+
+    @Test
+    public void testNativeGeoHashConformanceCorpusUsesExactTargetWire() throws Exception {
+        assertMemoryLeak(() -> {
+            InputStream stream = QwpSchemaBindingTest.class.getResourceAsStream(
+                    "/io/questdb/client/cutlass/qwp/native-geohash-conversions.tsv");
+            Assert.assertNotNull(stream);
+            int count = 0;
+            try (BufferedReader lines = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))) {
+                Assert.assertEquals("# case_id\tinput_bits\tprecision_bits\texpected_value_hex\texpected_text", lines.readLine());
+                String line;
+                while ((line = lines.readLine()) != null) {
+                    String[] fields = line.split("\t", -1);
+                    Assert.assertEquals(line, 5, fields.length);
+                    long input = Long.parseLong(fields[1]);
+                    int precision = Integer.parseInt(fields[2]);
+                    long expected = Long.parseUnsignedLong(fields[3], 16);
+                    int geoType = ColumnType.getGeoHashTypeWithBits(precision);
+                    for (int targetType : new int[]{geoType, ColumnType.STRING, ColumnType.VARCHAR}) {
+                        try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                             QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                            QwpSchemaBinding rows = rows(buffer, column("value", targetType));
+                            rows.geoHashColumn("value", input, precision);
+                            buffer.nextRow();
+                            byte wireType = ColumnType.isGeoHash(targetType)
+                                    ? QwpConstants.TYPE_GEOHASH
+                                    : QwpConstants.TYPE_VARCHAR;
+                            int size = encoder.encodeSchema(buffer);
+                            Reader reader = tableReader(encoder, size, 1, wireType);
+                            if (wireType == QwpConstants.TYPE_GEOHASH) {
+                                Assert.assertEquals(1, reader.byteValue());
+                                Assert.assertEquals(0, reader.byteValue());
+                                Assert.assertEquals(precision, reader.varint());
+                                for (int i = 0; i < (precision + 7) / 8; i++) {
+                                    Assert.assertEquals((int) ((expected >>> (i * 8)) & 0xff), reader.byteValue());
+                                }
+                            } else {
+                                Assert.assertEquals(0, reader.byteValue());
+                                Assert.assertEquals(0, reader.intValue());
+                                Assert.assertEquals(fields[4].length(), reader.intValue());
+                                Assert.assertEquals(fields[4], reader.ascii(fields[4].length()));
+                            }
+                            Assert.assertEquals(size, reader.position());
+                        } catch (AssertionError e) {
+                            throw new AssertionError("case_id=" + fields[0] + ", target="
+                                    + ColumnType.nameOf(targetType) + ": " + e.getMessage(), e);
+                        }
+                    }
+                    count++;
+                }
+            }
+            Assert.assertEquals(15, count);
+        });
+    }
+
+    @Test
+    public void testNativeGeoHashEveryPrecisionUsesFixedWidthText() throws Exception {
+        assertMemoryLeak(() -> {
+            for (int precision = 1; precision <= 60; precision++) {
+                try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                     QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                    rows(buffer, column("value", ColumnType.STRING))
+                            .geoHashColumn("value", -1, precision);
+                    buffer.nextRow();
+                    int size = encoder.encodeSchema(buffer);
+                    Reader reader = tableReader(encoder, size, 1, QwpConstants.TYPE_VARCHAR);
+                    Assert.assertEquals(0, reader.byteValue());
+                    Assert.assertEquals(0, reader.intValue());
+                    Assert.assertEquals(precision, reader.intValue());
+                    for (int i = 0; i < precision; i++) {
+                        Assert.assertEquals('1', reader.byteValue());
+                    }
+                    Assert.assertEquals(size, reader.position());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testNativeGeoHashOmissionRollbackInferenceAndGuards() throws Exception {
+        assertMemoryLeak(() -> {
+            int geo20 = ColumnType.getGeoHashTypeWithBits(20);
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                QwpSchemaBinding rows = rows(buffer,
+                        column("value", geo20), column("bad", ColumnType.UUID));
+                rows.geoHashColumn("value", 0xabcde, 20)
+                        .geoHashColumn("value", 0x12345, 20);
+                buffer.nextRow();
+                buffer.nextRow();
+                rows.geoHashColumn("value", 0x11111, 20);
+                assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+                        () -> rows.geoHashColumn("bad", 1, 20));
+                rollbackCurrentRow(buffer);
+                rows.geoHashColumn("value", 0x12345, 20);
+                buffer.nextRow();
+
+                int size = encoder.encodeSchema(buffer);
+                Reader reader = tableReader(encoder, size, 3, QwpConstants.TYPE_GEOHASH);
+                Assert.assertEquals(1, reader.byteValue());
+                Assert.assertEquals(0x02, reader.byteValue());
+                Assert.assertEquals(20, reader.varint());
+                for (long value : new long[]{0xabcde, 0x12345}) {
+                    for (int i = 0; i < 3; i++) {
+                        Assert.assertEquals((int) ((value >>> (i * 8)) & 0xff), reader.byteValue());
+                    }
+                }
+                Assert.assertEquals(size, reader.position());
+            }
+
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                QwpSchemaBinding rows = new QwpSchemaBinding(buffer, result(QwpSchemaProtocol.RESULT_MISSING));
+                rows.geoHashColumn("value", 0xabcde, 20);
+                buffer.nextRow();
+                Assert.assertEquals(QwpConstants.TYPE_GEOHASH, buffer.getColumnDefs()[0].getTypeCode());
+                int size = encoder.encodeSchema(buffer);
+                Reader reader = tableReader(encoder, size, -1, -1, 1, QwpConstants.TYPE_GEOHASH);
+                Assert.assertEquals(1, reader.byteValue());
+                Assert.assertEquals(0, reader.byteValue());
+                Assert.assertEquals(20, reader.varint());
+                Assert.assertEquals(0xde, reader.byteValue());
+                Assert.assertEquals(0xbc, reader.byteValue());
+                Assert.assertEquals(0x0a, reader.byteValue());
+                Assert.assertEquals(size, reader.position());
+            }
+
+            try (QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                QwpSchemaBinding rows = rows(buffer,
+                        column("mismatch", ColumnType.getGeoHashTypeWithBits(15)),
+                        column("unsupported", ColumnType.UUID),
+                        column("parameterized", geo20, new byte[]{1}));
+                assertReason(LineSenderSchemaException.Reason.INVALID_VALUE,
+                        () -> rows.geoHashColumn("mismatch", 1, 0));
+                assertReason(LineSenderSchemaException.Reason.INVALID_VALUE,
+                        () -> rows.geoHashColumn("mismatch", 1, 61));
+                assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+                        () -> rows.geoHashColumn("mismatch", 1, 20));
+                rollbackCurrentRow(buffer);
+                assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+                        () -> rows.geoHashColumn("unsupported", 1, 20));
+                rollbackCurrentRow(buffer);
+                assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+                        () -> rows.geoHashColumn("parameterized", 1, 20));
+            }
+            try (QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                QwpSchemaBinding rows = new QwpSchemaBinding(buffer,
+                        known(0, column("ts", ColumnType.TIMESTAMP_MICRO)));
+                assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+                        () -> rows.geoHashColumn("ts", 1, 20));
+            }
+        });
+    }
+
+    @Test
+    public void testNativeGeoHashTextOverloadPreservesSourcePrecision() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                QwpSchemaBinding rows = rows(buffer,
+                        column("geo", ColumnType.getGeoHashTypeWithBits(20)),
+                        column("text", ColumnType.STRING));
+                rows.geoHashColumn("geo", "u33d")
+                        .geoHashColumn("text", "U");
+                buffer.nextRow();
+                int size = encoder.encodeSchema(buffer);
+                Reader reader = tableReader(encoder, size, 1,
+                        QwpConstants.TYPE_GEOHASH, QwpConstants.TYPE_VARCHAR);
+                Assert.assertEquals(1, reader.byteValue());
+                Assert.assertEquals(0, reader.byteValue());
+                Assert.assertEquals(20, reader.varint());
+                long expected = Numbers.parseGeoHashBase32("u33d");
+                for (int i = 0; i < 3; i++) {
+                    Assert.assertEquals((int) ((expected >>> (i * 8)) & 0xff), reader.byteValue());
+                }
+                Assert.assertEquals(0, reader.byteValue());
+                Assert.assertEquals(0, reader.intValue());
+                Assert.assertEquals(5, reader.intValue());
+                Assert.assertEquals("11010", reader.ascii(5));
+                Assert.assertEquals(size, reader.position());
+            }
+
+            try (QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                QwpSchemaBinding rows = rows(buffer,
+                        column("value", ColumnType.getGeoHashTypeWithBits(15)));
+                assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+                        () -> rows.geoHashColumn("value", "u33d"));
+                rollbackCurrentRow(buffer);
+                assertReason(LineSenderSchemaException.Reason.INVALID_VALUE,
+                        () -> rows.geoHashColumn("value", (CharSequence) null));
+                assertReason(LineSenderSchemaException.Reason.INVALID_VALUE,
+                        () -> rows.geoHashColumn("value", ""));
+                assertReason(LineSenderSchemaException.Reason.INVALID_VALUE,
+                        () -> rows.geoHashColumn("value", "0123456789bcd"));
+                assertReason(LineSenderSchemaException.Reason.INVALID_VALUE,
+                        () -> rows.geoHashColumn("value", "a"));
+            }
+        });
     }
 
     private static void assertCtorReason(int result, LineSenderSchemaException.Reason reason, String message) {

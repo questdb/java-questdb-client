@@ -2029,7 +2029,7 @@ public class QwpWebSocketSender implements Sender {
         try {
             QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
-                binding.unsupportedColumn(columnName, "GEOHASH");
+                binding.geoHashColumn(columnName, bits, precisionBits);
                 return this;
             }
             if (precisionBits < 1 || precisionBits > 60) {
@@ -2040,6 +2040,9 @@ public class QwpWebSocketSender implements Sender {
             if (col != null) {
                 col.addGeoHash(maskGeoHashBits(bits, precisionBits), precisionBits);
             }
+        } catch (LineSenderSchemaException e) {
+            rollbackRow();
+            throw refreshAfterSchemaRejection(e, columnName);
         } catch (RuntimeException | Error e) {
             rollbackRow();
             throw e;
@@ -2068,9 +2071,12 @@ public class QwpWebSocketSender implements Sender {
         try {
             QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
-                binding.unsupportedColumn(columnName, "GEOHASH");
+                binding.geoHashColumn(columnName, value);
                 return this;
             }
+        } catch (LineSenderSchemaException e) {
+            rollbackRow();
+            throw refreshAfterSchemaRejection(e, columnName);
         } catch (RuntimeException | Error e) {
             rollbackRow();
             throw e;

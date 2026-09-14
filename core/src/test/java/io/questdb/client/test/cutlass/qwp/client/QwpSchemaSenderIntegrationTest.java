@@ -910,6 +910,66 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test
+    public void testGeoHashTargetsUsePinnedTargetWireAndRollback() throws Exception {
+        assertMemoryLeak(() -> {
+            int geo20 = ColumnType.getGeoHashTypeWithBits(20);
+            int[] targets = {geo20, ColumnType.STRING, ColumnType.VARCHAR};
+            for (int target : targets) {
+                LongTextSchemaHandler handler = new LongTextSchemaHandler(251 + target, 261, target);
+                try (TestWebSocketServer server = schemaServer(handler);
+                     Sender sender = sender(server)) {
+                    sender.table("events")
+                            .geoHashColumn("value", "u33d")
+                            .atNow();
+
+                    sender.table("events").geoHashColumn("value", 0x11111, 20);
+                    try {
+                        sender.geoHashColumn("failed_b", 1, 20);
+                        Assert.fail("expected GEOHASH to UUID rejection");
+                    } catch (LineSenderSchemaException e) {
+                        Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
+                    }
+
+                    sender.geoHashColumn("value", 0x12345, 20).atNow();
+                    sender.flush();
+
+                    new FrameReader(handler.awaitDataFrame()).geoHashTargetTable(
+                            "events", 251 + target, 261, target, 0xd0c6c, 0x12345, 20);
+                    Assert.assertEquals(2, handler.describeRequests.get());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testGeoHashGenerationRemainsNativeBeforeVarcharRebind() throws Exception {
+        assertMemoryLeak(() -> {
+            int geo20 = ColumnType.getGeoHashTypeWithBits(20);
+            LongTextSchemaHandler handler = new LongTextSchemaHandler(281, 291, geo20);
+            try (TestWebSocketServer server = schemaServer(handler);
+                 Sender sender = sender(server)) {
+                sender.table("events").geoHashColumn("value", 0xabcde, 20).atNow();
+
+                handler.targetType = ColumnType.VARCHAR;
+                handler.version = 292;
+                sender.table("events");
+                try {
+                    sender.stringColumn("value", "not-geohash");
+                    Assert.fail("expected target-changing schema refresh");
+                } catch (LineSenderSchemaException e) {
+                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                }
+                sender.geoHashColumn("value", 0x12345, 20).atNow();
+                sender.flush();
+
+                new FrameReader(handler.awaitDataFrame()).twoNativeGeoHashAndVarcharBlocks(
+                        "events", 281, 291, 292);
+                Assert.assertEquals(2, handler.describeRequests.get());
+            }
+        });
+    }
+
+    @Test
     public void testLong256TargetsUsePinnedTargetWireAndRollback() throws Exception {
         assertMemoryLeak(() -> {
             int[] targets = {ColumnType.LONG256, ColumnType.STRING, ColumnType.VARCHAR};
@@ -1288,6 +1348,23 @@ public class QwpSchemaSenderIntegrationTest {
                 byte[] frame = handler.awaitDataFrame();
                 Assert.assertEquals(0, frame[QwpConstants.HEADER_OFFSET_FLAGS] & QwpConstants.FLAG_SCHEMA);
                 new FrameReader(frame).legacyLong256Table("events", "value");
+                Assert.assertEquals(0, handler.describeRequests.get());
+            }
+        });
+    }
+
+    @Test
+    public void testOldPeerUsesLegacyGeoHashWireAndNeverDescribes() throws Exception {
+        assertMemoryLeak(() -> {
+            SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 1, 1);
+            try (TestWebSocketServer server = legacyServer(handler);
+                 Sender sender = sender(server)) {
+                sender.table("events").geoHashColumn("value", 3, 5).atNow();
+                sender.table("events").geoHashColumn("value", "U").atNow();
+                sender.flush();
+                byte[] frame = handler.awaitDataFrame();
+                Assert.assertEquals(0, frame[QwpConstants.HEADER_OFFSET_FLAGS] & QwpConstants.FLAG_SCHEMA);
+                new FrameReader(frame).legacyGeoHashTable("events", "value");
                 Assert.assertEquals(0, handler.describeRequests.get());
             }
         });
@@ -1996,6 +2073,64 @@ public class QwpSchemaSenderIntegrationTest {
             eof();
         }
 
+        private void geoHashTargetTable(
+                String table,
+                int tableId,
+                long version,
+                int targetType,
+                long first,
+                long second,
+                int precision
+        ) {
+            messageHeader(1);
+            Assert.assertEquals(0, varint());
+            Assert.assertEquals(0, varint());
+            byte wireType = ColumnType.isGeoHash(targetType)
+                    ? QwpConstants.TYPE_GEOHASH
+                    : QwpConstants.TYPE_VARCHAR;
+            schemaBlockHeader(table, tableId, version, 2, "value", wireType);
+            if (wireType == QwpConstants.TYPE_GEOHASH) {
+                Assert.assertEquals(1, u8());
+                Assert.assertEquals(0, u8());
+                Assert.assertEquals(precision, varint());
+                for (long value : new long[]{first, second}) {
+                    for (int i = 0; i < (precision + 7) / 8; i++) {
+                        Assert.assertEquals((int) ((value >>> (i * 8)) & 0xff), u8());
+                    }
+                }
+            } else {
+                String firstText = "11010000110001101100";
+                String secondText = "00010010001101000101";
+                Assert.assertEquals(0, u8());
+                Assert.assertEquals(0, in.getInt());
+                Assert.assertEquals(firstText.length(), in.getInt());
+                Assert.assertEquals(firstText.length() + secondText.length(), in.getInt());
+                Assert.assertEquals(firstText, stringBytes(firstText.length()));
+                Assert.assertEquals(secondText, stringBytes(secondText.length()));
+            }
+            eof();
+        }
+
+        private void legacyGeoHashTable(String table, String column) {
+            Assert.assertEquals(QwpConstants.MAGIC_MESSAGE, in.getInt());
+            Assert.assertEquals(QwpConstants.VERSION, u8());
+            Assert.assertEquals(0, u8() & QwpConstants.FLAG_SCHEMA);
+            Assert.assertEquals(1, in.getShort() & 0xffff);
+            Assert.assertEquals(in.remaining() - Integer.BYTES, in.getInt());
+            Assert.assertEquals(0, varint());
+            Assert.assertEquals(0, varint());
+            Assert.assertEquals(table, string());
+            Assert.assertEquals(2, varint());
+            Assert.assertEquals(1, varint());
+            Assert.assertEquals(column, string());
+            Assert.assertEquals(QwpConstants.TYPE_GEOHASH, u8());
+            Assert.assertEquals(0, u8());
+            Assert.assertEquals(5, varint());
+            Assert.assertEquals(3, u8());
+            Assert.assertEquals(26, u8());
+            eof();
+        }
+
         private void decimal64Table(
                 String table, int tableId, long version, int scale, long first, long second
         ) {
@@ -2235,6 +2370,28 @@ public class QwpSchemaSenderIntegrationTest {
             Assert.assertEquals(0, u8());
             String expected = "0x08000000000000000700000000000000060000000000000005";
             Assert.assertEquals(0, in.getInt());
+            Assert.assertEquals(expected.length(), in.getInt());
+            Assert.assertEquals(expected, stringBytes(expected.length()));
+            eof();
+        }
+
+        private void twoNativeGeoHashAndVarcharBlocks(
+                String table, int tableId, long firstVersion, long secondVersion
+        ) {
+            messageHeader(2);
+            Assert.assertEquals(0, varint());
+            Assert.assertEquals(0, varint());
+            schemaBlockHeader(table, tableId, firstVersion, 1, "value", QwpConstants.TYPE_GEOHASH);
+            Assert.assertEquals(1, u8());
+            Assert.assertEquals(0, u8());
+            Assert.assertEquals(20, varint());
+            Assert.assertEquals(0xde, u8());
+            Assert.assertEquals(0xbc, u8());
+            Assert.assertEquals(0x0a, u8());
+            schemaBlockHeader(table, tableId, secondVersion, 1, "value", QwpConstants.TYPE_VARCHAR);
+            Assert.assertEquals(0, u8());
+            Assert.assertEquals(0, in.getInt());
+            String expected = "00010010001101000101";
             Assert.assertEquals(expected.length(), in.getInt());
             Assert.assertEquals(expected, stringBytes(expected.length()));
             eof();

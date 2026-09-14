@@ -570,6 +570,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * Precision is locked the first time a value is added to the column: subsequent
      * rows must use the same precision or a {@link LineSenderException} is thrown.
      * To mark the value NULL, do not call this method for the current row.
+     * In schema-aware mode, the server column must be a GEOHASH with exactly the
+     * same precision, STRING, or VARCHAR. Text targets receive a binary string
+     * containing exactly {@code precisionBits} characters. Legacy mode keeps the
+     * native GEOHASH wire representation and server-side conversion behavior.
      *
      * @param name          name of the column
      * @param bits          packed geohash; low {@code precisionBits} bits significant
@@ -595,6 +599,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * <p>
      * The first call locks the column at {@code value.length() * 5} bits; all
      * subsequent rows must supply strings of the same length.
+     * In schema-aware mode, the server column must be a GEOHASH with exactly that
+     * precision, STRING, or VARCHAR. Text targets receive the corresponding binary
+     * bit string. Legacy mode keeps the native GEOHASH wire representation and
+     * server-side conversion behavior.
      *
      * @param name  name of the column
      * @param value base32 geohash string, 1..12 characters; must not be null or empty

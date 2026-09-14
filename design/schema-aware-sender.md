@@ -1,10 +1,10 @@
 # Schema-aware sender: schema-directed encoding
 
-Status: implemented on the development branch, revision 61. Scope: QWP v1 over
+Status: implemented on the development branch, revision 62. Scope: QWP v1 over
 WebSocket, with an automatically negotiated schema extension, legacy-server
 compatibility and companion server changes. The committed baseline contains the
-protocol, Sender integration and conversions through iteration 2.39a. Iteration
-2.39b (LONG256 identity and text targets) is locally validated. A released-binary
+protocol, Sender integration and conversions through iteration 2.39b. Iteration
+2.39c (GEOHASH identity and text targets) is locally validated. A released-binary
 compatibility gate is implemented and locally green. The remaining public-setter
 conversion contract is not complete.
 
@@ -39,9 +39,10 @@ server-side failures can still reject a batch.
 
 ## Implementation status
 
-Current checkpoint: iteration 2.39b adds `long256Column` for LONG256, STRING and
-VARCHAR targets. Its pre-iteration baseline is client `21168def` and server
-`d7b94647ae`; the LONG256 slice is the current locally validated increment.
+Current checkpoint: iteration 2.39c adds both `geoHashColumn` overloads for an
+exact-precision GEOHASH, STRING and VARCHAR targets. Its pre-iteration baseline
+is client `0d9663b26f` and server `de96ef5eb5`; the GEOHASH slice is the current
+locally validated increment.
 The wider conversion inventory below is not complete; this is not release acceptance.
 
 The standing compatibility gate now runs three real process combinations:
@@ -133,6 +134,17 @@ conversion behavior. Shared client/server vectors, exact wire checks, public
 Sender ingestion, rollback, schema rebind, legacy framing and persisted-frame
 replay cover the slice. D059 records the decision and evidence.
 
+Both `geoHashColumn` overloads now use the server schema in schema mode. A
+GEOHASH target keeps the masked packed value only when its precision exactly
+matches the source. STRING and VARCHAR receive the server's fixed-width binary
+text, one character per source bit, through the existing reusable sink. Bits
+above the declared precision remain ignored. Omission is the only GEOHASH null
+operation; all packed values are valid, including byte-aligned all-one values.
+Missing columns still infer the source precision, while legacy mode keeps its
+original native frame. Shared vectors, exact wire checks, public-Sender
+ingestion, local-error rollback, schema rebind, old-peer framing and persisted
+frame replay cover the slice. D060 records the decision and evidence.
+
 Iteration 2.15 is accepted as a bounded, unreleased Sender integration.
 Public setters select the negotiated mode, use server-directed conversions,
 cancel failed partial rows and retain completed rows under their original
@@ -141,8 +153,8 @@ Eight real-server tests cover these operations, relevant/unrelated DDL,
 schema lookups, auto-flush, reset and close. Fifteen public-Sender socket
 tests separately cover exact wire encoding, legacy fallback, one-way upgrade,
 startup timeout/interruption, pinned generations and split frames.
-The broader server regression selection still has 38 classified failures
-after the 2.22 expectation/fixture repairs;
+At the 2.22 checkpoint, the broader server regression selection still had 38
+classified failures;
 this is not a release-ready client. Compatibility with a non-confirming socket
 peer is tested; an actual older QuestDB distribution was not run in this slice.
 The fixed 30-second schema deadline is settled policy and is not part of the
@@ -351,8 +363,9 @@ emit the bitmap for schema-directed nullable GEOHASH columns, even with no null
 rows: otherwise valid byte-aligned maximum values are mistaken for nulls.
 Legacy and low-level non-nullable encoding remain unchanged. Only canonical
 packed GEOHASH types are recognized; unknown flags retain typed rejection.
-Native GEOHASH setters remain unsupported and missing strings still infer
-VARCHAR. Validation passes 464 client tests plus two packaging checks, 67
+At that checkpoint native GEOHASH setters remained unsupported and missing
+strings still inferred VARCHAR; iteration 2.39c completes the native setter
+slice. Validation passes 464 client tests plus two packaging checks, 67
 focused server tests, 331 regressions and three 94-test seeded repeats. All
 7,210 public differential cases match. The original 333-test diagnostic has
 22 errors, removing only STRING-to-GEOHASH. Scoped native STRING-to-VARCHAR
@@ -955,7 +968,7 @@ non-null conversion. Known compatibility exceptions above still apply.
 | `binaryColumn` (byte array, `DirectByteSlice`, native pointer/length; BINARY) | BINARY | Parser-reachable targets remain deferred; see boundaries below |
 | `decimalColumn(Decimal64/128/256)` (DECIMAL64/128/256) | All decimals from each source width, text | None |
 | `decimalColumn(CharSequence)` (locally parsed DECIMAL256) | All decimals, text | None; this is not the `stringColumn` parser path |
-| `geoHashColumn(long, bits)` and `geoHashColumn(CharSequence)` (GEOHASH with source bits) | None | Geohash with exactly matching bit precision, text |
+| `geoHashColumn(long, bits)` and `geoHashColumn(CharSequence)` (GEOHASH with source bits) | Geohash with exactly matching bit precision, text | None |
 | `doubleArray` (all Java ranks and `DoubleArray`; DOUBLE_ARRAY) | None | DOUBLE array of the target rank; identity/shape validation, not element casting |
 | `longArray` (all Java ranks and `LongArray`; LONG_ARRAY) | None | No supported conversion contract established; see the existing-server gap below |
 
@@ -1058,7 +1071,14 @@ new casts or copy the unresolved behaviours below.
   width and 16 hex digits for each lower limb. Legacy native wire behavior is
   unchanged, including its bitmap-dependent server-side text conversion.
 - **Geohashes:** wire precision must equal target bits; no native GEOHASH narrowing is
-  accepted. `stringColumn` uses `GeoHashes.fromStringTruncatingNl`: empty means
+  accepted. The packed overload masks bits above its declared 1..60-bit
+  precision. The textual GEOHASH overload retains its public contract: strict
+  base32, 1..12 characters, with five bits per character; null and empty values
+  are invalid, and omission writes NULL. Every packed bit pattern is a value.
+  Schema-mode GEOHASH buffers therefore carry the null bitmap so byte-aligned
+  all-one values cannot collide with the legacy cursor sentinel. Native
+  GEOHASH-to-text emits exactly one `0` or `1` per source bit. `stringColumn`
+  uses `GeoHashes.fromStringTruncatingNl`: empty means
   null, parse at most the first 12 base32 characters, require enough bits and
   truncate to target precision. Invalid consumed characters fail; characters
   beyond the 12-character limit are ignored. The public geohash text setter
@@ -1642,6 +1662,11 @@ They do not change the compatibility contract.
     Normalize the four-limb sentinel to the target bitmap before append. Do not
     add `BigInteger`, a LONG256 object, a formatter registry, retained source
     values or per-row string allocation.
+21. **Keep GEOHASH as a masked long plus precision.** Reuse native GEOHASH
+    storage for an exact precision match and the existing text sink for the
+    fixed-width bit string. The schema buffer's bitmap already separates NULL
+    from every packed value. Do not add a geohash object, lookup table,
+    converter registry, retained source value or per-row string allocation.
 
 These opportunities do not justify a per-setter opt-out, raw-value fallback or
 send-time transformation. Partial activation is permitted on the unreleased
@@ -1657,7 +1682,7 @@ implementation and its tests together. Do not wait for negotiation,
 compatibility and all converters to be implemented before exercising the
 complete client-to-server path. Reuse the existing test infrastructure.
 
-### Plan after iteration 2.39b
+### Plan after iteration 2.39c
 
 The permanent compatibility gate is implemented. It launches released and
 current artifacts as separate processes and checks these observable contracts:
@@ -1685,20 +1710,17 @@ would add timing and orchestration without improving the contract assertion.
 The gate adds no protocol mode, adapter, send-time transformation or production
 code.
 
-The next implementation slice is:
+Iteration group 2.39 is complete: IPv4, LONG256 and GEOHASH each use
+target-native identity or text representation, with separate public E2E,
+exact-wire, rollback, rebind, old-peer and replay coverage. The group added no
+new conversion framework or server production code.
 
-1. **Iteration group 2.39 — fixed-width identity and text targets.** IPv4 to
-   IPv4/STRING/VARCHAR is implemented in 2.39a, and LONG256 to
-   LONG256/STRING/VARCHAR is implemented in 2.39b. Next, land GEOHASH to the
-   exact same-precision GEOHASH/STRING/VARCHAR as a separate reviewable slice.
-   It gets a public-Sender real-server E2E, exact target wire checks, null/omission
-   decisions, rollback, refresh and SF replay. Preserve geohash bit precision
-   and the existing public overload semantics; do not use this group to approve
-   unrelated parser paths.
-
-After these slices, reassess the remaining inventory in this order: integer to
-DATE/timestamps; integer to text/SYMBOL/decimals and INT-to-IPv4;
-then DOUBLE arrays after rank metadata is proven end to end.
+The next bounded slice is integer temporal targets: BYTE, SHORT and INT to DATE,
+TIMESTAMP and TIMESTAMP_NS, plus LONG to DATE. Preserve each setter's source
+null semantics and the server's raw-count contract; these are representation
+selections, not unit conversions. Then implement integer to
+text/SYMBOL/decimals and INT-to-IPv4, followed by DOUBLE arrays after rank
+metadata is proven end to end.
 BINARY-to-parser conversions, LONG_ARRAY, non-ASCII
 CHAR-to-VARCHAR and malformed decimal metadata remain server-contract decisions,
 not client implementation backlog.

@@ -7326,3 +7326,68 @@ missed the separate `l1` formatting branch. Re-review found both resolved and no
 remaining correctness, compatibility, allocation or complexity issue in this
 slice. The wider conversion inventory remains open; the next bounded slice is
 native GEOHASH identity and text output with exact target precision.
+
+## D060 — GEOHASH uses exact native precision or fixed-width text
+
+Status: iteration 2.39c implemented and locally validated, 2026-09-14. Design
+revision 62. The pre-iteration baseline is client `0d9663b26f` and server
+`de96ef5eb5`; neither repository is committed by this decision record.
+
+Both public `geoHashColumn` overloads now participate in schema mode. A GEOHASH
+target receives the masked packed value only when the target and source bit
+precisions match exactly; a mismatch fails locally with `UNSUPPORTED_FEATURE`.
+STRING and VARCHAR targets receive direct VARCHAR wire data containing exactly
+one `0` or `1` per source bit. This matches the server cursor's reachable
+positive-precision formatter rather than its unreachable character-formatting
+branch. The implementation keeps one primitive long and its precision and
+reuses the existing text sink. It adds no geohash object, lookup table,
+converter registry, retained source value, server production change or per-row
+string allocation.
+
+The packed overload accepts precision 1..60 and ignores higher input bits. The
+textual overload preserves the existing public setter contract: strict,
+case-insensitive base32 of 1..12 characters and five bits per character; null,
+empty, overlong and invalid values fail locally. Omission is the only NULL
+operation. All packed bit patterns are therefore values, including `0xff` at
+eight bits. Schema-directed GEOHASH columns use the bitmap, so those
+byte-aligned all-one values cannot collide with the fixed-width cursor sentinel.
+Confirmed missing columns still infer the source precision. Legacy mode keeps
+the original unflagged native GEOHASH frame and performs no DESCRIBE.
+
+The 15-row shared corpus covers precisions 1, 5, 7, 8, 15, 16, 20, 31, 32, 35
+and 60, leading zeroes, all-one values and masking of higher bits. Client and
+server copies are byte-identical with SHA-256
+`8468be87f7061c58862b7bbe47290f508485c5cbc61a4373b2c3932e59a225e6`.
+Component tests assert all 60 text widths, exact target wire bytes and bitmap
+semantics, textual parsing, inference, duplicate suppression, rollback and
+typed rejection of precision mismatch, unsupported, parameterized and
+designated targets. Public socket tests cover exact schema frames, an existing
+buffer pinned through a GEOHASH-to-VARCHAR rebind, and old-peer framing. Four
+real-server tests cover missing-table inference, all shared text vectors,
+exact native values including eight-bit `0xff`, A/error/C recovery, persisted
+frame inspection and byte-preserving replay.
+
+The old `testCoercionToGeoHashErrors` expected every unsupported value to reach
+the server. That no longer tests the product contract once schema mode rejects
+the setter. It now asserts typed local errors and a subsequent successful row;
+server-rejection tests remain separate instead of weakening a shared helper to
+accept either path. This is a test-contract update, not a server behavior
+change.
+
+On JDK 25, an expanded client regression passes 294 tests with zero failures,
+errors or skips. It covers schema binding and Sender integration, table-buffer
+and encoder behavior, legacy Sender framing, constants, earlier STRING-to-
+GEOHASH, LONG256 and UUID conversions, recovered-frame analysis and replay.
+The current client artifact installs successfully. The focused server gate
+passes 15 tests: the four new GEOHASH tests, three STRING-to-GEOHASH tests, six
+public Sender GEOHASH tests and two existing GEOHASH-to-text server tests. All
+test JVM scratch roots are under `/mnt/pcie5`.
+
+The full `QwpSenderE2ETest` remains a diagnostic rather than an acceptance
+gate: 137 tests produce two failures and 38 errors, improved from three failures
+and 41 errors at D059. GEOHASH is no longer among them. The remaining product
+gaps begin with integer temporal/text/decimal conversions, INT-to-IPv4 and
+DOUBLE arrays; several other errors are legacy tests that still expect a
+delayed server rejection after the new client correctly fails at the setter.
+The next slice should implement integer temporal target representation, not
+mechanically rewrite all remaining error tests.
