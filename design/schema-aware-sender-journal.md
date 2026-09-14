@@ -1,6 +1,6 @@
 # Schema-aware sender implementation journal
 
-North star: [schema-aware sender design](schema-aware-sender.md), revision 55
+North star: [schema-aware sender design](schema-aware-sender.md), revision 58
 (revision 9 at kickoff; source-backed clarifications recorded below).
 
 This journal records decisions, evidence, review outcomes and remaining work.
@@ -7031,3 +7031,82 @@ the prior client had no corresponding schema-aware small-integer operation.
 The fixed 30-second timeout remains outside the conversion roadmap. Iteration
 2.37 is rebased on the user's timeout commit `98be3b0b` and does not duplicate
 or extend that change.
+
+## D056 — Released binaries form the standing compatibility gate
+
+Status: implemented and locally validated, 2026-09-14. Design revision 58.
+
+Compatibility is now a build gate rather than another conversion iteration.
+The gate adds test and CI files only; it does not change client or server
+production code, add a protocol adapter, or transform buffered data at send
+time. It runs these three process combinations:
+
+1. current client against QuestDB 10.0.1;
+2. client 1.3.9 against the current server; and
+3. current client against the current server.
+
+QuestDB 10.0.1 and client 1.3.9 are the fixed last released baseline before the
+schema extension. Their tagged sources contain no schema negotiation headers,
+and QuestDB 10.0.1 itself pins client 1.3.9. The peeled source tags are server
+`7a391566ac827e0d8c269b91f2415c16b0a32a84` and client
+`3d035bdcab9d65b487aa16ffcee2fbd608e84d74`. The gate downloads the
+published JARs into its own target directory and verifies SHA-256
+`432d27433836d4430aaca4d701cb0dfac23f7b8281963a5fae97079c0436892d`
+for the server and
+`41c31bc25646cfe1f045615f53edcfa685a01182749d96c381ea75cd27e7a6a0`
+for the client. The shared SLF4J API 2.0.17 dependency is pinned to
+`7b751d952061954d5abfed7181c1f645d336091b679891591d63329c622eb832`.
+These are deliberate baseline pins, not moving `latest` lookups.
+
+One Java probe is compiled with `--release 11` against client 1.3.9's public
+`Sender` API, then launched in isolated JVMs with exactly one selected client
+JAR. It writes one buffered three-row block to a table whose `value` column is
+FLOAT: `42`, `Long.MIN_VALUE`, and an omitted value. Explicit auto-flush limits
+keep the rows in one block because the last omission creates the bitmap that
+makes the old LONG sentinel behavior observable. Legacy mode stores `42.0`,
+`-9.223372E18`, and SQL NULL. Schema mode stores `42.0`, SQL NULL, and SQL NULL.
+Exact exported CSV distinguishes the modes; mere write success would not.
+
+The runner starts each server with separate roots and ports, waits for HTTP
+readiness, creates WAL tables through the public HTTP endpoint, executes the
+probe, polls exported rows for WAL visibility, and retains per-run server logs.
+Released artifacts live under `compat/target`, outside the shared Maven cache.
+The default source is the canonical Maven Central endpoint; an internal mirror
+can be supplied without bypassing checksum validation.
+
+The same script runs after the existing distribution build in
+`.github/workflows/pgwire_stable.yml` and in the Linux release build before
+artifacts are copied. It reuses the current server JAR and, when the server pins
+a client snapshot, the exact checked-out submodule JAR already built by the job.
+When the server pins a released client, it uses that exact resolved dependency
+from the local Maven cache. A cold local run, including roughly 40 MiB of
+released artifact downloads, passed all three combinations in 5.03 seconds. A
+focused client run also passed 60 negotiation, Sender-integration and replay
+tests with zero failures, errors or skips. The corresponding focused server run
+passed 15 schema discovery, numeric-conversion and identity tests with zero
+failures, errors or skips using project-local temporary storage. An initial run
+against the already-full shared `/tmp` failed with `No space left`; it is
+environmental evidence, not a product regression.
+
+The process matrix intentionally does not recreate the upgraded-sender state
+transition with two server processes. Deterministic socket and replay tests
+already prove the stronger exact contract: after schema confirmation, an old
+endpoint receives no schema frame, durable and ordinary watermarks do not
+advance, and retained bytes replay unchanged to a compatible endpoint. Keeping
+that assertion there avoids a timing-sensitive failover rig while the process
+gate proves released-binary interoperability and observable mode selection.
+
+Three independent SOL reviews checked the contract, published artifacts and
+CI harness. The first review found an unbounded server `wait`, a probe without
+a kill grace period and wording that overstated the public-API level of the
+existing watermark tests. The CI review found that Azure's custom Linux
+condition replaced its default success gate, that Azure did not retain failure
+logs, and that fixed ports plus iteration-counted polling left avoidable false
+target and timeout risks. Root replaced those with bounded TERM-to-KILL
+shutdown, a probe kill grace period, five-minute CI limits, a success-preserving
+Azure condition and failure artifact, occupied-port rejection, real 30-second
+deadlines, and accurate socket/replay wording. Released client pins now select
+the exact Maven-cache artifact while snapshots select the checked-out submodule
+build. A negative run substituting the old client for the current client failed
+the schema assertion and cleaned up both servers. Final re-review reports no
+blocker or remaining concrete finding.

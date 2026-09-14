@@ -1,11 +1,12 @@
 # Schema-aware sender: schema-directed encoding
 
-Status: implemented on the development branch, revision 57. Scope: QWP v1 over
+Status: implemented on the development branch, revision 58. Scope: QWP v1 over
 WebSocket, with an automatically negotiated schema extension, legacy-server
 compatibility and companion server changes. The committed baseline contains the
 protocol, Sender integration and conversions through iteration 2.36; iteration
-2.37 is locally validated. The remaining public-setter conversion contract and
-release compatibility gates are not complete.
+2.37 is locally validated. A released-binary compatibility gate is implemented
+and locally green. The remaining public-setter conversion contract is not
+complete.
 
 ## Goal and contract
 
@@ -45,6 +46,15 @@ baseline remains client `6fe3ce44`, server protocol `ffbb7125d2`, with server
 integration commit `818608c297` pinning that client revision. Iteration 2.37 is
 validated in this client revision and by its companion server change. The wider
 conversion inventory below is not complete; this is not release acceptance.
+
+The standing compatibility gate now runs three real process combinations:
+current client against QuestDB 10.0.1, client 1.3.9 against the current server,
+and current client against the current server. It proves legacy versus schema
+encoding from stored values, uses checksum-pinned released artifacts, and runs
+in both the stable-client CI workflow and the release pipeline. Exact no-send,
+watermark and replay behavior after a confirmed sender reaches an old endpoint
+remains covered by deterministic socket and replay tests; it does not need a
+second multi-process failover harness. D056 records the gate and local evidence.
 
 Schema discovery, pinned identity framing, safe replay and ACK/NACK feedback
 are implemented and tested. Local UUID and LONG-to-numeric conversion now uses
@@ -1564,9 +1574,14 @@ They do not change the compatibility contract.
     registry or graph. Do not refactor the established LONG hot path without
     measurements showing that the change is useful and safe.
 16. **Make compatibility a standing gate, not a feature iteration.** Run the
-    real old/new client-server binary matrix in CI and before release. Each
-    numbered conversion iteration still keeps a focused current-server E2E test
-    green; it does not reimplement negotiation or compatibility.
+    real old/new client-server binary matrix in CI and before release. Pin the
+    last pre-extension releases and verify their checksums; do not use moving
+    `latest` versions. Reuse one public-API probe compiled against the old client
+    and launch each client in an isolated JVM. Keep exact upgraded-sender
+    no-send, watermark and replay assertions in the faster deterministic socket
+    and replay tests instead of adding a flaky process failover rig. Each numbered
+    conversion iteration still keeps a focused current-server E2E test green;
+    it does not reimplement negotiation or compatibility.
 17. **Plan by conversion mechanism.** Group target paths that share a wire
     representation, conversion rule and rollback behavior. Do not create one
     iteration per matrix cell, and do not combine unrelated server-boundary
@@ -1588,22 +1603,31 @@ complete client-to-server path. Reuse the existing test infrastructure.
 
 ### Plan after iteration 2.37
 
-Before the next feature slice, establish the compatibility matrix as a
-permanent CI and release gate:
+The permanent compatibility gate is implemented. It launches released and
+current artifacts as separate processes and checks these observable contracts:
 
-- New client against the last released old server: no confirmation, unchanged
-  legacy behavior and no schema frames.
-- Last released old client against the new server: unchanged QWP v1 behavior
-  and no unsolicited schema traffic.
-- New client against the new server: schema mode is mandatory and the existing
-  public-Sender E2E remains green.
-- A sender that has confirmed schema support against a later old endpoint:
-  pending data is retained, with no downgrade or watermark advancement.
+- Current client against QuestDB 10.0.1 stores legacy LONG-to-FLOAT conversion.
+- Client 1.3.9 against the current server stores the same legacy result.
+- Current client against the current server stores the schema-mode result.
 
-This gate validates existing behavior; it is not a numbered implementation
-iteration. Use released binaries for the old sides rather than only scripted
-peers. A failure may require a production fix, but the gate itself adds no
-protocol mode, adapter or send-time transformation.
+The discriminator is one three-row block written to a FLOAT column: `42`,
+`Long.MIN_VALUE`, then a row omitting the value. Legacy mode stores the minimum
+long as a float; schema mode treats it as a source null. The old client probe is
+compiled against its public API and reused unchanged with each client JAR, so
+the gate tests binary compatibility as well as process interoperability. The
+released JARs and their SHA-256 hashes are fixed in `versions.env`; current JARs
+come from the build under test when the server pins a client snapshot. For a
+released client dependency, the gate uses that exact resolved artifact from the
+local Maven cache. The same script runs in stable-client CI and before release
+artifacts are copied.
+
+The existing deterministic socket and replay tests remain the authority for exact
+negotiation traffic and for a confirmed sender later reaching an old endpoint:
+it sends no buffered schema frame, advances no watermark and preserves exact
+bytes for replay. Splitting that state transition across two server processes
+would add timing and orchestration without improving the contract assertion.
+The gate adds no protocol mode, adapter, send-time transformation or production
+code.
 
 The next implementation slice is:
 
