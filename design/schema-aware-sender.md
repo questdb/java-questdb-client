@@ -1,10 +1,10 @@
 # Schema-aware sender: schema-directed encoding
 
-Status: implemented on the development branch, revision 62. Scope: QWP v1 over
+Status: implemented on the development branch, revision 63. Scope: QWP v1 over
 WebSocket, with an automatically negotiated schema extension, legacy-server
 compatibility and companion server changes. The committed baseline contains the
-protocol, Sender integration and conversions through iteration 2.39b. Iteration
-2.39c (GEOHASH identity and text targets) is locally validated. A released-binary
+protocol, Sender integration and conversions through iteration 2.39c. Iteration
+2.40 (integer temporal targets) is locally validated. A released-binary
 compatibility gate is implemented and locally green. The remaining public-setter
 conversion contract is not complete.
 
@@ -39,10 +39,11 @@ server-side failures can still reject a batch.
 
 ## Implementation status
 
-Current checkpoint: iteration 2.39c adds both `geoHashColumn` overloads for an
-exact-precision GEOHASH, STRING and VARCHAR targets. Its pre-iteration baseline
-is client `0d9663b26f` and server `de96ef5eb5`; the GEOHASH slice is the current
-locally validated increment.
+Current checkpoint: iteration 2.40 adds BYTE, SHORT and INT input to DATE,
+TIMESTAMP and TIMESTAMP_NS targets, plus LONG input to DATE. Its pre-iteration
+baseline is client `8932076f24` and server `67e2c94f7a`, whose submodule pins
+that exact client revision. The integer temporal slice is the current locally
+validated increment.
 The wider conversion inventory below is not complete; this is not release acceptance.
 
 The standing compatibility gate now runs three real process combinations:
@@ -144,6 +145,17 @@ Missing columns still infer the source precision, while legacy mode keeps its
 original native frame. Shared vectors, exact wire checks, public-Sender
 ingestion, local-error rollback, schema rebind, old-peer framing and persisted
 frame replay cover the slice. D060 records the decision and evidence.
+
+BYTE, SHORT and INT inputs now select DATE, TIMESTAMP and TIMESTAMP_NS target
+wire types directly; LONG also selects DATE. Values remain raw counts in the
+target's unit. There is no implicit unit conversion: DATE means epoch
+milliseconds, TIMESTAMP means epoch microseconds and TIMESTAMP_NS means epoch
+nanoseconds. INT and LONG source sentinels become explicit bitmap NULLs; BYTE
+and SHORT have no source-null sentinel. One existing small-integer helper and
+the established LONG switch perform the append, with no new converter, retained
+state, allocation or server production code. Shared exact-wire and real-server
+vectors, partial-row rollback, parameter rejection and a DATE-to-TIMESTAMP_NS
+schema rebind cover the slice. D061 records the decision and evidence.
 
 Iteration 2.15 is accepted as a bounded, unreleased Sender integration.
 Public setters select the negotiated mode, use server-directed conversions,
@@ -921,9 +933,9 @@ when the table or column is absent.
 ## Conversion backlog (server-source audit)
 
 Cross-checked on 2026-09-11 after iteration 2.13, with implemented coverage
-refreshed through iteration 2.38 on 2026-09-14. The accepted baseline is client
-`1310b0dd` and server `8ad0b92baf`, whose submodule pins that exact client
-revision. The original audit bases were client
+refreshed through iteration 2.40 on 2026-09-14. The pre-iteration baseline is
+client `8932076f24` and server `67e2c94f7a`, whose submodule pins that exact
+client revision. The original audit bases were client
 `981bdb02a471f3b290c89b8e78cbc422610e329e` and server
 `12a33d651e51e2682e7a448c8db5168fc72dfad3`. The matrix is a source audit;
 runtime evidence for implemented slices is recorded separately in the journal.
@@ -953,9 +965,9 @@ non-null conversion. Known compatibility exceptions above still apply.
 | Public input (source wire type) | Implemented targets | Missing server-accepted targets |
 | --- | --- | --- |
 | `boolColumn` (BOOLEAN) | BOOLEAN, numeric, text | None |
-| `byteColumn`, `shortColumn` (BYTE, SHORT) | Numeric | DATE, timestamps, text, SYMBOL, decimals |
-| `intColumn` (INT) | Numeric | DATE, timestamps, text, SYMBOL, decimals, IPv4 |
-| `longColumn` (LONG) | Numeric, text, SYMBOL, timestamps, decimals | DATE |
+| `byteColumn`, `shortColumn` (BYTE, SHORT) | Numeric, DATE, timestamps | Text, SYMBOL, decimals |
+| `intColumn` (INT) | Numeric, DATE, timestamps | Text, SYMBOL, decimals, IPv4 |
+| `longColumn` (LONG) | Numeric, text, SYMBOL, DATE, timestamps, decimals | None |
 | `floatColumn`, `doubleColumn` (FLOAT, DOUBLE) | Numeric, text, SYMBOL, decimals | None |
 | `stringColumn` (VARCHAR) | BOOLEAN, numeric, text, SYMBOL, UUID, BINARY, timestamps, CHAR, LONG256, geohash, decimals | DATE |
 | `symbol` (SYMBOL) | Text, SYMBOL | None |
@@ -976,13 +988,12 @@ DATE also exists as a wire input, but there is no public WebSocket `dateColumn`
 setter. The server accepts DATE-to-DATE and DATE-to-text only. Neither has a
 binding entrypoint today; record this wire-only coverage without adding a new
 public API just to mirror the protocol. DATE **targets** from existing integer
-and string setters are real missing work in the table.
+setters are implemented in iteration 2.40; STRING-to-DATE remains missing.
 
-The binding also lacks target representation selection for DATE and arrays. It
-rejects extension parameters.
-Adding a parser alone therefore does not complete these pairs: select the
-target wire representation and pin its parameters before append. Preserve the
-existing non-owning binding and buffer ownership.
+The binding still lacks target representation selection for arrays and rejects
+extension parameters. Adding array append code alone therefore does not
+complete those pairs: select the target wire representation and pin its rank
+before append. Preserve the existing non-owning binding and buffer ownership.
 
 ### Rules the missing conversions must cover
 
@@ -1667,6 +1678,12 @@ They do not change the compatibility contract.
     fixed-width bit string. The schema buffer's bitmap already separates NULL
     from every packed value. Do not add a geohash object, lookup table,
     converter registry, retained source value or per-row string allocation.
+22. **Treat integer temporal targets as representation selection.** DATE,
+    TIMESTAMP and TIMESTAMP_NS all retain the integer value as a raw 64-bit
+    count; only the target wire type and its unit differ. Reuse the existing
+    integer append paths and source-null rules. Do not add a temporal value
+    object, unit-normalization layer or shared encoder: DATE has no timestamp
+    encoding discriminator, while both timestamp wire types do.
 
 These opportunities do not justify a per-setter opt-out, raw-value fallback or
 send-time transformation. Partial activation is permitted on the unreleased
@@ -1682,7 +1699,7 @@ implementation and its tests together. Do not wait for negotiation,
 compatibility and all converters to be implemented before exercising the
 complete client-to-server path. Reuse the existing test infrastructure.
 
-### Plan after iteration 2.39c
+### Plan after iteration 2.40
 
 The permanent compatibility gate is implemented. It launches released and
 current artifacts as separate processes and checks these observable contracts:
@@ -1715,12 +1732,17 @@ target-native identity or text representation, with separate public E2E,
 exact-wire, rollback, rebind, old-peer and replay coverage. The group added no
 new conversion framework or server production code.
 
-The next bounded slice is integer temporal targets: BYTE, SHORT and INT to DATE,
-TIMESTAMP and TIMESTAMP_NS, plus LONG to DATE. Preserve each setter's source
-null semantics and the server's raw-count contract; these are representation
-selections, not unit conversions. Then implement integer to
-text/SYMBOL/decimals and INT-to-IPv4, followed by DOUBLE arrays after rank
-metadata is proven end to end.
+Iteration 2.40 is complete locally: BYTE, SHORT and INT select DATE, TIMESTAMP
+and TIMESTAMP_NS target representations, and LONG selects DATE. Source values
+remain raw counts in the target unit; no unit conversion or new temporal
+abstraction was added.
+
+The next bounded slice is BYTE, SHORT and INT to STRING, VARCHAR and SYMBOL.
+Reuse the existing allocation-free integer formatter and text/symbol append
+paths. Then reuse the established exact decimal append tail for those three
+integer sources, implement the separate INT-to-IPv4 null translation, and add
+STRING-to-DATE parsing. DOUBLE arrays follow only after rank metadata is proven
+end to end.
 BINARY-to-parser conversions, LONG_ARRAY, non-ASCII
 CHAR-to-VARCHAR and malformed decimal metadata remain server-contract decisions,
 not client implementation backlog.

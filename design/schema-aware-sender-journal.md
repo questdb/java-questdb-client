@@ -7391,3 +7391,77 @@ DOUBLE arrays; several other errors are legacy tests that still expect a
 delayed server rejection after the new client correctly fails at the setter.
 The next slice should implement integer temporal target representation, not
 mechanically rewrite all remaining error tests.
+
+## D061 — Integer temporal targets keep raw target-unit counts
+
+Status: iteration 2.40 implemented and locally validated, 2026-09-14. Design
+revision 63. The pre-iteration baseline is client `8932076f24` and server
+`67e2c94f7a`, whose submodule pins that exact client revision. Neither
+repository is committed by this decision record.
+
+BYTE, SHORT and INT setters now accept DATE, TIMESTAMP and TIMESTAMP_NS targets;
+LONG also accepts DATE. This is target representation selection, not a unit
+conversion. The client writes the integer unchanged as epoch milliseconds for
+DATE, epoch microseconds for TIMESTAMP, or epoch nanoseconds for TIMESTAMP_NS.
+`Integer.MIN_VALUE` and `Long.MIN_VALUE` retain their schema-mode source-null
+meaning and become explicit bitmap NULLs. BYTE and SHORT have no source-null
+sentinel.
+
+The implementation was cross-checked against `QwpWalAppender` and
+`WalColumnarRowAppender`. The server admits BYTE, SHORT, INT and LONG into DATE,
+and routes integer input for DATE and both timestamp types through the same raw
+64-bit append. It performs no scale multiplication or division. The client
+therefore adds DATE to the existing target-wire switch, adds the three temporal
+targets to the existing small-integer helper, and adds DATE to the established
+LONG path. No converter registry, temporal object, unit layer, retained value,
+per-row allocation or server production change was added. Numeric identity
+targets still short-circuit at the existing `isNumericTarget` check, so the new
+temporal comparisons are not evaluated on that hot path; this is source-level
+reasoning, not a new performance claim.
+
+The first component test draft incorrectly expected the timestamp raw-encoding
+discriminator after a DATE column. Inspecting `QwpColumnWriter` showed that
+DATE is a plain fixed-width value, while TIMESTAMP and TIMESTAMP_NS carry the
+discriminator. The test was corrected; production code was unchanged. This
+wire difference is why the implementation deliberately does not introduce a
+shared temporal encoder.
+
+Both repositories consume the same 24-case corpus, SHA-256
+`0872eab8b83f608c2e12778e4e44512c87bb7cff7e693109aed7effacd42fd85`.
+It covers BYTE and SHORT extrema for all three targets, INT null/negative/max
+for all three targets, and LONG null/minimum-non-null/max for DATE. Client
+component tests assert exact target wire types, bitmap state, timestamp
+discriminators and raw values. Public scripted-Sender tests cover all four
+setters, a failed partial row followed by a valid row, the one-refresh path,
+parameterized DATE rejection, and a DATE block remaining pinned when the next
+schema generation changes the target to TIMESTAMP_NS. The real-server test
+writes the shared corpus through public Sender setters, waits for ACK, and
+checks the stored raw values and nulls through SQL.
+
+Focused client validation passes 106 tests, and the expanded regression passes
+297 tests with zero failures, errors or skips. Packaged-JAR verification passes
+46 selected unit tests and both packaging integration tests. The focused server
+gate passes the new corpus plus the existing TIMESTAMP and TIMESTAMP_NS
+aggregate tests: three tests total, all green. All test JVM scratch roots are
+under `/mnt/pcie5`.
+
+The released-binary matrix also passes all three combinations with the freshly
+packaged client: current client to QuestDB 10.0.1 remains legacy, client 1.3.9
+to the current server remains legacy, and current client to current server uses
+schema mode. The run used
+`/mnt/pcie5/qwp-integer-temporal-compat/run.FKXeM7`.
+
+The full `QwpSenderE2ETest` remains diagnostic: 137 tests now produce two
+failures and 37 errors, down from two failures and 38 errors at D060. The
+existing TIMESTAMP aggregate is now green. The DATE aggregate still stops at
+the separate STRING-to-DATE gap after its integer setters succeed, so it is not
+claimed as this slice's acceptance test. Other remaining errors include integer
+text/decimal targets, INT-to-IPv4, arrays and legacy tests whose expected
+server-side rejection is now a local setter error.
+
+No setter-specific store-and-forward scenario was added. This slice changes
+only construction of ordinary schema-pinned bytes; persisted framing and replay
+remain opaque to column type. Exact public wire tests prove the new DATE and
+timestamp bytes before publication, while the existing schema-frame replay
+suite remains green. Adding a second recovery harness would duplicate those
+contracts without exercising changed recovery code.

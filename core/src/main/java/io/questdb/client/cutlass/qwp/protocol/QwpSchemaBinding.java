@@ -459,6 +459,7 @@ public final class QwpSchemaBinding {
         if (!isNumericTarget(targetType)
                 && !isTextTarget(targetType)
                 && !ColumnType.isDecimal(targetType)
+                && targetType != ColumnType.DATE
                 && targetType != ColumnType.TIMESTAMP_MICRO
                 && targetType != ColumnType.TIMESTAMP_NANO) {
             throw unsupported(name, "LONG", targetType, "conversion is not implemented");
@@ -503,6 +504,7 @@ public final class QwpSchemaBinding {
                 column.addInt((int) value);
                 break;
             case ColumnType.LONG:
+            case ColumnType.DATE:
             case ColumnType.TIMESTAMP_MICRO:
             case ColumnType.TIMESTAMP_NANO:
                 column.addLong(value);
@@ -981,6 +983,8 @@ public final class QwpSchemaBinding {
                 return QwpConstants.TYPE_INT;
             case ColumnType.LONG:
                 return QwpConstants.TYPE_LONG;
+            case ColumnType.DATE:
+                return QwpConstants.TYPE_DATE;
             case ColumnType.FLOAT:
                 return QwpConstants.TYPE_FLOAT;
             case ColumnType.DOUBLE:
@@ -1136,7 +1140,10 @@ public final class QwpSchemaBinding {
         if (column == null) {
             return this;
         }
-        if (!isNumericTarget(targetType)) {
+        if (!isNumericTarget(targetType)
+                && targetType != ColumnType.DATE
+                && targetType != ColumnType.TIMESTAMP_MICRO
+                && targetType != ColumnType.TIMESTAMP_NANO) {
             throw unsupported(name, inputType, targetType, "conversion is not implemented");
         }
         if (sourceNull) {
@@ -1160,6 +1167,9 @@ public final class QwpSchemaBinding {
                 column.addInt((int) value);
                 break;
             case ColumnType.LONG:
+            case ColumnType.DATE:
+            case ColumnType.TIMESTAMP_MICRO:
+            case ColumnType.TIMESTAMP_NANO:
                 column.addLong(value);
                 break;
             case ColumnType.FLOAT:

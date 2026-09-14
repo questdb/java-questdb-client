@@ -147,6 +147,65 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test
+    public void testIntegerTemporalGenerationRemainsDateBeforeTimestampRebind() throws Exception {
+        assertMemoryLeak(() -> {
+            LongTextSchemaHandler handler = new LongTextSchemaHandler(981, 991, ColumnType.DATE);
+            try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
+                sender.table("events").byteColumn("value", (byte) 11).atNow();
+
+                handler.targetType = ColumnType.TIMESTAMP_NANO;
+                handler.version = 992;
+                sender.table("events");
+                try {
+                    sender.stringColumn("value", "1970-01-01T00:00:00.000001Z");
+                    Assert.fail("expected target-changing schema refresh");
+                } catch (LineSenderSchemaException e) {
+                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                }
+                sender.intColumn("value", 12).atNow();
+                sender.flush();
+
+                new FrameReader(handler.awaitDataFrame())
+                        .twoDateAndTimestampBlocks("events", 981, 991, 992);
+                Assert.assertEquals(2, handler.describeRequests.get());
+            }
+        });
+    }
+
+    @Test
+    public void testIntegerTemporalTargetsUseExactTargetWireAndRollback() throws Exception {
+        assertMemoryLeak(() -> {
+            int[] targets = {ColumnType.DATE, ColumnType.TIMESTAMP_MICRO, ColumnType.TIMESTAMP_NANO};
+            for (int i = 0; i < targets.length; i++) {
+                int target = targets[i];
+                LongTextSchemaHandler handler = new LongTextSchemaHandler(961 + i, 971 + i, target);
+                try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
+                    sender.table("events").byteColumn("value", (byte) -1).atNow();
+
+                    sender.shortColumn("value", (short) 99);
+                    try {
+                        sender.intColumn("failed_b", 1);
+                        Assert.fail("expected INT-to-UUID conversion rejection");
+                    } catch (LineSenderSchemaException e) {
+                        Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
+                    }
+
+                    sender.shortColumn("value", (short) 2).atNow();
+                    sender.intColumn("value", Integer.MIN_VALUE).atNow();
+                    sender.intColumn("value", 3).atNow();
+                    sender.longColumn("value", Long.MAX_VALUE).atNow();
+                    sender.flush();
+
+                    new FrameReader(handler.awaitDataFrame()).integerTemporalTable(
+                            "events", 961 + i, 971 + i, temporalWireType(target));
+                    Assert.assertEquals("setter must use the standard one-refresh path", 2,
+                            handler.describeRequests.get());
+                }
+            }
+        });
+    }
+
+    @Test
     public void testNativeDecimalTextCorpusUsesExactVarcharWire() throws Exception {
         assertMemoryLeak(() -> {
             InputStream stream = QwpSchemaSenderIntegrationTest.class.getResourceAsStream(DECIMAL_TEXT_CORPUS);
@@ -1750,6 +1809,19 @@ public class QwpSchemaSenderIntegrationTest {
         }
     }
 
+    private static byte temporalWireType(int targetType) {
+        switch (targetType) {
+            case ColumnType.DATE:
+                return QwpConstants.TYPE_DATE;
+            case ColumnType.TIMESTAMP_MICRO:
+                return QwpConstants.TYPE_TIMESTAMP;
+            case ColumnType.TIMESTAMP_NANO:
+                return QwpConstants.TYPE_TIMESTAMP_NANOS;
+            default:
+                throw new AssertionError(ColumnType.nameOf(targetType));
+        }
+    }
+
     private static Sender sender(TestWebSocketServer server) {
         return Sender.fromConfig("ws::addr=localhost:" + server.getPort()
                 + ";auto_flush_rows=2147483647;auto_flush_bytes=0;auto_flush_interval=2147483646;"
@@ -2293,6 +2365,23 @@ public class QwpSchemaSenderIntegrationTest {
             eof();
         }
 
+        private void integerTemporalTable(String table, int tableId, long version, byte wireType) {
+            messageHeader(1);
+            Assert.assertEquals(0, varint());
+            Assert.assertEquals(0, varint());
+            schemaBlockHeader(table, tableId, version, 5, "value", wireType);
+            Assert.assertEquals(1, u8());
+            Assert.assertEquals(4, u8());
+            if (wireType != QwpConstants.TYPE_DATE) {
+                Assert.assertEquals(0, u8());
+            }
+            Assert.assertEquals(-1, i64());
+            Assert.assertEquals(2, i64());
+            Assert.assertEquals(3, i64());
+            Assert.assertEquals(Long.MAX_VALUE, i64());
+            eof();
+        }
+
         private void assertSmallIntegerValue(byte wireType, long value) {
             switch (wireType) {
                 case QwpConstants.TYPE_BYTE:
@@ -2332,6 +2421,22 @@ public class QwpSchemaSenderIntegrationTest {
             Assert.assertEquals(0, u8());
             Assert.assertEquals(5, varint());
             Assert.assertEquals(31, u8());
+            eof();
+        }
+
+        private void twoDateAndTimestampBlocks(
+                String table, int tableId, long firstVersion, long secondVersion
+        ) {
+            messageHeader(2);
+            Assert.assertEquals(0, varint());
+            Assert.assertEquals(0, varint());
+            schemaBlockHeader(table, tableId, firstVersion, 1, "value", QwpConstants.TYPE_DATE);
+            Assert.assertEquals(0, u8());
+            Assert.assertEquals(11, i64());
+            schemaBlockHeader(table, tableId, secondVersion, 1, "value", QwpConstants.TYPE_TIMESTAMP_NANOS);
+            Assert.assertEquals(0, u8());
+            Assert.assertEquals(0, u8());
+            Assert.assertEquals(12, i64());
             eof();
         }
 

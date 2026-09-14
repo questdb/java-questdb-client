@@ -569,6 +569,57 @@ public class QwpSchemaBindingTest {
     }
 
     @Test
+    public void testIntegerTemporalConformanceCorpusUsesTargetWire() throws Exception {
+        InputStream stream = QwpSchemaBindingTest.class.getResourceAsStream(
+                "/io/questdb/client/cutlass/qwp/integer-temporal-conversions.tsv");
+        Assert.assertNotNull(stream);
+        int count = 0;
+        try (BufferedReader lines = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = lines.readLine()) != null) {
+                if (line.isEmpty() || line.charAt(0) == '#') {
+                    continue;
+                }
+                String[] fields = line.split("\t", -1);
+                Assert.assertEquals(line, 5, fields.length);
+                try {
+                    long input = Long.parseLong(fields[2]);
+                    int targetType = temporalColumnType(fields[3]);
+                    try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                         QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                        QwpSchemaBinding rows = rows(buffer, column("value", targetType));
+                        appendIntegerTemporal(rows, fields[1], input, "value");
+                        buffer.nextRow();
+                        Reader reader = tableReader(
+                                encoder,
+                                encoder.encodeSchema(buffer),
+                                1,
+                                temporalWireType(fields[3])
+                        );
+                        if ("<NULL>".equals(fields[4])) {
+                            Assert.assertEquals("NULL bitmap must be present", 1, reader.byteValue());
+                            Assert.assertEquals("row zero must be NULL", 1, reader.byteValue());
+                        } else {
+                            Assert.assertEquals("value must be bitmap-present", 0, reader.byteValue());
+                        }
+                        if (!"DATE".equals(fields[3])) {
+                            Assert.assertEquals("short timestamp columns use raw encoding", 0, reader.byteValue());
+                        }
+                        if (!"<NULL>".equals(fields[4])) {
+                            Assert.assertEquals(Long.parseLong(fields[4]), reader.longValue());
+                        }
+                        Assert.assertEquals(encoder.getBuffer().getPosition(), reader.position());
+                    }
+                } catch (AssertionError e) {
+                    throw new AssertionError("case_id=" + fields[0] + ": " + e.getMessage(), e);
+                }
+                count++;
+            }
+        }
+        Assert.assertEquals(24, count);
+    }
+
+    @Test
     public void testSmallIntegerDuplicateFirstAndFailureRollback() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
@@ -658,12 +709,16 @@ public class QwpSchemaBindingTest {
         try (QwpTableBuffer buffer = new QwpTableBuffer("t")) {
             QwpSchemaBinding rows = rows(buffer,
                     column("uuid", ColumnType.UUID),
-                    column("future", ColumnType.INT, new byte[]{1}));
+                    column("future", ColumnType.INT, new byte[]{1}),
+                    column("future_date", ColumnType.DATE, new byte[]{1}));
             assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
                     () -> rows.byteColumn("uuid", (byte) 1));
             rollbackCurrentRow(buffer);
             assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
                     () -> rows.shortColumn("future", (short) 2));
+            rollbackCurrentRow(buffer);
+            assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+                    () -> rows.byteColumn("future_date", (byte) 3));
             rollbackCurrentRow(buffer);
             assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
                     () -> rows.intColumn("uuid", Integer.MIN_VALUE));
@@ -1656,6 +1711,30 @@ public class QwpSchemaBindingTest {
         }
     }
 
+    private static void appendIntegerTemporal(
+            QwpSchemaBinding rows,
+            String inputType,
+            long value,
+            String column
+    ) {
+        switch (inputType) {
+            case "BYTE":
+                rows.byteColumn(column, (byte) value);
+                break;
+            case "SHORT":
+                rows.shortColumn(column, (short) value);
+                break;
+            case "INT":
+                rows.intColumn(column, (int) value);
+                break;
+            case "LONG":
+                rows.longColumn(column, value);
+                break;
+            default:
+                throw new AssertionError(inputType);
+        }
+    }
+
     private static void assertNumericValue(Reader reader, String target, String expected) {
         switch (target) {
             case "BYTE":
@@ -1711,8 +1790,26 @@ public class QwpSchemaBindingTest {
         }
     }
 
+    private static int temporalColumnType(String target) {
+        switch (target) {
+            case "DATE": return ColumnType.DATE;
+            case "TIMESTAMP": return ColumnType.TIMESTAMP_MICRO;
+            case "TIMESTAMP_NS": return ColumnType.TIMESTAMP_NANO;
+            default: throw new AssertionError(target);
+        }
+    }
+
     private static byte timestampWireType(String target) {
         switch (target) {
+            case "TIMESTAMP": return QwpConstants.TYPE_TIMESTAMP;
+            case "TIMESTAMP_NS": return QwpConstants.TYPE_TIMESTAMP_NANOS;
+            default: throw new AssertionError(target);
+        }
+    }
+
+    private static byte temporalWireType(String target) {
+        switch (target) {
+            case "DATE": return QwpConstants.TYPE_DATE;
             case "TIMESTAMP": return QwpConstants.TYPE_TIMESTAMP;
             case "TIMESTAMP_NS": return QwpConstants.TYPE_TIMESTAMP_NANOS;
             default: throw new AssertionError(target);
