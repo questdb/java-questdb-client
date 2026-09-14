@@ -149,6 +149,10 @@ public class QwpWebSocketSender implements Sender {
     // sf-client.md section 4.4 floor: drop-oldest under bursts needs a wide
     // enough window to preserve the trailing category distribution.
     private static final int MIN_ERROR_INBOX_CAPACITY = 16;
+    // Upper bound for a row's first setter to wait on the initial handshake
+    // and a schema DESCRIBE round trip. A healthy lookup takes milliseconds;
+    // this only bounds a dead or still-connecting link.
+    private static final long DEFAULT_SCHEMA_WAIT_MILLIS = 30_000L;
     private static final String WRITE_PATH = "/write/v4";
     // Yields the Authorization header value presented on each WebSocket upgrade. A constant for a
     // fixed token or Basic credential; for an httpTokenProvider it pulls a freshly refreshed token,
@@ -394,6 +398,7 @@ public class QwpWebSocketSender implements Sender {
     // One-way owner capability: shared by foreground and every background
     // reconnect supplier created by this sender.
     private volatile boolean schemaRequired;
+    private long schemaWaitMillis = DEFAULT_SCHEMA_WAIT_MILLIS;
     // Monotonic per-attempt counter snapshotted onto every connection event
     // fired from buildAndConnect. Counts every FOREGROUND endpoint try --
     // successes and failures alike -- across this sender's lifetime.
@@ -2882,6 +2887,11 @@ public class QwpWebSocketSender implements Sender {
     }
 
     @TestOnly
+    public void setSchemaWaitMillisForTesting(long millis) {
+        schemaWaitMillis = millis;
+    }
+
+    @TestOnly
     public void setCursorSendLoopForTesting(CursorWebSocketSendLoop loop) {
         cursorSendLoop = loop;
         if (connectionDispatcher == null) {
@@ -4456,7 +4466,7 @@ public class QwpWebSocketSender implements Sender {
             schemaResolutionFresh[0] = false;
             return pinned;
         }
-        final long deadlineNanos = System.nanoTime() + 1_000_000_000L;
+        final long deadlineNanos = System.nanoTime() + schemaWaitMillis * 1_000_000L;
         ensureConnected();
         if (!cursorSendLoop.awaitInitialSchemaMode(remainingSchemaMillis(deadlineNanos))) {
             return null;
@@ -4537,7 +4547,7 @@ public class QwpWebSocketSender implements Sender {
         if (old == null) {
             return rejection;
         }
-        QwpSchemaResponse fresh = cursorSendLoop.refreshSchema(currentTableName, 1_000);
+        QwpSchemaResponse fresh = cursorSendLoop.refreshSchema(currentTableName, schemaWaitMillis);
         boolean identityChanged = old.getTableId() != fresh.getTableId()
                 || old.getMetadataVersion() != fresh.getMetadataVersion();
         boolean changed = old.getTableId() != fresh.getTableId()

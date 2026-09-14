@@ -10,6 +10,7 @@ import io.questdb.client.Sender;
 import io.questdb.client.SenderConnectionEvent;
 import io.questdb.client.cairo.ColumnType;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.protocol.QwpSchemaProtocol;
 import io.questdb.client.std.Decimal128;
@@ -1213,6 +1214,7 @@ public class QwpSchemaSenderIntegrationTest {
             try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + port
                     + ";initial_connect_retry=async;reconnect_initial_backoff_millis=10;"
                     + "reconnect_max_backoff_millis=50;close_flush_timeout_millis=0;")) {
+                ((QwpWebSocketSender) sender).setSchemaWaitMillisForTesting(1_000);
                 sender.table("events");
                 try {
                     sender.uuidColumn("id", 1, 2);
