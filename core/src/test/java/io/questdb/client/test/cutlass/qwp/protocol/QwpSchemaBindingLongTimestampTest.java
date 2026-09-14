@@ -1,0 +1,304 @@
+/*+*****************************************************************************
+ * Copyright (c) 2014-2019 Appsicle
+ * Copyright (c) 2019-2026 QuestDB
+ * Licensed under the Apache License, Version 2.0
+ ******************************************************************************/
+package io.questdb.client.test.cutlass.qwp.protocol;
+
+import io.questdb.client.LineSenderSchemaException;
+import io.questdb.client.cairo.ColumnType;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketEncoder;
+import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
+import io.questdb.client.cutlass.qwp.protocol.QwpSchemaBinding;
+import io.questdb.client.cutlass.qwp.protocol.QwpSchemaProtocol;
+import io.questdb.client.cutlass.qwp.protocol.QwpSchemaResponse;
+import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
+import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.Unsafe;
+import org.junit.Assert;
+import org.junit.Test;
+
+import java.io.BufferedReader;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
+
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
+
+public class QwpSchemaBindingLongTimestampTest {
+    private static final String CORPUS = "/io/questdb/client/cutlass/qwp/long-to-timestamp.tsv";
+
+    @Test
+    public void testCorpusUsesExactTargetUnitWire() throws Exception {
+        assertMemoryLeak(() -> {
+            InputStream stream = QwpSchemaBindingLongTimestampTest.class.getResourceAsStream(CORPUS);
+            Assert.assertNotNull(CORPUS, stream);
+            int count = 0;
+            try (BufferedReader lines = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = lines.readLine()) != null) {
+                    if (line.isEmpty() || line.charAt(0) == '#') {
+                        continue;
+                    }
+                    String[] fields = line.split("\t", -1);
+                    Assert.assertEquals(line, 6, fields.length);
+                    int target = targetType(fields[2]);
+                    byte wireType = wireType(fields[3]);
+                    long value = Long.parseLong(fields[1]);
+                    try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                         QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                        QwpSchemaBinding binding = binding(buffer, -1, column("value", target));
+                        binding.longColumn("value", value);
+                        buffer.nextRow();
+                        int size = encoder.encodeSchema(buffer);
+                        Reader reader = tableReader(encoder, size, 1, "value", wireType);
+                        if ("<NULL>".equals(fields[4])) {
+                            Assert.assertEquals("true", fields[5]);
+                            Assert.assertEquals(1, reader.u8());
+                            Assert.assertEquals(1, reader.u8());
+                            Assert.assertEquals(0, reader.u8());
+                        } else {
+                            Assert.assertEquals("false", fields[5]);
+                            Assert.assertEquals(0, reader.u8());
+                            Assert.assertEquals(0, reader.u8());
+                            Assert.assertEquals(Long.parseLong(fields[4]), reader.i64());
+                        }
+                        Assert.assertEquals(size, reader.position());
+                    } catch (AssertionError e) {
+                        throw new AssertionError("case_id=" + fields[0] + ": " + e.getMessage(), e);
+                    }
+                    count++;
+                }
+            }
+            Assert.assertEquals(12, count);
+        });
+    }
+
+    @Test
+    public void testNullDuplicateOmissionRollbackAndReset() throws Exception {
+        assertMemoryLeak(() -> {
+            for (int target : new int[]{ColumnType.TIMESTAMP_MICRO, ColumnType.TIMESTAMP_NANO}) {
+                byte wireType = target == ColumnType.TIMESTAMP_MICRO
+                        ? QwpConstants.TYPE_TIMESTAMP
+                        : QwpConstants.TYPE_TIMESTAMP_NANOS;
+                try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                     QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                    QwpSchemaBinding binding = binding(buffer, -1, column("value", target));
+                    binding.longColumn("value", Long.MIN_VALUE).binaryColumn("value", new byte[]{1});
+                    buffer.nextRow();
+                    binding.longColumn("value", Long.MIN_VALUE + 1);
+                    buffer.nextRow();
+                    buffer.nextRow();
+                    int size = encoder.encodeSchema(buffer);
+                    Reader reader = tableReader(encoder, size, 3, "value", wireType);
+                    Assert.assertEquals(1, reader.u8());
+                    Assert.assertEquals(5, reader.u8());
+                    Assert.assertEquals(0, reader.u8());
+                    Assert.assertEquals(Long.MIN_VALUE + 1, reader.i64());
+                    Assert.assertEquals(size, reader.position());
+
+                    buffer.reset();
+                    binding.longColumn("value", Long.MAX_VALUE);
+                    buffer.nextRow();
+                    int resetSize = encoder.encodeSchema(buffer);
+                    Reader reset = tableReader(encoder, resetSize, 1, "value", wireType);
+                    Assert.assertEquals(0, reset.u8());
+                    Assert.assertEquals(0, reset.u8());
+                    Assert.assertEquals(Long.MAX_VALUE, reset.i64());
+                    Assert.assertEquals(resetSize, reset.position());
+                }
+            }
+
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                QwpSchemaBinding binding = binding(buffer, -1,
+                        column("a", ColumnType.TIMESTAMP_MICRO),
+                        column("bad", ColumnType.UUID),
+                        column("c", ColumnType.TIMESTAMP_NANO));
+                binding.longColumn("a", -1);
+                buffer.nextRow();
+                binding.longColumn("a", 2);
+                assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+                        () -> binding.longColumn("bad", 3));
+                buffer.cancelCurrentRow();
+                buffer.rollbackUncommittedColumns();
+                binding.longColumn("c", 4);
+                buffer.nextRow();
+                int size = encoder.encodeSchema(buffer);
+                Reader reader = tableHeader(encoder, size, 2, 2);
+                Assert.assertEquals("a", reader.string());
+                Assert.assertEquals(QwpConstants.TYPE_TIMESTAMP, reader.u8());
+                Assert.assertEquals("c", reader.string());
+                Assert.assertEquals(QwpConstants.TYPE_TIMESTAMP_NANOS, reader.u8());
+                Assert.assertEquals(1, reader.u8());
+                Assert.assertEquals(2, reader.u8());
+                Assert.assertEquals(0, reader.u8());
+                Assert.assertEquals(-1, reader.i64());
+                Assert.assertEquals(1, reader.u8());
+                Assert.assertEquals(1, reader.u8());
+                Assert.assertEquals(0, reader.u8());
+                Assert.assertEquals(4, reader.i64());
+                Assert.assertEquals(size, reader.position());
+            }
+        });
+    }
+
+    @Test
+    public void testNativeInferenceAndNamedDesignatedRejection() {
+        try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder(); QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+            QwpSchemaBinding binding = new QwpSchemaBinding(buffer, missing());
+            binding.longColumn("value", Long.MIN_VALUE);
+            buffer.nextRow();
+            int size = encoder.encodeSchema(buffer);
+            Reader reader = new Reader(encoder.getBuffer().getBufferPtr(), size);
+            reader.skip(QwpConstants.HEADER_SIZE);
+            Assert.assertEquals("t", reader.string());
+            Assert.assertEquals(0, reader.u8());
+            Assert.assertEquals(1, reader.varint());
+            Assert.assertEquals(1, reader.varint());
+            Assert.assertEquals("value", reader.string());
+            Assert.assertEquals(QwpConstants.TYPE_LONG, reader.u8());
+            Assert.assertEquals(1, reader.u8());
+            Assert.assertEquals(1, reader.u8());
+            Assert.assertEquals(size, reader.position());
+        }
+        try (QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+            QwpSchemaBinding binding = binding(buffer, 0, column("ts", ColumnType.TIMESTAMP_MICRO));
+            assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, () -> binding.longColumn("ts", 1));
+        }
+    }
+
+    private static QwpSchemaBinding binding(QwpTableBuffer buffer, int designated, byte[]... columns) {
+        return new QwpSchemaBinding(buffer, known(designated, columns));
+    }
+
+    private static byte[] column(String name, int type) {
+        byte[] bytes = name.getBytes(StandardCharsets.UTF_8);
+        return ByteBuffer.allocate(2 + bytes.length + 6).order(ByteOrder.LITTLE_ENDIAN)
+                .putShort((short) bytes.length).put(bytes).putInt(type).putShort((short) 0).array();
+    }
+
+    private static QwpSchemaResponse missing() {
+        return decode(ByteBuffer.allocate(10).order(ByteOrder.LITTLE_ENDIAN)
+                .put(QwpSchemaProtocol.KIND_SCHEMA).putLong(1).put((byte) QwpSchemaProtocol.RESULT_MISSING).array());
+    }
+
+    private static QwpSchemaResponse known(int designated, byte[]... columns) {
+        int length = 26;
+        for (byte[] column : columns) {
+            length += column.length;
+        }
+        ByteBuffer payload = ByteBuffer.allocate(length).order(ByteOrder.LITTLE_ENDIAN)
+                .put(QwpSchemaProtocol.KIND_SCHEMA).putLong(1).put((byte) QwpSchemaProtocol.RESULT_KNOWN)
+                .putInt(1).putLong(1).putShort((short) designated).putShort((short) columns.length);
+        for (byte[] column : columns) {
+            payload.put(column);
+        }
+        return decode(payload.array());
+    }
+
+    private static QwpSchemaResponse decode(byte[] payload) {
+        ByteBuffer frame = ByteBuffer.allocate(QwpConstants.HEADER_SIZE + payload.length).order(ByteOrder.LITTLE_ENDIAN)
+                .putInt(QwpConstants.MAGIC_MESSAGE).put((byte) 1).put(QwpSchemaProtocol.FLAG_CONTROL)
+                .putShort((short) 0).putInt(payload.length).put(payload);
+        long address = Unsafe.malloc(frame.capacity(), MemoryTag.NATIVE_DEFAULT);
+        try {
+            for (int i = 0; i < frame.capacity(); i++) {
+                Unsafe.getUnsafe().putByte(address + i, frame.array()[i]);
+            }
+            return QwpSchemaProtocol.decodeResponse(address, frame.capacity());
+        } finally {
+            Unsafe.free(address, frame.capacity(), MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    private static Reader tableReader(QwpWebSocketEncoder encoder, int size, int rows, String name, byte type) {
+        Reader reader = tableHeader(encoder, size, rows, 1);
+        Assert.assertEquals(name, reader.string());
+        Assert.assertEquals(type, reader.u8());
+        return reader;
+    }
+
+    private static Reader tableHeader(QwpWebSocketEncoder encoder, int size, int rows, int columns) {
+        Reader reader = new Reader(encoder.getBuffer().getBufferPtr(), size);
+        reader.skip(QwpConstants.HEADER_SIZE);
+        Assert.assertEquals("t", reader.string());
+        Assert.assertEquals(1, reader.u8());
+        Assert.assertEquals(1, reader.i32());
+        Assert.assertEquals(1, reader.i64());
+        Assert.assertEquals(rows, reader.varint());
+        Assert.assertEquals(columns, reader.varint());
+        return reader;
+    }
+
+    private static int targetType(String value) {
+        return "TIMESTAMP".equals(value) ? ColumnType.TIMESTAMP_MICRO : ColumnType.TIMESTAMP_NANO;
+    }
+
+    private static byte wireType(String value) {
+        return "TIMESTAMP".equals(value) ? QwpConstants.TYPE_TIMESTAMP : QwpConstants.TYPE_TIMESTAMP_NANOS;
+    }
+
+    private static void assertReason(LineSenderSchemaException.Reason reason, Runnable action) {
+        Assert.assertEquals(reason, Assert.assertThrows(LineSenderSchemaException.class, action::run).getReason());
+    }
+
+    private static final class Reader {
+        private final long address;
+        private final int limit;
+        private int position;
+        private Reader(long address, int limit) {
+            this.address = address;
+            this.limit = limit;
+        }
+
+        private int i32() {
+            int value = Unsafe.getUnsafe().getInt(address + position);
+            position += 4;
+            return value;
+        }
+
+        private long i64() {
+            long value = Unsafe.getUnsafe().getLong(address + position);
+            position += 8;
+            return value;
+        }
+
+        private int position() {
+            return position;
+        }
+
+        private void skip(int length) {
+            position += length;
+            Assert.assertTrue(position <= limit);
+        }
+
+        private String string() {
+            int length = varint();
+            byte[] bytes = new byte[length];
+            for (int i = 0; i < length; i++) {
+                bytes[i] = (byte) u8();
+            }
+            return new String(bytes, StandardCharsets.UTF_8);
+        }
+
+        private int u8() {
+            Assert.assertTrue(position < limit);
+            return Unsafe.getUnsafe().getByte(address + position++) & 0xff;
+        }
+
+        private int varint() {
+            int result = 0;
+            int shift = 0;
+            int value;
+            do {
+                value = u8();
+                result |= (value & 0x7f) << shift;
+                shift += 7;
+            } while ((value & 0x80) != 0);
+            return result;
+        }
+    }
+}

@@ -44,6 +44,7 @@ import java.lang.reflect.Field;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
@@ -185,7 +186,8 @@ public class QwpWebSocketSenderTest {
     @Test
     public void testBinaryColumnRejectsNullArray() throws Exception {
         assertMemoryLeak(() -> {
-            try (QwpWebSocketSender sender = createUnconnectedSender()) {
+            try (TestWebSocketServer server = startLegacyServer();
+                 QwpWebSocketSender sender = connectLegacySender(server, Integer.MAX_VALUE, 0, 0L)) {
                 sender.table("t");
                 try {
                     sender.binaryColumn("x", (byte[]) null);
@@ -200,7 +202,8 @@ public class QwpWebSocketSenderTest {
     @Test
     public void testBinaryColumnRejectsNullDirectByteSlice() throws Exception {
         assertMemoryLeak(() -> {
-            try (QwpWebSocketSender sender = createUnconnectedSender()) {
+            try (TestWebSocketServer server = startLegacyServer();
+                 QwpWebSocketSender sender = connectLegacySender(server, Integer.MAX_VALUE, 0, 0L)) {
                 sender.table("t");
                 try {
                     sender.binaryColumn("x", (io.questdb.client.std.bytes.DirectByteSlice) null);
@@ -257,7 +260,8 @@ public class QwpWebSocketSenderTest {
     @Test
     public void testCancelRowDiscardsPartialRow() throws Exception {
         assertMemoryLeak(() -> {
-            try (QwpWebSocketSender sender = createUnconnectedSender()) {
+            try (TestWebSocketServer server = startLegacyServer();
+                 QwpWebSocketSender sender = connectLegacySender(server, Integer.MAX_VALUE, 0, 0L)) {
                 sender.table("test");
                 sender.longColumn("x", 1);
                 sender.boolColumn("y", true);
@@ -430,7 +434,8 @@ public class QwpWebSocketSenderTest {
         // real IPv4". Reject it as an invalid IPv4 address; the user can
         // pass a null reference (or omit the setter) to mark the row null.
         assertMemoryLeak(() -> {
-            try (QwpWebSocketSender sender = createUnconnectedSender()) {
+            try (TestWebSocketServer server = startLegacyServer();
+                 QwpWebSocketSender sender = connectLegacySender(server, Integer.MAX_VALUE, 0, 0L)) {
                 sender.table("t");
                 for (String input : new String[]{"null", "NULL", "Null", "nUlL"}) {
                     try {
@@ -456,7 +461,8 @@ public class QwpWebSocketSenderTest {
         // valid dotted-quad. Reject it on the client so the user gets a
         // clear error instead of a value that disappears on read.
         assertMemoryLeak(() -> {
-            try (QwpWebSocketSender sender = createUnconnectedSender()) {
+            try (TestWebSocketServer server = startLegacyServer();
+                 QwpWebSocketSender sender = connectLegacySender(server, Integer.MAX_VALUE, 0, 0L)) {
                 sender.table("t");
                 try {
                     sender.ipv4Column("addr", "0.0.0.0");
@@ -560,15 +566,8 @@ public class QwpWebSocketSenderTest {
     @Test
     public void testPendingBytesMatchesGroundTruthAcrossTableSwitches() throws Exception {
         assertMemoryLeak(() -> {
-            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
-                    "localhost", 9000,
-                    /*autoFlushRows*/ Integer.MAX_VALUE,
-                    /*autoFlushBytes*/ 0,
-                    /*autoFlushIntervalNanos*/ 0L)) {
-                // Bypass ensureConnected: sendRow only short-circuits on
-                // connected==true and we don't drive any path that touches
-                // the cursor engine in this test.
-                sender.setConnectedForTest(true);
+            try (TestWebSocketServer server = startLegacyServer();
+                 QwpWebSocketSender sender = connectLegacySender(server, Integer.MAX_VALUE, 0, 0L)) {
 
                 // Round-robin three tables to exercise the per-row delta
                 // logic across switches. The running pendingBytes must
@@ -590,12 +589,8 @@ public class QwpWebSocketSenderTest {
     @Test
     public void testPendingBytesUnchangedByCancelRow() throws Exception {
         assertMemoryLeak(() -> {
-            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
-                    "localhost", 9000,
-                    /*autoFlushRows*/ Integer.MAX_VALUE,
-                    /*autoFlushBytes*/ 0,
-                    /*autoFlushIntervalNanos*/ 0L)) {
-                sender.setConnectedForTest(true);
+            try (TestWebSocketServer server = startLegacyServer();
+                 QwpWebSocketSender sender = connectLegacySender(server, Integer.MAX_VALUE, 0, 0L)) {
 
                 sender.table("t0").longColumn("a", 1).longColumn("b", 2).atNow();
                 long committed = sender.getPendingBytes();
@@ -636,12 +631,8 @@ public class QwpWebSocketSenderTest {
         // the volatile serverMaxBatchSize to 0 mid-row, and a torn read that observed
         // the drop between the guard and the throw must not spuriously reject the row.
         assertMemoryLeak(() -> {
-            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
-                    "localhost", 9000,
-                    /*autoFlushRows*/ Integer.MAX_VALUE,
-                    /*autoFlushBytes*/ 0,
-                    /*autoFlushIntervalNanos*/ 0L)) {
-                sender.setConnectedForTest(true);
+            try (TestWebSocketServer server = startLegacyServer();
+                 QwpWebSocketSender sender = connectLegacySender(server, Integer.MAX_VALUE, 0, 0L)) {
                 sender.applyServerBatchSizeLimit(0);
                 Assert.assertEquals(0, sender.getServerMaxBatchSize());
 
@@ -665,12 +656,8 @@ public class QwpWebSocketSenderTest {
         // already exceed the server's advertised cap, before nextRow() commits it, so
         // the flush cannot build an oversize WS frame the server closes with 1009.
         assertMemoryLeak(() -> {
-            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
-                    "localhost", 9000,
-                    /*autoFlushRows*/ Integer.MAX_VALUE,
-                    /*autoFlushBytes*/ 0,
-                    /*autoFlushIntervalNanos*/ 0L)) {
-                sender.setConnectedForTest(true);
+            try (TestWebSocketServer server = startLegacyServer();
+                 QwpWebSocketSender sender = connectLegacySender(server, Integer.MAX_VALUE, 0, 0L)) {
                 sender.applyServerBatchSizeLimit(64);
                 Assert.assertEquals(64, sender.getServerMaxBatchSize());
 
@@ -706,12 +693,8 @@ public class QwpWebSocketSenderTest {
         // row once the table's CUMULATIVE buffered bytes crossed the cap; this
         // pins the wiring the single-row tests cannot distinguish.
         assertMemoryLeak(() -> {
-            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
-                    "localhost", 9000,
-                    /*autoFlushRows*/ Integer.MAX_VALUE,
-                    /*autoFlushBytes*/ 0,
-                    /*autoFlushIntervalNanos*/ 0L)) {
-                sender.setConnectedForTest(true);
+            try (TestWebSocketServer server = startLegacyServer();
+                 QwpWebSocketSender sender = connectLegacySender(server, Integer.MAX_VALUE, 0, 0L)) {
                 sender.applyServerBatchSizeLimit(64);
 
                 // Three rows of 22-26 bytes each: every row fits the 64-byte cap,
@@ -721,6 +704,9 @@ public class QwpWebSocketSenderTest {
                 }
                 QwpTableBuffer buf = sender.getTableBuffer("t");
                 Assert.assertEquals(3, buf.getRowCount());
+                // The accumulated frame is intentionally larger than the cap;
+                // this test covers the per-row guard, not close-time flushing.
+                sender.reset();
             }
         });
     }
@@ -861,6 +847,49 @@ public class QwpWebSocketSenderTest {
         Field field = QwpWebSocketSender.class.getDeclaredField(fieldName);
         field.setAccessible(true);
         return (MicrobatchBuffer) field.get(sender);
+    }
+
+    private static QwpWebSocketSender connectLegacySender(
+            TestWebSocketServer server,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos
+    ) {
+        CursorSendEngine engine = new CursorSendEngine(null, 4L * 1024 * 1024);
+        try {
+            return QwpWebSocketSender.connect(
+                    "localhost", server.getPort(), null,
+                    autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
+                    null, false, engine, 0L);
+        } catch (Throwable t) {
+            engine.close();
+            throw t;
+        }
+    }
+
+    private static TestWebSocketServer startLegacyServer() throws Exception {
+        AtomicLong nextSequence = new AtomicLong();
+        TestWebSocketServer server = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
+            @Override
+            public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+                try {
+                    client.sendBinary(QwpWireTestUtils.buildAck(nextSequence.getAndIncrement()));
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            }
+        });
+        boolean started = false;
+        try {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            started = true;
+            return server;
+        } finally {
+            if (!started) {
+                server.close();
+            }
+        }
     }
 
     /**

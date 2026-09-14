@@ -125,6 +125,7 @@ public class TestWebSocketServer implements Closeable {
     // builds. Lets a test force the delta-dictionary catch-up to split across
     // several frames. Live-updatable via setAdvertisedMaxBatchSize().
     private volatile int advertisedMaxBatchSize;
+    private volatile boolean advertiseSchema;
 
     public TestWebSocketServer(WebSocketServerHandler handler) throws IOException {
         this(handler, false);
@@ -188,6 +189,10 @@ public class TestWebSocketServer implements Closeable {
 
     public boolean awaitStart(long timeout, TimeUnit unit) throws InterruptedException {
         return startLatch.await(timeout, unit);
+    }
+
+    public void setAdvertiseSchema(boolean advertiseSchema) {
+        this.advertiseSchema = advertiseSchema;
     }
 
     @Override
@@ -419,6 +424,12 @@ public class TestWebSocketServer implements Closeable {
     public interface WebSocketServerHandler {
         default void onBinaryMessage(ClientHandler client, byte[] data) {
         }
+
+        default void onOpen(ClientHandler client) {
+        }
+
+        default void onPong(ClientHandler client, byte[] data) {
+        }
     }
 
     /**
@@ -461,6 +472,10 @@ public class TestWebSocketServer implements Closeable {
 
         public synchronized void sendBinary(byte[] data) throws IOException {
             writeFrame(WebSocketOpcode.BINARY, data, data.length);
+        }
+
+        public synchronized void sendPing(byte[] data) throws IOException {
+            writeFrame(WebSocketOpcode.PING, data, data.length);
         }
 
         public synchronized void sendClose(int code, String reason) throws IOException {
@@ -542,6 +557,9 @@ public class TestWebSocketServer implements Closeable {
                         } catch (IOException e) {
                             LOG.error("Failed to send pong", e);
                         }
+                        break;
+                    case WebSocketOpcode.PONG:
+                        handler.onPong(this, payload);
                         break;
                     case WebSocketOpcode.CLOSE: {
                         int code = WebSocketCloseCode.NORMAL_CLOSURE;
@@ -657,6 +675,9 @@ public class TestWebSocketServer implements Closeable {
             if (emitDurableAckHeader && !suppressDurableAckHeader) {
                 sb.append("X-QWP-Durable-Ack: enabled\r\n");
             }
+            if (advertiseSchema && request.toString().toLowerCase(java.util.Locale.ROOT).contains("x-qwp-request-schema: true\r\n")) {
+                sb.append("X-QWP-Schema: enabled\r\n");
+            }
             String role = advertisedRole;
             if (role != null) {
                 sb.append("X-QuestDB-Role: ").append(role).append("\r\n");
@@ -715,6 +736,7 @@ public class TestWebSocketServer implements Closeable {
                     liveConnections.incrementAndGet();
 
                     try {
+                        handler.onOpen(this);
                         // SERVER_INFO is an egress-only frame: send it only on a
                         // read-path (query) connection. An ingest write-path
                         // connection parses every inbound frame as an ACK and

@@ -25,6 +25,7 @@
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
+import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.std.Compat;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.FilesFacade;
@@ -174,6 +175,7 @@ public final class CursorSendEngine implements QuietCloseable {
     // because both producer seeding and every recycled send loop need the same
     // frame-rebuilt symbol suffix. Null for fresh and memory-only engines.
     private final RecoveredFrameAnalysis recoveredFrameAnalysis;
+    private volatile boolean requiresSchema;
     // close() is publicly callable from any thread (Sender.close from a user
     // thread, JVM shutdown hooks, test cleanup). volatile + synchronized
     // close() makes the check-and-set atomic and gives readers a fence.
@@ -820,6 +822,8 @@ public final class CursorSendEngine implements QuietCloseable {
             this.watermark = watermarkInProgress;
             this.persistedSymbolDict = persistedDictInProgress;
             this.recoveredFrameAnalysis = recoveredFrameAnalysisInProgress;
+            this.requiresSchema = recoveredFrameAnalysisInProgress != null
+                    && recoveredFrameAnalysisInProgress.requiresSchema();
         } catch (Throwable t) {
             // Stop an owned manager before freeing the ring and watermark it may
             // touch, then release the slot lock. Each cleanup is in its own
@@ -916,6 +920,7 @@ public final class CursorSendEngine implements QuietCloseable {
      * is wedged" failures (server down, slow disk, etc.) from the user.
      */
     public long appendBlocking(long payloadAddr, int payloadLen) {
+        latchSchemaRequirement(payloadAddr, payloadLen);
         long fsn = ring.appendOrFsn(payloadAddr, payloadLen);
         if (fsn >= 0) return fsn;
         if (fsn == SegmentRing.PAYLOAD_TOO_LARGE) {
@@ -959,6 +964,7 @@ public final class CursorSendEngine implements QuietCloseable {
      * {@code SegmentRing.BACKPRESSURE_*} / {@code PAYLOAD_*} sentinels.
      */
     public long appendOrFsn(long payloadAddr, int payloadLen, long spinDeadlineNanos) {
+        latchSchemaRequirement(payloadAddr, payloadLen);
         long fsn = ring.appendOrFsn(payloadAddr, payloadLen);
         if (fsn >= 0) {
             return fsn;
@@ -981,6 +987,27 @@ public final class CursorSendEngine implements QuietCloseable {
 
     public void checkDurability() {
         ring.checkDurability();
+    }
+
+    public boolean requiresSchema() {
+        return requiresSchema;
+    }
+
+    public void requireSchema() {
+        requiresSchema = true;
+    }
+
+    private void latchSchemaRequirement(long payloadAddr, int payloadLen) {
+        if (!requiresSchema
+                && payloadAddr != 0
+                && payloadLen >= QwpConstants.HEADER_SIZE
+                && io.questdb.client.std.Unsafe.getUnsafe().getInt(payloadAddr) == QwpConstants.MAGIC_MESSAGE
+                && (io.questdb.client.std.Unsafe.getUnsafe().getByte(
+                        payloadAddr + QwpConstants.HEADER_OFFSET_FLAGS) & QwpConstants.FLAG_SCHEMA) != 0) {
+            // Publish the capability requirement before ring.append publishes
+            // the frame to the I/O consumer.
+            requiresSchema = true;
+        }
     }
 
     @Override
@@ -1882,9 +1909,16 @@ public final class CursorSendEngine implements QuietCloseable {
      *         server ACKs
      */
     public boolean retireRecoveredOrphanTailIfReady() {
+        return retireRecoveredOrphanTailIfReady(false);
+    }
+
+    public boolean retireRecoveredOrphanTailIfReady(boolean schemaConfirmed) {
         long orphanTip = recoveredOrphanTipFsn;
         if (orphanTip < 0L) {
             return true;
+        }
+        if (requiresSchema && !schemaConfirmed) {
+            return false;
         }
         long orphanStart = recoveredCommitBoundaryFsn + 1L;
         if (ackedFsn() < orphanStart - 1L) {

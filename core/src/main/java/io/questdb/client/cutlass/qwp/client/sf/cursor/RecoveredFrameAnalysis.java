@@ -65,6 +65,7 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
     private int runningRawCount;
     private int runningRawLen;
     private long runningCoverage;
+    private boolean requiresSchema;
 
     RecoveredFrameAnalysis(int baseline, long ackedFsn) {
         this.baseline = baseline;
@@ -81,6 +82,11 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
         byte flags = isQwp
                 ? Unsafe.getUnsafe().getByte(payload + QwpConstants.HEADER_OFFSET_FLAGS)
                 : 0;
+        if (fsn > ackedFsn && isQwp && (flags & QwpConstants.FLAG_SCHEMA) != 0) {
+            // Conservative by design: retained deferred tails may still be
+            // replay-owned until the engine's orphan-tail retirement runs.
+            requiresSchema = true;
+        }
         if (isQwp && (flags & QwpConstants.FLAG_DELTA_SYMBOL_DICT) != 0) {
             foldDelta(fsn, payload + QwpConstants.HEADER_SIZE, payload + payloadLen);
         }
@@ -203,6 +209,10 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
 
     int rawCapacity() {
         return rawCapacity;
+    }
+
+    boolean requiresSchema() {
+        return requiresSchema;
     }
 
     /**

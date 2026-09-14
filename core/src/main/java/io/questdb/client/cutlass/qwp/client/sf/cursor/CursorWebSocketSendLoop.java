@@ -25,6 +25,7 @@
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.LineSenderServerException;
+import io.questdb.client.LineSenderSchemaException;
 import io.questdb.client.SenderConnectionEvent;
 import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
@@ -35,11 +36,14 @@ import io.questdb.client.cutlass.qwp.client.NativeBufferWriter;
 import io.questdb.client.cutlass.qwp.client.QwpAuthFailedException;
 import io.questdb.client.cutlass.qwp.client.QwpCredentialUnavailableException;
 import io.questdb.client.cutlass.qwp.client.QwpDurableAckMismatchException;
+import io.questdb.client.cutlass.qwp.client.QwpSchemaCapabilityMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpIngressRoleRejectedException;
 import io.questdb.client.cutlass.qwp.client.QwpRoleMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpVersionMismatchException;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
+import io.questdb.client.cutlass.qwp.protocol.QwpSchemaProtocol;
+import io.questdb.client.cutlass.qwp.protocol.QwpSchemaResponse;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
 import io.questdb.client.std.CharSequenceLongHashMap;
 import io.questdb.client.std.MemoryTag;
@@ -271,6 +275,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private final CursorSendEngine engine;
     private final long parkNanos;
     private final ReconnectPolicy reconnectPolicy;
+    private final QwpSchemaCoordinator schemaCoordinator = new QwpSchemaCoordinator();
     // FIFO of OK-acked batches awaiting durable-upload confirmation. Used only
     // when durableAckMode is true. Each entry binds a wireSeq to the per-table
     // (name, seqTxn) pairs the server reported on the OK frame. The queue is
@@ -919,6 +924,16 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // hands null and lets the I/O thread connect — hasEverConnected
         // stays false until swapClient sees its first success.
         this.hasEverConnected = client != null;
+        if (engine.requiresSchema()) {
+            if (reconnectFactory != null) {
+                reconnectFactory.requireSchema();
+            }
+        } else if (client != null && client.isQwpSchemaEnabled()) {
+            engine.requireSchema();
+            if (reconnectFactory != null) {
+                reconnectFactory.requireSchema();
+            }
+        }
         // Adopt the engine's recovered orphaned-deferred-tail range (if any).
         // See the field docs on orphanSkipStartFsn/orphanSkipTipFsn; the
         // BackgroundDrainer path builds its loop through this same
@@ -1202,6 +1217,35 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * Resolves a schema through this loop's I/O thread, returning a KNOWN or MISSING response.
+     * This producer-side API permits one outstanding lookup. The timeout covers the entire
+     * operation, including connection and I/O; zero permits only an existing cache hit.
+     * Failures are reported as {@link LineSenderSchemaException}. This does not mutate rows,
+     * store-and-forward state, or acknowledgment watermarks.
+     */
+    public QwpSchemaResponse resolveSchema(CharSequence tableName, long timeoutMillis) {
+        return schemaCoordinator.resolve(tableName, timeoutMillis, false, ioThread);
+    }
+
+    public QwpSchemaResponse resolveSchema(CharSequence tableName, long timeoutMillis, boolean[] freshOut) {
+        if (freshOut == null || freshOut.length == 0) {
+            throw new IllegalArgumentException("freshOut must contain one element");
+        }
+        return schemaCoordinator.resolve(tableName, timeoutMillis, false, ioThread, freshOut);
+    }
+
+    /**
+     * Evicts the named cache entry at admission and resolves it again through the I/O thread.
+     * This producer-side API permits one outstanding lookup. The timeout covers the entire
+     * operation, including connection and I/O, and must leave time for a request. It returns
+     * a KNOWN or MISSING response and reports failures as {@link LineSenderSchemaException}.
+     * This does not mutate rows, store-and-forward state, or acknowledgment watermarks.
+     */
+    public QwpSchemaResponse refreshSchema(CharSequence tableName, long timeoutMillis) {
+        return schemaCoordinator.resolve(tableName, timeoutMillis, true, ioThread);
+    }
+
+    /**
      * The typed rotating-credential auth terminal (401/403), or {@code null} if the loop's terminal
      * (if any) is a different failure class. Non-null only after {@link #checkError()} started
      * throwing: the marker is written before the {@code terminalError} latch, both on the I/O thread.
@@ -1259,6 +1303,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // is false and start's ioLoop will exit immediately) or entirely
         // after — the latch await is only skipped when the loop never ran.
         running = false;
+        schemaCoordinator.close();
         Thread t = ioThread;
         // The symbol-dict mirror (sentDictBytesAddr) is I/O-thread-owned and gets
         // freed on ioLoop's exit path. When t == null the loop never ran (start()
@@ -1534,6 +1579,41 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         return hasEverConnected;
     }
 
+    /**
+     * Waits for the first completed WebSocket upgrade and returns whether that
+     * handshake selected schema mode. A failed or still-pending handshake is
+     * never interpreted as a legacy peer.
+     */
+    public boolean awaitInitialSchemaMode(long timeoutMillis) {
+        long timeoutNanos = timeoutMillis > Long.MAX_VALUE / 1_000_000L
+                ? Long.MAX_VALUE : timeoutMillis * 1_000_000L;
+        long start = System.nanoTime();
+        while (!hasEverConnected) {
+            checkError();
+            if (!running) {
+                throw new LineSenderSchemaException(
+                        LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE,
+                        "schema negotiation stopped before the first successful connection");
+            }
+            if (Thread.interrupted()) {
+                Thread.currentThread().interrupt();
+                throw new LineSenderSchemaException(
+                        LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE,
+                        "schema negotiation was interrupted");
+            }
+            if (timeoutNanos - (System.nanoTime() - start) <= 0) {
+                throw new LineSenderSchemaException(
+                        LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE,
+                        "schema negotiation timed out before the first successful connection");
+            }
+            LockSupport.parkNanos(Math.min(50_000L,
+                    timeoutNanos - (System.nanoTime() - start)));
+        }
+        // swapClient/constructor publishes the sticky engine requirement before
+        // hasEverConnected becomes visible. Read the authority, not client state.
+        return engine.requiresSchema();
+    }
+
     public boolean isRunning() {
         return running;
     }
@@ -1584,6 +1664,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             throw new IllegalStateException("already started");
         }
         running = true;
+        if (engine.requiresSchema() && client != null && !client.isQwpSchemaEnabled()) {
+            running = false;
+            throw new QwpSchemaCapabilityMismatchException();
+        }
         // Position the cursor at the first unsent FSN before spinning the
         // I/O thread. For a fresh sender, ackedFsn=-1 → start at FSN 0,
         // which lands on the (empty) initial active — same as the prior
@@ -1732,6 +1816,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         if (!running) {
             return;
         }
+        WebSocketClient failedClient = client;
+        if (failedClient != null) {
+            schemaCoordinator.connectionLost(failedClient);
+        }
         if (reconnectFactory == null) {
             recordFatal(initial);
             return;
@@ -1788,6 +1876,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             attempts++;
             totalReconnectAttempts.incrementAndGet();
             try {
+                if (engine.requiresSchema()) {
+                    reconnectFactory.requireSchema();
+                }
                 WebSocketClient newClient = reconnectFactory.reconnect(connectCancellation);
                 if (newClient != null) {
                     if (!running) {
@@ -1884,6 +1975,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                             phase, attempts, e.getMessage());
                     lastLogNanos = now;
                 }
+            } catch (QwpSchemaCapabilityMismatchException e) {
+                resetCatchUpCapGapEpisode();
+                lastReconnectError = e;
+                LOG.warn("schema framing unavailable during {}; retaining backlog and retrying: {}",
+                        phase, e.getMessage());
             } catch (QwpDurableAckMismatchException e) {
                 if (endpointPolicyFailureIsTerminal()) {
                     // Orphans hand a capability gap back to BackgroundDrainer's
@@ -2376,7 +2472,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 attemptInitialConnect();
             }
             while (running) {
-                boolean didWork = trySendOne();
+                boolean didWork = trySendSchemaRequest();
+                if (trySendOne()) {
+                    didWork = true;
+                }
                 // 1. Try to send next frame(s).
                 // 2. Try to receive ACKs.
                 if (tryReceiveAcks()) {
@@ -2430,6 +2529,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 }
             }
         } finally {
+            schemaCoordinator.close();
             // Release native-segment lifetime before publishing I/O-thread
             // completion or running delegated engine cleanup.
             releaseSendingSegment();
@@ -2549,6 +2649,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * every rethrow delivers the same instance.
      */
     private void recordFatal(Throwable t) {
+        schemaCoordinator.close();
         if (terminalError == null) {
             terminalError = t instanceof LineSenderException
                     ? (LineSenderException) t
@@ -2646,8 +2747,23 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * {@link #trySendOne} call replays the first unacked frame.
      */
     private void swapClient(WebSocketClient newClient) {
+        if (engine.requiresSchema() && !newClient.isQwpSchemaEnabled()) {
+            try {
+                newClient.close();
+            } catch (Throwable ignored) {
+                // best-effort
+            }
+            throw new QwpSchemaCapabilityMismatchException();
+        }
+        if (newClient.isQwpSchemaEnabled()) {
+            engine.requireSchema();
+            if (reconnectFactory != null) {
+                reconnectFactory.requireSchema();
+            }
+        }
         WebSocketClient old = this.client;
         this.client = newClient;
+        schemaCoordinator.clearCache();
         this.lastReconnectError = null;
         if (old != null) {
             try {
@@ -3390,12 +3506,53 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         return any;
     }
 
+    private boolean trySendSchemaRequest() {
+        if (!schemaCoordinator.hasPendingRequest()) {
+            return false;
+        }
+        WebSocketClient activeClient = client;
+        if (activeClient == null) {
+            return false;
+        }
+        QwpSchemaCoordinator.Request request = schemaCoordinator.requestToSend(activeClient);
+        if (request == null) {
+            return false;
+        }
+        if (!activeClient.isQwpSchemaEnabled()) {
+            schemaCoordinator.fail(request, LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+                    "server did not negotiate schema lookup support");
+            return true;
+        }
+        long remainingNanos = request.remainingNanos();
+        if (remainingNanos <= 0) {
+            schemaCoordinator.fail(request, LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE,
+                    "schema lookup timed out before send");
+            return true;
+        }
+        int timeoutMillis = (int) Math.min(Integer.MAX_VALUE,
+                1L + (remainingNanos - 1L) / 1_000_000L);
+        try {
+            activeClient.sendBinary(request.message, timeoutMillis);
+            return true;
+        } catch (Throwable t) {
+            if (t instanceof Error) {
+                throw (Error) t;
+            }
+            fail(t);
+            return true;
+        }
+    }
+
     /**
      * Returns true if at least one frame was sent (caller skips the park).
      * Bounded: sends at most one frame per call so the ACK side gets
      * scheduling fairness.
      */
     private boolean trySendOne() {
+        if (engine.requiresSchema() && (client == null || !client.isQwpSchemaEnabled())) {
+            fail(new QwpSchemaCapabilityMismatchException());
+            return false;
+        }
         if (orphanSkipTipFsn >= 0 && fsnAtZero + nextWireSeq >= orphanSkipStartFsn) {
             // The send cursor reached the orphaned deferred tail. Its frames
             // belong to an aborted transaction and must never be transmitted
@@ -3485,6 +3642,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             return false; // payload not fully published yet
         }
         long frameAddr = base + sendOffset + MmapSegment.FRAME_HEADER_SIZE;
+        // The producer latches the requirement before publishing an extended
+        // frame. Re-check after observing publication so an append racing the
+        // early guard cannot expose either its legacy prefix or the extended
+        // frame to an already-connected legacy peer.
+        if (engine.requiresSchema() && (client == null || !client.isQwpSchemaEnabled())) {
+            fail(new QwpSchemaCapabilityMismatchException());
+            return false;
+        }
         // Torn-dictionary guard. sentDictCount is this loop's model of how many ids the
         // CURRENT server has been told about. A frame whose delta starts ABOVE that
         // coverage references ids the server was never given, and the server now rejects
@@ -3592,7 +3757,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         if (orphanSkipTipFsn < 0) {
             return true;
         }
-        if (!engine.retireRecoveredOrphanTailIfReady()) {
+        if (!engine.retireRecoveredOrphanTailIfReady(
+                client != null && client.isQwpSchemaEnabled())) {
             return false;
         }
         orphanSkipStartFsn = -1L;
@@ -3630,6 +3796,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     @FunctionalInterface
     public interface ReconnectFactory {
         WebSocketClient reconnect() throws Exception;
+
+        default void requireSchema() {
+        }
 
         /**
          * Whether this factory re-derives its {@code Authorization} header from a caller-supplied token
@@ -3862,10 +4031,42 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private final class ResponseHandler implements WebSocketFrameHandler {
         @Override
         public void onBinaryMessage(long payloadPtr, int payloadLen) {
-            if (!response.readFrom(payloadPtr, payloadLen)) {
+            if (payloadLen >= Integer.BYTES
+                    && Unsafe.getUnsafe().getInt(payloadPtr) == QwpConstants.MAGIC_MESSAGE) {
+                WebSocketClient responseClient = client;
+                final long requestId;
+                try {
+                    if (responseClient == null || !responseClient.isQwpSchemaEnabled()) {
+                        throw new IllegalArgumentException("schema control response was not negotiated");
+                    }
+                    requestId = QwpSchemaProtocol.peekResponseRequestId(payloadPtr, payloadLen);
+                } catch (RuntimeException e) {
+                    fail(new LineSenderException("Invalid schema control response: " + e.getMessage(), e));
+                    return;
+                }
+                if (!schemaCoordinator.isLiveResponse(responseClient, requestId)) {
+                    return;
+                }
+                final QwpSchemaResponse schema;
+                try {
+                    schema = QwpSchemaProtocol.decodeResponse(payloadPtr, payloadLen);
+                } catch (RuntimeException e) {
+                    if (!schemaCoordinator.isLiveResponse(responseClient, requestId)) {
+                        return;
+                    }
+                    fail(new LineSenderException("Invalid schema control response: " + e.getMessage(), e));
+                    return;
+                }
+                schemaCoordinator.completeResponse(responseClient, schema);
+                return;
+            }
+            if (!response.readFrom(payloadPtr, payloadLen, client != null && client.isQwpSchemaEnabled())) {
                 fail(new LineSenderException(
                         "Invalid ACK response payload [length=" + payloadLen + ']'));
                 return;
+            }
+            if (response.hasSchemaUpdates() || response.isSchemaInvalidation()) {
+                schemaCoordinator.applyFeedback(response);
             }
             long wireSeq = response.getSequence();
             if (response.isSuccess()) {

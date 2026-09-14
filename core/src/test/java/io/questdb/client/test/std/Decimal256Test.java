@@ -1329,7 +1329,7 @@ public class Decimal256Test {
     public void testOfStringDecimalPointAtStart() throws NumericException {
         Decimal256 d = new Decimal256();
         int precision = Numbers.decodeLowInt(d.ofString(".123"));
-        Assert.assertEquals(4, precision);
+        Assert.assertEquals(3, precision);
         Assert.assertEquals(3, d.getScale());
         Assert.assertEquals("0.123", d.toString());
     }
@@ -1440,7 +1440,7 @@ public class Decimal256Test {
 
         // Complex decimal with exponent
         int precision = Numbers.decodeLowInt(d.ofString("123.456789e-3"));
-        Assert.assertEquals(10, precision);
+        Assert.assertEquals(9, precision);
         Assert.assertEquals(9, d.getScale());
         Assert.assertEquals("0.123456789", d.toString());
 
@@ -1463,7 +1463,7 @@ public class Decimal256Test {
 
         // Large negative exponent within bounds
         precision = Numbers.decodeLowInt(d.ofString("1e-20"));
-        Assert.assertEquals(21, precision);
+        Assert.assertEquals(20, precision);
         Assert.assertEquals(20, d.getScale());
         Assert.assertEquals("0.00000000000000000001", d.toString());
     }
@@ -1530,7 +1530,7 @@ public class Decimal256Test {
 
         // Integer base with negative exponent
         precision = Numbers.decodeLowInt(d.ofString("456e-3"));
-        Assert.assertEquals(4, precision);
+        Assert.assertEquals(3, precision);
         Assert.assertEquals(3, d.getScale());
         Assert.assertEquals("0.456", d.toString());
     }
@@ -1564,7 +1564,7 @@ public class Decimal256Test {
 
         // Negative number with negative exponent
         precision = Numbers.decodeLowInt(d.ofString("-2.5e-2"));
-        Assert.assertEquals(4, precision);
+        Assert.assertEquals(3, precision);
         Assert.assertEquals(3, d.getScale());
         Assert.assertEquals("-0.025", d.toString());
     }
@@ -1581,7 +1581,7 @@ public class Decimal256Test {
 
         // With scale limit that matches the result scale
         precision = Numbers.decodeLowInt(d.ofString("1e-3", -1, 3));
-        Assert.assertEquals(4, precision);
+        Assert.assertEquals(3, precision);
         Assert.assertEquals(3, d.getScale());
         Assert.assertEquals("0.001", d.toString());
     }
@@ -1612,7 +1612,7 @@ public class Decimal256Test {
 
         // With m suffix
         precision = Numbers.decodeLowInt(d.ofString("2.5e-3m"));
-        Assert.assertEquals(5, precision);
+        Assert.assertEquals(4, precision);
         Assert.assertEquals(4, d.getScale());
         Assert.assertEquals("0.0025", d.toString());
     }
@@ -1832,7 +1832,7 @@ public class Decimal256Test {
         Assert.assertEquals(6, p3);
 
         int p4 = Numbers.decodeLowInt(d.ofString("00.001"));
-        Assert.assertEquals(4, p4); // Leading zeros don't count toward precision
+        Assert.assertEquals(3, p4); // Leading zeros don't count toward precision; 0.001 needs 3 fractional digits
     }
 
     @Test(expected = NumericException.class)
@@ -1946,25 +1946,25 @@ public class Decimal256Test {
 
         // Basic negative exponent
         int precision = Numbers.decodeLowInt(d.ofString("1.234e-2"));
-        Assert.assertEquals(6, precision);
+        Assert.assertEquals(5, precision);
         Assert.assertEquals(5, d.getScale());
         Assert.assertEquals("0.01234", d.toString());
 
         // Larger negative exponent
         precision = Numbers.decodeLowInt(d.ofString("5e-5"));
-        Assert.assertEquals(6, precision);
+        Assert.assertEquals(5, precision);
         Assert.assertEquals(5, d.getScale());
         Assert.assertEquals("0.00005", d.toString());
 
         // Negative exponent with E (uppercase)
         precision = Numbers.decodeLowInt(d.ofString("7.89E-3"));
-        Assert.assertEquals(6, precision);
+        Assert.assertEquals(5, precision);
         Assert.assertEquals(5, d.getScale());
         Assert.assertEquals("0.00789", d.toString());
 
         // Very small number
         precision = Numbers.decodeLowInt(d.ofString("1e-10"));
-        Assert.assertEquals(11, precision);
+        Assert.assertEquals(10, precision);
         Assert.assertEquals(10, d.getScale());
         Assert.assertEquals("0.0000000001", d.toString());
     }
@@ -2066,7 +2066,7 @@ public class Decimal256Test {
         Assert.assertEquals("0", d.toString());
 
         precision = Numbers.decodeLowInt(d.ofString("0.000m"));
-        Assert.assertEquals(4, precision);
+        Assert.assertEquals(3, precision);
         Assert.assertEquals(3, d.getScale());
         Assert.assertEquals("0.000", d.toString());
 

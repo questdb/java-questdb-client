@@ -35,7 +35,7 @@ package io.questdb.client.std;
  * <li>QuestDB decimal suffix: "123.45m" or "123.45M"</li>
  * <li>Floating-point suffixes: "123.45f", "123.45d" (stripped during parsing)</li>
  * <li>Leading zeros: "00123.45" → 123.45</li>
- * <li>Leading/trailing whitespace</li>
+ * <li>Leading ASCII spaces</li>
  * </ul>
  *
  * @see Decimal
@@ -54,7 +54,7 @@ public final class DecimalParser {
      * <p>
      * <b>Parsing Process:</b>
      * <ol>
-     * <li>Strip suffixes (m, M, f, d) and leading/trailing whitespace</li>
+     * <li>Strip supported suffixes (m, M, f, d) and leading ASCII spaces</li>
      * <li>Parse sign (+/-) and detect special values (NaN/Infinity)</li>
      * <li>Remove leading zeros</li>
      * <li>Extract mantissa and locate decimal point</li>
@@ -163,12 +163,21 @@ public final class DecimalParser {
         // We do a first pass over the literal to ensure that the format is correct (numerical and at most 1 dot) and to
         // measure the given precision/scale.
         int dot = -1;
+        int leadingZeroes = 0;
         boolean digitFound = false;
+        boolean hasSignificantDigit = false;
         int digitLo = lo;
         for (; lo < hi; lo++) {
             char c = cs.charAt(lo);
             if (isDigit(c)) {
                 digitFound = true;
+                if (!hasSignificantDigit) {
+                    if (c == '0') {
+                        leadingZeroes++;
+                    } else {
+                        hasSignificantDigit = true;
+                    }
+                }
                 continue;
             } else if (c == '.' && dot == -1) {
                 dot = lo;
@@ -178,7 +187,9 @@ public final class DecimalParser {
         }
         if (!digitFound) {
             if (skippedZeroes) {
+                // The stripper only walks over zeroes, so the digit it gives back is a zero.
                 digitLo--;
+                leadingZeroes = 1;
             } else {
                 throw NumericException.instance()
                         .put("invalid decimal: '").put(cs)
@@ -196,9 +207,9 @@ public final class DecimalParser {
         int literalScale = dot == -1 ? 0 : (digitHi - dot - 1);
         int literalDigits = digitHi - digitLo - (dot == -1 ? 0 : 1);
 
-        int virtualScale = literalScale;
+        long virtualScale = literalScale;
 
-        int exp = 0;
+        long exp = 0;
         if (lo != hi) {
             // Parses exponent
             if ((cs.charAt(lo) | 32) == 'e') {
@@ -222,7 +233,7 @@ public final class DecimalParser {
 
         // If lossy is enabled, we can strip digits after the provided scale (as long as it is provided)
         if (lossy && scale >= 0 && virtualScale > scale) {
-            int drop = virtualScale - scale;
+            long drop = virtualScale - scale;
             while (drop > 0 && digitHi > digitLo) {
                 digitHi--;
                 if (digitHi == dot) {
@@ -237,7 +248,12 @@ public final class DecimalParser {
 
         // We still need to adjust the exponent if the user specifies a target scale.
         if (scale == -1) {
-            scale = virtualScale;
+            if (virtualScale > decimal.getMaxScale()) {
+                throw NumericException.instance()
+                        .put("decimal '").put(cs)
+                        .put("' exceeds maximum allowed scale of ").put(decimal.getMaxScale());
+            }
+            scale = (int) virtualScale;
         } else if (virtualScale <= scale) {
             exp += scale - virtualScale;
         } else {
@@ -258,8 +274,9 @@ public final class DecimalParser {
         // precision, as long as it's lower.
 
         // Compute the final precision of the decimal
-        int pow = literalDigits + exp;
-        final int finalPrecision = Math.max(pow, scale + 1);
+        long pow = literalDigits + exp;
+        final long unscaledDigits = literalDigits > leadingZeroes ? pow - leadingZeroes : 0;
+        final long finalPrecision = Math.max(Math.max(unscaledDigits, scale), 1);
         if (precision != -1 && finalPrecision > precision) {
             throw NumericException.instance()
                     .put("decimal '").put(cs)
@@ -277,8 +294,14 @@ public final class DecimalParser {
             if (p == dot) {
                 continue;
             }
-
-            decimal.addPowerOfTenMultiple(--pow, cs.charAt(p) - '0');
+            int multiplier = cs.charAt(p) - '0';
+            pow--;
+            if (multiplier != 0) {
+                if (pow < 0 || pow >= decimal.getMaxPrecision()) {
+                    throw NumericException.instance().put("decimal '").put(cs).put("' exponent is out of range");
+                }
+                decimal.addPowerOfTenMultiple((int) pow, multiplier);
+            }
         }
         decimal.setScale(scale);
 
@@ -286,7 +309,7 @@ public final class DecimalParser {
             decimal.negate();
         }
 
-        return Numbers.encodeLowHighInts(finalPrecision, scale);
+        return Numbers.encodeLowHighInts((int) finalPrecision, scale);
     }
 
     /**
@@ -315,8 +338,8 @@ public final class DecimalParser {
      * @return true if "NaN" or "Infinity" is found at position lo, false otherwise
      */
     private static boolean isNanOrInfinite(char ch, CharSequence cs, int lo, int hi) {
-        return (ch == 'N' && lo + 2 < hi && cs.charAt(lo + 1) == 'a' && cs.charAt(lo + 2) == 'N') ||
-                (ch == 'I' && lo + 7 < hi && cs.charAt(lo + 1) == 'n' && cs.charAt(lo + 2) == 'f'
+        return (ch == 'N' && hi - lo == 3 && cs.charAt(lo + 1) == 'a' && cs.charAt(lo + 2) == 'N') ||
+                (ch == 'I' && hi - lo == 8 && cs.charAt(lo + 1) == 'n' && cs.charAt(lo + 2) == 'f'
                         && cs.charAt(lo + 3) == 'i' && cs.charAt(lo + 4) == 'n' && cs.charAt(lo + 5) == 'i'
                         && cs.charAt(lo + 6) == 't' && cs.charAt(lo + 7) == 'y');
     }
