@@ -1495,7 +1495,11 @@ public class QwpTableBuffer implements QuietCloseable {
         }
 
         public byte getDecimalScale() {
-            return decimalScale;
+            // A decimal column containing only nulls has no natural scale yet.
+            // Scale -1 is internal state, not valid QWP metadata; emit the
+            // deterministic scale-zero representation without locking it so a
+            // later finite batch can still select its natural scale.
+            return decimalScale == -1 ? 0 : decimalScale;
         }
 
         public double[] getDoubleArrayData() {

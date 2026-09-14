@@ -1,12 +1,11 @@
 # Schema-aware sender: schema-directed encoding
 
-Status: implemented on the development branch, revision 58. Scope: QWP v1 over
+Status: implemented on the development branch, revision 59. Scope: QWP v1 over
 WebSocket, with an automatically negotiated schema extension, legacy-server
 compatibility and companion server changes. The committed baseline contains the
-protocol, Sender integration and conversions through iteration 2.36; iteration
-2.37 is locally validated. A released-binary compatibility gate is implemented
-and locally green. The remaining public-setter conversion contract is not
-complete.
+protocol, Sender integration and conversions through iteration 2.37; iteration
+2.38 is locally validated. A released-binary compatibility gate is implemented
+and locally green. The remaining public-setter conversion contract is not complete.
 
 ## Goal and contract
 
@@ -39,13 +38,13 @@ server-side failures can still reject a batch.
 
 ## Implementation status
 
-Current checkpoint: iteration 2.37 adds BYTE, SHORT and INT inputs into all six
-numeric targets, including identity. Numeric narrowing is checked locally;
-`Integer.MIN_VALUE` is a stable INT source null in schema mode. The committed
-baseline remains client `6fe3ce44`, server protocol `ffbb7125d2`, with server
-integration commit `818608c297` pinning that client revision. Iteration 2.37 is
-validated in this client revision and by its companion server change. The wider
-conversion inventory below is not complete; this is not release acceptance.
+Current checkpoint: iteration 2.38 adds schema-aware
+`decimalColumn(CharSequence)` input for all decimal widths and STRING/VARCHAR
+targets. It parses once into the Sender's existing Decimal256 scratch value and
+reuses the established decimal append and text-formatting paths. The committed
+baseline remains client `1310b0dd` and server `8ad0b92baf`; iteration 2.38 is an
+uncommitted, locally validated increment. The wider conversion inventory below
+is not complete; this is not release acceptance.
 
 The standing compatibility gate now runs three real process combinations:
 current client against QuestDB 10.0.1, client 1.3.9 against the current server,
@@ -107,6 +106,15 @@ duplicate suppression, local errors and rollback. A shared variable-width
 append repair also preserves completed rows if string encoding throws midway;
 successful legacy writes retain their encoding. D029 records the accepted slice,
 independent reviews and complete verification evidence.
+
+The textual decimal overload now behaves as a DECIMAL256 input in schema mode.
+Known decimal targets use their declared precision and scale; STRING/VARCHAR
+targets receive canonical fixed-point text. Parsed `NaN` and infinities write
+target NULL, while Java `null` and empty input remain no-ops. A missing column
+infers DECIMAL256 at the first finite value's natural scale; a null-only block
+uses wire scale zero without locking later batches to that scale. The Sender
+uses its existing rollback and one-refresh lifecycle, with no new retained
+converter state or per-value allocation.
 
 Iteration 2.15 is accepted as a bounded, unreleased Sender integration.
 Public setters select the negotiated mode, use server-directed conversions,
@@ -883,9 +891,9 @@ when the table or column is absent.
 ## Conversion backlog (server-source audit)
 
 Cross-checked on 2026-09-11 after iteration 2.13, with implemented coverage
-refreshed through iteration 2.37 on 2026-09-14. The accepted baseline is committed as
-client `6fe3ce44`, server `ffbb7125d2`, with server integration commit
-`818608c297` pinning that client revision. The original audit bases were client
+refreshed through iteration 2.38 on 2026-09-14. The accepted baseline is client
+`1310b0dd` and server `8ad0b92baf`, whose submodule pins that exact client
+revision. The original audit bases were client
 `981bdb02a471f3b290c89b8e78cbc422610e329e` and server
 `12a33d651e51e2682e7a448c8db5168fc72dfad3`. The matrix is a source audit;
 runtime evidence for implemented slices is recorded separately in the journal.
@@ -929,7 +937,7 @@ non-null conversion. Known compatibility exceptions above still apply.
 | `long256Column` (LONG256) | None | LONG256, text |
 | `binaryColumn` (byte array, `DirectByteSlice`, native pointer/length; BINARY) | BINARY | Parser-reachable targets remain deferred; see boundaries below |
 | `decimalColumn(Decimal64/128/256)` (DECIMAL64/128/256) | All decimals from each source width, text | None |
-| `decimalColumn(CharSequence)` (locally parsed DECIMAL256) | None | All decimals, text; this is not the `stringColumn` parser path |
+| `decimalColumn(CharSequence)` (locally parsed DECIMAL256) | All decimals, text | None; this is not the `stringColumn` parser path |
 | `geoHashColumn(long, bits)` and `geoHashColumn(CharSequence)` (GEOHASH with source bits) | None | Geohash with exactly matching bit precision, text |
 | `doubleArray` (all Java ranks and `DoubleArray`; DOUBLE_ARRAY) | None | DOUBLE array of the target rank; identity/shape validation, not element casting |
 | `longArray` (all Java ranks and `LongArray`; LONG_ARRAY) | None | No supported conversion contract established; see the existing-server gap below |
@@ -1586,6 +1594,12 @@ They do not change the compatibility contract.
     representation, conversion rule and rollback behavior. Do not create one
     iteration per matrix cell, and do not combine unrelated server-boundary
     decisions merely because they appear in the same source audit.
+18. **Treat textual decimal as an existing source type.** Parse into the
+    Sender-owned Decimal256 scratch value, then reuse the native decimal append
+    and text-formatting tails. Keep parsed specials separate only because they
+    mean an effective target NULL while typed decimal null sentinels are no-ops.
+    Normalize an unset null-only scale at the encoding boundary; do not add a
+    second scale state, parser or converter registry.
 
 These opportunities do not justify a per-setter opt-out, raw-value fallback or
 send-time transformation. Partial activation is permitted on the unreleased
@@ -1601,7 +1615,7 @@ implementation and its tests together. Do not wait for negotiation,
 compatibility and all converters to be implemented before exercising the
 complete client-to-server path. Reuse the existing test infrastructure.
 
-### Plan after iteration 2.37
+### Plan after iteration 2.38
 
 The permanent compatibility gate is implemented. It launches released and
 current artifacts as separate processes and checks these observable contracts:
@@ -1631,7 +1645,7 @@ code.
 
 The next implementation slice is:
 
-1. **Iteration group 2.38 — fixed-width identity and text targets.** Land three
+1. **Iteration group 2.39 — fixed-width identity and text targets.** Land three
    independently reviewable slices: IPv4 to IPv4/STRING/VARCHAR, LONG256 to
    LONG256/STRING/VARCHAR, then GEOHASH to the exact same-precision
    GEOHASH/STRING/VARCHAR. Each slice gets its own public-Sender real-server E2E,
@@ -1641,8 +1655,8 @@ The next implementation slice is:
 
 After these slices, reassess the remaining inventory in this order: integer to
 DATE/timestamps; integer to text/SYMBOL/decimals and INT-to-IPv4;
-`decimalColumn(CharSequence)`; then DOUBLE arrays after rank metadata is proven
-end to end. BINARY-to-parser conversions, LONG_ARRAY, non-ASCII
+then DOUBLE arrays after rank metadata is proven end to end.
+BINARY-to-parser conversions, LONG_ARRAY, non-ASCII
 CHAR-to-VARCHAR and malformed decimal metadata remain server-contract decisions,
 not client implementation backlog.
 

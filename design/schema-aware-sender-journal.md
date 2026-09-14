@@ -1,13 +1,13 @@
 # Schema-aware sender implementation journal
 
-North star: [schema-aware sender design](schema-aware-sender.md), revision 58
+North star: [schema-aware sender design](schema-aware-sender.md), revision 59
 (revision 9 at kickoff; source-backed clarifications recorded below).
 
 This journal records decisions, evidence, review outcomes and remaining work.
 The design defines the intended product contract; this journal must not imply
 that an unimplemented part already works. Corrections are recorded explicitly.
 
-Current status: iterations 1 through 2.36 are accepted for their recorded scopes, including typed
+Current status: iterations 1 through 2.37 are accepted for their recorded scopes, including typed
 microsecond/nanosecond conversion (D020), broader timestamp units and `Instant`
 with the approved range/precision rules (D021), and text/symbol conversions
 (D023). Boolean conversion and strict ASCII text-to-boolean parsing are accepted
@@ -30,15 +30,16 @@ schema framing and safe SF recovery/replay are implemented and tested.
 Non-owning bindings provide local UUID, LONG-to-numeric, primitive/`Instant`
 timestamp, text/symbol, boolean, FLOAT/DOUBLE, STRING numeric, BINARY-target and
 native decimal-to-decimal, LONG/STRING/FLOAT/DOUBLE-to-decimal and native-
-decimal-to-text conversion over caller-owned table buffers.
+decimal-to-text conversion over caller-owned table buffers. Iteration 2.38 adds
+the textual decimal overload to all decimal and text targets and is locally
+validated but not committed.
 Review corrections are recorded in D016 and D019; the approved LONG null rule
 is recorded in D013.
 
 Automatic row-boundary schema adoption and ordinary Sender conversion are
 implemented and tested in iteration 2.15. The original 47-method failure ledger
 is fully resolved after iteration 2.36, but the complete feature is not yet
-releasable because the wider conversion inventory and release-level
-compatibility validation remain open.
+releasable because the wider conversion inventory remains open.
 D030 records the original 58, D032 the 56-test baseline, D033 the 54-test
 inference result and D034 the current diagnostic repair.
 The 2.15 scoped gates passed 410 client tests plus two packaging
@@ -7110,3 +7111,75 @@ the exact Maven-cache artifact while snapshots select the checked-out submodule
 build. A negative run substituting the old client for the current client failed
 the schema assertion and cleaned up both servers. Final re-review reports no
 blocker or remaining concrete finding.
+
+## D057 — Textual decimal input reuses Decimal256 conversion
+
+Status: iteration 2.38 implemented and locally validated, 2026-09-14. No commit
+or parent-repository submodule update has been made.
+
+The public `decimalColumn(CharSequence)` overload now participates in schema
+mode. It remains a DECIMAL256 input, not an alias for `stringColumn`: the Sender
+parses once into its existing Decimal256 scratch value, and the binding reuses
+the native decimal target conversion and text-formatting tails. Known decimal
+targets apply their declared precision and scale. STRING and VARCHAR receive
+canonical fixed-point text. This adds no converter registry, retained per-row
+object or server production change.
+
+Target lookup, duplicate suppression and target support checks precede parsing.
+An unsupported known target therefore reports `UNSUPPORTED_FEATURE` even for
+malformed input, while a duplicate malformed value remains ignored. Java null
+and empty input remain no-ops. Parsed `NaN` and infinities remain effective
+values that write target NULL; this differs intentionally from typed decimal
+null sentinels, which remain no-ops. The public Sender uses the established
+partial-row rollback and one-refresh path for local schema errors.
+
+A confirmed missing column infers DECIMAL256 at the first finite input's natural
+scale. A preceding parsed special must not pin scale zero. If a block contains
+only decimal nulls, `QwpTableBuffer` emits legal scale-zero wire metadata while
+retaining its internal unset scale, so a later finite batch can still choose its
+natural scale. This is an encoding-boundary normalization, not new scale state.
+
+Tests use public behavior and real wire/data results, without reflection or
+test-only production hooks. On JDK 25, 114 affected client tests and both
+packaged-JAR checks pass with the fork's startup temp root under
+`/mnt/pcie5/schema-aware-decimal-text-20260914/client/jdk25-verify`. They cover
+all six decimal widths, STRING/VARCHAR formatting, missing inference, parsed
+specials, null/empty omission, duplicate ordering, invalid-row rollback,
+refresh and exact frames. The companion server selection passes 12 tests for
+the new overload plus existing native/string decimal paths under
+`/mnt/pcie5/schema-aware-decimal-text-20260914/server/regression`. After
+replacing deterministic `returnsOnce()` assertions with the full query battery,
+the three new real-server tests pass again under the `server/final3` directory.
+
+Early server attempts inherited a full shared `/tmp`; server logs proved WAL
+mmap failures with `No space left`. No product change followed from those runs.
+After the test scratch location was moved to `/mnt/pcie5`, all subsequent test
+databases and scratch data used that filesystem. It remains required for future
+validation.
+
+Two broader checks exposed existing branch constraints rather than decimal
+failures. First, the Java 8 build stops in the committed, untouched
+`QwpSchemaRyuDouble` because it calls Java 9+ `Math.multiplyHigh`; the new code
+uses Java 8 syntax and APIs, but a real Java 8 build remains a release gate after
+that baseline blocker is repaired. Second, the full client suite blocks in
+offline-first tests because the current mandatory initial schema lookup waits
+before accepting the first value. The exact recovery failure reproduces at
+client baseline `1310b0dd`, and `CloseDrainTest` reaches the same wait on the
+current tree. This is the unresolved product conflict between cold offline
+buffering, mandatory local schema conversion and the prohibition on send-time
+transformation. The simplest coherent contract is to require the first
+effective write to establish schema mode; changing that contract needs a
+separate decision and is not hidden by excluding individual tests.
+
+No setter-specific SF replay test was added. This slice changes how the Sender
+constructs an ordinary schema-pinned table buffer, not persistence or replay;
+the public exact-frame tests cover the newly constructed bytes and the existing
+schema-frame replay tests remain byte-oriented. Adding another replay scenario
+would duplicate those two contracts without exercising new recovery logic.
+
+An author and an independent SOL reviewer challenged the first draft. They
+found and fixed missing-column dispatch through an unparameterized DECIMAL256
+type and a special-null path that prematurely locked scale zero. Final review
+found no implementation blocker, confirmed no apparent per-row heap allocation,
+and corrected the affected-test count from an earlier unsubstantiated 218 to
+the preserved 114-test reports.

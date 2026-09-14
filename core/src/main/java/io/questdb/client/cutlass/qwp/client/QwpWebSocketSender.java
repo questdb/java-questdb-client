@@ -1736,7 +1736,7 @@ public class QwpWebSocketSender implements Sender {
         try {
             QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
-                binding.unsupportedColumn(name, "DECIMAL256");
+                binding.decimalColumn(name, value, currentDecimal256);
                 return this;
             }
             currentDecimal256.ofString(value);
@@ -1744,6 +1744,9 @@ public class QwpWebSocketSender implements Sender {
             if (col != null) {
                 col.addDecimal256(currentDecimal256);
             }
+        } catch (LineSenderSchemaException e) {
+            rollbackRow();
+            throw refreshAfterSchemaRejection(e, name);
         } catch (RuntimeException | Error e) {
             rollbackRow();
             throw e;

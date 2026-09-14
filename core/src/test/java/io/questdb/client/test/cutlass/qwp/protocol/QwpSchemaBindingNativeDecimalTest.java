@@ -85,6 +85,159 @@ public class QwpSchemaBindingNativeDecimalTest {
     }
 
     @Test
+    public void testDecimalTextOverloadUsesEveryExactTargetWidth() throws Exception {
+        assertMemoryLeak(() -> {
+            int[] precisions = {2, 4, 9, 18, 38, 76};
+            for (int precision : precisions) {
+                try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                     QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                    QwpSchemaBinding binding = binding(buffer, -1,
+                            column("value", ColumnType.getDecimalType(precision, 1)));
+                    binding.decimalColumn("value", "1.2", new Decimal256());
+                    buffer.nextRow();
+
+                    int size = encoder.encodeSchema(buffer);
+                    Reader reader = tableReader(encoder, size, wireTypeForPrecision(precision));
+                    Assert.assertEquals(0, reader.u8());
+                    Assert.assertEquals(1, reader.u8());
+                    Assert.assertEquals(12, reader.i64());
+                    int limbs = precision <= 18 ? 1 : precision <= 38 ? 2 : 4;
+                    for (int i = 1; i < limbs; i++) {
+                        Assert.assertEquals(0, reader.i64());
+                    }
+                    Assert.assertEquals(size, reader.position());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testDecimalTextOverloadSuppressesDuplicatesAndRollsBackInvalidRows() throws Exception {
+        assertMemoryLeak(() -> {
+            int decimal = ColumnType.getDecimalType(5, 1);
+            Decimal256 scratch = new Decimal256();
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                QwpSchemaBinding binding = binding(buffer, -1,
+                        column("value", decimal), column("only_b", decimal));
+
+                binding.decimalColumn("value", "1.2", scratch)
+                        .decimalColumn("value", "not-a-decimal", scratch);
+                buffer.nextRow();
+
+                binding.decimalColumn("only_b", "2", scratch);
+                assertReason(LineSenderSchemaException.Reason.INVALID_VALUE,
+                        () -> binding.decimalColumn("value", "not-a-decimal", scratch));
+                buffer.cancelCurrentRow();
+                buffer.rollbackUncommittedColumns();
+
+                binding.decimalColumn("value", "NaN", scratch)
+                        .decimalColumn("value", "still-not-a-decimal", scratch);
+                buffer.nextRow();
+                binding.decimalColumn("value", (CharSequence) null, scratch)
+                        .decimalColumn("value", "", scratch);
+                buffer.nextRow();
+
+                int size = encoder.encodeSchema(buffer);
+                Reader reader = tableHeader(encoder, size, 3, 1);
+                decimalDefinition(reader, "value", QwpConstants.TYPE_DECIMAL64);
+                Assert.assertEquals(1, reader.u8());
+                Assert.assertEquals(0x06, reader.u8());
+                Assert.assertEquals(1, reader.u8());
+                Assert.assertEquals(12, reader.i64());
+                Assert.assertEquals(size, reader.position());
+            }
+        });
+    }
+
+    @Test
+    public void testDecimalTextOverloadValidatesTargetAfterDuplicateBeforeParsing() throws Exception {
+        assertMemoryLeak(() -> {
+            Decimal256 scratch = new Decimal256();
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                QwpSchemaBinding binding = binding(buffer, -1, column("value", ColumnType.UUID));
+
+                assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+                        () -> binding.decimalColumn("value", "not-a-decimal", scratch));
+                buffer.cancelCurrentRow();
+                buffer.rollbackUncommittedColumns();
+
+                binding.uuidColumn("value", 1, 2)
+                        .decimalColumn("value", "not-a-decimal", scratch);
+                buffer.nextRow();
+
+                int size = encoder.encodeSchema(buffer);
+                Reader reader = tableHeader(encoder, size, 1, 1);
+                Assert.assertEquals("value", reader.string());
+                Assert.assertEquals(QwpConstants.TYPE_UUID, reader.u8());
+                Assert.assertEquals(0, reader.u8());
+                Assert.assertEquals(1, reader.i64());
+                Assert.assertEquals(2, reader.i64());
+                Assert.assertEquals(size, reader.position());
+            }
+        });
+    }
+
+    @Test
+    public void testDecimalTextOverloadMissingInfersDecimal256AtNaturalScale() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                QwpSchemaBinding binding = new QwpSchemaBinding(buffer, missing());
+                Decimal256 scratch = new Decimal256();
+                binding.decimalColumn("value", "NaN", scratch);
+                buffer.nextRow();
+                binding.decimalColumn("value", "12.3400", scratch);
+                buffer.nextRow();
+
+                int size = encoder.encodeSchema(buffer);
+                Reader reader = unknownTableReader(encoder, size, QwpConstants.TYPE_DECIMAL256, 2);
+                Assert.assertEquals(1, reader.u8());
+                Assert.assertEquals(1, reader.u8());
+                Assert.assertEquals(2, reader.u8());
+                Assert.assertEquals(1234, reader.i64());
+                Assert.assertEquals(0, reader.i64());
+                Assert.assertEquals(0, reader.i64());
+                Assert.assertEquals(0, reader.i64());
+                Assert.assertEquals(size, reader.position());
+            }
+        });
+    }
+
+    @Test
+    public void testDecimalTextOverloadMissingSpecialInfersDecimal256ScaleZeroNull() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                QwpSchemaBinding binding = new QwpSchemaBinding(buffer, missing());
+                binding.decimalColumn("value", "-Infinity", new Decimal256());
+                buffer.nextRow();
+
+                int size = encoder.encodeSchema(buffer);
+                Reader reader = unknownTableReader(encoder, size, QwpConstants.TYPE_DECIMAL256);
+                Assert.assertEquals(1, reader.u8());
+                Assert.assertEquals(1, reader.u8());
+                Assert.assertEquals(0, reader.u8());
+                Assert.assertEquals(size, reader.position());
+
+                buffer.reset();
+                binding.decimalColumn("value", "5.678", new Decimal256());
+                buffer.nextRow();
+                int resetSize = encoder.encodeSchema(buffer);
+                Reader reset = unknownTableReader(encoder, resetSize, QwpConstants.TYPE_DECIMAL256);
+                Assert.assertEquals(0, reset.u8());
+                Assert.assertEquals(3, reset.u8());
+                Assert.assertEquals(5678, reset.i64());
+                Assert.assertEquals(0, reset.i64());
+                Assert.assertEquals(0, reset.i64());
+                Assert.assertEquals(0, reset.i64());
+                Assert.assertEquals(resetSize, reset.position());
+            }
+        });
+    }
+
+    @Test
     public void testDuplicateRollbackResetOmissionAndRetainedTargetScale() throws Exception {
         assertMemoryLeak(() -> {
             int decimal = ColumnType.getDecimalType(18, 4);
@@ -221,6 +374,39 @@ public class QwpSchemaBindingNativeDecimalTest {
         });
     }
 
+    @Test
+    public void testLegacyNullOnlyDecimalUsesWireScaleZeroWithoutLockingNextBatch() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                QwpTableBuffer.ColumnBuffer column = buffer.getOrCreateColumn(
+                        "value", QwpConstants.TYPE_DECIMAL256, true);
+                column.addDecimal256(Decimal256.NULL_VALUE);
+                buffer.nextRow();
+
+                int nullSize = encoder.encode(buffer);
+                Reader nullOnly = legacyTableReader(encoder, nullSize, QwpConstants.TYPE_DECIMAL256);
+                Assert.assertEquals(1, nullOnly.u8());
+                Assert.assertEquals(1, nullOnly.u8());
+                Assert.assertEquals(0, nullOnly.u8());
+                Assert.assertEquals(nullSize, nullOnly.position());
+
+                buffer.reset();
+                column.addDecimal256(new Decimal256(0, 0, 0, 1234, 4));
+                buffer.nextRow();
+                int valueSize = encoder.encode(buffer);
+                Reader value = legacyTableReader(encoder, valueSize, QwpConstants.TYPE_DECIMAL256);
+                Assert.assertEquals(0, value.u8());
+                Assert.assertEquals(4, value.u8());
+                Assert.assertEquals(1234, value.i64());
+                Assert.assertEquals(0, value.i64());
+                Assert.assertEquals(0, value.i64());
+                Assert.assertEquals(0, value.i64());
+                Assert.assertEquals(valueSize, value.position());
+            }
+        });
+    }
+
     private static void append(QwpSchemaBinding binding, Object value) {
         if (value instanceof Decimal64) {
             binding.decimalColumn("value", (Decimal64) value);
@@ -341,12 +527,16 @@ public class QwpSchemaBindingNativeDecimalTest {
     }
 
     private static Reader legacyTableReader(QwpWebSocketEncoder encoder, int size) {
+        return legacyTableReader(encoder, size, QwpConstants.TYPE_DECIMAL64);
+    }
+
+    private static Reader legacyTableReader(QwpWebSocketEncoder encoder, int size, byte type) {
         Reader reader = new Reader(encoder.getBuffer().getBufferPtr(), size);
         reader.skip(QwpConstants.HEADER_SIZE);
         Assert.assertEquals("t", reader.string());
         Assert.assertEquals(1, reader.varint());
         Assert.assertEquals(1, reader.varint());
-        decimalDefinition(reader, "value", QwpConstants.TYPE_DECIMAL64);
+        decimalDefinition(reader, "value", type);
         return reader;
     }
 
@@ -390,11 +580,15 @@ public class QwpSchemaBindingNativeDecimalTest {
     }
 
     private static Reader unknownTableReader(QwpWebSocketEncoder encoder, int size, byte type) {
+        return unknownTableReader(encoder, size, type, 1);
+    }
+
+    private static Reader unknownTableReader(QwpWebSocketEncoder encoder, int size, byte type, int rows) {
         Reader reader = new Reader(encoder.getBuffer().getBufferPtr(), size);
         reader.skip(QwpConstants.HEADER_SIZE);
         Assert.assertEquals("t", reader.string());
         Assert.assertEquals(0, reader.u8());
-        Assert.assertEquals(1, reader.varint());
+        Assert.assertEquals(rows, reader.varint());
         Assert.assertEquals(1, reader.varint());
         decimalDefinition(reader, "value", type);
         return reader;
@@ -418,6 +612,16 @@ public class QwpSchemaBindingNativeDecimalTest {
             return 4;
         }
         return 1;
+    }
+
+    private static byte wireTypeForPrecision(int precision) {
+        if (precision <= 18) {
+            return QwpConstants.TYPE_DECIMAL64;
+        }
+        if (precision <= 38) {
+            return QwpConstants.TYPE_DECIMAL128;
+        }
+        return QwpConstants.TYPE_DECIMAL256;
     }
 
     private static long[] wireLimbs(Object value) {

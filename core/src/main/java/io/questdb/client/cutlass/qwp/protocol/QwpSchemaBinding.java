@@ -144,6 +144,58 @@ public final class QwpSchemaBinding {
         return decimalColumn(name, value, "DECIMAL256", QwpConstants.TYPE_DECIMAL256);
     }
 
+    /**
+     * Parses the public textual-decimal overload after target selection and
+     * duplicate suppression, then applies the same DECIMAL256 conversion rules
+     * as the typed overload. The caller owns {@code scratch}; this binding does
+     * not retain it.
+     */
+    public QwpSchemaBinding decimalColumn(CharSequence name, CharSequence value, Decimal256 scratch) {
+        buffer.requireSchemaBinding(this);
+        if (value == null || value.length() == 0) {
+            return this;
+        }
+        int index = targetIndex(name, "DECIMAL256");
+        int targetType = targetType(index, ColumnType.DECIMAL256);
+        if (index < 0) {
+            QwpTableBuffer.ColumnBuffer inferred = buffer.getExistingInferredColumn(name);
+            if (inferred != null && inferred.getSize() > buffer.getRowCount()) {
+                return this;
+            }
+            if (inferred != null && inferred.getType() != QwpConstants.TYPE_DECIMAL256) {
+                throw unsupported(name, "DECIMAL256", -1, "inferred column type conflict [inferredType="
+                        + QwpConstants.getTypeName(inferred.getType()) + ']');
+            }
+            parseDecimalText(name, value, scratch, targetType);
+            inferred = buffer.getOrCreateColumn(name, QwpConstants.TYPE_DECIMAL256, true);
+            if (inferred != null) {
+                // Keep the legacy public-overload contract: infer DECIMAL256 at
+                // the parsed natural scale. A parsed special is an effective
+                // null but does not pin the scale of a later finite value.
+                inferred.addDecimal256(scratch);
+            }
+            return this;
+        }
+        QwpTableBuffer.ColumnBuffer column = targetColumn(name, "DECIMAL256", index, targetType);
+        if (column == null) {
+            return this;
+        }
+        if (!ColumnType.isDecimal(targetType)
+                && targetType != ColumnType.STRING && targetType != ColumnType.VARCHAR) {
+            throw unsupported(name, "DECIMAL256", targetType, "conversion is not implemented");
+        }
+        parseDecimalText(name, value, scratch, targetType);
+        if (scratch.isNull()) {
+            if (ColumnType.isDecimal(targetType)) {
+                column.addSchemaDecimalNull(ColumnType.getDecimalScale(targetType));
+            } else {
+                column.addNull();
+            }
+            return this;
+        }
+        return appendDecimal(column, name, scratch, "DECIMAL256", targetType);
+    }
+
     /** Appends an owned copy of the bytes addressed by {@code slice}. */
     public QwpSchemaBinding binaryColumn(CharSequence name, DirectByteSlice slice) {
         buffer.requireSchemaBinding(this);
@@ -869,6 +921,16 @@ public final class QwpSchemaBinding {
         if (column == null) {
             return this;
         }
+        return appendDecimal(column, name, value, inputType, targetType);
+    }
+
+    private QwpSchemaBinding appendDecimal(
+            QwpTableBuffer.ColumnBuffer column,
+            CharSequence name,
+            Decimal value,
+            String inputType,
+            int targetType
+    ) {
         if (!ColumnType.isDecimal(targetType)) {
             return decimalNonDecimalColumn(column, name, value, inputType, targetType);
         }
@@ -913,6 +975,14 @@ public final class QwpSchemaBinding {
 
     private LineSenderSchemaException invalidRange(CharSequence name, String inputType, int targetType) {
         return error(INVALID_VALUE, name, inputType, targetType, "value is outside target type range");
+    }
+
+    private void parseDecimalText(CharSequence name, CharSequence value, Decimal256 scratch, int targetType) {
+        try {
+            scratch.ofString(value);
+        } catch (NumericException e) {
+            throw error(INVALID_VALUE, name, "DECIMAL256", targetType, "invalid decimal text");
+        }
     }
 
     private QwpSchemaBinding integerNumericColumn(

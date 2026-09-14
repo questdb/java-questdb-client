@@ -49,6 +49,59 @@ public class QwpSchemaSenderIntegrationTest {
             "/io/questdb/client/cutlass/qwp/native-decimal-to-text.tsv";
 
     @Test
+    public void testDecimalTextOverloadUsesTargetDecimalAndRecoversRows() throws Exception {
+        assertMemoryLeak(() -> {
+            LongTextSchemaHandler handler = new LongTextSchemaHandler(
+                    921, 931, ColumnType.getDecimalType(5, 2));
+            try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
+                sender.table("events")
+                        .decimalColumn("value", "1.20m")
+                        .decimalColumn("value", "not-a-decimal")
+                        .atNow();
+
+                sender.uuidColumn("failed_b", 11, 12);
+                try {
+                    sender.decimalColumn("value", "not-a-decimal");
+                    Assert.fail("expected invalid textual decimal");
+                } catch (LineSenderSchemaException e) {
+                    Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
+                }
+
+                sender.decimalColumn("value", "2.5").atNow();
+                sender.flush();
+
+                new FrameReader(handler.awaitDataFrame()).decimal64Table(
+                        "events", 921, 931, 2, 120, 250);
+                Assert.assertEquals("setter must use the standard one-refresh path", 2,
+                        handler.describeRequests.get());
+            }
+        });
+    }
+
+    @Test
+    public void testDecimalTextOverloadFormatsTextAndPreservesNullNoOps() throws Exception {
+        assertMemoryLeak(() -> {
+            for (int targetType : new int[]{ColumnType.STRING, ColumnType.VARCHAR}) {
+                LongTextSchemaHandler handler = new LongTextSchemaHandler(941 + targetType, 951, targetType);
+                try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
+                    sender.table("events").decimalColumn("value", "00123.4500").atNow();
+                    sender.decimalColumn("value", "1.2300m").atNow();
+                    sender.decimalColumn("value", "Infinity")
+                            .decimalColumn("value", "not-a-decimal")
+                            .atNow();
+                    sender.decimalColumn("value", (CharSequence) null)
+                            .decimalColumn("value", "")
+                            .atNow();
+                    sender.flush();
+
+                    new FrameReader(handler.awaitDataFrame()).parsedDecimalTextTable(
+                            "events", 941 + targetType, 951);
+                }
+            }
+        });
+    }
+
+    @Test
     public void testSmallIntegerSettersUseExactNumericTargetWireAndRecoverRows() throws Exception {
         assertMemoryLeak(() -> {
             int[] targets = {
@@ -1740,6 +1793,20 @@ public class QwpSchemaSenderIntegrationTest {
             byte[] actual = new byte[totalLength];
             in.get(actual);
             Assert.assertArrayEquals(expectedBytes, actual);
+            eof();
+        }
+
+        private void parsedDecimalTextTable(String table, int tableId, long version) {
+            messageHeader(1);
+            Assert.assertEquals(0, varint());
+            Assert.assertEquals(0, varint());
+            schemaBlockHeader(table, tableId, version, 4, "value", QwpConstants.TYPE_VARCHAR);
+            Assert.assertEquals(1, u8());
+            Assert.assertEquals(0x0c, u8());
+            Assert.assertEquals(0, in.getInt());
+            Assert.assertEquals(6, in.getInt());
+            Assert.assertEquals(12, in.getInt());
+            Assert.assertEquals("123.451.2300", stringBytes(12));
             eof();
         }
 
