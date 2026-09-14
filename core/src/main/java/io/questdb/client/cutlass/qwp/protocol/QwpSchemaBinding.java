@@ -28,6 +28,7 @@ import io.questdb.client.cairo.ColumnType;
 import io.questdb.client.cairo.MicrosTimestampDriver;
 import io.questdb.client.cairo.NanosTimestampDriver;
 import io.questdb.client.cairo.TableUtils;
+import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.std.Chars;
 import io.questdb.client.std.Decimal;
 import io.questdb.client.std.Decimal128;
@@ -158,7 +159,7 @@ public final class QwpSchemaBinding {
         int index = targetIndex(name, "DECIMAL256");
         int targetType = targetType(index, ColumnType.DECIMAL256);
         if (index < 0) {
-            QwpTableBuffer.ColumnBuffer inferred = buffer.getExistingInferredColumn(name);
+            QwpTableBuffer.ColumnBuffer inferred = buffer.getExistingColumnByName(name);
             if (inferred != null && inferred.getSize() > buffer.getRowCount()) {
                 return this;
             }
@@ -264,6 +265,59 @@ public final class QwpSchemaBinding {
         return this;
     }
 
+    public QwpSchemaBinding doubleArray(CharSequence name, double[] values) {
+        buffer.requireSchemaBinding(this);
+        if (values == null) {
+            return this;
+        }
+        QwpTableBuffer.ColumnBuffer column = targetDoubleArrayColumn(name, 1);
+        if (column != null) {
+            column.addDoubleArray(values);
+        }
+        return this;
+    }
+
+    public QwpSchemaBinding doubleArray(CharSequence name, double[][] values) {
+        buffer.requireSchemaBinding(this);
+        if (values == null) {
+            return this;
+        }
+        QwpTableBuffer.ColumnBuffer column = targetDoubleArrayColumn(name, 2);
+        if (column != null) {
+            column.addDoubleArray(values);
+        }
+        return this;
+    }
+
+    public QwpSchemaBinding doubleArray(CharSequence name, double[][][] values) {
+        buffer.requireSchemaBinding(this);
+        if (values == null) {
+            return this;
+        }
+        QwpTableBuffer.ColumnBuffer column = targetDoubleArrayColumn(name, 3);
+        if (column != null) {
+            column.addDoubleArray(values);
+        }
+        return this;
+    }
+
+    public QwpSchemaBinding doubleArray(CharSequence name, DoubleArray array) {
+        buffer.requireSchemaBinding(this);
+        if (array == null) {
+            return this;
+        }
+        int index = targetIndex(name, "DOUBLE_ARRAY");
+        QwpTableBuffer.ColumnBuffer existing = buffer.getExistingColumnByName(name);
+        if (existing != null && existing.getSize() > buffer.getRowCount()) {
+            return this;
+        }
+        QwpTableBuffer.ColumnBuffer column = targetDoubleArrayColumn(name, index, array.getDimensionality());
+        if (column != null) {
+            column.addDoubleArray(array);
+        }
+        return this;
+    }
+
     public QwpSchemaBinding byteColumn(CharSequence name, byte value) {
         return integerColumn(name, value, "BYTE", ColumnType.BYTE, false);
     }
@@ -320,7 +374,7 @@ public final class QwpSchemaBinding {
     private QwpTableBuffer.ColumnBuffer designatedColumn(int targetType, String inputType) {
         byte wireType = timestampWireType(targetType);
         if (schema.getResult() == QwpSchemaProtocol.RESULT_MISSING) {
-            QwpTableBuffer.ColumnBuffer inferred = buffer.getExistingInferredColumn("");
+            QwpTableBuffer.ColumnBuffer inferred = buffer.getExistingColumnByName("");
             if (inferred != null && inferred.getType() != wireType) {
                 throw unsupported(null, inputType, -1, "inferred designated timestamp type conflict [inferredType="
                         + QwpConstants.getTypeName(inferred.getType()) + ']');
@@ -787,7 +841,7 @@ public final class QwpSchemaBinding {
     public QwpSchemaBinding unsupportedColumn(CharSequence name, String inputType) {
         buffer.requireSchemaBinding(this);
         int index = targetIndex(name, inputType);
-        QwpTableBuffer.ColumnBuffer inferred = index < 0 ? buffer.getExistingInferredColumn(name) : null;
+        QwpTableBuffer.ColumnBuffer inferred = index < 0 ? buffer.getExistingColumnByName(name) : null;
         if (inferred != null && inferred.getSize() > buffer.getRowCount()) {
             return this;
         }
@@ -900,6 +954,46 @@ public final class QwpSchemaBinding {
         return column;
     }
 
+    private QwpTableBuffer.ColumnBuffer targetDoubleArrayColumn(CharSequence name, int sourceDimensions) {
+        int index = targetIndex(name, "DOUBLE_ARRAY");
+        return targetDoubleArrayColumn(name, index, sourceDimensions);
+    }
+
+    private QwpTableBuffer.ColumnBuffer targetDoubleArrayColumn(
+            CharSequence name,
+            int index,
+            int sourceDimensions
+    ) {
+        int targetType = targetType(index, ColumnType.encodeArrayType(ColumnType.DOUBLE, sourceDimensions));
+        QwpTableBuffer.ColumnBuffer column = targetColumn(name, "DOUBLE_ARRAY", index, targetType);
+        if (column == null) {
+            return null;
+        }
+        if (!ColumnType.isArray(targetType)
+                || ColumnType.decodeArrayElementType(targetType) != ColumnType.DOUBLE) {
+            throw unsupported(name, "DOUBLE_ARRAY", targetType, "conversion is not implemented");
+        }
+        int targetDimensions = ColumnType.decodeWeakArrayDimensionality(targetType);
+        if (targetDimensions < 1
+                || targetType != ColumnType.encodeArrayType(ColumnType.DOUBLE, targetDimensions)) {
+            throw unsupported(name, "DOUBLE_ARRAY", targetType, "invalid target array type");
+        }
+        if (targetDimensions != sourceDimensions) {
+            throw unsupported(name, "DOUBLE_ARRAY", targetType,
+                    "array dimensionality mismatch [sourceDims=" + sourceDimensions
+                            + ", targetDims=" + targetDimensions + ']');
+        }
+        if (index < 0) {
+            int inferredDimensions = column.pinInferredArrayDimensionality(sourceDimensions);
+            if (inferredDimensions != sourceDimensions) {
+                throw unsupported(name, "DOUBLE_ARRAY", targetType,
+                        "array dimensionality mismatch [sourceDims=" + sourceDimensions
+                                + ", inferredDims=" + inferredDimensions + ']');
+            }
+        }
+        return column;
+    }
+
     private QwpTableBuffer.ColumnBuffer targetColumn(
             CharSequence name,
             String inputType,
@@ -907,7 +1001,7 @@ public final class QwpSchemaBinding {
             int targetType
     ) {
         if (index < 0) {
-            QwpTableBuffer.ColumnBuffer inferred = buffer.getExistingInferredColumn(name);
+            QwpTableBuffer.ColumnBuffer inferred = buffer.getExistingColumnByName(name);
             if (inferred != null && inferred.getSize() > buffer.getRowCount()) {
                 return null;
             }
@@ -934,6 +1028,14 @@ public final class QwpSchemaBinding {
     }
 
     private byte wireType(int targetType) {
+        if (ColumnType.isArray(targetType)) {
+            int dimensions = ColumnType.decodeWeakArrayDimensionality(targetType);
+            return dimensions >= 1
+                    && ColumnType.decodeArrayElementType(targetType) == ColumnType.DOUBLE
+                    && targetType == ColumnType.encodeArrayType(ColumnType.DOUBLE, dimensions)
+                    ? QwpConstants.TYPE_DOUBLE_ARRAY
+                    : 0;
+        }
         if (ColumnType.isGeoHash(targetType)) {
             int bits = ColumnType.getGeoHashBits(targetType);
             return bits >= 1 && bits <= 60 && targetType == ColumnType.getGeoHashTypeWithBits(bits)
@@ -1027,7 +1129,7 @@ public final class QwpSchemaBinding {
         }
         int index = targetIndex(name, inputType);
         if (index < 0) {
-            QwpTableBuffer.ColumnBuffer inferred = buffer.getExistingInferredColumn(name);
+            QwpTableBuffer.ColumnBuffer inferred = buffer.getExistingColumnByName(name);
             if (inferred != null && inferred.getSize() > buffer.getRowCount()) {
                 return this;
             }

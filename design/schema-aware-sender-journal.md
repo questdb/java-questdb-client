@@ -7718,3 +7718,94 @@ cascading assertion failures, so its unrelated failure count is not acceptance
 evidence. The final intentional conversion implementation left is ranked
 DOUBLE-array identity. BINARY parser paths, LONG_ARRAY, non-ASCII CHAR text and
 malformed decimal metadata remain explicit server-contract decisions.
+
+## D066 — DOUBLE arrays reuse the existing wire path and pin rank
+
+Status: iteration 2.45 implemented and locally validated, 2026-09-14. Design
+revision 68. The pre-iteration baseline is client `47a37a6f` and server
+`c1f970220f`, whose submodule pins that exact client revision. Neither
+repository is committed by this decision record.
+
+All four public `doubleArray` representations now participate in schema mode.
+The primitive overloads have ranks 1, 2 and 3. The N-dimensional `DoubleArray`
+wrapper exposes its current rank through an O(1) accessor, including after
+`reshape`. A known target must be a canonical strong DOUBLE array of exactly
+that rank. A confirmed missing column infers DOUBLE_ARRAY and pins its first
+effective rank in the existing column buffer across resets; a later different
+rank fails locally rather than creating a mixed-rank block. Null references
+remain no-ops, empty shapes remain values, and the existing duplicate-first,
+row rollback and one-refresh rules are preserved. Duplicate suppression runs
+before inspecting a wrapper's rank, so an invalid or closed ignored second
+value cannot change first-value-wins behavior.
+
+This is rank-checked identity, not an element conversion. The binding selects
+the existing `TYPE_DOUBLE_ARRAY` column, and the established buffer and encoder
+continue to own shape validation, element copying and wire output. No converter,
+second shape model, per-row object, array extension parameter, send-time
+transformation or server production change was added. The wrapper accessor
+avoids a second traversal or temporary capture before validation. The only new
+retained state is one integer on a confirmed-missing inferred column; known
+schemas already carry rank in the encoded `ColumnType`.
+
+No throughput claim is made. There was no successful schema-aware array path
+to compare before this slice, while the legacy append and encode loops are
+unchanged. The new successful path adds only constant-time schema/rank checks
+before the same element copy, so a synthetic A/B number would not isolate a
+real regression boundary.
+
+The exclusion of LONG arrays is source-backed. The current server validates
+DOUBLE_ARRAY batch rank but does not compare a cursor's element type with an
+existing array target. `WalColumnarRowAppender.putArrayColumn` then constructs
+storage from the cursor element type. Auto-creation rejects LONG_ARRAY, and SQL
+does not currently create LONG[] columns. Accepting DOUBLE_ARRAY-to-LONG[] or
+enabling `longArray` in schema mode would therefore reproduce a server
+validation gap, not implement a supported cast. Synthetic schema tests pin the
+local rejection because a real-server LONG[] fixture is not constructible.
+
+Five component tests cover every public representation, ranks 1, 2, 3 and 32,
+live wrapper reshaping, all null overloads, empty shapes, raw NaN payload bits,
+signed zero, infinity, duplicates, ragged inputs, rollback, reset, missing-rank
+pinning, wrong element type, weak rank, parameters and designated-column
+rejection. Three focused public-socket tests cover exact target wire bytes,
+A/error/C rollback, the standard one-refresh path, generation pinning and null
+no-op before negotiation. The expanded client acceptance selection passes 494
+tests with zero failures, errors or skips. Packaged-JAR verification passes the
+five component tests and both packaging integration tests.
+
+The focused real-server gate passes nine tests: two new tests cover ranks 1
+through 4, all public representations, empty shapes, exact stored shapes, ACKs
+and partial-row recovery; seven existing array/rejection tests now assert the
+new early local errors. The complete 137-test `QwpSenderE2ETest` diagnostic has
+113 passing tests, two assertion failures and 22 early schema errors. None is
+an unimplemented intentional conversion: 17 are old aggregate rejection tests,
+three are specialized tests that still expect a server-side error stage, two
+are the explicit CHAR-to-text boundary, and the assertion failures are stale
+empty/null-column-name message checks. With the test JVM started on
+`/mnt/pcie5`, this run has no disk-space infrastructure failures.
+
+The released-binary matrix passes current client to QuestDB 10.0.1 in legacy
+mode, client 1.3.9 to current server in legacy mode, and current client to
+current server in schema mode. Current artifact hashes are client
+`6d3cb13f4058e1cf9a2af7b3459266a2beffb4a92e7f148880dc5fcf40b24292`
+and server
+`87df2cee84f1cad1c450831fc2ec6f995437cb5eda701486bf452a8c3a3da524`;
+the run used `/mnt/pcie5/qwp-double-array-compat-final/run.pK2tjd`.
+
+No array-specific store-and-forward test was added. Schema mode writes the
+same self-contained DOUBLE_ARRAY bytes before persistence, and the 494-test
+gate includes schema network replay, self-sufficient-frame and recovery replay
+coverage. Repeating that unchanged persistence path with another value family
+would not add a new contract assertion.
+
+A full client-module diagnostic encountered the existing
+`QuestDBServerRecoveryTest.testFacadeStartsWhileServerDownThenWritesAndReaderConnectsOnRecovery`
+expectation: the first effective write now waits for mandatory schema
+negotiation and times out while no server exists. The timed-out test leaves its
+reconnecting sender active, so that diagnostic run was stopped. This is a
+separate startup-contract fixture, not an array regression; the 494-test
+acceptance set is green.
+
+The intentional, server-supported public-setter conversion catalogue is now
+complete. BINARY parser paths, LONG_ARRAY, non-ASCII CHAR text and malformed
+decimal metadata remain explicit server-contract decisions, not unfinished
+client converters.

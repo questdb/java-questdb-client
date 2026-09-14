@@ -921,6 +921,58 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test
+    public void testDoubleArrayUsesExactTargetWireAndRollback() throws Exception {
+        assertMemoryLeak(() -> {
+            int array2d = ColumnType.encodeArrayType(ColumnType.DOUBLE, 2);
+            LongTextSchemaHandler handler = new LongTextSchemaHandler(1181, 1191, array2d);
+            try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
+                sender.table("events").doubleArray("value", new double[][]{{1.0, 2.0}}).atNow();
+
+                sender.table("events").uuidColumn("failed_b", 11, 12);
+                try {
+                    sender.doubleArray("value", new double[]{99.0});
+                    Assert.fail("expected array rank mismatch");
+                } catch (LineSenderSchemaException e) {
+                    Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
+                }
+
+                sender.doubleArray("value", new double[][]{{3.0}, {4.0}}).atNow();
+                sender.flush();
+                new FrameReader(handler.awaitDataFrame())
+                        .doubleArrayTable("events", 1181, 1191);
+                Assert.assertEquals("setter must use the standard one-refresh path", 2,
+                        handler.describeRequests.get());
+            }
+        });
+    }
+
+    @Test
+    public void testDoubleArrayGenerationRemainsPinnedAcrossRankChange() throws Exception {
+        assertMemoryLeak(() -> {
+            int array2d = ColumnType.encodeArrayType(ColumnType.DOUBLE, 2);
+            int array1d = ColumnType.encodeArrayType(ColumnType.DOUBLE, 1);
+            LongTextSchemaHandler handler = new LongTextSchemaHandler(1201, 1211, array2d);
+            try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
+                sender.table("events").doubleArray("value", new double[][]{{1.0, 2.0}}).atNow();
+                handler.targetType = array1d;
+                handler.version = 1212;
+                sender.table("events");
+                try {
+                    sender.doubleArray("value", new double[]{3.0, 4.0});
+                    Assert.fail("expected target-changing schema refresh");
+                } catch (LineSenderSchemaException e) {
+                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                }
+                sender.doubleArray("value", new double[]{3.0, 4.0}).atNow();
+                sender.flush();
+                new FrameReader(handler.awaitDataFrame())
+                        .twoDoubleArrayRankBlocks("events", 1201, 1211, 1212);
+                Assert.assertEquals(2, handler.describeRequests.get());
+            }
+        });
+    }
+
+    @Test
     public void testVarcharGenerationRemainsPinnedBeforeTimestampRebind() throws Exception {
         assertMemoryLeak(() -> {
             LongTextSchemaHandler handler = new LongTextSchemaHandler(321, 331, ColumnType.VARCHAR);
@@ -2902,6 +2954,42 @@ public class QwpSchemaSenderIntegrationTest {
             Assert.assertEquals(1, u8());
             Assert.assertEquals(expectedValue, i64());
             eof();
+        }
+
+        private void doubleArrayTable(String table, int tableId, long version) {
+            messageHeader(1);
+            Assert.assertEquals(0, varint());
+            Assert.assertEquals(0, varint());
+            schemaBlockHeader(table, tableId, version, 2, "value", QwpConstants.TYPE_DOUBLE_ARRAY);
+            Assert.assertEquals(0, u8());
+            assertDoubleArray(new int[]{1, 2}, 1.0, 2.0);
+            assertDoubleArray(new int[]{2, 1}, 3.0, 4.0);
+            eof();
+        }
+
+        private void twoDoubleArrayRankBlocks(
+                String table, int tableId, long firstVersion, long secondVersion
+        ) {
+            messageHeader(2);
+            Assert.assertEquals(0, varint());
+            Assert.assertEquals(0, varint());
+            schemaBlockHeader(table, tableId, firstVersion, 1, "value", QwpConstants.TYPE_DOUBLE_ARRAY);
+            Assert.assertEquals(0, u8());
+            assertDoubleArray(new int[]{1, 2}, 1.0, 2.0);
+            schemaBlockHeader(table, tableId, secondVersion, 1, "value", QwpConstants.TYPE_DOUBLE_ARRAY);
+            Assert.assertEquals(0, u8());
+            assertDoubleArray(new int[]{2}, 3.0, 4.0);
+            eof();
+        }
+
+        private void assertDoubleArray(int[] shape, double... values) {
+            Assert.assertEquals(shape.length, u8());
+            for (int dimension : shape) {
+                Assert.assertEquals(dimension, in.getInt());
+            }
+            for (double value : values) {
+                Assert.assertEquals(Double.doubleToRawLongBits(value), in.getLong());
+            }
         }
 
         private void twoDateAndVarcharBlocks(

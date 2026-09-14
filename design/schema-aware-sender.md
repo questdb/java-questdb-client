@@ -1,12 +1,13 @@
 # Schema-aware sender: schema-directed encoding
 
-Status: implemented on the development branch, revision 67. Scope: QWP v1 over
+Status: implemented on the development branch, revision 68. Scope: QWP v1 over
 WebSocket, with an automatically negotiated schema extension, legacy-server
 compatibility and companion server changes. The committed baseline contains the
-protocol, Sender integration and conversions through iteration 2.43. Iteration
-2.44 (STRING-to-DATE) is locally validated. A released-binary
-compatibility gate is implemented and locally green. The remaining public-setter
-conversion contract is not complete.
+protocol, Sender integration and conversions through iteration 2.44. Iteration
+2.45 (ranked DOUBLE-array identity) is locally validated. A released-binary
+compatibility gate is implemented and locally green. The intentional,
+server-supported public-setter conversion catalogue is complete. The explicit
+server-contract boundaries below remain excluded rather than emulated.
 
 ## Goal and contract
 
@@ -39,11 +40,14 @@ server-side failures can still reject a batch.
 
 ## Implementation status
 
-Current checkpoint: iteration 2.44 adds STRING input to a DATE target. Its
-pre-iteration baseline is client `19557e2f` and server `5338ac0845`, whose
-submodule pins that exact client revision. STRING-to-DATE is the current locally
-validated increment.
-The wider conversion inventory below is not complete; this is not release acceptance.
+Current checkpoint: iteration 2.45 adds all public DOUBLE-array representations
+to canonical DOUBLE-array targets of exactly the same rank. Its pre-iteration
+baseline is client `47a37a6f` and server `c1f970220f`, whose submodule pins that
+exact client revision. The client reuses the existing array buffer and encoder,
+validates known rank before append, and pins the first effective rank for a
+confirmed missing column. The intentional conversion inventory below is now
+complete. This does not turn the separately documented unsafe or undefined
+server paths into supported conversions.
 
 The standing compatibility gate now runs three real process combinations:
 current client against QuestDB 10.0.1, client 1.3.9 against the current server,
@@ -202,6 +206,18 @@ throws an unchecked exception instead of returning a conversion error. A
 return/error domain, exact wire checks, public-Sender ingestion, partial-row
 rollback and a DATE-to-VARCHAR generation rebind cover the slice. D065 records
 the decision and evidence.
+
+All public DOUBLE-array inputs now select target-native DOUBLE_ARRAY storage
+when the server schema carries a canonical strong DOUBLE array of the same rank.
+The primitive overloads supply ranks 1, 2 and 3; `DoubleArray` exposes its live
+rank for dimensions 1 through 32. Known-rank mismatches fail before append, and
+a confirmed missing column pins the first effective rank in its existing buffer
+definition so later rows cannot form a mixed-rank block. Null references remain
+no-ops, empty shapes remain values, and duplicate first-value-wins behavior is
+unchanged. The implementation reuses the existing shape/data buffer and encoder;
+it adds no element converter, copy, array parameter format or server production
+code. Exact-wire, public socket, real-server shape/rank and partial-row recovery
+tests cover the slice. D066 records the decision and evidence.
 
 Iteration 2.15 is accepted as a bounded, unreleased Sender integration.
 Public setters select the negotiated mode, use server-directed conversions,
@@ -979,8 +995,8 @@ when the table or column is absent.
 ## Conversion backlog (server-source audit)
 
 Cross-checked on 2026-09-11 after iteration 2.13, with implemented coverage
-refreshed through iteration 2.44 on 2026-09-14. The pre-iteration baseline is
-client `19557e2f` and server `5338ac0845`, whose submodule pins that exact
+refreshed through iteration 2.45 on 2026-09-14. The pre-iteration baseline is
+client `47a37a6f` and server `c1f970220f`, whose submodule pins that exact
 client revision. The original audit bases were client
 `981bdb02a471f3b290c89b8e78cbc422610e329e` and server
 `12a33d651e51e2682e7a448c8db5168fc72dfad3`. The matrix is a source audit;
@@ -1027,7 +1043,7 @@ non-null conversion. Known compatibility exceptions above still apply.
 | `decimalColumn(Decimal64/128/256)` (DECIMAL64/128/256) | All decimals from each source width, text | None |
 | `decimalColumn(CharSequence)` (locally parsed DECIMAL256) | All decimals, text | None; this is not the `stringColumn` parser path |
 | `geoHashColumn(long, bits)` and `geoHashColumn(CharSequence)` (GEOHASH with source bits) | Geohash with exactly matching bit precision, text | None |
-| `doubleArray` (all Java ranks and `DoubleArray`; DOUBLE_ARRAY) | None | DOUBLE array of the target rank; identity/shape validation, not element casting |
+| `doubleArray` (all Java ranks and `DoubleArray`; DOUBLE_ARRAY) | DOUBLE array of exactly matching rank | None |
 | `longArray` (all Java ranks and `LongArray`; LONG_ARRAY) | None | No supported conversion contract established; see the existing-server gap below |
 
 DATE also exists as a wire input, but there is no public WebSocket `dateColumn`
@@ -1035,17 +1051,12 @@ setter. The server accepts DATE-to-DATE and DATE-to-text only. Neither has a
 binding entrypoint today; record this wire-only coverage without adding a new
 public API just to mirror the protocol. DATE **targets** from existing integer
 setters are implemented in iteration 2.40; STRING-to-DATE is implemented in
-iteration 2.44.
+iteration 2.44. Ranked DOUBLE-array identity is implemented in iteration 2.45.
 
-The binding still lacks target representation selection for arrays and rejects
-extension parameters. Adding array append code alone therefore does not
-complete those pairs: select the target wire representation and pin its rank
-before append. Preserve the existing non-owning binding and buffer ownership.
+### Conversion rules
 
-### Rules the missing conversions must cover
-
-These are server-source requirements to test, not permission to silently add
-new casts or copy the unresolved behaviours below.
+These are server-source requirements, not permission to silently add new casts
+or copy the unresolved behaviours below.
 
 - **Integer sources:** retain distinct BYTE/SHORT/INT/LONG input contracts.
   Numeric narrowing checks range. DATE takes raw epoch milliseconds; ordinary
@@ -1143,16 +1154,18 @@ new casts or copy the unresolved behaviours below.
   first produces a precision-bearing GEOHASH and must not be confused with
   `stringColumn`. Geohash-to-text emits bit strings for valid positive wire
   precision, not the helper's unreachable negative-precision character branch.
-- **Arrays:** DOUBLE_ARRAY copies 8-byte elements; rank must match the known
-  target, with per-row lengths permitted to vary. The cursor validates rank
-  1..32, nonnegative dimensions, checked element count and exact payload size.
-  Test each Java overload and wrapper, omitted/null/empty arrays, mixed ranks,
-  ragged inputs and capacity failures. No implicit LONG/DOUBLE element cast or
-  rank conversion is established by the server.
+- **Arrays:** DOUBLE_ARRAY copies raw 8-byte elements; the canonical encoded
+  target type supplies both DOUBLE element type and strong rank. Rank must match
+  exactly, while per-row lengths may vary. A confirmed missing column pins the
+  first effective rank across rows and batches. Public null array references are
+  no-ops; omission produces SQL NULL and an empty shape is a value. The cursor
+  validates rank 1..32, nonnegative dimensions, checked element count and exact
+  payload size. No implicit LONG/DOUBLE element cast or rank conversion is
+  established by the server.
 
-Every new pair also needs local rejection/rollback, exact target-wire and
-stored-value checks, recovery coverage, and explicit legacy comparisons using
-shared vectors. In particular, the fixed-width server cursor treats a null
+Every implemented pair needs local rejection/rollback, exact target-wire and
+stored-value checks, relevant recovery coverage, and explicit legacy comparisons
+using shared vectors. In particular, the fixed-width server cursor treats a null
 bitmap as authoritative and otherwise recognizes type-specific sentinels.
 BYTE/SHORT/CHAR have no source sentinel; INT minimum, LONG minimum, floating
 NaN, IPv4 zero and UUID/LONG256 sentinel limbs can behave differently when a
@@ -1754,13 +1767,21 @@ They do not change the compatibility contract.
     parser state or another conversion registry. Reject the one proven
     extreme-year/named-zone server crash precisely; do not turn it into a
     general defensive validation layer.
+27. **Treat DOUBLE-array support as rank validation, not conversion.** Read the
+    rank directly from the public wrapper, require the canonical strong DOUBLE
+    array type, and reuse the existing array buffer and encoder. For a missing
+    column, keep one rank integer on its inferred column definition so later
+    rows cannot form a mixed-rank block. Do not copy elements into a converter,
+    add array parameters, build a second shape model, or generalize this into
+    LONG-array casting. The current server checks rank but can build storage
+    from the cursor's element type, so accepting a non-DOUBLE target would
+    reproduce a server validation gap rather than a supported conversion.
 
 These opportunities do not justify a per-setter opt-out, raw-value fallback or
-send-time transformation. Partial activation is permitted on the unreleased
-development branch to exercise the real public Sender path early. It is not a
-release-ready client: missing conversion families still reject some
-previously working writes. Preserve legacy-mode behavior and complete the
-schema-mode contract before release.
+send-time transformation. The intentional conversion catalogue is complete on
+the unreleased development branch. Release review must still verify the standing
+gates and explicitly accept or resolve the server-contract boundaries above;
+they must not be hidden behind fallback behavior.
 
 ## Iterative implementation and testing
 
@@ -1769,7 +1790,7 @@ implementation and its tests together. Do not wait for negotiation,
 compatibility and all converters to be implemented before exercising the
 complete client-to-server path. Reuse the existing test infrastructure.
 
-### Plan after iteration 2.44
+### Plan after iteration 2.45
 
 The permanent compatibility gate is implemented. It launches released and
 current artifacts as separate processes and checks these observable contracts:
@@ -1822,17 +1843,24 @@ Iteration 2.43 is committed: INT selects target-native IPv4 storage,
 normalizing the INT and IPv4 null sentinels without adding parsing, allocation
 or a general numeric/address conversion.
 
-Iteration 2.44 is complete locally: STRING parses through the server's fixed
+Iteration 2.44 is committed: STRING parses through the server's fixed
 DATE grammar sequence and selects target-native DATE storage. Calendar and
 timezone mechanics are reused from the existing fixed timestamp parser; no
 general date-format framework was added.
 
-The final intentional conversion slice is DOUBLE-array identity. Implement it
-only after proving the rank metadata and every public array representation end
-to end; rank and shape validation are part of the conversion contract.
-BINARY-to-parser conversions, LONG_ARRAY, non-ASCII
-CHAR-to-VARCHAR and malformed decimal metadata remain server-contract decisions,
-not client implementation backlog.
+Iteration 2.45 is complete locally: every public DOUBLE-array overload selects
+the existing DOUBLE_ARRAY wire representation only when the server's canonical
+element type and rank match. The N-dimensional wrapper exposes its current rank;
+confirmed missing columns pin their first effective rank. Exact-wire tests cover
+ranks 1, 2, 3 and 32, raw floating-point bits, empty shapes, duplicate/rollback
+behavior and generation changes. Real-server tests cover public ranks 1 through
+4, stored shapes, rank rejection and partial-row recovery.
+
+There is no remaining intentional client conversion slice. Further datatype
+work must start by resolving one of the explicit server-contract boundaries:
+BINARY-to-parser behavior, LONG_ARRAY validation, non-ASCII CHAR text output or
+malformed decimal metadata. Until then, rejecting those paths is simpler and
+safer than copying an accidental server behavior into the client.
 
 Every slice keeps the existing observable-contract rules below: public API,
 exact wire, SQL result, partial-row rollback and relevant recovery behavior.

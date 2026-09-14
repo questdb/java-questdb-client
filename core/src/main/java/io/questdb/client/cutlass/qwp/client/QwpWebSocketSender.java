@@ -1762,13 +1762,16 @@ public class QwpWebSocketSender implements Sender {
         try {
             QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
-                binding.unsupportedColumn(name, "DOUBLE_ARRAY");
+                binding.doubleArray(name, values);
                 return this;
             }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_DOUBLE_ARRAY, true);
             if (col != null) {
                 col.addDoubleArray(values);
             }
+        } catch (LineSenderSchemaException e) {
+            rollbackRow();
+            throw refreshAfterSchemaRejection(e, name);
         } catch (RuntimeException | Error e) {
             rollbackRow();
             throw e;
@@ -1784,13 +1787,16 @@ public class QwpWebSocketSender implements Sender {
         try {
             QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
-                binding.unsupportedColumn(name, "DOUBLE_ARRAY");
+                binding.doubleArray(name, values);
                 return this;
             }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_DOUBLE_ARRAY, true);
             if (col != null) {
                 col.addDoubleArray(values);
             }
+        } catch (LineSenderSchemaException e) {
+            rollbackRow();
+            throw refreshAfterSchemaRejection(e, name);
         } catch (RuntimeException | Error e) {
             rollbackRow();
             throw e;
@@ -1806,13 +1812,16 @@ public class QwpWebSocketSender implements Sender {
         try {
             QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
-                binding.unsupportedColumn(name, "DOUBLE_ARRAY");
+                binding.doubleArray(name, values);
                 return this;
             }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_DOUBLE_ARRAY, true);
             if (col != null) {
                 col.addDoubleArray(values);
             }
+        } catch (LineSenderSchemaException e) {
+            rollbackRow();
+            throw refreshAfterSchemaRejection(e, name);
         } catch (RuntimeException | Error e) {
             rollbackRow();
             throw e;
@@ -1828,13 +1837,16 @@ public class QwpWebSocketSender implements Sender {
         try {
             QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
-                binding.unsupportedColumn(name, "DOUBLE_ARRAY");
+                binding.doubleArray(name, array);
                 return this;
             }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_DOUBLE_ARRAY, true);
             if (col != null) {
                 col.addDoubleArray(array);
             }
+        } catch (LineSenderSchemaException e) {
+            rollbackRow();
+            throw refreshAfterSchemaRejection(e, name);
         } catch (RuntimeException | Error e) {
             rollbackRow();
             throw e;

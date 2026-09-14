@@ -193,7 +193,7 @@ public class QwpTableBuffer implements QuietCloseable {
         return lookupColumn(name, type);
     }
 
-    ColumnBuffer getExistingInferredColumn(CharSequence name) {
+    ColumnBuffer getExistingColumnByName(CharSequence name) {
         int index = columnNameToIndex.get(name);
         return index >= 0 ? columns.get(index) : null;
     }
@@ -664,6 +664,7 @@ public class QwpTableBuffer implements QuietCloseable {
         // Decimal storage
         private byte decimalScale = -1;
         private boolean schemaDecimalScaleLocked;
+        private int inferredArrayDimensionality = -1;
         private double[] doubleArrayData;
         // GeoHash precision (number of bits, 1-60)
         private int geohashPrecision = -1;
@@ -1532,6 +1533,13 @@ public class QwpTableBuffer implements QuietCloseable {
 
         public int getSize() {
             return size;
+        }
+
+        int pinInferredArrayDimensionality(int dimensionality) {
+            if (inferredArrayDimensionality < 0) {
+                inferredArrayDimensionality = dimensionality;
+            }
+            return inferredArrayDimensionality;
         }
 
         public long getStringDataAddress() {
