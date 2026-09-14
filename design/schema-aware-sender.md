@@ -1,10 +1,10 @@
 # Schema-aware sender: schema-directed encoding
 
-Status: implemented on the development branch, revision 65. Scope: QWP v1 over
+Status: implemented on the development branch, revision 66. Scope: QWP v1 over
 WebSocket, with an automatically negotiated schema extension, legacy-server
 compatibility and companion server changes. The committed baseline contains the
-protocol, Sender integration and conversions through iteration 2.41. Iteration
-2.42 (small-integer decimal targets) is locally validated. A released-binary
+protocol, Sender integration and conversions through iteration 2.42. Iteration
+2.43 (INT-to-IPv4) is locally validated. A released-binary
 compatibility gate is implemented and locally green. The remaining public-setter
 conversion contract is not complete.
 
@@ -39,10 +39,10 @@ server-side failures can still reject a batch.
 
 ## Implementation status
 
-Current checkpoint: iteration 2.42 adds BYTE, SHORT and INT input to all six
-decimal target widths. Its pre-iteration baseline is client `3acdceadbd` and
-server `9bfa31a2fc`, whose submodule pins that exact client revision. The
-small-integer decimal slice is the current locally validated increment.
+Current checkpoint: iteration 2.43 adds INT input to an IPv4 target. Its
+pre-iteration baseline is client `1630c04775` and server `50d487e8b5`, whose
+submodule pins that exact client revision. INT-to-IPv4 is the current locally
+validated increment.
 The wider conversion inventory below is not complete; this is not release acceptance.
 
 The standing compatibility gate now runs three real process combinations:
@@ -177,6 +177,15 @@ have no source-null sentinel. One shared helper also replaces the identical
 LONG decimal tail without changing its behavior. Shared exact-wire and
 real-server vectors, precision rejection, partial-row rollback and a decimal
 precision/scale schema rebind cover the slice. D063 records the decision and
+evidence.
+
+INT input now selects target-native IPv4 wire representation. The input's
+`Integer.MIN_VALUE` sentinel becomes an explicit bitmap NULL; the integer value
+zero also becomes NULL because zero is the target IPv4 sentinel. Every other
+32-bit pattern is appended unchanged. BYTE, SHORT and LONG remain unsupported
+for IPv4, so this is not a general integer/address conversion. Exact-wire tests,
+public-Sender ingestion, partial-row rollback, parameter rejection and a
+DECIMAL-to-IPv4 schema rebind cover the slice. D064 records the decision and
 evidence.
 
 Iteration 2.15 is accepted as a bounded, unreleased Sender integration.
@@ -955,8 +964,8 @@ when the table or column is absent.
 ## Conversion backlog (server-source audit)
 
 Cross-checked on 2026-09-11 after iteration 2.13, with implemented coverage
-refreshed through iteration 2.42 on 2026-09-14. The pre-iteration baseline is
-client `3acdceadbd` and server `9bfa31a2fc`, whose submodule pins that exact
+refreshed through iteration 2.43 on 2026-09-14. The pre-iteration baseline is
+client `1630c04775` and server `50d487e8b5`, whose submodule pins that exact
 client revision. The original audit bases were client
 `981bdb02a471f3b290c89b8e78cbc422610e329e` and server
 `12a33d651e51e2682e7a448c8db5168fc72dfad3`. The matrix is a source audit;
@@ -988,7 +997,7 @@ non-null conversion. Known compatibility exceptions above still apply.
 | --- | --- | --- |
 | `boolColumn` (BOOLEAN) | BOOLEAN, numeric, text | None |
 | `byteColumn`, `shortColumn` (BYTE, SHORT) | Numeric, DATE, timestamps, text, SYMBOL, decimals | None |
-| `intColumn` (INT) | Numeric, DATE, timestamps, text, SYMBOL, decimals | IPv4 |
+| `intColumn` (INT) | Numeric, DATE, timestamps, text, SYMBOL, decimals, IPv4 | None |
 | `longColumn` (LONG) | Numeric, text, SYMBOL, DATE, timestamps, decimals | None |
 | `floatColumn`, `doubleColumn` (FLOAT, DOUBLE) | Numeric, text, SYMBOL, decimals | None |
 | `stringColumn` (VARCHAR) | BOOLEAN, numeric, text, SYMBOL, UUID, BINARY, timestamps, CHAR, LONG256, geohash, decimals | DATE |
@@ -1716,6 +1725,11 @@ They do not change the compatibility contract.
     the established rescale, precision-check and target-width append logic. Do
     not add one encoder per source width, a decimal conversion registry or
     retained decimal objects.
+25. **Treat INT-to-IPv4 as sentinel-aware representation selection.** Both
+    types carry one 32-bit value, but their null sentinels differ. Translate
+    INT null and IPv4 zero to the target bitmap, then append every other bit
+    pattern through the existing IPv4 column. Do not add address parsing,
+    widening, an address object or a general numeric-to-IPv4 rule.
 
 These opportunities do not justify a per-setter opt-out, raw-value fallback or
 send-time transformation. Partial activation is permitted on the unreleased
@@ -1731,7 +1745,7 @@ implementation and its tests together. Do not wait for negotiation,
 compatibility and all converters to be implemented before exercising the
 complete client-to-server path. Reuse the existing test infrastructure.
 
-### Plan after iteration 2.42
+### Plan after iteration 2.43
 
 The permanent compatibility gate is implemented. It launches released and
 current artifacts as separate processes and checks these observable contracts:
@@ -1775,15 +1789,17 @@ formatter and direct text/symbol append paths. The real-server conversion
 diagnostic improves by exactly one error because the SYMBOL aggregate is now
 green; STRING and VARCHAR continue to the independent CHAR-to-text gap.
 
-Iteration 2.42 is complete locally: BYTE, SHORT and INT select every decimal
+Iteration 2.42 is committed: BYTE, SHORT and INT select every decimal
 target width through the established exact integer-decimal tail. The target's
 declared precision and scale control rescaling and storage; no new decimal
 representation or server production code was added.
 
-The next bounded slice is INT-to-IPv4. Treat it as target representation
-selection plus the server's specific INT-null translation, not a general
-integer/address conversion. Then implement STRING-to-DATE parsing. DOUBLE
-arrays follow only after rank metadata is proven end to end.
+Iteration 2.43 is complete locally: INT selects target-native IPv4 storage,
+normalizing the INT and IPv4 null sentinels without adding parsing, allocation
+or a general numeric/address conversion.
+
+The next bounded slice is STRING-to-DATE parsing. DOUBLE arrays follow only
+after rank metadata is proven end to end.
 BINARY-to-parser conversions, LONG_ARRAY, non-ASCII
 CHAR-to-VARCHAR and malformed decimal metadata remain server-contract decisions,
 not client implementation backlog.

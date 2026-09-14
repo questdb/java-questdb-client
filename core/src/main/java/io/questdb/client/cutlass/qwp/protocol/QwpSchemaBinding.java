@@ -1131,6 +1131,7 @@ public final class QwpSchemaBinding {
         if (!isNumericTarget(targetType)
                 && !isTextTarget(targetType)
                 && !ColumnType.isDecimal(targetType)
+                && !(inferredType == ColumnType.INT && targetType == ColumnType.IPv4)
                 && targetType != ColumnType.DATE
                 && targetType != ColumnType.TIMESTAMP_MICRO
                 && targetType != ColumnType.TIMESTAMP_NANO) {
@@ -1159,6 +1160,13 @@ public final class QwpSchemaBinding {
                 break;
             case ColumnType.INT:
                 column.addInt((int) value);
+                break;
+            case ColumnType.IPv4:
+                if (value == Numbers.IPv4_NULL) {
+                    column.addNull();
+                } else {
+                    column.addIPv4((int) value);
+                }
                 break;
             case ColumnType.LONG:
             case ColumnType.DATE:

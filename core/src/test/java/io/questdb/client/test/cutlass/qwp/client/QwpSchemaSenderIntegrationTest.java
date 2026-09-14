@@ -320,6 +320,60 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test
+    public void testIntToIpv4GenerationRemainsPinnedBeforeRebind() throws Exception {
+        assertMemoryLeak(() -> {
+            LongTextSchemaHandler handler = new LongTextSchemaHandler(
+                    1101, 1111, ColumnType.getDecimalType(3, 0));
+            try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
+                sender.table("events").intColumn("value", 1).atNow();
+
+                handler.targetType = ColumnType.IPv4;
+                handler.version = 1112;
+                sender.table("events");
+                try {
+                    sender.intColumn("value", 1_000);
+                    Assert.fail("expected target-changing schema refresh");
+                } catch (LineSenderSchemaException e) {
+                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                }
+                sender.intColumn("value", 1_000).atNow();
+                sender.flush();
+
+                new FrameReader(handler.awaitDataFrame()).twoIntDecimalAndIpv4Blocks(
+                        "events", 1101, 1111, 1112);
+                Assert.assertEquals(2, handler.describeRequests.get());
+            }
+        });
+    }
+
+    @Test
+    public void testIntToIpv4UsesExactTargetWireAndRollback() throws Exception {
+        assertMemoryLeak(() -> {
+            LongTextSchemaHandler handler = new LongTextSchemaHandler(1121, 1131, ColumnType.IPv4);
+            try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
+                sender.table("events").intColumn("value", Integer.MIN_VALUE).atNow();
+                sender.intColumn("value", 0).atNow();
+
+                sender.intColumn("value", 0x0a000001);
+                try {
+                    sender.intColumn("failed_b", 1);
+                    Assert.fail("expected INT to UUID rejection");
+                } catch (LineSenderSchemaException e) {
+                    Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
+                }
+
+                sender.intColumn("value", 1).atNow();
+                sender.intColumn("value", -1).atNow();
+                sender.flush();
+
+                new FrameReader(handler.awaitDataFrame()).intToIpv4Table("events", 1121, 1131);
+                Assert.assertEquals("setter must use the standard one-refresh path", 2,
+                        handler.describeRequests.get());
+            }
+        });
+    }
+
+    @Test
     public void testNativeDecimalTextCorpusUsesExactVarcharWire() throws Exception {
         assertMemoryLeak(() -> {
             InputStream stream = QwpSchemaSenderIntegrationTest.class.getResourceAsStream(DECIMAL_TEXT_CORPUS);
@@ -2243,6 +2297,18 @@ public class QwpSchemaSenderIntegrationTest {
             eof();
         }
 
+        private void intToIpv4Table(String table, int tableId, long version) {
+            messageHeader(1);
+            Assert.assertEquals(0, varint());
+            Assert.assertEquals(0, varint());
+            schemaBlockHeader(table, tableId, version, 4, "value", QwpConstants.TYPE_IPv4);
+            Assert.assertEquals(1, u8());
+            Assert.assertEquals(3, u8());
+            Assert.assertEquals(1, in.getInt());
+            Assert.assertEquals(-1, in.getInt());
+            eof();
+        }
+
         private void long256TargetTable(
                 String table,
                 int tableId,
@@ -2920,6 +2986,22 @@ public class QwpSchemaSenderIntegrationTest {
             Assert.assertEquals(5, u8());
             Assert.assertEquals(100_000_000, i64());
             Assert.assertEquals(0, i64());
+            eof();
+        }
+
+        private void twoIntDecimalAndIpv4Blocks(
+                String table, int tableId, long firstVersion, long secondVersion
+        ) {
+            messageHeader(2);
+            Assert.assertEquals(0, varint());
+            Assert.assertEquals(0, varint());
+            schemaBlockHeader(table, tableId, firstVersion, 1, "value", QwpConstants.TYPE_DECIMAL64);
+            Assert.assertEquals(0, u8());
+            Assert.assertEquals(0, u8());
+            Assert.assertEquals(1, i64());
+            schemaBlockHeader(table, tableId, secondVersion, 1, "value", QwpConstants.TYPE_IPv4);
+            Assert.assertEquals(0, u8());
+            Assert.assertEquals(1_000, in.getInt());
             eof();
         }
 

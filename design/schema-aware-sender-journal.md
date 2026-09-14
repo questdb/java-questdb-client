@@ -7593,3 +7593,63 @@ decimal bytes before persistence and reuses the already exercised decimal
 buffer representation. Exact public wire tests prove those bytes; the existing
 schema-frame replay suite remains green. A small-integer-specific recovery test
 would repeat unchanged persistence code.
+
+## D064 — INT-to-IPv4 translates both source and target null sentinels
+
+Status: iteration 2.43 implemented and locally validated, 2026-09-14. Design
+revision 66. The pre-iteration baseline is client `1630c04775` and server
+`50d487e8b5`, whose submodule pins that exact client revision. Neither
+repository is committed by this decision record.
+
+`intColumn` now accepts an IPv4 target in schema mode and emits target-native
+`TYPE_IPv4`. `Integer.MIN_VALUE` is the INT source null sentinel and becomes an
+explicit bitmap NULL. A supplied integer zero also becomes bitmap NULL because
+zero is QuestDB's IPv4 null sentinel. Every other 32-bit pattern is appended
+unchanged, including negative Java integers representing addresses whose first
+octet is at least 128. BYTE, SHORT and LONG remain rejected for IPv4, and a
+parameterized IPv4 target remains rejected.
+
+This rule is cross-checked against the current server's `QwpWalAppender` IPv4
+dispatch, `QwpFixedWidthColumnCursor` null detection and
+`WalColumnarRowAppender.putIntToIPv4Column`. The legacy server path reads a
+TYPE_INT cursor, translates its source-null row to IPv4 zero, and copies every
+other integer verbatim. The client performs the equivalent conversion before
+buffering, using the existing four-byte IPv4 column. The implementation adds
+one allowed-target condition and one switch arm; it adds no parser, formatter,
+address object, allocation, retained state, protocol field or server production
+change. Other integer target arms are unchanged. This is source-level reasoning,
+not a measured throughput claim.
+
+The component test covers `Integer.MIN_VALUE`, zero, one, minimum-plus-one,
+maximum, all-one bits and omission. It asserts the exact TYPE_IPv4 wire code,
+bitmap and four stored values. Negative tests retain BYTE/SHORT rejection and
+cover IPv4 parameter rejection. Public socket tests prove A/error/C rollback,
+the standard one-refresh lifecycle, exact target wire data, and a DECIMAL(3,0)
+block remaining pinned before a new IPv4 generation.
+
+The real-server E2E uses public Sender calls for both null cases and six
+non-null patterns from `0.0.0.1` through `255.255.255.255`, plus omission. It
+waits for the ACK, drains WAL and checks exact rendered IPv4 values and marker
+rows; a partial `failed-B` row is absent after an INT-to-UUID local error. The
+focused gate also runs the existing INT-null IPv4 test: two tests total, both
+green. Its stale comment was corrected because the current client now exercises
+target-native schema encoding rather than the server's legacy TYPE_INT arm.
+
+Focused client validation passes 116 tests. Expanded client validation passes
+326 tests, all with zero failures, errors or skips. Packaged-JAR verification
+passes 49 selected unit tests and both packaging integration tests. The
+released-binary matrix passes all three old/new combinations with current JAR
+SHA-256 `82140012a88ee02b4aff5e7554a722f9f8a55b1eb83fb3763bd027a9cbc1469d`;
+the run used `/mnt/pcie5/qwp-int-ipv4-compat/run.CKpGSZ`.
+
+The full `QwpSenderE2ETest` remains diagnostic: 137 tests now produce two
+failures and 33 errors, down from 34 errors at D063. The INT-to-IPv4 test is now
+green. The only intentional conversion implementations left are STRING-to-DATE
+and DOUBLE arrays; the separately unresolved and legacy-expectation cases remain
+outside this slice.
+
+No new store-and-forward test was added. The changed code selects the existing
+target-native IPv4 representation before persistence. Exact public wire tests
+prove those bytes, while the unchanged schema-frame replay suite remains green.
+An INT-specific recovery test would repeat the already covered opaque-frame
+persistence contract.

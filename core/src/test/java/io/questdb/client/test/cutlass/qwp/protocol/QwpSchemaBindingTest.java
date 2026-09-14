@@ -821,6 +821,39 @@ public class QwpSchemaBindingTest {
     }
 
     @Test
+    public void testIntToIpv4UsesTargetNativeWireAndNulls() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                QwpSchemaBinding rows = rows(buffer, column("ip", ColumnType.IPv4));
+                rows.intColumn("ip", Integer.MIN_VALUE);
+                buffer.nextRow();
+                rows.intColumn("ip", 0);
+                buffer.nextRow();
+                rows.intColumn("ip", 1);
+                buffer.nextRow();
+                rows.intColumn("ip", Integer.MIN_VALUE + 1);
+                buffer.nextRow();
+                rows.intColumn("ip", Integer.MAX_VALUE);
+                buffer.nextRow();
+                rows.intColumn("ip", -1);
+                buffer.nextRow();
+                buffer.nextRow();
+
+                int size = encoder.encodeSchema(buffer);
+                Reader reader = tableReader(encoder, size, 7, QwpConstants.TYPE_IPv4);
+                Assert.assertEquals("NULL bitmap must be present", 1, reader.byteValue());
+                Assert.assertEquals("INT null, IPv4 zero and omission must be NULL", 0x43, reader.byteValue());
+                Assert.assertEquals(1, reader.intValue());
+                Assert.assertEquals(Integer.MIN_VALUE + 1, reader.intValue());
+                Assert.assertEquals(Integer.MAX_VALUE, reader.intValue());
+                Assert.assertEquals(-1, reader.intValue());
+                Assert.assertEquals(size, reader.position());
+            }
+        });
+    }
+
+    @Test
     public void testSmallIntegerMissingSchemaUsesNativeWireTypes() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
@@ -847,12 +880,20 @@ public class QwpSchemaBindingTest {
         try (QwpTableBuffer buffer = new QwpTableBuffer("t")) {
             QwpSchemaBinding rows = rows(buffer,
                     column("uuid", ColumnType.UUID),
+                    column("ip", ColumnType.IPv4),
                     column("future", ColumnType.INT, new byte[]{1}),
                     column("future_date", ColumnType.DATE, new byte[]{1}),
                     column("future_text", ColumnType.VARCHAR, new byte[]{1}),
-                    column("future_decimal", ColumnType.getDecimalType(18, 2), new byte[]{1}));
+                    column("future_decimal", ColumnType.getDecimalType(18, 2), new byte[]{1}),
+                    column("future_ipv4", ColumnType.IPv4, new byte[]{1}));
             assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
                     () -> rows.byteColumn("uuid", (byte) 1));
+            rollbackCurrentRow(buffer);
+            assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+                    () -> rows.byteColumn("ip", (byte) 1));
+            rollbackCurrentRow(buffer);
+            assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+                    () -> rows.shortColumn("ip", (short) 2));
             rollbackCurrentRow(buffer);
             assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
                     () -> rows.shortColumn("future", (short) 2));
@@ -865,6 +906,9 @@ public class QwpSchemaBindingTest {
             rollbackCurrentRow(buffer);
             assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
                     () -> rows.shortColumn("future_decimal", (short) 5));
+            rollbackCurrentRow(buffer);
+            assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+                    () -> rows.intColumn("future_ipv4", 6));
             rollbackCurrentRow(buffer);
             assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
                     () -> rows.intColumn("uuid", Integer.MIN_VALUE));
