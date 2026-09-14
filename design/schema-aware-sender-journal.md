@@ -7529,3 +7529,67 @@ already supported target-native VARCHAR or SYMBOL representation before the
 frame is persisted. Exact public wire tests prove those bytes, while existing
 schema-frame replay and the established long-to-text persistence coverage remain
 green. A setter-specific replay test would repeat unchanged persistence code.
+
+## D063 — Small integers share the exact integer-decimal tail
+
+Status: iteration 2.42 implemented and locally validated, 2026-09-14. Design
+revision 65. The pre-iteration baseline is client `3acdceadbd` and server
+`9bfa31a2fc`, whose submodule pins that exact client revision. Neither
+repository is committed by this decision record.
+
+BYTE, SHORT and INT setters now accept DECIMAL8, DECIMAL16, DECIMAL32,
+DECIMAL64, DECIMAL128 and DECIMAL256 targets in schema mode. Each non-null
+source is an exact scale-zero integer. The binding passes its widened value to
+one shared tail that applies the target's declared scale, checks its declared
+precision and appends the matching target storage width. `Integer.MIN_VALUE`
+retains its source-null meaning and becomes a scaled bitmap NULL. BYTE and SHORT
+have no source-null sentinel. Missing columns still infer their native integer
+types; legacy mode is unchanged.
+
+The current server source supports the same rule. `QwpWalAppender` dispatches
+BYTE, SHORT, INT and LONG cursors to the small, 64-bit, 128-bit or 256-bit
+decimal target appenders. `WalColumnarRowAppender` reads the integer through
+`getLong()`, assigns scale zero, performs exact rescaling, validates precision
+and storage, and writes the target decimal. The client therefore extracts the
+existing LONG decimal branch into `appendIntegerDecimal` and calls it from all
+four integer sources. Numeric and temporal target branches retain their earlier
+short-circuits; no conversion registry, retained decimal object, per-value
+allocation, protocol field or server production change was added. This is
+source-level hot-path reasoning, not a new performance claim.
+
+Client and server consume the same 30-case corpus, SHA-256
+`e3ffe93367c2a6e65d1eeac821b3ccd798d88a9a4a7e37dfaaf9548a89d17ddf`.
+It covers every one of the 18 source/target-width pairs, INT null at every
+width, positive and negative scale conversion, source extrema and precision
+overflow. Component tests assert the exact target wire type, scale byte, bitmap
+and raw 64-bit limbs. Public socket tests additionally cover parameter rejection,
+precision failure rollback, A/error/C row recovery and a DECIMAL(3,0) block
+remaining pinned before a DECIMAL(20,5) schema generation.
+
+The real-server corpus test sends every valid vector through public Sender
+setters, waits for the acknowledged sequence, drains WAL and asserts exact SQL
+values and nulls. A second public-Sender test proves a partially written row is
+discarded after an INT-to-UUID local error while completed decimal rows survive.
+The focused server gate also runs the existing decimal aggregate and variant
+tests: four tests total, all green.
+
+Expanded client validation passes 323 tests with zero failures, errors or skips.
+Packaged-JAR verification passes 48 selected unit tests and both packaging
+integration tests. The released-binary matrix passes current client to QuestDB
+10.0.1 in legacy mode, client 1.3.9 to current server in legacy mode, and current
+client to current server in schema mode. The matrix run used
+`/mnt/pcie5/qwp-small-integer-decimal-compat/run.0W5Ji1`; all other scratch roots
+also remain under `/mnt/pcie5`.
+
+The full `QwpSenderE2ETest` remains diagnostic: 137 tests now produce two
+failures and 34 errors, down from 36 errors at D062. Both decimal aggregate
+tests are now green. The open intentional implementation entries are
+INT-to-IPv4, STRING-to-DATE and DOUBLE arrays. STRING/VARCHAR aggregates still
+stop at the separately unresolved CHAR-to-text contract; other errors are
+legacy tests whose expected server-side rejection is now an early local error.
+
+No new store-and-forward test was added. The changed code selects target-native
+decimal bytes before persistence and reuses the already exercised decimal
+buffer representation. Exact public wire tests prove those bytes; the existing
+schema-frame replay suite remains green. A small-integer-specific recovery test
+would repeat unchanged persistence code.

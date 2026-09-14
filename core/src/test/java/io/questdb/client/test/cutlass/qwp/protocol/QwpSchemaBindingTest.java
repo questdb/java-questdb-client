@@ -628,6 +628,85 @@ public class QwpSchemaBindingTest {
     }
 
     @Test
+    public void testSmallIntegerDecimalConformanceCorpusUsesTargetWire() throws Exception {
+        InputStream stream = QwpSchemaBindingTest.class.getResourceAsStream(
+                "/io/questdb/client/cutlass/qwp/small-integer-to-decimal.tsv");
+        Assert.assertNotNull(stream);
+        boolean[][] sourceTargets = new boolean[3][6];
+        int count = 0;
+        try (BufferedReader lines = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))) {
+            Assert.assertEquals(
+                    "# case_id\tinput_type\tinput\ttarget_type\ttarget_precision\ttarget_scale\toutcome"
+                            + "\texpected_ll_hex\texpected_lh_hex\texpected_hl_hex\texpected_hh_hex\texpected_sql",
+                    lines.readLine()
+            );
+            String line;
+            while ((line = lines.readLine()) != null) {
+                String[] fields = line.split("\t", -1);
+                Assert.assertEquals(line, 12, fields.length);
+                try {
+                    long input = Long.parseLong(fields[2]);
+                    int precision = Integer.parseInt(fields[4]);
+                    int scale = Integer.parseInt(fields[5]);
+                    Assert.assertEquals(decimalStorageType(precision), fields[3]);
+                    sourceTargets[smallIntegerSourceIndex(fields[1])][decimalStorageIndex(fields[3])] = true;
+                    try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                         QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                        QwpSchemaBinding rows = rows(
+                                buffer,
+                                column("value", ColumnType.getDecimalType(precision, scale))
+                        );
+                        Runnable append = () -> appendSmallInteger(rows, fields[1], input, "value");
+                        if ("INVALID".equals(fields[6])) {
+                            assertReason(LineSenderSchemaException.Reason.INVALID_VALUE, append);
+                            rollbackCurrentRow(buffer);
+                        } else {
+                            append.run();
+                            buffer.nextRow();
+                            int size = encoder.encodeSchema(buffer);
+                            Reader reader = tableReader(
+                                    encoder,
+                                    size,
+                                    1,
+                                    decimalWireType(fields[3])
+                            );
+                            if ("NULL".equals(fields[6])) {
+                                Assert.assertEquals("NULL", fields[11]);
+                                Assert.assertEquals(1, reader.byteValue());
+                                Assert.assertEquals(1, reader.byteValue());
+                            } else {
+                                Assert.assertEquals("VALUE", fields[6]);
+                                Assert.assertEquals(0, reader.byteValue());
+                            }
+                            Assert.assertEquals(scale, reader.byteValue());
+                            if ("VALUE".equals(fields[6])) {
+                                int limbs = decimalWireLongCount(fields[3]);
+                                for (int i = 0; i < limbs; i++) {
+                                    Assert.assertEquals(parseHexLong(fields[7 + i]), reader.longValue());
+                                }
+                                for (int i = limbs; i < 4; i++) {
+                                    Assert.assertEquals("-", fields[7 + i]);
+                                }
+                            }
+                            Assert.assertEquals(size, reader.position());
+                        }
+                    }
+                } catch (AssertionError e) {
+                    throw new AssertionError("case_id=" + fields[0] + ": " + e.getMessage(), e);
+                }
+                count++;
+            }
+        }
+        Assert.assertEquals(30, count);
+        for (int source = 0; source < sourceTargets.length; source++) {
+            for (int target = 0; target < sourceTargets[source].length; target++) {
+                Assert.assertTrue("missing source/target coverage " + source + '/' + target,
+                        sourceTargets[source][target]);
+            }
+        }
+    }
+
+    @Test
     public void testIntegerTemporalConformanceCorpusUsesTargetWire() throws Exception {
         InputStream stream = QwpSchemaBindingTest.class.getResourceAsStream(
                 "/io/questdb/client/cutlass/qwp/integer-temporal-conversions.tsv");
@@ -770,7 +849,8 @@ public class QwpSchemaBindingTest {
                     column("uuid", ColumnType.UUID),
                     column("future", ColumnType.INT, new byte[]{1}),
                     column("future_date", ColumnType.DATE, new byte[]{1}),
-                    column("future_text", ColumnType.VARCHAR, new byte[]{1}));
+                    column("future_text", ColumnType.VARCHAR, new byte[]{1}),
+                    column("future_decimal", ColumnType.getDecimalType(18, 2), new byte[]{1}));
             assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
                     () -> rows.byteColumn("uuid", (byte) 1));
             rollbackCurrentRow(buffer);
@@ -782,6 +862,9 @@ public class QwpSchemaBindingTest {
             rollbackCurrentRow(buffer);
             assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
                     () -> rows.intColumn("future_text", 4));
+            rollbackCurrentRow(buffer);
+            assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+                    () -> rows.shortColumn("future_decimal", (short) 5));
             rollbackCurrentRow(buffer);
             assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
                     () -> rows.intColumn("uuid", Integer.MIN_VALUE));
@@ -1774,6 +1857,63 @@ public class QwpSchemaBindingTest {
         }
     }
 
+    private static int decimalStorageIndex(String target) {
+        switch (target) {
+            case "DECIMAL8":
+                return 0;
+            case "DECIMAL16":
+                return 1;
+            case "DECIMAL32":
+                return 2;
+            case "DECIMAL64":
+                return 3;
+            case "DECIMAL128":
+                return 4;
+            default:
+                Assert.assertEquals("DECIMAL256", target);
+                return 5;
+        }
+    }
+
+    private static String decimalStorageType(int precision) {
+        if (precision <= 2) {
+            return "DECIMAL8";
+        }
+        if (precision <= 4) {
+            return "DECIMAL16";
+        }
+        if (precision <= 9) {
+            return "DECIMAL32";
+        }
+        if (precision <= 18) {
+            return "DECIMAL64";
+        }
+        if (precision <= 38) {
+            return "DECIMAL128";
+        }
+        return "DECIMAL256";
+    }
+
+    private static int decimalWireLongCount(String target) {
+        if ("DECIMAL128".equals(target)) {
+            return 2;
+        }
+        if ("DECIMAL256".equals(target)) {
+            return 4;
+        }
+        return 1;
+    }
+
+    private static byte decimalWireType(String target) {
+        if ("DECIMAL128".equals(target)) {
+            return QwpConstants.TYPE_DECIMAL128;
+        }
+        if ("DECIMAL256".equals(target)) {
+            return QwpConstants.TYPE_DECIMAL256;
+        }
+        return QwpConstants.TYPE_DECIMAL64;
+    }
+
     private static void appendIntegerTemporal(
             QwpSchemaBinding rows,
             String inputType,
@@ -1850,6 +1990,23 @@ public class QwpSchemaBindingTest {
             case "FLOAT": return ColumnType.FLOAT;
             case "DOUBLE": return ColumnType.DOUBLE;
             default: throw new AssertionError(target);
+        }
+    }
+
+    private static long parseHexLong(String value) {
+        Assert.assertNotEquals("-", value);
+        return Long.parseUnsignedLong(value, 16);
+    }
+
+    private static int smallIntegerSourceIndex(String source) {
+        switch (source) {
+            case "BYTE":
+                return 0;
+            case "SHORT":
+                return 1;
+            default:
+                Assert.assertEquals("INT", source);
+                return 2;
         }
     }
 

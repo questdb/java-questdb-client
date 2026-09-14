@@ -264,6 +264,62 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test
+    public void testSmallIntegerDecimalGenerationRemainsPinnedBeforeRebind() throws Exception {
+        assertMemoryLeak(() -> {
+            LongTextSchemaHandler handler = new LongTextSchemaHandler(
+                    1061, 1071, ColumnType.getDecimalType(3, 0));
+            try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
+                sender.table("events").byteColumn("value", (byte) 1).atNow();
+
+                handler.targetType = ColumnType.getDecimalType(20, 5);
+                handler.version = 1072;
+                sender.table("events");
+                try {
+                    sender.shortColumn("value", (short) 1_000);
+                    Assert.fail("expected width-and-scale-changing schema refresh");
+                } catch (LineSenderSchemaException e) {
+                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                }
+                sender.shortColumn("value", (short) 1_000).atNow();
+                sender.flush();
+
+                new FrameReader(handler.awaitDataFrame()).twoSmallIntegerDecimalBlocks(
+                        "events", 1061, 1071, 1072);
+                Assert.assertEquals(2, handler.describeRequests.get());
+            }
+        });
+    }
+
+    @Test
+    public void testSmallIntegerDecimalTargetUsesExactWireAndRollback() throws Exception {
+        assertMemoryLeak(() -> {
+            LongTextSchemaHandler handler = new LongTextSchemaHandler(
+                    1081, 1091, ColumnType.getDecimalType(18, 2));
+            try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
+                sender.table("events").byteColumn("value", (byte) 42).atNow();
+
+                sender.shortColumn("value", (short) 99);
+                try {
+                    sender.intColumn("failed_b", 1);
+                    Assert.fail("expected INT-to-UUID conversion rejection");
+                } catch (LineSenderSchemaException e) {
+                    Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
+                }
+
+                sender.shortColumn("value", (short) -7).atNow();
+                sender.intColumn("value", Integer.MIN_VALUE).atNow();
+                sender.intColumn("value", Integer.MAX_VALUE).atNow();
+                sender.flush();
+
+                new FrameReader(handler.awaitDataFrame()).smallIntegerDecimalTable(
+                        "events", 1081, 1091);
+                Assert.assertEquals("setter must use the standard one-refresh path", 2,
+                        handler.describeRequests.get());
+            }
+        });
+    }
+
+    @Test
     public void testNativeDecimalTextCorpusUsesExactVarcharWire() throws Exception {
         assertMemoryLeak(() -> {
             InputStream stream = QwpSchemaSenderIntegrationTest.class.getResourceAsStream(DECIMAL_TEXT_CORPUS);
@@ -2469,6 +2525,20 @@ public class QwpSchemaSenderIntegrationTest {
             eof();
         }
 
+        private void smallIntegerDecimalTable(String table, int tableId, long version) {
+            messageHeader(1);
+            Assert.assertEquals(0, varint());
+            Assert.assertEquals(0, varint());
+            schemaBlockHeader(table, tableId, version, 4, "value", QwpConstants.TYPE_DECIMAL64);
+            Assert.assertEquals(1, u8());
+            Assert.assertEquals(4, u8());
+            Assert.assertEquals(2, u8());
+            Assert.assertEquals(4_200, i64());
+            Assert.assertEquals(-700, i64());
+            Assert.assertEquals(214_748_364_700L, i64());
+            eof();
+        }
+
         private void smallIntegerTextTable(String table, int tableId, long version, int targetType) {
             messageHeader(1);
             if (targetType == ColumnType.SYMBOL) {
@@ -2832,6 +2902,24 @@ public class QwpSchemaSenderIntegrationTest {
             Assert.assertEquals(0, in.getInt());
             Assert.assertEquals(1, in.getInt());
             Assert.assertEquals('8', u8());
+            eof();
+        }
+
+        private void twoSmallIntegerDecimalBlocks(
+                String table, int tableId, long firstVersion, long secondVersion
+        ) {
+            messageHeader(2);
+            Assert.assertEquals(0, varint());
+            Assert.assertEquals(0, varint());
+            schemaBlockHeader(table, tableId, firstVersion, 1, "value", QwpConstants.TYPE_DECIMAL64);
+            Assert.assertEquals(0, u8());
+            Assert.assertEquals(0, u8());
+            Assert.assertEquals(1, i64());
+            schemaBlockHeader(table, tableId, secondVersion, 1, "value", QwpConstants.TYPE_DECIMAL128);
+            Assert.assertEquals(0, u8());
+            Assert.assertEquals(5, u8());
+            Assert.assertEquals(100_000_000, i64());
+            Assert.assertEquals(0, i64());
             eof();
         }
 

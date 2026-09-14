@@ -465,19 +465,7 @@ public final class QwpSchemaBinding {
             throw unsupported(name, "LONG", targetType, "conversion is not implemented");
         }
         if (ColumnType.isDecimal(targetType)) {
-            int targetPrecision = ColumnType.getDecimalPrecision(targetType);
-            int targetScale = ColumnType.getDecimalScale(targetType);
-            if (value == Long.MIN_VALUE) {
-                column.addSchemaDecimalNull(targetScale);
-                return this;
-            }
-            try {
-                if (!column.addSchemaLongDecimal(value, targetPrecision, targetScale)) {
-                    throw error(INVALID_VALUE, name, "LONG", targetType, "decimal value exceeds target precision");
-                }
-            } catch (NumericException e) {
-                throw error(INVALID_VALUE, name, "LONG", targetType, "decimal value cannot be rescaled exactly");
-            }
+            appendIntegerDecimal(column, name, value, "LONG", targetType, value == Long.MIN_VALUE);
             return this;
         }
         if (value == Long.MIN_VALUE) {
@@ -1142,10 +1130,15 @@ public final class QwpSchemaBinding {
         }
         if (!isNumericTarget(targetType)
                 && !isTextTarget(targetType)
+                && !ColumnType.isDecimal(targetType)
                 && targetType != ColumnType.DATE
                 && targetType != ColumnType.TIMESTAMP_MICRO
                 && targetType != ColumnType.TIMESTAMP_NANO) {
             throw unsupported(name, inputType, targetType, "conversion is not implemented");
+        }
+        if (ColumnType.isDecimal(targetType)) {
+            appendIntegerDecimal(column, name, value, inputType, targetType, sourceNull);
+            return this;
         }
         if (sourceNull) {
             column.addNull();
@@ -1190,6 +1183,29 @@ public final class QwpSchemaBinding {
                 throw new AssertionError("unsupported integer target");
         }
         return this;
+    }
+
+    private void appendIntegerDecimal(
+            QwpTableBuffer.ColumnBuffer column,
+            CharSequence name,
+            long value,
+            String inputType,
+            int targetType,
+            boolean sourceNull
+    ) {
+        int targetPrecision = ColumnType.getDecimalPrecision(targetType);
+        int targetScale = ColumnType.getDecimalScale(targetType);
+        if (sourceNull) {
+            column.addSchemaDecimalNull(targetScale);
+            return;
+        }
+        try {
+            if (!column.addSchemaLongDecimal(value, targetPrecision, targetScale)) {
+                throw error(INVALID_VALUE, name, inputType, targetType, "decimal value exceeds target precision");
+            }
+        } catch (NumericException e) {
+            throw error(INVALID_VALUE, name, inputType, targetType, "decimal value cannot be rescaled exactly");
+        }
     }
 
     private CharSequence formatLong(long value) {
