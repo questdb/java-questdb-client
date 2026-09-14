@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
@@ -75,7 +76,7 @@ public class BackgroundDrainerSetupFailureTest {
                     5_000L,
                     1L,
                     10L,
-                    true,
+                    DurableAckTiers.REPLICATED,
                     200L);
 
             LinkageError thrown = null;
@@ -123,7 +124,7 @@ public class BackgroundDrainerSetupFailureTest {
                     5_000L,
                     1L,
                     10L,
-                    true,
+                    DurableAckTiers.REPLICATED,
                     200L);
 
             OutOfMemoryError thrown = null;
@@ -182,7 +183,7 @@ public class BackgroundDrainerSetupFailureTest {
                     5_000L,
                     1L,
                     10L,
-                    true,
+                    DurableAckTiers.REPLICATED,
                     200L);
 
             drainer.run();
@@ -268,7 +269,7 @@ public class BackgroundDrainerSetupFailureTest {
                     5_000L,
                     1L,
                     10L,
-                    true,
+                    DurableAckTiers.REPLICATED,
                     200L);
 
             LinkageError thrown = null;
@@ -330,7 +331,7 @@ public class BackgroundDrainerSetupFailureTest {
                     5_000L,
                     1L,
                     10L,
-                    true,
+                    DurableAckTiers.REPLICATED,
                     200L);
 
             drainer.run();
@@ -370,7 +371,7 @@ public class BackgroundDrainerSetupFailureTest {
                     5_000L,
                     1L,
                     10L,
-                    true,
+                    DurableAckTiers.REPLICATED,
                     200L);
 
             drainer.run();

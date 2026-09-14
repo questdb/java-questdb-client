@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
@@ -159,7 +160,7 @@ public class SelfSufficientFramesTest {
                         slot, 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
                         CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, dictFf);
                 try (Sender sender = QwpWebSocketSender.connect(
-                        "localhost", port, null, 0, 0, 0L, null, false, engine)) {
+                        "localhost", port, null, 0, 0, 0L, null, DurableAckTiers.NONE, engine)) {
                     sender.table("foo").symbol("s", "alpha").longColumn("v", 1L).atNow();
                     sender.flush();
                     waitFor(() -> handler.batches.size() >= 1, 5_000);
@@ -751,7 +752,7 @@ public class SelfSufficientFramesTest {
                 // 40 x ~60-byte entries is ~2.4 KB of dictionary against a 512-byte cap,
                 // so no single frame can carry it and at least five chunks are required.
                 try (Sender sender = QwpWebSocketSender.connect(
-                        "localhost", port, null, 1_000_000, 0, 0L, null, false, engine)) {
+                        "localhost", port, null, 1_000_000, 0, 0L, null, DurableAckTiers.NONE, engine)) {
                     String pad = TestUtils.repeat("x", 55);
                     for (int i = 0; i < symbols; i++) {
                         String sym = String.format("%04d", i) + pad;
@@ -826,7 +827,7 @@ public class SelfSufficientFramesTest {
                         CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, dictFf);
                 List<String> expected = new ArrayList<>();
                 try (Sender sender = QwpWebSocketSender.connect(
-                        "localhost", port, null, 1_000_000, 0, 0L, null, false, engine)) {
+                        "localhost", port, null, 1_000_000, 0, 0L, null, DurableAckTiers.NONE, engine)) {
                     // 10 x 48-char symbols: dict section 10 x 49 = 490 bytes, dict-only
                     // frame 504 -- one row under the 512 cap.
                     String pad = TestUtils.repeat("s", 46);
@@ -900,7 +901,7 @@ public class SelfSufficientFramesTest {
                         CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, dictFf);
                 List<String> expected = new ArrayList<>();
                 try (Sender sender = QwpWebSocketSender.connect(
-                        "localhost", port, null, 1_000_000, 0, 0L, null, false, engine)) {
+                        "localhost", port, null, 1_000_000, 0, 0L, null, DurableAckTiers.NONE, engine)) {
                     String symPad = TestUtils.repeat("s", 46);
                     // t1 registers the 10 symbols (ids 0..9): small body, whole dict.
                     for (int i = 0; i < 10; i++) {
@@ -973,7 +974,7 @@ public class SelfSufficientFramesTest {
                         slot, 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
                         CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, dictFf);
                 try (Sender sender = QwpWebSocketSender.connect(
-                        "localhost", port, null, 1_000_000, 0, 0L, null, false, engine)) {
+                        "localhost", port, null, 1_000_000, 0, 0L, null, DurableAckTiers.NONE, engine)) {
                     String symPad = TestUtils.repeat("s", 46);
                     String rowPad = TestUtils.repeat("x", 40);
                     // 20 rows cycling through 10 symbols: the same 504-byte dictionary
@@ -1028,7 +1029,7 @@ public class SelfSufficientFramesTest {
                         slot, 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
                         CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, dictFf);
                 try (Sender sender = QwpWebSocketSender.connect(
-                        "localhost", port, null, 1_000_000, 0, 0L, null, false, engine)) {
+                        "localhost", port, null, 1_000_000, 0, 0L, null, DurableAckTiers.NONE, engine)) {
                     // Small enough to pass sendRow's per-row guard, too large for a
                     // dictionary frame of its own once the header and varints are added.
                     sender.table("t").symbol("s", TestUtils.repeat("y", 250))
@@ -1209,7 +1210,7 @@ public class SelfSufficientFramesTest {
                         slot, 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
                         CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, dictFf);
                 Sender sender = QwpWebSocketSender.connect(
-                        "localhost", port, null, 1_000_000, 0, 0L, null, false, engine);
+                        "localhost", port, null, 1_000_000, 0, 0L, null, DurableAckTiers.NONE, engine);
                 try {
                     String symPad = TestUtils.repeat("s", 46);
                     String rowPad = TestUtils.repeat("x", 60);
@@ -1287,7 +1288,7 @@ public class SelfSufficientFramesTest {
                         slot, 100L, 4L * 1024 * 1024,
                         CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, dictFf);
                 Sender sender = QwpWebSocketSender.connect(
-                        "localhost", port, null, 1_000_000, 0, 0L, null, false, engine);
+                        "localhost", port, null, 1_000_000, 0, 0L, null, DurableAckTiers.NONE, engine);
                 try {
                     // One 40-char symbol makes the dictionary section big enough that
                     // section+body busts the 150-byte cap, while the body alone fits it
@@ -1364,7 +1365,7 @@ public class SelfSufficientFramesTest {
                         slot, 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
                         CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, dictFf);
                 try (Sender sender = QwpWebSocketSender.connect(
-                        "localhost", port, null, 1_000_000, 0, 0L, null, false, engine)) {
+                        "localhost", port, null, 1_000_000, 0, 0L, null, DurableAckTiers.NONE, engine)) {
                     QwpWebSocketSender ws = (QwpWebSocketSender) sender;
                     Assert.assertFalse("an unopenable .symbol-dict must select full-dict mode",
                             ws.isDeltaDictEnabledForTest());

@@ -58,7 +58,10 @@ public class WsSenderConfigHonoredTest {
         assertHonored("auto_flush=off", "auto_flush_interval", Integer.MAX_VALUE);
         assertHonored("max_name_len=99", "max_name_len", 99);
         assertHonored("transaction=on", "transaction", true);
-        assertHonored("request_durable_ack=on", "request_durable_ack", true);
+        assertHonored("request_durable_ack=on", "request_durable_ack", "on");
+        assertHonored("request_durable_ack=local", "request_durable_ack", "local");
+        assertHonored("request_durable_ack=replicated", "request_durable_ack", "replicated");
+        assertHonored("request_durable_ack=local,replicated", "request_durable_ack", "local,replicated");
         assertHonored("sender_id=probe-1", "sender_id", "probe-1");
         assertHonored("sf_dir=/var/probe", "sf_dir", "/var/probe");
         assertHonored("sf_max_segment_bytes=4096", "sf_max_segment_bytes", 4096L);
