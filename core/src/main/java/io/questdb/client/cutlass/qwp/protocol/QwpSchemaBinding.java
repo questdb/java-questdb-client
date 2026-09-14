@@ -337,6 +337,65 @@ public final class QwpSchemaBinding {
         return integerNumericColumn(name, value, "INT", ColumnType.INT, value == Integer.MIN_VALUE);
     }
 
+    public QwpSchemaBinding ipv4Column(CharSequence name, int address) {
+        buffer.requireSchemaBinding(this);
+        int index = targetIndex(name, "IPv4");
+        int targetType = targetType(index, ColumnType.IPv4);
+        QwpTableBuffer.ColumnBuffer column = targetColumn(name, "IPv4", index, targetType);
+        if (column == null) {
+            return this;
+        }
+        if (targetType != ColumnType.IPv4
+                && targetType != ColumnType.STRING
+                && targetType != ColumnType.VARCHAR) {
+            throw unsupported(name, "IPv4", targetType, "conversion is not implemented");
+        }
+        if (address == Numbers.IPv4_NULL) {
+            column.addNull();
+        } else if (targetType == ColumnType.IPv4) {
+            column.addIPv4(address);
+        } else {
+            column.addString(formatIPv4(address));
+        }
+        return this;
+    }
+
+    public QwpSchemaBinding ipv4Column(CharSequence name, CharSequence address) {
+        buffer.requireSchemaBinding(this);
+        if (address == null) {
+            return this;
+        }
+        int index = targetIndex(name, "IPv4");
+        int targetType = targetType(index, ColumnType.IPv4);
+        QwpTableBuffer.ColumnBuffer column = targetColumn(name, "IPv4", index, targetType);
+        if (column == null) {
+            return this;
+        }
+        if (targetType != ColumnType.IPv4
+                && targetType != ColumnType.STRING
+                && targetType != ColumnType.VARCHAR) {
+            throw unsupported(name, "IPv4", targetType, "conversion is not implemented");
+        }
+        if (Chars.equalsIgnoreCase("null", address) || Chars.equals("0.0.0.0", address)) {
+            throw error(INVALID_VALUE, name, "IPv4", targetType,
+                    "NULL sentinel inputs are rejected; pass a null reference or omit the setter");
+        }
+        final int packed;
+        try {
+            packed = Numbers.parseIPv4(address);
+        } catch (NumericException e) {
+            throw error(INVALID_VALUE, name, "IPv4", targetType, "invalid IPv4 address");
+        }
+        if (packed == Numbers.IPv4_NULL) {
+            column.addNull();
+        } else if (targetType == ColumnType.IPv4) {
+            column.addIPv4(packed);
+        } else {
+            column.addString(formatIPv4(packed));
+        }
+        return this;
+    }
+
     public QwpSchemaBinding longColumn(CharSequence name, long value) {
         buffer.requireSchemaBinding(this);
         int index = targetIndex(name, "LONG");
@@ -859,6 +918,8 @@ public final class QwpSchemaBinding {
                 return QwpConstants.TYPE_UUID;
             case ColumnType.LONG256:
                 return QwpConstants.TYPE_LONG256;
+            case ColumnType.IPv4:
+                return QwpConstants.TYPE_IPv4;
             case ColumnType.BINARY:
                 return QwpConstants.TYPE_BINARY;
             case ColumnType.TIMESTAMP_MICRO:
@@ -1045,6 +1106,23 @@ public final class QwpSchemaBinding {
             sink.clear();
         }
         Numbers.append(sink, value, false);
+        return sink;
+    }
+
+    private CharSequence formatIPv4(int value) {
+        StringSink sink = numericTextSink;
+        if (sink == null) {
+            numericTextSink = sink = new StringSink(15);
+        } else {
+            sink.clear();
+        }
+        Numbers.append(sink, (value >>> 24) & 0xff);
+        sink.put('.');
+        Numbers.append(sink, (value >>> 16) & 0xff);
+        sink.put('.');
+        Numbers.append(sink, (value >>> 8) & 0xff);
+        sink.put('.');
+        Numbers.append(sink, value & 0xff);
         return sink;
     }
 

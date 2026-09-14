@@ -844,6 +844,72 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test
+    public void testIpv4TargetsUsePinnedTargetWireAndRollback() throws Exception {
+        assertMemoryLeak(() -> {
+            int[] targets = {ColumnType.IPv4, ColumnType.STRING, ColumnType.VARCHAR};
+            for (int target : targets) {
+                LongTextSchemaHandler handler = new LongTextSchemaHandler(211 + target, 221, target);
+                try (TestWebSocketServer server = schemaServer(handler);
+                     Sender sender = sender(server)) {
+                    sender.table("events")
+                            .ipv4Column("value", 0)
+                            .ipv4Column("value", "not-an-ip")
+                            .atNow();
+
+                    sender.table("events").ipv4Column("value", 0x05060708);
+                    try {
+                        sender.ipv4Column("failed_b", 0x090a0b0c);
+                        Assert.fail("expected IPv4 to UUID rejection");
+                    } catch (LineSenderSchemaException e) {
+                        Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
+                    }
+
+                    sender.uuidColumn("failed_b", 1, 2);
+                    try {
+                        sender.ipv4Column("value", "not-an-ip");
+                        Assert.fail("expected invalid IPv4 text");
+                    } catch (LineSenderSchemaException e) {
+                        Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
+                    }
+
+                    sender.ipv4Column("value", ".....255.1.2.3......").atNow();
+                    sender.flush();
+
+                    new FrameReader(handler.awaitDataFrame()).ipv4Table(
+                            "events", 211 + target, 221, target, 0xff010203);
+                    Assert.assertEquals(3, handler.describeRequests.get());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testIpv4GenerationRemainsNativeBeforeVarcharRebind() throws Exception {
+        assertMemoryLeak(() -> {
+            LongTextSchemaHandler handler = new LongTextSchemaHandler(231, 241, ColumnType.IPv4);
+            try (TestWebSocketServer server = schemaServer(handler);
+                 Sender sender = sender(server)) {
+                sender.table("events").ipv4Column("value", 0x01020304).atNow();
+
+                handler.targetType = ColumnType.VARCHAR;
+                handler.version = 242;
+                sender.table("events");
+                try {
+                    sender.ipv4Column("value", "not-an-ip");
+                    Assert.fail("expected target-changing schema refresh");
+                } catch (LineSenderSchemaException e) {
+                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                }
+                sender.ipv4Column("value", 0x05060708).atNow();
+                sender.flush();
+
+                new FrameReader(handler.awaitDataFrame()).twoIpv4AndVarcharBlocks("events", 231, 241, 242);
+                Assert.assertEquals(2, handler.describeRequests.get());
+            }
+        });
+    }
+
+    @Test
     public void testLongToTextTargetsUsePinnedTargetWireAndRollback() throws Exception {
         assertMemoryLeak(() -> {
             int[] targets = {ColumnType.STRING, ColumnType.VARCHAR, ColumnType.SYMBOL};
@@ -1127,6 +1193,24 @@ public class QwpSchemaSenderIntegrationTest {
                 Assert.assertEquals(0, frame[QwpConstants.HEADER_OFFSET_FLAGS] & QwpConstants.FLAG_SCHEMA);
                 FrameReader reader = new FrameReader(frame);
                 reader.legacyVarcharTable("events", "value", "legacy");
+                Assert.assertEquals(0, handler.describeRequests.get());
+            }
+        });
+    }
+
+    @Test
+    public void testOldPeerUsesLegacyIpv4WireAndNeverDescribes() throws Exception {
+        assertMemoryLeak(() -> {
+            SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 1, 1);
+            try (TestWebSocketServer server = legacyServer(handler);
+                 Sender sender = sender(server)) {
+                sender.table("events").ipv4Column("value", 0xc0a80101).atNow();
+                sender.table("events").ipv4Column("value", "10.20.30.40").atNow();
+                sender.flush();
+                byte[] frame = handler.awaitDataFrame();
+                Assert.assertEquals(0, frame[QwpConstants.HEADER_OFFSET_FLAGS] & QwpConstants.FLAG_SCHEMA);
+                new FrameReader(frame).legacyIpv4Table(
+                        "events", "value", 0xc0a80101, 0x0a141e28);
                 Assert.assertEquals(0, handler.describeRequests.get());
             }
         });
@@ -1674,6 +1758,26 @@ public class QwpSchemaSenderIntegrationTest {
             eof();
         }
 
+        private void legacyIpv4Table(String table, String column, int... values) {
+            Assert.assertEquals(QwpConstants.MAGIC_MESSAGE, in.getInt());
+            Assert.assertEquals(QwpConstants.VERSION, u8());
+            Assert.assertEquals(0, u8() & QwpConstants.FLAG_SCHEMA);
+            Assert.assertEquals(1, in.getShort() & 0xffff);
+            Assert.assertEquals(in.remaining() - Integer.BYTES, in.getInt());
+            Assert.assertEquals(0, varint());
+            Assert.assertEquals(0, varint());
+            Assert.assertEquals(table, string());
+            Assert.assertEquals(values.length, varint());
+            Assert.assertEquals(1, varint());
+            Assert.assertEquals(column, string());
+            Assert.assertEquals(QwpConstants.TYPE_IPv4, u8());
+            Assert.assertEquals(0, u8());
+            for (int value : values) {
+                Assert.assertEquals(value, in.getInt());
+            }
+            eof();
+        }
+
         private void longTextTable(
                 String table,
                 int tableId,
@@ -1706,6 +1810,26 @@ public class QwpSchemaSenderIntegrationTest {
                 byte[] actual = new byte[expected.length];
                 in.get(actual);
                 Assert.assertArrayEquals(expected, actual);
+            }
+            eof();
+        }
+
+        private void ipv4Table(String table, int tableId, long version, int targetType, int expectedValue) {
+            messageHeader(1);
+            Assert.assertEquals(0, varint());
+            Assert.assertEquals(0, varint());
+            byte wireType = targetType == ColumnType.IPv4
+                    ? QwpConstants.TYPE_IPv4
+                    : QwpConstants.TYPE_VARCHAR;
+            schemaBlockHeader(table, tableId, version, 2, "value", wireType);
+            Assert.assertEquals(1, u8());
+            Assert.assertEquals(1, u8());
+            if (wireType == QwpConstants.TYPE_IPv4) {
+                Assert.assertEquals(expectedValue, in.getInt());
+            } else {
+                Assert.assertEquals(0, in.getInt());
+                Assert.assertEquals(9, in.getInt());
+                Assert.assertEquals("255.1.2.3", stringBytes(9));
             }
             eof();
         }
@@ -2176,6 +2300,23 @@ public class QwpSchemaSenderIntegrationTest {
             Assert.assertEquals(0, in.getInt());
             Assert.assertEquals(36, in.getInt());
             Assert.assertEquals("31323334-3536-3738-2122-232425262728", stringBytes(36));
+            eof();
+        }
+
+        private void twoIpv4AndVarcharBlocks(String table, int tableId, long firstVersion, long secondVersion) {
+            messageHeader(2);
+            Assert.assertEquals(0, varint());
+            Assert.assertEquals(0, varint());
+
+            schemaBlockHeader(table, tableId, firstVersion, 1, "value", QwpConstants.TYPE_IPv4);
+            Assert.assertEquals(0, u8());
+            Assert.assertEquals(0x01020304, in.getInt());
+
+            schemaBlockHeader(table, tableId, secondVersion, 1, "value", QwpConstants.TYPE_VARCHAR);
+            Assert.assertEquals(0, u8());
+            Assert.assertEquals(0, in.getInt());
+            Assert.assertEquals(7, in.getInt());
+            Assert.assertEquals("5.6.7.8", stringBytes(7));
             eof();
         }
 

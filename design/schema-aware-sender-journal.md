@@ -7183,3 +7183,58 @@ type and a special-null path that prematurely locked scale zero. Final review
 found no implementation blocker, confirmed no apparent per-row heap allocation,
 and corrected the affected-test count from an earlier unsubstantiated 218 to
 the preserved 114-test reports.
+
+## D058 — IPv4 uses target-native wire data
+
+Status: iteration 2.39a implemented and locally validated, 2026-09-14. Design
+revision 60. The parent-repository test and submodule update land separately.
+
+Both public `ipv4Column` overloads now participate in schema mode. IPv4 targets
+retain the four-byte packed value. STRING and VARCHAR targets receive canonical
+dotted-quad text through the binding's existing reusable numeric sink. The
+implementation adds no converter registry, address object, parser fork or
+per-row string allocation. Legacy mode keeps its existing native IPv4 wire path.
+
+Packed zero is the public IPv4 null sentinel and becomes an explicit bitmap
+NULL for every target. A Java null text reference remains a no-op. The
+case-insensitive `"null"` literal and exact `"0.0.0.0"` remain rejected, while
+legacy dotted aliases such as `".0.0.0.0."` remain accepted and normalize to
+NULL. Target selection and duplicate suppression precede parsing, so an invalid
+duplicate stays ignored and an unsupported known target wins over malformed
+text. Sender-level schema errors use the established partial-row rollback and
+single-refresh lifecycle.
+
+The implementation review found one pre-existing parser boundary: an address
+made only of dots read past the input and leaked `StringIndexOutOfBoundsException`
+instead of the public invalid-value error. One bounds check now converts that
+case to `NumericException`; `"."` and `"...."` are fixed shared-corpus cases.
+The permissive leading/trailing-dot grammar is otherwise unchanged.
+
+The 16-row corpus covers packed boundaries, canonical and normalized text,
+zero/null behavior and malformed input against IPv4, STRING and VARCHAR
+targets. Component tests assert exact wire bytes and bitmaps, inference,
+omission, duplicate ordering, unsupported/parameterized/designated targets and
+rollback. Public scripted-socket tests assert the same target wire plus a schema
+change from IPv4 to VARCHAR while the already-buffered block remains native
+IPv4. A separate old-peer test proves the integer and text overloads still emit
+one unflagged native IPv4 frame without a DESCRIBE. The real-server test sends
+all three targets in one batch, verifies exact stored values, local invalid-row
+recovery and missing-table inference. A compact store-and-forward test inspects
+the persisted frame before replay and verifies the same rows after replay.
+
+On JDK 25, 238 focused client tests pass with zero failures, errors or skips:
+the schema binding, Sender integration, legacy Sender, QWP constants and numeric
+parser suites.
+Five focused server tests pass against the installed client snapshot: the three
+new IPv4 tests plus existing auto-create and schema-aware text-target tests. All
+validation used `/mnt/pcie5/schema-aware-ipv4-20260914`. An earlier run inherited
+the full shared `/tmp`; logs showed all three WAL writers accepted eight rows,
+then STRING and VARCHAR WAL apply suspended on `errno=28`. That run is discarded
+as environmental evidence. Setting the forked JVM's `java.io.tmpdir` moved the
+JUnit database roots to the project scratch filesystem and the same single-flush
+test passed.
+
+The final SOL review found no production correctness, compatibility, allocation
+or complexity blocker. It corrected one design sentence that named the server's
+IPv4 formatter as though it existed in the client, and requested the explicit
+old-peer setter test above. Re-review found both corrections complete.

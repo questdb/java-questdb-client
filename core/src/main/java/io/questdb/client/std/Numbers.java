@@ -406,7 +406,10 @@ public final class Numbers {
             if (sign == '.') {
                 do {
                     lo++;
-                } while (sequence.charAt(lo) == '.');
+                } while (lo < lim && sequence.charAt(lo) == '.');
+                if (lo == lim) {
+                    throw NumericException.instance().put("IPv4 address must have 4 octets, found: 1");
+                }
             } else {
                 throw NumericException.instance().put("invalid IPv4 address: ").put(sequence);
             }

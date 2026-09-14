@@ -2494,13 +2494,16 @@ public class QwpWebSocketSender implements Sender {
         try {
             QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
-                binding.unsupportedColumn(columnName, "IPv4");
+                binding.ipv4Column(columnName, address);
                 return this;
             }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_IPv4, true);
             if (col != null) {
                 col.addIPv4(address);
             }
+        } catch (LineSenderSchemaException e) {
+            rollbackRow();
+            throw refreshAfterSchemaRejection(e, columnName);
         } catch (RuntimeException | Error e) {
             rollbackRow();
             throw e;
@@ -2545,9 +2548,12 @@ public class QwpWebSocketSender implements Sender {
         try {
             QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
-                binding.unsupportedColumn(columnName, "IPv4");
+                binding.ipv4Column(columnName, address);
                 return this;
             }
+        } catch (LineSenderSchemaException e) {
+            rollbackRow();
+            throw refreshAfterSchemaRejection(e, columnName);
         } catch (RuntimeException | Error e) {
             rollbackRow();
             throw e;

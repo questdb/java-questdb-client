@@ -653,10 +653,18 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     /**
      * Add an IPv4 column value from a dotted-quad string (e.g. "192.168.1.1").
      *
+     * A null reference skips the column for the current row. The literal
+     * {@code "null"} (case-insensitive) and the exact address
+     * {@code "0.0.0.0"} are rejected; omit the setter or pass a null reference
+     * to write a missing value.
+     * Legacy dotted aliases such as {@code ".0.0.0.0."} are accepted and
+     * normalized to the IPv4 NULL value.
+     *
      * @param name    name of the column
-     * @param address dotted-quad IPv4 address; must not be null
+     * @param address dotted-quad IPv4 address, or null to skip the column
      * @return this instance for method chaining
-     * @throws LineSenderException if the address fails to parse, or the
+     * @throws LineSenderException if the address fails to parse, represents a
+     *                             rejected NULL sentinel, or the
      *                             configured protocol version does not support IPv4
      */
     default Sender ipv4Column(CharSequence name, CharSequence address) {

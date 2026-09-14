@@ -537,6 +537,16 @@ public class NumbersTest {
     }
 
     @Test(expected = NumericException.class)
+    public void testParseIPv4OnlyDots() {
+        Numbers.parseIPv4("....");
+    }
+
+    @Test(expected = NumericException.class)
+    public void testParseIPv4SingleDot() {
+        Numbers.parseIPv4(".");
+    }
+
+    @Test(expected = NumericException.class)
     public void testParseIPv4MiddleDots() {
         Numbers.parseIPv4("1..2..3..4");
     }

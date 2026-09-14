@@ -1133,6 +1133,151 @@ public class QwpSchemaBindingTest {
         });
     }
 
+    @Test
+    public void testIpv4ConformanceCorpusUsesExactTargetWire() throws Exception {
+        InputStream stream = QwpSchemaBindingTest.class.getResourceAsStream(
+                "/io/questdb/client/cutlass/qwp/ipv4-conversions.tsv");
+        Assert.assertNotNull(stream);
+        int count = 0;
+        try (BufferedReader lines = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))) {
+            Assert.assertEquals("# case_id\tinput_kind\tinput\toutcome\texpected_hex\texpected_text", lines.readLine());
+            String line;
+            while ((line = lines.readLine()) != null) {
+                String[] fields = line.split("\t", -1);
+                Assert.assertEquals(line, 6, fields.length);
+                for (int targetType : new int[]{ColumnType.IPv4, ColumnType.STRING, ColumnType.VARCHAR}) {
+                    try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                         QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                        QwpSchemaBinding rows = rows(buffer, column("ip", targetType));
+                        Runnable append = "INT".equals(fields[1])
+                                ? () -> rows.ipv4Column("ip", Integer.parseInt(fields[2]))
+                                : () -> rows.ipv4Column("ip", fields[2]);
+                        if ("INVALID".equals(fields[3])) {
+                            assertReason(LineSenderSchemaException.Reason.INVALID_VALUE, append);
+                            continue;
+                        }
+                        append.run();
+                        buffer.nextRow();
+                        byte wireType = targetType == ColumnType.IPv4
+                                ? QwpConstants.TYPE_IPv4
+                                : QwpConstants.TYPE_VARCHAR;
+                        Reader reader = tableReader(encoder, encoder.encodeSchema(buffer), 1, wireType);
+                        if ("NULL".equals(fields[3])) {
+                            Assert.assertEquals(1, reader.byteValue());
+                            Assert.assertEquals(1, reader.byteValue());
+                            if (wireType == QwpConstants.TYPE_VARCHAR) {
+                                Assert.assertEquals(0, reader.intValue());
+                            }
+                        } else {
+                            Assert.assertEquals("VALUE", fields[3]);
+                            Assert.assertEquals(0, reader.byteValue());
+                            if (wireType == QwpConstants.TYPE_IPv4) {
+                                Assert.assertEquals((int) Long.parseUnsignedLong(fields[4], 16), reader.intValue());
+                            } else {
+                                byte[] expected = fields[5].getBytes(StandardCharsets.UTF_8);
+                                Assert.assertEquals(0, reader.intValue());
+                                Assert.assertEquals(expected.length, reader.intValue());
+                                Assert.assertEquals(fields[5], reader.ascii(expected.length));
+                            }
+                        }
+                        Assert.assertEquals(encoder.getBuffer().getPosition(), reader.position());
+                    } catch (AssertionError e) {
+                        throw new AssertionError("case_id=" + fields[0] + ", target="
+                                + ColumnType.nameOf(targetType) + ": " + e.getMessage(), e);
+                    }
+                }
+                count++;
+            }
+        }
+        Assert.assertEquals(16, count);
+    }
+
+    @Test
+    public void testIpv4DuplicateRollbackNullOmissionAndInference() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                QwpSchemaBinding rows = rows(buffer,
+                        column("ip", ColumnType.IPv4), column("bad", ColumnType.LONG));
+                rows.ipv4Column("ip", 0x01020304).ipv4Column("ip", "not-an-ip");
+                buffer.nextRow();
+
+                rows.ipv4Column("ip", 0x05060708);
+                assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+                        () -> rows.ipv4Column("bad", 0x090a0b0c));
+                rollbackCurrentRow(buffer);
+
+                rows.ipv4Column("ip", 0);
+                buffer.nextRow();
+                buffer.nextRow();
+                rows.ipv4Column("ip", ".0.0.0.0.");
+                buffer.nextRow();
+                rows.ipv4Column("ip", 0x0d0e0f10);
+                buffer.nextRow();
+
+                int size = encoder.encodeSchema(buffer);
+                Reader reader = tableReader(encoder, size, 5, QwpConstants.TYPE_IPv4);
+                Assert.assertEquals(1, reader.byteValue());
+                Assert.assertEquals(0x0e, reader.byteValue());
+                Assert.assertEquals(0x01020304, reader.intValue());
+                Assert.assertEquals(0x0d0e0f10, reader.intValue());
+                Assert.assertEquals(size, reader.position());
+            }
+
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                QwpSchemaBinding rows = new QwpSchemaBinding(buffer, result(QwpSchemaProtocol.RESULT_MISSING));
+                rows.ipv4Column("ignored", (CharSequence) null)
+                        .ipv4Column("ip", "192.168.1.1");
+                buffer.nextRow();
+                Assert.assertEquals(1, buffer.getColumnDefs().length);
+                Assert.assertEquals(QwpConstants.TYPE_IPv4, buffer.getColumnDefs()[0].getTypeCode());
+                Reader reader = tableReader(encoder, encoder.encodeSchema(buffer), -1, -1, 1,
+                        QwpConstants.TYPE_IPv4);
+                Assert.assertEquals(0, reader.byteValue());
+                Assert.assertEquals(0xc0a80101, reader.intValue());
+                Assert.assertEquals(encoder.getBuffer().getPosition(), reader.position());
+            }
+
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                QwpSchemaBinding rows = new QwpSchemaBinding(buffer, result(QwpSchemaProtocol.RESULT_MISSING));
+                rows.ipv4Column("ip", 0);
+                buffer.nextRow();
+                Assert.assertEquals(1, buffer.getColumnDefs().length);
+                Assert.assertEquals(QwpConstants.TYPE_IPv4, buffer.getColumnDefs()[0].getTypeCode());
+                Reader reader = tableReader(encoder, encoder.encodeSchema(buffer), -1, -1, 1,
+                        QwpConstants.TYPE_IPv4);
+                Assert.assertEquals(1, reader.byteValue());
+                Assert.assertEquals(1, reader.byteValue());
+                Assert.assertEquals(encoder.getBuffer().getPosition(), reader.position());
+            }
+        });
+    }
+
+    @Test
+    public void testIpv4RejectsUnsupportedParameterizedAndDesignatedTargets() {
+        try (QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+            QwpSchemaBinding rows = rows(buffer,
+                    column("long_value", ColumnType.LONG),
+                    column("parameterized", ColumnType.IPv4, new byte[]{1}));
+            assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+                    () -> rows.ipv4Column("long_value", 1));
+            rollbackCurrentRow(buffer);
+            assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+                    () -> rows.ipv4Column("long_value", "not-an-ip"));
+            rollbackCurrentRow(buffer);
+            assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+                    () -> rows.ipv4Column("parameterized", "1.2.3.4"));
+        }
+        try (QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+            QwpSchemaBinding rows = new QwpSchemaBinding(buffer,
+                    known(0, column("ts", ColumnType.TIMESTAMP_MICRO)));
+            assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+                    () -> rows.ipv4Column("ts", 1));
+        }
+    }
+
     private static void assertCtorReason(int result, LineSenderSchemaException.Reason reason, String message) {
         try (QwpTableBuffer buffer = new QwpTableBuffer("t");
              QwpWebSocketEncoder encoder = new QwpWebSocketEncoder()) {

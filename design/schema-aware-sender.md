@@ -1,11 +1,12 @@
 # Schema-aware sender: schema-directed encoding
 
-Status: implemented on the development branch, revision 59. Scope: QWP v1 over
+Status: implemented on the development branch, revision 60. Scope: QWP v1 over
 WebSocket, with an automatically negotiated schema extension, legacy-server
 compatibility and companion server changes. The committed baseline contains the
-protocol, Sender integration and conversions through iteration 2.37; iteration
-2.38 is locally validated. A released-binary compatibility gate is implemented
-and locally green. The remaining public-setter conversion contract is not complete.
+protocol, Sender integration and conversions through iteration 2.38. Iteration
+2.39a (IPv4 identity and text targets) is locally validated. A released-binary
+compatibility gate is implemented and locally green. The remaining public-setter
+conversion contract is not complete.
 
 ## Goal and contract
 
@@ -38,13 +39,10 @@ server-side failures can still reject a batch.
 
 ## Implementation status
 
-Current checkpoint: iteration 2.38 adds schema-aware
-`decimalColumn(CharSequence)` input for all decimal widths and STRING/VARCHAR
-targets. It parses once into the Sender's existing Decimal256 scratch value and
-reuses the established decimal append and text-formatting paths. The committed
-baseline remains client `1310b0dd` and server `8ad0b92baf`; iteration 2.38 is an
-uncommitted, locally validated increment. The wider conversion inventory below
-is not complete; this is not release acceptance.
+Current checkpoint: iteration 2.39a adds both `ipv4Column` overloads for IPv4,
+STRING and VARCHAR targets. Its pre-iteration baseline is client `edf6f346` and
+server `fea4d4a6c0`; the IPv4 slice is the current locally validated increment.
+The wider conversion inventory below is not complete; this is not release acceptance.
 
 The standing compatibility gate now runs three real process combinations:
 current client against QuestDB 10.0.1, client 1.3.9 against the current server,
@@ -115,6 +113,15 @@ infers DECIMAL256 at the first finite value's natural scale; a null-only block
 uses wire scale zero without locking later batches to that scale. The Sender
 uses its existing rollback and one-refresh lifecycle, with no new retained
 converter state or per-value allocation.
+
+Both IPv4 overloads now use the server schema in schema mode. An IPv4 target
+keeps the four-byte value; STRING and VARCHAR receive canonical dotted-quad
+text through the existing reusable numeric sink. Packed zero is written as a
+bitmap NULL for every target. A Java null text reference remains a no-op. Exact
+`"null"` (case-insensitive) and `"0.0.0.0"` strings remain rejected, while
+legacy dotted aliases such as `".0.0.0.0."` remain accepted and normalize to
+NULL. Malformed input fails locally with `INVALID_VALUE`, including strings
+made only of dots.
 
 Iteration 2.15 is accepted as a bounded, unreleased Sender integration.
 Public setters select the negotiated mode, use server-directed conversions,
@@ -933,7 +940,7 @@ non-null conversion. Known compatibility exceptions above still apply.
 | `timestampColumn(Instant)` (currently TIMESTAMP micros in legacy Sender) | Timestamps, preserving nanos for the schema-mode nano target; text | None |
 | `uuidColumn` (UUID) | UUID, text | None |
 | `charColumn` (CHAR) | CHAR | Text; non-ASCII text output needs the decision below |
-| `ipv4Column(int)` and `ipv4Column(CharSequence)` (IPv4; text parsed locally) | None | IPv4, text |
+| `ipv4Column(int)` and `ipv4Column(CharSequence)` (IPv4; text parsed locally) | IPv4, text | None |
 | `long256Column` (LONG256) | None | LONG256, text |
 | `binaryColumn` (byte array, `DirectByteSlice`, native pointer/length; BINARY) | BINARY | Parser-reachable targets remain deferred; see boundaries below |
 | `decimalColumn(Decimal64/128/256)` (DECIMAL64/128/256) | All decimals from each source width, text | None |
@@ -948,8 +955,8 @@ binding entrypoint today; record this wire-only coverage without adding a new
 public API just to mirror the protocol. DATE **targets** from existing integer
 and string setters are real missing work in the table.
 
-The binding also lacks target representation selection for DATE,
-IPv4 and arrays. It rejects extension parameters.
+The binding also lacks target representation selection for DATE and arrays. It
+rejects extension parameters.
 Adding a parser alone therefore does not complete these pairs: select the
 target wire representation and pin its parameters before append. Preserve the
 existing non-owning binding and buffer ownership.
@@ -986,9 +993,11 @@ new casts or copy the unresolved behaviours below.
   separately. D044 separately approves checked normalization into legacy
   source precision for text targets, without changing legacy mode.
 - **Other text output:** UUID uses `Numbers.appendUuid`, LONG256 uses
-  `Numbers.appendLong256`, IPv4 uses `Numbers.intToIPv4Sink`, DATE uses
-  `DateFormatUtils.appendDateTime`, and decimal output preserves source scale.
-  CHAR uses the server's `putAscii` path; see the non-ASCII limitation below.
+  `Numbers.appendLong256`, DATE uses `DateFormatUtils.appendDateTime`, and
+  decimal output preserves source scale. The server formats IPv4 through
+  `Numbers.intToIPv4Sink`; iteration 2.39a uses the client's private reusable
+  `formatIPv4` sink. CHAR uses the server's `putAscii` path; see the non-ASCII
+  limitation below.
 - **Decimals:** all three decimal wire widths reach every decimal target.
   Decimal input rescaling must be exact: discarded nonzero digits cause
   precision loss; scale-up/precision/storage overflow fails. Integer input is
@@ -1024,6 +1033,13 @@ new casts or copy the unresolved behaviours below.
   later scales. This is intentional: once the target is known to be text,
   preserving an irrelevant intermediate native-decimal layout would add state
   and make valid per-value conversion depend on neighboring rows.
+- **IPv4:** the packed zero sentinel becomes a bitmap NULL for IPv4 and text
+  targets, so its result cannot depend on whether another row creates a bitmap.
+  Text is parsed locally after target selection and duplicate suppression.
+  Preserve the legacy dotted grammar: case-insensitive `"null"` and exact
+  `"0.0.0.0"` are rejected, but dotted aliases that parse to zero normalize to
+  NULL. Both STRING and VARCHAR receive target-native VARCHAR wire data; no
+  server-side second conversion is required.
 - **Geohashes:** wire precision must equal target bits; no native GEOHASH narrowing is
   accepted. `stringColumn` uses `GeoHashes.fromStringTruncatingNl`: empty means
   null, parse at most the first 12 base32 characters, require enough bits and
@@ -1600,6 +1616,10 @@ They do not change the compatibility contract.
     mean an effective target NULL while typed decimal null sentinels are no-ops.
     Normalize an unset null-only scale at the encoding boundary; do not add a
     second scale state, parser or converter registry.
+19. **Keep IPv4 as one primitive path.** Reuse the native four-byte column for
+    IPv4 targets and the existing reusable numeric sink for canonical text.
+    Normalize zero to the target bitmap before append. Do not add an address
+    object, parser fork, converter registry or per-row string allocation.
 
 These opportunities do not justify a per-setter opt-out, raw-value fallback or
 send-time transformation. Partial activation is permitted on the unreleased
@@ -1615,7 +1635,7 @@ implementation and its tests together. Do not wait for negotiation,
 compatibility and all converters to be implemented before exercising the
 complete client-to-server path. Reuse the existing test infrastructure.
 
-### Plan after iteration 2.38
+### Plan after iteration 2.39a
 
 The permanent compatibility gate is implemented. It launches released and
 current artifacts as separate processes and checks these observable contracts:
@@ -1645,13 +1665,14 @@ code.
 
 The next implementation slice is:
 
-1. **Iteration group 2.39 — fixed-width identity and text targets.** Land three
-   independently reviewable slices: IPv4 to IPv4/STRING/VARCHAR, LONG256 to
+1. **Iteration group 2.39 — fixed-width identity and text targets.** IPv4 to
+   IPv4/STRING/VARCHAR is implemented in 2.39a. Next, land LONG256 to
    LONG256/STRING/VARCHAR, then GEOHASH to the exact same-precision
-   GEOHASH/STRING/VARCHAR. Each slice gets its own public-Sender real-server E2E,
-   exact target wire checks, null/omission decisions, rollback, refresh and SF
-   replay. Preserve geohash bit precision and the existing public overload
-   semantics; do not use this group to approve unrelated parser paths.
+   GEOHASH/STRING/VARCHAR as separate reviewable slices. Each slice gets its own
+   public-Sender real-server E2E, exact target wire checks, null/omission
+   decisions, rollback, refresh and SF replay. Preserve geohash bit precision
+   and the existing public overload semantics; do not use this group to approve
+   unrelated parser paths.
 
 After these slices, reassess the remaining inventory in this order: integer to
 DATE/timestamps; integer to text/SYMBOL/decimals and INT-to-IPv4;
