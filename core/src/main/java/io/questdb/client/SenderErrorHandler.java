@@ -36,8 +36,11 @@ import org.jetbrains.annotations.NotNull;
  * I/O thread or the producer thread. One exception: a slot quarantine
  * ({@link SenderError.Category#DATA_LOSS}) is dispatched synchronously on the
  * calling thread — at {@code build()} time because the async dispatcher does
- * not exist yet, and during a symbol-dictionary recycle rebuild (inside
- * {@code table(...)}, on the producer thread) because a data-loss notice must
+ * not exist yet, and during a symbol-dictionary recycle rebuild (on the
+ * producer thread: inside the {@code table(...)} call that triggered the
+ * recycle or, when an earlier attempt failed transiently, inside the
+ * {@code table(...)}, {@code at(...)}, {@code atNow()}, {@code flush()} or
+ * {@code drain(...)} call that resumes it) because a data-loss notice must
  * not be dropped under inbox pressure. Handlers must not block or call back
  * into the sender: in both cases the caller is waiting.
  * Slow handlers cannot stall publishing; if the bounded

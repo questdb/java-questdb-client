@@ -453,6 +453,227 @@ public class SymbolDictRecycleDeferredCloseTest {
         });
     }
 
+    /**
+     * The deferred-close park shares {@code maybeBlockForStarvedReset()}'s
+     * interrupt policy. An interrupt flag set as the park begins must not
+     * leak past the completed exit: the swap's remaining steps (rebuild,
+     * reconnect) run on this same producer thread, and a restored flag would
+     * turn a recycle that just rode out the stall into a transient abandon.
+     * The park clears the flag per iteration (so it cannot busy-spin either)
+     * and swallows it once the close completes.
+     */
+    @Test(timeout = 60_000L)
+    public void testInterruptAtParkEntryIsSwallowedWhenCloseCompletes() throws Exception {
+        assertMemoryLeak(() -> {
+            String sfDir = temporaryFolder.getRoot().toPath().resolve("recycle-deferred-interrupt-swallow").toString();
+            try (TestWebSocketServer server = ackingServer()) {
+                String cfg = "ws::addr=localhost:" + server.getPort() + ";sf_dir=" + sfDir + ";";
+                CountDownLatch workerBlocked = new CountDownLatch(1);
+                CountDownLatch releaseWorker = new CountDownLatch(1);
+                AtomicBoolean wedgeFired = new AtomicBoolean();
+                AtomicReference<Throwable> auxErr = new AtomicReference<>();
+                Thread releaser = null;
+                try (Sender sender = Sender.fromConfig(cfg)) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+
+                    sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
+                    long fsn1 = sender.flushAndGetSequence();
+                    Assert.assertTrue("setup: batch must be acked before the recycle",
+                            sender.awaitAckedFsn(fsn1, 5_000));
+
+                    CursorSendEngine outgoing = ws.getCursorEngineForTesting();
+                    SegmentManager manager = outgoing.getManagerForTesting();
+                    try {
+                        manager.setBeforeTrimSyncHook(() -> {
+                            if (!wedgeFired.compareAndSet(false, true)) {
+                                return;
+                            }
+                            workerBlocked.countDown();
+                            try {
+                                if (!releaseWorker.await(30, TimeUnit.SECONDS)) {
+                                    auxErr.compareAndSet(null, new AssertionError(
+                                            "timed out waiting for the test to release the worker"));
+                                }
+                            } catch (Throwable t) {
+                                auxErr.compareAndSet(null, t);
+                            }
+                        });
+                        manager.wakeWorker();
+                        Assert.assertTrue("worker never reached the wedge hook",
+                                workerBlocked.await(5, TimeUnit.SECONDS));
+                        manager.setWorkerJoinTimeoutMillis(50L);
+
+                        sender.resetSymbolDictionary();
+                        Assert.assertTrue(ws.isResetArmed());
+
+                        // The witness runs on the producer thread as the park
+                        // begins, before its first parkNanos: the flag it sets is
+                        // exactly the "interrupt carried into the wait" the policy
+                        // exists for.
+                        CountDownLatch parked = new CountDownLatch(1);
+                        ws.setDeferredCloseParkWitnessForTesting(() -> {
+                            Thread.currentThread().interrupt();
+                            parked.countDown();
+                        });
+
+                        // Un-wedges the worker only after the park has iterated a
+                        // while with the flag cleared, so the completed exit is
+                        // reached from a genuinely parked wait.
+                        long releaseDelayMs = 150;
+                        releaser = new Thread(() -> {
+                            try {
+                                Assert.assertTrue("the await must actually park",
+                                        parked.await(10, TimeUnit.SECONDS));
+                                Thread.sleep(releaseDelayMs);
+                            } catch (Throwable t) {
+                                auxErr.compareAndSet(null, t);
+                            } finally {
+                                releaseWorker.countDown();
+                            }
+                        }, "deferred-close-releaser");
+                        releaser.start();
+
+                        boolean leftoverFlag;
+                        try {
+                            sender.table("t").symbol("s", "b").longColumn("v", 2L).atNow();
+                        } finally {
+                            leftoverFlag = Thread.interrupted(); // read AND clear for JUnit's sake
+                        }
+                        Assert.assertFalse("the completed exit must swallow the interrupt -- a restored "
+                                + "flag would poison the swap's remaining steps on this thread", leftoverFlag);
+                        Assert.assertEquals("the recycle must have committed, not abandoned",
+                                1, ws.getSymbolDictEpoch());
+                        Assert.assertFalse("recycle must disarm", ws.isResetArmed());
+                        Assert.assertTrue("the outgoing engine's deferred close must have completed",
+                                outgoing.isCloseCompleted());
+
+                        sender.table("t").symbol("s", "c").longColumn("v", 3L).atNow();
+                        long fsn2 = sender.flushAndGetSequence();
+                        Assert.assertTrue("post-recycle batch must still get acked",
+                                sender.awaitAckedFsn(fsn2, 5_000));
+                    } finally {
+                        manager.setBeforeTrimSyncHook(null);
+                        releaseWorker.countDown();
+                    }
+                } finally {
+                    releaseWorker.countDown();
+                    if (releaser != null) {
+                        releaser.join(10_000L);
+                    }
+                }
+                if (auxErr.get() != null) {
+                    throw new AssertionError("auxiliary thread failed", auxErr.get());
+                }
+            }
+        });
+    }
+
+    /**
+     * The timeout exit of the deferred-close park must RESTORE the interrupt
+     * flag it cleared to keep its budget: the park achieved nothing, so the
+     * caller's interrupt is not its to eat. The throw itself stays the
+     * ordinary transient verdict (pending, not latched), and the cleared flag
+     * must not let the park spin out before its deadline.
+     */
+    @Test(timeout = 60_000L)
+    public void testInterruptAtParkEntryIsRestoredWhenAwaitTimesOut() throws Exception {
+        assertMemoryLeak(() -> {
+            String sfDir = temporaryFolder.getRoot().toPath().resolve("recycle-deferred-interrupt-restore").toString();
+            try (TestWebSocketServer server = ackingServer()) {
+                String cfg = "ws::addr=localhost:" + server.getPort() + ";sf_dir=" + sfDir + ";";
+                CountDownLatch workerBlocked = new CountDownLatch(1);
+                CountDownLatch releaseWorker = new CountDownLatch(1);
+                AtomicBoolean wedgeFired = new AtomicBoolean();
+                AtomicReference<Throwable> auxErr = new AtomicReference<>();
+                try (Sender sender = Sender.fromConfig(cfg)) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+
+                    sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
+                    long fsn1 = sender.flushAndGetSequence();
+                    Assert.assertTrue("setup: batch must be acked before the recycle",
+                            sender.awaitAckedFsn(fsn1, 5_000));
+
+                    CursorSendEngine outgoing = ws.getCursorEngineForTesting();
+                    SegmentManager manager = outgoing.getManagerForTesting();
+                    try {
+                        manager.setBeforeTrimSyncHook(() -> {
+                            if (!wedgeFired.compareAndSet(false, true)) {
+                                return;
+                            }
+                            workerBlocked.countDown();
+                            try {
+                                if (!releaseWorker.await(30, TimeUnit.SECONDS)) {
+                                    auxErr.compareAndSet(null, new AssertionError(
+                                            "timed out waiting for the test to release the worker"));
+                                }
+                            } catch (Throwable t) {
+                                auxErr.compareAndSet(null, t);
+                            }
+                        });
+                        manager.wakeWorker();
+                        Assert.assertTrue("worker never reached the wedge hook",
+                                workerBlocked.await(5, TimeUnit.SECONDS));
+                        manager.setWorkerJoinTimeoutMillis(50L);
+                        long maxWaitMillis = 300L;
+                        ws.setRecycleDeferredCloseMaxWaitMillisForTesting(maxWaitMillis);
+
+                        sender.resetSymbolDictionary();
+                        Assert.assertTrue(ws.isResetArmed());
+
+                        CountDownLatch parked = new CountDownLatch(1);
+                        ws.setDeferredCloseParkWitnessForTesting(() -> {
+                            Thread.currentThread().interrupt();
+                            parked.countDown();
+                        });
+
+                        boolean flagAfter;
+                        long elapsedMs;
+                        long t0 = System.nanoTime();
+                        try {
+                            sender.table("t").symbol("s", "b").longColumn("v", 2L).atNow();
+                            Assert.fail("expected the exhausted deferred-close await to throw "
+                                    + "while the worker stays wedged");
+                        } catch (LineSenderException e) {
+                            TestUtils.assertContains(e.getMessage(),
+                                    "deferred close did not release the slot lock");
+                        } finally {
+                            elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
+                            flagAfter = Thread.interrupted(); // read AND clear for JUnit's sake
+                        }
+                        Assert.assertEquals("the await must actually have parked", 0L, parked.getCount());
+                        Assert.assertTrue("timeout exit must restore the interrupt flag", flagAfter);
+                        Assert.assertTrue("must wait out the deadline, not spin out early: got "
+                                + elapsedMs + "ms", elapsedMs >= maxWaitMillis - 50);
+                        Assert.assertEquals("the swap must not have committed",
+                                0, ws.getSymbolDictEpoch());
+
+                        // Not a latch: once the worker exits, the next send resumes
+                        // the pending recycle and commits it.
+                        releaseWorker.countDown();
+                        long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+                        while (!outgoing.isCloseCompleted() && System.nanoTime() < deadlineNanos) {
+                            Thread.sleep(10L);
+                        }
+                        Assert.assertTrue("deferred cleanup did not complete after the release",
+                                outgoing.isCloseCompleted());
+                        sender.table("t").symbol("s", "c").longColumn("v", 3L).atNow();
+                        Assert.assertEquals("the pending recycle must complete once the wedge "
+                                + "clears", 1, ws.getSymbolDictEpoch());
+                        long fsn2 = sender.flushAndGetSequence();
+                        Assert.assertTrue("post-resume batch must still get acked",
+                                sender.awaitAckedFsn(fsn2, 5_000));
+                    } finally {
+                        manager.setBeforeTrimSyncHook(null);
+                        releaseWorker.countDown();
+                    }
+                }
+                if (auxErr.get() != null) {
+                    throw new AssertionError("auxiliary thread failed", auxErr.get());
+                }
+            }
+        });
+    }
+
     private static TestWebSocketServer ackingServer() throws Exception {
         TestWebSocketServer server = new TestWebSocketServer(new AckAllHandler());
         server.start();

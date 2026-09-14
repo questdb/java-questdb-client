@@ -703,7 +703,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * the backlog still does not drain, the request stays pending and may be
      * deferred indefinitely under sustained saturation. {@code table(...)}
      * is the only trigger point: a caller that never starts another row
-     * never recycles. No-op on transports without a symbol dictionary.
+     * never starts a recycle. A recycle that a {@code table(...)} call has
+     * already started but could not finish (a transient failure mid-swap) is
+     * resumed and completed by the next {@code table(...)}, {@code at(...)},
+     * {@code atNow()}, {@code flush()} or {@code drain(...)} call, on the
+     * producer thread. No-op on transports without a symbol dictionary.
      * <p>
      * The request bypasses the anti-thrash re-arm floor for that one swap and
      * does not lower it: the floor only ever rises, so a scheduled manual
