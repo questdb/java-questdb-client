@@ -1272,13 +1272,16 @@ public class QwpWebSocketSender implements Sender {
         try {
             QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
-                binding.unsupportedColumn(columnName, "BYTE");
+                binding.byteColumn(columnName, value);
                 return this;
             }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_BYTE, false);
             if (col != null) {
                 col.addByte(value);
             }
+        } catch (LineSenderSchemaException e) {
+            rollbackRow();
+            throw refreshAfterSchemaRejection(e, columnName);
         } catch (RuntimeException | Error e) {
             rollbackRow();
             throw e;
@@ -2451,13 +2454,16 @@ public class QwpWebSocketSender implements Sender {
         try {
             QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
-                binding.unsupportedColumn(columnName, "INT");
+                binding.intColumn(columnName, value);
                 return this;
             }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_INT, true);
             if (col != null) {
                 col.addInt(value);
             }
+        } catch (LineSenderSchemaException e) {
+            rollbackRow();
+            throw refreshAfterSchemaRejection(e, columnName);
         } catch (RuntimeException | Error e) {
             rollbackRow();
             throw e;
@@ -3004,13 +3010,16 @@ public class QwpWebSocketSender implements Sender {
         try {
             QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
-                binding.unsupportedColumn(columnName, "SHORT");
+                binding.shortColumn(columnName, value);
                 return this;
             }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_SHORT, false);
             if (col != null) {
                 col.addShort(value);
             }
+        } catch (LineSenderSchemaException e) {
+            rollbackRow();
+            throw refreshAfterSchemaRejection(e, columnName);
         } catch (RuntimeException | Error e) {
             rollbackRow();
             throw e;

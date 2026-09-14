@@ -49,6 +49,51 @@ public class QwpSchemaSenderIntegrationTest {
             "/io/questdb/client/cutlass/qwp/native-decimal-to-text.tsv";
 
     @Test
+    public void testSmallIntegerSettersUseExactNumericTargetWireAndRecoverRows() throws Exception {
+        assertMemoryLeak(() -> {
+            int[] targets = {
+                    ColumnType.BYTE, ColumnType.SHORT, ColumnType.INT,
+                    ColumnType.LONG, ColumnType.FLOAT, ColumnType.DOUBLE
+            };
+            for (int i = 0; i < targets.length; i++) {
+                int target = targets[i];
+                LongTextSchemaHandler handler = new LongTextSchemaHandler(901 + i, 911 + i, target);
+                try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
+                    sender.table("events").byteColumn("value", (byte) -1).atNow();
+
+                    sender.byteColumn("value", (byte) 99);
+                    try {
+                        switch (i % 3) {
+                            case 0:
+                                sender.byteColumn("failed_b", (byte) 1);
+                                break;
+                            case 1:
+                                sender.shortColumn("failed_b", (short) 1);
+                                break;
+                            default:
+                                sender.intColumn("failed_b", 1);
+                                break;
+                        }
+                        Assert.fail("expected unsupported small-integer-to-UUID conversion");
+                    } catch (LineSenderSchemaException e) {
+                        Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
+                    }
+
+                    sender.shortColumn("value", (short) 2).atNow();
+                    sender.intColumn("value", Integer.MIN_VALUE).atNow();
+                    sender.intColumn("value", 3).atNow();
+                    sender.flush();
+
+                    new FrameReader(handler.awaitDataFrame()).smallIntegerNumericTable(
+                            "events", 901 + i, 911 + i, numericWireType(target));
+                    Assert.assertEquals("setter must use the standard one-refresh path", 2,
+                            handler.describeRequests.get());
+                }
+            }
+        });
+    }
+
+    @Test
     public void testNativeDecimalTextCorpusUsesExactVarcharWire() throws Exception {
         assertMemoryLeak(() -> {
             InputStream stream = QwpSchemaSenderIntegrationTest.class.getResourceAsStream(DECIMAL_TEXT_CORPUS);
@@ -1395,6 +1440,25 @@ public class QwpSchemaSenderIntegrationTest {
         }
     }
 
+    private static byte numericWireType(int targetType) {
+        switch (targetType) {
+            case ColumnType.BYTE:
+                return QwpConstants.TYPE_BYTE;
+            case ColumnType.SHORT:
+                return QwpConstants.TYPE_SHORT;
+            case ColumnType.INT:
+                return QwpConstants.TYPE_INT;
+            case ColumnType.LONG:
+                return QwpConstants.TYPE_LONG;
+            case ColumnType.FLOAT:
+                return QwpConstants.TYPE_FLOAT;
+            case ColumnType.DOUBLE:
+                return QwpConstants.TYPE_DOUBLE;
+            default:
+                throw new AssertionError(ColumnType.nameOf(targetType));
+        }
+    }
+
     private static Sender sender(TestWebSocketServer server) {
         return Sender.fromConfig("ws::addr=localhost:" + server.getPort()
                 + ";auto_flush_rows=2147483647;auto_flush_bytes=0;auto_flush_interval=2147483646;"
@@ -1755,6 +1819,44 @@ public class QwpSchemaSenderIntegrationTest {
             Assert.assertEquals(1, u8());
             Assert.assertEquals(bits, varint());
             eof();
+        }
+
+        private void smallIntegerNumericTable(String table, int tableId, long version, byte wireType) {
+            messageHeader(1);
+            Assert.assertEquals(0, varint());
+            Assert.assertEquals(0, varint());
+            schemaBlockHeader(table, tableId, version, 4, "value", wireType);
+            Assert.assertEquals(1, u8());
+            Assert.assertEquals(4, u8());
+            assertSmallIntegerValue(wireType, -1);
+            assertSmallIntegerValue(wireType, 2);
+            assertSmallIntegerValue(wireType, 3);
+            eof();
+        }
+
+        private void assertSmallIntegerValue(byte wireType, long value) {
+            switch (wireType) {
+                case QwpConstants.TYPE_BYTE:
+                    Assert.assertEquals((byte) value & 0xff, u8());
+                    break;
+                case QwpConstants.TYPE_SHORT:
+                    Assert.assertEquals((short) value, in.getShort());
+                    break;
+                case QwpConstants.TYPE_INT:
+                    Assert.assertEquals((int) value, in.getInt());
+                    break;
+                case QwpConstants.TYPE_LONG:
+                    Assert.assertEquals(value, in.getLong());
+                    break;
+                case QwpConstants.TYPE_FLOAT:
+                    Assert.assertEquals(Float.floatToRawIntBits((float) value), in.getInt());
+                    break;
+                case QwpConstants.TYPE_DOUBLE:
+                    Assert.assertEquals(Double.doubleToRawLongBits((double) value), in.getLong());
+                    break;
+                default:
+                    throw new AssertionError(wireType);
+            }
         }
 
         private void twoGeoHashBlocks(String table, int tableId, long firstVersion, long secondVersion) {

@@ -212,6 +212,10 @@ public final class QwpSchemaBinding {
         return this;
     }
 
+    public QwpSchemaBinding byteColumn(CharSequence name, byte value) {
+        return integerNumericColumn(name, value, "BYTE", ColumnType.BYTE, false);
+    }
+
     public QwpSchemaBinding doubleColumn(CharSequence name, double value) {
         return floatingNumericColumn(name, value, "DOUBLE");
     }
@@ -277,6 +281,10 @@ public final class QwpSchemaBinding {
         return floatingNumericColumn(name, value, "FLOAT");
     }
 
+    public QwpSchemaBinding intColumn(CharSequence name, int value) {
+        return integerNumericColumn(name, value, "INT", ColumnType.INT, value == Integer.MIN_VALUE);
+    }
+
     public QwpSchemaBinding longColumn(CharSequence name, long value) {
         buffer.requireSchemaBinding(this);
         int index = targetIndex(name, "LONG");
@@ -315,19 +323,19 @@ public final class QwpSchemaBinding {
         switch (targetType) {
             case ColumnType.BYTE:
                 if (value < Byte.MIN_VALUE || value > Byte.MAX_VALUE) {
-                    throw invalidRange(name, targetType);
+                    throw invalidRange(name, "LONG", targetType);
                 }
                 column.addByte((byte) value);
                 break;
             case ColumnType.SHORT:
                 if (value < Short.MIN_VALUE || value > Short.MAX_VALUE) {
-                    throw invalidRange(name, targetType);
+                    throw invalidRange(name, "LONG", targetType);
                 }
                 column.addShort((short) value);
                 break;
             case ColumnType.INT:
                 if (value < Integer.MIN_VALUE || value > Integer.MAX_VALUE) {
-                    throw invalidRange(name, targetType);
+                    throw invalidRange(name, "LONG", targetType);
                 }
                 column.addInt((int) value);
                 break;
@@ -353,6 +361,10 @@ public final class QwpSchemaBinding {
                 throw unsupported(name, "LONG", targetType, "conversion is not implemented");
         }
         return this;
+    }
+
+    public QwpSchemaBinding shortColumn(CharSequence name, short value) {
+        return integerNumericColumn(name, value, "SHORT", ColumnType.SHORT, false);
     }
 
     public QwpSchemaBinding stringColumn(CharSequence name, CharSequence value) {
@@ -899,8 +911,60 @@ public final class QwpSchemaBinding {
         throw unsupported(name, inputType, targetType, "conversion is not implemented");
     }
 
-    private LineSenderSchemaException invalidRange(CharSequence name, int targetType) {
-        return error(INVALID_VALUE, name, "LONG", targetType, "value is outside target type range");
+    private LineSenderSchemaException invalidRange(CharSequence name, String inputType, int targetType) {
+        return error(INVALID_VALUE, name, inputType, targetType, "value is outside target type range");
+    }
+
+    private QwpSchemaBinding integerNumericColumn(
+            CharSequence name,
+            long value,
+            String inputType,
+            int inferredType,
+            boolean sourceNull
+    ) {
+        buffer.requireSchemaBinding(this);
+        int index = targetIndex(name, inputType);
+        int targetType = targetType(index, inferredType);
+        QwpTableBuffer.ColumnBuffer column = targetColumn(name, inputType, index, targetType);
+        if (column == null) {
+            return this;
+        }
+        if (!isNumericTarget(targetType)) {
+            throw unsupported(name, inputType, targetType, "conversion is not implemented");
+        }
+        if (sourceNull) {
+            column.addNull();
+            return this;
+        }
+        switch (targetType) {
+            case ColumnType.BYTE:
+                if (value < Byte.MIN_VALUE || value > Byte.MAX_VALUE) {
+                    throw invalidRange(name, inputType, targetType);
+                }
+                column.addByte((byte) value);
+                break;
+            case ColumnType.SHORT:
+                if (value < Short.MIN_VALUE || value > Short.MAX_VALUE) {
+                    throw invalidRange(name, inputType, targetType);
+                }
+                column.addShort((short) value);
+                break;
+            case ColumnType.INT:
+                column.addInt((int) value);
+                break;
+            case ColumnType.LONG:
+                column.addLong(value);
+                break;
+            case ColumnType.FLOAT:
+                column.addFloat((float) value);
+                break;
+            case ColumnType.DOUBLE:
+                column.addDouble((double) value);
+                break;
+            default:
+                throw new AssertionError("unsupported numeric target");
+        }
+        return this;
     }
 
     private CharSequence formatLong(long value) {

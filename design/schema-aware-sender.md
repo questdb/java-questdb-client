@@ -1,8 +1,11 @@
 # Schema-aware sender: schema-directed encoding
 
-Status: proposal, revision 55. Scope: QWP v1 over WebSocket, with an automatically
-negotiated schema extension, legacy-server compatibility and companion server
-changes.
+Status: implemented on the development branch, revision 57. Scope: QWP v1 over
+WebSocket, with an automatically negotiated schema extension, legacy-server
+compatibility and companion server changes. The committed baseline contains the
+protocol, Sender integration and conversions through iteration 2.36; iteration
+2.37 is locally validated. The remaining public-setter conversion contract and
+release compatibility gates are not complete.
 
 ## Goal and contract
 
@@ -35,11 +38,13 @@ server-side failures can still reject a batch.
 
 ## Implementation status
 
-Current checkpoint: iteration 2.36 completes phase 5e native-decimal-to-text
-conversion for all three native widths and both text targets. All original 47
-failing conversion cases now pass.
-The wider conversion inventory below is not yet complete; this is not release
-acceptance.
+Current checkpoint: iteration 2.37 adds BYTE, SHORT and INT inputs into all six
+numeric targets, including identity. Numeric narrowing is checked locally;
+`Integer.MIN_VALUE` is a stable INT source null in schema mode. The committed
+baseline remains client `6fe3ce44`, server protocol `ffbb7125d2`, with server
+integration commit `818608c297` pinning that client revision. Iteration 2.37 is
+validated in this client revision and by its companion server change. The wider
+conversion inventory below is not complete; this is not release acceptance.
 
 Schema discovery, pinned identity framing, safe replay and ACK/NACK feedback
 are implemented and tested. Local UUID and LONG-to-numeric conversion now uses
@@ -72,6 +77,13 @@ tested: NaN means missing and out-of-range integer conversions fail locally.
 Coverage includes raw-bit rounding boundaries, legacy differences, rollback
 and recovered delivery. D025/D026 record the decisions and verification.
 
+BYTE/SHORT/INT input conversion into the six numeric targets is implemented in
+iteration 2.37. One narrow helper performs target selection, range checks and
+direct target-width append; it does not change the established LONG path.
+Shared component, public-Sender, recovered-frame and real-server tests cover 64
+boundary vectors, exact wire/SQL values, rollback, refresh, inference and the
+stable INT null contract. D055 records the local acceptance evidence.
+
 STRING input conversion into the six numeric targets is implemented and tested
 with 429 shared cases, exact wire/stored values, legacy acceptance/rejection,
 null/sentinel contexts, rollback and recovered delivery. Parsing preserves
@@ -98,8 +110,8 @@ The broader server regression selection still has 38 classified failures
 after the 2.22 expectation/fixture repairs;
 this is not a release-ready client. Compatibility with a non-confirming socket
 peer is tested; an actual older QuestDB distribution was not run in this slice.
-The integrated lookup deadline is currently fixed at 1000 ms; the proposed
-configuration key below is not wired into Sender yet. Complete conversion
+The fixed 30-second schema deadline is settled policy and is not part of the
+remaining conversion plan. Complete conversion
 coverage gates release, not the first integrated test. Until that
 coverage is complete, this is an unreleased development increment: unsupported
 schema-mode inputs fail explicitly rather than falling back to server conversion.
@@ -527,10 +539,14 @@ raw-value encoding. Schema lookup failures never disable schema mode.
 
 ## Availability
 
-In schema mode, required lookups have a bounded deadline
-(`schema_describe_timeout_millis`, proposed default 1000). Timeout, unavailable
-metadata or request saturation throws a lookup error before accepting the
-value. It cancels any partial row but does not permanently halt the sender.
+In schema mode, required lookups use a fixed 30-second deadline. On the first
+write, mode selection and its immediately following describe share one
+end-to-end budget; a later cache-miss describe or forced refresh starts its own
+30-second budget. This is not a public configuration surface.
+Timeout, unavailable metadata or request saturation throws a lookup error
+before accepting the value. It cancels any partial row but does not permanently
+halt the sender. Do not add automatic retries or separate timeout settings for
+the three lookup paths.
 
 Known schemas can be used offline; unfamiliar tables require a live lookup.
 Reconnect invalidates the lookup cache for future row starts, but does not reset
@@ -857,8 +873,10 @@ when the table or column is absent.
 ## Conversion backlog (server-source audit)
 
 Cross-checked on 2026-09-11 after iteration 2.13, with implemented coverage
-refreshed through iteration 2.36 against the working trees, including uncommitted changes: client base
-`981bdb02a471f3b290c89b8e78cbc422610e329e`, server base
+refreshed through iteration 2.37 on 2026-09-14. The accepted baseline is committed as
+client `6fe3ce44`, server `ffbb7125d2`, with server integration commit
+`818608c297` pinning that client revision. The original audit bases were client
+`981bdb02a471f3b290c89b8e78cbc422610e329e` and server
 `12a33d651e51e2682e7a448c8db5168fc72dfad3`. The matrix is a source audit;
 runtime evidence for implemented slices is recorded separately in the journal.
 Read the actual QWP cursor selection, target dispatch and
@@ -887,8 +905,8 @@ non-null conversion. Known compatibility exceptions above still apply.
 | Public input (source wire type) | Implemented targets | Missing server-accepted targets |
 | --- | --- | --- |
 | `boolColumn` (BOOLEAN) | BOOLEAN, numeric, text | None |
-| `byteColumn`, `shortColumn` (BYTE, SHORT) | None | Numeric, DATE, timestamps, text, SYMBOL, decimals; includes each input's identity pair |
-| `intColumn` (INT) | None | Numeric, DATE, timestamps, text, SYMBOL, decimals, IPv4; includes INT identity |
+| `byteColumn`, `shortColumn` (BYTE, SHORT) | Numeric | DATE, timestamps, text, SYMBOL, decimals |
+| `intColumn` (INT) | Numeric | DATE, timestamps, text, SYMBOL, decimals, IPv4 |
 | `longColumn` (LONG) | Numeric, text, SYMBOL, timestamps, decimals | DATE |
 | `floatColumn`, `doubleColumn` (FLOAT, DOUBLE) | Numeric, text, SYMBOL, decimals | None |
 | `stringColumn` (VARCHAR) | BOOLEAN, numeric, text, SYMBOL, UUID, BINARY, timestamps, CHAR, LONG256, geohash, decimals | DATE |
@@ -1468,13 +1486,19 @@ They do not change the compatibility contract.
    encoding/validation between DESCRIBE and ACK/NACK feedback, while retaining
    their distinct message framing and delivery rules. Reuse authorization and
    size checks. Keep full snapshots; avoid schema patches, subscriptions or an
-   additional conversion-version handshake.
+   additional conversion-version handshake. Treat the encoded 32-bit
+   `ColumnType` as the canonical source of decimal precision/scale, geohash bits
+   and array element/rank. Keep the existing parameter bytes reserved; do not
+   add a second per-type parameter model until the encoded type cannot represent
+   a required contract.
 4. **A short view of remaining work.** Keep a concise implementation-status
    checklist near the beginning of the design, separate from the intended
    contract. Distinguish tested components from ordinary Sender activation.
    Keep decision history and detailed test evidence in the journal so readers
    do not need to reconstruct current status from past iterations. Link to
    that evidence rather than maintaining duplicate test logs in the design.
+   Retain method and file names in the source map, but remove brittle source
+   line numbers when the document is next compacted.
 5. **Reuse inferred column definitions.** A confirmed missing target needs no
    second schema registry. Let the existing buffer pin the first effective
    native type and own rollback. Reuse the existing typed-rejection refresh
@@ -1523,6 +1547,30 @@ They do not change the compatibility contract.
     phase-5a append tail. Enforce exact special-value matching centrally according
     to the parser's documented contract, rather than adding target-width branches.
     D050 applies this rule.
+13. **Implement intentional conversions, not every reachable cast.** The server
+    audit is evidence, not a requirement to reproduce parser accidents or
+    validation gaps. Keep BINARY-to-parser conversions, LONG_ARRAY, non-ASCII
+    CHAR-to-VARCHAR and malformed decimal metadata out until their server
+    contracts are deliberately resolved. Matching a server bug is not
+    compatibility.
+14. **Keep the schema deadline fixed.** Initial negotiation and its first
+    describe share one 30-second end-to-end budget; later cache-miss describes
+    and forced refreshes each get their own 30-second budget. Do not add public
+    configuration, retries, another socket, a request queue or separate timeout
+    policy per path.
+15. **Prefer narrow family helpers to a conversion framework.** A shared helper
+    for BYTE/SHORT/INT numeric targets is justified because those setters have
+    the same range-check and append mechanics. Do not introduce a converter
+    registry or graph. Do not refactor the established LONG hot path without
+    measurements showing that the change is useful and safe.
+16. **Make compatibility a standing gate, not a feature iteration.** Run the
+    real old/new client-server binary matrix in CI and before release. Each
+    numbered conversion iteration still keeps a focused current-server E2E test
+    green; it does not reimplement negotiation or compatibility.
+17. **Plan by conversion mechanism.** Group target paths that share a wire
+    representation, conversion rule and rollback behavior. Do not create one
+    iteration per matrix cell, and do not combine unrelated server-boundary
+    decisions merely because they appear in the same source audit.
 
 These opportunities do not justify a per-setter opt-out, raw-value fallback or
 send-time transformation. Partial activation is permitted on the unreleased
@@ -1538,7 +1586,52 @@ implementation and its tests together. Do not wait for negotiation,
 compatibility and all converters to be implemented before exercising the
 complete client-to-server path. Reuse the existing test infrastructure.
 
-The milestones are:
+### Plan after iteration 2.37
+
+Before the next feature slice, establish the compatibility matrix as a
+permanent CI and release gate:
+
+- New client against the last released old server: no confirmation, unchanged
+  legacy behavior and no schema frames.
+- Last released old client against the new server: unchanged QWP v1 behavior
+  and no unsolicited schema traffic.
+- New client against the new server: schema mode is mandatory and the existing
+  public-Sender E2E remains green.
+- A sender that has confirmed schema support against a later old endpoint:
+  pending data is retained, with no downgrade or watermark advancement.
+
+This gate validates existing behavior; it is not a numbered implementation
+iteration. Use released binaries for the old sides rather than only scripted
+peers. A failure may require a production fix, but the gate itself adds no
+protocol mode, adapter or send-time transformation.
+
+The next implementation slice is:
+
+1. **Iteration group 2.38 — fixed-width identity and text targets.** Land three
+   independently reviewable slices: IPv4 to IPv4/STRING/VARCHAR, LONG256 to
+   LONG256/STRING/VARCHAR, then GEOHASH to the exact same-precision
+   GEOHASH/STRING/VARCHAR. Each slice gets its own public-Sender real-server E2E,
+   exact target wire checks, null/omission decisions, rollback, refresh and SF
+   replay. Preserve geohash bit precision and the existing public overload
+   semantics; do not use this group to approve unrelated parser paths.
+
+After these slices, reassess the remaining inventory in this order: integer to
+DATE/timestamps; integer to text/SYMBOL/decimals and INT-to-IPv4;
+`decimalColumn(CharSequence)`; then DOUBLE arrays after rank metadata is proven
+end to end. BINARY-to-parser conversions, LONG_ARRAY, non-ASCII
+CHAR-to-VARCHAR and malformed decimal metadata remain server-contract decisions,
+not client implementation backlog.
+
+Every slice keeps the existing observable-contract rules below: public API,
+exact wire, SQL result, partial-row rollback and relevant recovery behavior.
+Run canonical and packaged-client gates, the server gate against its pinned
+client submodule, and affected fixed-work performance checks before acceptance.
+Update the journal and exact submodule pin with every accepted slice.
+
+### Original milestones
+
+The original milestones below describe how the present architecture was built;
+they remain useful as constraints for later work:
 
 1. **E2E baseline.** Write one typed value through the public `Sender` API to
    a real server and verify it through SQL. Keep this path working throughout

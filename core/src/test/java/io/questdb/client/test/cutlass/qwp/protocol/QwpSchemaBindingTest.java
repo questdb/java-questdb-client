@@ -522,6 +522,167 @@ public class QwpSchemaBindingTest {
     }
 
     @Test
+    public void testSmallIntegerNumericConformanceCorpus() throws Exception {
+        InputStream stream = QwpSchemaBindingTest.class.getResourceAsStream(
+                "/io/questdb/client/cutlass/qwp/small-integer-to-numeric.tsv");
+        Assert.assertNotNull(stream);
+        int count = 0;
+        try (BufferedReader lines = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = lines.readLine()) != null) {
+                if (line.isEmpty() || line.charAt(0) == '#') {
+                    continue;
+                }
+                String[] fields = line.split("\t", -1);
+                Assert.assertEquals(line, 5, fields.length);
+                try {
+                    long input = Long.parseLong(fields[2]);
+                    int targetType = numericColumnType(fields[3]);
+                    try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                         QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                        QwpSchemaBinding rows = rows(buffer, column("n", targetType));
+                        Runnable append = () -> appendSmallInteger(rows, fields[1], input, "n");
+                        if ("<INVALID>".equals(fields[4])) {
+                            assertReason(LineSenderSchemaException.Reason.INVALID_VALUE, append);
+                        } else {
+                            append.run();
+                            buffer.nextRow();
+                            Reader reader = tableReader(encoder, encoder.encodeSchema(buffer), 1,
+                                    numericWireType(fields[3]));
+                            if ("<NULL>".equals(fields[4])) {
+                                assertNumericNull(reader, fields[3]);
+                            } else {
+                                Assert.assertEquals(0, reader.byteValue());
+                                assertNumericValue(reader, fields[3], fields[4]);
+                            }
+                            Assert.assertEquals(encoder.getBuffer().getPosition(), reader.position());
+                        }
+                    }
+                } catch (AssertionError e) {
+                    throw new AssertionError("case_id=" + fields[0] + ": " + e.getMessage(), e);
+                }
+                count++;
+            }
+        }
+        Assert.assertEquals(64, count);
+    }
+
+    @Test
+    public void testSmallIntegerDuplicateFirstAndFailureRollback() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                QwpSchemaBinding rows = rows(buffer,
+                        column("a", ColumnType.LONG),
+                        column("only_b", ColumnType.SHORT),
+                        column("bad", ColumnType.BYTE),
+                        column("c", ColumnType.DOUBLE));
+                rows.byteColumn("a", (byte) -1).intColumn("a", Integer.MIN_VALUE);
+                buffer.nextRow();
+
+                rows.shortColumn("only_b", (short) 5);
+                assertReason(LineSenderSchemaException.Reason.INVALID_VALUE,
+                        () -> rows.shortColumn("bad", (short) 128));
+                rollbackCurrentRow(buffer);
+
+                rows.intColumn("c", 3);
+                buffer.nextRow();
+                int size = encoder.encodeSchema(buffer);
+                Reader reader = tableReader(encoder, size, 2,
+                        QwpConstants.TYPE_LONG, QwpConstants.TYPE_DOUBLE);
+                Assert.assertEquals(1, reader.byteValue());
+                Assert.assertEquals(2, reader.byteValue());
+                Assert.assertEquals(-1, reader.longValue());
+                Assert.assertEquals(1, reader.byteValue());
+                Assert.assertEquals(1, reader.byteValue());
+                Assert.assertEquals(Double.doubleToRawLongBits(3), reader.longValue());
+                Assert.assertEquals(size, reader.position());
+            }
+        });
+    }
+
+    @Test
+    public void testIntMinIsNullWithCompanionMissingRowsAcrossNumericTargets() throws Exception {
+        assertMemoryLeak(() -> {
+            for (String target : new String[]{"BYTE", "SHORT", "INT", "LONG", "FLOAT", "DOUBLE"}) {
+                try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                     QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                    QwpSchemaBinding rows = rows(buffer, column("n", numericColumnType(target)));
+                    rows.intColumn("n", Integer.MIN_VALUE);
+                    buffer.nextRow();
+                    buffer.nextRow();
+                    rows.intColumn("n", 7);
+                    buffer.nextRow();
+                    int size = encoder.encodeSchema(buffer);
+                    Reader reader = tableReader(encoder, size, 3, numericWireType(target));
+                    Assert.assertEquals(target, 1, reader.byteValue());
+                    Assert.assertEquals(target, 3, reader.byteValue());
+                    if ("FLOAT".equals(target)) {
+                        assertNumericValue(reader, target, "0x40e00000");
+                    } else if ("DOUBLE".equals(target)) {
+                        assertNumericValue(reader, target, "0x401c000000000000");
+                    } else {
+                        assertNumericValue(reader, target, "7");
+                    }
+                    Assert.assertEquals(size, reader.position());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testSmallIntegerMissingSchemaUsesNativeWireTypes() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                QwpSchemaBinding rows = new QwpSchemaBinding(buffer, result(QwpSchemaProtocol.RESULT_MISSING));
+                rows.byteColumn("b", (byte) -1).shortColumn("s", (short) 2).intColumn("i", 3);
+                buffer.nextRow();
+                int size = encoder.encodeSchema(buffer);
+                Reader reader = tableReader(encoder, size, -1, -1, 1,
+                        QwpConstants.TYPE_BYTE, QwpConstants.TYPE_SHORT, QwpConstants.TYPE_INT);
+                Assert.assertEquals(0, reader.byteValue());
+                Assert.assertEquals(0xff, reader.byteValue());
+                Assert.assertEquals(0, reader.byteValue());
+                Assert.assertEquals(2, reader.shortValue());
+                Assert.assertEquals(0, reader.byteValue());
+                Assert.assertEquals(3, reader.intValue());
+                Assert.assertEquals(size, reader.position());
+            }
+        });
+    }
+
+    @Test
+    public void testSmallIntegerUnsupportedParameterizedDesignatedAndStaleTargets() {
+        try (QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+            QwpSchemaBinding rows = rows(buffer,
+                    column("uuid", ColumnType.UUID),
+                    column("future", ColumnType.INT, new byte[]{1}));
+            assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+                    () -> rows.byteColumn("uuid", (byte) 1));
+            rollbackCurrentRow(buffer);
+            assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+                    () -> rows.shortColumn("future", (short) 2));
+            rollbackCurrentRow(buffer);
+            assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+                    () -> rows.intColumn("uuid", Integer.MIN_VALUE));
+        }
+        try (QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+            QwpSchemaBinding rows = new QwpSchemaBinding(buffer,
+                    known(0, column("designated", ColumnType.TIMESTAMP_MICRO)));
+            assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+                    () -> rows.intColumn("designated", 1));
+        }
+        try (QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+            QwpSchemaBinding stale = rows(buffer, column("n", ColumnType.LONG));
+            buffer.clear();
+            assertIllegalState(() -> stale.byteColumn("n", (byte) 1));
+            assertIllegalState(() -> stale.shortColumn("n", (short) 2));
+            assertIllegalState(() -> stale.intColumn("n", 3));
+        }
+    }
+
+    @Test
     public void testLongNumericConformanceCorpus() throws Exception {
         InputStream stream = QwpSchemaBindingTest.class.getResourceAsStream(
                 "/io/questdb/client/cutlass/qwp/long-to-numeric.tsv");
@@ -999,6 +1160,27 @@ public class QwpSchemaBindingTest {
         Assert.assertEquals(size, reader.position());
     }
 
+    private static void appendSmallInteger(
+            QwpSchemaBinding rows,
+            String inputType,
+            long value,
+            String column
+    ) {
+        switch (inputType) {
+            case "BYTE":
+                rows.byteColumn(column, (byte) value);
+                break;
+            case "SHORT":
+                rows.shortColumn(column, (short) value);
+                break;
+            case "INT":
+                rows.intColumn(column, (int) value);
+                break;
+            default:
+                throw new AssertionError(inputType);
+        }
+    }
+
     private static void assertNumericValue(Reader reader, String target, String expected) {
         switch (target) {
             case "BYTE":
@@ -1027,6 +1209,11 @@ public class QwpSchemaBindingTest {
     private static void assertNumericNull(Reader reader, String target) {
         Assert.assertEquals(1, reader.byteValue());
         Assert.assertEquals(target, 1, reader.byteValue());
+    }
+
+    private static void rollbackCurrentRow(QwpTableBuffer buffer) {
+        buffer.cancelCurrentRow();
+        buffer.rollbackUncommittedColumns();
     }
 
     private static int numericColumnType(String target) {

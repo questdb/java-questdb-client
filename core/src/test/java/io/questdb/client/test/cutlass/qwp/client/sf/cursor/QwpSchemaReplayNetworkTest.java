@@ -24,6 +24,7 @@
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.Sender;
+import io.questdb.client.cairo.ColumnType;
 import io.questdb.client.cutlass.qwp.client.QwpSchemaCapabilityMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketEncoder;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
@@ -35,6 +36,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
+import io.questdb.client.cutlass.qwp.protocol.QwpSchemaProtocol;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
@@ -121,6 +123,39 @@ public class QwpSchemaReplayNetworkTest {
         Assert.assertEquals(2, supportingHandler.frames.size());
         Assert.assertArrayEquals(expected[0], supportingHandler.frames.get(0));
         Assert.assertArrayEquals(expected[1], supportingHandler.frames.get(1));
+        assertNoQuarantine(root);
+    }
+
+    @Test
+    public void testPublicSenderSchemaFrameSurvivesRestartByteForByte() throws Exception {
+        File root = temp.newFolder("public-sender-restart");
+        String slot = new File(root, "default").getAbsolutePath();
+        SchemaRecordingHandler firstHandler = new SchemaRecordingHandler(false);
+        byte[] expected;
+        try (TestWebSocketServer firstPeer = new TestWebSocketServer(firstHandler)) {
+            firstPeer.setAdvertiseSchema(true);
+            firstPeer.start();
+            Assert.assertTrue(firstPeer.awaitStart(5, TimeUnit.SECONDS));
+            try (Sender sender = Sender.fromConfig(config(firstPeer.getPort(), root, false))) {
+                sender.table("small_replay").byteColumn("value", (byte) -7).atNow();
+                Assert.assertEquals(0, sender.flushAndGetSequence());
+                expected = firstHandler.awaitDataFrame();
+            }
+        }
+        assertRetained(slot, 0);
+
+        SchemaRecordingHandler replayHandler = new SchemaRecordingHandler(true);
+        try (TestWebSocketServer replayPeer = new TestWebSocketServer(replayHandler)) {
+            replayPeer.setAdvertiseSchema(true);
+            replayPeer.start();
+            Assert.assertTrue(replayPeer.awaitStart(5, TimeUnit.SECONDS));
+            try (Sender sender = Sender.fromConfig(config(replayPeer.getPort(), root, false))) {
+                Assert.assertTrue(sender.drain(10_000));
+            }
+        }
+        Assert.assertArrayEquals(expected, replayHandler.awaitDataFrame());
+        Assert.assertEquals(QwpConstants.FLAG_SCHEMA,
+                expected[QwpConstants.HEADER_OFFSET_FLAGS] & QwpConstants.FLAG_SCHEMA);
         assertNoQuarantine(root);
     }
 
@@ -422,6 +457,82 @@ public class QwpSchemaReplayNetworkTest {
         private static byte[] ok(long sequence) {
             return ByteBuffer.allocate(11).order(ByteOrder.LITTLE_ENDIAN)
                     .put(WebSocketResponse.STATUS_OK).putLong(sequence).putShort((short) 0).array();
+        }
+    }
+
+    private static final class SchemaRecordingHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private final boolean acknowledge;
+        private final List<byte[]> dataFrames = new ArrayList<>();
+
+        private SchemaRecordingHandler(boolean acknowledge) {
+            this.acknowledge = acknowledge;
+        }
+
+        @Override
+        public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            if (data.length >= QwpConstants.HEADER_SIZE
+                    && data[QwpConstants.HEADER_OFFSET_FLAGS] == QwpSchemaProtocol.FLAG_CONTROL) {
+                ByteBuffer request = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
+                sendSchema(client, request.getLong(QwpConstants.HEADER_SIZE + 1));
+                return;
+            }
+            dataFrames.add(data);
+            notifyAll();
+            if (acknowledge) {
+                try {
+                    client.sendBinary(RecordingHandler.ok(0));
+                } catch (IOException e) {
+                    throw new AssertionError(e);
+                }
+            }
+        }
+
+        private synchronized byte[] awaitDataFrame() throws InterruptedException {
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (dataFrames.isEmpty()) {
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0) {
+                    Assert.fail("timed out waiting for schema data frame");
+                }
+                TimeUnit.NANOSECONDS.timedWait(this, remaining);
+            }
+            return dataFrames.get(0);
+        }
+
+        private static void sendSchema(TestWebSocketServer.ClientHandler client, long requestId) {
+            byte[] value = "value".getBytes(StandardCharsets.UTF_8);
+            byte[] timestamp = "ts".getBytes(StandardCharsets.UTF_8);
+            int payloadLength = 1 + Long.BYTES + 1 + Integer.BYTES + Long.BYTES
+                    + Short.BYTES + Short.BYTES
+                    + Short.BYTES + value.length + Integer.BYTES + Short.BYTES
+                    + Short.BYTES + timestamp.length + Integer.BYTES + Short.BYTES;
+            ByteBuffer response = ByteBuffer.allocate(QwpConstants.HEADER_SIZE + payloadLength)
+                    .order(ByteOrder.LITTLE_ENDIAN);
+            response.putInt(QwpConstants.MAGIC_MESSAGE)
+                    .put((byte) QwpConstants.VERSION)
+                    .put(QwpSchemaProtocol.FLAG_CONTROL)
+                    .putShort((short) 0)
+                    .putInt(payloadLength)
+                    .put(QwpSchemaProtocol.KIND_SCHEMA)
+                    .putLong(requestId)
+                    .put((byte) QwpSchemaProtocol.RESULT_KNOWN)
+                    .putInt(301)
+                    .putLong(401)
+                    .putShort((short) 1)
+                    .putShort((short) 2)
+                    .putShort((short) value.length)
+                    .put(value)
+                    .putInt(ColumnType.INT)
+                    .putShort((short) 0)
+                    .putShort((short) timestamp.length)
+                    .put(timestamp)
+                    .putInt(ColumnType.TIMESTAMP_NANO)
+                    .putShort((short) 0);
+            try {
+                client.sendBinary(response.array());
+            } catch (IOException e) {
+                throw new AssertionError(e);
+            }
         }
     }
 

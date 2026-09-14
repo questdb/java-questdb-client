@@ -6926,3 +6926,108 @@ production ownership, compatibility wording, exact hashes, raw logs, XML
 provenance and performance claim bounds. One P3 remains: older source-map line
 numbers in the design have drifted, although their method names remain correct.
 That navigation debt is outside phase 5e and does not change the contract.
+
+## D054 — Post-2.36 simplification and next-iteration plan
+
+Status: accepted planning decision, 2026-09-14. Revision 56 records the plan;
+it does not claim release acceptance or add production code.
+
+The schema-aware implementation is now committed as client `6fe3ce44` and
+server `ffbb7125d2`. Server integration commit `818608c297` pins that exact
+client revision. A Maven reactor run using the pinned local client passed the
+public-Sender UUID conversion and rollback E2E against the server, so the next
+work starts from an integrated baseline rather than another component-only
+slice.
+
+Compatibility becomes a permanent CI and release gate, not another feature
+iteration. It must exercise released binaries for new-client/old-server and
+old-client/new-server behavior, current new/new schema mode, and the one-way
+upgrade failure against an old endpoint. This validates the promised behavior
+without adding a compatibility adapter, downgrade encoder or send-time
+transformation.
+
+Timeout productization is removed from the roadmap. The policy is a fixed
+30-second deadline with no new public configuration: initial negotiation and
+its first describe share one budget, while later cache-miss describes and
+refreshes each get their own budget. The timeout change is owned separately
+from these conversion slices and is implemented by client commit `98be3b0b`;
+it is not recreated or extended by iteration 2.37.
+
+The next implementation areas are deliberately narrow: iteration 2.37 adds
+BYTE/SHORT/INT to the six numeric targets with a small shared helper; iteration
+group 2.38 adds fixed-width identity/text support as separate IPv4, LONG256 and
+exact-precision GEOHASH slices. Each slice retains a real public-Sender E2E and
+the existing wire, SQL, rollback, refresh, recovery, packaging and
+affected-performance gates.
+
+The source audit remains broader than the intended product. BINARY-to-parser
+paths, LONG_ARRAY, non-ASCII CHAR-to-VARCHAR and malformed decimal metadata are
+server-contract questions, not automatic client backlog. The client will not
+reproduce parser accidents or validation gaps merely because current server
+dispatch can reach them. The encoded 32-bit `ColumnType` remains the single
+parameter representation, and no converter registry, schema patch protocol,
+retry framework, second request channel or per-path timeout setting is planned.
+
+Before iteration 2.37 code lands, tests must freeze `Integer.MIN_VALUE` behavior
+with and without a companion null bitmap. The recommended schema-mode contract
+is stable source NULL, independent of neighboring rows; this remains an explicit
+contract checkpoint rather than an assumption copied from LONG.
+
+## D055 — Small integer inputs use direct numeric target widths
+
+Status: iteration 2.37 implemented and locally validated, 2026-09-14. Revision
+57 is recorded in the client commit containing this decision; the companion
+server commit pins that exact client revision.
+
+BYTE, SHORT and INT setters now support BYTE, SHORT, INT, LONG, FLOAT and DOUBLE
+targets. One private helper owns their shared numeric-target check, narrowing
+range checks and direct append. The public Sender branches reuse the established
+schema-rejection rollback and one-refresh path. Missing columns retain the
+setter's native source type. Legacy mode and the established LONG implementation
+are unchanged; no registry, converter graph, new buffer state or server
+production change was added.
+
+The source-null decision is now explicit. `Integer.MIN_VALUE` is a stable INT
+source null in schema mode, independent of whether another row creates a null
+bitmap. BYTE and SHORT have no public source-null sentinel. An unsupported
+target still rejects the setter even when the INT value is the null sentinel;
+null does not make an otherwise unsupported conversion available.
+
+Both repositories consume the same 64-case boundary corpus, SHA-256
+`93dd3987145766e6b9d7fff0b592e0a56b67577d83de4de623ed0e8231e3b96d`.
+It covers identity, widening, valid and invalid narrowing, FLOAT/DOUBLE raw-bit
+rounding and INT nulls. Client component tests assert exact target wire data and
+bitmap behavior. Public scripted-Sender tests add partial-row rollback, one
+refresh, snapshot pinning and missing-column inference. A public Sender restart
+test retains an unacknowledged schema frame and proves byte-identical replay.
+The real-server E2E creates all six numeric target tables and verifies the
+accepted values through SQL while range failures remain local typed errors.
+
+Focused client validation passes 91 tests: 35 binding, 47 public Sender and 9
+network replay tests. The established client gate passes 957 tests, followed by
+both packaged-JAR integration checks. The focused real-server E2E passes, and
+the corrected accumulated server selector passes 379 tests with zero failures,
+errors or skips.
+
+One exploratory server run incorrectly selected every method in
+`QwpSenderE2ETest` and `QwpWebSocketSenderReceiverTest`. It ran 631 tests and
+reported 3 failures plus 65 errors in conversion families that remain explicitly
+unsupported, chiefly arrays, geohashes and parser paths. That run is not a
+regression result. A second invalid setup exhausted shared `/tmp`; its generated
+512 MiB test directory and crash log were moved under the run-owned server
+target directory without touching unrelated temporary files. The valid run uses
+project-local temporary storage and only the intentionally supported legacy
+methods from the established acceptance selector.
+
+The affected fixed-work guard runs each identity source for two million warmup
+and 50 million measured rows, five times on one CPU. All checksums and work
+counts match and hardware counters run at 100%. Average retired instructions are
+30.45 billion for BYTE, 30.76 billion for SHORT, 32.54 billion for INT and 35.14
+billion for the established LONG reference. A separate 100-million-row INT run
+records no GC after startup. These data reject an obvious helper-path regression;
+they are not a before/after speed claim or network/ingestion benchmark because
+the prior client had no corresponding schema-aware small-integer operation.
+
+The fixed 30-second timeout remains outside the conversion roadmap. Iteration
+2.37 is rebased on the user's timeout commit `98be3b0b` and does not duplicate
+or extend that change.
