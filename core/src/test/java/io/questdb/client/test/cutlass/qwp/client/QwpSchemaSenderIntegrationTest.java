@@ -206,6 +206,64 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test
+    public void testSmallIntegerTextGenerationRemainsSymbolBeforeVarcharRebind() throws Exception {
+        assertMemoryLeak(() -> {
+            LongTextSchemaHandler handler = new LongTextSchemaHandler(1021, 1031, ColumnType.SYMBOL);
+            try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
+                sender.table("events").byteColumn("value", (byte) 7).atNow();
+
+                handler.targetType = ColumnType.VARCHAR;
+                handler.version = 1032;
+                sender.table("events");
+                try {
+                    sender.uuidColumn("value", 1, 2);
+                    Assert.fail("expected target-changing schema refresh");
+                } catch (LineSenderSchemaException e) {
+                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                }
+                sender.shortColumn("value", (short) 8).atNow();
+                sender.flush();
+
+                new FrameReader(handler.awaitDataFrame())
+                        .twoSymbolAndVarcharBlocks("events", 1021, 1031, 1032);
+                Assert.assertEquals(2, handler.describeRequests.get());
+            }
+        });
+    }
+
+    @Test
+    public void testSmallIntegerTextTargetsUseExactTargetWireAndRollback() throws Exception {
+        assertMemoryLeak(() -> {
+            int[] targets = {ColumnType.STRING, ColumnType.VARCHAR, ColumnType.SYMBOL};
+            for (int i = 0; i < targets.length; i++) {
+                int target = targets[i];
+                LongTextSchemaHandler handler = new LongTextSchemaHandler(1041 + i, 1051 + i, target);
+                try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
+                    sender.table("events").byteColumn("value", (byte) -128).atNow();
+
+                    sender.shortColumn("value", (short) 99);
+                    try {
+                        sender.intColumn("failed_b", 1);
+                        Assert.fail("expected INT-to-UUID conversion rejection");
+                    } catch (LineSenderSchemaException e) {
+                        Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
+                    }
+
+                    sender.shortColumn("value", Short.MAX_VALUE).atNow();
+                    sender.intColumn("value", Integer.MIN_VALUE).atNow();
+                    sender.intColumn("value", Integer.MAX_VALUE).atNow();
+                    sender.flush();
+
+                    new FrameReader(handler.awaitDataFrame()).smallIntegerTextTable(
+                            "events", 1041 + i, 1051 + i, target);
+                    Assert.assertEquals("setter must use the standard one-refresh path", 2,
+                            handler.describeRequests.get());
+                }
+            }
+        });
+    }
+
+    @Test
     public void testNativeDecimalTextCorpusUsesExactVarcharWire() throws Exception {
         assertMemoryLeak(() -> {
             InputStream stream = QwpSchemaSenderIntegrationTest.class.getResourceAsStream(DECIMAL_TEXT_CORPUS);
@@ -1140,7 +1198,7 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.flush();
 
                 new FrameReader(handler.awaitDataFrame())
-                        .twoLongTextBlocks("events", 151, 161, 162);
+                        .twoSymbolAndVarcharBlocks("events", 151, 161, 162);
                 Assert.assertEquals(2, handler.describeRequests.get());
             }
         });
@@ -1371,6 +1429,26 @@ public class QwpSchemaSenderIntegrationTest {
                 Assert.assertEquals(0, frame[QwpConstants.HEADER_OFFSET_FLAGS] & QwpConstants.FLAG_SCHEMA);
                 FrameReader reader = new FrameReader(frame);
                 reader.legacyVarcharTable("events", "value", "legacy");
+                Assert.assertEquals(0, handler.describeRequests.get());
+            }
+        });
+    }
+
+    @Test
+    public void testOldPeerUsesLegacySmallIntegerWireAndNeverDescribes() throws Exception {
+        assertMemoryLeak(() -> {
+            SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 1, 1);
+            try (TestWebSocketServer server = legacyServer(handler);
+                 Sender sender = sender(server)) {
+                sender.table("events")
+                        .byteColumn("b", (byte) -7)
+                        .shortColumn("s", (short) 42)
+                        .intColumn("i", Integer.MIN_VALUE)
+                        .atNow();
+                sender.flush();
+                byte[] frame = handler.awaitDataFrame();
+                Assert.assertEquals(0, frame[QwpConstants.HEADER_OFFSET_FLAGS] & QwpConstants.FLAG_SCHEMA);
+                new FrameReader(frame).legacySmallIntegerTable("events");
                 Assert.assertEquals(0, handler.describeRequests.get());
             }
         });
@@ -2027,6 +2105,32 @@ public class QwpSchemaSenderIntegrationTest {
             eof();
         }
 
+        private void legacySmallIntegerTable(String table) {
+            Assert.assertEquals(QwpConstants.MAGIC_MESSAGE, in.getInt());
+            Assert.assertEquals(QwpConstants.VERSION, u8());
+            Assert.assertEquals(0, u8() & QwpConstants.FLAG_SCHEMA);
+            Assert.assertEquals(1, in.getShort() & 0xffff);
+            Assert.assertEquals(in.remaining() - Integer.BYTES, in.getInt());
+            Assert.assertEquals(0, varint());
+            Assert.assertEquals(0, varint());
+            Assert.assertEquals(table, string());
+            Assert.assertEquals(1, varint());
+            Assert.assertEquals(3, varint());
+            Assert.assertEquals("b", string());
+            Assert.assertEquals(QwpConstants.TYPE_BYTE, u8());
+            Assert.assertEquals("s", string());
+            Assert.assertEquals(QwpConstants.TYPE_SHORT, u8());
+            Assert.assertEquals("i", string());
+            Assert.assertEquals(QwpConstants.TYPE_INT, u8());
+            Assert.assertEquals(0, u8());
+            Assert.assertEquals((byte) -7 & 0xff, u8());
+            Assert.assertEquals(0, u8());
+            Assert.assertEquals(42, in.getShort());
+            Assert.assertEquals(0, u8());
+            Assert.assertEquals(Integer.MIN_VALUE, in.getInt());
+            eof();
+        }
+
         private void longTextTable(
                 String table,
                 int tableId,
@@ -2365,6 +2469,37 @@ public class QwpSchemaSenderIntegrationTest {
             eof();
         }
 
+        private void smallIntegerTextTable(String table, int tableId, long version, int targetType) {
+            messageHeader(1);
+            if (targetType == ColumnType.SYMBOL) {
+                Assert.assertEquals(0, varint());
+                Assert.assertEquals(4, varint());
+                Assert.assertEquals("-128", string());
+                Assert.assertEquals("99", string());
+                Assert.assertEquals("32767", string());
+                Assert.assertEquals("2147483647", string());
+            } else {
+                Assert.assertEquals(0, varint());
+                Assert.assertEquals(0, varint());
+            }
+            schemaBlockHeader(table, tableId, version, 4, "value",
+                    targetType == ColumnType.SYMBOL ? QwpConstants.TYPE_SYMBOL : QwpConstants.TYPE_VARCHAR);
+            Assert.assertEquals(1, u8());
+            Assert.assertEquals(4, u8());
+            if (targetType == ColumnType.SYMBOL) {
+                Assert.assertEquals(0, varint());
+                Assert.assertEquals(2, varint());
+                Assert.assertEquals(3, varint());
+            } else {
+                Assert.assertEquals(0, in.getInt());
+                Assert.assertEquals(4, in.getInt());
+                Assert.assertEquals(9, in.getInt());
+                Assert.assertEquals(19, in.getInt());
+                Assert.assertEquals("-128327672147483647", stringBytes(19));
+            }
+            eof();
+        }
+
         private void integerTemporalTable(String table, int tableId, long version, byte wireType) {
             messageHeader(1);
             Assert.assertEquals(0, varint());
@@ -2682,7 +2817,7 @@ public class QwpSchemaSenderIntegrationTest {
             Assert.assertEquals(wireType & 0xff, u8());
         }
 
-        private void twoLongTextBlocks(String table, int tableId, long firstVersion, long secondVersion) {
+        private void twoSymbolAndVarcharBlocks(String table, int tableId, long firstVersion, long secondVersion) {
             messageHeader(2);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(1, varint());

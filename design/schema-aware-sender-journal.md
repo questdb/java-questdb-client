@@ -7465,3 +7465,67 @@ remain opaque to column type. Exact public wire tests prove the new DATE and
 timestamp bytes before publication, while the existing schema-frame replay
 suite remains green. Adding a second recovery harness would duplicate those
 contracts without exercising changed recovery code.
+
+## D062 — Small integers reuse the established text and symbol paths
+
+Status: iteration 2.41 implemented and locally validated, 2026-09-14. Design
+revision 64. The pre-iteration baseline is client `853c3292c1` and server
+`85f24785d3`, whose submodule pins that exact client revision. Neither
+repository is committed by this decision record.
+
+BYTE, SHORT and INT setters now accept STRING, VARCHAR and SYMBOL targets in
+schema mode. Each input widens losslessly to long and uses the existing reusable
+numeric text sink. STRING and VARCHAR append direct VARCHAR wire data; SYMBOL
+uses the existing global dictionary writer. `Integer.MIN_VALUE` retains its
+source-null meaning and becomes an explicit target bitmap NULL. BYTE and SHORT
+have no source-null sentinel. Missing columns still infer their native input
+types, and a legacy peer still receives native BYTE, SHORT and INT wire columns
+without a DESCRIBE.
+
+The implementation was cross-checked against the current server's
+`QwpWalAppender` dispatch and `WalColumnarRowAppender`. Fixed-width integer
+cursors targeting STRING, VARCHAR or SYMBOL all call `Numbers.append` on
+`cursor.getLong()`. The client therefore extends the existing small-integer
+target switch and reuses `formatLong`, `addString` and `addSymbol`. It adds no
+source-width formatter, converter object, retained value, per-row `String`,
+protocol field or server production change. Numeric identity targets still
+short-circuit at the first `isNumericTarget` check, so the additional text check
+is not evaluated on that hot path. This is source-level reasoning, not a new
+performance claim.
+
+Client and server consume the same 30-case corpus, SHA-256
+`78481d27bbeb70354f309372650311e269ee365087e9003218222c2b0580dcfe`.
+For each target it covers BYTE and SHORT extrema plus INT null,
+minimum-non-null, negative one, zero, one and maximum. Component tests assert
+the exact target wire type, UTF-8 payload or symbol dictionary entry, offsets,
+IDs and bitmap null. Public socket tests additionally cover a rolled-back symbol
+dictionary entry, A/error/C row recovery, the standard one-refresh path, a
+SYMBOL block pinned before a VARCHAR schema generation, parameter rejection and
+old-peer native framing.
+
+The real-server E2E uses the public `Sender` API and one flush across STRING,
+VARCHAR and SYMBOL tables, waits for the acknowledged sequence, drains WAL and
+asserts exact SQL values and nullness for all 30 vectors. A second E2E proves a
+partially written row is discarded after an INT-to-UUID local error, completed
+rows survive and the same symbol value is reused. The focused server gate also
+runs the existing `testCoercionToSymbol`; all three tests pass.
+
+Expanded client validation passes 305 tests with zero failures, errors or
+skips. Packaged-JAR verification passes 47 selected unit tests and both
+packaging integration tests. The released-binary matrix passes current client
+to QuestDB 10.0.1 in legacy mode, client 1.3.9 to current server in legacy mode,
+and current client to current server in schema mode. All scratch roots are
+under `/mnt/pcie5`.
+
+The full `QwpSenderE2ETest` remains diagnostic: 137 tests now produce two
+failures and 36 errors, down from 37 errors at D061. The SYMBOL aggregate is now
+green. The STRING and VARCHAR aggregates advance through the small-integer
+inputs and stop at the separate CHAR-to-text gap; this slice does not claim
+that unresolved contract. Other open implementation entries include
+small-integer decimal targets, INT-to-IPv4, STRING-to-DATE and DOUBLE arrays.
+
+No new store-and-forward test was added. The changed code only chooses an
+already supported target-native VARCHAR or SYMBOL representation before the
+frame is persisted. Exact public wire tests prove those bytes, while existing
+schema-frame replay and the established long-to-text persistence coverage remain
+green. A setter-specific replay test would repeat unchanged persistence code.

@@ -1,10 +1,10 @@
 # Schema-aware sender: schema-directed encoding
 
-Status: implemented on the development branch, revision 63. Scope: QWP v1 over
+Status: implemented on the development branch, revision 64. Scope: QWP v1 over
 WebSocket, with an automatically negotiated schema extension, legacy-server
 compatibility and companion server changes. The committed baseline contains the
-protocol, Sender integration and conversions through iteration 2.39c. Iteration
-2.40 (integer temporal targets) is locally validated. A released-binary
+protocol, Sender integration and conversions through iteration 2.40. Iteration
+2.41 (small-integer text targets) is locally validated. A released-binary
 compatibility gate is implemented and locally green. The remaining public-setter
 conversion contract is not complete.
 
@@ -39,11 +39,10 @@ server-side failures can still reject a batch.
 
 ## Implementation status
 
-Current checkpoint: iteration 2.40 adds BYTE, SHORT and INT input to DATE,
-TIMESTAMP and TIMESTAMP_NS targets, plus LONG input to DATE. Its pre-iteration
-baseline is client `8932076f24` and server `67e2c94f7a`, whose submodule pins
-that exact client revision. The integer temporal slice is the current locally
-validated increment.
+Current checkpoint: iteration 2.41 adds BYTE, SHORT and INT input to STRING,
+VARCHAR and SYMBOL targets. Its pre-iteration baseline is client `853c3292c1`
+and server `85f24785d3`, whose submodule pins that exact client revision. The
+small-integer text slice is the current locally validated increment.
 The wider conversion inventory below is not complete; this is not release acceptance.
 
 The standing compatibility gate now runs three real process combinations:
@@ -156,6 +155,17 @@ the established LONG switch perform the append, with no new converter, retained
 state, allocation or server production code. Shared exact-wire and real-server
 vectors, partial-row rollback, parameter rejection and a DATE-to-TIMESTAMP_NS
 schema rebind cover the slice. D061 records the decision and evidence.
+
+BYTE, SHORT and INT inputs now also select STRING, VARCHAR and SYMBOL target
+wire types directly. The existing reusable integer text sink formats the widened
+value once; STRING and VARCHAR use the same VARCHAR wire representation, while
+SYMBOL uses the existing global dictionary path. `Integer.MIN_VALUE` remains a
+source NULL and is written through the target bitmap. BYTE and SHORT have no
+source-null sentinel. No source-width formatter, converter object, retained
+value, per-row String or server production code was added. A shared 30-case
+corpus, exact-wire tests, generation rebind, legacy isolation, public-Sender
+real-server ingestion and A/error/C rollback cover the slice. D062 records the
+decision and evidence.
 
 Iteration 2.15 is accepted as a bounded, unreleased Sender integration.
 Public setters select the negotiated mode, use server-directed conversions,
@@ -933,8 +943,8 @@ when the table or column is absent.
 ## Conversion backlog (server-source audit)
 
 Cross-checked on 2026-09-11 after iteration 2.13, with implemented coverage
-refreshed through iteration 2.40 on 2026-09-14. The pre-iteration baseline is
-client `8932076f24` and server `67e2c94f7a`, whose submodule pins that exact
+refreshed through iteration 2.41 on 2026-09-14. The pre-iteration baseline is
+client `853c3292c1` and server `85f24785d3`, whose submodule pins that exact
 client revision. The original audit bases were client
 `981bdb02a471f3b290c89b8e78cbc422610e329e` and server
 `12a33d651e51e2682e7a448c8db5168fc72dfad3`. The matrix is a source audit;
@@ -965,8 +975,8 @@ non-null conversion. Known compatibility exceptions above still apply.
 | Public input (source wire type) | Implemented targets | Missing server-accepted targets |
 | --- | --- | --- |
 | `boolColumn` (BOOLEAN) | BOOLEAN, numeric, text | None |
-| `byteColumn`, `shortColumn` (BYTE, SHORT) | Numeric, DATE, timestamps | Text, SYMBOL, decimals |
-| `intColumn` (INT) | Numeric, DATE, timestamps | Text, SYMBOL, decimals, IPv4 |
+| `byteColumn`, `shortColumn` (BYTE, SHORT) | Numeric, DATE, timestamps, text, SYMBOL | Decimals |
+| `intColumn` (INT) | Numeric, DATE, timestamps, text, SYMBOL | Decimals, IPv4 |
 | `longColumn` (LONG) | Numeric, text, SYMBOL, DATE, timestamps, decimals | None |
 | `floatColumn`, `doubleColumn` (FLOAT, DOUBLE) | Numeric, text, SYMBOL, decimals | None |
 | `stringColumn` (VARCHAR) | BOOLEAN, numeric, text, SYMBOL, UUID, BINARY, timestamps, CHAR, LONG256, geohash, decimals | DATE |
@@ -1684,6 +1694,10 @@ They do not change the compatibility contract.
     integer append paths and source-null rules. Do not add a temporal value
     object, unit-normalization layer or shared encoder: DATE has no timestamp
     encoding discriminator, while both timestamp wire types do.
+23. **Reuse one integer formatter for integer text targets.** BYTE, SHORT and
+    INT widen losslessly to long, so use the established reusable long sink and
+    direct STRING/VARCHAR or SYMBOL append paths. Do not add source-width
+    formatters, boxed values, per-row strings or a text conversion registry.
 
 These opportunities do not justify a per-setter opt-out, raw-value fallback or
 send-time transformation. Partial activation is permitted on the unreleased
@@ -1699,7 +1713,7 @@ implementation and its tests together. Do not wait for negotiation,
 compatibility and all converters to be implemented before exercising the
 complete client-to-server path. Reuse the existing test infrastructure.
 
-### Plan after iteration 2.40
+### Plan after iteration 2.41
 
 The permanent compatibility gate is implemented. It launches released and
 current artifacts as separate processes and checks these observable contracts:
@@ -1732,17 +1746,21 @@ target-native identity or text representation, with separate public E2E,
 exact-wire, rollback, rebind, old-peer and replay coverage. The group added no
 new conversion framework or server production code.
 
-Iteration 2.40 is complete locally: BYTE, SHORT and INT select DATE, TIMESTAMP
+Iteration 2.40 is committed: BYTE, SHORT and INT select DATE, TIMESTAMP
 and TIMESTAMP_NS target representations, and LONG selects DATE. Source values
 remain raw counts in the target unit; no unit conversion or new temporal
 abstraction was added.
 
-The next bounded slice is BYTE, SHORT and INT to STRING, VARCHAR and SYMBOL.
-Reuse the existing allocation-free integer formatter and text/symbol append
-paths. Then reuse the established exact decimal append tail for those three
-integer sources, implement the separate INT-to-IPv4 null translation, and add
-STRING-to-DATE parsing. DOUBLE arrays follow only after rank metadata is proven
-end to end.
+Iteration 2.41 is complete locally: BYTE, SHORT and INT select STRING, VARCHAR
+and SYMBOL target representations through the existing reusable integer
+formatter and direct text/symbol append paths. The real-server conversion
+diagnostic improves by exactly one error because the SYMBOL aggregate is now
+green; STRING and VARCHAR continue to the independent CHAR-to-text gap.
+
+The next bounded slice is BYTE, SHORT and INT to decimal targets. Reuse the
+established exact decimal append tail rather than add another conversion path.
+Then implement the separate INT-to-IPv4 null translation and STRING-to-DATE
+parsing. DOUBLE arrays follow only after rank metadata is proven end to end.
 BINARY-to-parser conversions, LONG_ARRAY, non-ASCII
 CHAR-to-VARCHAR and malformed decimal metadata remain server-contract decisions,
 not client implementation backlog.

@@ -265,7 +265,7 @@ public final class QwpSchemaBinding {
     }
 
     public QwpSchemaBinding byteColumn(CharSequence name, byte value) {
-        return integerNumericColumn(name, value, "BYTE", ColumnType.BYTE, false);
+        return integerColumn(name, value, "BYTE", ColumnType.BYTE, false);
     }
 
     public QwpSchemaBinding doubleColumn(CharSequence name, double value) {
@@ -386,7 +386,7 @@ public final class QwpSchemaBinding {
     }
 
     public QwpSchemaBinding intColumn(CharSequence name, int value) {
-        return integerNumericColumn(name, value, "INT", ColumnType.INT, value == Integer.MIN_VALUE);
+        return integerColumn(name, value, "INT", ColumnType.INT, value == Integer.MIN_VALUE);
     }
 
     public QwpSchemaBinding ipv4Column(CharSequence name, int address) {
@@ -553,7 +553,7 @@ public final class QwpSchemaBinding {
     }
 
     public QwpSchemaBinding shortColumn(CharSequence name, short value) {
-        return integerNumericColumn(name, value, "SHORT", ColumnType.SHORT, false);
+        return integerColumn(name, value, "SHORT", ColumnType.SHORT, false);
     }
 
     public QwpSchemaBinding stringColumn(CharSequence name, CharSequence value) {
@@ -1126,7 +1126,7 @@ public final class QwpSchemaBinding {
         }
     }
 
-    private QwpSchemaBinding integerNumericColumn(
+    private QwpSchemaBinding integerColumn(
             CharSequence name,
             long value,
             String inputType,
@@ -1141,6 +1141,7 @@ public final class QwpSchemaBinding {
             return this;
         }
         if (!isNumericTarget(targetType)
+                && !isTextTarget(targetType)
                 && targetType != ColumnType.DATE
                 && targetType != ColumnType.TIMESTAMP_MICRO
                 && targetType != ColumnType.TIMESTAMP_NANO) {
@@ -1178,8 +1179,15 @@ public final class QwpSchemaBinding {
             case ColumnType.DOUBLE:
                 column.addDouble((double) value);
                 break;
+            case ColumnType.STRING:
+            case ColumnType.VARCHAR:
+                column.addString(formatLong(value));
+                break;
+            case ColumnType.SYMBOL:
+                column.addSymbol(formatLong(value));
+                break;
             default:
-                throw new AssertionError("unsupported numeric target");
+                throw new AssertionError("unsupported integer target");
         }
         return this;
     }

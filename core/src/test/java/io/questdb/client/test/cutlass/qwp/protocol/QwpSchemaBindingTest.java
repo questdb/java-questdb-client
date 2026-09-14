@@ -569,6 +569,65 @@ public class QwpSchemaBindingTest {
     }
 
     @Test
+    public void testSmallIntegerTextConformanceCorpusUsesTargetWire() throws Exception {
+        InputStream stream = QwpSchemaBindingTest.class.getResourceAsStream(
+                "/io/questdb/client/cutlass/qwp/small-integer-to-text.tsv");
+        Assert.assertNotNull(stream);
+        int count = 0;
+        try (BufferedReader lines = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = lines.readLine()) != null) {
+                if (line.isEmpty() || line.charAt(0) == '#') {
+                    continue;
+                }
+                String[] fields = line.split("\t", -1);
+                Assert.assertEquals(line, 6, fields.length);
+                try {
+                    long input = Long.parseLong(fields[2]);
+                    byte wireType = textWireType(fields[3]);
+                    try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                         QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                        QwpSchemaBinding rows = rows(buffer, column("value", textColumnType(fields[3])));
+                        appendSmallInteger(rows, fields[1], input, "value");
+                        buffer.nextRow();
+                        Reader reader = tableReader(encoder, encoder.encodeSchema(buffer), 1, wireType);
+                        if ("<NULL>".equals(fields[4])) {
+                            Assert.assertEquals("<NULL>", fields[5]);
+                            Assert.assertEquals("NULL bitmap must be present", 1, reader.byteValue());
+                            Assert.assertEquals("row zero must be NULL", 1, reader.byteValue());
+                            if (wireType == QwpConstants.TYPE_SYMBOL) {
+                                Assert.assertEquals(0, reader.varint());
+                            } else {
+                                Assert.assertEquals(0, reader.intValue());
+                            }
+                        } else {
+                            byte[] expected = hexBytes(fields[4]);
+                            Assert.assertEquals(fields[5], new String(expected, StandardCharsets.UTF_8));
+                            Assert.assertEquals("value must be bitmap-present", 0, reader.byteValue());
+                            if (wireType == QwpConstants.TYPE_SYMBOL) {
+                                Assert.assertEquals(1, reader.varint());
+                                Assert.assertEquals(fields[5], reader.stringValue());
+                                Assert.assertEquals(0, reader.varint());
+                            } else {
+                                Assert.assertEquals(0, reader.intValue());
+                                Assert.assertEquals(expected.length, reader.intValue());
+                                for (byte value : expected) {
+                                    Assert.assertEquals(value & 0xff, reader.byteValue());
+                                }
+                            }
+                        }
+                        Assert.assertEquals(encoder.getBuffer().getPosition(), reader.position());
+                    }
+                } catch (AssertionError e) {
+                    throw new AssertionError("case_id=" + fields[0] + ": " + e.getMessage(), e);
+                }
+                count++;
+            }
+        }
+        Assert.assertEquals(30, count);
+    }
+
+    @Test
     public void testIntegerTemporalConformanceCorpusUsesTargetWire() throws Exception {
         InputStream stream = QwpSchemaBindingTest.class.getResourceAsStream(
                 "/io/questdb/client/cutlass/qwp/integer-temporal-conversions.tsv");
@@ -710,7 +769,8 @@ public class QwpSchemaBindingTest {
             QwpSchemaBinding rows = rows(buffer,
                     column("uuid", ColumnType.UUID),
                     column("future", ColumnType.INT, new byte[]{1}),
-                    column("future_date", ColumnType.DATE, new byte[]{1}));
+                    column("future_date", ColumnType.DATE, new byte[]{1}),
+                    column("future_text", ColumnType.VARCHAR, new byte[]{1}));
             assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
                     () -> rows.byteColumn("uuid", (byte) 1));
             rollbackCurrentRow(buffer);
@@ -719,6 +779,9 @@ public class QwpSchemaBindingTest {
             rollbackCurrentRow(buffer);
             assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
                     () -> rows.byteColumn("future_date", (byte) 3));
+            rollbackCurrentRow(buffer);
+            assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+                    () -> rows.intColumn("future_text", 4));
             rollbackCurrentRow(buffer);
             assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
                     () -> rows.intColumn("uuid", Integer.MIN_VALUE));
@@ -1735,6 +1798,14 @@ public class QwpSchemaBindingTest {
         }
     }
 
+    private static byte[] hexBytes(String value) {
+        byte[] bytes = new byte[value.length() / 2];
+        for (int i = 0; i < bytes.length; i++) {
+            bytes[i] = (byte) Integer.parseInt(value.substring(i * 2, i * 2 + 2), 16);
+        }
+        return bytes;
+    }
+
     private static void assertNumericValue(Reader reader, String target, String expected) {
         switch (target) {
             case "BYTE":
@@ -1797,6 +1868,19 @@ public class QwpSchemaBindingTest {
             case "TIMESTAMP_NS": return ColumnType.TIMESTAMP_NANO;
             default: throw new AssertionError(target);
         }
+    }
+
+    private static int textColumnType(String target) {
+        switch (target) {
+            case "STRING": return ColumnType.STRING;
+            case "VARCHAR": return ColumnType.VARCHAR;
+            case "SYMBOL": return ColumnType.SYMBOL;
+            default: throw new AssertionError(target);
+        }
+    }
+
+    private static byte textWireType(String target) {
+        return "SYMBOL".equals(target) ? QwpConstants.TYPE_SYMBOL : QwpConstants.TYPE_VARCHAR;
     }
 
     private static byte timestampWireType(String target) {
