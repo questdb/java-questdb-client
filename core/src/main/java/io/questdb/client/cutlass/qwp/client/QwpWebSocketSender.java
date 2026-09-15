@@ -4503,8 +4503,10 @@ public class QwpWebSocketSender implements Sender {
 
     /**
      * Selects the wire contract before the first effective value of a row.
-     * Empty table selection remains local; an unreachable or failed handshake
-     * is never guessed to be a legacy server.
+     * Empty table selection remains local. In asynchronous initial-connect mode,
+     * fresh senders use the legacy contract until schema support is confirmed;
+     * recovered schema-framed data and senders that have already confirmed support
+     * retain the strict schema path.
      */
     private QwpSchemaBinding bindingForEffectiveWrite() {
         QwpSchemaBinding pinned = currentTableBuffer.getSchemaBinding();
@@ -4512,8 +4514,13 @@ public class QwpWebSocketSender implements Sender {
             schemaResolutionFresh[0] = false;
             return pinned;
         }
-        final long deadlineNanos = System.nanoTime() + schemaWaitMillis * 1_000_000L;
         ensureConnected();
+        if (initialConnectMode == Sender.InitialConnectMode.ASYNC
+                && !cursorEngine.requiresSchema()) {
+            schemaResolutionFresh[0] = false;
+            return null;
+        }
+        final long deadlineNanos = System.nanoTime() + schemaWaitMillis * 1_000_000L;
         if (!cursorSendLoop.awaitInitialSchemaMode(remainingSchemaMillis(deadlineNanos))) {
             return null;
         }

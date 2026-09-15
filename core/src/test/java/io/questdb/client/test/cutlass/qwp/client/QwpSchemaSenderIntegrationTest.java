@@ -18,9 +18,12 @@ import io.questdb.client.std.Decimal256;
 import io.questdb.client.std.Decimal64;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 
 import java.io.BufferedReader;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -32,12 +35,10 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -47,6 +48,8 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 public class QwpSchemaSenderIntegrationTest {
     private static final String DECIMAL_TEXT_CORPUS =
             "/io/questdb/client/cutlass/qwp/native-decimal-to-text.tsv";
+    @Rule
+    public final TemporaryFolder temporaryFolder = TemporaryFolder.builder().assureDeletion().build();
 
     @Test
     public void testDecimalTextOverloadUsesTargetDecimalAndRecoversRows() throws Exception {
@@ -1804,45 +1807,40 @@ public class QwpSchemaSenderIntegrationTest {
         });
     }
 
-    @Test
-    public void testAsyncFirstEffectiveWriteWaitsForNegotiationInsteadOfGuessingLegacy() throws Exception {
+    @Test(timeout = 10_000)
+    public void testAsyncWritesLegacyOfflineThenUsesSchemaAfterSupportingConnect() throws Exception {
         assertMemoryLeak(() -> {
             int port = TestPorts.findUnusedPort();
             Sender sender = Sender.fromConfig("ws::addr=localhost:" + port
                     + ";initial_connect_retry=async;reconnect_initial_backoff_millis=10;"
-                    + "reconnect_max_backoff_millis=50;close_flush_timeout_millis=0;");
-            ExecutorService executor = Executors.newSingleThreadExecutor();
-            CountDownLatch entered = new CountDownLatch(1);
-            Future<?> write = executor.submit(() -> {
-                entered.countDown();
-                sender.table("events").uuidColumn("id", 7, 8).atNow();
-                sender.flush();
-            });
+                    + "reconnect_max_backoff_millis=50;auto_flush_rows=2147483647;"
+                    + "auto_flush_bytes=0;auto_flush_interval=2147483646;"
+                    + "close_flush_timeout_millis=0;");
             TestWebSocketServer server = null;
             try {
-                Assert.assertTrue(entered.await(5, TimeUnit.SECONDS));
-                try {
-                    write.get(100, TimeUnit.MILLISECONDS);
-                    Assert.fail("first effective write guessed a wire mode without a server handshake");
-                } catch (TimeoutException expected) {
-                    // The write remains blocked inside the bounded negotiation path.
-                }
-                SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 71, 72);
+                Instant value = Instant.ofEpochSecond(3, 456_789_123);
+                // No server is listening: this effective write must nevertheless
+                // complete on the caller thread using the existing legacy conversion.
+                sender.table("events").timestampColumn("ts", value).atNow();
+
+                SchemaHandler handler = new SchemaHandler(
+                        QwpSchemaProtocol.RESULT_KNOWN, 71, 72, true, -1);
                 server = new TestWebSocketServer(handler, false, null, port);
                 server.setAdvertiseSchema(true);
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-                try {
-                    write.get(5, TimeUnit.SECONDS);
-                } catch (ExecutionException e) {
-                    throw new AssertionError(e.getCause());
-                }
-                byte[] frame = handler.awaitDataFrame();
-                Assert.assertTrue((frame[QwpConstants.HEADER_OFFSET_FLAGS] & QwpConstants.FLAG_SCHEMA) != 0);
+                Assert.assertTrue("schema-capable connection was not installed", handler.awaitPong());
+
+                sender.table("events").timestampColumn("ts", value).atNow();
+                sender.flush();
+
+                List<byte[]> frames = handler.awaitDataFrames(2);
+                new FrameReader(frames.get(0)).legacyTimestampTable(
+                        "events", "ts", 3_456_789L);
+                new FrameReader(frames.get(1)).schemaTimestampTable(
+                        "events", 71, 72, "ts", 3_456_789_123L);
                 Assert.assertEquals(1, handler.describeRequests.get());
             } finally {
-                executor.shutdownNow();
-                Assert.assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
                 sender.close();
                 if (server != null) {
                     server.close();
@@ -1892,12 +1890,15 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test(timeout = 10_000)
-    public void testFirstNegotiationDeadlineFailsTypedThenRetryUsesAvailableSchema() throws Exception {
+    public void testSchemaLookupDeadlineFailsTypedThenRetryUsesAvailableSchema() throws Exception {
         assertMemoryLeak(() -> {
-            int port = TestPorts.findUnusedPort();
-            try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + port
-                    + ";initial_connect_retry=async;reconnect_initial_backoff_millis=10;"
-                    + "reconnect_max_backoff_millis=50;close_flush_timeout_millis=0;")) {
+            SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 91, 92);
+            handler.respondToDescribe = false;
+            try (TestWebSocketServer server = schemaServer(handler);
+                 Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                         + ";initial_connect_retry=async;reconnect_initial_backoff_millis=10;"
+                         + "reconnect_max_backoff_millis=50;close_flush_timeout_millis=0;")) {
+                Assert.assertTrue("schema-capable connection was not installed", handler.awaitPong());
                 ((QwpWebSocketSender) sender).setSchemaWaitMillisForTesting(1_000);
                 sender.table("events");
                 try {
@@ -1906,53 +1907,88 @@ public class QwpSchemaSenderIntegrationTest {
                 } catch (LineSenderSchemaException e) {
                     Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE, e.getReason());
                 }
-                SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 91, 92);
-                try (TestWebSocketServer server = new TestWebSocketServer(handler, false, null, port)) {
-                    server.setAdvertiseSchema(true);
-                    server.start();
-                    Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-                    sender.uuidColumn("id", 3, 4).atNow();
-                    sender.flush();
-                    Assert.assertTrue((handler.awaitDataFrame()[QwpConstants.HEADER_OFFSET_FLAGS]
-                            & QwpConstants.FLAG_SCHEMA) != 0);
-                }
+                handler.respondToDescribe = true;
+                sender.uuidColumn("id", 3, 4).atNow();
+                sender.flush();
+                Assert.assertTrue((handler.awaitDataFrame()[QwpConstants.HEADER_OFFSET_FLAGS]
+                        & QwpConstants.FLAG_SCHEMA) != 0);
             }
         });
     }
 
     @Test
-    public void testInterruptedFirstNegotiationFailsTypedAndPreservesInterrupt() throws Exception {
+    public void testInterruptedSchemaLookupFailsTypedAndPreservesInterrupt() throws Exception {
         assertMemoryLeak(() -> {
-            int port = TestPorts.findUnusedPort();
-            Sender sender = Sender.fromConfig("ws::addr=localhost:" + port
-                    + ";initial_connect_retry=async;reconnect_initial_backoff_millis=10;"
-                    + "reconnect_max_backoff_millis=50;close_flush_timeout_millis=0;");
-            ExecutorService executor = Executors.newSingleThreadExecutor();
-            CountDownLatch entered = new CountDownLatch(1);
-            AtomicReference<Thread> writer = new AtomicReference<>();
-            AtomicBoolean interruptPreserved = new AtomicBoolean();
-            Future<LineSenderSchemaException> result = executor.submit(() -> {
-                writer.set(Thread.currentThread());
-                entered.countDown();
+            SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 93, 94);
+            handler.respondToDescribe = false;
+            try (TestWebSocketServer server = schemaServer(handler);
+                 Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                         + ";initial_connect_retry=async;reconnect_initial_backoff_millis=10;"
+                         + "reconnect_max_backoff_millis=50;close_flush_timeout_millis=0;")) {
+                Assert.assertTrue("schema-capable connection was not installed", handler.awaitPong());
+                ExecutorService executor = Executors.newSingleThreadExecutor();
+                CountDownLatch entered = new CountDownLatch(1);
+                AtomicReference<Thread> writer = new AtomicReference<>();
+                AtomicBoolean interruptPreserved = new AtomicBoolean();
+                Future<LineSenderSchemaException> result = executor.submit(() -> {
+                    writer.set(Thread.currentThread());
+                    entered.countDown();
+                    try {
+                        sender.table("events").uuidColumn("id", 1, 2);
+                        return null;
+                    } catch (LineSenderSchemaException e) {
+                        interruptPreserved.set(Thread.currentThread().isInterrupted());
+                        return e;
+                    }
+                });
                 try {
-                    sender.table("events").uuidColumn("id", 1, 2);
-                    return null;
-                } catch (LineSenderSchemaException e) {
-                    interruptPreserved.set(Thread.currentThread().isInterrupted());
-                    return e;
+                    Assert.assertTrue(entered.await(5, TimeUnit.SECONDS));
+                    writer.get().interrupt();
+                    LineSenderSchemaException error = result.get(5, TimeUnit.SECONDS);
+                    Assert.assertNotNull(error);
+                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE, error.getReason());
+                    Assert.assertTrue("writer interrupt status was cleared", interruptPreserved.get());
+                } finally {
+                    executor.shutdownNow();
+                    Assert.assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
                 }
-            });
-            try {
-                Assert.assertTrue(entered.await(5, TimeUnit.SECONDS));
-                writer.get().interrupt();
-                LineSenderSchemaException error = result.get(5, TimeUnit.SECONDS);
-                Assert.assertNotNull(error);
-                Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE, error.getReason());
-                Assert.assertTrue("writer interrupt status was cleared", interruptPreserved.get());
-            } finally {
-                executor.shutdownNow();
-                Assert.assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
-                sender.close();
+            }
+        });
+    }
+
+    @Test(timeout = 10_000)
+    public void testAsyncRecoveredSchemaBacklogDoesNotFallBackToLegacy() throws Exception {
+        assertMemoryLeak(() -> {
+            File sfRoot = temporaryFolder.newFolder("schema-required-recovery");
+            SchemaHandler handler = new SchemaHandler(
+                    QwpSchemaProtocol.RESULT_KNOWN, 95, 96, false);
+            int unavailablePort;
+            try (TestWebSocketServer server = schemaServer(handler)) {
+                String cfg = "ws::addr=localhost:" + server.getPort()
+                        + ";sf_dir=" + sfRoot.getAbsolutePath()
+                        + ";sender_id=recovery;close_flush_timeout_millis=0;";
+                try (Sender sender = Sender.fromConfig(cfg)) {
+                    sender.table("events").uuidColumn("id", 1, 2).atNow();
+                    sender.flush();
+                    Assert.assertTrue((handler.awaitDataFrame()[QwpConstants.HEADER_OFFSET_FLAGS]
+                            & QwpConstants.FLAG_SCHEMA) != 0);
+                }
+                unavailablePort = TestPorts.findUnusedPort();
+            }
+
+            try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + unavailablePort
+                    + ";sf_dir=" + sfRoot.getAbsolutePath()
+                    + ";sender_id=recovery;initial_connect_retry=async;"
+                    + "reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=50;"
+                    + "close_flush_timeout_millis=0;")) {
+                ((QwpWebSocketSender) sender).setSchemaWaitMillisForTesting(250);
+                sender.table("events");
+                try {
+                    sender.uuidColumn("id", 3, 4);
+                    Assert.fail("recovered schema-required backlog fell back to legacy encoding");
+                } catch (LineSenderSchemaException e) {
+                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE, e.getReason());
+                }
             }
         });
     }
@@ -2270,6 +2306,42 @@ public class QwpSchemaSenderIntegrationTest {
             byte[] actual = new byte[total];
             in.get(actual);
             Assert.assertArrayEquals(bytes, actual);
+            eof();
+        }
+
+        private void legacyTimestampTable(String table, String column, long expectedMicros) {
+            Assert.assertEquals(QwpConstants.MAGIC_MESSAGE, in.getInt());
+            Assert.assertEquals(QwpConstants.VERSION, u8());
+            Assert.assertEquals(0, u8() & QwpConstants.FLAG_SCHEMA);
+            Assert.assertEquals(1, in.getShort() & 0xffff);
+            Assert.assertEquals(in.remaining() - Integer.BYTES, in.getInt());
+            Assert.assertEquals(0, varint());
+            Assert.assertEquals(0, varint());
+            Assert.assertEquals(table, string());
+            Assert.assertEquals(1, varint());
+            Assert.assertEquals(1, varint());
+            Assert.assertEquals(column, string());
+            Assert.assertEquals(QwpConstants.TYPE_TIMESTAMP, u8());
+            Assert.assertEquals(0, u8());
+            Assert.assertEquals(0, u8());
+            Assert.assertEquals(expectedMicros, i64());
+            eof();
+        }
+
+        private void schemaTimestampTable(
+                String table,
+                int tableId,
+                long version,
+                String column,
+                long expectedNanos
+        ) {
+            messageHeader(1);
+            Assert.assertEquals(0, varint());
+            Assert.assertEquals(0, varint());
+            schemaBlockHeader(table, tableId, version, 1, column, QwpConstants.TYPE_TIMESTAMP_NANOS);
+            Assert.assertEquals(0, u8());
+            Assert.assertEquals(0, u8());
+            Assert.assertEquals(expectedNanos, i64());
             eof();
         }
 
@@ -3346,18 +3418,37 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     private static final class SchemaHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private final boolean acknowledgeData;
         private final List<byte[]> dataFrames = new ArrayList<>();
         private final CountDownLatch pong = new CountDownLatch(1);
         private final AtomicInteger describeRequests = new AtomicInteger();
+        private final int designatedIndex;
         private volatile int result;
+        private volatile boolean respondToDescribe = true;
         private final int tableId;
         private volatile long version;
         private long ackSequence;
 
         private SchemaHandler(int result, int tableId, long version) {
+            this(result, tableId, version, true);
+        }
+
+        private SchemaHandler(int result, int tableId, long version, boolean acknowledgeData) {
+            this(result, tableId, version, acknowledgeData, 2);
+        }
+
+        private SchemaHandler(
+                int result,
+                int tableId,
+                long version,
+                boolean acknowledgeData,
+                int designatedIndex
+        ) {
             this.result = result;
             this.tableId = tableId;
             this.version = version;
+            this.acknowledgeData = acknowledgeData;
+            this.designatedIndex = designatedIndex;
         }
 
         @Override
@@ -3365,6 +3456,9 @@ public class QwpSchemaSenderIntegrationTest {
             if (data.length >= QwpConstants.HEADER_SIZE
                     && data[QwpConstants.HEADER_OFFSET_FLAGS] == QwpSchemaProtocol.FLAG_CONTROL) {
                 describeRequests.incrementAndGet();
+                if (!respondToDescribe) {
+                    return;
+                }
                 ByteBuffer request = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
                 long requestId = request.getLong(QwpConstants.HEADER_SIZE + 1);
                 int nameLength = request.getShort(QwpConstants.HEADER_SIZE + 1 + Long.BYTES) & 0xffff;
@@ -3377,6 +3471,9 @@ public class QwpSchemaSenderIntegrationTest {
             }
             dataFrames.add(data);
             notifyAll();
+            if (!acknowledgeData) {
+                return;
+            }
             try {
                 client.sendBinary(QwpWireTestUtils.buildAck(ackSequence++));
             } catch (IOException e) {
@@ -3445,7 +3542,7 @@ public class QwpSchemaSenderIntegrationTest {
                     .put(QwpSchemaProtocol.FLAG_CONTROL).putShort((short) 0).putInt(payloadLength)
                     .put(QwpSchemaProtocol.KIND_SCHEMA).putLong(requestId).put((byte) result);
             if (result == QwpSchemaProtocol.RESULT_KNOWN) {
-                out.putInt(responseTableId).putLong(version).putShort((short) 2).putShort((short) 3)
+                out.putInt(responseTableId).putLong(version).putShort((short) designatedIndex).putShort((short) 3)
                         .putShort((short) id.length).put(id).putInt(ColumnType.UUID).putShort((short) 0)
                         .putShort((short) failed.length).put(failed).putInt(ColumnType.STRING).putShort((short) 0)
                         .putShort((short) ts.length).put(ts).putInt(ColumnType.TIMESTAMP_NANO).putShort((short) 0);

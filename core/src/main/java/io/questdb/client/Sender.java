@@ -819,7 +819,15 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      *       unconnected sender; the I/O thread runs the same retry loop in
      *       the background. The user thread can call {@code at()} /
      *       {@code flush()} immediately; rows accumulate in the cursor SF
-     *       engine until the wire is up. Transport failures (unreachable or
+     *       engine until the wire is up. Before schema support is confirmed,
+     *       new rows use the legacy conversion contract; schema mismatches may
+     *       therefore be reported later by the server, and values such as
+     *       nanosecond timestamps use their legacy representation. If recovered
+     *       data already requires schema support, writes instead wait for schema
+     *       negotiation. Once support is confirmed, all future rows use strict
+     *       schema lookup and validation, including across reconnects; a row
+     *       already in progress keeps the contract under which it began. Transport
+     *       failures (unreachable or
      *       dropped server) retry indefinitely and are never surfaced -- the
      *       buffered rows are safe in SF and the server may still appear. A
      *       terminal auth, upgrade or capability rejection on the initial

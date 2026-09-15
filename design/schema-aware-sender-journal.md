@@ -7809,3 +7809,132 @@ The intentional, server-supported public-setter conversion catalogue is now
 complete. BINARY parser paths, LONG_ARRAY, non-ASCII CHAR text and malformed
 decimal metadata remain explicit server-contract decisions, not unfinished
 client converters.
+
+## D067 — ASYNC cold start uses best-effort legacy encoding
+
+Status: design accepted, implementation pending, 2026-09-15. Design revision
+69. No production code or tests changed in this decision record.
+
+The full client-module diagnostic exposed a real contract conflict rather
+than an array failure. `lazy_connect=true` selects the existing asynchronous
+initial-connect policy, whose public contract says producers can buffer while
+the server is unavailable. Schema activation instead made the first effective
+write wait up to 30 seconds for negotiation and throw `SCHEMA_UNAVAILABLE`.
+Preserving both mandatory cold-cache schema lookup and non-blocking offline
+writes would require retaining original values for later conversion. That
+would reintroduce the rejected send-time transformation model.
+
+Reuse the existing initial-connect choice instead. `OFF` makes one strict
+foreground connection/negotiation attempt, while `SYNC` retries strictly within
+its configured reconnect budget. Before any successful handshake, `ASYNC`
+accepts a row immediately using the existing legacy conversion and flag-clear
+framing, provided recovery has not already found schema-framed data. The first
+effective operation pins the row's mode. A handshake completed during a partial
+legacy row affects only the next row; buffered bytes are never relabelled,
+rewritten or reconverted.
+
+This is a narrow startup exception, not a permanent schema switch. A successful
+old-server handshake keeps subsequent rows legacy, but does not prohibit a
+later one-way upgrade when another connection confirms schema support. Once
+support is confirmed, cache misses and later outages retain the strict
+30-second lookup/error contract and never fall back. A recovered extended
+backlog also carries the sticky schema requirement before the fresh sender has
+connected, so it overrides `ASYNC` fallback and waits for a supporting server.
+
+Source review confirms the simple wire path. The server rejects a schema flag
+without negotiation but accepts flag-clear legacy frames on a negotiated
+connection. The sender already pins a partial row and separates legacy and
+schema-bound buffers at a row boundary. The cursor engine already records when
+recovered frames require schema support. Implementation therefore needs no new
+protocol field, raw-row store, deferred converter, persisted side file or
+schema-specific configuration option.
+
+The availability cost is explicit. Pre-handshake rows use the whole legacy
+conversion contract, not merely weaker validation. Handshake timing can change
+successful stored values for cases such as sub-microsecond timestamps,
+overflow and source-null normalization. A bad legacy row can also be accepted
+locally and later receive a terminal NACK that stops the persisted queue; no
+schema reply can repair its bytes. API documentation and release notes must
+call this legacy conversion before confirmation and explain existing terminal
+recovery, rather than promise deterministic schema-mode results.
+
+Required acceptance covers offline `ASYNC` startup followed by old and new
+servers, handshake before the first row and during a partial row, old-to-new
+upgrade, exact legacy/schema value differences, mixed replay across restart,
+recovered schema-required backlog while offline, terminal rejection of a bad
+startup row and a post-upgrade cache miss. Replace the stale facade recovery
+expectation that a blocking first write returns before the test starts its
+server; retain its observable construction, reconnect, write and read recovery
+coverage under the new contract.
+
+## D068 — Integrate ASYNC fallback with one existing sticky latch
+
+Status: implemented and validated in the working tree, 2026-09-15. Design
+revision 70. Not yet committed.
+
+Further source tracing reduced D067 to one producer-side decision in
+`QwpWebSocketSender.bindingForEffectiveWrite()`. Preserve the existing partial-
+row return first and call `ensureConnected()` as today. Before the current
+bounded negotiation/lookup path, return the existing legacy binding result
+when `initialConnectMode == ASYNC && !cursorEngine.requiresSchema()`, clearing
+the per-call schema-freshness marker as on other legacy/in-progress paths.
+
+Do not consult `hasEverConnected()`. A fresh asynchronous sender and a sender
+successfully connected to an old server both need legacy behavior, so
+distinguishing them adds no decision value. The engine requirement already
+becomes sticky when a supporting handshake succeeds and is restored directly
+from recovered schema-framed data. It is volatile and published before the I/O
+loop exposes the supporting connection, so it is also the correct race and
+recovery authority. If it flips immediately after the producer reads false,
+the current row is deliberately legacy and the existing row-boundary adoption
+makes the next row schema-aware.
+
+No new state, helper abstraction, cache probe, schema mode, configuration key,
+protocol field, raw-value owner, encoder path, persisted format, coordinator or
+server change is justified. Existing retired-buffer and mixed-flush code owns
+legacy-to-schema ordering, while the server already accepts flag-clear data on
+a negotiated connection.
+
+The essential new coverage is narrow. Replace the asynchronous first-write
+blocking test with one public test that buffers legacy data offline, connects
+to a supporting server and verifies exact legacy then schema representations;
+use a nanosecond `Instant` so the semantic difference is observable. Retarget
+the existing timeout and interruption tests to a confirmed schema connection
+whose describe response is withheld. Add one public recovered-schema-backlog
+test proving that `ASYNC` still waits or fails instead of appending legacy data.
+Reuse the existing facade late-server recovery, partial-row old-to-new upgrade,
+mixed restart replay, real-server negotiated-legacy and terminal-NACK tests;
+do not duplicate those fixtures. Final acceptance requires the complete client
+suite and the standing released-binary compatibility matrix.
+
+The implementation matches the brief. `bindingForEffectiveWrite()` keeps its
+in-progress-row path first, starts the existing I/O loop, then returns the
+legacy binding for `ASYNC` only while the cursor engine does not require
+schema. No production state, helper abstraction, coordinator path, encoder,
+store-and-forward format, protocol field or server code changed. The public
+`InitialConnectMode.ASYNC` documentation now states the legacy-before-support,
+sticky-upgrade and recovered-backlog behavior.
+
+One fixture assumption was disproved during implementation: its `ts` column was
+marked as the designated timestamp, so it could not expose the ordinary
+timestamp representation difference. The fixture now reports no designated
+column for that test. A nanosecond `Instant` then proves the actual contract:
+the offline row contains legacy microseconds and the post-handshake row contains
+schema-mode nanoseconds.
+
+Four focused new or changed tests pass. The full
+`QwpSchemaSenderIntegrationTest` passes 72 tests and
+`InitialConnectAsyncTest` passes seven. The complete client module passes 3,720
+tests with zero failures or errors and seven pre-existing skips. The current
+server's five-test `QwpSchemaIdentityE2ETest` passes, including mixed
+legacy/schema replay and legacy data on a negotiated connection.
+
+The released-binary matrix also passes: current client to QuestDB 10.0.1 uses
+legacy conversion, client 1.3.9 to the current server remains legacy, and the
+current client to current server enables schema mode. The packaged artifacts
+used client SHA-256
+`74bbc706b69a53b89b84ce738865321b639d06b92200e1e1fa497e85c36e2e40`
+and server SHA-256
+`38d597d80b12bb3c5ea13aa490b23df83061fb7299394b7c36a2c8227860627d`.
+The completed full-client, build, server and compatibility runs used scratch
+under `/mnt/pcie5`; `git diff --check` passes.

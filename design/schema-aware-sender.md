@@ -1,13 +1,17 @@
 # Schema-aware sender: schema-directed encoding
 
-Status: implemented on the development branch, revision 68. Scope: QWP v1 over
-WebSocket, with an automatically negotiated schema extension, legacy-server
-compatibility and companion server changes. The committed baseline contains the
-protocol, Sender integration and conversions through iteration 2.44. Iteration
-2.45 (ranked DOUBLE-array identity) is locally validated. A released-binary
-compatibility gate is implemented and locally green. The intentional,
-server-supported public-setter conversion catalogue is complete. The explicit
-server-contract boundaries below remain excluded rather than emulated.
+Status: schema-directed encoding is implemented on the development branch;
+design revision 70. Scope: QWP v1 over WebSocket, with an automatically
+negotiated schema extension, legacy-server compatibility and companion server
+changes. The committed baseline contains the protocol, Sender integration and
+conversions through iteration 2.45. A released-binary compatibility gate is
+implemented and locally green. The intentional, server-supported public-setter
+conversion catalogue is complete. Revision 69 defines best-effort legacy
+encoding during a genuinely asynchronous cold start; revision 70 reduces its
+integration to one existing sticky schema requirement. That availability
+change is implemented and validated in the working tree but is not yet
+committed. The explicit server-contract boundaries below remain excluded
+rather than emulated.
 
 ## Goal and contract
 
@@ -40,14 +44,20 @@ server-side failures can still reject a batch.
 
 ## Implementation status
 
-Current checkpoint: iteration 2.45 adds all public DOUBLE-array representations
-to canonical DOUBLE-array targets of exactly the same rank. Its pre-iteration
-baseline is client `47a37a6f` and server `c1f970220f`, whose submodule pins that
-exact client revision. The client reuses the existing array buffer and encoder,
-validates known rank before append, and pins the first effective rank for a
-confirmed missing column. The intentional conversion inventory below is now
-complete. This does not turn the separately documented unsafe or undefined
-server paths into supported conversions.
+Current checkpoint: iteration 2.46 implements revision 70's asynchronous
+cold-start behavior in the working tree. Before schema support is known, an
+`ASYNC` sender uses the legacy contract; after a supporting handshake, the
+existing engine requirement makes schema mode sticky. Recovered schema-framed
+backlog bypasses the legacy branch. The production change is one branch in
+`bindingForEffectiveWrite()` plus API documentation; it adds no state, protocol
+field, persisted format or send-time conversion.
+
+The committed baseline remains client `bc16c164` and server `02af9a6f31`, whose
+submodule pins that exact client revision. Iteration 2.45 on that baseline adds
+all public DOUBLE-array representations to canonical DOUBLE-array targets of
+exactly the same rank. The intentional conversion inventory is complete. This
+does not turn the separately documented unsafe or undefined server paths into
+supported conversions.
 
 The standing compatibility gate now runs three real process combinations:
 current client against QuestDB 10.0.1, client 1.3.9 against the current server,
@@ -625,19 +635,26 @@ response header selects legacy behavior, unless this sender has previously
 confirmed schema support. Explicit confirmation enables schema requests,
 schema-directed encoding and extended responses. An unrecognized response
 header is a negotiation error, not evidence of an old server; neither are
-connection failures, timeouts or authorization failures.
+connection failures, timeouts or authorization failures. Before any successful
+upgrade, `ASYNC` may nevertheless choose the existing legacy encoding contract
+for a new row. That is an explicit availability policy, not a claim that the
+unreachable peer is an old server.
 
 The upgrade is one-way: once a sender confirms schema support, it assumes all
 subsequent connections support the extension too. Require confirmation on
 reconnect and background replay connections; never switch back to legacy mode.
 Moving an upgraded sender to an old server is unsupported. Retain pending data
 and report the capability mismatch under the existing reconnect policy. There
-is no send-time transformation, metadata stripping or downgrade encoder.
+is no send-time transformation, metadata stripping or downgrade encoder. A
+successful connection to an old server does not permanently prevent upgrade:
+a later connection that confirms schema support adopts schema mode at the next
+row boundary.
 
 | Client | Server | Behavior |
 |---|---|---|
 | Existing client, no schema request | New server | Existing QWP v1 framing and behavior |
 | New client, not yet upgraded | Old server | Existing inferred-type QWP v1 behavior |
+| New client, `ASYNC`, no completed handshake | Unknown server | Best-effort legacy encoding until a handshake selects the mode |
 | New client, always requests schema | Supporting server | QWP v1 with the schema extension; one-way upgrade |
 | New client, already upgraded | Old server | Unsupported endpoint; retain pending data, no downgrade |
 
@@ -650,7 +667,9 @@ old/new endpoints are not supported for that sender after the upgrade.
 An existing legacy row finishes in legacy mode. The producer adopts schema
 mode at the next actual row boundary, seals completed legacy rows and replaces
 the inferred layout before binding new rows. Pending legacy blocks retain
-their original types and flag-clear framing, even if encoded or sent later.
+their original types and flag-clear framing, even if encoded or sent later. A
+supporting server accepts those flag-clear blocks on a schema-negotiated
+connection; negotiation is required only for schema-flagged data.
 
 The extension defines one stable conversion contract, backed by shared test
 vectors, rather than a separate conversion-version handshake or a dependency on
@@ -661,25 +680,85 @@ raw-value encoding. Schema lookup failures never disable schema mode.
 
 ## Availability
 
-In schema mode, required lookups use a fixed 30-second deadline. On the first
-write, mode selection and its immediately following describe share one
-end-to-end budget; a later cache-miss describe or forced refresh starts its own
-30-second budget. This is not a public configuration surface.
-Timeout, unavailable metadata or request saturation throws a lookup error
-before accepting the value. It cancels any partial row but does not permanently
-halt the sender. Do not add automatic retries or separate timeout settings for
-the three lookup paths.
+Reuse the existing initial-connection policy; do not add a schema-specific mode
+or option:
+
+- `OFF` makes one foreground connection and negotiation attempt. Failure aborts
+  construction.
+- `SYNC` retries connection and negotiation on the caller thread within the
+  configured reconnect budget. Exhaustion aborts construction.
+- `ASYNC` returns before connecting. Until the first successful handshake, a
+  row whose first effective operation finds no negotiated mode is accepted
+  immediately under the existing legacy conversion and flag-clear framing.
+  This is best-effort schema use, not deferred validation: the client never
+  retains the original values for later conversion.
+
+The mode is pinned by the first effective operation. If the handshake completes
+mid-row, that row remains legacy and schema mode can start only on the next row.
+Consequently, handshake timing can change successful stored values as well as
+error timing: the legacy and schema contracts deliberately differ for cases
+such as sub-microsecond timestamps, overflow and source-null normalization.
+Release notes and API documentation must describe this as legacy conversion
+before confirmation, not merely skipped validation.
+
+The `ASYNC` exception applies only before the first successful handshake and
+only when recovery has not already found schema-framed data. A recovered
+schema-required backlog must negotiate schema support before accepting new
+data; it must not append speculative legacy rows. If the first successful
+server is old, rows remain legacy until a later connection confirms schema
+support. Once support is confirmed, the sender never falls back to legacy,
+including on reconnect, cache miss or lookup failure.
+
+After schema support is confirmed, required lookups use a fixed 30-second
+deadline. A cache-miss describe or forced refresh starts its own 30-second
+budget. This is not a public configuration surface. Timeout, unavailable
+metadata or request saturation throws a lookup error before accepting the
+value. It cancels any partial row but does not permanently halt the sender. Do
+not add automatic retries or separate timeout settings for lookup paths.
+
+### Minimal client integration
+
+Change only `QwpWebSocketSender.bindingForEffectiveWrite()`. Keep its existing
+in-progress-row fast path first, then ensure the existing I/O loop is started.
+Before entering the current deadline, negotiation and lookup path, select
+legacy behavior with this condition:
+
+```java
+if (initialConnectMode == Sender.InitialConnectMode.ASYNC
+        && !cursorEngine.requiresSchema()) {
+    schemaResolutionFresh[0] = false;
+    return null;
+}
+```
+
+`CursorSendEngine.requiresSchema()` is the existing sticky authority. It is
+false for a fresh asynchronous sender and after a successful old-server
+handshake. It becomes true before publication after a supporting handshake,
+and recovery initializes it to true when persisted frames require schema
+support. That single value therefore covers startup, old-server compatibility,
+one-way upgrade and recovery. Do not also consult `hasEverConnected()` and do
+not add another negotiated-mode field.
+
+A supporting handshake may set the requirement immediately after the producer
+observes false. That race is harmless and intentional: the current row has
+already selected legacy behavior, while the next row observes the sticky true
+value and enters schema mode. The existing partial-row check, retired table
+buffers and mixed-frame flush preserve that boundary without a new lock or row
+state.
+
+No change belongs in `QwpSchemaCoordinator`, `CursorWebSocketSendLoop`,
+`CursorSendEngine`, the encoder, store-and-forward format or server. Update the
+`ASYNC` API documentation and the outdated method comment that currently says
+an unavailable first connection can never select legacy encoding.
 
 Known schemas can be used offline; unfamiliar tables require a live lookup.
 Reconnect invalidates the lookup cache for future row starts, but does not reset
 an upgraded sender to legacy mode, invalidate an already pinned row or rewrite
-buffered and persisted blocks. Legacy mode retains existing offline buffering.
-
-Asynchronous construction may remain, but the first write waits for the initial
-successful negotiation to select the mode within a bounded deadline. An offline
-or unreachable server is not assumed to be old. In schema mode, required lookup
-must also complete before accepting the value; in legacy mode, no lookup is
-needed. This changes cold-start offline behavior, not the minimum server version.
+buffered and persisted blocks. Legacy mode and the pre-handshake `ASYNC`
+exception retain existing offline buffering. A bad speculative legacy row may
+therefore be rejected only after connection and can stop the persisted queue
+under the existing terminal-NACK policy; metadata cannot repair or reconvert
+it. This is the cost of choosing asynchronous startup.
 
 ## Frame layout and replay compatibility
 
@@ -1776,10 +1855,19 @@ They do not change the compatibility contract.
     LONG-array casting. The current server checks rank but can build storage
     from the cursor's element type, so accepting a non-DOUBLE target would
     reproduce a server validation gap rather than a supported conversion.
+28. **Reuse initial-connect policy only at the cold-start boundary.** Let
+    `ASYNC` create ordinary legacy rows until the first handshake, then use the
+    existing row-boundary transition to adopt schema mode. Keep `OFF` and
+    `SYNC` strict, and let a recovered schema-required backlog override the
+    startup exception. Do not add raw-value storage, a deferred converter, a
+    second availability option or a downgrade path after schema confirmation.
+    Extending fallback to later cache misses would turn a connection option
+    into a permanent validation switch and is intentionally excluded.
 
-These opportunities do not justify a per-setter opt-out, raw-value fallback or
-send-time transformation. The intentional conversion catalogue is complete on
-the unreleased development branch. Release review must still verify the standing
+Outside the explicit pre-handshake `ASYNC` exception, these opportunities do
+not justify a per-setter opt-out, raw-value fallback or send-time
+transformation. The intentional conversion catalogue is complete on the
+unreleased development branch. Release review must still verify the standing
 gates and explicitly accept or resolve the server-contract boundaries above;
 they must not be hidden behind fallback behavior.
 
@@ -1848,7 +1936,7 @@ DATE grammar sequence and selects target-native DATE storage. Calendar and
 timezone mechanics are reused from the existing fixed timestamp parser; no
 general date-format framework was added.
 
-Iteration 2.45 is complete locally: every public DOUBLE-array overload selects
+Iteration 2.45 is committed: every public DOUBLE-array overload selects
 the existing DOUBLE_ARRAY wire representation only when the server's canonical
 element type and rank match. The N-dimensional wrapper exposes its current rank;
 confirmed missing columns pin their first effective rank. Exact-wire tests cover
@@ -1861,6 +1949,20 @@ work must start by resolving one of the explicit server-contract boundaries:
 BINARY-to-parser behavior, LONG_ARRAY validation, non-ASCII CHAR text output or
 malformed decimal metadata. Until then, rejecting those paths is simpler and
 safer than copying an accidental server behavior into the client.
+
+Iteration 2.46 implements the revision-70 availability change with the single
+`ASYNC && !cursorEngine.requiresSchema()` branch above; the existing sticky
+requirement is the recovery guard. Public tests now verify exact legacy
+microseconds before connection and schema nanoseconds after a supporting
+handshake, timeout and interruption after schema support is confirmed, and no
+legacy fallback when recovery finds schema-framed backlog. Existing partial-row
+upgrade and mixed-replay coverage remains unchanged.
+
+Acceptance is green: the complete client suite passes 3,720 tests with zero
+failures or errors, the five-test real-server schema identity/replay suite
+passes, and the released-binary matrix passes current-client/old-server,
+old-client/current-server and current-client/current-server combinations. This
+is an availability correction, not another conversion family.
 
 Every slice keeps the existing observable-contract rules below: public API,
 exact wire, SQL result, partial-row rollback and relevant recovery behavior.
@@ -1960,19 +2062,27 @@ without claiming general exactly-once delivery.
 
 ## Acceptance checks
 
-- New clients always request the extension. Before upgrade, an old server's
-  absent confirmation selects existing inferred-type behavior, with unchanged
+- New clients always request the extension. A successful old-server handshake
+  without confirmation selects existing inferred-type behavior, with unchanged
   wire framing, server conversions, missing-value semantics and SF delivery.
-  Supporting servers enable schema mode automatically; no option disables it.
-- Failed handshakes, timeouts and invalid confirmation are not treated as old
-  servers. Async startup waits for mode selection and cannot bypass a required
-  first-use lookup.
+  Supporting servers enable schema mode automatically; no option disables it
+  after confirmation.
+- With no completed handshake and no recovered schema-required backlog,
+  `ASYNC` accepts flag-clear legacy rows without waiting. Verify offline startup
+  followed by both old and supporting servers, handshake before the first row,
+  handshake during a partial row, and a later old-to-new upgrade. Pin legacy
+  conversion results where they differ from schema mode, including timestamp
+  precision, overflow and source-null handling.
+- Failed handshakes, timeouts and invalid confirmation are not classified as
+  old servers. `OFF` and `SYNC` remain strict. Recovered schema-framed backlog
+  overrides `ASYNC` fallback and sends no data until schema support is confirmed.
 - Existing clients against new servers see byte-compatible QWP v1 behavior,
   with no unsolicited schema messages or extended responses. The base protocol
   version remains 1 for both legacy and extended traffic.
 - The persisted flag selects table-header parsing. Exercise mixed legacy and
   extended SF replay on a negotiated connection, and reject flagged frames on
-  unnegotiated connections before processing data.
+  unnegotiated connections before processing data. Restart with a mixed backlog
+  and prove its original bytes, order and schema requirement are preserved.
 - Upgrade from an old to a supporting server finishes any partial legacy row
   unchanged and adopts schema mode at the next row boundary, including without
   another `table()` call. Pending legacy blocks and SF remain unchanged and
@@ -1982,6 +2092,9 @@ without claiming general exactly-once delivery.
   advancement. The requirement survives reconnect even with a legacy-only
   backlog; recovery detects pending extended SF before sending a legacy prefix.
   Legacy-only recovery by a fresh sender remains compatible with old servers.
+- A bad pre-handshake `ASYNC` legacy row is rejected through the existing
+  server-error and terminal-SF path; it is never silently repaired, converted
+  or acknowledged. Document the resulting queue-stop and recovery behavior.
 - The downgrade procedure drains every pending extended slot with a supporting
   client under the configured ACK policy. Interrupted or timed-out draining
   leaves recoverable data and does not qualify as safe to downgrade.
@@ -2026,8 +2139,9 @@ without claiming general exactly-once delivery.
   frame order, transaction boundaries, backpressure and completed rows on error.
 - Auto-create, multi-table writes, cumulative ACKs, deferred commits, delayed
   sends and describe/ACK interleaving preserve schema feedback and watermarks.
-- Lookup timeout, offline cache misses, eviction, reconnect and shutdown neither
-  bypass required resolution nor invalidate pinned data or strand callers.
+- After schema confirmation, lookup timeout, offline cache misses, eviction,
+  reconnect and shutdown neither bypass required resolution nor invalidate
+  pinned data or strand callers. `ASYNC` does not enable later fallback.
 - Unsupported target types fail explicitly when used; unrelated columns with
   unknown types do not block supported writes. The million-entry cache grows
   on demand and obsolete pinned metadata is released.
