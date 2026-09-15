@@ -7973,3 +7973,49 @@ passes both existing regressions (`testCoercionToString` and
 failures and 20 errors are the previously catalogued DATE/GEOHASH wire issues
 and stale legacy rejection expectations, down from two failures and 22 errors
 before this change. All test scratch owned by this work is under `/mnt/pcie5`.
+
+## D070 — Align complete server E2Es with mandatory schema validation
+
+Status: accepted, 2026-09-15. The associated QuestDB changes are test-only.
+
+The complete server test classes confirmed that the remaining failures were
+stale test contracts and unstable test-only buffer handles, not missing client
+conversions. Twenty-two Sender cases expected a server rejection for invalid
+input that a schema-aware client must now reject before encoding. Their shared
+helper now accepts only typed, non-retryable local schema errors and verifies
+row recovery. A separate strict helper retains the server-NACK contract for
+server-owned failures. No helper may accept either outcome interchangeably.
+
+The deferred-commit case now states the actual ownership rule: a local schema
+error cancels only the current partial row. It cannot ask the server to roll
+back already completed deferred rows because the invalid row never reached the
+server. Empty column names, STRING input for DOUBLE, and timestamp overflow
+likewise assert local structured errors and subsequent valid writes.
+
+DATE and GEOHASH integration fixtures exposed a separate test bug. They held a
+test-only column object across rows, but schema installation can replace the
+sender's active table buffer at the row boundary. Public integration tests now
+write through the public row API. The six deliberately low-level tests keep
+their raw coverage but reacquire the active column on every row. This adds no
+production state, compatibility path, defensive check or abstraction.
+
+The two real-server asynchronous in-flight/fragmentation tests no longer try to
+force a type mismatch through a schema-aware public API. They now send a valid
+public row to a non-WAL table: local validation succeeds and the server returns
+the server-owned terminal NACK whose propagation those tests exercise. The
+immediate type-mismatch test was removed because that state is unreachable after
+discovery and its useful NACK behavior duplicates the existing non-WAL test.
+Deterministic client tests continue to cover broader asynchronous NACK and
+terminal-error delivery.
+
+Validation passes the complete 138-test `QwpSenderE2ETest`, the complete
+117-test `QwpWebSocketSenderReceiverTest` with one existing skip, and all six
+`QwpSenderLowLevelTest` cases. The combined schema-aware server gate passes 480
+tests with zero failures or errors and one existing skip. The complete client
+module passes 3,721 tests with zero failures or errors and seven existing skips.
+The two asynchronous server-rejection cases pass three times each, including
+their fragmented-transport variant. Final server scratch is under
+`/mnt/pcie5/qwp-schema-aware-tests/final-repeat`; the final complete client run
+uses `/mnt/pcie5/qwp-schema-aware-tests/client-final`, with no `/tmp` paths in
+its 295 current Surefire reports. No client or server production source changed
+in this decision.

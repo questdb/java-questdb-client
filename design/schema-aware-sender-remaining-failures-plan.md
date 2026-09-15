@@ -569,6 +569,36 @@ delete the test, loosen its expected error, or silently count a renamed/removed
 method as fixed. Readiness requires every baseline case's behavior to remain
 represented.
 
+## Post-ledger whole-class cleanup — 2026-09-15
+
+Running the complete server Sender classes after the 47-method ledger exposed
+two kinds of test debt, not more missing conversions:
+
+- Twenty-two `QwpSenderE2ETest` cases still expected the server to reject input
+  that mandatory schema mode now rejects locally. They now require a typed,
+  non-retryable local schema error and cancel the partial row. The separate
+  helper for server-owned failures accepts only a server NACK.
+- DATE and GEOHASH fixtures retained a test-only column handle across rows even
+  though schema discovery may replace the active table buffer after a row.
+  Public API tests now use the public row API. The six intentionally low-level
+  tests remain low-level and reacquire the active column for every row.
+
+The two asynchronous in-flight/fragmentation tests now use a public write to a
+non-WAL table: schema validation succeeds, then the server returns the real
+server-owned NACK those tests are meant to propagate. The immediate type-
+mismatch test was removed because that path is no longer reachable after
+discovery and its useful server-NACK behavior duplicates the existing non-WAL
+test. Deterministic client tests retain broader terminal-error coverage. This is
+a test-contract migration only: no client or server production code changed.
+
+The complete `QwpSenderE2ETest` passes 138 tests, the complete
+`QwpWebSocketSenderReceiverTest` passes 117 with one existing skip, and the
+complete `QwpSenderLowLevelTest` passes six. The combined schema-aware server
+gate passes 480 tests with zero failures or errors and one existing skip. The
+complete client module passes 3,721 tests with zero failures or errors and seven
+existing skips. The two asynchronous server-rejection cases pass three times
+each, including their fragmented-transport variant.
+
 ## Definition of done and remaining release work
 
 Done for this plan: all 47 baseline cases are represented and pass, the original
