@@ -3,15 +3,15 @@
 Status: schema-directed encoding is implemented on the development branch;
 design revision 70. Scope: QWP v1 over WebSocket, with an automatically
 negotiated schema extension, legacy-server compatibility and companion server
-changes. The committed baseline contains the protocol, Sender integration and
-conversions through iteration 2.45. A released-binary compatibility gate is
-implemented and locally green. The intentional, server-supported public-setter
-conversion catalogue is complete. Revision 69 defines best-effort legacy
-encoding during a genuinely asynchronous cold start; revision 70 reduces its
-integration to one existing sticky schema requirement. That availability
-change is implemented and validated in the working tree but is not yet
-committed. The explicit server-contract boundaries below remain excluded
-rather than emulated.
+changes. The committed implementation contains the protocol, Sender integration
+and conversions through iteration 2.46 at client `59ade916` and server
+`ea019a99f3`, whose submodule pins that exact client revision. A released-binary
+compatibility gate is implemented and locally green. The intentional,
+server-supported public-setter conversion catalogue is complete. Revision 69
+defines best-effort legacy encoding during a genuinely asynchronous cold start;
+revision 70 reduces its integration to one existing sticky schema requirement.
+That availability change is committed and locally validated. The explicit
+server-contract boundaries below remain excluded rather than emulated.
 
 ## Goal and contract
 
@@ -44,20 +44,20 @@ server-side failures can still reject a batch.
 
 ## Implementation status
 
-Current checkpoint: iteration 2.46 implements revision 70's asynchronous
-cold-start behavior in the working tree. Before schema support is known, an
-`ASYNC` sender uses the legacy contract; after a supporting handshake, the
-existing engine requirement makes schema mode sticky. Recovered schema-framed
-backlog bypasses the legacy branch. The production change is one branch in
-`bindingForEffectiveWrite()` plus API documentation; it adds no state, protocol
-field, persisted format or send-time conversion.
+Current checkpoint: iteration 2.46 is committed as client `59ade916` and pinned
+by server `ea019a99f3`. It implements revision 70's asynchronous cold-start
+behavior. Before schema support is known, an `ASYNC` sender uses the legacy
+contract; after a supporting handshake, the existing engine requirement makes
+schema mode sticky. Recovered schema-framed backlog bypasses the legacy branch.
+The production change is one branch in `bindingForEffectiveWrite()` plus API
+documentation; it adds no state, protocol field, persisted format or send-time
+conversion.
 
-The committed baseline remains client `bc16c164` and server `02af9a6f31`, whose
-submodule pins that exact client revision. Iteration 2.45 on that baseline adds
-all public DOUBLE-array representations to canonical DOUBLE-array targets of
-exactly the same rank. The intentional conversion inventory is complete. This
-does not turn the separately documented unsafe or undefined server paths into
-supported conversions.
+Iteration 2.45 at client `bc16c164` and server `02af9a6f31` added all public
+DOUBLE-array representations to canonical DOUBLE-array targets of exactly the
+same rank. The intentional conversion inventory is complete. This does not turn
+the separately documented unsafe or undefined server paths into supported
+conversions.
 
 The standing compatibility gate now runs three real process combinations:
 current client against QuestDB 10.0.1, client 1.3.9 against the current server,
