@@ -180,7 +180,9 @@ public class QwpSchemaFeedbackResponseTest {
         byte[] payload = missingPayload();
         byte[] update = java.util.Arrays.copyOf(base, base.length + 2 + 2 + 1 + 4 + payload.length);
         ByteBuffer trailer = ByteBuffer.wrap(update).order(ByteOrder.LITTLE_ENDIAN);
-        trailer.position(base.length).putShort((short) 1).putShort((short) 1).put((byte) 't').putInt(payload.length).put(payload);
+        // Not chained off position(): that returns Buffer, not ByteBuffer, on Java 8.
+        trailer.position(base.length);
+        trailer.putShort((short) 1).putShort((short) 1).put((byte) 't').putInt(payload.length).put(payload);
         update[0] = (byte) (WebSocketResponse.STATUS_OK | WebSocketResponse.SCHEMA_FEEDBACK_MODE_UPDATES);
         withNative(update, (ptr, n) -> Assert.assertFalse(new WebSocketResponse().readFrom(ptr, n, true)));
     }

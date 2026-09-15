@@ -140,7 +140,10 @@ public class NumbersTest {
     public void testFormatDoubleFast() {
         sink.clear();
         Numbers.append(sink, -5.9522650387500933e18);
-        TestUtils.assertEquals("-5.9522650387500933E18", sink);
+        // Shortest form that still reads back to the same double. The previous
+        // formatter emitted a 17th digit ("...0933E18"); both parse to
+        // -0x1.4a6ac610aeb44p62, and Double.toString agrees with this one.
+        TestUtils.assertEquals("-5.952265038750093E18", sink);
     }
 
     @Test

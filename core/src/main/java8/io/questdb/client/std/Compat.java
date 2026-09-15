@@ -59,13 +59,25 @@ public final class Compat {
      * Spin-loop pause hint. No-op on Java 8 — {@code Thread.onSpinWait()} does
      * not exist there. The parallel Java 9+ variant delegates to it.
      */
-    public static void onSpinWait() {
+    /**
+     * Returns the most significant 64 bits of the 128-bit product of two longs.
+     * Java 8 has no {@code Math.multiplyHigh()}, so this splits both operands
+     * into 32-bit halves and reassembles the high word from the partial
+     * products. The Java 9+ variant delegates to the intrinsic instead.
+     */
+    public static long multiplyHigh(long x, long y) {
+        long x1 = x >> 32;
+        long x2 = x & 0xFFFFFFFFL;
+        long y1 = y >> 32;
+        long y2 = y & 0xFFFFFFFFL;
+        long z2 = x2 * y2;
+        long t = x1 * y2 + (z2 >>> 32);
+        long z1 = t & 0xFFFFFFFFL;
+        long z0 = t >> 32;
+        z1 += x2 * y1;
+        return x1 * y1 + z0 + (z1 >> 32);
     }
 
-    /**
-     * No-op on Java 8: {@code sun.misc} is open, so {@code FDBigInteger} needs
-     * no module export. Present for symmetry with the Java 9+ variant.
-     */
-    static void exportFdBigInteger() {
+    public static void onSpinWait() {
     }
 }

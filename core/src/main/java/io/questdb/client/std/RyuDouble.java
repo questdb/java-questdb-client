@@ -22,22 +22,24 @@
  *
  ******************************************************************************/
 
-package io.questdb.client.cutlass.qwp.protocol;
+package io.questdb.client.std;
 
 /**
- * Schema-only port of the QuestDB server's {@code io.questdb.std.RyuDouble}
- * at revision {@code 12a33d651e51e2682e7a448c8db5168fc72dfad3}.
+ * Port of the QuestDB server's {@code io.questdb.std.RyuDouble}, kept
+ * byte-compatible with it so that client-side and server-side formatting of
+ * the same double produce identical text.
  * Ryu algorithm for converting IEEE 754 double-precision floating-point numbers
  * to their shortest decimal representation.
  * <p>
  * Based on the paper "Ryu: Fast Float-to-String Conversion" by Ulf Adams (2018).
- * This implementation uses 128-bit arithmetic via {@code Math.multiplyHigh} (Java 9+).
+ * This implementation uses 128-bit arithmetic via {@link Compat#multiplyHigh},
+ * which is {@code Math.multiplyHigh} on Java 9+ and a hand-rolled equivalent on Java 8.
  * <p>
  * The core method {@link #d2d} returns the shortest decimal significand as a {@code long}
  * (1-17 digits) and writes the decimal exponent to a caller-provided array. The result
  * satisfies: {@code value = output * 10^e10}.
  */
-class QwpSchemaRyuDouble {
+class RyuDouble {
     private static final int DOUBLE_POW5_BITCOUNT = 125;
     private static final int DOUBLE_POW5_INV_BITCOUNT = 125;
     // ceil(2^(pow5bits(q) - 1 + 125) / 5^q) for q in [0, 291], stored as (hi64, lo64) pairs.
@@ -373,11 +375,11 @@ class QwpSchemaRyuDouble {
      */
     // Requires shift in [65, 127] (guaranteed by the Ryu algorithm).
     private static long mulShift64(long m, long mul0, long mul1, int shift) {
-        // Math.multiplyHigh is signed; correct for unsigned by adding m
+        // Compat.multiplyHigh is signed; correct for unsigned by adding m
         // when the other operand is negative (MSB set).
-        long high1 = Math.multiplyHigh(m, mul1) + ((mul1 >> 63) & m);
+        long high1 = Compat.multiplyHigh(m, mul1) + ((mul1 >> 63) & m);
         long low0 = m * mul0;
-        long high0 = Math.multiplyHigh(m, mul0) + ((mul0 >> 63) & m);
+        long high0 = Compat.multiplyHigh(m, mul0) + ((mul0 >> 63) & m);
 
         long mid = low0 + high1;
         long carry = Long.compareUnsigned(mid, low0) < 0 ? 1L : 0L;

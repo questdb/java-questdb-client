@@ -83,7 +83,6 @@ public final class QwpSchemaBinding {
     private final String tableName;
     private Decimal256 decimalTextScratch;
     private StringSink charTextSink;
-    private int[] floatingTextExponentScratch;
     private StringSink floatingTextSink;
     private StringSink numericTextSink;
     private Utf8StringSink timestampTextSink;
@@ -1416,11 +1415,10 @@ public final class QwpSchemaBinding {
         StringSink sink = floatingTextSink;
         if (sink == null) {
             floatingTextSink = sink = new StringSink(24);
-            floatingTextExponentScratch = new int[1];
         } else {
             sink.clear();
         }
-        QwpSchemaDoubleFormatter.append(sink, value, floatingTextExponentScratch);
+        Numbers.append(sink, value);
         return sink;
     }
 

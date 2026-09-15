@@ -196,7 +196,7 @@
                     </excludes>
                 </configuration>
             </plugin>
-            <!-- Packaging integration tests (JarPackagingIT): the sun.misc.FDBigInteger /
+            <!-- Packaging integration tests (JarPackagingIT): the versioned-shim /
                  module-name regressions in 1.3.5-1.3.7 were invisible to unit tests because
                  they run against target/classes, where Multi-Release selection never
                  happens. These ITs inspect and execute the packaged jar itself. -->
@@ -222,7 +222,7 @@
                 </configuration>
             </plugin>
             <!-- Adds the JDK-version-specific source root (src/main/java11 or src/main/java8)
-                 so the FDBigInteger bridge / module-access shim compiles on each JDK. -->
+                 so the Compat shim compiles on each JDK. -->
             <plugin>
                 <groupId>org.codehaus.mojo</groupId>
                 <artifactId>build-helper-maven-plugin</artifactId>
@@ -450,8 +450,8 @@
             <build>
                 <plugins>
                     <!-- The shipped artifact must be the JDK 8 build: a JDK 11+ build puts the
-                         jdk.internal.math FdBig bridge and module-info.class into the jar ROOT,
-                         which breaks Java 8 consumers. Refuse to publish from any other JDK. -->
+                         Java 9+ Compat shim and module-info.class into the jar ROOT, which
+                         breaks Java 8 consumers. Refuse to publish from any other JDK. -->
                     <plugin>
                         <groupId>org.apache.maven.plugins</groupId>
                         <artifactId>maven-enforcer-plugin</artifactId>
@@ -524,13 +524,13 @@
                 <jdk.version>11</jdk.version>
                 <java.enforce.version>11</java.enforce.version>
                 <questdb.artifactid>questdb</questdb.artifactid>
-                <compilerArg1>--add-exports</compilerArg1>
-                <compilerArg2>java.base/jdk.internal.math=io.questdb.client</compilerArg2>
-                <!-- javadoc needs the same module export to resolve jdk.internal.math.FDBigInteger
-                     referenced by the src/main/java11 FdBig bridge. Kept separate from the javac
-                     compilerArgs because javadoc and javac accept different option sets. -->
-                <javadocJOption1>--add-exports</javadocJOption1>
-                <javadocJOption2>java.base/jdk.internal.math=io.questdb.client</javadocJOption2>
+                <!-- No JDK-internal package is needed any more: the double formatter
+                     is Ryu over the public Compat.multiplyHigh shim. Kept as harmless
+                     no-ops because the plugin configuration always passes these. -->
+                <compilerArg1>-Xlint:none</compilerArg1>
+                <compilerArg2>-Xlint:none</compilerArg2>
+                <javadocJOption1>-quiet</javadocJOption1>
+                <javadocJOption2>-quiet</javadocJOption2>
                 <excludePattern1>nothing-to-exclude-dummy-value-include-all-java11plus</excludePattern1>
                 <excludeTestPattern1>nothing-to-exclude-dummy-value-include-all-java11plus</excludeTestPattern1>
                 <javac.compile.source>${javac.target}</javac.compile.source>
@@ -562,8 +562,7 @@
                 <!-- JDK8 javac rejects the add-exports flag; use a harmless no-op flag instead -->
                 <compilerArg1>-Xlint:none</compilerArg1>
                 <compilerArg2>-Xlint:none</compilerArg2>
-                <!-- JDK8 javadoc rejects javac's -Xlint and needs no module export (the java8 FdBig
-                     bridge uses the open sun.misc.FDBigInteger). Pass a harmless no-op instead. -->
+                <!-- JDK8 javadoc rejects javac's -Xlint. Pass a harmless no-op instead. -->
                 <javadocJOption1>-quiet</javadocJOption1>
                 <javadocJOption2>-quiet</javadocJOption2>
                 <!-- module-info.java cannot be compiled on JDK8; exclude it from both the main
@@ -585,13 +584,13 @@
             </activation>
             <build>
                 <plugins>
-                    <!-- JDK 8 javac can only compile the src/main/java8 FdBig bridge
-                         (sun.misc.FDBigInteger), which does not exist on Java 9+. Package the
-                         src/main/java11 bridge (jdk.internal.math.FDBigInteger) into
-                         META-INF/versions/11 so the Multi-Release jar works on every JDK.
-                         Shipping a JDK 8-built jar without this breaks double formatting on
-                         Java 9+ with NoClassDefFoundError (the 1.3.5-1.3.7 regression), hence
-                         a missing JDK 11 fails the build instead of skipping. -->
+                    <!-- JDK 8 javac can only compile the src/main/java8 Compat shim, whose
+                         multiplyHigh/onSpinWait fallbacks exist only for Java 8. Package the
+                         src/main/java11 shim, which uses the Math.multiplyHigh and
+                         Thread.onSpinWait intrinsics, into META-INF/versions/11 so the
+                         Multi-Release jar picks the right variant on every JDK. The Ryu double
+                         formatter calls multiplyHigh on every value, so a missing JDK 11 fails
+                         the build instead of skipping. -->
                     <plugin>
                         <groupId>org.apache.maven.plugins</groupId>
                         <artifactId>maven-antrun-plugin</artifactId>
@@ -621,8 +620,6 @@
                                              the jar is broken on Java 9+ again (JarPackagingIT
                                              cross-checks the packaged jar against the source root) -->
                                         <javac srcdir="${project.basedir}/src/main/java11" destdir="${project.build.outputDirectory}/META-INF/versions/11" classpath="${project.build.outputDirectory}" source="11" target="11" encoding="UTF-8" debug="true" includeantruntime="false" fork="true" executable="${java11.home}/bin/javac" compiler="extJavac">
-                                            <compilerarg value="--add-exports" />
-                                            <compilerarg value="java.base/jdk.internal.math=ALL-UNNAMED" />
                                         </javac>
                                     </target>
                                 </configuration>

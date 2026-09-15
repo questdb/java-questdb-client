@@ -29,7 +29,7 @@ import io.questdb.client.std.str.StringSink;
 /**
  * Standalone (no JUnit) smoke check that double formatting works against the
  * packaged jar on the running JDK. The extreme-exponent values exercise the
- * FdBig fallback of {@code Numbers.appendDouble0}, which resolves
+ * Ryu double formatter, which resolves
  * {@code FDBigInteger} from a different JDK-internal package on Java 8 vs 9+;
  * a jar packaged with the wrong bridge dies here with
  * {@code NoClassDefFoundError: sun/misc/FDBigInteger} (the 1.3.5-1.3.7
@@ -42,7 +42,7 @@ public final class DoubleFormatSmoke {
         double[] values = {
                 0.0d,
                 123.456d,
-                // FdBig slow-path values
+                // formerly FdBig slow-path values
                 1.0E-300,
                 Double.MIN_VALUE,
                 Double.MAX_VALUE,
