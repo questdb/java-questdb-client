@@ -774,7 +774,7 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test
-    public void testVarcharGenerationRemainsPinnedBeforeNativeCharRebind() throws Exception {
+    public void testVarcharGenerationRemainsPinnedBeforeCharRebind() throws Exception {
         assertMemoryLeak(() -> {
             LongTextSchemaHandler handler = new LongTextSchemaHandler(411, 421, ColumnType.VARCHAR);
             try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
@@ -783,7 +783,7 @@ public class QwpSchemaSenderIntegrationTest {
                 handler.version = 422;
                 sender.table("events");
                 try {
-                    sender.charColumn("value", 'B');
+                    sender.binaryColumn("value", new byte[]{1});
                     Assert.fail("expected target-changing schema refresh");
                 } catch (LineSenderSchemaException e) {
                     Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());

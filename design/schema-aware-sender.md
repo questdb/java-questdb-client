@@ -1,7 +1,7 @@
 # Schema-aware sender: schema-directed encoding
 
 Status: schema-directed encoding is implemented on the development branch;
-design revision 70. Scope: QWP v1 over WebSocket, with an automatically
+design revision 71. Scope: QWP v1 over WebSocket, with an automatically
 negotiated schema extension, legacy-server compatibility and companion server
 changes. The committed implementation contains the protocol, Sender integration
 and conversions through iteration 2.46 at client `59ade916` and server
@@ -10,8 +10,10 @@ compatibility gate is implemented and locally green. The intentional,
 server-supported public-setter conversion catalogue is complete. Revision 69
 defines best-effort legacy encoding during a genuinely asynchronous cold start;
 revision 70 reduces its integration to one existing sticky schema requirement.
-That availability change is committed and locally validated. The explicit
-server-contract boundaries below remain excluded rather than emulated.
+Revision 71 restores CHAR-to-STRING/VARCHAR compatibility with target-native
+UTF-8 encoding. That conversion is implemented and locally validated in the
+working tree. The explicit server-contract boundaries below remain excluded
+rather than emulated.
 
 ## Goal and contract
 
@@ -43,6 +45,15 @@ eventual server acceptance. Concurrent DDL, auto-creation races and other
 server-side failures can still reject a batch.
 
 ## Implementation status
+
+Current working tree: iteration 2.47 implements CHAR-to-STRING/VARCHAR. It
+preserves native CHAR storage, encodes non-surrogate characters directly as
+target-native VARCHAR wire data for either text target, and rejects a lone
+UTF-16 surrogate locally. All 3,721 client tests pass. The complete 138-test
+server E2E class removes both CHAR regressions and passes the dedicated Unicode
+case; its remaining 2 failures and 20 errors are the previously catalogued
+DATE/GEOHASH and stale legacy-expectation cases. D069 records the decision and
+evidence.
 
 Current checkpoint: iteration 2.46 is committed as client `59ade916` and pinned
 by server `ea019a99f3`. It implements revision 70's asynchronous cold-start
@@ -416,12 +427,13 @@ diagnostic now has 26 errors, removing only its two timestamp-to-text cases.
 No repeatable native timestamp-write regression is detected by the performance
 guard; this does not measure formatter throughput. D044 records the evidence.
 
-Iteration 2.29 accepts native CHAR and STRING-to-CHAR using existing two-byte
+Iteration 2.29 accepted native CHAR and STRING-to-CHAR using existing two-byte
 storage. Native values retain all 16 bits. Text takes the first BMP character,
 ignoring the remainder; empty/NUL/supplementary-first text becomes code unit
 zero, while malformed UTF-16 becomes '?', matching existing client replacement
 and server decoding. Java null is bitmap-null; present zero remains wire-present
-but reads as SQL NULL. CHAR-to-text remains separate missing work. Validation
+but reads as SQL NULL. CHAR-to-text remained separate at that checkpoint and
+is implemented by iteration 2.47. Validation
 passes 452 client tests plus two packaging checks, 59 focused server tests,
 323 regressions and three 86-test seeded repeats. All 65,549 public differential
 checks match the server. The unchanged original 333-test diagnostic has 24
@@ -1115,7 +1127,7 @@ non-null conversion. Known compatibility exceptions above still apply.
 | `timestampColumn(long, unit)` (TIMESTAMP or TIMESTAMP_NANOS) | Timestamps, text | None |
 | `timestampColumn(Instant)` (currently TIMESTAMP micros in legacy Sender) | Timestamps, preserving nanos for the schema-mode nano target; text | None |
 | `uuidColumn` (UUID) | UUID, text | None |
-| `charColumn` (CHAR) | CHAR | Text; non-ASCII text output needs the decision below |
+| `charColumn` (CHAR) | CHAR, text for non-surrogate values | None |
 | `ipv4Column(int)` and `ipv4Column(CharSequence)` (IPv4; text parsed locally) | IPv4, text | None |
 | `long256Column` (LONG256) | LONG256, text | None |
 | `binaryColumn` (byte array, `DirectByteSlice`, native pointer/length; BINARY) | BINARY | Parser-reachable targets remain deferred; see boundaries below |
@@ -1287,13 +1299,13 @@ unsafe behaviour merely because it is reachable is not the recommendation.
    Thus the existing-target route is not proof of correct LONG_ARRAY ingestion
    or cross-element conversion. Resolve the server validation/compatibility
    gap rather than inventing client-side element casts to cover it.
-3. **CHAR-to-text is not uniformly Unicode-safe.** CHAR-to-STRING writes the
-   UTF-16 code unit; CHAR-to-VARCHAR calls `Utf8StringSink.putAscii(char)`, which
-   truncates it to one byte. Non-ASCII values can therefore produce corrupted
-   VARCHAR bytes. A surrogate code unit in STRING also cannot be preserved by
-   the binding's normal VARCHAR wire encoding. Keep these value-level limits
-   visible; correct UTF-8 output would require a deliberate compatibility
-   decision, not an undocumented change disguised as parity.
+3. **CHAR-to-text uses valid UTF-8, not the server's unsafe VARCHAR path.** The
+   legacy server formatter truncates a non-ASCII CHAR when targeting VARCHAR.
+   Iteration 2.47 deliberately fixes that behavior in schema mode by encoding
+   any non-surrogate CHAR as target-native UTF-8 for both STRING and VARCHAR.
+   A lone UTF-16 surrogate has no valid standalone UTF-8 representation and is
+   rejected locally instead of being replaced or corrupted. Native CHAR writes
+   still preserve all 16 bits.
 4. **Designated timestamp fallback is not a conversion catalogue.** Its special
    branch can pass a fixed-width cursor to timestamp storage without the
    ordinary-column source-type allowlist. Do not derive new public casts from
@@ -1770,10 +1782,10 @@ They do not change the compatibility contract.
     D050 applies this rule.
 13. **Implement intentional conversions, not every reachable cast.** The server
     audit is evidence, not a requirement to reproduce parser accidents or
-    validation gaps. Keep BINARY-to-parser conversions, LONG_ARRAY, non-ASCII
-    CHAR-to-VARCHAR and malformed decimal metadata out until their server
-    contracts are deliberately resolved. Matching a server bug is not
-    compatibility.
+    validation gaps. Keep BINARY-to-parser conversions, LONG_ARRAY and malformed
+    decimal metadata out until their server contracts are deliberately resolved.
+    For CHAR-to-VARCHAR, D069 applies this rule by emitting correct UTF-8 instead
+    of copying the server's one-byte truncation bug.
 14. **Keep the schema deadline fixed.** Initial negotiation and its first
     describe share one 30-second end-to-end budget; later cache-miss describes
     and forced refreshes each get their own 30-second budget. Do not add public
@@ -1944,11 +1956,21 @@ ranks 1, 2, 3 and 32, raw floating-point bits, empty shapes, duplicate/rollback
 behavior and generation changes. Real-server tests cover public ranks 1 through
 4, stored shapes, rank rejection and partial-row recovery.
 
-There is no remaining intentional client conversion slice. Further datatype
-work must start by resolving one of the explicit server-contract boundaries:
-BINARY-to-parser behavior, LONG_ARRAY validation, non-ASCII CHAR text output or
-malformed decimal metadata. Until then, rejecting those paths is simpler and
-safer than copying an accidental server behavior into the client.
+There is no remaining intentional client conversion slice after iteration
+2.47. Further datatype work must start by resolving one of the explicit
+server-contract boundaries: BINARY-to-parser behavior, LONG_ARRAY validation
+or malformed decimal metadata. Until then, rejecting those paths is simpler
+and safer than copying accidental server behavior into the client.
+
+Iteration 2.47 restores CHAR-to-STRING/VARCHAR compatibility. The binding
+selects the actual schema target, retains the existing two-byte CHAR path, and
+uses one reusable single-character sink to append target-native VARCHAR wire
+data for STRING or VARCHAR. Valid non-ASCII characters are encoded as UTF-8;
+lone surrogates fail locally. No protocol, sender state, replay path or server
+production change is added. The complete client suite passes 3,721 tests with
+seven skips. The complete server E2E class runs 138 tests: both former CHAR
+regressions and the new Unicode assertion pass, leaving 2 failures and 20 errors
+from the separately tracked DATE/GEOHASH and stale legacy-expectation cases.
 
 Iteration 2.46 implements the revision-70 availability change with the single
 `ASYNC && !cursorEngine.requiresSchema()` branch above; the existing sticky

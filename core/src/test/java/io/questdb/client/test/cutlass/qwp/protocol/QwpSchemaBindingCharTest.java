@@ -30,6 +30,33 @@ public class QwpSchemaBindingCharTest {
     private static final String HEADER = "# case_id\tinput_kind\tutf16_hex\texpected_char\texpected_null";
 
     @Test
+    public void testCharToTextUsesTargetNativeUtf8() {
+        for (int targetType : new int[]{ColumnType.STRING, ColumnType.VARCHAR}) {
+            try (QwpTableBuffer buffer = new QwpTableBuffer("t");
+                 QwpWebSocketEncoder encoder = new QwpWebSocketEncoder()) {
+                QwpSchemaBinding binding = new QwpSchemaBinding(buffer, known(-1, column("value", targetType)));
+                binding.charColumn("value", 'A');
+                buffer.nextRow();
+                binding.charColumn("value", '\u03a9');
+                buffer.nextRow();
+
+                int size = encoder.encodeSchema(buffer);
+                Reader reader = tableHeader(encoder, size, 2, 1);
+                Assert.assertEquals("value", reader.string());
+                Assert.assertEquals(QwpConstants.TYPE_VARCHAR, reader.u8());
+                Assert.assertEquals(0, reader.u8());
+                Assert.assertEquals(0, reader.i32());
+                Assert.assertEquals(1, reader.i32());
+                Assert.assertEquals(3, reader.i32());
+                Assert.assertEquals('A', reader.u8());
+                Assert.assertEquals(0xce, reader.u8());
+                Assert.assertEquals(0xa9, reader.u8());
+                Assert.assertEquals(size, reader.position);
+            }
+        }
+    }
+
+    @Test
     public void testCorpusUsesExactNativeCharWire() throws Exception {
         InputStream stream = getClass().getResourceAsStream(CORPUS);
         Assert.assertNotNull(CORPUS, stream);
@@ -157,6 +184,13 @@ public class QwpSchemaBindingCharTest {
             QwpSchemaBinding binding = new QwpSchemaBinding(buffer, known(0, column("ts", ColumnType.TIMESTAMP_MICRO)));
             assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
                     () -> binding.charColumn("ts", 'A'));
+        }
+        for (int targetType : new int[]{ColumnType.STRING, ColumnType.VARCHAR}) {
+            try (QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                QwpSchemaBinding binding = new QwpSchemaBinding(buffer, known(-1, column("value", targetType)));
+                assertReason(LineSenderSchemaException.Reason.INVALID_VALUE,
+                        () -> binding.charColumn("value", '\ud800'));
+            }
         }
     }
 

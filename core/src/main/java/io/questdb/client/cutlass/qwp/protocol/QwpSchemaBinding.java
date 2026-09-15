@@ -82,6 +82,7 @@ public final class QwpSchemaBinding {
     private final QwpSchemaResponse schema;
     private final String tableName;
     private Decimal256 decimalTextScratch;
+    private StringSink charTextSink;
     private int[] floatingTextExponentScratch;
     private StringSink floatingTextSink;
     private StringSink numericTextSink;
@@ -701,9 +702,32 @@ public final class QwpSchemaBinding {
 
     public QwpSchemaBinding charColumn(CharSequence name, char value) {
         buffer.requireSchemaBinding(this);
-        QwpTableBuffer.ColumnBuffer column = targetColumn(name, "CHAR", ColumnType.CHAR);
-        if (column != null) {
-            column.addShort((short) value);
+        int index = targetIndex(name, "CHAR");
+        int targetType = targetType(index, ColumnType.CHAR);
+        QwpTableBuffer.ColumnBuffer column = targetColumn(name, "CHAR", index, targetType);
+        if (column == null) {
+            return this;
+        }
+        switch (targetType) {
+            case ColumnType.CHAR:
+                column.addShort((short) value);
+                break;
+            case ColumnType.STRING:
+            case ColumnType.VARCHAR:
+                if (Character.isSurrogate(value)) {
+                    throw error(INVALID_VALUE, name, "CHAR", targetType, "surrogate cannot be converted to text");
+                }
+                StringSink sink = charTextSink;
+                if (sink == null) {
+                    charTextSink = sink = new StringSink(1);
+                } else {
+                    sink.clear();
+                }
+                sink.put(value);
+                column.addString(sink);
+                break;
+            default:
+                throw unsupported(name, "CHAR", targetType, "conversion is not implemented");
         }
         return this;
     }

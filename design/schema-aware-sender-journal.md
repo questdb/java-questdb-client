@@ -7938,3 +7938,38 @@ and server SHA-256
 `38d597d80b12bb3c5ea13aa490b23df83061fb7299394b7c36a2c8227860627d`.
 The completed full-client, build, server and compatibility runs used scratch
 under `/mnt/pcie5`; `git diff --check` passes.
+
+## D069 — Restore CHAR-to-text compatibility with valid UTF-8
+
+Status: implemented and locally validated in the working tree, 2026-09-15.
+Design revision 71. Not yet committed.
+
+The complete server E2E classes exposed a conversion omitted by the earlier
+hand-picked gates. On a known STRING or VARCHAR column, `charColumn` requested
+only a CHAR target and therefore threw `UNSUPPORTED_FEATURE`. The existing
+server accepts CHAR for both text targets, so mandatory schema mode turned a
+previously valid public call into a local failure. The design had documented
+the pair as an unresolved boundary, but that classification was not acceptable
+for an always-on feature.
+
+Resolve the actual target in the existing `charColumn` path. Keep exact CHAR
+storage unchanged. For STRING and VARCHAR, append the character through one
+reused single-character sink into the existing target-native VARCHAR buffer.
+This adds no conversion framework, protocol field, sender state, replay path,
+server change or per-row allocation.
+
+Do not reproduce the server formatter's non-ASCII VARCHAR truncation. A valid
+non-surrogate Java CHAR is encoded as valid UTF-8 for both text targets. A lone
+UTF-16 surrogate cannot be represented as a standalone Unicode character, so
+the setter reports `INVALID_VALUE` instead of silently replacing or corrupting
+it. Native CHAR targets continue to preserve every 16-bit code unit.
+
+The focused component test passes four tests and checks exact target wire bytes
+for ASCII and non-ASCII input plus surrogate rejection. The complete client
+module passes 3,721 tests with no failures or errors and seven skips. After
+installing that client artifact, the complete 138-test real-server E2E class
+passes both existing regressions (`testCoercionToString` and
+`testCoercionToVarchar`) and a new non-ASCII SQL assertion. Its remaining two
+failures and 20 errors are the previously catalogued DATE/GEOHASH wire issues
+and stale legacy rejection expectations, down from two failures and 22 errors
+before this change. All test scratch owned by this work is under `/mnt/pcie5`.
