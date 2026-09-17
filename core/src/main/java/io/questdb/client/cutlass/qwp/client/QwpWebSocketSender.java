@@ -1040,12 +1040,8 @@ public class QwpWebSocketSender implements Sender {
                 long micros = toMicros(timestamp, unit);
                 atMicros(micros);
             }
-        } catch (LineSenderSchemaException e) {
-            rollbackRow();
-            throw refreshAfterSchemaRejection(e, null, true);
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, null, true);
         }
     }
 
@@ -1062,12 +1058,8 @@ public class QwpWebSocketSender implements Sender {
             }
             long micros = timestamp.getEpochSecond() * 1_000_000L + timestamp.getNano() / 1000L;
             atMicros(micros);
-        } catch (LineSenderSchemaException e) {
-            rollbackRow();
-            throw refreshAfterSchemaRejection(e, null, true);
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, null, true);
         }
     }
 
@@ -1080,8 +1072,7 @@ public class QwpWebSocketSender implements Sender {
             // Server-assigned timestamp - just send the row without designated timestamp
             sendRow();
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, null);
         }
     }
 
@@ -1161,12 +1152,8 @@ public class QwpWebSocketSender implements Sender {
             if (col != null) {
                 col.addBinary(value);
             }
-        } catch (LineSenderSchemaException e) {
-            rollbackRow();
-            throw refreshAfterSchemaRejection(e, columnName);
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, columnName);
         }
         return this;
     }
@@ -1192,12 +1179,8 @@ public class QwpWebSocketSender implements Sender {
                         "BINARY slice cannot be null; mark the row null via the null bitmap instead");
             }
             return binaryColumn(columnName, slice.ptr(), slice.size());
-        } catch (LineSenderSchemaException e) {
-            rollbackRow();
-            throw refreshAfterSchemaRejection(e, columnName);
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, columnName);
         }
     }
 
@@ -1220,12 +1203,8 @@ public class QwpWebSocketSender implements Sender {
             if (col != null) {
                 col.addBinary(ptr, len);
             }
-        } catch (LineSenderSchemaException e) {
-            rollbackRow();
-            throw refreshAfterSchemaRejection(e, columnName);
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, columnName);
         }
         return this;
     }
@@ -1244,12 +1223,8 @@ public class QwpWebSocketSender implements Sender {
             if (col != null) {
                 col.addBoolean(value);
             }
-        } catch (LineSenderSchemaException e) {
-            rollbackRow();
-            throw refreshAfterSchemaRejection(e, columnName);
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, columnName);
         }
         return this;
     }
@@ -1279,12 +1254,8 @@ public class QwpWebSocketSender implements Sender {
             if (col != null) {
                 col.addByte(value);
             }
-        } catch (LineSenderSchemaException e) {
-            rollbackRow();
-            throw refreshAfterSchemaRejection(e, columnName);
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, columnName);
         }
         return this;
     }
@@ -1320,12 +1291,8 @@ public class QwpWebSocketSender implements Sender {
             if (col != null) {
                 col.addShort((short) value);
             }
-        } catch (LineSenderSchemaException e) {
-            rollbackRow();
-            throw refreshAfterSchemaRejection(e, columnName);
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, columnName);
         }
         return this;
     }
@@ -1668,12 +1635,8 @@ public class QwpWebSocketSender implements Sender {
             if (col != null) {
                 col.addDecimal64(value);
             }
-        } catch (LineSenderSchemaException e) {
-            rollbackRow();
-            throw refreshAfterSchemaRejection(e, name);
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, name);
         }
         return this;
     }
@@ -1693,12 +1656,8 @@ public class QwpWebSocketSender implements Sender {
             if (col != null) {
                 col.addDecimal128(value);
             }
-        } catch (LineSenderSchemaException e) {
-            rollbackRow();
-            throw refreshAfterSchemaRejection(e, name);
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, name);
         }
         return this;
     }
@@ -1718,12 +1677,8 @@ public class QwpWebSocketSender implements Sender {
             if (col != null) {
                 col.addDecimal256(value);
             }
-        } catch (LineSenderSchemaException e) {
-            rollbackRow();
-            throw refreshAfterSchemaRejection(e, name);
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, name);
         }
         return this;
     }
@@ -1744,12 +1699,8 @@ public class QwpWebSocketSender implements Sender {
             if (col != null) {
                 col.addDecimal256(currentDecimal256);
             }
-        } catch (LineSenderSchemaException e) {
-            rollbackRow();
-            throw refreshAfterSchemaRejection(e, name);
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, name);
         }
         return this;
     }
@@ -1769,12 +1720,8 @@ public class QwpWebSocketSender implements Sender {
             if (col != null) {
                 col.addDoubleArray(values);
             }
-        } catch (LineSenderSchemaException e) {
-            rollbackRow();
-            throw refreshAfterSchemaRejection(e, name);
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, name);
         }
         return this;
     }
@@ -1794,12 +1741,8 @@ public class QwpWebSocketSender implements Sender {
             if (col != null) {
                 col.addDoubleArray(values);
             }
-        } catch (LineSenderSchemaException e) {
-            rollbackRow();
-            throw refreshAfterSchemaRejection(e, name);
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, name);
         }
         return this;
     }
@@ -1819,12 +1762,8 @@ public class QwpWebSocketSender implements Sender {
             if (col != null) {
                 col.addDoubleArray(values);
             }
-        } catch (LineSenderSchemaException e) {
-            rollbackRow();
-            throw refreshAfterSchemaRejection(e, name);
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, name);
         }
         return this;
     }
@@ -1844,12 +1783,8 @@ public class QwpWebSocketSender implements Sender {
             if (col != null) {
                 col.addDoubleArray(array);
             }
-        } catch (LineSenderSchemaException e) {
-            rollbackRow();
-            throw refreshAfterSchemaRejection(e, name);
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, name);
         }
         return this;
     }
@@ -1868,12 +1803,8 @@ public class QwpWebSocketSender implements Sender {
             if (col != null) {
                 col.addDouble(value);
             }
-        } catch (LineSenderSchemaException e) {
-            rollbackRow();
-            throw refreshAfterSchemaRejection(e, columnName);
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, columnName);
         }
         return this;
     }
@@ -1898,12 +1829,8 @@ public class QwpWebSocketSender implements Sender {
             if (col != null) {
                 col.addFloat(value);
             }
-        } catch (LineSenderSchemaException e) {
-            rollbackRow();
-            throw refreshAfterSchemaRejection(e, columnName);
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, columnName);
         }
         return this;
     }
@@ -2052,12 +1979,8 @@ public class QwpWebSocketSender implements Sender {
             if (col != null) {
                 col.addGeoHash(maskGeoHashBits(bits, precisionBits), precisionBits);
             }
-        } catch (LineSenderSchemaException e) {
-            rollbackRow();
-            throw refreshAfterSchemaRejection(e, columnName);
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, columnName);
         }
         return this;
     }
@@ -2086,12 +2009,8 @@ public class QwpWebSocketSender implements Sender {
                 binding.geoHashColumn(columnName, value);
                 return this;
             }
-        } catch (LineSenderSchemaException e) {
-            rollbackRow();
-            throw refreshAfterSchemaRejection(e, columnName);
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, columnName);
         }
         if (value == null) {
             throw new LineSenderException(
@@ -2482,12 +2401,8 @@ public class QwpWebSocketSender implements Sender {
             if (col != null) {
                 col.addInt(value);
             }
-        } catch (LineSenderSchemaException e) {
-            rollbackRow();
-            throw refreshAfterSchemaRejection(e, columnName);
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, columnName);
         }
         return this;
     }
@@ -2519,12 +2434,8 @@ public class QwpWebSocketSender implements Sender {
             if (col != null) {
                 col.addIPv4(address);
             }
-        } catch (LineSenderSchemaException e) {
-            rollbackRow();
-            throw refreshAfterSchemaRejection(e, columnName);
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, columnName);
         }
         return this;
     }
@@ -2569,12 +2480,8 @@ public class QwpWebSocketSender implements Sender {
                 binding.ipv4Column(columnName, address);
                 return this;
             }
-        } catch (LineSenderSchemaException e) {
-            rollbackRow();
-            throw refreshAfterSchemaRejection(e, columnName);
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, columnName);
         }
         if (Chars.equalsIgnoreCase("null", address) || Chars.equals("0.0.0.0", address)) {
             throw new LineSenderException(
@@ -2621,12 +2528,8 @@ public class QwpWebSocketSender implements Sender {
             if (col != null) {
                 col.addLong256(l0, l1, l2, l3);
             }
-        } catch (LineSenderSchemaException e) {
-            rollbackRow();
-            throw refreshAfterSchemaRejection(e, columnName);
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, columnName);
         }
         return this;
     }
@@ -2647,8 +2550,7 @@ public class QwpWebSocketSender implements Sender {
                 col.addLongArray(values);
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, name);
         }
         return this;
     }
@@ -2669,8 +2571,7 @@ public class QwpWebSocketSender implements Sender {
                 col.addLongArray(values);
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, name);
         }
         return this;
     }
@@ -2691,8 +2592,7 @@ public class QwpWebSocketSender implements Sender {
                 col.addLongArray(values);
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, name);
         }
         return this;
     }
@@ -2713,8 +2613,7 @@ public class QwpWebSocketSender implements Sender {
                 col.addLongArray(array);
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, name);
         }
         return this;
     }
@@ -2733,12 +2632,8 @@ public class QwpWebSocketSender implements Sender {
             if (col != null) {
                 col.addLong(value);
             }
-        } catch (LineSenderSchemaException e) {
-            rollbackRow();
-            throw refreshAfterSchemaRejection(e, columnName);
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, columnName);
         }
         return this;
     }
@@ -3054,12 +2949,8 @@ public class QwpWebSocketSender implements Sender {
             if (col != null) {
                 col.addShort(value);
             }
-        } catch (LineSenderSchemaException e) {
-            rollbackRow();
-            throw refreshAfterSchemaRejection(e, columnName);
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, columnName);
         }
         return this;
     }
@@ -3178,12 +3069,8 @@ public class QwpWebSocketSender implements Sender {
             if (col != null) {
                 col.addString(value);
             }
-        } catch (LineSenderSchemaException e) {
-            rollbackRow();
-            throw refreshAfterSchemaRejection(e, columnName);
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, columnName);
         }
         return this;
     }
@@ -3202,12 +3089,8 @@ public class QwpWebSocketSender implements Sender {
             if (col != null) {
                 col.addSymbol(value);
             }
-        } catch (LineSenderSchemaException e) {
-            rollbackRow();
-            throw refreshAfterSchemaRejection(e, columnName);
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, columnName);
         }
         return this;
     }
@@ -3267,12 +3150,8 @@ public class QwpWebSocketSender implements Sender {
                     col.addLong(micros);
                 }
             }
-        } catch (LineSenderSchemaException e) {
-            rollbackRow();
-            throw refreshAfterSchemaRejection(e, columnName);
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, columnName);
         }
         return this;
     }
@@ -3292,12 +3171,8 @@ public class QwpWebSocketSender implements Sender {
             if (col != null) {
                 col.addLong(micros);
             }
-        } catch (LineSenderSchemaException e) {
-            rollbackRow();
-            throw refreshAfterSchemaRejection(e, columnName);
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, columnName);
         }
         return this;
     }
@@ -3323,12 +3198,8 @@ public class QwpWebSocketSender implements Sender {
             if (col != null) {
                 col.addUuid(hi, lo);
             }
-        } catch (LineSenderSchemaException e) {
-            rollbackRow();
-            throw refreshAfterSchemaRejection(e, columnName);
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e, columnName);
         }
         return this;
     }
@@ -4575,11 +4446,22 @@ public class QwpWebSocketSender implements Sender {
         return replacementBinding;
     }
 
-    private RuntimeException refreshAfterSchemaRejection(
-            LineSenderSchemaException rejection,
-            CharSequence columnName
-    ) {
-        return refreshAfterSchemaRejection(rejection, columnName, false);
+    // Single home of the row-failure policy: roll the whole row back first, so a
+    // failed refresh cannot leave a half-written row, then apply the one-refresh
+    // rule to a schema rejection. Every other failure propagates unchanged.
+    private RuntimeException onRowFailure(Throwable e, CharSequence columnName) {
+        return onRowFailure(e, columnName, false);
+    }
+
+    private RuntimeException onRowFailure(Throwable e, CharSequence columnName, boolean isDesignatedTimestamp) {
+        rollbackRow();
+        if (e instanceof LineSenderSchemaException) {
+            return refreshAfterSchemaRejection((LineSenderSchemaException) e, columnName, isDesignatedTimestamp);
+        }
+        if (e instanceof Error) {
+            throw (Error) e;
+        }
+        return (RuntimeException) e;
     }
 
     private RuntimeException refreshAfterSchemaRejection(

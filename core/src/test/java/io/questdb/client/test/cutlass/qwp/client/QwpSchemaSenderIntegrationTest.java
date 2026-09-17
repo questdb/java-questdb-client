@@ -10,6 +10,7 @@ import io.questdb.client.Sender;
 import io.questdb.client.SenderConnectionEvent;
 import io.questdb.client.cairo.ColumnType;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.line.array.LongArray;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.protocol.QwpSchemaProtocol;
@@ -976,6 +977,62 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test
+    public void testLongArrayRejectionRollsBackAndRefreshesOnce() throws Exception {
+        assertMemoryLeak(() -> {
+            int array2d = ColumnType.encodeArrayType(ColumnType.DOUBLE, 2);
+            LongTextSchemaHandler handler = new LongTextSchemaHandler(1221, 1231, array2d);
+            try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
+                sender.table("events").doubleArray("value", new double[][]{{1.0, 2.0}}).atNow();
+
+                sender.table("events").uuidColumn("failed_b", 11, 12);
+                try {
+                    sender.longArray("value", new long[]{99L});
+                    Assert.fail("expected unsupported LONG_ARRAY setter");
+                } catch (LineSenderSchemaException e) {
+                    Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
+                }
+
+                sender.doubleArray("value", new double[][]{{3.0}, {4.0}}).atNow();
+                sender.flush();
+                // The frame carries the two DOUBLE[] rows only: the partial row that
+                // held failed_b rolled back, so no extra column reaches the wire.
+                new FrameReader(handler.awaitDataFrame())
+                        .doubleArrayTable("events", 1221, 1231);
+                Assert.assertEquals("setter must use the standard one-refresh path", 2,
+                        handler.describeRequests.get());
+            }
+        });
+    }
+
+    @Test
+    public void testLongArrayRejectionSurfacesSchemaChangeAfterRebind() throws Exception {
+        assertMemoryLeak(() -> {
+            int array2d = ColumnType.encodeArrayType(ColumnType.DOUBLE, 2);
+            int array1d = ColumnType.encodeArrayType(ColumnType.DOUBLE, 1);
+            LongTextSchemaHandler handler = new LongTextSchemaHandler(1241, 1251, array2d);
+            try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
+                sender.table("events").doubleArray("value", new double[][]{{1.0, 2.0}}).atNow();
+                handler.targetType = array1d;
+                handler.version = 1252;
+                sender.table("events").uuidColumn("failed_b", 11, 12);
+                try {
+                    sender.longArray("value", new long[]{3L, 4L});
+                    Assert.fail("expected target-changing schema refresh");
+                } catch (LineSenderSchemaException e) {
+                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                }
+                sender.doubleArray("value", new double[]{3.0, 4.0}).atNow();
+                sender.flush();
+                // The rebound block holds the recovered row alone: rollback dropped
+                // failed_b before the refresh installed the new generation.
+                new FrameReader(handler.awaitDataFrame())
+                        .twoDoubleArrayRankBlocks("events", 1241, 1251, 1252);
+                Assert.assertEquals(2, handler.describeRequests.get());
+            }
+        });
+    }
+
+    @Test
     public void testVarcharGenerationRemainsPinnedBeforeTimestampRebind() throws Exception {
         assertMemoryLeak(() -> {
             LongTextSchemaHandler handler = new LongTextSchemaHandler(321, 331, ColumnType.VARCHAR);
@@ -1598,6 +1655,10 @@ public class QwpSchemaSenderIntegrationTest {
             try (TestWebSocketServer server = schemaServer(handler);
                  Sender sender = sender(server)) {
                 sender.table("events").doubleArray("values", (double[]) null);
+                sender.longArray("values", (long[]) null);
+                sender.longArray("values", (long[][]) null);
+                sender.longArray("values", (long[][][]) null);
+                sender.longArray("values", (LongArray) null);
                 sender.ipv4Column("address", (CharSequence) null);
                 Assert.assertEquals(0, handler.describeRequests.get());
                 sender.cancelRow();
