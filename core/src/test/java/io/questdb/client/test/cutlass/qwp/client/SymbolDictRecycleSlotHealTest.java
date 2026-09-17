@@ -313,6 +313,91 @@ public class SymbolDictRecycleSlotHealTest {
     }
 
     /**
+     * The heal's second pass. When the segment unlink keeps failing across
+     * the heal's own close (the slot directory stays unwritable), the rebuild
+     * after the heal recovers the same fully-acked leftovers again.
+     * Committing on that engine would carry the outgoing epoch's .symbol-dict
+     * and FSNs into the fresh one, so the recycle must refuse -- resumable,
+     * not terminal -- and heal once the directory is writable again.
+     */
+    @Test(timeout = 60_000L)
+    public void testHealThatKeepsRecoveringLeftoversRefusesUntilCleanupIsDurable() throws Exception {
+        assertMemoryLeak(() -> {
+            String doctoredSlot = temporaryFolder.getRoot().toPath()
+                    .resolve("keeps-recovering-slot").toString();
+            prepareFullyAckedLeftoverSlot(doctoredSlot);
+            Path doctoredSlotPath = Paths.get(doctoredSlot);
+
+            String sfDir = temporaryFolder.getRoot().toPath().resolve("keeps-recovering-sf").toString();
+            try (TestWebSocketServer server = ackingServer()) {
+                try (Sender sender = Sender.fromConfig(config(server, sfDir))) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
+                    long fsn1 = sender.flushAndGetSequence();
+                    Assert.assertTrue("setup: batch must be acked before the recycle",
+                            sender.awaitAckedFsn(fsn1, 5_000));
+
+                    // The first two rebuilds construct on a writable slot and then
+                    // drop the write permission again, so the close that follows
+                    // each of them (the heal's, then the second pass's) cannot
+                    // unlink the leftovers. Later rebuilds leave the slot writable.
+                    AtomicInteger rebuilds = new AtomicInteger();
+                    AtomicInteger unwritableRebuildsLeft = new AtomicInteger(2);
+                    ws.setEngineRebuildFactory(() -> {
+                        rebuilds.incrementAndGet();
+                        try {
+                            setPermissions(doctoredSlotPath, "rwxr-xr-x");
+                            CursorSendEngine engine = new CursorSendEngine(doctoredSlot, SEGMENT_BYTES);
+                            if (unwritableRebuildsLeft.getAndDecrement() > 0) {
+                                setPermissions(doctoredSlotPath, "r-xr-xr-x");
+                            }
+                            return engine;
+                        } catch (Exception e) {
+                            throw new RuntimeException(e);
+                        }
+                    });
+                    try {
+                        sender.resetSymbolDictionary();
+                        Assert.assertTrue(ws.isResetArmed());
+                        try {
+                            sender.table("t");
+                            Assert.fail("the second recovered pass must refuse to commit");
+                        } catch (LineSenderException e) {
+                            TestUtils.assertContains(e.getMessage(),
+                                    "symbol dictionary recycle keeps recovering leftover acked segments");
+                        }
+                        Assert.assertEquals("rebuild #1 recovers, the heal rebuilds #2, which recovers again",
+                                2, rebuilds.get());
+                        Assert.assertEquals("no swap on a recovered engine", 0, ws.getSymbolDictEpoch());
+                        Assert.assertNull("resumable, not terminal", ws.getLastTerminalError());
+                        Assert.assertTrue("the leftovers are still on the slot",
+                                Files.exists(doctoredSlot + "/sf-initial.sfa"));
+
+                        // Cleanup becomes durable: the next table() resumes, heals
+                        // (rebuild #3 recovers, its close unlinks) and commits on
+                        // rebuild #4.
+                        setPermissions(doctoredSlotPath, "rwxr-xr-x");
+                        sender.table("t").symbol("s", "b").longColumn("v", 2L).atNow();
+                        Assert.assertEquals("resume: rebuild #3 recovers, heal, rebuild #4 is clean",
+                                4, rebuilds.get());
+                        Assert.assertEquals(1, ws.getSymbolDictEpoch());
+                        Assert.assertFalse(ws.isResetArmed());
+                        Assert.assertFalse("the recycle must commit on a non-recovered engine",
+                                ws.getCursorEngineForTesting().wasRecoveredFromDisk());
+                        long fsn2 = sender.flushAndGetSequence();
+                        Assert.assertTrue("post-heal batch must still get acked",
+                                sender.awaitAckedFsn(fsn2, 5_000));
+                        Assert.assertTrue("post-recycle FSN must exceed pre-recycle FSN "
+                                + "[fsn1=" + fsn1 + ", fsn2=" + fsn2 + ']', fsn2 > fsn1);
+                    } finally {
+                        setPermissions(doctoredSlotPath, "rwxr-xr-x");
+                    }
+                }
+            }
+        });
+    }
+
+    /**
      * The terminal latch's one surviving case. A rebuild that
      * recovers UNACKED frames proves the fully-drained-close contract was
      * breached -- the fresh producer dictionary and the slot's state have
