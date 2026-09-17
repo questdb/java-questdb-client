@@ -10,21 +10,19 @@ import io.questdb.client.cairo.ColumnType;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketEncoder;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.protocol.QwpSchemaBinding;
-import io.questdb.client.cutlass.qwp.protocol.QwpSchemaProtocol;
-import io.questdb.client.cutlass.qwp.protocol.QwpSchemaResponse;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
-import io.questdb.client.std.MemoryTag;
-import io.questdb.client.std.Unsafe;
 import org.junit.Assert;
 import org.junit.Test;
 
 import java.io.BufferedReader;
 import java.io.InputStream;
 import java.io.InputStreamReader;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 
+import static io.questdb.client.test.cutlass.qwp.protocol.QwpSchemaTestFixtures.assertReason;
+import static io.questdb.client.test.cutlass.qwp.protocol.QwpSchemaTestFixtures.binding;
+import static io.questdb.client.test.cutlass.qwp.protocol.QwpSchemaTestFixtures.column;
+import static io.questdb.client.test.cutlass.qwp.protocol.QwpSchemaTestFixtures.skipTablePrefix;
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
 public class QwpSchemaBindingFloatingTest {
@@ -51,14 +49,14 @@ public class QwpSchemaBindingFloatingTest {
                         } else {
                             append.run();
                             buffer.nextRow();
-                            Reader reader = tableReader(encoder, encoder.encodeSchema(buffer), wireType(f[4]), 1, 1);
+                            QwpTestWireReader reader = tableReader(encoder, encoder.encodeSchema(buffer), wireType(f[4]), 1, 1);
                             if ("<NULL>".equals(f[5])) {
                                 Assert.assertEquals(f[0],
                                         "BYTE".equals(f[3]) || "SHORT".equals(f[3]) ? "0" : "NULL", f[6]);
-                                Assert.assertEquals(1, reader.byteValue());
-                                Assert.assertEquals(1, reader.byteValue());
+                                Assert.assertEquals(1, reader.u8());
+                                Assert.assertEquals(1, reader.u8());
                             } else {
-                                Assert.assertEquals(0, reader.byteValue());
+                                Assert.assertEquals(0, reader.u8());
                                 Assert.assertArrayEquals(f[0], hex(f[5]), reader.bytes(hex(f[5]).length));
                             }
                             Assert.assertEquals(f[0], encoder.getBuffer().getPosition(), reader.position());
@@ -83,10 +81,10 @@ public class QwpSchemaBindingFloatingTest {
                 buffer.nextRow();
                 binding.doubleColumn("value", -0.0d);
                 buffer.nextRow();
-                Reader reader = tableReader(encoder, encoder.encodeSchema(buffer), QwpConstants.TYPE_DOUBLE, 3, 1);
-                Assert.assertEquals(1, reader.byteValue());
-                Assert.assertEquals(3, reader.byteValue());
-                Assert.assertEquals(0x8000000000000000L, reader.longValue());
+                QwpTestWireReader reader = tableReader(encoder, encoder.encodeSchema(buffer), QwpConstants.TYPE_DOUBLE, 3, 1);
+                Assert.assertEquals(1, reader.u8());
+                Assert.assertEquals(3, reader.u8());
+                Assert.assertEquals(0x8000000000000000L, reader.i64());
                 Assert.assertEquals(encoder.getBuffer().getPosition(), reader.position());
             }
         });
@@ -102,18 +100,18 @@ public class QwpSchemaBindingFloatingTest {
                 binding.uuidColumn("uuid", 1, 2).floatColumn("uuid", Float.NaN);
                 buffer.nextRow();
                 int size = encoder.encodeSchema(buffer);
-                Reader reader = new Reader(encoder.getBuffer().getBufferPtr(), size);
+                QwpTestWireReader reader = new QwpTestWireReader(encoder.getBuffer().getBufferPtr(), size);
                 reader.skip(QwpConstants.HEADER_SIZE);
                 skipTablePrefix(reader, 1, 2);
                 Assert.assertEquals("n", reader.string());
-                Assert.assertEquals(QwpConstants.TYPE_LONG, reader.byteValue());
+                Assert.assertEquals(QwpConstants.TYPE_LONG, reader.u8());
                 Assert.assertEquals("uuid", reader.string());
-                Assert.assertEquals(QwpConstants.TYPE_UUID, reader.byteValue());
-                Assert.assertEquals(0, reader.byteValue());
-                Assert.assertEquals(1, reader.longValue());
-                Assert.assertEquals(0, reader.byteValue());
-                Assert.assertEquals(1, reader.longValue());
-                Assert.assertEquals(2, reader.longValue());
+                Assert.assertEquals(QwpConstants.TYPE_UUID, reader.u8());
+                Assert.assertEquals(0, reader.u8());
+                Assert.assertEquals(1, reader.i64());
+                Assert.assertEquals(0, reader.u8());
+                Assert.assertEquals(1, reader.i64());
+                Assert.assertEquals(2, reader.i64());
                 Assert.assertEquals(size, reader.position());
             }
         });
@@ -136,19 +134,19 @@ public class QwpSchemaBindingFloatingTest {
                 binding.floatColumn("c", 3);
                 buffer.nextRow();
                 int size = encoder.encodeSchema(buffer);
-                Reader reader = new Reader(encoder.getBuffer().getBufferPtr(), size);
+                QwpTestWireReader reader = new QwpTestWireReader(encoder.getBuffer().getBufferPtr(), size);
                 reader.skip(QwpConstants.HEADER_SIZE);
                 skipTablePrefix(reader, 2, 2);
                 Assert.assertEquals("a", reader.string());
-                Assert.assertEquals(QwpConstants.TYPE_FLOAT, reader.byteValue());
+                Assert.assertEquals(QwpConstants.TYPE_FLOAT, reader.u8());
                 Assert.assertEquals("c", reader.string());
-                Assert.assertEquals(QwpConstants.TYPE_LONG, reader.byteValue());
-                Assert.assertEquals(1, reader.byteValue());
-                Assert.assertEquals(2, reader.byteValue());
-                Assert.assertEquals(Float.floatToRawIntBits(1.5f), reader.intValue());
-                Assert.assertEquals(1, reader.byteValue());
-                Assert.assertEquals(1, reader.byteValue());
-                Assert.assertEquals(3, reader.longValue());
+                Assert.assertEquals(QwpConstants.TYPE_LONG, reader.u8());
+                Assert.assertEquals(1, reader.u8());
+                Assert.assertEquals(2, reader.u8());
+                Assert.assertEquals(Float.floatToRawIntBits(1.5f), reader.i32());
+                Assert.assertEquals(1, reader.u8());
+                Assert.assertEquals(1, reader.u8());
+                Assert.assertEquals(3, reader.i64());
                 Assert.assertEquals(size, reader.position());
             }
         });
@@ -164,9 +162,9 @@ public class QwpSchemaBindingFloatingTest {
                 buffer.reset();
                 binding.floatColumn("value", -0.0f);
                 buffer.nextRow();
-                Reader reader = tableReader(encoder, encoder.encodeSchema(buffer), QwpConstants.TYPE_FLOAT, 1, 1);
-                Assert.assertEquals(0, reader.byteValue());
-                Assert.assertEquals(0x80000000, reader.intValue());
+                QwpTestWireReader reader = tableReader(encoder, encoder.encodeSchema(buffer), QwpConstants.TYPE_FLOAT, 1, 1);
+                Assert.assertEquals(0, reader.u8());
+                Assert.assertEquals(0x80000000, reader.i32());
                 Assert.assertEquals(encoder.getBuffer().getPosition(), reader.position());
                 buffer.clear();
                 assertIllegalState(() -> binding.floatColumn("value", 1));
@@ -219,47 +217,13 @@ public class QwpSchemaBindingFloatingTest {
         }
     }
 
-    private static QwpSchemaBinding binding(QwpTableBuffer buffer, int designated, byte[]... columns) {
-        return new QwpSchemaBinding(buffer, known(designated, columns));
-    }
-
-    private static byte[] column(String name, int type) { return column(name, type, new byte[0]); }
-    private static byte[] column(String name, int type, byte[] params) {
-        byte[] bytes = name.getBytes(StandardCharsets.UTF_8);
-        return ByteBuffer.allocate(2 + bytes.length + 4 + 2 + params.length).order(ByteOrder.LITTLE_ENDIAN)
-                .putShort((short) bytes.length).put(bytes).putInt(type).putShort((short) params.length).put(params).array();
-    }
-
-    private static QwpSchemaResponse known(int designated, byte[]... columns) {
-        int length = 1 + 8 + 1 + 4 + 8 + 2 + 2;
-        for (byte[] column : columns) length += column.length;
-        ByteBuffer payload = ByteBuffer.allocate(length).order(ByteOrder.LITTLE_ENDIAN)
-                .put(QwpSchemaProtocol.KIND_SCHEMA).putLong(1).put((byte) QwpSchemaProtocol.RESULT_KNOWN)
-                .putInt(1).putLong(1).putShort((short) designated).putShort((short) columns.length);
-        for (byte[] column : columns) payload.put(column);
-        ByteBuffer frame = ByteBuffer.allocate(QwpConstants.HEADER_SIZE + length).order(ByteOrder.LITTLE_ENDIAN)
-                .putInt(QwpConstants.MAGIC_MESSAGE).put((byte) 1).put(QwpSchemaProtocol.FLAG_CONTROL)
-                .putShort((short) 0).putInt(length).put(payload.array());
-        long address = Unsafe.malloc(frame.capacity(), MemoryTag.NATIVE_DEFAULT);
-        try {
-            for (int i = 0; i < frame.capacity(); i++) Unsafe.getUnsafe().putByte(address + i, frame.array()[i]);
-            return QwpSchemaProtocol.decodeResponse(address, frame.capacity());
-        } finally { Unsafe.free(address, frame.capacity(), MemoryTag.NATIVE_DEFAULT); }
-    }
-
-    private static Reader tableReader(QwpWebSocketEncoder encoder, int size, byte type, int rows, int columns) {
-        Reader reader = new Reader(encoder.getBuffer().getBufferPtr(), size);
+    private static QwpTestWireReader tableReader(QwpWebSocketEncoder encoder, int size, byte type, int rows, int columns) {
+        QwpTestWireReader reader = new QwpTestWireReader(encoder.getBuffer().getBufferPtr(), size);
         reader.skip(QwpConstants.HEADER_SIZE);
         skipTablePrefix(reader, rows, columns);
         Assert.assertEquals("value", reader.string());
-        Assert.assertEquals(type, reader.byteValue());
+        Assert.assertEquals(type, reader.u8());
         return reader;
-    }
-
-    private static void skipTablePrefix(Reader reader, int rows, int columns) {
-        Assert.assertEquals("t", reader.string()); Assert.assertEquals(1, reader.byteValue());
-        Assert.assertEquals(1, reader.intValue()); Assert.assertEquals(1, reader.longValue());
-        Assert.assertEquals(rows, reader.varint()); Assert.assertEquals(columns, reader.varint());
     }
 
     private static int targetType(String value) {
@@ -298,20 +262,4 @@ public class QwpSchemaBindingFloatingTest {
         rollback(buffer);
     }
     private static void assertIllegalState(Runnable action) { Assert.assertThrows(IllegalStateException.class, action::run); }
-    private static void assertReason(LineSenderSchemaException.Reason reason, Runnable action) {
-        Assert.assertEquals(reason, Assert.assertThrows(LineSenderSchemaException.class, action::run).getReason());
-    }
-
-    private static final class Reader {
-        private final long address; private final int limit; private int position;
-        private Reader(long address, int limit) { this.address=address; this.limit=limit; }
-        private int byteValue() { Assert.assertTrue(position<limit); return Unsafe.getUnsafe().getByte(address+position++)&0xff; }
-        private byte[] bytes(int n) { Assert.assertTrue(position+n<=limit); byte[] b=new byte[n]; for(int i=0;i<n;i++)b[i]=(byte)byteValue(); return b; }
-        private int intValue() { Assert.assertTrue(position+4<=limit); int v=Unsafe.getUnsafe().getInt(address+position); position+=4; return v; }
-        private long longValue() { Assert.assertTrue(position+8<=limit); long v=Unsafe.getUnsafe().getLong(address+position); position+=8; return v; }
-        private int position() { return position; }
-        private void skip(int n) { Assert.assertTrue(position+n<=limit); position+=n; }
-        private String string() { return new String(bytes(varint()), StandardCharsets.UTF_8); }
-        private int varint() { int r=0,s=0,v; do {v=byteValue();r|=(v&0x7f)<<s;s+=7;}while((v&0x80)!=0);return r; }
-    }
 }

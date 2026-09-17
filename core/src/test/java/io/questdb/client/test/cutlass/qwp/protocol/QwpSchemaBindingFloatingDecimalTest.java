@@ -10,10 +10,7 @@ import io.questdb.client.cairo.ColumnType;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketEncoder;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.protocol.QwpSchemaBinding;
-import io.questdb.client.cutlass.qwp.protocol.QwpSchemaProtocol;
-import io.questdb.client.cutlass.qwp.protocol.QwpSchemaResponse;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
-import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
 import org.junit.Assert;
 import org.junit.Test;
@@ -21,10 +18,11 @@ import org.junit.Test;
 import java.io.BufferedReader;
 import java.io.InputStream;
 import java.io.InputStreamReader;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 
+import static io.questdb.client.test.cutlass.qwp.protocol.QwpSchemaTestFixtures.assertReason;
+import static io.questdb.client.test.cutlass.qwp.protocol.QwpSchemaTestFixtures.binding;
+import static io.questdb.client.test.cutlass.qwp.protocol.QwpSchemaTestFixtures.column;
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
 public class QwpSchemaBindingFloatingDecimalTest {
@@ -94,7 +92,7 @@ public class QwpSchemaBindingFloatingDecimalTest {
                 buffer.nextRow();
 
                 int size = encoder.encodeSchema(buffer);
-                Reader reader = tableReader(encoder, size, QwpConstants.TYPE_DECIMAL64, 4);
+                QwpTestWireReader reader = tableReader(encoder, size, QwpConstants.TYPE_DECIMAL64, 4);
                 Assert.assertEquals(1, reader.u8());
                 Assert.assertEquals(0x0a, reader.u8());
                 Assert.assertEquals(1, reader.u8());
@@ -105,7 +103,7 @@ public class QwpSchemaBindingFloatingDecimalTest {
                 buffer.reset();
                 buffer.nextRow();
                 int resetSize = encoder.encodeSchema(buffer);
-                Reader reset = tableReader(encoder, resetSize, QwpConstants.TYPE_DECIMAL64, 1);
+                QwpTestWireReader reset = tableReader(encoder, resetSize, QwpConstants.TYPE_DECIMAL64, 1);
                 Assert.assertEquals(1, reset.u8());
                 Assert.assertEquals(1, reset.u8());
                 Assert.assertEquals(1, reset.u8());
@@ -131,12 +129,6 @@ public class QwpSchemaBindingFloatingDecimalTest {
         }
     }
 
-    private static void assertReason(LineSenderSchemaException.Reason reason, Runnable action) {
-        LineSenderSchemaException error = Assert.assertThrows(LineSenderSchemaException.class, action::run);
-        Assert.assertEquals(error.getMessage(), reason, error.getReason());
-        Assert.assertFalse(error.getMessage(), error.isRetryable());
-    }
-
     private static void assertVector(Vector vector) throws Exception {
         try {
             if (vector.invalid()) {
@@ -153,7 +145,7 @@ public class QwpSchemaBindingFloatingDecimalTest {
                 Assert.assertEquals(QwpConstants.FLAG_SCHEMA,
                         Unsafe.getUnsafe().getByte(encoder.getBuffer().getBufferPtr()
                                 + QwpConstants.HEADER_OFFSET_FLAGS) & QwpConstants.FLAG_SCHEMA);
-                Reader reader = tableReader(encoder, size, wireType(vector.targetType), 1);
+                QwpTestWireReader reader = tableReader(encoder, size, wireType(vector.targetType), 1);
                 if (vector.isNull()) {
                     Assert.assertEquals(vector.caseId, 1, reader.u8());
                     Assert.assertEquals(vector.caseId, 1, reader.u8());
@@ -172,52 +164,13 @@ public class QwpSchemaBindingFloatingDecimalTest {
         }
     }
 
-    private static QwpSchemaBinding binding(QwpTableBuffer buffer, byte[]... columns) {
-        return new QwpSchemaBinding(buffer, known(columns));
-    }
-
-    private static byte[] column(String name, int type) {
-        byte[] bytes = name.getBytes(StandardCharsets.UTF_8);
-        return ByteBuffer.allocate(2 + bytes.length + 6).order(ByteOrder.LITTLE_ENDIAN)
-                .putShort((short) bytes.length).put(bytes).putInt(type).putShort((short) 0).array();
-    }
-
-    private static QwpSchemaResponse decode(byte[] payload) {
-        ByteBuffer frame = ByteBuffer.allocate(QwpConstants.HEADER_SIZE + payload.length).order(ByteOrder.LITTLE_ENDIAN)
-                .putInt(QwpConstants.MAGIC_MESSAGE).put((byte) 1).put(QwpSchemaProtocol.FLAG_CONTROL)
-                .putShort((short) 0).putInt(payload.length).put(payload);
-        long address = Unsafe.malloc(frame.capacity(), MemoryTag.NATIVE_DEFAULT);
-        try {
-            for (int i = 0; i < frame.capacity(); i++) {
-                Unsafe.getUnsafe().putByte(address + i, frame.array()[i]);
-            }
-            return QwpSchemaProtocol.decodeResponse(address, frame.capacity());
-        } finally {
-            Unsafe.free(address, frame.capacity(), MemoryTag.NATIVE_DEFAULT);
-        }
-    }
-
-    private static QwpSchemaResponse known(byte[]... columns) {
-        int length = 26;
-        for (byte[] column : columns) {
-            length += column.length;
-        }
-        ByteBuffer payload = ByteBuffer.allocate(length).order(ByteOrder.LITTLE_ENDIAN)
-                .put(QwpSchemaProtocol.KIND_SCHEMA).putLong(1).put((byte) QwpSchemaProtocol.RESULT_KNOWN)
-                .putInt(1).putLong(1).putShort((short) -1).putShort((short) columns.length);
-        for (byte[] column : columns) {
-            payload.put(column);
-        }
-        return decode(payload.array());
-    }
-
     private static long parseHex(String value) {
         Assert.assertNotEquals("-", value);
         return Long.parseUnsignedLong(value, 16);
     }
 
-    private static Reader tableReader(QwpWebSocketEncoder encoder, int size, byte wireType, int rows) {
-        Reader reader = new Reader(encoder.getBuffer().getBufferPtr(), size);
+    private static QwpTestWireReader tableReader(QwpWebSocketEncoder encoder, int size, byte wireType, int rows) {
+        QwpTestWireReader reader = new QwpTestWireReader(encoder.getBuffer().getBufferPtr(), size);
         reader.skip(QwpConstants.HEADER_SIZE);
         Assert.assertEquals("t", reader.string());
         Assert.assertEquals(1, reader.u8());
@@ -265,66 +218,6 @@ public class QwpSchemaBindingFloatingDecimalTest {
             return 4;
         }
         return 1;
-    }
-
-    private static final class Reader {
-        private final long address;
-        private final int limit;
-        private int position;
-
-        private Reader(long address, int limit) {
-            this.address = address;
-            this.limit = limit;
-        }
-
-        private int i32() {
-            Assert.assertTrue(position + 4 <= limit);
-            int value = Unsafe.getUnsafe().getInt(address + position);
-            position += 4;
-            return value;
-        }
-
-        private long i64() {
-            Assert.assertTrue(position + 8 <= limit);
-            long value = Unsafe.getUnsafe().getLong(address + position);
-            position += 8;
-            return value;
-        }
-
-        private int position() {
-            return position;
-        }
-
-        private void skip(int length) {
-            position += length;
-            Assert.assertTrue(position <= limit);
-        }
-
-        private String string() {
-            int length = varint();
-            byte[] bytes = new byte[length];
-            for (int i = 0; i < length; i++) {
-                bytes[i] = (byte) u8();
-            }
-            return new String(bytes, StandardCharsets.UTF_8);
-        }
-
-        private int u8() {
-            Assert.assertTrue(position < limit);
-            return Unsafe.getUnsafe().getByte(address + position++) & 0xff;
-        }
-
-        private int varint() {
-            int result = 0;
-            int shift = 0;
-            int value;
-            do {
-                value = u8();
-                result |= (value & 0x7f) << shift;
-                shift += 7;
-            } while ((value & 0x80) != 0);
-            return result;
-        }
     }
 
     private static final class Vector {
