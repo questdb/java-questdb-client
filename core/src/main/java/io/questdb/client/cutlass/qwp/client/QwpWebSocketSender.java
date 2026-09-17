@@ -5647,6 +5647,15 @@ public class QwpWebSocketSender implements Sender {
         }
     }
 
+    /**
+     * Step-4 rebuild, and the REBUILD resume's retry of it. Every failure
+     * abandons to the resume point and the next send retries; there is
+     * deliberately no in-place retry loop. That includes a sibling sender's
+     * startup orphan drainer (drain_orphans=on, same sf_dir) holding this
+     * slot's logical lock for the microseconds between taking it and finding
+     * no segment files: the rebuild surfaces one SlotLockContentionException
+     * (naming this same process) and the next table() completes the swap.
+     */
     private CursorSendEngine rebuildEngineOrAbandon(String message) {
         try {
             return engineRebuildFactory.rebuild(userErrorHandler());
