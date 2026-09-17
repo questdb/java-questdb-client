@@ -977,35 +977,51 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test
-    public void testLongArrayRejectionRollsBackAndRefreshesOnce() throws Exception {
+    public void testLongArrayRejectionRollsBackWithoutRefresh() throws Exception {
         assertMemoryLeak(() -> {
-            int array2d = ColumnType.encodeArrayType(ColumnType.DOUBLE, 2);
-            LongTextSchemaHandler handler = new LongTextSchemaHandler(1221, 1231, array2d);
-            try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
-                sender.table("events").doubleArray("value", new double[][]{{1.0, 2.0}}).atNow();
+            for (int overload = 0; overload < 4; overload++) {
+                int array2d = ColumnType.encodeArrayType(ColumnType.DOUBLE, 2);
+                LongTextSchemaHandler handler = new LongTextSchemaHandler(1221, 1231, array2d);
+                try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
+                    sender.table("events").doubleArray("value", new double[][]{{1.0, 2.0}}).atNow();
 
-                sender.table("events").uuidColumn("failed_b", 11, 12);
-                try {
-                    sender.longArray("value", new long[]{99L});
-                    Assert.fail("expected unsupported LONG_ARRAY setter");
-                } catch (LineSenderSchemaException e) {
-                    Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
+                    sender.table("events").uuidColumn("failed_b", 11, 12);
+                    try {
+                        switch (overload) {
+                            case 0:
+                                sender.longArray("value", new long[]{99L});
+                                break;
+                            case 1:
+                                sender.longArray("value", new long[][]{{99L}});
+                                break;
+                            case 2:
+                                sender.longArray("value", new long[][][]{{{99L}}});
+                                break;
+                            default:
+                                try (LongArray array = new LongArray(1)) {
+                                    sender.longArray("value", array.append(99L));
+                                }
+                                break;
+                        }
+                        Assert.fail("expected unsupported LONG_ARRAY setter [overload=" + overload + "]");
+                    } catch (LineSenderSchemaException e) {
+                        Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
+                    }
+
+                    sender.doubleArray("value", new double[][]{{3.0}, {4.0}}).atNow();
+                    sender.flush();
+                    // Only the two completed DOUBLE[] rows reach the wire; failed_b is rolled back.
+                    new FrameReader(handler.awaitDataFrame())
+                            .doubleArrayTable("events", 1221, 1231);
+                    Assert.assertEquals("unsupported input must not refresh [overload=" + overload + "]", 1,
+                            handler.describeRequests.get());
                 }
-
-                sender.doubleArray("value", new double[][]{{3.0}, {4.0}}).atNow();
-                sender.flush();
-                // The frame carries the two DOUBLE[] rows only: the partial row that
-                // held failed_b rolled back, so no extra column reaches the wire.
-                new FrameReader(handler.awaitDataFrame())
-                        .doubleArrayTable("events", 1221, 1231);
-                Assert.assertEquals("setter must use the standard one-refresh path", 2,
-                        handler.describeRequests.get());
             }
         });
     }
 
     @Test
-    public void testLongArrayRejectionSurfacesSchemaChangeAfterRebind() throws Exception {
+    public void testLongArrayRejectionDoesNotRefreshAfterSchemaChange() throws Exception {
         assertMemoryLeak(() -> {
             int array2d = ColumnType.encodeArrayType(ColumnType.DOUBLE, 2);
             int array1d = ColumnType.encodeArrayType(ColumnType.DOUBLE, 1);
@@ -1014,9 +1030,20 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events").doubleArray("value", new double[][]{{1.0, 2.0}}).atNow();
                 handler.targetType = array1d;
                 handler.version = 1252;
-                sender.table("events").uuidColumn("failed_b", 11, 12);
+                for (int attempt = 0; attempt < 2; attempt++) {
+                    sender.table("events").uuidColumn("failed_b", 11, 12);
+                    try {
+                        sender.longArray("value", new long[]{3L, 4L});
+                        Assert.fail("expected unsupported LONG_ARRAY setter");
+                    } catch (LineSenderSchemaException e) {
+                        Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
+                    }
+                    Assert.assertEquals("schema changes cannot implement LONG_ARRAY", 1,
+                            handler.describeRequests.get());
+                }
+                // A supported input still discovers the rank change and can be retried.
                 try {
-                    sender.longArray("value", new long[]{3L, 4L});
+                    sender.doubleArray("value", new double[]{3.0, 4.0});
                     Assert.fail("expected target-changing schema refresh");
                 } catch (LineSenderSchemaException e) {
                     Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
@@ -1028,6 +1055,26 @@ public class QwpSchemaSenderIntegrationTest {
                 new FrameReader(handler.awaitDataFrame())
                         .twoDoubleArrayRankBlocks("events", 1241, 1251, 1252);
                 Assert.assertEquals(2, handler.describeRequests.get());
+            }
+        });
+    }
+
+    @Test(timeout = 10_000)
+    public void testLongArrayRejectionDoesNotDependOnDescribeAvailability() throws Exception {
+        assertMemoryLeak(() -> {
+            SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 91, 92);
+            try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
+                sender.table("events").uuidColumn("id", 1, 2).atNow();
+                handler.respondToDescribe = false;
+                ((QwpWebSocketSender) sender).setSchemaWaitMillisForTesting(100);
+                sender.table("events").stringColumn("partial", "discard");
+                try {
+                    sender.longArray("id", new long[]{99L});
+                    Assert.fail("expected unsupported LONG_ARRAY setter");
+                } catch (LineSenderSchemaException e) {
+                    Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
+                }
+                Assert.assertEquals(1, handler.describeRequests.get());
             }
         });
     }

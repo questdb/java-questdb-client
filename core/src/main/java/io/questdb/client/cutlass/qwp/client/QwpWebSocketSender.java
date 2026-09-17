@@ -2550,7 +2550,8 @@ public class QwpWebSocketSender implements Sender {
                 col.addLongArray(values);
             }
         } catch (RuntimeException | Error e) {
-            throw onRowFailure(e, name);
+            // LONG_ARRAY is unimplemented; a schema refresh cannot make it valid.
+            throw onRowFailure(e, null);
         }
         return this;
     }
@@ -2571,7 +2572,7 @@ public class QwpWebSocketSender implements Sender {
                 col.addLongArray(values);
             }
         } catch (RuntimeException | Error e) {
-            throw onRowFailure(e, name);
+            throw onRowFailure(e, null);
         }
         return this;
     }
@@ -2592,7 +2593,7 @@ public class QwpWebSocketSender implements Sender {
                 col.addLongArray(values);
             }
         } catch (RuntimeException | Error e) {
-            throw onRowFailure(e, name);
+            throw onRowFailure(e, null);
         }
         return this;
     }
@@ -2613,7 +2614,7 @@ public class QwpWebSocketSender implements Sender {
                 col.addLongArray(array);
             }
         } catch (RuntimeException | Error e) {
-            throw onRowFailure(e, name);
+            throw onRowFailure(e, null);
         }
         return this;
     }
