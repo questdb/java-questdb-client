@@ -824,9 +824,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      *       therefore be reported later by the server, and values such as
      *       nanosecond timestamps use their legacy representation. If recovered
      *       data already requires schema support, writes instead wait for schema
-     *       negotiation. Once support is confirmed, all future rows use strict
-     *       schema lookup and validation, including across reconnects; a row
-     *       already in progress keeps the contract under which it began. Transport
+     *       negotiation. A batch keeps the contract under which its first row
+     *       was written: rows added to a pending legacy batch stay legacy even
+     *       after support is confirmed. The first row after that batch flushes
+     *       (explicitly or by auto-flush) and all later rows use strict schema
+     *       lookup and validation, including across reconnects. Transport
      *       failures (unreachable or
      *       dropped server) retry indefinitely and are never surfaced -- the
      *       buffered rows are safe in SF and the server may still appear. A

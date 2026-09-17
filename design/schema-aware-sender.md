@@ -1379,7 +1379,8 @@ Do not extend the rule to other input families or targets by analogy.
 
 The table does not include missing-table/column inference or Sender lifecycle
 integration. Iteration 2.15 implements first-effective-write schema resolution,
-designated timestamp row completion and row-boundary adoption. Iteration 2.18
+designated timestamp row completion and schema-mode adoption (since moved from
+the row boundary to the batch boundary). Iteration 2.18
 adds inference for the already-supported setter families, not the missing
 families in the conversion inventory. Preserve each public overload's null/no-op
 and duplicate rules:
@@ -1872,8 +1873,8 @@ They do not change the compatibility contract.
     from the cursor's element type, so accepting a non-DOUBLE target would
     reproduce a server validation gap rather than a supported conversion.
 28. **Reuse initial-connect policy only at the cold-start boundary.** Let
-    `ASYNC` create ordinary legacy rows until the first handshake, then use the
-    existing row-boundary transition to adopt schema mode. Keep `OFF` and
+    `ASYNC` create ordinary legacy rows until the first handshake, then adopt
+    schema mode at the next batch boundary. Keep `OFF` and
     `SYNC` strict, and let a recovered schema-required backlog override the
     startup exception. Do not add raw-value storage, a deferred converter, a
     second availability option or a downgrade path after schema confirmation.
