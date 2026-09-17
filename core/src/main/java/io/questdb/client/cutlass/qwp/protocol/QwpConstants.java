@@ -92,8 +92,17 @@ public final class QwpConstants {
      * <p>
      * NOT the result-direction cap: {@code QwpResultBatchDecoder.MAX_CONN_DICT_SIZE}
      * (8,388,608) governs server-to-client result batches and is unrelated.
+     * <p>
+     * Compatibility: servers released before QuestDB 10.0.0 cap their
+     * dictionary at 1,000,000, and QWP has no wire-level negotiation of the
+     * limit -- a dictionary this client lets grow past 1M is rejected by
+     * those servers as a terminal parse error. Reachable on defaults: each
+     * recycle raises the re-arm bar to twice the dictionary size at the
+     * swap, capped at half of this constant, so an unbounded-cardinality
+     * producer's dictionary grows to 1M entries per epoch. Only 10.0.0+
+     * servers are supported.
      */
-    public static final int MAX_SYMBOL_DICTIONARY_SIZE = 1_000_000;
+    public static final int MAX_SYMBOL_DICTIONARY_SIZE = 2_000_000;
     /**
      * Maximum table name length in bytes. Mirrors the server's same-named
      * constant; used by the decoder to reject malformed wire bytes.

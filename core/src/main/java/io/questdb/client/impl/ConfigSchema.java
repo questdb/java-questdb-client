@@ -90,6 +90,9 @@ public final class ConfigSchema {
         str("sf_max_segment_bytes", Side.INGRESS);
         str("sf_max_total_bytes", Side.INGRESS);
         str("sf_sync_interval_millis", Side.INGRESS);
+        str("symbol_dict_reset", Side.INGRESS);
+        str("symbol_dict_reset_max_wait_millis", Side.INGRESS);
+        str("symbol_dict_reset_threshold", Side.INGRESS);
         str("transaction", Side.INGRESS);
 
         // EGRESS -- the QwpQueryClient applies. Typed where there is a range or
