@@ -5348,11 +5348,13 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Closes the outgoing I/O loop with {@link #close()}'s carried-interrupt
-     * policy: the shutdown-latch await tests the flag before it consults the
-     * latch, so a flag already set would report a failed stop after 0 ms.
-     * Cleared for the join, restored after; an interrupt that arrives during
-     * the join still takes the loop's genuine failed-stop branch.
+     * Closes the outgoing I/O loop with the flag treatment {@link #close()}
+     * gives its own loop-close join: a flag already set would make the
+     * shutdown-latch await report a failed stop after 0 ms, so it is cleared
+     * for the join and put back after, whatever the outcome. An interrupt
+     * that arrives during the join still takes the loop's failed-stop
+     * branch. Only the join is covered: a park the recycle enters later
+     * (the starvation wait, the deferred-close wait) keeps its own policy.
      */
     private void closeLoopInterruptNeutral(CursorWebSocketSendLoop loop) {
         final boolean carried = Thread.interrupted();
