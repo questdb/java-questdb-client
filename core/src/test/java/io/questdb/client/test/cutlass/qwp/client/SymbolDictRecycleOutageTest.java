@@ -437,9 +437,14 @@ public class SymbolDictRecycleOutageTest {
                         ws.forceCloseLoopAbandonForTesting();
                     }
                     sender.table("t").symbol("s", "c").longColumn("v", 2L).atNow(); // recycle, or resume, runs here
-                    Assert.assertEquals("the swap itself needs no connection",
+                    Assert.assertEquals(viaCloseLoopResume
+                                    ? "the resume must not swap"
+                                    : "the swap itself needs no connection",
                             viaCloseLoopResume ? 0 : 1, ws.getSymbolDictEpoch());
-                    Assert.assertTrue("the seed must survive the swap", ws.wasEverConnected());
+                    Assert.assertTrue(viaCloseLoopResume
+                                    ? "the seed must survive the resume's re-close"
+                                    : "the seed must survive the swap",
+                            ws.wasEverConnected());
 
                     // Producing keeps working: the rejection is transient under
                     // Invariant B, so rows buffer and nothing latches.

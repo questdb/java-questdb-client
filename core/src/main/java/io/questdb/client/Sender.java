@@ -705,11 +705,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * is the only trigger point: a caller that never starts another row
      * never starts a recycle. A recycle that a {@code table(...)} call has
      * already started but could not finish (a transient failure mid-swap) is
-     * resumed and completed by the next {@code table(...)}, {@code flush()}
-     * or {@code drain(...)} call, on the producer thread; an {@code at(...)}
-     * or {@code atNow()} that finds the swap still pending fails and rolls
-     * back its row, and the next {@code table(...)} completes the swap.
-     * No-op on transports without a symbol dictionary.
+     * resumed on the producer thread. While the swap's rebuild is pending,
+     * the next {@code table(...)}, {@code flush()} or {@code drain(...)}
+     * call completes it, and an {@code at(...)} or {@code atNow()} fails
+     * and rolls back its row. While only the outgoing loop's close is
+     * pending, any of those calls finishes it and the armed recycle re-fires
+     * at a later {@code table(...)} call. No-op on transports without a
+     * symbol dictionary.
      * <p>
      * The request bypasses the anti-thrash re-arm floor for that one swap and
      * does not lower it: the floor only ever rises, so a scheduled manual

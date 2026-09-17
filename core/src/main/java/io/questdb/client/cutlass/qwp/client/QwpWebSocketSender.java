@@ -380,12 +380,13 @@ public class QwpWebSocketSender implements Sender {
     // Sender-lifetime sticky OR of every rebuilt loop's own hasEverConnected:
     // once ANY loop instance owned by this sender has reached the server,
     // this stays true even after a symbol-dict recycle rebuilds the loop.
-    // Latched in two places -- ensureConnected()'s tail on a successful
-    // foreground (client != null) connect, and recycleForDictReset()'s step
-    // 2, which OR's in the outgoing loop's own hasEverConnected() before
-    // closing it (covers an ASYNC-initial sender whose only connect ever
-    // happened on the I/O thread, so this method never observed client !=
-    // null). ensureConnected() seeds it into the freshly built loop via
+    // Latched in three places -- ensureConnected()'s tail on a successful
+    // foreground (client != null) connect, recycleForDictReset()'s step 2
+    // and resumeRecycleIfPending()'s CLOSE_LOOP arm, which both OR in the
+    // outgoing loop's own hasEverConnected() after closing it (covers an
+    // ASYNC-initial sender whose only connect ever happened on the I/O
+    // thread, so this method never observed client != null).
+    // ensureConnected() seeds it into the freshly built loop via
     // markEverConnected() before start(), so a post-recycle loop rebuild
     // does not reset CursorWebSocketSendLoop's own hasEverConnected back to
     // false -- which would wrongly re-arm its startup-terminal
@@ -5581,10 +5582,9 @@ public class QwpWebSocketSender implements Sender {
         // parkNanos returns immediately while the thread's interrupt flag is
         // set. Clear the flag each time a park returns so the wait keeps its
         // time budget instead of busy-spinning; restore it on the timeout and
-        // throw exits only. The drained exit deliberately swallows it, the
-        // flock-release retry driver's policy that awaitDeferredEngineClose()
-        // shares; the loop-close join that follows clears a carried flag
-        // itself (closeLoopInterruptNeutral), so nothing depends on the swallow.
+        // throw exits only. The drained exit still swallows it, as before;
+        // the loop-close join that follows clears a carried flag itself
+        // (closeLoopInterruptNeutral), so nothing depends on the swallow.
         boolean wasInterrupted = false;
         try {
             while (!isRingDrained()) {
@@ -5768,9 +5768,10 @@ public class QwpWebSocketSender implements Sender {
             if (cursorSendLoop != null) {
                 closeLoopInterruptNeutral(cursorSendLoop);
                 // Read the sticky AFTER close(): close joins the I/O thread,
-                // so a connect that landed mid-window is final here. This is
-                // the only place an ASYNC-initial sender's connect (observed
-                // only by the I/O thread) reaches hasLoopEverConnected.
+                // so a connect that landed mid-window is final here. This and
+                // the CLOSE_LOOP resume's re-close are the only places an
+                // ASYNC-initial sender's connect (observed only by the I/O
+                // thread) reaches hasLoopEverConnected.
                 hasLoopEverConnected |= cursorSendLoop.hasEverConnected();
                 cursorSendLoop = null;
             }
