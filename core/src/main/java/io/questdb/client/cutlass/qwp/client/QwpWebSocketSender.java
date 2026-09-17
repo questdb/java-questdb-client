@@ -2331,7 +2331,10 @@ public class QwpWebSocketSender implements Sender {
      * abandoned recycle parked at CLOSE_LOOP -- on a loop that is genuinely
      * closed, so the resume's re-close converges instantly instead of
      * depending on a real step-2 failure.
-     * The loop reference is deliberately KEPT (the resume re-closes it).
+     * The loop reference is deliberately KEPT (the resume re-closes it), and
+     * the ever-connected sticky is deliberately NOT carried here: a real
+     * step-2 failure throws before the recycle reads it, so carrying it is
+     * the resume's job.
      */
     @TestOnly
     public void forceCloseLoopAbandonForTesting() {
@@ -2339,7 +2342,6 @@ public class QwpWebSocketSender implements Sender {
             throw new IllegalStateException("connect and publish first: the CLOSE_LOOP arm needs a loop");
         }
         cursorSendLoop.close();
-        hasLoopEverConnected |= cursorSendLoop.hasEverConnected();
         connected = false;
         recycleResume = RecycleResume.CLOSE_LOOP;
     }

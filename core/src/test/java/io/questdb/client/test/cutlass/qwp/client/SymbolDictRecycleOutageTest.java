@@ -383,18 +383,39 @@ public class SymbolDictRecycleOutageTest {
      * transient only because the swap seeds the fresh loop with
      * markEverConnected() -- without it, the fresh loop would classify the
      * same 401 as a pre-first-connect endpoint-policy failure and latch a
-     * terminal, turning a transient auth blip into data loss.
+     * terminal, turning a transient auth blip into data loss. With the
+     * default (foreground) initial connect ensureConnected() records the
+     * first connect itself; with an ASYNC initial connect only the I/O
+     * thread ever sees it, so the seed exists only if the recycle's loop
+     * close carries the loop's own sticky across the swap (step 2), and the
+     * CLOSE_LOOP resume's re-close must carry it the same way.
      */
     @Test(timeout = 60_000L)
     public void testPostRecycleEndpointPolicyRejectionIsTransient() throws Exception {
+        assertPostRecycle401IsTransient("", false);
+    }
+
+    @Test(timeout = 60_000L)
+    public void testPostRecycleEndpointPolicyRejectionIsTransientWithAsyncInitialConnect() throws Exception {
+        assertPostRecycle401IsTransient("initial_connect_retry=async;", false);
+    }
+
+    @Test(timeout = 60_000L)
+    public void testPostCloseLoopResumeEndpointPolicyRejectionIsTransientWithAsyncInitialConnect() throws Exception {
+        assertPostRecycle401IsTransient("initial_connect_retry=async;", true);
+    }
+
+    private void assertPostRecycle401IsTransient(String connectModeCfg, boolean viaCloseLoopResume) throws Exception {
         assertMemoryLeak(() -> {
-            String sfDir = temporaryFolder.getRoot().toPath().resolve("post-recycle-401").toString();
+            String sfDir = temporaryFolder.getRoot().toPath()
+                    .resolve("post-recycle-401-" + (connectModeCfg.isEmpty() ? "eager" : "async")
+                            + (viaCloseLoopResume ? "-resume" : "")).toString();
             AckAllHandler handler = new AckAllHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
                 String cfg = "ws::addr=localhost:" + server.getPort() + ";sf_dir=" + sfDir
-                        + ";symbol_dict_reset_threshold=2;";
+                        + ";symbol_dict_reset_threshold=2;" + connectModeCfg;
                 try (Sender sender = Sender.fromConfig(cfg)) {
                     QwpWebSocketSender ws = (QwpWebSocketSender) sender;
                     sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
@@ -402,13 +423,22 @@ public class SymbolDictRecycleOutageTest {
                     long fsn1 = sender.flushAndGetSequence();
                     Assert.assertTrue("setup: arm batch must be acked", sender.awaitAckedFsn(fsn1, 5_000));
                     Assert.assertTrue(ws.isResetArmed());
+                    Assert.assertTrue("setup: the first connect has happened", ws.wasEverConnected());
 
                     // Every handshake from here on is met with 401 -- including
-                    // the fresh post-recycle loop's very first connect.
+                    // the fresh loop's very first connect.
                     server.setRejectWithStatus(401, "Unauthorized");
 
-                    sender.table("t").symbol("s", "c").longColumn("v", 2L).atNow(); // recycle fires here
-                    Assert.assertEquals("the swap itself needs no connection", 1, ws.getSymbolDictEpoch());
+                    if (viaCloseLoopResume) {
+                        // The state a step-2 close failure leaves behind: old
+                        // loop dead, no swap, resume pending. The next row's
+                        // table() finishes the close, and its send builds the
+                        // fresh loop.
+                        ws.forceCloseLoopAbandonForTesting();
+                    }
+                    sender.table("t").symbol("s", "c").longColumn("v", 2L).atNow(); // recycle, or resume, runs here
+                    Assert.assertEquals("the swap itself needs no connection",
+                            viaCloseLoopResume ? 0 : 1, ws.getSymbolDictEpoch());
                     Assert.assertTrue("the seed must survive the swap", ws.wasEverConnected());
 
                     // Producing keeps working: the rejection is transient under
@@ -426,7 +456,7 @@ public class SymbolDictRecycleOutageTest {
                     while (server.statusRejectCount() == 0 && System.nanoTime() < rejectDeadline) {
                         Thread.sleep(2);
                     }
-                    Assert.assertTrue("the fresh post-recycle loop must actually hit the 401 "
+                    Assert.assertTrue("the fresh loop must actually hit the 401 "
                                     + "before this test can exercise Invariant B's seed",
                             server.statusRejectCount() > 0);
                     Assert.assertNull("must not latch a terminal on a post-recycle 401",
