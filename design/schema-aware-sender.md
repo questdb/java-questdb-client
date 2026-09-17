@@ -660,7 +660,7 @@ and report the capability mismatch under the existing reconnect policy. There
 is no send-time transformation, metadata stripping or downgrade encoder. A
 successful connection to an old server does not permanently prevent upgrade:
 a later connection that confirms schema support adopts schema mode at the next
-row boundary.
+batch boundary: the first row after the pending legacy batch flushes.
 
 | Client | Server | Behavior |
 |---|---|---|
@@ -676,10 +676,13 @@ clients need no changes. Clients may be upgraded before servers. Once schema
 support has been confirmed, failover destinations must also support it; mixed
 old/new endpoints are not supported for that sender after the upgrade.
 
-An existing legacy row finishes in legacy mode. The producer adopts schema
-mode at the next actual row boundary, seals completed legacy rows and replaces
-the inferred layout before binding new rows. Pending legacy blocks retain
-their original types and flag-clear framing, even if encoded or sent later. A
+A pending legacy batch finishes in legacy mode. A batch has one wire contract,
+selected by its first committed row, because a QWP frame has one wire family:
+while the batch holds legacy rows, later rows stay legacy. The producer adopts
+schema mode on the first row after that batch flushes (explicitly or by
+auto-flush) and replaces the inferred layout before binding new rows. Legacy
+and schema blocks therefore never share a flush. Published legacy frames retain
+their original types and flag-clear framing, even if sent later. A
 supporting server accepts those flag-clear blocks on a schema-negotiated
 connection; negotiation is required only for schema-flagged data.
 
@@ -706,7 +709,8 @@ or option:
   retains the original values for later conversion.
 
 The mode is pinned by the first effective operation. If the handshake completes
-mid-row, that row remains legacy and schema mode can start only on the next row.
+mid-batch, that batch remains legacy and schema mode can start only on the first
+row after it flushes.
 Consequently, handshake timing can change successful stored values as well as
 error timing: the legacy and schema contracts deliberately differ for cases
 such as sub-microsecond timestamps, overflow and source-null normalization.
@@ -752,11 +756,11 @@ one-way upgrade and recovery. Do not also consult `hasEverConnected()` and do
 not add another negotiated-mode field.
 
 A supporting handshake may set the requirement immediately after the producer
-observes false. That race is harmless and intentional: the current row has
-already selected legacy behavior, while the next row observes the sticky true
-value and enters schema mode. The existing partial-row check, retired table
-buffers and mixed-frame flush preserve that boundary without a new lock or row
-state.
+observes false. That race is harmless and intentional: the current batch has
+already selected legacy behavior, while the first row of the next batch observes
+the sticky true value and enters schema mode. One producer-thread flag, set by
+the batch's first committed row, preserves that boundary without a lock, and no
+flush ever mixes wire families.
 
 No change belongs in `QwpSchemaCoordinator`, `CursorWebSocketSendLoop`,
 `CursorSendEngine`, the encoder, store-and-forward format or server. Update the
@@ -2105,10 +2109,11 @@ without claiming general exactly-once delivery.
   extended SF replay on a negotiated connection, and reject flagged frames on
   unnegotiated connections before processing data. Restart with a mixed backlog
   and prove its original bytes, order and schema requirement are preserved.
-- Upgrade from an old to a supporting server finishes any partial legacy row
-  unchanged and adopts schema mode at the next row boundary, including without
-  another `table()` call. Pending legacy blocks and SF remain unchanged and
-  ordered; new blocks use the extended layout. No send-time conversion occurs.
+- Upgrade from an old to a supporting server finishes the pending legacy batch
+  unchanged and adopts schema mode on the first row after it flushes, including
+  on a table that already flushed legacy rows. Published legacy frames and SF
+  remain unchanged and ordered; new batches use the extended layout. No
+  send-time conversion occurs.
 - Reconnect and background replay re-negotiate support. After upgrade, an old
   endpoint receives no pending data and causes neither downgrade nor watermark
   advancement. The requirement survives reconnect even with a legacy-only

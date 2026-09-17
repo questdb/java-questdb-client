@@ -8019,3 +8019,27 @@ their fragmented-transport variant. Final server scratch is under
 uses `/mnt/pcie5/qwp-schema-aware-tests/client-final`, with no `/tmp` paths in
 its 295 current Surefire reports. No client or server production source changed
 in this decision.
+
+### Legacy-to-schema adoption moves to the batch boundary
+
+The 2026-09-17 complexity review ranked the duplicated mixed-family flush first.
+Rather than fold it into the split path, this decision removes its cause. Row
+boundary adoption was the only source of mixed legacy/schema batches. A batch
+now has one wire contract, selected by its first committed row
+(`isPendingBatchLegacy`); `bindingForEffectiveWrite()` keeps returning the
+legacy contract while that batch is pending, and the first row after the flush
+adopts schema mode. The upgrade stays one-way and is delayed by at most one
+batch. `flushPendingRowsMixed()`, `mixedFramesFit()`, `encodeSingleTableFrame()`
+and `isMixedSchemaBatch()` are deleted; the encoder is unchanged. This
+supersedes the earlier "next effective row adopts schema mode" rule. The
+trade-off: rows written after the handshake but inside the pending legacy batch
+keep legacy conversion (for example microsecond `Instant` truncation). Which
+rows preceded the handshake was already a timing race.
+
+The rewrite exposed an existing defect, reproduced on unmodified source: legacy
+row, flush, supporting reconnect, then a row on the same table threw
+`IllegalStateException: schema binding requires an empty, unbound table buffer`
+from the column setter. `installSchemaBinding()` bound in place whenever the
+buffer had no rows, but a flushed legacy buffer keeps its column layout. It now
+binds in place only a buffer with no columns and replaces the buffer otherwise.
+Both rewritten upgrade tests cover that path.

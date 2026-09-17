@@ -1854,7 +1854,7 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test
-    public void testPendingLegacyRowSurvivesUpgradeAndPublishesBeforeSchemaRow() throws Exception {
+    public void testPendingLegacyBatchStaysLegacyAcrossUpgradeAndNextBatchAdoptsSchema() throws Exception {
         assertMemoryLeak(() -> {
             int port = TestPorts.findUnusedPort();
             SchemaHandler legacyHandler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 1, 1);
@@ -1887,17 +1887,22 @@ public class QwpSchemaSenderIntegrationTest {
                 Assert.assertTrue("schema-capable connection was not installed and servicing frames",
                         schemaHandler.awaitPong());
                 sender.atNow();
+                // A batch has one wire contract: the pending batch already holds
+                // legacy rows, so this row stays legacy although the supporting
+                // connection is up. The first row after the flush adopts schema mode.
+                sender.table("events").stringColumn("legacy_value", "C").atNow();
+                sender.flush();
                 sender.table("events").uuidColumn("id", 3, 4).atNow();
                 sender.flush();
                 List<byte[]> frames = schemaHandler.awaitDataFrames(2);
                 Assert.assertEquals(0, frames.get(0)[QwpConstants.HEADER_OFFSET_FLAGS] & QwpConstants.FLAG_SCHEMA);
-                Assert.assertTrue((frames.get(0)[QwpConstants.HEADER_OFFSET_FLAGS]
-                        & QwpConstants.FLAG_DEFER_COMMIT) != 0);
+                Assert.assertEquals(0, frames.get(0)[QwpConstants.HEADER_OFFSET_FLAGS]
+                        & QwpConstants.FLAG_DEFER_COMMIT);
                 Assert.assertTrue((frames.get(1)[QwpConstants.HEADER_OFFSET_FLAGS]
                         & QwpConstants.FLAG_SCHEMA) != 0);
                 Assert.assertEquals(0, frames.get(1)[QwpConstants.HEADER_OFFSET_FLAGS]
                         & QwpConstants.FLAG_DEFER_COMMIT);
-                new FrameReader(frames.get(0)).legacyVarcharTable("events", "legacy_value", "A", "B");
+                new FrameReader(frames.get(0)).legacyVarcharTable("events", "legacy_value", "A", "B", "C");
                 FrameReader schema = new FrameReader(frames.get(1));
                 schema.schemaTable("events", 61, 62, 1, "id", QwpConstants.TYPE_UUID);
                 Assert.assertEquals(0, schema.u8());
@@ -1939,12 +1944,16 @@ public class QwpSchemaSenderIntegrationTest {
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
                 Assert.assertTrue("schema-capable connection was not installed", handler.awaitPong());
 
+                // The pending batch is legacy, so this row stays legacy too. The
+                // first row after the flush adopts schema mode.
+                sender.table("events").timestampColumn("ts", value).atNow();
+                sender.flush();
                 sender.table("events").timestampColumn("ts", value).atNow();
                 sender.flush();
 
                 List<byte[]> frames = handler.awaitDataFrames(2);
                 new FrameReader(frames.get(0)).legacyTimestampTable(
-                        "events", "ts", 3_456_789L);
+                        "events", "ts", 3_456_789L, 3_456_789L);
                 new FrameReader(frames.get(1)).schemaTimestampTable(
                         "events", 71, 72, "ts", 3_456_789_123L);
                 Assert.assertEquals(1, handler.describeRequests.get());
@@ -2417,7 +2426,7 @@ public class QwpSchemaSenderIntegrationTest {
             eof();
         }
 
-        private void legacyTimestampTable(String table, String column, long expectedMicros) {
+        private void legacyTimestampTable(String table, String column, long... expectedMicros) {
             Assert.assertEquals(QwpConstants.MAGIC_MESSAGE, in.getInt());
             Assert.assertEquals(QwpConstants.VERSION, u8());
             Assert.assertEquals(0, u8() & QwpConstants.FLAG_SCHEMA);
@@ -2426,13 +2435,15 @@ public class QwpSchemaSenderIntegrationTest {
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
             Assert.assertEquals(table, string());
-            Assert.assertEquals(1, varint());
+            Assert.assertEquals(expectedMicros.length, varint());
             Assert.assertEquals(1, varint());
             Assert.assertEquals(column, string());
             Assert.assertEquals(QwpConstants.TYPE_TIMESTAMP, u8());
             Assert.assertEquals(0, u8());
             Assert.assertEquals(0, u8());
-            Assert.assertEquals(expectedMicros, i64());
+            for (long micros : expectedMicros) {
+                Assert.assertEquals(micros, i64());
+            }
             eof();
         }
 

@@ -334,6 +334,9 @@ public class QwpWebSocketSender implements Sender {
     //         (Invariant B); endpoint-policy and transport failures stay
     //         contained in that loop and never reach the producer.
     private Sender.InitialConnectMode initialConnectMode = Sender.InitialConnectMode.OFF;
+    // Wire contract of the pending batch, selected by its first committed row.
+    // Meaningful only while pendingRowCount > 0. Producer-thread only.
+    private boolean isPendingBatchLegacy;
     private boolean ownsCursorEngine;
     // Whether close() may let the engine reclaim the parent-anchored LOGICAL slot lock.
     // False only while an outer frame holds it: Sender.build() acquires it for the whole
@@ -4387,8 +4390,14 @@ public class QwpWebSocketSender implements Sender {
             return pinned;
         }
         ensureConnected();
-        if (initialConnectMode == Sender.InitialConnectMode.ASYNC
-                && !cursorEngine.requiresSchema()) {
+        // A batch has one wire contract, because a QWP frame has one wire family.
+        // While the pending batch holds legacy rows, later rows stay legacy even if
+        // a supporting handshake has landed since; the first row after the flush
+        // adopts schema mode. The upgrade is one-way, so a schema batch never
+        // reverts.
+        if ((pendingRowCount > 0 && isPendingBatchLegacy)
+                || (initialConnectMode == Sender.InitialConnectMode.ASYNC
+                && !cursorEngine.requiresSchema())) {
             schemaResolutionFresh[0] = false;
             return null;
         }
@@ -4407,7 +4416,11 @@ public class QwpWebSocketSender implements Sender {
     }
 
     private QwpSchemaBinding installSchemaBinding(QwpSchemaResponse latest, QwpSchemaBinding pinned) {
-        if (pinned == null && currentTableBuffer.getRowCount() == 0) {
+        // Bind in place only a pristine buffer. A flushed legacy buffer has no rows
+        // but keeps its legacy column layout, which a schema binding cannot adopt;
+        // the replacement below covers it.
+        if (pinned == null && currentTableBuffer.getRowCount() == 0
+                && currentTableBuffer.getColumnCount() == 0) {
             return new QwpSchemaBinding(currentTableBuffer, latest);
         }
         QwpTableBuffer replacement = new QwpTableBuffer(currentTableName, this);
@@ -4571,10 +4584,6 @@ public class QwpWebSocketSender implements Sender {
         // up the new cap.
         int cap = serverMaxBatchSize;
         int deltaBaseline = symbolDeltaBaseline();
-        if (isMixedSchemaBatch(tableCount)) {
-            flushPendingRowsMixed(deferCommit, cap, deltaBaseline);
-            return;
-        }
         int combinedBodyStart = encodeCombinedFrame(tableCount, deferCommit, deltaBaseline);
         int messageSize = encoder.finishMessage();
 
@@ -4655,104 +4664,6 @@ public class QwpWebSocketSender implements Sender {
             }
             throw t;
         }
-    }
-
-    /**
-     * Flushes the rare live legacy-to-schema upgrade batch. Each block is its
-     * own frame because a QWP frame has one wire family. The first pass sizes
-     * every frame before anything is published; the second pass re-encodes and
-     * publishes in collection order, with one commit boundary for the batch.
-     */
-    private void flushPendingRowsMixed(boolean deferCommit, int cap, int deltaBaseline) {
-        final int blockCount = flushTableBuffers.size();
-        int sizingBaseline = deltaBaseline;
-        boolean fits = mixedFramesFit(cap, sizingBaseline);
-        boolean dictionaryChunksAwaitCommit = false;
-        if (!fits && !deltaDictEnabled && currentBatchMaxSymbolId > deltaBaseline
-                && mixedFramesFit(cap, currentBatchMaxSymbolId)) {
-            publishDictionaryChunks(cap, deltaBaseline + 1, currentBatchMaxSymbolId);
-            dictionaryChunksAwaitCommit = true;
-            sizingBaseline = currentBatchMaxSymbolId;
-        } else if (!fits) {
-            throw new BatchTooLargeForCapException(
-                    "single table block too large for server batch cap in mixed schema batch; "
-                            + "the batch is retained for retry until a larger-cap node is reached");
-        }
-
-        int frameBaseline = sizingBaseline;
-        try {
-            for (int i = 0; i < blockCount; i++) {
-                boolean frameDefer = deferCommit || i + 1 < blockCount;
-                int messageSize = encodeSingleTableFrame(i, frameDefer, frameBaseline);
-                if (cap > 0 && messageSize > cap) {
-                    throw new AssertionError("mixed frame exceeded preflight cap");
-                }
-                persistNewSymbolsBeforePublish();
-                QwpBufferWriter buffer = encoder.getBuffer();
-                activeBuffer.ensureCapacity(messageSize);
-                activeBuffer.write(buffer.getBufferPtr(), messageSize);
-                activeBuffer.incrementRowCount();
-                sealAndSwapBuffer();
-                if (frameDefer) {
-                    hasDeferredMessages = true;
-                }
-                advanceSentMaxSymbolId();
-                if (deltaDictEnabled && currentBatchMaxSymbolId > frameBaseline) {
-                    frameBaseline = currentBatchMaxSymbolId;
-                }
-            }
-            hasDeferredMessages = deferCommit;
-            if (!deferCommit) {
-                lastCommitBoundaryFsn = cursorEngine.publishedFsn();
-            }
-            resetTableBuffersAfterFlush();
-        } catch (Throwable t) {
-            if (dictionaryChunksAwaitCommit) {
-                commitOrphanedDictionaryChunks(t);
-            }
-            throw t;
-        }
-    }
-
-    private boolean mixedFramesFit(int cap, int deltaBaseline) {
-        if (cap <= 0) {
-            return true;
-        }
-        int simBaseline = deltaBaseline;
-        for (int i = 0, n = flushTableBuffers.size(); i < n; i++) {
-            int messageSize = encodeSingleTableFrame(i, true, simBaseline);
-            if (messageSize > cap) {
-                return false;
-            }
-            if (deltaDictEnabled && currentBatchMaxSymbolId > simBaseline) {
-                simBaseline = currentBatchMaxSymbolId;
-            }
-        }
-        return true;
-    }
-
-    private int encodeSingleTableFrame(int index, boolean deferCommit, int deltaBaseline) {
-        encoder.setDeferCommit(deferCommit);
-        QwpTableBuffer tableBuffer = flushTableBuffers.getQuick(index);
-        QwpSchemaBinding binding = tableBuffer.getSchemaBinding();
-        if (binding == null) {
-            encoder.beginMessage(1, globalSymbolDictionary, deltaBaseline, currentBatchMaxSymbolId);
-            encoder.addTable(tableBuffer);
-        } else {
-            encoder.beginSchemaMessage(1, globalSymbolDictionary, deltaBaseline, currentBatchMaxSymbolId);
-            encoder.addSchemaTable(tableBuffer, binding.getTableId(), binding.getMetadataVersion());
-        }
-        return encoder.finishMessage();
-    }
-
-    private boolean isMixedSchemaBatch(int tableCount) {
-        boolean schema = flushTableBuffers.getQuick(0).getSchemaBinding() != null;
-        for (int i = 1; i < tableCount; i++) {
-            if ((flushTableBuffers.getQuick(i).getSchemaBinding() != null) != schema) {
-                return true;
-            }
-        }
-        return false;
     }
 
     /**
@@ -5692,6 +5603,9 @@ public class QwpWebSocketSender implements Sender {
 
         if (pendingRowCount == 0) {
             firstPendingRowTimeNanos = System.nanoTime();
+            // The batch's first row selects its wire contract; see
+            // bindingForEffectiveWrite.
+            isPendingBatchLegacy = currentTableBuffer.getSchemaBinding() == null;
         }
         pendingRowCount++;
 
