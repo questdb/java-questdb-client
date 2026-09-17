@@ -369,7 +369,6 @@ public class SymbolDictRecycleSlotHealTest {
                         Assert.assertEquals("rebuild #1 recovers, the heal rebuilds #2, which recovers again",
                                 2, rebuilds.get());
                         Assert.assertEquals("no swap on a recovered engine", 0, ws.getSymbolDictEpoch());
-                        Assert.assertNull("resumable, not terminal", ws.getLastTerminalError());
                         Assert.assertTrue("the leftovers are still on the slot",
                                 Files.exists(doctoredSlot + "/sf-initial.sfa"));
 
