@@ -39,8 +39,8 @@ import org.jetbrains.annotations.NotNull;
  * not exist yet, and during a symbol-dictionary recycle rebuild (on the
  * producer thread: inside the {@code table(...)} call that triggered the
  * recycle or, when an earlier attempt failed transiently, inside the
- * {@code table(...)}, {@code at(...)}, {@code atNow()}, {@code flush()} or
- * {@code drain(...)} call that resumes it) because a data-loss notice must
+ * {@code table(...)}, {@code flush()} or {@code drain(...)} call that
+ * resumes it) because a data-loss notice must
  * not be dropped under inbox pressure. Handlers must not block or call back
  * into the sender: in both cases the caller is waiting.
  * Slow handlers cannot stall publishing; if the bounded

@@ -728,6 +728,64 @@ public class SymbolDictRecycleTest {
     }
 
     /**
+     * A pending REBUILD resume must refuse to complete under an in-progress
+     * row. The row's symbol ids belong to the outgoing dictionary; committing
+     * the swap underneath it would ship them against the fresh one and the
+     * server would decode a different symbol. at()/atNow() always arrive with
+     * a row in progress, so only table(), flush() and drain() can complete a
+     * pending rebuild: the refused row is rolled back and the next table()
+     * completes the swap.
+     */
+    @Test(timeout = 60_000L)
+    public void testRebuildResumeRefusesAnInProgressRow() throws Exception {
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = ackingServer()) {
+                try (Sender sender = Sender.fromConfig(cfg(server))) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    sender.table("t").symbol("s", "old").longColumn("v", 1L).atNow();
+                    long f1 = sender.flushAndGetSequence();
+                    Assert.assertTrue(sender.awaitAckedFsn(f1, 5_000));
+
+                    QwpWebSocketSender.EngineRebuildFactory real = ws.getEngineRebuildFactoryForTesting();
+                    AtomicInteger remainingFaults = new AtomicInteger(1);
+                    ws.setEngineRebuildFactory(() -> {
+                        if (remainingFaults.getAndDecrement() > 0) {
+                            throw new RuntimeException("injected engine rebuild fault");
+                        }
+                        return real.rebuild();
+                    });
+                    sender.resetSymbolDictionary();
+                    Assert.assertTrue(ws.isResetArmed());
+                    try {
+                        sender.table("t"); // step 4 fails: the recycle parks at REBUILD
+                        Assert.fail("expected the triggering table() call to throw");
+                    } catch (LineSenderException expected) {
+                    }
+                    Assert.assertEquals(0, ws.getSymbolDictEpoch());
+
+                    // The caller ignores the failure and finishes a row on the
+                    // still-selected table: its symbol id is an OLD-dictionary id.
+                    try {
+                        sender.symbol("s", "x").longColumn("v", 2L).atNow();
+                        Assert.fail("atNow() must not complete the pending rebuild under an in-progress row");
+                    } catch (LineSenderException e) {
+                        TestUtils.assertContains(e.getMessage(),
+                                "a symbol dictionary recycle is completing; finish or cancel the in-progress row and retry");
+                    }
+                    Assert.assertEquals("the swap must not commit underneath the row",
+                            0, ws.getSymbolDictEpoch());
+
+                    // The refused row was rolled back; the next table() completes the swap.
+                    sender.table("t").symbol("s", "x").longColumn("v", 3L).atNow();
+                    Assert.assertEquals(1, ws.getSymbolDictEpoch());
+                    long f2 = sender.flushAndGetSequence();
+                    Assert.assertTrue(sender.awaitAckedFsn(f2, 5_000));
+                }
+            }
+        });
+    }
+
+    /**
      * A CLOSE_LOOP abandon must not degrade every later flush to a full
      * re-registration (which a dictionary over the server batch cap can never
      * ship at all). The resume re-registers [0..sentMaxSymbolId] as deferred
