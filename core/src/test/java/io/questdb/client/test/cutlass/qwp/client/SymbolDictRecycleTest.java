@@ -40,7 +40,6 @@ import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
-import org.junit.Assume;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -685,59 +684,44 @@ public class SymbolDictRecycleTest {
     }
 
     /**
-     * A producer thread whose interrupt flag is already set usually makes
-     * step 2's loop close throw before the recycle can proceed
-     * (CountDownLatch.await() checks the flag first) -- an abandon that must
-     * be non-terminal. Under load the I/O thread can finish and count the
-     * shutdown latch down concurrently, so the close can also complete
-     * normally despite the flag; this asserts the failed-stop protocol when
-     * the throw happens and skips visibly when it does not. Either way the
-     * recovery half always runs: once the flag is cleared the next call
-     * finishes the loop close and the sender recovers.
+     * A producer thread that reaches the recycle barrier with its interrupt
+     * flag already set (a worker that keeps writing after shutdownNow() or
+     * Future.cancel(true)) must still get its recycle. CountDownLatch.await()
+     * tests the flag before it consults the latch, so without the clear/restore
+     * around the loop-close join every drained barrier would report a failed
+     * stop after 0 ms, abandon to CLOSE_LOOP, refuse the row and never swap the
+     * dictionary. Three consecutive swaps, each entered with the flag set,
+     * each committing and each handing the caller's flag back.
      */
-    @Test
-    public void testInterruptedRecycleAbandonsAndRecovers() throws Exception {
+    @Test(timeout = 60_000L)
+    public void testCarriedInterruptCommitsRecycleAndKeepsFlag() throws Exception {
         assertMemoryLeak(() -> {
             try (TestWebSocketServer server = ackingServer()) {
                 try (Sender sender = Sender.fromConfig(cfg(server))) {
                     QwpWebSocketSender ws = (QwpWebSocketSender) sender;
-                    sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
-                    long f1 = sender.flushAndGetSequence();
-                    Assert.assertTrue(sender.awaitAckedFsn(f1, 5_000));
-                    sender.resetSymbolDictionary();
-                    Assert.assertTrue(ws.isResetArmed());
+                    for (int epoch = 1; epoch <= 3; epoch++) {
+                        sender.table("t").symbol("s", "s" + epoch).longColumn("v", epoch).atNow();
+                        long fsn = sender.flushAndGetSequence();
+                        Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
+                        sender.resetSymbolDictionary();
+                        Assert.assertTrue(ws.isResetArmed());
 
-                    Thread.currentThread().interrupt();
-                    boolean threw = false;
-                    try {
-                        sender.table("t");
-                    } catch (LineSenderException expected) {
-                        threw = true;
+                        Thread.currentThread().interrupt(); // carried into the barrier; the producer never clears it
+                        boolean flagAfterSwap;
+                        try {
+                            sender.table("t"); // drained barrier: the recycle runs synchronously in here
+                        } finally {
+                            flagAfterSwap = Thread.interrupted(); // read AND clear for JUnit's sake
+                        }
+                        Assert.assertTrue("the caller's interrupt flag must survive the swap", flagAfterSwap);
+                        Assert.assertEquals("the swap must commit despite the carried flag",
+                                epoch, ws.getSymbolDictEpoch());
+                        Assert.assertFalse("a committed swap consumes the arm", ws.isResetArmed());
                     }
-                    // close() re-asserts the flag whenever the interrupted await
-                    // fires, whether or not the abandon then propagates to the
-                    // caller; clear it for the recovery half of the test.
-                    boolean flagWasPreserved = Thread.interrupted();
-                    // Whether the loop close threw (abandon) or completed
-                    // normally (the recycle already ran), the sender must never
-                    // be terminal and must finish the recycle by now. A
-                    // CLOSE_LOOP abandon leaves the recycle armed but NOT yet
-                    // run, and the barrier only recycles at a drained instant
-                    // with nothing staged -- so flush the recovery row before
-                    // the barrier that must swap.
-                    sender.table("t").symbol("s", "b").longColumn("v", 2L).atNow();
-                    long f2 = sender.flushAndGetSequence();
-                    Assert.assertTrue(sender.awaitAckedFsn(f2, 5_000));
-                    sender.table("t");
-                    Assert.assertEquals(1, ws.getSymbolDictEpoch());
-                    sender.table("t").symbol("s", "c").longColumn("v", 3L).atNow();
-                    long f3 = sender.flushAndGetSequence();
-                    Assert.assertTrue(sender.awaitAckedFsn(f3, 5_000));
-
-                    Assume.assumeTrue("the interrupt raced past the loop close, so the "
-                            + "abandon branch was not exercised in this run", threw);
-                    Assert.assertTrue("the failed-stop protocol re-asserts the flag",
-                            flagWasPreserved);
+                    // The rebuilt sender is usable: a row lands on the fresh loop.
+                    sender.table("t").symbol("s", "after").longColumn("v", 4L).atNow();
+                    long f = sender.flushAndGetSequence();
+                    Assert.assertTrue(sender.awaitAckedFsn(f, 5_000));
                 }
             }
         });

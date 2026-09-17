@@ -2330,7 +2330,7 @@ public class QwpWebSocketSender implements Sender {
      * Fabricates the state a step-2 close failure leaves behind -- an
      * abandoned recycle parked at CLOSE_LOOP -- on a loop that is genuinely
      * closed, so the resume's re-close converges instantly instead of
-     * depending on the interrupt race the Assume-gated abandon test drives.
+     * depending on a real step-2 failure.
      * The loop reference is deliberately KEPT (the resume re-closes it).
      */
     @TestOnly
@@ -5347,6 +5347,24 @@ public class QwpWebSocketSender implements Sender {
         recycleDeferredCloseDeadlineNanos = Long.MIN_VALUE;
     }
 
+    /**
+     * Closes the outgoing I/O loop with {@link #close()}'s carried-interrupt
+     * policy: the shutdown-latch await tests the flag before it consults the
+     * latch, so a flag already set would report a failed stop after 0 ms.
+     * Cleared for the join, restored after; an interrupt that arrives during
+     * the join still takes the loop's genuine failed-stop branch.
+     */
+    private void closeLoopInterruptNeutral(CursorWebSocketSendLoop loop) {
+        final boolean carried = Thread.interrupted();
+        try {
+            loop.close();
+        } finally {
+            if (carried) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
     private void closeRecoveredEngine(CursorSendEngine recovered) {
         recyclePendingOutgoing = recovered;
         try {
@@ -5559,10 +5577,10 @@ public class QwpWebSocketSender implements Sender {
         // parkNanos returns immediately while the thread's interrupt flag is
         // set. Clear the flag each time a park returns so the wait keeps its
         // time budget instead of busy-spinning; restore it on the timeout and
-        // throw exits only. The drained exit deliberately swallows it (the
-        // flock-release retry driver's policy): a restored flag would make
-        // recycleForDictReset()'s loop-close join observe the interrupt and
-        // abandon the recycle this wait just earned.
+        // throw exits only. The drained exit deliberately swallows it, the
+        // flock-release retry driver's policy that awaitDeferredEngineClose()
+        // shares; the loop-close join that follows clears a carried flag
+        // itself (closeLoopInterruptNeutral), so nothing depends on the swallow.
         boolean wasInterrupted = false;
         try {
             while (!isRingDrained()) {
@@ -5735,7 +5753,7 @@ public class QwpWebSocketSender implements Sender {
         // step 2: close the loop - joins the I/O thread, closes the client.
         try {
             if (cursorSendLoop != null) {
-                cursorSendLoop.close();
+                closeLoopInterruptNeutral(cursorSendLoop);
                 // Read the sticky AFTER close(): close joins the I/O thread,
                 // so a connect that landed mid-window is final here. This is
                 // the only place an ASYNC-initial sender's connect (observed
@@ -5809,7 +5827,7 @@ public class QwpWebSocketSender implements Sender {
         }
         if (recycleResume == RecycleResume.CLOSE_LOOP) {
             try {
-                cursorSendLoop.close(); // re-signals; converges once the I/O thread exits
+                closeLoopInterruptNeutral(cursorSendLoop); // re-signals; converges once the I/O thread exits
             } catch (Error e) {
                 throw e;
             } catch (Throwable t) {
