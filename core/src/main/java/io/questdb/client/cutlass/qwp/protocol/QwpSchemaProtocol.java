@@ -130,7 +130,8 @@ public final class QwpSchemaProtocol {
             if (p != limit) {
                 throw malformed("trailing bytes after schema result");
             }
-            return new QwpSchemaResponse(requestId, result, -1, -1, -1, new QwpSchemaResponse.Column[0]);
+            return new QwpSchemaResponse(requestId, result, -1, -1, -1, new QwpSchemaResponse.Column[0],
+                    new LowerCaseCharSequenceIntHashMap());
         }
         if (length < KNOWN_FIXED_PAYLOAD_SIZE) {
             throw malformed("truncated known schema");
@@ -187,7 +188,7 @@ public final class QwpSchemaProtocol {
         if (p != limit) {
             throw malformed("trailing bytes after schema");
         }
-        return new QwpSchemaResponse(requestId, result, tableId, metadataVersion, designatedIndex, columns);
+        return new QwpSchemaResponse(requestId, result, tableId, metadataVersion, designatedIndex, columns, columnNames);
     }
 
     public static byte[] encodeDescribe(long requestId, CharSequence tableName) {

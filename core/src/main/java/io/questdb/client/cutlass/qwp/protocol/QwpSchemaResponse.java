@@ -23,8 +23,15 @@
 
 package io.questdb.client.cutlass.qwp.protocol;
 
-/** Immutable response to a QWP schema DESCRIBE control request. */
+import io.questdb.client.std.LowerCaseCharSequenceIntHashMap;
+
+/**
+ * Immutable response to a QWP schema DESCRIBE control request. The snapshot
+ * owns the case-insensitive column-name index that the decoder builds while
+ * it validates name uniqueness, so consumers never rebuild it.
+ */
 public final class QwpSchemaResponse {
+    private final LowerCaseCharSequenceIntHashMap columnIndexes;
     private final Column[] columns;
     private final int designatedIndex;
     private final int result;
@@ -32,17 +39,31 @@ public final class QwpSchemaResponse {
     private final long metadataVersion;
     private final long requestId;
 
-    QwpSchemaResponse(long requestId, int result, int tableId, long metadataVersion, int designatedIndex, Column[] columns) {
+    QwpSchemaResponse(
+            long requestId,
+            int result,
+            int tableId,
+            long metadataVersion,
+            int designatedIndex,
+            Column[] columns,
+            LowerCaseCharSequenceIntHashMap columnIndexes
+    ) {
         this.requestId = requestId;
         this.result = result;
         this.tableId = tableId;
         this.metadataVersion = metadataVersion;
         this.designatedIndex = designatedIndex;
         this.columns = columns;
+        this.columnIndexes = columnIndexes;
     }
 
     public int getColumnCount() {
         return columns.length;
+    }
+
+    /** Returns the index of the case-insensitively named column, or -1. */
+    public int getColumnIndex(CharSequence name) {
+        return columnIndexes.get(name);
     }
 
     public String getColumnName(int index) {
@@ -81,6 +102,23 @@ public final class QwpSchemaResponse {
 
     public int getTableId() {
         return tableId;
+    }
+
+    /**
+     * Returns whether {@code name} resolves to an equivalent conversion target
+     * in both snapshots: same presence, designated-timestamp role, column type,
+     * and extension-parameter flag. A null {@code name} selects the designated
+     * timestamp. Column position is irrelevant.
+     */
+    public boolean hasSameRelevantTarget(QwpSchemaResponse other, CharSequence name) {
+        int current = name == null ? designatedIndex : getColumnIndex(name);
+        int next = name == null ? other.designatedIndex : other.getColumnIndex(name);
+        if (current < 0 || next < 0) {
+            return current < 0 && next < 0;
+        }
+        return (current == designatedIndex) == (next == other.designatedIndex)
+                && columns[current].type == other.columns[next].type
+                && columns[current].hasTypeParameters == other.columns[next].hasTypeParameters;
     }
 
     public boolean hasSchema() {

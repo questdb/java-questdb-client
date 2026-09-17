@@ -35,7 +35,6 @@ import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.Decimal256;
 import io.questdb.client.std.Decimal64;
 import io.questdb.client.std.Decimals;
-import io.questdb.client.std.LowerCaseCharSequenceIntHashMap;
 import io.questdb.client.std.NumericException;
 import io.questdb.client.std.Numbers;
 import io.questdb.client.std.bytes.DirectByteSlice;
@@ -78,7 +77,6 @@ public final class QwpSchemaBinding {
     private static final int UUID_LENGTH = 36;
 
     private final QwpTableBuffer buffer;
-    private final LowerCaseCharSequenceIntHashMap columns = new LowerCaseCharSequenceIntHashMap();
     private final QwpSchemaResponse schema;
     private final String tableName;
     private Decimal256 decimalTextScratch;
@@ -108,9 +106,6 @@ public final class QwpSchemaBinding {
         this.tableName = tableName;
         this.schema = schema;
         requireUsableSchema();
-        for (int i = 0, n = schema.getColumnCount(); i < n; i++) {
-            columns.put(schema.getColumnName(i), i);
-        }
         this.buffer = buffer;
         buffer.attachSchemaBinding(this);
     }
@@ -909,24 +904,7 @@ public final class QwpSchemaBinding {
     }
 
     public boolean hasSameRelevantTarget(QwpSchemaResponse other, CharSequence name) {
-        int current = name == null ? schema.getDesignatedIndex() : columns.get(name);
-        int next = -1;
-        if (name == null) {
-            next = other.getDesignatedIndex();
-        } else {
-            for (int i = 0, n = other.getColumnCount(); i < n; i++) {
-                if (Chars.equalsIgnoreCase(other.getColumnName(i), name)) {
-                    next = i;
-                    break;
-                }
-            }
-        }
-        if (current < 0 || next < 0) {
-            return current < 0 && next < 0;
-        }
-        return (current == schema.getDesignatedIndex()) == (next == other.getDesignatedIndex())
-                && schema.getColumnType(current) == other.getColumnType(next)
-                && schema.hasColumnExtensionParameters(current) == other.hasColumnExtensionParameters(next);
+        return schema.hasSameRelevantTarget(other, name);
     }
 
     private LineSenderSchemaException error(
@@ -1867,8 +1845,7 @@ public final class QwpSchemaBinding {
         if (name == null || !TableUtils.isValidColumnName(name, QwpSchemaProtocol.MAX_NAME_UTF16_LENGTH)) {
             throw error(INVALID_VALUE, name, inputType, null, "invalid column name");
         }
-        int index = columns.get(name);
-        return index;
+        return schema.getColumnIndex(name);
     }
 
     private int targetType(int index, int inferredType) {
