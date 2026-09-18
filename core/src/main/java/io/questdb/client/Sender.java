@@ -758,13 +758,15 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     Sender symbol(CharSequence name, CharSequence value);
 
     /**
-     * Select the table for a new row. This is always the first method to start an error. It's an error to call other
-     * methods without calling this method first.
+     * Select the table and start a new row. Call this before every row, including consecutive rows for the same table.
+     * It's an error to add a column or complete a row without calling this method first.
      * <br>
      * After calling this method you can start adding columns to the row and then call {@link #atNow()} or {@link #at(Instant)}
      * to finalize the row. You can then start a new row by calling this method again.
      * <br>
      * If you want to cancel the current row, you can call {@link #cancelRow()}.
+     * QWP WebSocket senders also resolve and pin the row's schema contract here, so this call may wait for or fail
+     * schema discovery. Column setters do not initiate schema discovery.
      *
      * @param table name of the table
      * @return this instance for method chaining
