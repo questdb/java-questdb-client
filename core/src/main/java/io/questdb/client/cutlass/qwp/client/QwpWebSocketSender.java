@@ -174,10 +174,10 @@ public class QwpWebSocketSender implements Sender {
     private static final int MIN_ERROR_INBOX_CAPACITY = 16;
     // Upper bound on how long recycleForDictReset step 3 waits for a DEFERRED
     // engine close (SF worker wedged in a syscall past SegmentManager's
-    // bounded join) to release the slot flock before giving up and latching
-    // the sender terminal. Sized well past any transient disk/NFS stall the
-    // deferred-close machinery exists to survive; a worker still wedged after
-    // this long is treated as a genuinely dead disk.
+    // bounded join) to release the slot flock before giving up; the recycle
+    // then stays pending and the next send probes the close again. Sized well
+    // past any transient disk/NFS stall the deferred-close machinery exists
+    // to survive.
     private static final long RECYCLE_DEFERRED_CLOSE_MAX_WAIT_MILLIS = 30_000L;
     private static final String WRITE_PATH = "/write/v4";
     // Yields the Authorization header value presented on each WebSocket upgrade. A constant for a
