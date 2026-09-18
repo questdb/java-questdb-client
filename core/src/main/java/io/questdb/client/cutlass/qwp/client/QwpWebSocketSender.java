@@ -5317,11 +5317,9 @@ public class QwpWebSocketSender implements Sender {
                     + recycleDeferredCloseMaxWaitMillis * 1_000_000L;
         }
         // Same interrupt policy as maybeBlockForStarvedReset: clear per park
-        // iteration, restore on ALL throw exits (the deadline throw included
-        // -- LineSenderException is a RuntimeException, so the catch below
-        // covers it too; a stray throw from isCloseCompleted() or
-        // ensureFlockReleaseRetryScheduled() is covered the same way), and
-        // swallow on the completed exit.
+        // iteration, hand the flag back on every exit (the deadline throw and
+        // the completed exit alike); the swap's remaining steps tolerate a
+        // set flag.
         boolean wasInterrupted = false;
         try {
             while (!outgoing.isCloseCompleted()) {
@@ -5338,16 +5336,10 @@ public class QwpWebSocketSender implements Sender {
                 java.util.concurrent.locks.LockSupport.parkNanos(50_000L);
                 wasInterrupted |= Thread.interrupted();
             }
-        } catch (Error e) {
+        } finally {
             if (wasInterrupted) {
                 Thread.currentThread().interrupt();
             }
-            throw e;
-        } catch (RuntimeException e) {
-            if (wasInterrupted) {
-                Thread.currentThread().interrupt();
-            }
-            throw e;
         }
         recycleDeferredCloseDeadlineNanos = Long.MIN_VALUE;
     }
@@ -5358,8 +5350,9 @@ public class QwpWebSocketSender implements Sender {
      * shutdown-latch await report a failed stop after 0 ms, so it is cleared
      * for the join and put back after, whatever the outcome. An interrupt
      * that arrives during the join still takes the loop's failed-stop
-     * branch. Only the join is covered: a park the recycle enters later
-     * (the starvation wait, the deferred-close wait) keeps its own policy.
+     * branch. Only the join is covered; the recycle's two parks (the
+     * starvation wait before it, the deferred-close wait after it) clear
+     * and hand the flag back the same way themselves.
      */
     private void closeLoopInterruptNeutral(CursorWebSocketSendLoop loop) {
         final boolean carried = Thread.interrupted();
@@ -5583,10 +5576,9 @@ public class QwpWebSocketSender implements Sender {
         long deadlineNanos = System.nanoTime() + resetMaxWaitMillis * 1_000_000L;
         // parkNanos returns immediately while the thread's interrupt flag is
         // set. Clear the flag each time a park returns so the wait keeps its
-        // time budget instead of busy-spinning; restore it on the timeout and
-        // throw exits only. The drained exit still swallows it, as before;
-        // the loop-close join that follows clears a carried flag itself
-        // (closeLoopInterruptNeutral), so nothing depends on the swallow.
+        // time budget instead of busy-spinning, and hand it back on every
+        // exit: the recycle never consumes the caller's interrupt (the
+        // loop-close join clears and restores a carried flag itself).
         boolean wasInterrupted = false;
         try {
             while (!isRingDrained()) {
@@ -5599,24 +5591,15 @@ public class QwpWebSocketSender implements Sender {
                     symbolDictResetStarvationTimeouts++;
                     LOG.warn("symbol dictionary reset starved: backlog not drained within {} ms; "
                             + "staying armed", resetMaxWaitMillis);
-                    if (wasInterrupted) {
-                        Thread.currentThread().interrupt();
-                    }
                     return;
                 }
                 java.util.concurrent.locks.LockSupport.parkNanos(50_000L);
                 wasInterrupted |= Thread.interrupted();
             }
-        } catch (Error e) {
+        } finally {
             if (wasInterrupted) {
                 Thread.currentThread().interrupt();
             }
-            throw e;
-        } catch (RuntimeException e) {
-            if (wasInterrupted) {
-                Thread.currentThread().interrupt();
-            }
-            throw e;
         }
         recycleForDictReset();
     }

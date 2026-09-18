@@ -455,15 +455,14 @@ public class SymbolDictRecycleDeferredCloseTest {
 
     /**
      * The deferred-close park shares {@code maybeBlockForStarvedReset()}'s
-     * interrupt policy. An interrupt flag set as the park begins must not
-     * leak past the completed exit: the swap's remaining steps (rebuild,
-     * reconnect) run on this same producer thread, and a restored flag would
-     * turn a recycle that just rode out the stall into a transient abandon.
-     * The park clears the flag per iteration (so it cannot busy-spin either)
-     * and swallows it once the close completes.
+     * interrupt policy: an interrupt flag set as the park begins is cleared
+     * per iteration (so the park cannot busy-spin) and handed back on the
+     * completed exit, and the swap's remaining steps (rebuild, reconnect)
+     * commit with it set. A caller cancelled mid-park still sees its
+     * cancellation.
      */
     @Test(timeout = 60_000L)
-    public void testInterruptAtParkEntryIsSwallowedWhenCloseCompletes() throws Exception {
+    public void testInterruptAtParkEntryIsHandedBackWhenCloseCompletes() throws Exception {
         assertMemoryLeak(() -> {
             String sfDir = temporaryFolder.getRoot().toPath().resolve("recycle-deferred-interrupt-swallow").toString();
             try (TestWebSocketServer server = ackingServer()) {
@@ -539,8 +538,8 @@ public class SymbolDictRecycleDeferredCloseTest {
                         } finally {
                             leftoverFlag = Thread.interrupted(); // read AND clear for JUnit's sake
                         }
-                        Assert.assertFalse("the completed exit must swallow the interrupt -- a restored "
-                                + "flag would poison the swap's remaining steps on this thread", leftoverFlag);
+                        Assert.assertTrue("the completed exit must hand the caller's interrupt flag back: "
+                                + "the swap's remaining steps tolerate a set flag", leftoverFlag);
                         Assert.assertEquals("the recycle must have committed, not abandoned",
                                 1, ws.getSymbolDictEpoch());
                         Assert.assertFalse("recycle must disarm", ws.isResetArmed());

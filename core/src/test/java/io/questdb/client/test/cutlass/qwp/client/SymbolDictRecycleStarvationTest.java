@@ -454,12 +454,12 @@ public class SymbolDictRecycleStarvationTest {
     }
 
     /**
-     * An interrupt flag set when the bounded wait begins must not leak into
-     * {@code recycleForDictReset()} once the ring drains: the swap's step-2
-     * loop-close join would observe it and manufacture a CLOSE_LOOP abandon
-     * out of a recycle that was otherwise home free. The wait clears the flag
-     * per park iteration (so it also cannot busy-spin) and swallows it on the
-     * drained exit, mirroring CursorSendEngine's flock-release retry driver.
+     * An interrupt flag set when the bounded wait begins is handed back once
+     * the ring drains: the wait clears the flag per park iteration (so it
+     * cannot busy-spin) and restores it on every exit, and the swap that
+     * follows commits regardless -- its loop-close join clears and restores
+     * a carried flag itself, and nothing after the join depends on a cleared
+     * flag. A caller cancelled mid-wait therefore still sees its cancellation.
      */
     @Test(timeout = 60_000L)
     public void testInterruptDuringWaitDoesNotManufactureAbandon() throws Exception {
@@ -502,8 +502,8 @@ public class SymbolDictRecycleStarvationTest {
                         leftoverFlag = Thread.interrupted(); // read AND clear for JUnit's sake
                         releaser.join();
                     }
-                    Assert.assertFalse("the drained exit must swallow the interrupt -- a restored "
-                            + "flag would poison the swap's loop-close join", leftoverFlag);
+                    Assert.assertTrue("the drained exit must hand the caller's interrupt flag back: "
+                            + "the loop-close join clears and restores a carried flag itself", leftoverFlag);
                     Assert.assertFalse("recycle must complete, not abandon", ws.isResetArmed());
                     Assert.assertEquals(1L, ws.getSymbolDictEpoch());
                     Assert.assertEquals(0L, ws.getSymbolDictResetStarvationTimeouts());
