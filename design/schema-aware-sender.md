@@ -779,7 +779,8 @@ it. This is the cost of choosing asynchronous startup.
 ## Frame layout and replay compatibility
 
 Negotiation authorizes the extension; a persisted frame flag identifies the
-actual data layout. Use `FLAG_SCHEMA = 0x02` without changing the QWP version byte:
+actual data layout. Use `FLAG_SCHEMA = 0x40` without changing the QWP version byte
+(`0x02` belongs to the server's `FLAG_DURABLE_ACK_POLL`):
 
 - Flag set: each table header includes its pinned schema identity, or an
   explicit unknown identity. The server uses the extended table-header parser.

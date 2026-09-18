@@ -42,7 +42,7 @@ public final class QwpConstants {
      */
     public static final byte FLAG_DEFER_COMMIT = 0x01;
     /** Flag bit: table headers carry schema identity information. */
-    public static final byte FLAG_SCHEMA = 0x02;
+    public static final byte FLAG_SCHEMA = 0x40;
     /**
      * Flag bit: Delta symbol dictionary encoding enabled.
      * When set, symbol columns use global IDs and send only new dictionary entries.

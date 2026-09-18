@@ -8043,3 +8043,17 @@ from the column setter. `installSchemaBinding()` bound in place whenever the
 buffer had no rows, but a flushed legacy buffer keeps its column layout. It now
 binds in place only a buffer with no columns and replaces the buffer otherwise.
 Both rewritten upgrade tests cover that path.
+
+### FLAG_SCHEMA moves from 0x02 to 0x40
+
+Merging server `master` on 2026-09-18 surfaced a wire-bit collision that git
+merged cleanly: server PR #7531 (browser negotiation) had already claimed `0x02`
+for `FLAG_DURABLE_ACK_POLL`, a zero-table control frame. The ingress dispatch
+read a poll frame as a schema-flagged frame on a connection that had not
+negotiated schema and rejected it, failing seven durable-ack poll tests in
+`QwpIngressAckLeapfrogTest` and `QwpIngressUpgradeProcessorResumeRecvTest`.
+The poll bit is already on `master`, while `FLAG_SCHEMA` is unreleased, so
+`FLAG_SCHEMA` moves to the free bit `0x40` in both the server and the client
+`QwpConstants`. This supersedes the `FLAG_SCHEMA=0x02` value recorded in design
+revision 13. The trade-off: store-and-forward frames persisted by an earlier
+build of this branch carry `0x02` and no longer replay as schema frames.
