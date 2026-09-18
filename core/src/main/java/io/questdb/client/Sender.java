@@ -1761,26 +1761,26 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 // closing the engine alone would leak the I/O thread,
                 // dispatcher daemon, drainer pool, microbatch buffers and
                 // WebSocketClient inside the abandoned `connected`.
-                connected.setTransactional(transactional);
-                final String rebuildSfDir = sfDir;
-                final String rebuildSenderId = senderId;
-                final SenderErrorHandler buildTimeHandler = errorHandler;
-                connected.setEngineRebuildFactory(new QwpWebSocketSender.EngineRebuildFactory() {
-                    @Override
-                    public CursorSendEngine rebuild() {
-                        return rebuild(buildTimeHandler);
-                    }
-
-                    @Override
-                    public CursorSendEngine rebuild(SenderErrorHandler liveHandler) {
-                        return LineSenderBuilder.constructEngineOnSlot(
-                                rebuildSfDir, rebuildSenderId, slotPath,
-                                actualSfMaxSegmentBytes, actualSfMaxTotalBytes,
-                                actualSfAppendDeadlineNanos, actualSfSyncIntervalNanos,
-                                liveHandler);
-                    }
-                });
                 try {
+                    connected.setTransactional(transactional);
+                    final String rebuildSfDir = sfDir;
+                    final String rebuildSenderId = senderId;
+                    final SenderErrorHandler buildTimeHandler = errorHandler;
+                    connected.setEngineRebuildFactory(new QwpWebSocketSender.EngineRebuildFactory() {
+                        @Override
+                        public CursorSendEngine rebuild() {
+                            return rebuild(buildTimeHandler);
+                        }
+
+                        @Override
+                        public CursorSendEngine rebuild(SenderErrorHandler liveHandler) {
+                            return LineSenderBuilder.constructEngineOnSlot(
+                                    rebuildSfDir, rebuildSenderId, slotPath,
+                                    actualSfMaxSegmentBytes, actualSfMaxTotalBytes,
+                                    actualSfAppendDeadlineNanos, actualSfSyncIntervalNanos,
+                                    liveHandler);
+                        }
+                    });
                     // Install the drainer listener BEFORE startOrphanDrainers
                     // below: drainers must see the listener at submit time so
                     // no early drainer event is lost to a late installation.

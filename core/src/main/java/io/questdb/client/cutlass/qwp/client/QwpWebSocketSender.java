@@ -3289,7 +3289,9 @@ public class QwpWebSocketSender implements Sender {
      * @throws LineSenderException if the sender is closed
      */
     public void setEngineRebuildFactory(EngineRebuildFactory factory) {
-        checkNotClosed();
+        if (closed) {
+            throw new LineSenderException("Sender is closed");
+        }
         this.engineRebuildFactory = factory;
     }
 
