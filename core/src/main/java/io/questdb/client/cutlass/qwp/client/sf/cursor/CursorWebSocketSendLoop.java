@@ -1541,6 +1541,20 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         return hasEverConnected;
     }
 
+    /**
+     * True while the I/O thread holds a live connection: the loop is running,
+     * not inside its reconnect loop, and the installed client is connected
+     * and upgraded. The recycle barrier swaps only in this state because
+     * {@link #close()} can cancel a live socket but not a reconnect blocked
+     * in a hostname resolve or a credential pull. A drop the I/O thread has
+     * not observed yet still reads as up; that window is the one close()'s
+     * bounded await already covers.
+     */
+    public boolean isLinkUp() {
+        WebSocketClient c = client;
+        return running && lastReconnectError == null && c != null && c.isConnected();
+    }
+
     public boolean isRunning() {
         return running;
     }

@@ -5608,21 +5608,29 @@ public class QwpWebSocketSender implements Sender {
      * Evaluates whether the barrier in {@link #table(CharSequence)} may run
      * the symbol-dictionary recycle right now. Only ever called with
      * {@link #resetArmed} true -- {@link #armIfEligible()} already refused to
-     * arm a sender that cannot rebuild, so this method only has to weigh
-     * producer-side state.
+     * arm a sender that cannot rebuild.
      * <p>
      * Refuses when there is producer-side state the swap cannot safely tear
      * down: no connection yet (a V4 sender that has never sent is never
      * pre-connected here), a flush in flight ({@code pendingRowCount != 0}),
-     * or a row under construction. Otherwise proceeds to the ring-drained
-     * check: if the backlog is empty, recycle immediately; if not, defer to
-     * {@link #maybeBlockForStarvedReset()}'s starvation-wait policy instead
-     * of blocking the caller indefinitely here.
+     * or a row under construction. Also refuses while the I/O loop is between
+     * connections ({@link CursorWebSocketSendLoop#isLinkUp()}): step 2's loop
+     * close cancels a live socket in milliseconds, but a reconnect blocked in
+     * a hostname resolve or a credential pull ignores the cancel and would
+     * hold the caller for the join budget, so the recycle stays armed and
+     * runs at the first drained barrier after the reconnect. Otherwise
+     * proceeds to the ring-drained check: if the backlog is empty, recycle
+     * immediately; if not, defer to {@link #maybeBlockForStarvedReset()}'s
+     * starvation-wait policy instead of blocking the caller indefinitely here.
      */
     private void maybeRecycleForDictReset() {
         if (!connected
                 || pendingRowCount != 0
                 || (currentTableBuffer != null && currentTableBuffer.hasInProgressRow())) {
+            return;
+        }
+        final CursorWebSocketSendLoop loop = cursorSendLoop;
+        if (loop == null || !loop.isLinkUp()) {
             return;
         }
         if (isRingDrained()) {
