@@ -4034,6 +4034,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     }
                     requestId = QwpSchemaProtocol.peekResponseRequestId(payloadPtr, payloadLen);
                 } catch (RuntimeException e) {
+                    schemaCoordinator.invalidResponse(responseClient, 0);
                     fail(new LineSenderException("Invalid schema control response: " + e.getMessage(), e));
                     return;
                 }
@@ -4044,7 +4045,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 try {
                     schema = QwpSchemaProtocol.decodeResponse(payloadPtr, payloadLen);
                 } catch (RuntimeException e) {
-                    if (!schemaCoordinator.isLiveResponse(responseClient, requestId)) {
+                    if (!schemaCoordinator.invalidResponse(responseClient, requestId)) {
                         return;
                     }
                     fail(new LineSenderException("Invalid schema control response: " + e.getMessage(), e));

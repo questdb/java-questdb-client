@@ -8,19 +8,25 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 import io.questdb.client.LineSenderSchemaException;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cairo.ColumnType;
+import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketClientFactory;
+import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.protocol.QwpSchemaProtocol;
 import io.questdb.client.cutlass.qwp.protocol.QwpSchemaResponse;
+import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
+import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
+import org.junit.rules.TestRule;
+import org.junit.runners.model.Statement;
 
 import java.io.File;
 import java.io.IOException;
@@ -33,6 +39,23 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 public class CursorWebSocketSchemaLifecycleTest {
+    @Rule
+    public final TestRule memoryLeak = (base, description) -> new Statement() {
+        @Override
+        public void evaluate() throws Throwable {
+            AtomicReference<Throwable> failure = new AtomicReference<>();
+            TestUtils.assertMemoryLeak(() -> {
+                try {
+                    base.evaluate();
+                } catch (Throwable e) {
+                    failure.set(e);
+                }
+            });
+            if (failure.get() != null) {
+                throw failure.get();
+            }
+        }
+    };
     @Rule
     public final TemporaryFolder temp = TemporaryFolder.builder().parentFolder(taskTempRoot()).build();
 
@@ -90,7 +113,7 @@ public class CursorWebSocketSchemaLifecycleTest {
     }
 
     @Test
-    public void testDisconnectFailsCurrentLookupRetainsCacheAndQueuesMissForReplacement() throws Exception {
+    public void testDisconnectRetriesCurrentLookupRetainsCacheAndRejectsStaleReply() throws Exception {
         SchemaHandler handler = new SchemaHandler();
         handler.reply = true;
         try (TestWebSocketServer server = server(handler);
@@ -102,31 +125,180 @@ public class CursorWebSocketSchemaLifecycleTest {
                     loop.start();
                     QwpSchemaResponse cached = loop.resolveSchema("cached", 5_000);
                     handler.disconnectName = "lost";
+                    handler.disconnectsRemaining = 2;
                     Lookup lost = lookup(loop, "lost", 5_000, null);
                     Assert.assertTrue(reconnect.attempted.await(5, TimeUnit.SECONDS));
-                    lost.join();
-                    assertUnavailable(lost.error.get());
-
                     Assert.assertSame(cached, loop.resolveSchema("CACHED", 5_000));
-                    CountDownLatch oneDone = new CountDownLatch(1);
-                    Lookup first = lookup(loop, "fresh-one", 5_000, oneDone);
-                    Lookup second = lookup(loop, "fresh-two", 5_000, oneDone);
-                    Assert.assertTrue(oneDone.await(5, TimeUnit.SECONDS));
-                    reconnect.allow.countDown();
-                    first.join();
-                    second.join();
-                    Lookup successful = first.response.get() != null ? first : second;
-                    Lookup busy = successful == first ? second : first;
-                    Assert.assertNotNull(successful.response.get());
+                    Lookup busy = lookup(loop, "fresh", 5_000, null);
+                    busy.join();
                     assertUnavailable(busy.error.get());
-                    Assert.assertSame(successful.response.get(), loop.resolveSchema(
-                            handler.lastName.get(), 5_000));
+                    Assert.assertTrue(busy.error.get().getMessage().contains("another schema lookup"));
+                    handler.sendStaleBeforeNextReply = true;
+                    reconnect.allow.countDown();
+                    lost.join();
+                    Assert.assertNull(String.valueOf(lost.error.get()), lost.error.get());
+                    Assert.assertNotNull(lost.response.get());
+                    Assert.assertEquals(4, lost.response.get().getTableId());
+                    Assert.assertSame(lost.response.get(), loop.resolveSchema("lost", 0));
+                    Assert.assertEquals(3, server.handshakeCount());
 
                     int requestsBeforeCacheProbe = handler.requests;
                     QwpSchemaResponse replacement = loop.resolveSchema("cached", 5_000);
                     Assert.assertTrue(replacement.getRequestId() > 0);
                     Assert.assertNotSame(cached, replacement);
                     Assert.assertEquals(requestsBeforeCacheProbe + 1, handler.requests);
+                } finally {
+                    reconnect.allow.countDown();
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testQueuedUnsentLookupSurvivesDisconnect() throws Exception {
+        SchemaHandler handler = new SchemaHandler();
+        handler.reply = true;
+        try (TestWebSocketServer server = server(handler);
+             CursorSendEngine engine = engine("queued-disconnect");
+             DisconnectingClient client = new DisconnectingClient()) {
+            GatedReconnectFactory reconnect = new GatedReconnectFactory(server.getPort());
+            reconnect.allow.countDown();
+            try (CursorWebSocketSendLoop loop = loop(client, engine, reconnect)) {
+                try {
+                    loop.start();
+                    Assert.assertTrue(client.receiving.await(5, TimeUnit.SECONDS));
+                    Lookup queued = lookup(loop, "queued", 5_000, null);
+                    queued.awaitWaiting();
+                    client.disconnect.countDown();
+                    queued.join();
+                    Assert.assertNull(String.valueOf(queued.error.get()), queued.error.get());
+                    Assert.assertEquals(QwpSchemaProtocol.RESULT_KNOWN, queued.response.get().getResult());
+                    Assert.assertEquals(1, handler.requests);
+                } finally {
+                    client.disconnect.countDown();
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testReconnectWaitCountsAgainstOriginalLookupDeadline() throws Exception {
+        SchemaHandler handler = new SchemaHandler();
+        handler.reply = true;
+        handler.disconnectName = "deadline";
+        try (TestWebSocketServer server = server(handler);
+             CursorSendEngine engine = engine("reconnect-deadline");
+             WebSocketClient client = connect(server.getPort())) {
+            GatedReconnectFactory reconnect = new GatedReconnectFactory(server.getPort());
+            try (CursorWebSocketSendLoop loop = loop(client, engine, reconnect)) {
+                try {
+                    loop.start();
+                    Lookup lookup = lookup(loop, "deadline", 1_000, null);
+                    Assert.assertTrue(reconnect.attempted.await(5, TimeUnit.SECONDS));
+                    lookup.join();
+                    assertUnavailable(lookup.error.get());
+                    Assert.assertTrue(lookup.error.get().getMessage().contains("timed out"));
+                    reconnect.allow.countDown();
+                    Assert.assertEquals(QwpSchemaProtocol.RESULT_KNOWN,
+                            loop.resolveSchema("probe", 5_000).getResult());
+                    Assert.assertEquals(2, handler.requests);
+                    Assert.assertEquals("probe", handler.lastName.get());
+                } finally {
+                    reconnect.allow.countDown();
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testInterruptDuringReconnectReleasesSlotForQueuedLookup() throws Exception {
+        SchemaHandler handler = new SchemaHandler();
+        handler.reply = true;
+        handler.disconnectName = "interrupted";
+        try (TestWebSocketServer server = server(handler);
+             CursorSendEngine engine = engine("reconnect-interrupt");
+             WebSocketClient client = connect(server.getPort())) {
+            GatedReconnectFactory reconnect = new GatedReconnectFactory(server.getPort());
+            try (CursorWebSocketSendLoop loop = loop(client, engine, reconnect)) {
+                try {
+                    loop.start();
+                    Lookup interrupted = lookup(loop, "interrupted", Long.MAX_VALUE, null);
+                    Assert.assertTrue(reconnect.attempted.await(5, TimeUnit.SECONDS));
+                    interrupted.thread.interrupt();
+                    interrupted.join();
+                    assertUnavailable(interrupted.error.get());
+                    Assert.assertTrue(interrupted.interrupted.get());
+                    Lookup queued = lookup(loop, "queued", 5_000, null);
+                    queued.awaitWaiting();
+                    reconnect.allow.countDown();
+                    queued.join();
+                    Assert.assertNull(String.valueOf(queued.error.get()), queued.error.get());
+                    Assert.assertEquals(QwpSchemaProtocol.RESULT_KNOWN, queued.response.get().getResult());
+                    Assert.assertEquals(2, handler.requests);
+                } finally {
+                    reconnect.allow.countDown();
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testCloseDuringReconnectReleasesLookupBeforeFactoryReturns() throws Exception {
+        SchemaHandler handler = new SchemaHandler();
+        handler.disconnectName = "closed";
+        try (TestWebSocketServer server = server(handler);
+             CursorSendEngine engine = engine("reconnect-close");
+             WebSocketClient client = connect(server.getPort())) {
+            GatedReconnectFactory reconnect = new GatedReconnectFactory(server.getPort());
+            try (CursorWebSocketSendLoop loop = loop(client, engine, reconnect)) {
+                AtomicReference<Throwable> closeError = new AtomicReference<>();
+                Thread closer = new Thread(() -> {
+                    try {
+                        loop.close();
+                    } catch (Throwable e) {
+                        closeError.set(e);
+                    }
+                });
+                try {
+                    loop.start();
+                    Lookup lookup = lookup(loop, "closed", Long.MAX_VALUE, null);
+                    Assert.assertTrue(reconnect.attempted.await(5, TimeUnit.SECONDS));
+                    closer.start();
+                    lookup.join();
+                    assertUnavailable(lookup.error.get());
+                    Assert.assertTrue(lookup.error.get().getMessage().contains("closed"));
+                } finally {
+                    reconnect.allow.countDown();
+                    closer.join(5_000);
+                    Assert.assertFalse(closer.isAlive());
+                }
+                Assert.assertNull(String.valueOf(closeError.get()), closeError.get());
+                Assert.assertEquals(1, handler.requests);
+            }
+        }
+    }
+
+    @Test
+    public void testMalformedCurrentReplyCancelsLookupEvenWithReconnectAvailable() throws Exception {
+        SchemaHandler handler = new SchemaHandler();
+        handler.malformedReply = true;
+        try (TestWebSocketServer server = server(handler);
+             CursorSendEngine engine = engine("reconnect-malformed");
+             WebSocketClient client = connect(server.getPort())) {
+            GatedReconnectFactory reconnect = new GatedReconnectFactory(server.getPort());
+            try (CursorWebSocketSendLoop loop = loop(client, engine, reconnect)) {
+                try {
+                    loop.start();
+                    Lookup lookup = lookup(loop, "malformed", Long.MAX_VALUE, null);
+                    Assert.assertTrue(reconnect.attempted.await(5, TimeUnit.SECONDS));
+                    lookup.join();
+                    assertUnavailable(lookup.error.get());
+                    handler.malformedReply = false;
+                    handler.reply = true;
+                    reconnect.allow.countDown();
+                    Assert.assertEquals(QwpSchemaProtocol.RESULT_KNOWN,
+                            loop.resolveSchema("probe", 5_000).getResult());
+                    Assert.assertEquals(2, handler.requests);
                 } finally {
                     reconnect.allow.countDown();
                 }
@@ -329,6 +501,15 @@ public class CursorWebSocketSchemaLifecycleTest {
         private final AtomicReference<QwpSchemaResponse> response = new AtomicReference<>();
         private Thread thread;
 
+        private void awaitWaiting() throws InterruptedException {
+            Assert.assertTrue(entered.await(5, TimeUnit.SECONDS));
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (thread.getState() != Thread.State.TIMED_WAITING) {
+                Assert.assertTrue("lookup did not wait", thread.isAlive() && System.nanoTime() < deadline);
+                Thread.yield();
+            }
+        }
+
         private void join() throws InterruptedException {
             thread.join(5_000);
             Assert.assertFalse("lookup thread did not finish", thread.isAlive());
@@ -366,10 +547,42 @@ public class CursorWebSocketSchemaLifecycleTest {
         }
     }
 
+    // Fault injection only: hold the receive poll until the producer has queued
+    // a lookup, then fail before the I/O thread can send that lookup.
+    private static final class DisconnectingClient extends WebSocketClient {
+        private final CountDownLatch disconnect = new CountDownLatch(1);
+        private final CountDownLatch receiving = new CountDownLatch(1);
+
+        private DisconnectingClient() {
+            super(DefaultHttpClientConfiguration.INSTANCE, PlainSocketFactory.INSTANCE);
+        }
+
+        @Override
+        public boolean tryReceiveFrame(WebSocketFrameHandler handler) {
+            receiving.countDown();
+            try {
+                Assert.assertTrue(disconnect.await(5, TimeUnit.SECONDS));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError(e);
+            }
+            throw new LineSenderException("injected transport disconnect");
+        }
+
+        @Override
+        protected void ioWait(int timeout, int op) {
+        }
+
+        @Override
+        protected void setupIoWait() {
+        }
+    }
+
     private static final class SchemaHandler implements TestWebSocketServer.WebSocketServerHandler {
         private final AtomicReference<String> lastName = new AtomicReference<>();
         private final CountDownLatch requestSeen = new CountDownLatch(1);
         private volatile String disconnectName;
+        private int disconnectsRemaining = 1;
         private volatile TestWebSocketServer.ClientHandler lastClient;
         private volatile long lastRequestId;
         private volatile boolean malformedReply;
@@ -389,7 +602,7 @@ public class CursorWebSocketSchemaLifecycleTest {
             lastRequestId = requestId;
             lastName.set(name);
             requestSeen.countDown();
-            if (name.equals(disconnectName)) {
+            if (name.equals(disconnectName) && disconnectsRemaining-- > 0) {
                 try {
                     client.sendClose(1001, "test disconnect");
                 } catch (IOException e) {
@@ -398,6 +611,7 @@ public class CursorWebSocketSchemaLifecycleTest {
             } else if (sendStaleBeforeNextReply) {
                 sendStaleBeforeNextReply = false;
                 sendMalformed(client, staleRequestId);
+                send(client, staleRequestId, 999);
                 send(client, requestId, requests);
             } else if (malformedReply) {
                 sendMalformed(client, requestId);

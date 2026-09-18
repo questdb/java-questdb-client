@@ -65,7 +65,7 @@ final class QwpSchemaCoordinator {
             long id = nextRequestId;
             byte[] message = QwpSchemaProtocol.encodeDescribe(id, tableName);
             nextRequestId++;
-            Request own = new Request(id, key, startNanos, timeoutNanos, message);
+            Request own = new Request(id, key, tableName.toString(), startNanos, timeoutNanos, message);
             request = own;
             hasPendingRequest = true;
             LockSupport.unpark(ioThread);
@@ -95,6 +95,14 @@ final class QwpSchemaCoordinator {
         if (request.remainingNanos() <= 0) {
             complete(request, null, failure(SCHEMA_UNAVAILABLE, request.key, "schema lookup timed out"));
             return null;
+        }
+        if (request.id == 0) {
+            if (nextRequestId <= 0 || nextRequestId == Long.MAX_VALUE) {
+                complete(request, null, failure(UNSUPPORTED_FEATURE, request.key, "schema request id space is exhausted"));
+                return null;
+            }
+            request.id = nextRequestId++;
+            request.message = QwpSchemaProtocol.encodeDescribe(request.id, request.tableName);
         }
         request.sentClient = client;
         return request;
@@ -169,9 +177,24 @@ final class QwpSchemaCoordinator {
     }
 
     synchronized void connectionLost(WebSocketClient client) {
-        if (request != null && (request.sentClient == null || request.sentClient == client)) {
-            complete(request, null, failure(SCHEMA_UNAVAILABLE, request.key, "connection lost during schema lookup"));
+        if (request != null && request.sentClient == client) {
+            // Keep the producer's request and deadline; only its wire attempt ended.
+            // A fresh ID also rejects old replies delivered on the replacement connection.
+            request.sentClient = null;
+            request.id = 0;
         }
+    }
+
+    synchronized boolean invalidResponse(WebSocketClient client, long requestId) {
+        // Zero means the malformed header could not identify a request. For an
+        // identifiable reply, cancellation must share the liveness check's lock.
+        if (requestId != 0 && !isLiveResponse(client, requestId)) {
+            return false;
+        }
+        if (request != null && (request.sentClient == null || request.sentClient == client)) {
+            complete(request, null, failure(SCHEMA_UNAVAILABLE, request.key, "invalid schema control response"));
+        }
+        return true;
     }
 
     synchronized void clearCache() {
@@ -249,17 +272,19 @@ final class QwpSchemaCoordinator {
     static final class Request {
         final long startNanos;
         final long timeoutNanos;
-        final long id;
+        long id;
         final String key;
-        final byte[] message;
+        final String tableName;
+        byte[] message;
         boolean done;
         LineSenderSchemaException error;
         QwpSchemaResponse response;
         WebSocketClient sentClient;
 
-        Request(long id, String key, long startNanos, long timeoutNanos, byte[] message) {
+        Request(long id, String key, String tableName, long startNanos, long timeoutNanos, byte[] message) {
             this.id = id;
             this.key = key;
+            this.tableName = tableName;
             this.startNanos = startNanos;
             this.timeoutNanos = timeoutNanos;
             this.message = message;

@@ -729,8 +729,10 @@ After schema support is confirmed, required lookups use a fixed 30-second
 deadline. A cache-miss describe or forced refresh starts its own 30-second
 budget. This is not a public configuration surface. Timeout, unavailable
 metadata or request saturation throws a lookup error before accepting the
-value. It cancels any partial row but does not permanently halt the sender. Do
-not add automatic retries or separate timeout settings for lookup paths.
+value. It cancels any partial row but does not permanently halt the sender.
+Recoverable transport loss resends the pending lookup after reconnection within
+its original deadline. Do not retry completed lookup errors or add separate
+timeout settings for lookup paths.
 
 ### Minimal client integration
 
@@ -1637,9 +1639,15 @@ bound for schemas, converters and pending buffers.
 Use one outstanding lookup because the producer owns row construction; no
 general request queue is needed. Its deadline starts at the producer call and
 includes waiting for the I/O thread, connection and response. Never reuse a
-request ID; correlate completion with the connection that sent it. Timeout,
-shutdown and connection loss release waiters. Ignore cancelled or unmatched
-replies entirely, including their metadata.
+request ID; correlate completion with the connection that sent it. Recoverable
+transport loss retains the pending lookup, including one not yet sent. Resend
+on the replacement connection with a fresh request ID within the original
+deadline; repeated disconnects do not restart that deadline. The lookup can
+time out while the store-and-forward loop continues reconnecting indefinitely.
+Timeout, interruption, shutdown and terminal failure release waiters. Ignore
+cancelled or unmatched replies entirely, including their metadata. Explicit
+denial, unavailability and unsupported responses complete the lookup without
+retrying it.
 
 Validate the fixed control header and request ID before parsing a direct
 reply's schema. An identifiable stale reply is ignored even if its schema body
@@ -1647,9 +1655,11 @@ is malformed. Invalid headers that cannot safely identify a reply still fail
 the connection. Parse outside the coordinator monitor; if parsing fails,
 recheck the existing request identity and deadline before accepting the error
 as a current connection failure. Successful parsing retains the final check
-before publication. Existing timeout and connection-loss paths remain
-responsible for cancellation; response validation must not pre-complete a
-request before recycling its connection.
+before publication. A malformed current reply cancels its matching lookup
+atomically with that identity check before recycling the connection; malformed
+headers that cannot identify a reply cancel the connection's pending lookup.
+Protocol errors retain this immediate failure policy even when transport loss
+would preserve the lookup for reconnection.
 
 Cache known schemas and confirmed missing-table results, not denial or
 unavailability. A forced refresh removes the previous entry before lookup;
@@ -1781,8 +1791,9 @@ They do not change the compatibility contract.
     of copying the server's one-byte truncation bug.
 14. **Keep the schema deadline fixed.** Initial negotiation and its first
     describe share one 30-second end-to-end budget; later cache-miss describes
-    and forced refreshes each get their own 30-second budget. Do not add public
-    configuration, retries, another socket, a request queue or separate timeout
+    and forced refreshes each get their own 30-second budget. Transport retries
+    retain that original budget. Do not add public configuration, retries of
+    completed lookup errors, another socket, a request queue or separate timeout
     policy per path.
 15. **Prefer narrow family helpers to a conversion framework.** A shared helper
     for BYTE/SHORT/INT numeric targets is justified because those setters have
