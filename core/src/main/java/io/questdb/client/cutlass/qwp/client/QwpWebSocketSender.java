@@ -252,12 +252,6 @@ public class QwpWebSocketSender implements Sender {
     private int currentBatchMaxSymbolId = -1;
     private volatile int currentEndpointIdx = -1;
     private QwpTableBuffer currentTableBuffer;
-    // Authoritative row lifecycle state. A row is open immediately after a
-    // successful table(), even before any value has been appended.
-    private boolean currentRowOpen;
-    // Contract selected by table() for the open row. Null means an explicitly
-    // prepared legacy row; it never permits lazy negotiation in a setter.
-    private QwpSchemaBinding currentRowBinding;
     // Tracks currentTableBuffer.getBufferedBytes() at the last point pendingBytes
     // was made consistent (end of sendRow(), or right after a table switch).
     // sendRow() advances pendingBytes by (now - snapshot) and re-snaps, which
@@ -1034,7 +1028,7 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.designatedTimestamp(timestamp, unit);
                 sendRow();
@@ -1056,7 +1050,7 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.designatedTimestamp(timestamp);
                 sendRow();
@@ -1074,6 +1068,7 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
+            bindingForEffectiveWrite();
             // Server-assigned timestamp - just send the row without designated timestamp
             sendRow();
         } catch (RuntimeException | Error e) {
@@ -1144,7 +1139,7 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.binaryColumn(columnName, value);
                 return this;
@@ -1174,7 +1169,7 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.binaryColumn(columnName, slice);
                 return this;
@@ -1199,7 +1194,7 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.binaryColumn(columnName, ptr, len);
                 return this;
@@ -1219,7 +1214,7 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.boolColumn(columnName, value);
                 return this;
@@ -1250,7 +1245,7 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.byteColumn(columnName, value);
                 return this;
@@ -1268,7 +1263,10 @@ public class QwpWebSocketSender implements Sender {
     @Override
     public void cancelRow() {
         checkNotClosed();
-        rollbackRow();
+        if (currentTableBuffer != null) {
+            currentTableBuffer.cancelCurrentRow();
+            currentTableBuffer.rollbackUncommittedColumns();
+        }
     }
 
     /**
@@ -1284,7 +1282,7 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.charColumn(columnName, value);
                 return this;
@@ -1394,10 +1392,6 @@ public class QwpWebSocketSender implements Sender {
                 ? cursorSendLoop.getSynchronouslySurfacedError() : null;
 
         try {
-            // Closing never turns an unfinished row into an implicit write.
-            // Keep cancellation inside the protected cleanup path so even an
-            // unexpected rollback failure cannot skip transport teardown.
-            rollbackRow();
             // Only drain when both the engine and the I/O loop are wired
             // up — close() is also called from createForTesting() teardown
             // and from connect() rollback paths where one or both may be null.
@@ -1625,10 +1619,10 @@ public class QwpWebSocketSender implements Sender {
     @Override
     public Sender decimalColumn(CharSequence name, Decimal64 value) {
         checkNotClosed();
-        checkTableSelected();
         if (value == null || value.isNull()) return this;
+        checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.decimalColumn(name, value);
                 return this;
@@ -1646,10 +1640,10 @@ public class QwpWebSocketSender implements Sender {
     @Override
     public Sender decimalColumn(CharSequence name, Decimal128 value) {
         checkNotClosed();
-        checkTableSelected();
         if (value == null || value.isNull()) return this;
+        checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.decimalColumn(name, value);
                 return this;
@@ -1667,10 +1661,10 @@ public class QwpWebSocketSender implements Sender {
     @Override
     public Sender decimalColumn(CharSequence name, Decimal256 value) {
         checkNotClosed();
-        checkTableSelected();
         if (value == null || value.isNull()) return this;
+        checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.decimalColumn(name, value);
                 return this;
@@ -1688,10 +1682,10 @@ public class QwpWebSocketSender implements Sender {
     @Override
     public Sender decimalColumn(CharSequence name, CharSequence value) {
         checkNotClosed();
-        checkTableSelected();
         if (value == null || value.length() == 0) return this;
+        checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.decimalColumn(name, value, currentDecimal256);
                 return this;
@@ -1710,10 +1704,10 @@ public class QwpWebSocketSender implements Sender {
     @Override
     public Sender doubleArray(@NotNull CharSequence name, double[] values) {
         checkNotClosed();
-        checkTableSelected();
         if (values == null) return this;
+        checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.doubleArray(name, values);
                 return this;
@@ -1731,10 +1725,10 @@ public class QwpWebSocketSender implements Sender {
     @Override
     public Sender doubleArray(@NotNull CharSequence name, double[][] values) {
         checkNotClosed();
-        checkTableSelected();
         if (values == null) return this;
+        checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.doubleArray(name, values);
                 return this;
@@ -1752,10 +1746,10 @@ public class QwpWebSocketSender implements Sender {
     @Override
     public Sender doubleArray(@NotNull CharSequence name, double[][][] values) {
         checkNotClosed();
-        checkTableSelected();
         if (values == null) return this;
+        checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.doubleArray(name, values);
                 return this;
@@ -1773,10 +1767,10 @@ public class QwpWebSocketSender implements Sender {
     @Override
     public Sender doubleArray(CharSequence name, DoubleArray array) {
         checkNotClosed();
-        checkTableSelected();
         if (array == null) return this;
+        checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.doubleArray(name, array);
                 return this;
@@ -1796,7 +1790,7 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.doubleColumn(columnName, value);
                 return this;
@@ -1822,7 +1816,7 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.floatColumn(columnName, value);
                 return this;
@@ -1968,7 +1962,7 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.geoHashColumn(columnName, bits, precisionBits);
                 return this;
@@ -2006,7 +2000,7 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.geoHashColumn(columnName, value);
                 return this;
@@ -2394,7 +2388,7 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.intColumn(columnName, value);
                 return this;
@@ -2427,7 +2421,7 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.ipv4Column(columnName, address);
                 return this;
@@ -2472,12 +2466,12 @@ public class QwpWebSocketSender implements Sender {
     @Override
     public QwpWebSocketSender ipv4Column(CharSequence columnName, CharSequence address) {
         checkNotClosed();
-        checkTableSelected();
         if (address == null) {
             return this;
         }
+        checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.ipv4Column(columnName, address);
                 return this;
@@ -2521,7 +2515,7 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.long256Column(columnName, l0, l1, l2, l3);
                 return this;
@@ -2539,10 +2533,10 @@ public class QwpWebSocketSender implements Sender {
     @Override
     public Sender longArray(@NotNull CharSequence name, long[] values) {
         checkNotClosed();
-        checkTableSelected();
         if (values == null) return this;
+        checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.unsupportedColumn(name, "LONG_ARRAY");
                 return this;
@@ -2561,10 +2555,10 @@ public class QwpWebSocketSender implements Sender {
     @Override
     public Sender longArray(@NotNull CharSequence name, long[][] values) {
         checkNotClosed();
-        checkTableSelected();
         if (values == null) return this;
+        checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.unsupportedColumn(name, "LONG_ARRAY");
                 return this;
@@ -2582,10 +2576,10 @@ public class QwpWebSocketSender implements Sender {
     @Override
     public Sender longArray(@NotNull CharSequence name, long[][][] values) {
         checkNotClosed();
-        checkTableSelected();
         if (values == null) return this;
+        checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.unsupportedColumn(name, "LONG_ARRAY");
                 return this;
@@ -2603,10 +2597,10 @@ public class QwpWebSocketSender implements Sender {
     @Override
     public Sender longArray(@NotNull CharSequence name, LongArray array) {
         checkNotClosed();
-        checkTableSelected();
         if (array == null) return this;
+        checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.unsupportedColumn(name, "LONG_ARRAY");
                 return this;
@@ -2626,7 +2620,7 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.longColumn(columnName, value);
                 return this;
@@ -2709,7 +2703,6 @@ public class QwpWebSocketSender implements Sender {
     @Override
     public void reset() {
         checkNotClosed();
-        rollbackRow();
         // Reset ALL table buffers, not just the current one
         ObjList<CharSequence> keys = tableBuffers.keys();
         for (int i = 0, n = keys.size(); i < n; i++) {
@@ -2735,7 +2728,6 @@ public class QwpWebSocketSender implements Sender {
         currentTableBuffer = null;
         currentTableBufferSnapshotBytes = 0;
         currentTableName = null;
-        currentRowBinding = null;
         cachedTimestampColumn = null;
         cachedTimestampNanosColumn = null;
     }
@@ -2941,7 +2933,7 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.shortColumn(columnName, value);
                 return this;
@@ -3061,7 +3053,7 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.stringColumn(columnName, value);
                 return this;
@@ -3081,7 +3073,7 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.symbol(columnName, value);
                 return this;
@@ -3099,39 +3091,34 @@ public class QwpWebSocketSender implements Sender {
     @Override
     public QwpWebSocketSender table(CharSequence tableName) {
         checkNotClosed();
-        if (currentRowOpen) {
-            throw new LineSenderException("cannot start a new row while a row is in progress"
-                    + " [currentTable=").put(currentTableName).put(']');
-        }
-        validateTableName(tableName);
-        ensureConnected();
-        cachedTimestampColumn = null;
-        cachedTimestampNanosColumn = null;
-        currentTableBuffer = tableBuffers.get(tableName);
-        if (currentTableBuffer != null) {
-            currentTableName = currentTableBuffer.getTableName();
-        } else {
-            currentTableName = tableName.toString();
-            currentTableBuffer = new QwpTableBuffer(currentTableName, this);
-            tableBuffers.put(currentTableName, currentTableBuffer);
-        }
-        // Re-snap so sendRow()'s delta math is anchored to this table's
-        // current byte count. The prior current table's bytes already match
-        // its last-snapped value (the in-progress-row guard above ensures
-        // no column setters ran on it since the last consistency point).
-        currentTableBufferSnapshotBytes = currentTableBuffer.getBufferedBytes();
-        try {
-            currentRowBinding = prepareRowBinding();
-            currentRowOpen = true;
-        } catch (RuntimeException | Error e) {
-            currentRowBinding = null;
-            currentTableBuffer = null;
-            currentTableName = null;
-            currentTableBufferSnapshotBytes = 0;
+        if (currentTableName == null || !Chars.equals(tableName, currentTableName)) {
+            // Prevent switching tables while a row is in progress.
+            if (currentTableBuffer != null && currentTableBuffer.hasInProgressRow()) {
+                throw new LineSenderException("cannot switch tables while row is in progress"
+                        + " [currentTable=").put(currentTableName).put(']');
+            }
+            validateTableName(tableName);
+            // Table changed - invalidate cached column references.
             cachedTimestampColumn = null;
             cachedTimestampNanosColumn = null;
-            throw e;
+            currentTableBuffer = tableBuffers.get(tableName);
+            if (currentTableBuffer != null) {
+                currentTableName = currentTableBuffer.getTableName();
+            } else {
+                currentTableName = tableName.toString();
+                currentTableBuffer = new QwpTableBuffer(currentTableName, this);
+                tableBuffers.put(currentTableName, currentTableBuffer);
+            }
+            // Re-snap so sendRow()'s delta math is anchored to this table's
+            // current byte count. The prior current table's bytes already match
+            // its last-snapped value (the in-progress-row guard above ensures
+            // no column setters ran on it since the last consistency point).
+            currentTableBufferSnapshotBytes = currentTableBuffer.getBufferedBytes();
         }
+        // Resolve schema at the explicit table boundary. Setters retain the
+        // same lookup as a fallback because the selected table also starts
+        // implicit rows after completion, cancellation, and batch flushes.
+        bindingForEffectiveWrite();
         return this;
     }
 
@@ -3140,7 +3127,7 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.timestampColumn(columnName, value, unit);
                 return this;
@@ -3168,7 +3155,7 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.timestampColumn(columnName, value);
                 return this;
@@ -3196,7 +3183,7 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
-            QwpSchemaBinding binding = currentRowBinding;
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
             if (binding != null) {
                 binding.uuidColumn(columnName, lo, hi);
                 return this;
@@ -3892,7 +3879,7 @@ public class QwpWebSocketSender implements Sender {
     }
 
     private void checkTableSelected() {
-        if (!currentRowOpen) {
+        if (currentTableBuffer == null) {
             throw new LineSenderException("table() must be called before adding columns");
         }
     }
@@ -4373,7 +4360,8 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Selects the wire contract while table() prepares a row. In asynchronous initial-connect mode,
+     * Selects the wire contract at an explicit table boundary or before the first
+     * effective value of an implicit row. In asynchronous initial-connect mode,
      * fresh senders use the legacy contract until schema support is confirmed;
      * recovered schema-framed data and senders that have already confirmed support
      * retain the strict schema path.
@@ -4383,8 +4371,12 @@ public class QwpWebSocketSender implements Sender {
      * the cache; the first row after a flush or reset adopts whatever the cache holds
      * by then, which ACK schema feedback and reconnects keep current.
      */
-    private QwpSchemaBinding prepareRowBinding() {
+    private QwpSchemaBinding bindingForEffectiveWrite() {
         QwpSchemaBinding pinned = currentTableBuffer.getSchemaBinding();
+        if (currentTableBuffer.hasInProgressRow()) {
+            return pinned;
+        }
+        ensureConnected();
         if (pinned != null && currentTableBuffer.getRowCount() > 0) {
             return pinned;
         }
@@ -4446,7 +4438,7 @@ public class QwpWebSocketSender implements Sender {
     }
 
     private void ensureNoInProgressRow() {
-        if (currentRowOpen) {
+        if (currentTableBuffer != null && currentTableBuffer.hasInProgressRow()) {
             throw new LineSenderException(
                     "Cannot flush while row is in progress. "
                             + "Use sender.at(), sender.atNow(), or sender.cancelRow() first."
@@ -5427,16 +5419,10 @@ public class QwpWebSocketSender implements Sender {
     }
 
     private void rollbackRow() {
-        if (currentRowOpen) {
+        if (currentTableBuffer != null) {
             currentTableBuffer.cancelCurrentRow();
             currentTableBuffer.rollbackUncommittedColumns();
-            endRow();
         }
-    }
-
-    private void endRow() {
-        currentRowOpen = false;
-        currentRowBinding = null;
     }
 
     /**
@@ -5512,6 +5498,8 @@ public class QwpWebSocketSender implements Sender {
      * Rows buffer until flush (explicit or auto-flush).
      */
     private void sendRow() {
+        ensureConnected();
+
         // Hard guard: a single row whose bytes exceed the server's wire cap
         // would flush as an oversize WS frame the server closes with
         // ws-close[1009]. nextRow() measures the row -- padding included,
@@ -5531,7 +5519,7 @@ public class QwpWebSocketSender implements Sender {
         if (pendingRowCount == 0) {
             firstPendingRowTimeNanos = System.nanoTime();
             // The batch's first row selects its wire contract; see
-            // prepareRowBinding.
+            // bindingForEffectiveWrite.
             isPendingBatchLegacy = currentTableBuffer.getSchemaBinding() == null;
         }
         pendingRowCount++;
@@ -5544,11 +5532,6 @@ public class QwpWebSocketSender implements Sender {
         // seen across its lifetime.
         pendingBytes += bufferedNow - currentTableBufferSnapshotBytes;
         currentTableBufferSnapshotBytes = bufferedNow;
-
-        // The row belongs to the completed batch from this point onward. End
-        // the open-row state before auto-flush so a publication failure cannot
-        // roll the committed row back or invite the caller to append it twice.
-        endRow();
 
         if (shouldAutoFlush()) {
             flushPendingRows(transactional);

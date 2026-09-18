@@ -25,7 +25,6 @@
 package io.questdb.client.impl;
 
 import io.questdb.client.Sender;
-import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
 import io.questdb.client.std.Decimal128;
@@ -167,11 +166,7 @@ public final class PooledSender implements Sender {
             // above. A stale duplicate throws here, and the finally routes it
             // to discardBroken, which drops it on the same stale-generation
             // check under the pool lock.
-            Sender delegate = slot.live(generation);
-            if (delegate instanceof QwpWebSocketSender) {
-                delegate.cancelRow();
-            }
-            delegate.flush();
+            slot.live(generation).flush();
             flushed = true;
         } finally {
             if (flushed) {

@@ -287,45 +287,23 @@ public class QwpWebSocketSenderTest {
     }
 
     @Test
-    public void testEveryRowRequiresTableAndEmptyOpenRowRejectsLifecycleOperations() throws Exception {
+    public void testSelectedTableSupportsEmptyFlushAndImplicitRows() throws Exception {
         assertMemoryLeak(() -> {
             try (TestWebSocketServer server = startLegacyServer();
                  QwpWebSocketSender sender = connectLegacySender(server, Integer.MAX_VALUE, 0, 0L)) {
-                assertTableRequired(() -> sender.stringColumn("ignored", null));
-
                 sender.table("t");
-                try {
-                    sender.table("t");
-                    Assert.fail("expected second table() to reject the open row");
-                } catch (LineSenderException e) {
-                    Assert.assertTrue(e.getMessage().contains("row is in progress"));
-                }
-                try {
-                    sender.flush();
-                    Assert.fail("expected flush() to reject the empty open row");
-                } catch (LineSenderException e) {
-                    Assert.assertTrue(e.getMessage().contains("row is in progress"));
-                }
-                try {
-                    sender.flushAndGetSequence();
-                    Assert.fail("expected flushAndGetSequence() to reject the empty open row");
-                } catch (LineSenderException e) {
-                    Assert.assertTrue(e.getMessage().contains("row is in progress"));
-                }
-                try {
-                    sender.drain(1);
-                    Assert.fail("expected drain() to reject the empty open row");
-                } catch (LineSenderException e) {
-                    Assert.assertTrue(e.getMessage().contains("row is in progress"));
-                }
+                sender.flush();
 
+                sender.longColumn("v", 1).atNow();
+                sender.longColumn("discarded", 2);
                 sender.cancelRow();
-                assertTableRequired(sender::atNow);
-                sender.table("t").atNow();
-                assertTableRequired(sender::atNow);
-                sender.table("t").longColumn("v", 1).atNow();
-                sender.cancelRow();
-                assertTableRequired(() -> sender.longColumn("v", 2));
+                sender.longColumn("v", 3).atNow();
+
+                sender.longColumn("v", 4);
+                sender.table("t"); // same-table selection does not disturb a partial row
+                sender.boolColumn("flag", true).atNow();
+
+                Assert.assertEquals(3, sender.getTableBuffer("t").getRowCount());
             }
         });
     }
@@ -381,7 +359,7 @@ public class QwpWebSocketSenderTest {
     }
 
     @Test
-    public void testAutoFlushAppendFailureRetainsCommittedRowAndEndsOpenRow() throws Exception {
+    public void testFlushAppendFailureDoesNotLeaveMicrobatchBufferInUse() throws Exception {
         assertMemoryLeak(() -> {
             try (TestWebSocketServer server = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
             })) {
@@ -396,19 +374,16 @@ public class QwpWebSocketSenderTest {
                 long minSegmentBytes = MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + 1;
                 CursorSendEngine engine = new CursorSendEngine(null, minSegmentBytes, minSegmentBytes, 1L);
                 try (QwpWebSocketSender sender = QwpWebSocketSender.connect(
-                        "localhost", port, null, 1, 0, 0L, null,
+                        "localhost", port, null, Integer.MAX_VALUE, 0, 0L, null,
                         false, engine, 0L)) {
+                    sender.table("t").longColumn("v", 1L).atNow();
+
                     try {
-                        sender.table("t").longColumn("v", 1L).atNow();
+                        sender.flushAndGetSequence();
                         Assert.fail("Expected LineSenderException");
                     } catch (LineSenderException e) {
                         Assert.assertTrue(e.getMessage().contains("cursor SF append failed"));
                     }
-
-                    Assert.assertEquals("auto-flush failure must retain the committed row", 1,
-                            sender.getTableBuffer("t").getRowCount());
-                    sender.table("t");
-                    sender.cancelRow();
 
                     MicrobatchBuffer buffer0 = getMicrobatchBuffer(sender, "buffer0");
                     MicrobatchBuffer buffer1 = getMicrobatchBuffer(sender, "buffer1");
@@ -466,9 +441,7 @@ public class QwpWebSocketSenderTest {
         // way it round-trips as SQL NULL. The call must not throw and must
         // return the sender so chained builders keep working.
         assertMemoryLeak(() -> {
-            try (TestWebSocketServer server = startLegacyServer();
-                 QwpWebSocketSender sender = connectLegacySender(server, Integer.MAX_VALUE, 0, 0L)) {
-                sender.table("t");
+            try (QwpWebSocketSender sender = createUnconnectedSender()) {
                 Assert.assertSame(sender, sender.ipv4Column("addr", null));
             }
         });
@@ -589,8 +562,9 @@ public class QwpWebSocketSenderTest {
     public void testNullArrayReturnsThis() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpWebSocketSender sender = createUnconnectedSender()) {
-                assertTableRequired(() -> sender.doubleArray("x", (double[]) null));
-                assertTableRequired(() -> sender.longArray("x", (long[]) null));
+                // Null arrays should be no-ops and return sender
+                Assert.assertSame(sender, sender.doubleArray("x", (double[]) null));
+                Assert.assertSame(sender, sender.longArray("x", (long[]) null));
             }
         });
     }
@@ -894,15 +868,6 @@ public class QwpWebSocketSenderTest {
         Field field = QwpWebSocketSender.class.getDeclaredField(fieldName);
         field.setAccessible(true);
         return (MicrobatchBuffer) field.get(sender);
-    }
-
-    private static void assertTableRequired(Runnable operation) {
-        try {
-            operation.run();
-            Assert.fail("expected table() requirement");
-        } catch (LineSenderException e) {
-            Assert.assertTrue(e.getMessage().contains("table() must be called"));
-        }
     }
 
     private static QwpWebSocketSender connectLegacySender(

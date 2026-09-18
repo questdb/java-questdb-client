@@ -26,8 +26,6 @@ package io.questdb.client.test.impl;
 
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
-import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
-import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.impl.PooledSender;
 import io.questdb.client.impl.SenderPool;
 import io.questdb.client.test.tools.TestUtils;
@@ -36,7 +34,6 @@ import org.junit.Test;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Proxy;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -55,52 +52,6 @@ public class SenderPoolTest {
 
     private static final String DEAD_HTTP_CONFIG =
             "http::addr=127.0.0.1:1;protocol_version=2;auto_flush=off;";
-
-    @Test
-    public void testQwpCloseCancelsEmptyAndPartialRowsBeforeReusingSlot() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            try (TestWebSocketServer server = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
-            })) {
-                server.start();
-                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-                String config = "ws::addr=localhost:" + server.getPort()
-                        + ";auto_flush_rows=2147483647;auto_flush_bytes=0;auto_flush_interval=2147483646;"
-                        + "close_flush_timeout_millis=0;";
-                try (SenderPool pool = new SenderPool(config, 1, 1, 1_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
-                    Sender first = pool.borrow();
-                    Object slot = slotOf(first);
-                    Field delegateField = slot.getClass().getDeclaredField("delegate");
-                    delegateField.setAccessible(true);
-                    QwpWebSocketSender delegate = (QwpWebSocketSender) delegateField.get(slot);
-
-                    first.table("events");
-                    first.close();
-                    Assert.assertEquals("table-only close must publish nothing", -1,
-                            delegate.getCursorEngineForTesting().publishedFsn());
-
-                    Sender second = pool.borrow();
-                    Assert.assertSame(slot, slotOf(second));
-                    Assert.assertThrows(LineSenderException.class, second::atNow);
-                    second.table("events").longColumn("v", 1).atNow();
-                    second.table("events").longColumn("partial_only", 2);
-                    second.close();
-                    Assert.assertEquals("close must publish the completed row", 0,
-                            delegate.getCursorEngineForTesting().publishedFsn());
-                    Assert.assertEquals("the incomplete row must not retain its new column", 1,
-                            delegate.getTableBuffer("events").getColumnCount());
-                    Assert.assertEquals(0, delegate.getTableBuffer("events").getRowCount());
-
-                    try (Sender third = pool.borrow()) {
-                        Assert.assertSame(slot, slotOf(third));
-                        Assert.assertThrows(LineSenderException.class, () -> third.longColumn("v", 3));
-                        third.table("events").longColumn("v", 3).atNow();
-                    }
-                    Assert.assertEquals("the next borrower can publish its own row", 1,
-                            delegate.getCursorEngineForTesting().publishedFsn());
-                }
-            }
-        });
-    }
 
     @Test
     public void testBorrowReturnRecyclesSameDecorator() throws Exception {

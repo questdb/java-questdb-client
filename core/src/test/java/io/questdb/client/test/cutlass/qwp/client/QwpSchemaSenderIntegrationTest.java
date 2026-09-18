@@ -15,6 +15,7 @@ import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.protocol.QwpSchemaProtocol;
+import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
 import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.Decimal256;
 import io.questdb.client.std.Decimal64;
@@ -65,7 +66,6 @@ public class QwpSchemaSenderIntegrationTest {
                         .decimalColumn("value", "not-a-decimal")
                         .atNow();
 
-                sender.table("events");
                 sender.uuidColumn("failed_b", 11, 12);
                 try {
                     sender.decimalColumn("value", "not-a-decimal");
@@ -74,7 +74,6 @@ public class QwpSchemaSenderIntegrationTest {
                     Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
                 }
 
-                sender.table("events");
                 sender.decimalColumn("value", "2.5").atNow();
                 sender.flush();
 
@@ -93,11 +92,11 @@ public class QwpSchemaSenderIntegrationTest {
                 LongTextSchemaHandler handler = new LongTextSchemaHandler(941 + targetType, 951, targetType);
                 try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
                     sender.table("events").decimalColumn("value", "00123.4500").atNow();
-                    sender.table("events").decimalColumn("value", "1.2300m").atNow();
-                    sender.table("events").decimalColumn("value", "Infinity")
+                    sender.decimalColumn("value", "1.2300m").atNow();
+                    sender.decimalColumn("value", "Infinity")
                             .decimalColumn("value", "not-a-decimal")
                             .atNow();
-                    sender.table("events").decimalColumn("value", (CharSequence) null)
+                    sender.decimalColumn("value", (CharSequence) null)
                             .decimalColumn("value", "")
                             .atNow();
                     sender.flush();
@@ -122,7 +121,6 @@ public class QwpSchemaSenderIntegrationTest {
                 try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
                     sender.table("events").byteColumn("value", (byte) -1).atNow();
 
-                    sender.table("events");
                     sender.byteColumn("value", (byte) 99);
                     try {
                         switch (i % 3) {
@@ -141,10 +139,9 @@ public class QwpSchemaSenderIntegrationTest {
                         Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
                     }
 
-                    sender.table("events");
                     sender.shortColumn("value", (short) 2).atNow();
-                    sender.table("events").intColumn("value", Integer.MIN_VALUE).atNow();
-                    sender.table("events").intColumn("value", 3).atNow();
+                    sender.intColumn("value", Integer.MIN_VALUE).atNow();
+                    sender.intColumn("value", 3).atNow();
                     sender.flush();
 
                     new FrameReader(handler.awaitDataFrame()).smallIntegerNumericTable(
@@ -197,7 +194,6 @@ public class QwpSchemaSenderIntegrationTest {
                 try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
                     sender.table("events").byteColumn("value", (byte) -1).atNow();
 
-                    sender.table("events");
                     sender.shortColumn("value", (short) 99);
                     try {
                         sender.intColumn("failed_b", 1);
@@ -206,11 +202,10 @@ public class QwpSchemaSenderIntegrationTest {
                         Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
                     }
 
-                    sender.table("events");
                     sender.shortColumn("value", (short) 2).atNow();
-                    sender.table("events").intColumn("value", Integer.MIN_VALUE).atNow();
-                    sender.table("events").intColumn("value", 3).atNow();
-                    sender.table("events").longColumn("value", Long.MAX_VALUE).atNow();
+                    sender.intColumn("value", Integer.MIN_VALUE).atNow();
+                    sender.intColumn("value", 3).atNow();
+                    sender.longColumn("value", Long.MAX_VALUE).atNow();
                     sender.flush();
 
                     new FrameReader(handler.awaitDataFrame()).integerTemporalTable(
@@ -263,7 +258,6 @@ public class QwpSchemaSenderIntegrationTest {
                 try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
                     sender.table("events").byteColumn("value", (byte) -128).atNow();
 
-                    sender.table("events");
                     sender.shortColumn("value", (short) 99);
                     try {
                         sender.intColumn("failed_b", 1);
@@ -272,10 +266,9 @@ public class QwpSchemaSenderIntegrationTest {
                         Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
                     }
 
-                    sender.table("events");
                     sender.shortColumn("value", Short.MAX_VALUE).atNow();
-                    sender.table("events").intColumn("value", Integer.MIN_VALUE).atNow();
-                    sender.table("events").intColumn("value", Integer.MAX_VALUE).atNow();
+                    sender.intColumn("value", Integer.MIN_VALUE).atNow();
+                    sender.intColumn("value", Integer.MAX_VALUE).atNow();
                     sender.flush();
 
                     new FrameReader(handler.awaitDataFrame()).smallIntegerTextTable(
@@ -327,7 +320,6 @@ public class QwpSchemaSenderIntegrationTest {
             try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
                 sender.table("events").byteColumn("value", (byte) 42).atNow();
 
-                sender.table("events");
                 sender.shortColumn("value", (short) 99);
                 try {
                     sender.intColumn("failed_b", 1);
@@ -336,10 +328,9 @@ public class QwpSchemaSenderIntegrationTest {
                     Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
                 }
 
-                sender.table("events");
                 sender.shortColumn("value", (short) -7).atNow();
-                sender.table("events").intColumn("value", Integer.MIN_VALUE).atNow();
-                sender.table("events").intColumn("value", Integer.MAX_VALUE).atNow();
+                sender.intColumn("value", Integer.MIN_VALUE).atNow();
+                sender.intColumn("value", Integer.MAX_VALUE).atNow();
                 sender.flush();
 
                 new FrameReader(handler.awaitDataFrame()).smallIntegerDecimalTable(
@@ -388,9 +379,8 @@ public class QwpSchemaSenderIntegrationTest {
             LongTextSchemaHandler handler = new LongTextSchemaHandler(1121, 1131, ColumnType.IPv4);
             try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
                 sender.table("events").intColumn("value", Integer.MIN_VALUE).atNow();
-                sender.table("events").intColumn("value", 0).atNow();
+                sender.intColumn("value", 0).atNow();
 
-                sender.table("events");
                 sender.intColumn("value", 0x0a000001);
                 try {
                     sender.intColumn("failed_b", 1);
@@ -399,9 +389,8 @@ public class QwpSchemaSenderIntegrationTest {
                     Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
                 }
 
-                sender.table("events");
                 sender.intColumn("value", 1).atNow();
-                sender.table("events").intColumn("value", -1).atNow();
+                sender.intColumn("value", -1).atNow();
                 sender.flush();
 
                 new FrameReader(handler.awaitDataFrame()).intToIpv4Table("events", 1121, 1131);
@@ -470,7 +459,6 @@ public class QwpSchemaSenderIntegrationTest {
                         .binaryColumn("value", new byte[]{1})
                         .atNow();
 
-                sender.table("events");
                 sender.decimalColumn("value", Decimal256.MAX_VALUE);
                 try {
                     sender.decimalColumn("failed_b", new Decimal64(1, 0));
@@ -479,16 +467,15 @@ public class QwpSchemaSenderIntegrationTest {
                     Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
                 }
 
-                sender.table("events");
                 sender.decimalColumn("value", new Decimal64(-125, 3)).atNow();
                 sender.table("events").atNow();
-                sender.table("events").decimalColumn("value", new Decimal256(
+                sender.decimalColumn("value", new Decimal256(
                         0x161bcca7119915b5L,
                         0x0764b4abe8652979L,
                         0x7775a5f171950fffL,
                         0xffffffffffffffffL,
                         76)).atNow();
-                sender.table("events").decimalColumn("value", new Decimal64(0, 0)).atNow();
+                sender.decimalColumn("value", new Decimal64(0, 0)).atNow();
                 sender.flush();
 
                 new FrameReader(handler.awaitDataFrame()).decimalTextLifecycleTable("events", 781, 791);
@@ -506,8 +493,8 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events")
                         .decimalColumn("value", new Decimal128(Long.MAX_VALUE, -1L))
                         .atNow();
-                sender.table("events").decimalColumn("value", wrappedScale).atNow();
-                sender.table("events").decimalColumn("value", new Decimal128(0, 420, 2)).atNow();
+                sender.decimalColumn("value", wrappedScale).atNow();
+                sender.decimalColumn("value", new Decimal128(0, 420, 2)).atNow();
                 sender.flush();
 
                 new FrameReader(handler.awaitDataFrame()).decimalTextTable(
@@ -529,14 +516,13 @@ public class QwpSchemaSenderIntegrationTest {
             LongTextSchemaHandler handler = new LongTextSchemaHandler(601, 611, target);
             try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
                 sender.table("events").decimalColumn("value", new Decimal64(150, 2)).atNow();
-                sender.table("events").uuidColumn("failed_b", 0xa456426614174000L, 0x123e4567e89b12d3L);
+                sender.uuidColumn("failed_b", 0xa456426614174000L, 0x123e4567e89b12d3L);
                 try {
                     sender.decimalColumn("value", Decimal128.fromLong(100_000_000_000_000_000L, 0));
                     Assert.fail("expected target precision overflow");
                 } catch (LineSenderSchemaException e) {
                     Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
                 }
-                sender.table("events");
                 sender.decimalColumn("value", new Decimal64(25, 2)).atNow();
                 sender.flush();
                 new FrameReader(handler.awaitDataFrame()).decimal64Table("events", 601, 611, 4, 15_000, 2_500);
@@ -737,14 +723,13 @@ public class QwpSchemaSenderIntegrationTest {
                     551, 561, ColumnType.getGeoHashTypeWithBits(8));
             try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
                 sender.table("events").stringColumn("value", "zz").atNow();
-                sender.table("events").stringColumn("failed_b", "123e4567-e89b-12d3-a456-426614174000");
+                sender.stringColumn("failed_b", "123e4567-e89b-12d3-a456-426614174000");
                 try {
                     sender.stringColumn("value", "a");
                     Assert.fail("expected invalid GeoHash text");
                 } catch (LineSenderSchemaException e) {
                     Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
                 }
-                sender.table("events");
                 sender.stringColumn("value", "04").atNow();
                 sender.flush();
                 new FrameReader(handler.awaitDataFrame()).geoHashTable("events", 551, 561, 8, 0xff, 1);
@@ -788,14 +773,13 @@ public class QwpSchemaSenderIntegrationTest {
             try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
                 sender.table("events").stringColumn("value", null);
                 sender.binaryColumn("value", new byte[]{1}).atNow();
-                sender.table("events").stringColumn("failed_b", "123e4567-e89b-12d3-a456-426614174000");
+                sender.stringColumn("failed_b", "123e4567-e89b-12d3-a456-426614174000");
                 try {
                     sender.stringColumn("value", "0x0");
                     Assert.fail("expected odd-length LONG256 rejection");
                 } catch (LineSenderSchemaException e) {
                     Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
                 }
-                sender.table("events");
                 sender.stringColumn("value", "0x0123456789abcdeffedcba9876543210").atNow();
                 sender.flush();
                 new FrameReader(handler.awaitDataFrame()).long256Table("events", 431, 441);
@@ -839,14 +823,13 @@ public class QwpSchemaSenderIntegrationTest {
             LongTextSchemaHandler handler = new LongTextSchemaHandler(391, 401, ColumnType.CHAR);
             try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
                 sender.table("events").stringColumn("value", "A").atNow();
-                sender.table("events").uuidColumn("failed_b", 0xa456426614174000L, 0x123e4567e89b12d3L);
+                sender.uuidColumn("failed_b", 0xa456426614174000L, 0x123e4567e89b12d3L);
                 try {
                     sender.binaryColumn("value", new byte[]{1});
                     Assert.fail("expected BINARY to CHAR rejection");
                 } catch (LineSenderSchemaException e) {
                     Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
                 }
-                sender.table("events");
                 sender.stringColumn("value", "\ud83d").atNow();
                 sender.flush();
                 new FrameReader(handler.awaitDataFrame()).charTable("events", 391, 401, 'A', '?');
@@ -889,14 +872,13 @@ public class QwpSchemaSenderIntegrationTest {
                 LongTextSchemaHandler handler = new LongTextSchemaHandler(351 + target, 361, target);
                 try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
                     sender.table("events").timestampColumn("value", Long.MIN_VALUE, ChronoUnit.MICROS).atNow();
-                    sender.table("events").uuidColumn("failed_b", 0xa456426614174000L, 0x123e4567e89b12d3L);
+                    sender.uuidColumn("failed_b", 0xa456426614174000L, 0x123e4567e89b12d3L);
                     try {
                         sender.timestampColumn("value", Long.MAX_VALUE, ChronoUnit.DAYS);
                         Assert.fail("expected timestamp range error");
                     } catch (LineSenderSchemaException e) {
                         Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
                     }
-                    sender.table("events");
                     sender.timestampColumn("value", 1, ChronoUnit.MILLIS).atNow();
                     sender.flush();
                     new FrameReader(handler.awaitDataFrame()).timestampTextTable(
@@ -952,7 +934,6 @@ public class QwpSchemaSenderIntegrationTest {
                         Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
                     }
 
-                    sender.table("events");
                     sender.stringColumn("value", "1969-12-31T23:59:59.999999Z").atNow();
                     sender.flush();
                     new FrameReader(handler.awaitDataFrame()).longTimestampTable(
@@ -983,7 +964,6 @@ public class QwpSchemaSenderIntegrationTest {
                     Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
                 }
 
-                sender.table("events");
                 sender.stringColumn("value", "1969-12-31").atNow();
                 sender.flush();
                 new FrameReader(handler.awaitDataFrame())
@@ -1039,7 +1019,6 @@ public class QwpSchemaSenderIntegrationTest {
                     Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
                 }
 
-                sender.table("events");
                 sender.doubleArray("value", new double[][]{{3.0}, {4.0}}).atNow();
                 sender.flush();
                 new FrameReader(handler.awaitDataFrame())
@@ -1113,7 +1092,6 @@ public class QwpSchemaSenderIntegrationTest {
                         Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
                     }
 
-                    sender.table("events");
                     sender.doubleArray("value", new double[][]{{3.0}, {4.0}}).atNow();
                     sender.flush();
                     // Only the two completed DOUBLE[] rows reach the wire; failed_b is rolled back.
@@ -1150,7 +1128,6 @@ public class QwpSchemaSenderIntegrationTest {
                 // A supported input of the new rank is still rejected against the
                 // pinned snapshot; the batch does not discover the rank change.
                 try {
-                    sender.table("events");
                     sender.doubleArray("value", new double[]{3.0, 4.0});
                     Assert.fail("expected rejection against the pinned snapshot");
                 } catch (LineSenderSchemaException e) {
@@ -1237,7 +1214,6 @@ public class QwpSchemaSenderIntegrationTest {
                     } catch (LineSenderSchemaException e) {
                         Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
                     }
-                    sender.table("events");
                     sender.longColumn("value", Long.MAX_VALUE).atNow();
                     sender.flush();
                     new FrameReader(handler.awaitDataFrame())
@@ -1327,7 +1303,6 @@ public class QwpSchemaSenderIntegrationTest {
                             Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
                         }
 
-                sender.table("events");
                         if ("FLOAT".equals(input)) sender.floatColumn("value", Float.intBitsToFloat(1));
                         else sender.doubleColumn("value", Double.longBitsToDouble(1));
                         sender.atNow();
@@ -1398,7 +1373,6 @@ public class QwpSchemaSenderIntegrationTest {
                         Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
                     }
 
-                    sender.table("events");
                     sender.uuidColumn("value", 0x0102030405060708L, 0x1112131415161718L).atNow();
                     sender.flush();
 
@@ -1438,7 +1412,6 @@ public class QwpSchemaSenderIntegrationTest {
                         Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
                     }
 
-                    sender.table("events");
                     sender.uuidColumn("failed_b", 1, 2);
                     try {
                         sender.ipv4Column("value", "not-an-ip");
@@ -1447,7 +1420,6 @@ public class QwpSchemaSenderIntegrationTest {
                         Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
                     }
 
-                    sender.table("events");
                     sender.ipv4Column("value", ".....255.1.2.3......").atNow();
                     sender.flush();
 
@@ -1512,7 +1484,6 @@ public class QwpSchemaSenderIntegrationTest {
                         Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
                     }
 
-                    sender.table("events");
                     sender.geoHashColumn("value", 0x12345, 20).atNow();
                     sender.flush();
 
@@ -1579,7 +1550,6 @@ public class QwpSchemaSenderIntegrationTest {
                         Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
                     }
 
-                    sender.table("events");
                     sender.long256Column("value", 1, 2, 3, 4).atNow();
                     sender.flush();
 
@@ -1644,8 +1614,7 @@ public class QwpSchemaSenderIntegrationTest {
                         Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
                     }
 
-                    // The failed middle row is auto-cancelled; start a fresh row.
-                    sender.table("events");
+                    // The failed middle row is auto-cancelled; continue without selecting the table again.
                     sender.longColumn("value", Long.MAX_VALUE).atNow();
                     sender.flush();
 
@@ -1705,7 +1674,6 @@ public class QwpSchemaSenderIntegrationTest {
                 } catch (LineSenderSchemaException e) {
                     Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
                 }
-                sender.table("events");
                 sender.uuidColumn("id", 0x2122232425262728L, 0x3132333435363738L).atNow();
                 sender.flush();
                 byte[] frame = handler.awaitDataFrame();
@@ -1786,7 +1754,6 @@ public class QwpSchemaSenderIntegrationTest {
                 // The pending batch keeps its inferred snapshot: a conflicting input
                 // fails against the inferred LONG and the failed row rolls back whole.
                 try {
-                    sender.table("events");
                     sender.stringColumn("failed_b", "partial");
                     sender.stringColumn("id", "11121314-1516-1718-0102-030405060708");
                     Assert.fail("expected inferred type conflict");
@@ -1814,13 +1781,11 @@ public class QwpSchemaSenderIntegrationTest {
                  Sender sender = sender(server)) {
                 sender.table("events").longColumn("id", 1).atNow();
                 try {
-                    sender.table("events");
                     sender.stringColumn("id", "different inferred type");
                     Assert.fail("expected inferred type conflict");
                 } catch (LineSenderSchemaException e) {
                     Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
                 }
-                sender.table("events");
                 sender.longColumn("id", 3).atNow();
                 sender.flush();
                 FrameReader reader = new FrameReader(handler.awaitDataFrame());
@@ -1858,14 +1823,12 @@ public class QwpSchemaSenderIntegrationTest {
                     // The pending batch never consults the server: the conflict is
                     // local and only the partial row rolls back.
                     try {
-                        sender.table("events");
                         sender.stringColumn("failed_only", "partial");
                         sender.stringColumn("id", "different inferred type");
                         Assert.fail("expected inferred type conflict");
                     } catch (LineSenderSchemaException e) {
                         Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
                     }
-                    sender.table("events");
                     sender.longColumn("id", 3).atNow();
                     long fsn = sender.flushAndGetSequence();
                     Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
@@ -1878,8 +1841,8 @@ public class QwpSchemaSenderIntegrationTest {
                     Assert.assertEquals(1, handler.describeRequests.get());
 
                     // The server could not describe the table for the stale frame, so
-                    // its ACK invalidated the cache. The next batch looks the table up
-                    // again and reports the lookup failure from table().
+                    // its ACK invalidated the cache. The next explicit table selection
+                    // looks the table up and reports the failure there.
                     try {
                         sender.table("events");
                         Assert.fail("expected lookup failure");
@@ -1902,7 +1865,7 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test
-    public void testNullNoopUsesContractPreparedByTable() throws Exception {
+    public void testTableNegotiatesBeforeNullNoops() throws Exception {
         assertMemoryLeak(() -> {
             SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 1, 1);
             try (TestWebSocketServer server = schemaServer(handler);
@@ -2036,27 +1999,6 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test
-    public void testTablePinsSchemaBeforeFirstValue() throws Exception {
-        assertMemoryLeak(() -> {
-            SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 51, 52);
-            try (TestWebSocketServer server = schemaServer(handler);
-                 Sender sender = sender(server)) {
-                sender.table("events");
-                Assert.assertEquals(1, handler.describeRequests.get());
-
-                // A schema change after table() must not alter the open row.
-                handler.version = 53;
-                sender.uuidColumn("id", 1, 2).atNow();
-                sender.flush();
-
-                new FrameReader(handler.awaitDataFrame()).uuidTable("events", 51, 52, 1, 2);
-                Assert.assertEquals("setters and completion must not discover schema", 1,
-                        handler.describeRequests.get());
-            }
-        });
-    }
-
-    @Test
     public void testVersionChangeDoesNotSplitPendingBatch() throws Exception {
         assertMemoryLeak(() -> {
             SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 51, 52);
@@ -2074,7 +2016,6 @@ public class QwpSchemaSenderIntegrationTest {
                 }
                 // The rejection neither looks up metadata nor splits the batch: the
                 // next row joins the block pinned to version 52.
-                sender.table("events");
                 sender.uuidColumn("id", 3, 4).atNow();
                 long fsn = sender.flushAndGetSequence();
                 new FrameReader(handler.awaitDataFrame()).uuidTable("events", 51, 52, 1, 2, 3, 4);
@@ -2204,86 +2145,6 @@ public class QwpSchemaSenderIntegrationTest {
         });
     }
 
-    @Test(timeout = 10_000)
-    public void testAsyncRowPreparedOfflineStaysLegacyWhenHandshakePrecedesFirstValue() throws Exception {
-        assertMemoryLeak(() -> {
-            int port = TestPorts.findUnusedPort();
-            Sender sender = Sender.fromConfig("ws::addr=localhost:" + port
-                    + ";initial_connect_retry=async;reconnect_initial_backoff_millis=10;"
-                    + "reconnect_max_backoff_millis=50;auto_flush_rows=2147483647;"
-                    + "auto_flush_bytes=0;auto_flush_interval=2147483646;"
-                    + "close_flush_timeout_millis=0;");
-            TestWebSocketServer server = null;
-            try {
-                Instant value = Instant.ofEpochSecond(3, 456_789_123);
-                sender.table("events");
-
-                SchemaHandler handler = new SchemaHandler(
-                        QwpSchemaProtocol.RESULT_KNOWN, 73, 74, true, -1);
-                server = new TestWebSocketServer(handler, false, null, port);
-                server.setAdvertiseSchema(true);
-                server.start();
-                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-                Assert.assertTrue("schema-capable connection was not installed", handler.awaitPong());
-
-                // The row contract was fixed by table(), before the connection existed.
-                sender.timestampColumn("ts", value).atNow();
-                sender.flush();
-                sender.table("events").timestampColumn("ts", value).atNow();
-                sender.flush();
-
-                List<byte[]> frames = handler.awaitDataFrames(2);
-                new FrameReader(frames.get(0)).legacyTimestampTable("events", "ts", 3_456_789L);
-                new FrameReader(frames.get(1)).schemaTimestampTable(
-                        "events", 73, 74, "ts", 3_456_789_123L);
-                Assert.assertEquals(1, handler.describeRequests.get());
-            } finally {
-                sender.close();
-                if (server != null) {
-                    server.close();
-                }
-            }
-        });
-    }
-
-    @Test(timeout = 10_000)
-    public void testCancellingAsyncRowPreparedOfflineDoesNotPinLegacyBatch() throws Exception {
-        assertMemoryLeak(() -> {
-            int port = TestPorts.findUnusedPort();
-            Sender sender = Sender.fromConfig("ws::addr=localhost:" + port
-                    + ";initial_connect_retry=async;reconnect_initial_backoff_millis=10;"
-                    + "reconnect_max_backoff_millis=50;auto_flush_rows=2147483647;"
-                    + "auto_flush_bytes=0;auto_flush_interval=2147483646;"
-                    + "close_flush_timeout_millis=0;");
-            TestWebSocketServer server = null;
-            try {
-                sender.table("events");
-
-                SchemaHandler handler = new SchemaHandler(
-                        QwpSchemaProtocol.RESULT_KNOWN, 75, 76, true, -1);
-                server = new TestWebSocketServer(handler, false, null, port);
-                server.setAdvertiseSchema(true);
-                server.start();
-                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-                Assert.assertTrue("schema-capable connection was not installed", handler.awaitPong());
-
-                sender.cancelRow();
-                sender.table("events").timestampColumn(
-                        "ts", Instant.ofEpochSecond(3, 456_789_123)).atNow();
-                sender.flush();
-
-                new FrameReader(handler.awaitDataFrame()).schemaTimestampTable(
-                        "events", 75, 76, "ts", 3_456_789_123L);
-                Assert.assertEquals(1, handler.describeRequests.get());
-            } finally {
-                sender.close();
-                if (server != null) {
-                    server.close();
-                }
-            }
-        });
-    }
-
     @Test
     public void testSchemaBatchCapSplitsWithoutDroppingPinnedFlags() throws Exception {
         assertMemoryLeak(() -> {
@@ -2328,29 +2189,30 @@ public class QwpSchemaSenderIntegrationTest {
     public void testSchemaLookupDeadlineFailsTypedThenRetryUsesAvailableSchema() throws Exception {
         assertMemoryLeak(() -> {
             SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 91, 92);
-            handler.respondToDescribe = false;
             try (TestWebSocketServer server = schemaServer(handler);
                  Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
                          + ";initial_connect_retry=async;reconnect_initial_backoff_millis=10;"
-                         + "reconnect_max_backoff_millis=50;close_flush_timeout_millis=0;")) {
+                         + "reconnect_max_backoff_millis=50;auto_flush_rows=2147483647;"
+                         + "auto_flush_bytes=0;auto_flush_interval=2147483646;"
+                         + "close_flush_timeout_millis=0;")) {
                 Assert.assertTrue("schema-capable connection was not installed", handler.awaitPong());
                 ((QwpWebSocketSender) sender).setSchemaWaitMillisForTesting(1_000);
+                QwpTableBuffer b = ((QwpWebSocketSender) sender).getTableBuffer("b");
+                sender.table("events").uuidColumn("id", 1, 2).atNow();
+                QwpTableBuffer events = ((QwpWebSocketSender) sender).getTableBuffer("events");
+                handler.respondToDescribe = false;
                 try {
-                    sender.table("events");
+                    sender.table("b");
                     Assert.fail("expected schema negotiation deadline");
                 } catch (LineSenderSchemaException e) {
                     Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE, e.getReason());
                 }
-                try {
-                    sender.uuidColumn("id", 1, 2);
-                    Assert.fail("failed table() must leave no open row");
-                } catch (LineSenderException e) {
-                    Assert.assertTrue(e.getMessage().contains("table() must be called"));
-                }
-                Assert.assertEquals("a setter after failed table() must not retry lookup", 1,
-                        handler.describeRequests.get());
+                Assert.assertEquals(1, events.getRowCount());
+                Assert.assertEquals(0, b.getRowCount());
                 handler.respondToDescribe = true;
-                sender.table("events").uuidColumn("id", 3, 4).atNow();
+                sender.uuidColumn("id", 3, 4).atNow();
+                Assert.assertEquals(1, events.getRowCount());
+                Assert.assertEquals(1, b.getRowCount());
                 sender.flush();
                 Assert.assertTrue((handler.awaitDataFrame()[QwpConstants.HEADER_OFFSET_FLAGS]
                         & QwpConstants.FLAG_SCHEMA) != 0);
