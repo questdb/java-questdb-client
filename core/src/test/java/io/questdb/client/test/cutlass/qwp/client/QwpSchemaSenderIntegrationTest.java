@@ -12,6 +12,7 @@ import io.questdb.client.cairo.ColumnType;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.LongArray;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
+import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.protocol.QwpSchemaProtocol;
 import io.questdb.client.std.Decimal128;
@@ -34,6 +35,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -76,7 +78,7 @@ public class QwpSchemaSenderIntegrationTest {
 
                 new FrameReader(handler.awaitDataFrame()).decimal64Table(
                         "events", 921, 931, 2, 120, 250);
-                Assert.assertEquals("setter must use the standard one-refresh path", 2,
+                Assert.assertEquals("a rejected setter must not look up metadata", 1,
                         handler.describeRequests.get());
             }
         });
@@ -143,7 +145,7 @@ public class QwpSchemaSenderIntegrationTest {
 
                     new FrameReader(handler.awaitDataFrame()).smallIntegerNumericTable(
                             "events", 901 + i, 911 + i, numericWireType(target));
-                    Assert.assertEquals("setter must use the standard one-refresh path", 2,
+                    Assert.assertEquals("a rejected setter must not look up metadata", 1,
                             handler.describeRequests.get());
                 }
             }
@@ -162,16 +164,21 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events");
                 try {
                     sender.stringColumn("value", "1970-01-01T00:00:00.000001Z");
-                    Assert.fail("expected target-changing schema refresh");
+                    Assert.fail("expected rejection against the pinned snapshot");
                 } catch (LineSenderSchemaException e) {
-                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                    Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
                 }
-                sender.intColumn("value", 12).atNow();
+                Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                    handler.describeRequests.get());
+                long fsn = sender.flushAndGetSequence();
+                Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
+                sender.table("events").intColumn("value", 12).atNow();
                 sender.flush();
 
-                new FrameReader(handler.awaitDataFrame())
+                new FrameReader(handler.awaitDataFrames(2))
                         .twoDateAndTimestampBlocks("events", 981, 991, 992);
-                Assert.assertEquals(2, handler.describeRequests.get());
+                Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
+                        handler.describeRequests.get());
             }
         });
     }
@@ -202,7 +209,7 @@ public class QwpSchemaSenderIntegrationTest {
 
                     new FrameReader(handler.awaitDataFrame()).integerTemporalTable(
                             "events", 961 + i, 971 + i, temporalWireType(target));
-                    Assert.assertEquals("setter must use the standard one-refresh path", 2,
+                    Assert.assertEquals("a rejected setter must not look up metadata", 1,
                             handler.describeRequests.get());
                 }
             }
@@ -221,16 +228,21 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events");
                 try {
                     sender.uuidColumn("value", 1, 2);
-                    Assert.fail("expected target-changing schema refresh");
+                    Assert.fail("expected rejection against the pinned snapshot");
                 } catch (LineSenderSchemaException e) {
-                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                    Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
                 }
-                sender.shortColumn("value", (short) 8).atNow();
+                Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                    handler.describeRequests.get());
+                long fsn = sender.flushAndGetSequence();
+                Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
+                sender.table("events").shortColumn("value", (short) 8).atNow();
                 sender.flush();
 
-                new FrameReader(handler.awaitDataFrame())
+                new FrameReader(handler.awaitDataFrames(2))
                         .twoSymbolAndVarcharBlocks("events", 1021, 1031, 1032);
-                Assert.assertEquals(2, handler.describeRequests.get());
+                Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
+                        handler.describeRequests.get());
             }
         });
     }
@@ -260,7 +272,7 @@ public class QwpSchemaSenderIntegrationTest {
 
                     new FrameReader(handler.awaitDataFrame()).smallIntegerTextTable(
                             "events", 1041 + i, 1051 + i, target);
-                    Assert.assertEquals("setter must use the standard one-refresh path", 2,
+                    Assert.assertEquals("a rejected setter must not look up metadata", 1,
                             handler.describeRequests.get());
                 }
             }
@@ -280,16 +292,21 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events");
                 try {
                     sender.shortColumn("value", (short) 1_000);
-                    Assert.fail("expected width-and-scale-changing schema refresh");
+                    Assert.fail("expected rejection against the pinned snapshot");
                 } catch (LineSenderSchemaException e) {
-                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                    Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
                 }
-                sender.shortColumn("value", (short) 1_000).atNow();
+                Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                    handler.describeRequests.get());
+                long fsn = sender.flushAndGetSequence();
+                Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
+                sender.table("events").shortColumn("value", (short) 1_000).atNow();
                 sender.flush();
 
-                new FrameReader(handler.awaitDataFrame()).twoSmallIntegerDecimalBlocks(
+                new FrameReader(handler.awaitDataFrames(2)).twoSmallIntegerDecimalBlocks(
                         "events", 1061, 1071, 1072);
-                Assert.assertEquals(2, handler.describeRequests.get());
+                Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
+                        handler.describeRequests.get());
             }
         });
     }
@@ -317,7 +334,7 @@ public class QwpSchemaSenderIntegrationTest {
 
                 new FrameReader(handler.awaitDataFrame()).smallIntegerDecimalTable(
                         "events", 1081, 1091);
-                Assert.assertEquals("setter must use the standard one-refresh path", 2,
+                Assert.assertEquals("a rejected setter must not look up metadata", 1,
                         handler.describeRequests.get());
             }
         });
@@ -336,16 +353,21 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events");
                 try {
                     sender.intColumn("value", 1_000);
-                    Assert.fail("expected target-changing schema refresh");
+                    Assert.fail("expected rejection against the pinned snapshot");
                 } catch (LineSenderSchemaException e) {
-                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                    Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
                 }
-                sender.intColumn("value", 1_000).atNow();
+                Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                    handler.describeRequests.get());
+                long fsn = sender.flushAndGetSequence();
+                Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
+                sender.table("events").intColumn("value", 1_000).atNow();
                 sender.flush();
 
-                new FrameReader(handler.awaitDataFrame()).twoIntDecimalAndIpv4Blocks(
+                new FrameReader(handler.awaitDataFrames(2)).twoIntDecimalAndIpv4Blocks(
                         "events", 1101, 1111, 1112);
-                Assert.assertEquals(2, handler.describeRequests.get());
+                Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
+                        handler.describeRequests.get());
             }
         });
     }
@@ -371,7 +393,7 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.flush();
 
                 new FrameReader(handler.awaitDataFrame()).intToIpv4Table("events", 1121, 1131);
-                Assert.assertEquals("setter must use the standard one-refresh path", 2,
+                Assert.assertEquals("a rejected setter must not look up metadata", 1,
                         handler.describeRequests.get());
             }
         });
@@ -519,14 +541,19 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events");
                 try {
                     sender.decimalColumn("value", Decimal128.fromLong(1_000, 0));
-                    Assert.fail("expected target-changing schema refresh");
+                    Assert.fail("expected rejection against the pinned snapshot");
                 } catch (LineSenderSchemaException e) {
-                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                    Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
                 }
-                sender.decimalColumn("value", Decimal128.fromLong(1_000, 0)).atNow();
+                Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                    handler.describeRequests.get());
+                long fsn = sender.flushAndGetSequence();
+                Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
+                sender.table("events").decimalColumn("value", Decimal128.fromLong(1_000, 0)).atNow();
                 sender.flush();
-                new FrameReader(handler.awaitDataFrame()).twoDecimalBlocks("events", 621, 631, 632);
-                Assert.assertEquals(2, handler.describeRequests.get());
+                new FrameReader(handler.awaitDataFrames(2)).twoDecimalBlocks("events", 621, 631, 632);
+                Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
+                        handler.describeRequests.get());
             }
         });
     }
@@ -543,15 +570,20 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events");
                 try {
                     sender.decimalColumn("value", new Decimal64(12_345, 4));
-                    Assert.fail("expected scale-changing schema refresh");
+                    Assert.fail("expected rejection against the pinned snapshot");
                 } catch (LineSenderSchemaException e) {
-                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                    Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
                 }
-                sender.decimalColumn("value", new Decimal64(12_345, 4)).atNow();
+                Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                    handler.describeRequests.get());
+                long fsn = sender.flushAndGetSequence();
+                Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
+                sender.table("events").decimalColumn("value", new Decimal64(12_345, 4)).atNow();
                 sender.flush();
-                new FrameReader(handler.awaitDataFrame()).twoDecimal64ScaleBlocks(
+                new FrameReader(handler.awaitDataFrames(2)).twoDecimal64ScaleBlocks(
                         "events", 641, 651, 652);
-                Assert.assertEquals(2, handler.describeRequests.get());
+                Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
+                        handler.describeRequests.get());
             }
         });
     }
@@ -568,14 +600,19 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events");
                 try {
                     sender.longColumn("value", 100_000_000_000_000L);
-                    Assert.fail("expected width-and-scale-changing schema refresh");
+                    Assert.fail("expected rejection against the pinned snapshot");
                 } catch (LineSenderSchemaException e) {
-                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                    Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
                 }
-                sender.longColumn("value", 100_000_000_000_000L).atNow();
+                Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                    handler.describeRequests.get());
+                long fsn = sender.flushAndGetSequence();
+                Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
+                sender.table("events").longColumn("value", 100_000_000_000_000L).atNow();
                 sender.flush();
-                new FrameReader(handler.awaitDataFrame()).twoDecimalWidthAndScaleBlocks("events", 661, 671, 672);
-                Assert.assertEquals(2, handler.describeRequests.get());
+                new FrameReader(handler.awaitDataFrames(2)).twoDecimalWidthAndScaleBlocks("events", 661, 671, 672);
+                Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
+                        handler.describeRequests.get());
             }
         });
     }
@@ -592,14 +629,19 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events");
                 try {
                     sender.stringColumn("value", "100000000000000");
-                    Assert.fail("expected width-and-scale-changing schema refresh");
+                    Assert.fail("expected rejection against the pinned snapshot");
                 } catch (LineSenderSchemaException e) {
-                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                    Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
                 }
-                sender.stringColumn("value", "100000000000000").atNow();
+                Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                    handler.describeRequests.get());
+                long fsn = sender.flushAndGetSequence();
+                Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
+                sender.table("events").stringColumn("value", "100000000000000").atNow();
                 sender.flush();
-                new FrameReader(handler.awaitDataFrame()).twoDecimalWidthAndScaleBlocks("events", 681, 691, 692);
-                Assert.assertEquals(2, handler.describeRequests.get());
+                new FrameReader(handler.awaitDataFrames(2)).twoDecimalWidthAndScaleBlocks("events", 681, 691, 692);
+                Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
+                        handler.describeRequests.get());
             }
         });
     }
@@ -616,14 +658,19 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events");
                 try {
                     sender.doubleColumn("value", 100_000_000_000_000.0);
-                    Assert.fail("expected width-and-scale-changing schema refresh");
+                    Assert.fail("expected rejection against the pinned snapshot");
                 } catch (LineSenderSchemaException e) {
-                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                    Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
                 }
-                sender.doubleColumn("value", 100_000_000_000_000.0).atNow();
+                Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                    handler.describeRequests.get());
+                long fsn = sender.flushAndGetSequence();
+                Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
+                sender.table("events").doubleColumn("value", 100_000_000_000_000.0).atNow();
                 sender.flush();
-                new FrameReader(handler.awaitDataFrame()).twoDecimalWidthAndScaleBlocks("events", 701, 711, 712);
-                Assert.assertEquals(2, handler.describeRequests.get());
+                new FrameReader(handler.awaitDataFrames(2)).twoDecimalWidthAndScaleBlocks("events", 701, 711, 712);
+                Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
+                        handler.describeRequests.get());
             }
         });
     }
@@ -640,15 +687,20 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events");
                 try {
                     sender.decimalColumn("value", new Decimal64(250_000, 4));
-                    Assert.fail("expected target-changing schema refresh");
+                    Assert.fail("expected rejection against the pinned snapshot");
                 } catch (LineSenderSchemaException e) {
-                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                    Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
                 }
-                sender.decimalColumn("value", new Decimal64(250_000, 4)).atNow();
+                Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                    handler.describeRequests.get());
+                long fsn = sender.flushAndGetSequence();
+                Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
+                sender.table("events").decimalColumn("value", new Decimal64(250_000, 4)).atNow();
                 sender.flush();
-                new FrameReader(handler.awaitDataFrame()).twoDecimal64AndVarcharBlocks(
+                new FrameReader(handler.awaitDataFrames(2)).twoDecimal64AndVarcharBlocks(
                         "events", 741, 751, 752);
-                Assert.assertEquals(2, handler.describeRequests.get());
+                Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
+                        handler.describeRequests.get());
             }
         });
     }
@@ -696,14 +748,19 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events");
                 try {
                     sender.stringColumn("value", "z");
-                    Assert.fail("expected target-changing schema refresh");
+                    Assert.fail("expected rejection against the pinned snapshot");
                 } catch (LineSenderSchemaException e) {
-                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                    Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
                 }
-                sender.stringColumn("value", "z").atNow();
+                Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                    handler.describeRequests.get());
+                long fsn = sender.flushAndGetSequence();
+                Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
+                sender.table("events").stringColumn("value", "z").atNow();
                 sender.flush();
-                new FrameReader(handler.awaitDataFrame()).twoGeoHashBlocks("events", 571, 581, 582);
-                Assert.assertEquals(2, handler.describeRequests.get());
+                new FrameReader(handler.awaitDataFrames(2)).twoGeoHashBlocks("events", 571, 581, 582);
+                Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
+                        handler.describeRequests.get());
             }
         });
     }
@@ -742,14 +799,19 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events");
                 try {
                     sender.stringColumn("value", "not-long256");
-                    Assert.fail("expected target-changing schema refresh");
+                    Assert.fail("expected rejection against the pinned snapshot");
                 } catch (LineSenderSchemaException e) {
-                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                    Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
                 }
-                sender.stringColumn("value", "not-long256").atNow();
+                Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                    handler.describeRequests.get());
+                long fsn = sender.flushAndGetSequence();
+                Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
+                sender.table("events").stringColumn("value", "not-long256").atNow();
                 sender.flush();
-                new FrameReader(handler.awaitDataFrame()).twoLong256AndVarcharBlocks("events", 451, 461, 462);
-                Assert.assertEquals(2, handler.describeRequests.get());
+                new FrameReader(handler.awaitDataFrames(2)).twoLong256AndVarcharBlocks("events", 451, 461, 462);
+                Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
+                        handler.describeRequests.get());
             }
         });
     }
@@ -785,14 +847,19 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events");
                 try {
                     sender.binaryColumn("value", new byte[]{1});
-                    Assert.fail("expected target-changing schema refresh");
+                    Assert.fail("expected rejection against the pinned snapshot");
                 } catch (LineSenderSchemaException e) {
-                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                    Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
                 }
-                sender.charColumn("value", '\uffff').atNow();
+                Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                    handler.describeRequests.get());
+                long fsn = sender.flushAndGetSequence();
+                Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
+                sender.table("events").charColumn("value", '\uffff').atNow();
                 sender.flush();
-                new FrameReader(handler.awaitDataFrame()).twoVarcharAndCharBlocks("events", 411, 421, 422);
-                Assert.assertEquals(2, handler.describeRequests.get());
+                new FrameReader(handler.awaitDataFrames(2)).twoVarcharAndCharBlocks("events", 411, 421, 422);
+                Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
+                        handler.describeRequests.get());
             }
         });
     }
@@ -831,15 +898,20 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events");
                 try {
                     sender.uuidColumn("value", 1, 0);
-                    Assert.fail("expected target-changing schema refresh");
+                    Assert.fail("expected rejection against the pinned snapshot");
                 } catch (LineSenderSchemaException e) {
-                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                    Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
                 }
-                sender.timestampColumn("value", Long.MAX_VALUE, ChronoUnit.NANOS).atNow();
+                Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                    handler.describeRequests.get());
+                long fsn = sender.flushAndGetSequence();
+                Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
+                sender.table("events").timestampColumn("value", Long.MAX_VALUE, ChronoUnit.NANOS).atNow();
                 sender.flush();
-                new FrameReader(handler.awaitDataFrame()).twoTimestampAndVarcharBlocks(
+                new FrameReader(handler.awaitDataFrames(2)).twoTimestampAndVarcharBlocks(
                         "events", 371, 381, 382);
-                Assert.assertEquals(2, handler.describeRequests.get());
+                Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
+                        handler.describeRequests.get());
             }
         });
     }
@@ -895,7 +967,8 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.flush();
                 new FrameReader(handler.awaitDataFrame())
                         .stringDateTable("events", 1141, 1151, -86_400_000L);
-                Assert.assertEquals(2, handler.describeRequests.get());
+                Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                        handler.describeRequests.get());
             }
         });
     }
@@ -911,15 +984,20 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events");
                 try {
                     sender.stringColumn("value", "native-a");
-                    Assert.fail("expected target-changing schema refresh");
+                    Assert.fail("expected rejection against the pinned snapshot");
                 } catch (LineSenderSchemaException e) {
-                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                    Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
                 }
-                sender.stringColumn("value", "native-a").atNow();
+                Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                    handler.describeRequests.get());
+                long fsn = sender.flushAndGetSequence();
+                Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
+                sender.table("events").stringColumn("value", "native-a").atNow();
                 sender.flush();
-                new FrameReader(handler.awaitDataFrame())
+                new FrameReader(handler.awaitDataFrames(2))
                         .twoDateAndVarcharBlocks("events", 1161, 1171, 1172);
-                Assert.assertEquals(2, handler.describeRequests.get());
+                Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
+                        handler.describeRequests.get());
             }
         });
     }
@@ -944,7 +1022,7 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.flush();
                 new FrameReader(handler.awaitDataFrame())
                         .doubleArrayTable("events", 1181, 1191);
-                Assert.assertEquals("setter must use the standard one-refresh path", 2,
+                Assert.assertEquals("a rejected setter must not look up metadata", 1,
                         handler.describeRequests.get());
             }
         });
@@ -963,15 +1041,20 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events");
                 try {
                     sender.doubleArray("value", new double[]{3.0, 4.0});
-                    Assert.fail("expected target-changing schema refresh");
+                    Assert.fail("expected rejection against the pinned snapshot");
                 } catch (LineSenderSchemaException e) {
-                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                    Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
                 }
-                sender.doubleArray("value", new double[]{3.0, 4.0}).atNow();
+                Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                    handler.describeRequests.get());
+                long fsn = sender.flushAndGetSequence();
+                Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
+                sender.table("events").doubleArray("value", new double[]{3.0, 4.0}).atNow();
                 sender.flush();
-                new FrameReader(handler.awaitDataFrame())
+                new FrameReader(handler.awaitDataFrames(2))
                         .twoDoubleArrayRankBlocks("events", 1201, 1211, 1212);
-                Assert.assertEquals(2, handler.describeRequests.get());
+                Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
+                        handler.describeRequests.get());
             }
         });
     }
@@ -1021,7 +1104,7 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test
-    public void testLongArrayRejectionDoesNotRefreshAfterSchemaChange() throws Exception {
+    public void testLongArrayRejectionKeepsPinnedSnapshotAfterSchemaChange() throws Exception {
         assertMemoryLeak(() -> {
             int array2d = ColumnType.encodeArrayType(ColumnType.DOUBLE, 2);
             int array1d = ColumnType.encodeArrayType(ColumnType.DOUBLE, 1);
@@ -1041,20 +1124,26 @@ public class QwpSchemaSenderIntegrationTest {
                     Assert.assertEquals("schema changes cannot implement LONG_ARRAY", 1,
                             handler.describeRequests.get());
                 }
-                // A supported input still discovers the rank change and can be retried.
+                // A supported input of the new rank is still rejected against the
+                // pinned snapshot; the batch does not discover the rank change.
                 try {
                     sender.doubleArray("value", new double[]{3.0, 4.0});
-                    Assert.fail("expected target-changing schema refresh");
+                    Assert.fail("expected rejection against the pinned snapshot");
                 } catch (LineSenderSchemaException e) {
-                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                    Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
                 }
-                sender.doubleArray("value", new double[]{3.0, 4.0}).atNow();
+                Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                        handler.describeRequests.get());
+                long fsn = sender.flushAndGetSequence();
+                Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
+                sender.table("events").doubleArray("value", new double[]{3.0, 4.0}).atNow();
                 sender.flush();
                 // The rebound block holds the recovered row alone: rollback dropped
-                // failed_b before the refresh installed the new generation.
-                new FrameReader(handler.awaitDataFrame())
+                // failed_b with the rejected row.
+                new FrameReader(handler.awaitDataFrames(2))
                         .twoDoubleArrayRankBlocks("events", 1241, 1251, 1252);
-                Assert.assertEquals(2, handler.describeRequests.get());
+                Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
+                        handler.describeRequests.get());
             }
         });
     }
@@ -1090,16 +1179,21 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events");
                 try {
                     sender.stringColumn("failed_b", "not-a-uuid");
-                    Assert.fail("expected invalid UUID and schema adoption");
+                    Assert.fail("expected invalid UUID");
                 } catch (LineSenderSchemaException e) {
                     Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
                 }
-                sender.stringColumn("value", "1970-01-01T00:00:00.000001Z").atNow();
+                Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                        handler.describeRequests.get());
+                long fsn = sender.flushAndGetSequence();
+                Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
+                sender.table("events").stringColumn("value", "1970-01-01T00:00:00.000001Z").atNow();
                 sender.flush();
-                new FrameReader(handler.awaitDataFrame()).twoVarcharAndTimestampBlocks(
+                new FrameReader(handler.awaitDataFrames(2)).twoVarcharAndTimestampBlocks(
                         "events", 321, 331, 332
                 );
-                Assert.assertEquals(2, handler.describeRequests.get());
+                Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
+                        handler.describeRequests.get());
             }
         });
     }
@@ -1123,7 +1217,8 @@ public class QwpSchemaSenderIntegrationTest {
                     sender.flush();
                     new FrameReader(handler.awaitDataFrame())
                             .longTimestampTable("events", 251 + target, 261, target, Long.MAX_VALUE);
-                    Assert.assertEquals(2, handler.describeRequests.get());
+                    Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                        handler.describeRequests.get());
                 }
             }
         });
@@ -1140,14 +1235,19 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events");
                 try {
                     sender.stringColumn("value", "not-a-long");
-                    Assert.fail("expected target-changing schema refresh");
+                    Assert.fail("expected rejection against the pinned snapshot");
                 } catch (LineSenderSchemaException e) {
-                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                    Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
                 }
-                sender.longColumn("value", 12).atNow();
+                Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                    handler.describeRequests.get());
+                long fsn = sender.flushAndGetSequence();
+                Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
+                sender.table("events").longColumn("value", 12).atNow();
                 sender.flush();
-                new FrameReader(handler.awaitDataFrame()).twoLongAndTimestampBlocks("events", 271, 281, 282);
-                Assert.assertEquals(2, handler.describeRequests.get());
+                new FrameReader(handler.awaitDataFrames(2)).twoLongAndTimestampBlocks("events", 271, 281, 282);
+                Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
+                        handler.describeRequests.get());
             }
         });
     }
@@ -1163,14 +1263,19 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events");
                 try {
                     sender.stringColumn("value", "not-a-double");
-                    Assert.fail("expected target-changing schema refresh");
+                    Assert.fail("expected rejection against the pinned snapshot");
                 } catch (LineSenderSchemaException e) {
-                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                    Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
                 }
-                sender.doubleColumn("value", 1e23).atNow();
+                Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                    handler.describeRequests.get());
+                long fsn = sender.flushAndGetSequence();
+                Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
+                sender.table("events").doubleColumn("value", 1e23).atNow();
                 sender.flush();
-                new FrameReader(handler.awaitDataFrame()).twoDoubleAndVarcharBlocks("events", 231, 241, 242);
-                Assert.assertEquals(2, handler.describeRequests.get());
+                new FrameReader(handler.awaitDataFrames(2)).twoDoubleAndVarcharBlocks("events", 231, 241, 242);
+                Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
+                        handler.describeRequests.get());
             }
         });
     }
@@ -1207,7 +1312,8 @@ public class QwpSchemaSenderIntegrationTest {
                                 "FLOAT".equals(input) ? "0.10000000149011612" : "1.0E23",
                                 "FLOAT".equals(input) ? "1.401298464324817E-45" : "5.0E-324"
                         );
-                        Assert.assertEquals(2, handler.describeRequests.get());
+                        Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                        handler.describeRequests.get());
                     }
                 }
             }
@@ -1229,15 +1335,20 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events");
                 try {
                     sender.stringColumn("value", "not-a-uuid");
-                    Assert.fail("expected target-changing schema refresh");
+                    Assert.fail("expected rejection against the pinned snapshot");
                 } catch (LineSenderSchemaException e) {
-                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                    Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
                 }
-                sender.uuidColumn("value", 0x2122232425262728L, 0x3132333435363738L).atNow();
+                Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                    handler.describeRequests.get());
+                long fsn = sender.flushAndGetSequence();
+                Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
+                sender.table("events").uuidColumn("value", 0x2122232425262728L, 0x3132333435363738L).atNow();
                 sender.flush();
 
-                new FrameReader(handler.awaitDataFrame()).twoUuidAndVarcharBlocks("events", 191, 201, 202);
-                Assert.assertEquals(2, handler.describeRequests.get());
+                new FrameReader(handler.awaitDataFrames(2)).twoUuidAndVarcharBlocks("events", 191, 201, 202);
+                Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
+                        handler.describeRequests.get());
             }
         });
     }
@@ -1272,7 +1383,8 @@ public class QwpSchemaSenderIntegrationTest {
                             target,
                             "11121314-1516-1718-0102-030405060708"
                     );
-                    Assert.assertEquals(2, handler.describeRequests.get());
+                    Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                        handler.describeRequests.get());
                 }
             }
         });
@@ -1312,7 +1424,8 @@ public class QwpSchemaSenderIntegrationTest {
 
                     new FrameReader(handler.awaitDataFrame()).ipv4Table(
                             "events", 211 + target, 221, target, 0xff010203);
-                    Assert.assertEquals(3, handler.describeRequests.get());
+                    Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                        handler.describeRequests.get());
                 }
             }
         });
@@ -1331,15 +1444,20 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events");
                 try {
                     sender.ipv4Column("value", "not-an-ip");
-                    Assert.fail("expected target-changing schema refresh");
+                    Assert.fail("expected rejection against the pinned snapshot");
                 } catch (LineSenderSchemaException e) {
-                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                    Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
                 }
-                sender.ipv4Column("value", 0x05060708).atNow();
+                Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                    handler.describeRequests.get());
+                long fsn = sender.flushAndGetSequence();
+                Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
+                sender.table("events").ipv4Column("value", 0x05060708).atNow();
                 sender.flush();
 
-                new FrameReader(handler.awaitDataFrame()).twoIpv4AndVarcharBlocks("events", 231, 241, 242);
-                Assert.assertEquals(2, handler.describeRequests.get());
+                new FrameReader(handler.awaitDataFrames(2)).twoIpv4AndVarcharBlocks("events", 231, 241, 242);
+                Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
+                        handler.describeRequests.get());
             }
         });
     }
@@ -1370,7 +1488,8 @@ public class QwpSchemaSenderIntegrationTest {
 
                     new FrameReader(handler.awaitDataFrame()).geoHashTargetTable(
                             "events", 251 + target, 261, target, 0xd0c6c, 0x12345, 20);
-                    Assert.assertEquals(2, handler.describeRequests.get());
+                    Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                        handler.describeRequests.get());
                 }
             }
         });
@@ -1390,16 +1509,21 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events");
                 try {
                     sender.stringColumn("value", "not-geohash");
-                    Assert.fail("expected target-changing schema refresh");
+                    Assert.fail("expected rejection against the pinned snapshot");
                 } catch (LineSenderSchemaException e) {
-                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                    Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
                 }
-                sender.geoHashColumn("value", 0x12345, 20).atNow();
+                Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                    handler.describeRequests.get());
+                long fsn = sender.flushAndGetSequence();
+                Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
+                sender.table("events").geoHashColumn("value", 0x12345, 20).atNow();
                 sender.flush();
 
-                new FrameReader(handler.awaitDataFrame()).twoNativeGeoHashAndVarcharBlocks(
+                new FrameReader(handler.awaitDataFrames(2)).twoNativeGeoHashAndVarcharBlocks(
                         "events", 281, 291, 292);
-                Assert.assertEquals(2, handler.describeRequests.get());
+                Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
+                        handler.describeRequests.get());
             }
         });
     }
@@ -1430,7 +1554,8 @@ public class QwpSchemaSenderIntegrationTest {
 
                     new FrameReader(handler.awaitDataFrame()).long256TargetTable(
                             "events", 251 + target, 261, target, 1, 2, 3, 4);
-                    Assert.assertEquals(2, handler.describeRequests.get());
+                    Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                        handler.describeRequests.get());
                 }
             }
         });
@@ -1449,16 +1574,21 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events");
                 try {
                     sender.stringColumn("value", "not-long256");
-                    Assert.fail("expected target-changing schema refresh");
+                    Assert.fail("expected rejection against the pinned snapshot");
                 } catch (LineSenderSchemaException e) {
-                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                    Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
                 }
-                sender.long256Column("value", 5, 6, 7, 8).atNow();
+                Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                    handler.describeRequests.get());
+                long fsn = sender.flushAndGetSequence();
+                Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
+                sender.table("events").long256Column("value", 5, 6, 7, 8).atNow();
                 sender.flush();
 
-                new FrameReader(handler.awaitDataFrame()).twoNativeLong256AndVarcharBlocks(
+                new FrameReader(handler.awaitDataFrames(2)).twoNativeLong256AndVarcharBlocks(
                         "events", 281, 291, 292);
-                Assert.assertEquals(2, handler.describeRequests.get());
+                Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
+                        handler.describeRequests.get());
             }
         });
     }
@@ -1489,7 +1619,8 @@ public class QwpSchemaSenderIntegrationTest {
 
                     FrameReader reader = new FrameReader(handler.awaitDataFrame());
                     reader.longTextTable("events", 121 + target, 131, target, Long.toString(Long.MAX_VALUE));
-                    Assert.assertEquals(2, handler.describeRequests.get());
+                    Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                        handler.describeRequests.get());
                 }
             }
         });
@@ -1508,16 +1639,21 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events");
                 try {
                     sender.uuidColumn("value", 1, 2);
-                    Assert.fail("expected target-changing schema refresh");
+                    Assert.fail("expected rejection against the pinned snapshot");
                 } catch (LineSenderSchemaException e) {
-                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                    Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
                 }
-                sender.longColumn("value", 8).atNow();
+                Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                    handler.describeRequests.get());
+                long fsn = sender.flushAndGetSequence();
+                Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
+                sender.table("events").longColumn("value", 8).atNow();
                 sender.flush();
 
-                new FrameReader(handler.awaitDataFrame())
+                new FrameReader(handler.awaitDataFrames(2))
                         .twoSymbolAndVarcharBlocks("events", 151, 161, 162);
-                Assert.assertEquals(2, handler.describeRequests.get());
+                Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
+                        handler.describeRequests.get());
             }
         });
     }
@@ -1548,7 +1684,8 @@ public class QwpSchemaSenderIntegrationTest {
                 Assert.assertEquals(0x2122232425262728L, reader.i64());
                 Assert.assertEquals(0x3132333435363738L, reader.i64());
                 reader.eof();
-                Assert.assertEquals(2, handler.describeRequests.get());
+                Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                        handler.describeRequests.get());
             }
         });
     }
@@ -1605,31 +1742,38 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test
-    public void testKnownAdoptionRetainsPendingUnknownGeneration() throws Exception {
+    public void testKnownAdoptionWaitsForBatchBoundary() throws Exception {
         assertMemoryLeak(() -> {
             SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_MISSING, 31, 41);
+            handler.isSchemaFeedbackEnabled = true;
             try (TestWebSocketServer server = schemaServer(handler);
                  Sender sender = sender(server)) {
                 sender.table("events").longColumn("id", 11).atNow();
                 handler.result = QwpSchemaProtocol.RESULT_KNOWN;
+                // The pending batch keeps its inferred snapshot: a conflicting input
+                // fails against the inferred LONG and the failed row rolls back whole.
                 try {
                     sender.stringColumn("failed_b", "partial");
                     sender.stringColumn("id", "11121314-1516-1718-0102-030405060708");
-                    Assert.fail("expected schema adoption");
+                    Assert.fail("expected inferred type conflict");
                 } catch (LineSenderSchemaException e) {
-                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_CHANGED, e.getReason());
+                    Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
                 }
-                sender.stringColumn("id", "21222324-2526-2728-3132-333435363738").atNow();
+                Assert.assertEquals(1, handler.describeRequests.get());
+                long fsn = sender.flushAndGetSequence();
+                Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
+                sender.table("events").stringColumn("id", "21222324-2526-2728-3132-333435363738").atNow();
                 sender.flush();
-                FrameReader reader = new FrameReader(handler.awaitDataFrame());
+                FrameReader reader = new FrameReader(handler.awaitDataFrames(2));
                 reader.twoInferredAdoptionBlocks("events");
-                Assert.assertEquals(2, handler.describeRequests.get());
+                Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
+                        handler.describeRequests.get());
             }
         });
     }
 
     @Test
-    public void testUnchangedMissingColumnRefreshesOnceAndRetainsInferredRows() throws Exception {
+    public void testInferredTypeConflictDoesNotRefreshAndRetainsInferredRows() throws Exception {
         assertMemoryLeak(() -> {
             SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_MISSING, -1, -1);
             try (TestWebSocketServer server = schemaServer(handler);
@@ -1649,13 +1793,14 @@ public class QwpSchemaSenderIntegrationTest {
                 Assert.assertEquals(1, reader.i64());
                 Assert.assertEquals(3, reader.i64());
                 reader.eof();
-                Assert.assertEquals(2, handler.describeRequests.get());
+                Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                        handler.describeRequests.get());
             }
         });
     }
 
     @Test
-    public void testFreshLookupFailuresRemoveOnlyPartialInferredRow() throws Exception {
+    public void testInvalidateAllFeedbackMakesNextBatchLookUpAndSurfaceFailure() throws Exception {
         assertMemoryLeak(() -> {
             int[] results = {
                     QwpSchemaProtocol.RESULT_DENIED,
@@ -1669,25 +1814,49 @@ public class QwpSchemaSenderIntegrationTest {
             };
             for (int i = 0; i < results.length; i++) {
                 SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_MISSING, -1, -1);
+                handler.isSchemaFeedbackEnabled = true;
                 try (TestWebSocketServer server = schemaServer(handler);
                      Sender sender = sender(server)) {
                     sender.table("events").longColumn("id", 1).atNow();
                     handler.result = results[i];
+                    // The pending batch never consults the server: the conflict is
+                    // local and only the partial row rolls back.
                     try {
                         sender.stringColumn("failed_only", "partial");
                         sender.stringColumn("id", "different inferred type");
-                        Assert.fail("expected fresh lookup failure");
+                        Assert.fail("expected inferred type conflict");
                     } catch (LineSenderSchemaException e) {
-                        Assert.assertEquals(reasons[i], e.getReason());
+                        Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
                     }
-                    handler.result = QwpSchemaProtocol.RESULT_MISSING;
                     sender.longColumn("id", 3).atNow();
-                    sender.flush();
+                    long fsn = sender.flushAndGetSequence();
+                    Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
                     FrameReader reader = new FrameReader(handler.awaitDataFrame());
                     reader.schemaTable("events", -1, -1, 2, "id", QwpConstants.TYPE_LONG);
                     Assert.assertEquals(0, reader.u8());
                     Assert.assertEquals(1, reader.i64());
                     Assert.assertEquals(3, reader.i64());
+                    reader.eof();
+                    Assert.assertEquals(1, handler.describeRequests.get());
+
+                    // The server could not describe the table for the stale frame, so
+                    // its ACK invalidated the cache. The next batch looks the table up
+                    // again and reports the lookup failure from the setter.
+                    sender.table("events");
+                    try {
+                        sender.longColumn("id", 5);
+                        Assert.fail("expected lookup failure");
+                    } catch (LineSenderSchemaException e) {
+                        Assert.assertEquals(reasons[i], e.getReason());
+                    }
+                    Assert.assertEquals(2, handler.describeRequests.get());
+                    handler.result = QwpSchemaProtocol.RESULT_MISSING;
+                    sender.table("events").longColumn("id", 5).atNow();
+                    sender.flush();
+                    reader = new FrameReader(handler.awaitDataFrames(2).get(1));
+                    reader.schemaTable("events", -1, -1, 1, "id", QwpConstants.TYPE_LONG);
+                    Assert.assertEquals(0, reader.u8());
+                    Assert.assertEquals(5, reader.i64());
                     reader.eof();
                     Assert.assertEquals(3, handler.describeRequests.get());
                 }
@@ -1830,9 +1999,10 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test
-    public void testUnrelatedVersionChangeKeepsOriginalRejectionAndRetainsOldRows() throws Exception {
+    public void testVersionChangeDoesNotSplitPendingBatch() throws Exception {
         assertMemoryLeak(() -> {
             SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 51, 52);
+            handler.isSchemaFeedbackEnabled = true;
             try (TestWebSocketServer server = schemaServer(handler);
                  Sender sender = sender(server)) {
                 sender.table("events").uuidColumn("id", 1, 2).atNow();
@@ -1840,15 +2010,24 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events");
                 try {
                     sender.stringColumn("id", "still-invalid");
-                    Assert.fail("expected unchanged UUID validation error");
+                    Assert.fail("expected UUID validation error");
                 } catch (LineSenderSchemaException e) {
                     Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
                 }
+                // The rejection neither looks up metadata nor splits the batch: the
+                // next row joins the block pinned to version 52.
                 sender.uuidColumn("id", 3, 4).atNow();
+                long fsn = sender.flushAndGetSequence();
+                new FrameReader(handler.awaitDataFrame()).uuidTable("events", 51, 52, 1, 2, 3, 4);
+                Assert.assertEquals(1, handler.describeRequests.get());
+
+                // The stale frame's ACK carries version 53; the next batch adopts it.
+                Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
+                sender.table("events").uuidColumn("id", 5, 6).atNow();
                 sender.flush();
-                byte[] frame = handler.awaitDataFrame();
-                new FrameReader(frame).twoUuidBlocks("events", 51, 52, 1, 2, 53, 3, 4);
-                Assert.assertEquals(2, handler.describeRequests.get());
+                new FrameReader(handler.awaitDataFrames(2).get(1)).uuidTable("events", 51, 53, 5, 6);
+                Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
+                        handler.describeRequests.get());
             }
         });
     }
@@ -2111,9 +2290,10 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test
-    public void testResetDiscardsRetiredSchemaGeneration() throws Exception {
+    public void testResetDiscardsRowsAndKeepsCachedSnapshot() throws Exception {
         assertMemoryLeak(() -> {
             SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 101, 102);
+            handler.isSchemaFeedbackEnabled = true;
             try (TestWebSocketServer server = schemaServer(handler);
                  Sender sender = sender(server)) {
                 sender.table("events").uuidColumn("id", 1, 2).atNow();
@@ -2125,15 +2305,23 @@ public class QwpSchemaSenderIntegrationTest {
                 } catch (LineSenderSchemaException e) {
                     Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
                 }
+                // reset() discards the rows without sending anything, so no ACK can
+                // deliver version 103: the next batch still pins the cached 102.
                 sender.reset();
                 sender.table("events").uuidColumn("id", 3, 4).atNow();
-                sender.flush();
+                long fsn = sender.flushAndGetSequence();
                 FrameReader reader = new FrameReader(handler.awaitDataFrame());
-                reader.schemaTable("events", 101, 103, 1, "id", QwpConstants.TYPE_UUID);
+                reader.schemaTable("events", 101, 102, 1, "id", QwpConstants.TYPE_UUID);
                 Assert.assertEquals(0, reader.u8());
                 Assert.assertEquals(3, reader.i64());
                 Assert.assertEquals(4, reader.i64());
                 reader.eof();
+                // That frame's ACK carries 103 for the batch after it.
+                Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
+                sender.table("events").uuidColumn("id", 5, 6).atNow();
+                sender.flush();
+                new FrameReader(handler.awaitDataFrames(2).get(1)).uuidTable("events", 101, 103, 5, 6);
+                Assert.assertEquals(1, handler.describeRequests.get());
             }
         });
     }
@@ -2386,11 +2574,76 @@ public class QwpSchemaSenderIntegrationTest {
         }
     }
 
+    /**
+     * Builds the cumulative ACK the fake servers send for a data frame. Like the real
+     * server, a handler attaches the current schema of {@code tableName} when the
+     * snapshot it last delivered to the client is stale, so the client learns about
+     * a change on the batch boundary without a DESCRIBE of its own.
+     */
+    private static byte[] ackWithSchemaUpdate(long sequence, String tableName, byte[] schemaPayload) {
+        byte[] name = tableName.getBytes(StandardCharsets.UTF_8);
+        ByteBuffer ack = ByteBuffer.allocate(1 + 8 + 2 + 2 + 2 + name.length + 4 + schemaPayload.length)
+                .order(ByteOrder.LITTLE_ENDIAN);
+        ack.put((byte) (WebSocketResponse.STATUS_OK | WebSocketResponse.SCHEMA_FEEDBACK_MODE_UPDATES))
+                .putLong(sequence).putShort((short) 0)
+                .putShort((short) 1).putShort((short) name.length).put(name)
+                .putInt(schemaPayload.length).put(schemaPayload);
+        return ack.array();
+    }
+
+    /** The ACK a server sends when it cannot produce the schema snapshot a stale frame calls for. */
+    private static byte[] ackInvalidateAll(long sequence) {
+        ByteBuffer ack = ByteBuffer.allocate(1 + 8 + 2).order(ByteOrder.LITTLE_ENDIAN);
+        ack.put((byte) (WebSocketResponse.STATUS_OK | WebSocketResponse.SCHEMA_FEEDBACK_MODE_INVALIDATE_ALL))
+                .putLong(sequence).putShort((short) 0);
+        return ack.array();
+    }
+
+    private static byte[] schemaControlFrame(byte[] schemaPayload) {
+        ByteBuffer out = ByteBuffer.allocate(QwpConstants.HEADER_SIZE + schemaPayload.length)
+                .order(ByteOrder.LITTLE_ENDIAN);
+        out.putInt(QwpConstants.MAGIC_MESSAGE).put((byte) QwpConstants.VERSION)
+                .put(QwpSchemaProtocol.FLAG_CONTROL).putShort((short) 0).putInt(schemaPayload.length)
+                .put(schemaPayload);
+        return out.array();
+    }
+
+    /**
+     * Walks one QWP data frame, or a sequence of single-table frames. A table
+     * pins one schema snapshot per batch, so two schema generations of the same
+     * table always arrive in two frames; the two-block helpers read the second
+     * block from the second frame, skipping its message header and symbol
+     * dictionary prelude.
+     */
     private static final class FrameReader {
-        private final ByteBuffer in;
+        private final List<byte[]> frames;
+        private int frameIndex;
+        private ByteBuffer in;
 
         private FrameReader(byte[] data) {
-            in = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
+            this(Collections.singletonList(data));
+        }
+
+        private FrameReader(List<byte[]> frames) {
+            this.frames = frames;
+            this.in = ByteBuffer.wrap(frames.get(0)).order(ByteOrder.LITTLE_ENDIAN);
+        }
+
+        private void nextFrameIfExhausted() {
+            if (in.hasRemaining() || frameIndex + 1 >= frames.size()) {
+                return;
+            }
+            frameIndex++;
+            in = ByteBuffer.wrap(frames.get(frameIndex)).order(ByteOrder.LITTLE_ENDIAN);
+            Assert.assertEquals(QwpConstants.MAGIC_MESSAGE, in.getInt());
+            Assert.assertEquals(QwpConstants.VERSION, u8());
+            Assert.assertTrue((u8() & QwpConstants.FLAG_SCHEMA) != 0);
+            Assert.assertEquals(1, in.getShort() & 0xffff);
+            Assert.assertEquals(in.remaining() - Integer.BYTES, in.getInt());
+            varint();
+            for (int i = 0, n = varint(); i < n; i++) {
+                string();
+            }
         }
 
         private long i64() {
@@ -3289,7 +3542,13 @@ public class QwpSchemaSenderIntegrationTest {
             Assert.assertEquals(QwpConstants.MAGIC_MESSAGE, in.getInt());
             Assert.assertEquals(QwpConstants.VERSION, u8());
             Assert.assertTrue((u8() & QwpConstants.FLAG_SCHEMA) != 0);
-            Assert.assertEquals(tableCount, in.getShort() & 0xffff);
+            if (frames.size() == 1) {
+                Assert.assertEquals(tableCount, in.getShort() & 0xffff);
+            } else {
+                // One generation per frame: the blocks span the frame sequence.
+                Assert.assertEquals(tableCount, frames.size());
+                Assert.assertEquals(1, in.getShort() & 0xffff);
+            }
             Assert.assertEquals(in.remaining() - Integer.BYTES, in.getInt());
         }
 
@@ -3301,6 +3560,7 @@ public class QwpSchemaSenderIntegrationTest {
                 String column,
                 byte wireType
         ) {
+            nextFrameIfExhausted();
             Assert.assertEquals(table, string());
             Assert.assertEquals(1, u8());
             Assert.assertEquals(tableId, in.getInt());
@@ -3420,6 +3680,7 @@ public class QwpSchemaSenderIntegrationTest {
         }
 
         private void eof() {
+            Assert.assertEquals("unread frames", frames.size() - 1, frameIndex);
             Assert.assertFalse("unexpected trailing column or value bytes", in.hasRemaining());
         }
 
@@ -3453,34 +3714,20 @@ public class QwpSchemaSenderIntegrationTest {
             Assert.assertEquals(type & 0xff, u8());
         }
 
-        private void twoUuidBlocks(
-                String table,
-                int tableId,
-                long firstVersion,
-                long firstLo,
-                long firstHi,
-                long secondVersion,
-                long secondLo,
-                long secondHi
-        ) {
-            Assert.assertEquals(QwpConstants.MAGIC_MESSAGE, in.getInt());
-            Assert.assertEquals(QwpConstants.VERSION, u8());
-            Assert.assertTrue((u8() & QwpConstants.FLAG_SCHEMA) != 0);
-            Assert.assertEquals(2, in.getShort() & 0xffff);
-            Assert.assertEquals(in.remaining() - Integer.BYTES, in.getInt());
+        private void uuidTable(String table, int tableId, long version, long... loHiPairs) {
+            messageHeader(1);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            uuidBlock(table, tableId, firstVersion, firstLo, firstHi);
-            uuidBlock(table, tableId, secondVersion, secondLo, secondHi);
+            schemaBlockHeader(table, tableId, version, loHiPairs.length / 2, "id", QwpConstants.TYPE_UUID);
+            Assert.assertEquals(0, u8());
+            for (long word : loHiPairs) {
+                Assert.assertEquals(word, i64());
+            }
             eof();
         }
 
         private void twoInferredAdoptionBlocks(String table) {
-            Assert.assertEquals(QwpConstants.MAGIC_MESSAGE, in.getInt());
-            Assert.assertEquals(QwpConstants.VERSION, u8());
-            Assert.assertTrue((u8() & QwpConstants.FLAG_SCHEMA) != 0);
-            Assert.assertEquals(2, in.getShort() & 0xffff);
-            Assert.assertEquals(in.remaining() - Integer.BYTES, in.getInt());
+            messageHeader(2);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
 
@@ -3493,22 +3740,11 @@ public class QwpSchemaSenderIntegrationTest {
             Assert.assertEquals(0, u8());
             Assert.assertEquals(11, i64());
 
-            uuidBlock(table, 31, 41, 0x3132333435363738L, 0x2122232425262728L);
-            eof();
-        }
-
-        private void uuidBlock(String table, int tableId, long version, long lo, long hi) {
-            Assert.assertEquals(table, string());
-            Assert.assertEquals(1, u8());
-            Assert.assertEquals(tableId, in.getInt());
-            Assert.assertEquals(version, in.getLong());
-            Assert.assertEquals(1, varint());
-            Assert.assertEquals(1, varint());
-            Assert.assertEquals("id", string());
-            Assert.assertEquals(QwpConstants.TYPE_UUID, u8());
+            schemaBlockHeader(table, 31, 41, 1, "id", QwpConstants.TYPE_UUID);
             Assert.assertEquals(0, u8());
-            Assert.assertEquals(lo, i64());
-            Assert.assertEquals(hi, i64());
+            Assert.assertEquals(0x3132333435363738L, i64());
+            Assert.assertEquals(0x2122232425262728L, i64());
+            eof();
         }
 
         private void uuidOnlyTable(String table, int tableId, long version, long lo, long hi) {
@@ -3547,6 +3783,12 @@ public class QwpSchemaSenderIntegrationTest {
         private final int tableId;
         private volatile long version;
         private long ackSequence;
+        // The snapshot the client last received for "events", through DESCRIBE or ACK
+        // feedback. With feedback enabled, a data frame acknowledged while that
+        // snapshot is stale carries the update, as the real server does.
+        private int deliveredResult = -1;
+        private long deliveredVersion = -1;
+        private volatile boolean isSchemaFeedbackEnabled;
 
         private SchemaHandler(int result, int tableId, long version) {
             this(result, tableId, version, true);
@@ -3584,8 +3826,13 @@ public class QwpSchemaSenderIntegrationTest {
                 byte[] name = new byte[nameLength];
                 request.position(QwpConstants.HEADER_SIZE + 1 + Long.BYTES + Short.BYTES);
                 request.get(name);
-                int responseTableId = tableId + ("b".equals(new String(name, StandardCharsets.UTF_8)) ? 1 : 0);
-                sendSchema(client, requestId, responseTableId);
+                String tableName = new String(name, StandardCharsets.UTF_8);
+                int responseTableId = tableId + ("b".equals(tableName) ? 1 : 0);
+                if ("events".equals(tableName)) {
+                    deliveredResult = result;
+                    deliveredVersion = version;
+                }
+                send(client, schemaControlFrame(schemaPayload(requestId, responseTableId)));
                 return;
             }
             dataFrames.add(data);
@@ -3593,8 +3840,25 @@ public class QwpSchemaSenderIntegrationTest {
             if (!acknowledgeData) {
                 return;
             }
+            send(client, ack());
+        }
+
+        private byte[] ack() {
+            long sequence = ackSequence++;
+            if (!isSchemaFeedbackEnabled || (result == deliveredResult && version == deliveredVersion)) {
+                return QwpWireTestUtils.buildAck(sequence);
+            }
+            if (result != QwpSchemaProtocol.RESULT_KNOWN && result != QwpSchemaProtocol.RESULT_MISSING) {
+                return ackInvalidateAll(sequence);
+            }
+            deliveredResult = result;
+            deliveredVersion = version;
+            return ackWithSchemaUpdate(sequence, "events", schemaPayload(0, tableId));
+        }
+
+        private static void send(TestWebSocketServer.ClientHandler client, byte[] frame) {
             try {
-                client.sendBinary(QwpWireTestUtils.buildAck(ackSequence++));
+                client.sendBinary(frame);
             } catch (IOException e) {
                 throw new AssertionError(e);
             }
@@ -3644,7 +3908,7 @@ public class QwpSchemaSenderIntegrationTest {
             return new ArrayList<>(dataFrames);
         }
 
-        private void sendSchema(TestWebSocketServer.ClientHandler client, long requestId, int responseTableId) {
+        private byte[] schemaPayload(long requestId, int responseTableId) {
             byte[] id = "id".getBytes(StandardCharsets.UTF_8);
             byte[] failed = "failed_b".getBytes(StandardCharsets.UTF_8);
             byte[] ts = "ts".getBytes(StandardCharsets.UTF_8);
@@ -3655,22 +3919,15 @@ public class QwpSchemaSenderIntegrationTest {
                         + 2 + failed.length + 4 + 2
                         + 2 + ts.length + 4 + 2;
             }
-            ByteBuffer out = ByteBuffer.allocate(QwpConstants.HEADER_SIZE + payloadLength)
-                    .order(ByteOrder.LITTLE_ENDIAN);
-            out.putInt(QwpConstants.MAGIC_MESSAGE).put((byte) QwpConstants.VERSION)
-                    .put(QwpSchemaProtocol.FLAG_CONTROL).putShort((short) 0).putInt(payloadLength)
-                    .put(QwpSchemaProtocol.KIND_SCHEMA).putLong(requestId).put((byte) result);
+            ByteBuffer out = ByteBuffer.allocate(payloadLength).order(ByteOrder.LITTLE_ENDIAN);
+            out.put(QwpSchemaProtocol.KIND_SCHEMA).putLong(requestId).put((byte) result);
             if (result == QwpSchemaProtocol.RESULT_KNOWN) {
                 out.putInt(responseTableId).putLong(version).putShort((short) designatedIndex).putShort((short) 3)
                         .putShort((short) id.length).put(id).putInt(ColumnType.UUID).putShort((short) 0)
                         .putShort((short) failed.length).put(failed).putInt(ColumnType.STRING).putShort((short) 0)
                         .putShort((short) ts.length).put(ts).putInt(ColumnType.TIMESTAMP_NANO).putShort((short) 0);
             }
-            try {
-                client.sendBinary(out.array());
-            } catch (IOException e) {
-                throw new AssertionError(e);
-            }
+            return out.array();
         }
     }
 
@@ -3681,6 +3938,8 @@ public class QwpSchemaSenderIntegrationTest {
         private volatile int targetType;
         private volatile long version;
         private long ackSequence;
+        // The version the client last received, through DESCRIBE or ACK feedback.
+        private long deliveredVersion = -1;
 
         private LongTextSchemaHandler(int tableId, long version, int targetType) {
             this.tableId = tableId;
@@ -3695,13 +3954,24 @@ public class QwpSchemaSenderIntegrationTest {
                 describeRequests.incrementAndGet();
                 ByteBuffer request = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
                 long requestId = request.getLong(QwpConstants.HEADER_SIZE + 1);
-                sendSchema(client, requestId);
+                deliveredVersion = version;
+                send(client, schemaControlFrame(schemaPayload(requestId)));
                 return;
             }
             dataFrames.add(data);
             notifyAll();
+            long sequence = ackSequence++;
+            if (version == deliveredVersion) {
+                send(client, QwpWireTestUtils.buildAck(sequence));
+            } else {
+                deliveredVersion = version;
+                send(client, ackWithSchemaUpdate(sequence, "events", schemaPayload(0)));
+            }
+        }
+
+        private static void send(TestWebSocketServer.ClientHandler client, byte[] frame) {
             try {
-                client.sendBinary(QwpWireTestUtils.buildAck(ackSequence++));
+                client.sendBinary(frame);
             } catch (IOException e) {
                 throw new AssertionError(e);
             }
@@ -3719,7 +3989,19 @@ public class QwpSchemaSenderIntegrationTest {
             return dataFrames.get(0);
         }
 
-        private void sendSchema(TestWebSocketServer.ClientHandler client, long requestId) {
+        private synchronized List<byte[]> awaitDataFrames(int count) throws InterruptedException {
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (dataFrames.size() < count) {
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0) {
+                    Assert.fail("timed out waiting for " + count + " data frames; received " + dataFrames.size());
+                }
+                TimeUnit.NANOSECONDS.timedWait(this, remaining);
+            }
+            return new ArrayList<>(dataFrames);
+        }
+
+        private byte[] schemaPayload(long requestId) {
             byte[] value = "value".getBytes(StandardCharsets.UTF_8);
             byte[] failed = "failed_b".getBytes(StandardCharsets.UTF_8);
             byte[] ts = "ts".getBytes(StandardCharsets.UTF_8);
@@ -3727,21 +4009,14 @@ public class QwpSchemaSenderIntegrationTest {
                     + 2 + value.length + 4 + 2
                     + 2 + failed.length + 4 + 2
                     + 2 + ts.length + 4 + 2;
-            ByteBuffer out = ByteBuffer.allocate(QwpConstants.HEADER_SIZE + payloadLength)
-                    .order(ByteOrder.LITTLE_ENDIAN);
-            out.putInt(QwpConstants.MAGIC_MESSAGE).put((byte) QwpConstants.VERSION)
-                    .put(QwpSchemaProtocol.FLAG_CONTROL).putShort((short) 0).putInt(payloadLength)
-                    .put(QwpSchemaProtocol.KIND_SCHEMA).putLong(requestId)
+            ByteBuffer out = ByteBuffer.allocate(payloadLength).order(ByteOrder.LITTLE_ENDIAN);
+            out.put(QwpSchemaProtocol.KIND_SCHEMA).putLong(requestId)
                     .put((byte) QwpSchemaProtocol.RESULT_KNOWN)
                     .putInt(tableId).putLong(version).putShort((short) 2).putShort((short) 3)
                     .putShort((short) value.length).put(value).putInt(targetType).putShort((short) 0)
                     .putShort((short) failed.length).put(failed).putInt(ColumnType.UUID).putShort((short) 0)
                     .putShort((short) ts.length).put(ts).putInt(ColumnType.TIMESTAMP_NANO).putShort((short) 0);
-            try {
-                client.sendBinary(out.array());
-            } catch (IOException e) {
-                throw new AssertionError(e);
-            }
+            return out.array();
         }
     }
 }

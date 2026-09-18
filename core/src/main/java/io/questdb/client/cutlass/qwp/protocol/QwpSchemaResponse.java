@@ -104,23 +104,6 @@ public final class QwpSchemaResponse {
         return tableId;
     }
 
-    /**
-     * Returns whether {@code name} resolves to an equivalent conversion target
-     * in both snapshots: same presence, designated-timestamp role, column type,
-     * and extension-parameter flag. A null {@code name} selects the designated
-     * timestamp. Column position is irrelevant.
-     */
-    public boolean hasSameRelevantTarget(QwpSchemaResponse other, CharSequence name) {
-        int current = name == null ? designatedIndex : getColumnIndex(name);
-        int next = name == null ? other.designatedIndex : other.getColumnIndex(name);
-        if (current < 0 || next < 0) {
-            return current < 0 && next < 0;
-        }
-        return (current == designatedIndex) == (next == other.designatedIndex)
-                && columns[current].type == other.columns[next].type
-                && columns[current].hasTypeParameters == other.columns[next].hasTypeParameters;
-    }
-
     public boolean hasSchema() {
         return result == QwpSchemaProtocol.RESULT_KNOWN;
     }

@@ -145,54 +145,6 @@ public class QwpSchemaProtocolTest {
     }
 
     @Test
-    public void testHasSameRelevantTarget() {
-        byte[] none = new byte[0];
-        QwpSchemaResponse base = decode(knownResponse(1, 1, 1, 1,
-                column("v", 5, none), column("ts", 10, none)));
-
-        // Position and unrelated columns do not matter; name case does not either.
-        QwpSchemaResponse moved = decode(knownResponse(2, 1, 2, 0,
-                column("TS", 10, none), column("extra", 7, none), column("V", 5, none)));
-        Assert.assertTrue(base.hasSameRelevantTarget(moved, "v"));
-        Assert.assertTrue(base.hasSameRelevantTarget(moved, "ts"));
-        Assert.assertTrue(base.hasSameRelevantTarget(moved, null));
-        Assert.assertTrue(moved.hasSameRelevantTarget(base, "V"));
-
-        // Absent on both sides is the same target; absent on one side is not.
-        Assert.assertTrue(base.hasSameRelevantTarget(moved, "absent"));
-        Assert.assertFalse(base.hasSameRelevantTarget(moved, "extra"));
-        Assert.assertFalse(moved.hasSameRelevantTarget(base, "extra"));
-
-        QwpSchemaResponse retyped = decode(knownResponse(3, 1, 3, 1,
-                column("v", 6, none), column("ts", 10, none)));
-        Assert.assertFalse(base.hasSameRelevantTarget(retyped, "v"));
-        Assert.assertTrue(base.hasSameRelevantTarget(retyped, "ts"));
-
-        QwpSchemaResponse parameterized = decode(knownResponse(4, 1, 4, 1,
-                column("v", 5, new byte[]{1}), column("ts", 10, none)));
-        Assert.assertFalse(base.hasSameRelevantTarget(parameterized, "v"));
-
-        // The designated role moves from "ts" to "v": both named targets change,
-        // and so does the designated timestamp's type.
-        QwpSchemaResponse redesignated = decode(knownResponse(5, 1, 5, 0,
-                column("v", 5, none), column("ts", 10, none)));
-        Assert.assertFalse(base.hasSameRelevantTarget(redesignated, "v"));
-        Assert.assertFalse(base.hasSameRelevantTarget(redesignated, "ts"));
-        Assert.assertFalse(base.hasSameRelevantTarget(redesignated, null));
-
-        QwpSchemaResponse undesignated = decode(knownResponse(6, 1, 6, -1,
-                column("v", 5, none), column("ts", 10, none)));
-        Assert.assertFalse(base.hasSameRelevantTarget(undesignated, null));
-        Assert.assertTrue(undesignated.hasSameRelevantTarget(undesignated, null));
-        Assert.assertTrue(base.hasSameRelevantTarget(undesignated, "v"));
-
-        QwpSchemaResponse missing = decode(resultResponse(7, QwpSchemaProtocol.RESULT_MISSING));
-        Assert.assertFalse(base.hasSameRelevantTarget(missing, "v"));
-        Assert.assertTrue(missing.hasSameRelevantTarget(missing, "v"));
-        Assert.assertTrue(missing.hasSameRelevantTarget(missing, null));
-    }
-
-    @Test
     public void testRejectsMalformedEnvelopesAndTrailingData() {
         byte[] valid = knownResponse(1, 1, 0, -1, column("x", 5, new byte[0]));
         assertMalformed(mutate(valid, 0, (byte) 'X'));

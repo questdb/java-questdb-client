@@ -1227,13 +1227,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         return schemaCoordinator.resolve(tableName, timeoutMillis, false, ioThread);
     }
 
-    public QwpSchemaResponse resolveSchema(CharSequence tableName, long timeoutMillis, boolean[] freshOut) {
-        if (freshOut == null || freshOut.length == 0) {
-            throw new IllegalArgumentException("freshOut must contain one element");
-        }
-        return schemaCoordinator.resolve(tableName, timeoutMillis, false, ioThread, freshOut);
-    }
-
     /**
      * Evicts the named cache entry at admission and resolves it again through the I/O thread.
      * This producer-side API permits one outstanding lookup. The timeout covers the entire

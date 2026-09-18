@@ -903,10 +903,6 @@ public final class QwpSchemaBinding {
         return schema.getMetadataVersion();
     }
 
-    public boolean hasSameRelevantTarget(QwpSchemaResponse other, CharSequence name) {
-        return schema.hasSameRelevantTarget(other, name);
-    }
-
     private LineSenderSchemaException error(
             LineSenderSchemaException.Reason reason,
             CharSequence column,

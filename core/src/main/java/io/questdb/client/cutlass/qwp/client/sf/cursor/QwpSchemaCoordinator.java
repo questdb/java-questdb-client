@@ -30,16 +30,6 @@ final class QwpSchemaCoordinator {
     private Request request;
 
     QwpSchemaResponse resolve(CharSequence tableName, long timeoutMillis, boolean refresh, Thread ioThread) {
-        return resolve(tableName, timeoutMillis, refresh, ioThread, null);
-    }
-
-    QwpSchemaResponse resolve(
-            CharSequence tableName,
-            long timeoutMillis,
-            boolean refresh,
-            Thread ioThread,
-            boolean[] freshOut
-    ) {
         final long startNanos = System.nanoTime();
         if (timeoutMillis < 0) {
             throw new IllegalArgumentException("timeoutMillis must be non-negative");
@@ -58,9 +48,6 @@ final class QwpSchemaCoordinator {
             if (!refresh) {
                 QwpSchemaResponse cached = cache == null ? null : cache.get(key);
                 if (cached != null) {
-                    if (freshOut != null) {
-                        freshOut[0] = false;
-                    }
                     return cached;
                 }
             } else {
@@ -76,9 +63,6 @@ final class QwpSchemaCoordinator {
                 throw failure(UNSUPPORTED_FEATURE, key, "schema request id space is exhausted");
             }
             long id = nextRequestId;
-            if (freshOut != null) {
-                freshOut[0] = true;
-            }
             byte[] message = QwpSchemaProtocol.encodeDescribe(id, tableName);
             nextRequestId++;
             Request own = new Request(id, key, startNanos, timeoutNanos, message);

@@ -29,7 +29,6 @@ import io.questdb.client.cutlass.line.LineSenderException;
 public class LineSenderSchemaException extends LineSenderException {
     public enum Reason {
         INVALID_VALUE,
-        SCHEMA_CHANGED,
         SCHEMA_UNAVAILABLE,
         ACCESS_DENIED,
         UNSUPPORTED_FEATURE

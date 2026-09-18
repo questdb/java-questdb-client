@@ -1453,8 +1453,7 @@ decide recovery. The proposed reason codes and actions are:
 
 | Reason | Caller action |
 |---|---|
-| `INVALID_VALUE` | Correct or reject the input; reconstruct the whole row if writing it again. Retrying the same input against the same target will fail. |
-| `SCHEMA_CHANGED` | Reconstruct and retry the whole row using the refreshed schema. |
+| `INVALID_VALUE` | Correct or reject the input; reconstruct the whole row if writing it again. Retrying the same input against the same snapshot will fail. If server DDL has since made the input valid, the next batch after an acknowledged flush validates against the new schema. |
 | `SCHEMA_UNAVAILABLE` | Retry the whole row when metadata can be obtained, for example after a timeout or temporary outage. |
 | `ACCESS_DENIED` | Resolve authorization; unchanged credentials/permissions do not make an immediate retry useful. |
 | `UNSUPPORTED_FEATURE` | Use a supporting endpoint/client for an extension required after upgrade or by pending extended SF, or for an unsupported target type. Do not downgrade or fall back to raw encoding. |
@@ -1470,79 +1469,67 @@ recovery. Existing transport/flush failures and terminal server NACKs keep their
 own delivery and recovery semantics. Test the reason, row outcome and allowed
 next public API operation, not only the diagnostic text.
 
-A cached schema must not reject indefinitely after DDL makes an input valid.
-Before reporting a conversion rejection against cached metadata, describe once.
-If this operation already obtained a fresh schema, do not look up again.
-Freshness belongs to the failing setter, not the whole row: a describe performed
-by an earlier setter does not suppress refresh for a later failing setter.
+A conversion rejection is final for the snapshot the batch pinned. The failed
+setter reports `INVALID_VALUE` or `UNSUPPORTED_FEATURE` directly; it never
+performs a network lookup, so a rejection costs no round trip and cannot fail
+for a transport reason. A cached schema therefore keeps rejecting an input that
+DDL has since made valid until the batch boundary brings the new snapshot (see
+the next section). Lookup and authorization errors surface only from the path
+that actually looks metadata up: the first row of a batch on a cache miss.
 
-- If the relevant target is unchanged, preserve the original rejection reason:
-  `INVALID_VALUE` for an invalid value or `UNSUPPORTED_FEATURE` for an unsupported
-  conversion. A changed metadata version alone is not `SCHEMA_CHANGED`.
-- If the target or table incarnation changed, cancel the row and report
-  `SCHEMA_CHANGED`. Prepare the fresh snapshot for the next whole-row retry.
-- If refresh fails, cancel the partial row and report its actual reason:
-  temporary unavailability, access denial or unsupported functionality.
+Do not retry only the failing setter after a refresh: earlier values in the
+same row have already been converted under the old snapshot. The sender does
+not retain original inputs for automatic whole-row reconversion.
 
-Do not retry only the failing setter using the fresh schema: earlier values
-in the same row have already been converted under the old one. The sender
-does not retain original inputs for automatic whole-row reconversion.
-There is at most one refresh per failing operation, not a DDL retry loop.
-An implemented input family rejected against a cached missing column or target
-type also gets this refresh, so a newly added or changed server column can be
-discovered. An intrinsically unimplemented input family fails directly; looking
-up another schema cannot implement that setter. Lookup and authorization errors
-are not conversion-retry triggers.
-
-## Pinned blocks and schema transitions
+## One schema snapshot per table per batch
 
 Keep two concepts separate:
 
-- The latest server snapshot, learned through describes or ACKs/NACKs.
-- The encoding snapshot pinned to a row and its table block.
+- The latest server snapshot, learned through describes or ACK feedback.
+- The encoding snapshot pinned to a table for the pending batch.
 
-All rows in a schema-mode table block use one encoding snapshot. Its identity
+All rows a table holds in one batch use one encoding snapshot. Its identity
 describes the schema used to resolve server-backed bindings, with explicit
 inferred bindings for any missing columns. It is not replaced by the latest
 cache identity when the block is sent. Wire column definitions still describe
 the actual bytes; the identity does not replace those definitions.
 
-For example, an ACK for an earlier batch may arrive while another block is
-being built:
+The sender resolves the cache only when a table's buffer holds no rows: at the
+first effective write of the table's first row in a batch, including
+timestamp-only rows. From then on every row of that table in the batch reuses
+the pinned binding without consulting the cache, so an ACK that lands mid-batch
+with a newer snapshot cannot split the batch or relabel buffered values:
 
 ```
-Server v10: count INT  -> current block: v10, INT, four-byte values
-Server v11: count LONG -> next block:    v11, LONG, eight-byte values
+Server v10: count INT  -> this batch:  v10, INT, four-byte values
+Server v11: count LONG -> next batch:  v11, LONG, eight-byte values
 ```
 
-Publishing v11 cannot relabel existing four-byte values as LONG or start
-appending eight-byte values to their column buffer.
+Adoption happens at the batch boundary. After a successful `flush()` or an
+explicit `reset()` the table buffer is row-less again, and the next row
+compares the pinned identity with the cache; a different identity replaces the
+buffer's layout (`QwpTableBuffer.reset()` keeps column definitions, so the
+buffer is cleared and rebound in place) before accepting the first value. A
+failed flush retains the batch and its snapshot.
 
-The I/O thread only publishes snapshots. The producer finishes an in-progress
-row under its pinned snapshot, or cancels it on error. At the first effective
-write of each schema-mode row, including timestamp-only rows, it resolves the
-latest cached schema or performs a lookup on a miss. If the identity changed,
-it seals completed rows under the old snapshot and installs a new layout before
-accepting the new row's first value. This boundary is detected from actual row
-state, including rows started without another `table()` call. Repeating
-`table()` is not itself a safe transition point.
+There is no explicit refresh API. The cache stays current through the server:
+a frame that carries a stale identity makes the server attach the table's
+current schema to the ACK, and the send loop applies that feedback before it
+advances the ack watermark, so an application that flushes and waits for the
+acknowledgment before starting the next batch adopts the change deterministically.
+When the server cannot produce the snapshot it answers `INVALIDATE_ALL`, the
+cache empties, and the next batch's first row looks the table up again and
+reports `SCHEMA_UNAVAILABLE`, `ACCESS_DENIED` or `UNSUPPORTED_FEATURE` from the
+setter. A reconnect also clears the cache. A producer whose every new row is
+rejected by a stale snapshot never ships a frame and therefore never receives
+feedback; recovery from that state is a reconnect or a new sender. An explicit
+refresh was considered and dropped: a caller cannot tell a stale-snapshot
+rejection from invalid input, so there is no sound rule for when to call it.
 
-For the first implementation, adopting a different identity starts a new
-block. Reusing unchanged allocations is allowed, but not relabeling existing
-rows. Avoiding splits for provably irrelevant updates is an optional later
-optimization, not a reason to mix snapshots.
-
-Sealing freezes a block; it need not wait for a network send or ACK. Keep sealed
-blocks ordered and included in normal pending-row/byte accounting, flush limits
-and backpressure. Do not introduce an unbounded queue. Successive generations
-of one table can use separate frames; preserve existing multi-table transaction
-and deferred-commit boundaries.
-
-The current `QwpTableBuffer.reset()` preserves column definitions. Transition
-therefore needs an explicit producer-owned layout replacement after old rows
-have been retained for encoding or encoded. Invalidate column-definition and
-designated-timestamp caches with that replacement. Never clear data still
-owned by a pending block.
+A frame therefore never carries two generations of one table, and the sender
+keeps no retired buffers, pending-generation lists or per-operation freshness
+bookkeeping. Persisted frames from before this rule may still hold two blocks
+of one table; the replay path reads them unchanged.
 
 ## Schema feedback through writes
 
@@ -2153,18 +2140,21 @@ without claiming general exactly-once delivery.
   fractions and `Instant` precision at both target resolutions. Include valid
   negative instants whose intermediate seconds multiplication would overflow,
   duplicate suppression, local failure/rollback and unchanged legacy behavior.
-- A stale rejection refreshes once. A changed target cancels the whole row;
-  retry uses the new snapshot. No setter splices new rules into a partial row.
+- A stale rejection is local: it issues no describe, cancels the whole row and
+  leaves the batch pinned. No setter splices new rules into a partial row.
 - Local errors expose the expected reason and recovery action. An invalid row
-  stays cancelled after flush; whole-row retries after schema refresh or a
-  recovered lookup can succeed without losing earlier completed rows. Access
-  denial and unsupported functionality are not mislabeled as transient lookup
-  failures or flush-retryable errors.
-- ACK metadata arriving mid-row leaves that row and completed rows unchanged.
-  The next adopted snapshot gets a separate block with matching wire types
-  and identity; exercise INT-to-LONG and cached designated timestamps.
-- Transitions work without another `table()` call, preserve pending accounting,
-  frame order, transaction boundaries, backpressure and completed rows on error.
+  stays cancelled after flush; whole-row retries in the next batch after ACK
+  feedback or a recovered lookup can succeed without losing earlier completed
+  rows. Access denial and unsupported functionality are not mislabeled as
+  transient lookup failures or flush-retryable errors, and an `INVALIDATE_ALL`
+  ACK makes the next batch's lookup report them from the setter.
+- ACK metadata arriving mid-batch leaves that batch unchanged. The next batch
+  adopts the snapshot with matching wire types and identity in its own frame;
+  exercise INT-to-LONG and cached designated timestamps.
+- `reset()` discards rows without shipping a frame, so it delivers no feedback;
+  the next batch pins the cached snapshot. Transitions preserve pending
+  accounting, frame order, transaction boundaries, backpressure and completed
+  rows on error.
 - Auto-create, multi-table writes, cumulative ACKs, deferred commits, delayed
   sends and describe/ACK interleaving preserve schema feedback and watermarks.
 - After schema confirmation, lookup timeout, offline cache misses, eviction,
