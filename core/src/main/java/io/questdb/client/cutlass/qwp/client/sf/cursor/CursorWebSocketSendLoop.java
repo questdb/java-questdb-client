@@ -436,6 +436,15 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // foreground sender's transient auth blip becomes a producer-fatal terminal -- the
     // exact failure this policy exists to prevent.
     private volatile boolean hasEverConnected;
+    // Producer-visible wire state. True from the moment swapClient installs a
+    // connection until the I/O thread enters the reconnect loop for it. The
+    // sender's schema contract selection reads it to decide between a lookup
+    // (wire up) and a cache-only probe (wire down).
+    private volatile boolean isWireUp;
+    // When true, connectLoop fails a pending schema lookup immediately instead of
+    // letting the replacement connection re-send it. Set by a sender whose schema
+    // mode can fall back to the legacy contract.
+    private volatile boolean shouldAbandonSchemaLookupOnDisconnect;
     // Cause of the outage the reconnect loop is currently riding out, or null once a
     // connect succeeds. Written by the I/O thread, read by the producer thread so a
     // backpressure or drain-timeout failure can NAME the reason the wire is not draining
@@ -924,6 +933,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // hands null and lets the I/O thread connect — hasEverConnected
         // stays false until swapClient sees its first success.
         this.hasEverConnected = client != null;
+        this.isWireUp = client != null;
         if (engine.requiresSchema()) {
             if (reconnectFactory != null) {
                 reconnectFactory.requireSchema();
@@ -1225,6 +1235,24 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      */
     public QwpSchemaResponse resolveSchema(CharSequence tableName, long timeoutMillis) {
         return schemaCoordinator.resolve(tableName, timeoutMillis, false, ioThread);
+    }
+
+    /**
+     * Cache-only variant of {@link #resolveSchema}: the schema the coordinator
+     * already holds for the table, or {@code null}. Never sends a request and
+     * never waits, so a producer can call it while the wire is down.
+     */
+    public QwpSchemaResponse peekSchema(CharSequence tableName) {
+        return schemaCoordinator.peek(tableName);
+    }
+
+    /**
+     * Selects what happens to a schema lookup in flight when the connection
+     * drops: {@code true} fails it immediately, {@code false} (the default) keeps
+     * it pending with its original deadline for the replacement connection.
+     */
+    public void setAbandonSchemaLookupOnDisconnect(boolean abandon) {
+        this.shouldAbandonSchemaLookupOnDisconnect = abandon;
     }
 
     /**
@@ -1573,6 +1601,15 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * Whether a connection is currently installed. False before the first
+     * upgrade completes and from the moment the I/O thread enters the reconnect
+     * loop until {@code swapClient} installs the replacement.
+     */
+    public boolean isWireUp() {
+        return isWireUp;
+    }
+
+    /**
      * Waits for the first completed WebSocket upgrade and returns whether that
      * handshake selected schema mode. A failed or still-pending handshake is
      * never interpreted as a legacy peer.
@@ -1809,9 +1846,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         if (!running) {
             return;
         }
+        isWireUp = false;
         WebSocketClient failedClient = client;
         if (failedClient != null) {
-            schemaCoordinator.connectionLost(failedClient);
+            schemaCoordinator.connectionLost(failedClient, shouldAbandonSchemaLookupOnDisconnect);
         }
         if (reconnectFactory == null) {
             recordFatal(initial);
@@ -2797,6 +2835,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // dies inside the dictionary catch-up above was never fully
         // established, so the sender stays INITIALIZING and a subsequent
         // endpoint-policy rejection still latches the startup terminal.
+        this.isWireUp = true;
         this.hasEverConnected = true;
     }
 

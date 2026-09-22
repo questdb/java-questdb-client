@@ -253,6 +253,55 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
+    public void testSchemaModeBuilderNotSupportedForTcp() {
+        assertThrows("schema_mode is only supported for WebSocket transport",
+                () -> Sender.builder(Sender.Transport.TCP)
+                        .address(LOCALHOST)
+                        .schemaMode(Sender.SchemaMode.STRICT));
+    }
+
+    @Test
+    public void testSchemaModeConfigStringInvalidRejected() {
+        assertThrows("invalid schema_mode [value=maybe, allowed-values=[auto, strict, off]]",
+                () -> Sender.builder("ws::addr=localhost:9000;schema_mode=maybe;"));
+    }
+
+    @Test
+    public void testSchemaModeConfigStringNotSupportedForTcp() {
+        assertThrows("schema_mode is only supported for WebSocket transport",
+                () -> Sender.builder("tcp::addr=localhost:9009;schema_mode=auto;"));
+    }
+
+    @Test
+    public void testSchemaModeConfigStringValuesAreCaseInsensitive() {
+        Assert.assertEquals("AUTO",
+                Sender.builder("ws::addr=localhost:9000;schema_mode=Auto;").wsConfigSnapshotForTest().get("schema_mode"));
+        Assert.assertEquals("OFF",
+                Sender.builder("ws::addr=localhost:9000;schema_mode=OFF;").wsConfigSnapshotForTest().get("schema_mode"));
+        Assert.assertNull(Sender.builder("ws::addr=localhost:9000;").wsConfigSnapshotForTest().get("schema_mode"));
+    }
+
+    @Test
+    public void testSchemaWaitMillisBuilderNotSupportedForTcp() {
+        assertThrows("schema_wait_millis is only supported for WebSocket transport",
+                () -> Sender.builder(Sender.Transport.TCP)
+                        .address(LOCALHOST)
+                        .schemaWaitMillis(1000));
+    }
+
+    @Test
+    public void testSchemaWaitMillisConfigStringZeroRejected() {
+        assertThrows("schema_wait_millis must be > 0: 0",
+                () -> Sender.builder("ws::addr=localhost:9000;schema_wait_millis=0;"));
+    }
+
+    @Test
+    public void testSchemaWaitMillisUnsetInSnapshot() {
+        Assert.assertEquals(-1L,
+                Sender.builder("ws::addr=localhost:9000;").wsConfigSnapshotForTest().get("schema_wait_millis"));
+    }
+
+    @Test
     public void testCatchUpCapGapMinEscalationWindowUnsetInSnapshot() {
         // wsConfigSnapshotForTest puts the raw field, not the resolved default (see
         // WsSenderConfigHonoredTest#testSnapshotReportsTheRawUnsetSentinel), so an

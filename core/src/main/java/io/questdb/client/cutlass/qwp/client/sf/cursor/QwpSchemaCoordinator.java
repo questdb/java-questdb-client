@@ -176,13 +176,38 @@ final class QwpSchemaCoordinator {
         }
     }
 
-    synchronized void connectionLost(WebSocketClient client) {
-        if (request != null && request.sentClient == client) {
+    /**
+     * Records that {@code client} died. With {@code abandon} false the producer's
+     * request keeps its deadline and the replacement connection re-sends it; with
+     * {@code abandon} true the request fails right away, so a producer that can
+     * fall back to the legacy contract does not sit out the rest of its budget on
+     * a wire that is known to be down.
+     */
+    synchronized void connectionLost(WebSocketClient client, boolean abandon) {
+        if (request == null || request.done) {
+            return;
+        }
+        if (abandon) {
+            complete(request, null, failure(SCHEMA_UNAVAILABLE, request.key, "connection lost during schema lookup"));
+            return;
+        }
+        if (request.sentClient == client) {
             // Keep the producer's request and deadline; only its wire attempt ended.
             // A fresh ID also rejects old replies delivered on the replacement connection.
             request.sentClient = null;
             request.id = 0;
         }
+    }
+
+    /**
+     * Cache-only lookup: the schema this coordinator already holds for the table,
+     * or {@code null}. Never sends a request and never waits.
+     */
+    synchronized QwpSchemaResponse peek(CharSequence tableName) {
+        if (closed || cache == null) {
+            return null;
+        }
+        return cache.get(normalize(tableName));
     }
 
     synchronized boolean invalidResponse(WebSocketClient client, long requestId) {

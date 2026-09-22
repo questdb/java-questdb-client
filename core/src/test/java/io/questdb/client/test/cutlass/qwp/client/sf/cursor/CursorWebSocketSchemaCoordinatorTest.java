@@ -173,6 +173,58 @@ public class CursorWebSocketSchemaCoordinatorTest {
     }
 
     @Test
+    public void testAbandonOnDisconnectFailsPendingLookupBeforeItsDeadline() throws Exception {
+        DescribeHandler handler = new DescribeHandler(false);
+        try (TestWebSocketServer server = server(handler);
+             CursorSendEngine engine = new CursorSendEngine(temp.newFolder("abandon").getAbsolutePath(), 1 << 20);
+             WebSocketClient client = connect(server.getPort())) {
+            CursorWebSocketSendLoop loop = loop(client, engine);
+            loop.setAbandonSchemaLookupOnDisconnect(true);
+            ExecutorService executor = Executors.newSingleThreadExecutor();
+            try {
+                loop.start();
+                Assert.assertTrue(loop.isWireUp());
+                // A budget far beyond the assertion window: only the drop can end it.
+                Future<QwpSchemaResponse> pending = executor.submit(() -> loop.resolveSchema("t", 60_000));
+                Assert.assertTrue(handler.awaitFirstRequest());
+                server.close();
+                try {
+                    pending.get(5, TimeUnit.SECONDS);
+                    Assert.fail("lookup survived the connection loss");
+                } catch (ExecutionException e) {
+                    LineSenderSchemaException cause = (LineSenderSchemaException) e.getCause();
+                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE, cause.getReason());
+                    Assert.assertTrue(cause.getMessage(), cause.getMessage().contains("connection lost"));
+                }
+                Assert.assertFalse(loop.isWireUp());
+            } finally {
+                executor.shutdownNow();
+                loop.close();
+            }
+        }
+    }
+
+    @Test
+    public void testPeekReturnsOnlyCachedSchema() throws Exception {
+        DescribeHandler handler = new DescribeHandler(true);
+        try (TestWebSocketServer server = server(handler);
+             CursorSendEngine engine = new CursorSendEngine(temp.newFolder("peek").getAbsolutePath(), 1 << 20);
+             WebSocketClient client = connect(server.getPort())) {
+            CursorWebSocketSendLoop loop = loop(client, engine);
+            try {
+                loop.start();
+                Assert.assertNull(loop.peekSchema("Trades"));
+                Assert.assertEquals(0, handler.requests.get());
+                QwpSchemaResponse resolved = loop.resolveSchema("Trades", 5_000);
+                Assert.assertSame(resolved, loop.peekSchema("trades"));
+                Assert.assertEquals(1, handler.requests.get());
+            } finally {
+                loop.close();
+            }
+        }
+    }
+
+    @Test
     public void testUnnegotiatedConnectionIsUnsupported() throws Exception {
         DescribeHandler handler = new DescribeHandler(true);
         try (TestWebSocketServer server = new TestWebSocketServer(handler);

@@ -151,7 +151,7 @@ public class QwpWebSocketSender implements Sender {
     // Upper bound for a row's first setter to wait on the initial handshake
     // and a schema DESCRIBE round trip. A healthy lookup takes milliseconds;
     // this only bounds a dead or still-connecting link.
-    private static final long DEFAULT_SCHEMA_WAIT_MILLIS = 30_000L;
+    public static final long DEFAULT_SCHEMA_WAIT_MILLIS = 30_000L;
     private static final String WRITE_PATH = "/write/v4";
     // Yields the Authorization header value presented on each WebSocket upgrade. A constant for a
     // fixed token or Basic credential; for an httpTokenProvider it pulls a freshly refreshed token,
@@ -398,6 +398,9 @@ public class QwpWebSocketSender implements Sender {
     // One-way owner capability: shared by foreground and every background
     // reconnect supplier created by this sender.
     private volatile boolean schemaRequired;
+    // Row-encoding contract when a schema is not obtainable; see
+    // resolveSchemaForCurrentTable().
+    private Sender.SchemaMode schemaMode = Sender.SchemaMode.AUTO;
     private long schemaWaitMillis = DEFAULT_SCHEMA_WAIT_MILLIS;
     // Monotonic per-attempt counter snapshotted onto every connection event
     // fired from buildAndConnect. Counts every FOREGROUND endpoint try --
@@ -870,10 +873,50 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Overload with the default {@link Sender.SchemaMode#AUTO} schema contract
+     * and the default schema wait.
+     */
+    public static QwpWebSocketSender connectWithCredentialSupplier(
+            List<Endpoint> endpoints,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            Supplier<String> authorizationHeaderSupplier,
+            boolean requestDurableAck,
+            CursorSendEngine cursorEngine,
+            long closeFlushTimeoutMillis,
+            long reconnectMaxDurationMillis,
+            long reconnectInitialBackoffMillis,
+            long reconnectMaxBackoffMillis,
+            Sender.InitialConnectMode initialConnectMode,
+            SenderErrorHandler errorHandler,
+            int errorInboxCapacity,
+            long durableAckKeepaliveIntervalMillis,
+            long authTimeoutMs,
+            int connectTimeoutMs,
+            SenderConnectionListener connectionListener,
+            int connectionListenerInboxCapacity,
+            int maxFrameRejections,
+            long poisonMinEscalationWindowMillis,
+            long catchUpCapGapMinEscalationWindowMillis
+    ) {
+        return connectWithCredentialSupplier(endpoints, tlsConfig, autoFlushRows, autoFlushBytes,
+                autoFlushIntervalNanos, authorizationHeaderSupplier, requestDurableAck, cursorEngine,
+                closeFlushTimeoutMillis, reconnectMaxDurationMillis, reconnectInitialBackoffMillis,
+                reconnectMaxBackoffMillis, initialConnectMode, errorHandler, errorInboxCapacity,
+                durableAckKeepaliveIntervalMillis, authTimeoutMs, connectTimeoutMs, connectionListener,
+                connectionListenerInboxCapacity, maxFrameRejections, poisonMinEscalationWindowMillis,
+                catchUpCapGapMinEscalationWindowMillis, Sender.SchemaMode.AUTO, DEFAULT_SCHEMA_WAIT_MILLIS);
+    }
+
+    /**
      * Master connect entry point — also accepts the poison-frame detector
      * threshold ({@code max_frame_rejections}): consecutive server-active
      * rejections of the same head-of-line frame, with no ack progress in
-     * between, before the loop escalates to a typed terminal.
+     * between, before the loop escalates to a typed terminal; and the schema
+     * contract ({@code schema_mode}) with its lookup budget
+     * ({@code schema_wait_millis}).
      * <p>
      * Named apart from {@code connect} for the reason given on
      * {@link #connectWithCredentialSupplier(List, ClientTlsConfiguration, int, int, long, Supplier,
@@ -903,7 +946,9 @@ public class QwpWebSocketSender implements Sender {
             int connectionListenerInboxCapacity,
             int maxFrameRejections,
             long poisonMinEscalationWindowMillis,
-            long catchUpCapGapMinEscalationWindowMillis
+            long catchUpCapGapMinEscalationWindowMillis,
+            Sender.SchemaMode schemaMode,
+            long schemaWaitMillis
     ) {
         QwpWebSocketSender sender = new QwpWebSocketSender(
                 endpoints, tlsConfig,
@@ -925,6 +970,8 @@ public class QwpWebSocketSender implements Sender {
             sender.initialConnectMode = initialConnectMode == null
                     ? Sender.InitialConnectMode.OFF
                     : initialConnectMode;
+            sender.schemaMode = schemaMode == null ? Sender.SchemaMode.AUTO : schemaMode;
+            sender.schemaWaitMillis = schemaWaitMillis;
             if (errorHandler != null) {
                 sender.setErrorHandler(errorHandler);
             }
@@ -2818,11 +2865,6 @@ public class QwpWebSocketSender implements Sender {
     }
 
     @TestOnly
-    public void setSchemaWaitMillisForTesting(long millis) {
-        schemaWaitMillis = millis;
-    }
-
-    @TestOnly
     public void setCursorSendLoopForTesting(CursorWebSocketSendLoop loop) {
         cursorSendLoop = loop;
         if (connectionDispatcher == null) {
@@ -4301,6 +4343,10 @@ public class QwpWebSocketSender implements Sender {
             // the loop no longer fires a terminal budget-exhaustion event -- it
             // retries indefinitely.)
             cursorSendLoop.setConnectionDispatcher(connectionDispatcher);
+            // AUTO falls back to the legacy contract when the wire drops under a
+            // lookup, so the lookup must fail right away rather than ride the
+            // reconnect. STRICT keeps it pending for the replacement connection.
+            cursorSendLoop.setAbandonSchemaLookupOnDisconnect(schemaMode == Sender.SchemaMode.AUTO);
             cursorSendLoop.start();
         } catch (Throwable t) {
             // start() (or dispatcher construction) failed after cursorSendLoop was
@@ -4361,15 +4407,16 @@ public class QwpWebSocketSender implements Sender {
 
     /**
      * Selects the wire contract at an explicit table boundary or before the first
-     * effective value of an implicit row. In asynchronous initial-connect mode,
-     * fresh senders use the legacy contract until schema support is confirmed;
-     * recovered schema-framed data and senders that have already confirmed support
-     * retain the strict schema path.
+     * effective value of an implicit row.
      * <p>
      * A table pins one schema snapshot per batch. Once the table holds pending rows,
      * later rows of the same batch validate against that snapshot without consulting
      * the cache; the first row after a flush or reset adopts whatever the cache holds
      * by then, which ACK schema feedback and reconnects keep current.
+     * <p>
+     * When no snapshot is pinned, the configured {@link Sender.SchemaMode} decides
+     * between a schema lookup and the legacy contract; see
+     * {@link #resolveSchemaForCurrentTable()}.
      */
     private QwpSchemaBinding bindingForEffectiveWrite() {
         QwpSchemaBinding pinned = currentTableBuffer.getSchemaBinding();
@@ -4382,20 +4429,15 @@ public class QwpWebSocketSender implements Sender {
         }
         // A batch has one wire contract, because a QWP frame has one wire family.
         // While the pending batch holds legacy rows, later rows stay legacy even if
-        // a supporting handshake has landed since; the first row after the flush
-        // adopts schema mode. The upgrade is one-way, so a schema batch never
-        // reverts.
-        if ((pendingRowCount > 0 && isPendingBatchLegacy)
-                || (initialConnectMode == Sender.InitialConnectMode.ASYNC
-                && !cursorEngine.requiresSchema())) {
-            return null;
+        // a schema has become obtainable since; the first row after the flush
+        // consults the schema again.
+        if (pendingRowCount > 0 && isPendingBatchLegacy) {
+            return selectLegacyContract();
         }
-        final long deadlineNanos = System.nanoTime() + schemaWaitMillis * 1_000_000L;
-        if (!cursorSendLoop.awaitInitialSchemaMode(remainingSchemaMillis(deadlineNanos))) {
-            return null;
+        QwpSchemaResponse latest = resolveSchemaForCurrentTable();
+        if (latest == null) {
+            return selectLegacyContract();
         }
-        QwpSchemaResponse latest = cursorSendLoop.resolveSchema(
-                currentTableName, remainingSchemaMillis(deadlineNanos));
         if (pinned != null
                 && pinned.getTableId() == latest.getTableId()
                 && pinned.getMetadataVersion() == latest.getMetadataVersion()) {
@@ -4405,20 +4447,85 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Resolves the current table's schema under the configured
+     * {@link Sender.SchemaMode}, or returns {@code null} when the row must take the
+     * legacy contract: the mode is OFF, the server negotiated legacy QWP, or, in
+     * AUTO, the schema is not obtainable.
+     * <p>
+     * STRICT waits for the first upgrade and then for the lookup within one
+     * {@code schemaWaitMillis} budget and lets a lookup failure propagate. AUTO
+     * never waits on a dead wire: before the first upgrade it takes the legacy
+     * contract outright, while the wire is down it consults only the cache, and
+     * a lookup that ends in {@code SCHEMA_UNAVAILABLE} (a drop under it, a timeout,
+     * a server-side unavailability) selects the legacy contract instead of failing
+     * the row. Access denial and unsupported responses still fail the row.
+     */
+    private QwpSchemaResponse resolveSchemaForCurrentTable() {
+        if (schemaMode == Sender.SchemaMode.OFF) {
+            return null;
+        }
+        final long deadlineNanos = System.nanoTime() + schemaWaitMillis * 1_000_000L;
+        if (schemaMode == Sender.SchemaMode.STRICT) {
+            if (!cursorSendLoop.awaitInitialSchemaMode(remainingSchemaMillis(deadlineNanos))) {
+                return null;
+            }
+            return cursorSendLoop.resolveSchema(currentTableName, remainingSchemaMillis(deadlineNanos));
+        }
+        if (!cursorSendLoop.hasEverConnected() || !cursorEngine.requiresSchema()) {
+            return null;
+        }
+        if (!cursorSendLoop.isWireUp()) {
+            return cursorSendLoop.peekSchema(currentTableName);
+        }
+        try {
+            return cursorSendLoop.resolveSchema(currentTableName, remainingSchemaMillis(deadlineNanos));
+        } catch (LineSenderSchemaException e) {
+            if (e.getReason() == LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE) {
+                return null;
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Commits the current table's next row to the legacy contract. A pending
+     * schema batch cannot take a legacy row, because a QWP frame has one wire
+     * family, so it is published first; a buffer still bound to an earlier batch's
+     * snapshot is unbound so the legacy setters lay out its columns afresh.
+     */
+    private QwpSchemaBinding selectLegacyContract() {
+        if (pendingRowCount > 0 && !isPendingBatchLegacy) {
+            flushPendingRows(transactional);
+        }
+        if (currentTableBuffer.getSchemaBinding() != null) {
+            unbindCurrentTableBuffer();
+        }
+        return null;
+    }
+
+    /**
      * Binds the row-less current table buffer to {@code latest}. A buffer that has
      * been bound before, or that a flushed legacy batch left with a column layout
      * ({@link QwpTableBuffer#reset()} keeps columns), cannot take a new binding in
      * place; {@link QwpTableBuffer#clear()} drops both before rebinding.
      */
     private QwpSchemaBinding installSchemaBinding(QwpSchemaResponse latest) {
-        assert currentTableBuffer.getRowCount() == 0 : "schema binding replaced under pending rows";
         if (currentTableBuffer.getSchemaBinding() != null || currentTableBuffer.getColumnCount() != 0) {
-            currentTableBuffer.clear();
-            currentTableBufferSnapshotBytes = 0;
-            cachedTimestampColumn = null;
-            cachedTimestampNanosColumn = null;
+            unbindCurrentTableBuffer();
         }
         return new QwpSchemaBinding(currentTableBuffer, latest);
+    }
+
+    /**
+     * Drops the row-less current table buffer's binding and column layout so the
+     * next contract lays it out afresh.
+     */
+    private void unbindCurrentTableBuffer() {
+        assert currentTableBuffer.getRowCount() == 0 : "table buffer unbound under pending rows";
+        currentTableBuffer.clear();
+        currentTableBufferSnapshotBytes = 0;
+        cachedTimestampColumn = null;
+        cachedTimestampNanosColumn = null;
     }
 
     // Single home of the row-failure policy: roll the whole row back, then report

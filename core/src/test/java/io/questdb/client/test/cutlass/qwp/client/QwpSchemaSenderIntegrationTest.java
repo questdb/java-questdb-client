@@ -1153,10 +1153,12 @@ public class QwpSchemaSenderIntegrationTest {
     public void testLongArrayRejectionDoesNotDependOnDescribeAvailability() throws Exception {
         assertMemoryLeak(() -> {
             SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 91, 92);
-            try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
+            try (TestWebSocketServer server = schemaServer(handler);
+                 Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                         + ";schema_wait_millis=100;auto_flush_rows=2147483647;auto_flush_bytes=0;"
+                         + "auto_flush_interval=2147483646;close_flush_timeout_millis=0;")) {
                 sender.table("events").uuidColumn("id", 1, 2).atNow();
                 handler.respondToDescribe = false;
-                ((QwpWebSocketSender) sender).setSchemaWaitMillisForTesting(100);
                 sender.table("events").stringColumn("partial", "discard");
                 try {
                     sender.longArray("id", new long[]{99L});
@@ -1801,7 +1803,7 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test
-    public void testInvalidateAllFeedbackMakesNextBatchLookUpAndSurfaceFailure() throws Exception {
+    public void testStrictInvalidateAllFeedbackMakesNextBatchLookUpAndSurfaceFailure() throws Exception {
         assertMemoryLeak(() -> {
             int[] results = {
                     QwpSchemaProtocol.RESULT_DENIED,
@@ -1816,8 +1818,12 @@ public class QwpSchemaSenderIntegrationTest {
             for (int i = 0; i < results.length; i++) {
                 SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_MISSING, -1, -1);
                 handler.isSchemaFeedbackEnabled = true;
+                // STRICT surfaces every lookup failure; AUTO would write the
+                // RESULT_UNAVAILABLE case with the legacy contract instead.
                 try (TestWebSocketServer server = schemaServer(handler);
-                     Sender sender = sender(server)) {
+                     Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                             + ";schema_mode=strict;auto_flush_rows=2147483647;auto_flush_bytes=0;"
+                             + "auto_flush_interval=2147483646;close_flush_timeout_millis=0;")) {
                     sender.table("events").longColumn("id", 1).atNow();
                     handler.result = results[i];
                     // The pending batch never consults the server: the conflict is
@@ -2186,17 +2192,17 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test(timeout = 10_000)
-    public void testSchemaLookupDeadlineFailsTypedThenRetryUsesAvailableSchema() throws Exception {
+    public void testStrictSchemaLookupDeadlineFailsTypedThenRetryUsesAvailableSchema() throws Exception {
         assertMemoryLeak(() -> {
             SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 91, 92);
             try (TestWebSocketServer server = schemaServer(handler);
                  Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
-                         + ";initial_connect_retry=async;reconnect_initial_backoff_millis=10;"
+                         + ";schema_mode=strict;schema_wait_millis=1000;"
+                         + "initial_connect_retry=async;reconnect_initial_backoff_millis=10;"
                          + "reconnect_max_backoff_millis=50;auto_flush_rows=2147483647;"
                          + "auto_flush_bytes=0;auto_flush_interval=2147483646;"
                          + "close_flush_timeout_millis=0;")) {
                 Assert.assertTrue("schema-capable connection was not installed", handler.awaitPong());
-                ((QwpWebSocketSender) sender).setSchemaWaitMillisForTesting(1_000);
                 QwpTableBuffer b = ((QwpWebSocketSender) sender).getTableBuffer("b");
                 sender.table("events").uuidColumn("id", 1, 2).atNow();
                 QwpTableBuffer events = ((QwpWebSocketSender) sender).getTableBuffer("events");
@@ -2221,13 +2227,13 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test
-    public void testInterruptedSchemaLookupFailsTypedAndPreservesInterrupt() throws Exception {
+    public void testStrictInterruptedSchemaLookupFailsTypedAndPreservesInterrupt() throws Exception {
         assertMemoryLeak(() -> {
             SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 93, 94);
             handler.respondToDescribe = false;
             try (TestWebSocketServer server = schemaServer(handler);
                  Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
-                         + ";initial_connect_retry=async;reconnect_initial_backoff_millis=10;"
+                         + ";schema_mode=strict;initial_connect_retry=async;reconnect_initial_backoff_millis=10;"
                          + "reconnect_max_backoff_millis=50;close_flush_timeout_millis=0;")) {
                 Assert.assertTrue("schema-capable connection was not installed", handler.awaitPong());
                 ExecutorService executor = Executors.newSingleThreadExecutor();
@@ -2261,36 +2267,278 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test(timeout = 10_000)
-    public void testAsyncRecoveredSchemaBacklogDoesNotFallBackToLegacy() throws Exception {
+    public void testStrictAsyncRecoveredSchemaBacklogWaitsForNegotiation() throws Exception {
         assertMemoryLeak(() -> {
             File sfRoot = temporaryFolder.newFolder("schema-required-recovery");
-            SchemaHandler handler = new SchemaHandler(
-                    QwpSchemaProtocol.RESULT_KNOWN, 95, 96, false);
-            int unavailablePort;
-            try (TestWebSocketServer server = schemaServer(handler)) {
-                String cfg = "ws::addr=localhost:" + server.getPort()
-                        + ";sf_dir=" + sfRoot.getAbsolutePath()
-                        + ";sender_id=recovery;close_flush_timeout_millis=0;";
-                try (Sender sender = Sender.fromConfig(cfg)) {
-                    sender.table("events").uuidColumn("id", 1, 2).atNow();
-                    sender.flush();
-                    Assert.assertTrue((handler.awaitDataFrame()[QwpConstants.HEADER_OFFSET_FLAGS]
-                            & QwpConstants.FLAG_SCHEMA) != 0);
-                }
-                unavailablePort = TestPorts.findUnusedPort();
-            }
+            int unavailablePort = publishUnackedSchemaBacklog(sfRoot, 95, 96);
 
+            // STRICT never takes the legacy contract once schema support is known,
+            // and the recovered backlog already requires it. With no server the
+            // wait runs out its configured budget and fails typed.
             try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + unavailablePort
                     + ";sf_dir=" + sfRoot.getAbsolutePath()
-                    + ";sender_id=recovery;initial_connect_retry=async;"
+                    + ";sender_id=recovery;initial_connect_retry=async;schema_mode=strict;"
+                    + "schema_wait_millis=250;"
                     + "reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=50;"
                     + "close_flush_timeout_millis=0;")) {
-                ((QwpWebSocketSender) sender).setSchemaWaitMillisForTesting(250);
                 try {
                     sender.table("events");
                     Assert.fail("recovered schema-required backlog fell back to legacy encoding");
                 } catch (LineSenderSchemaException e) {
                     Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE, e.getReason());
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 10_000)
+    public void testAutoAsyncRecoveredSchemaBacklogWritesLegacyOfflineAndReplaysBacklog() throws Exception {
+        assertMemoryLeak(() -> {
+            File sfRoot = temporaryFolder.newFolder("schema-required-recovery-auto");
+            int port = publishUnackedSchemaBacklog(sfRoot, 97, 98);
+
+            TestWebSocketServer server = null;
+            try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + port
+                    + ";sf_dir=" + sfRoot.getAbsolutePath()
+                    + ";sender_id=recovery;initial_connect_retry=async;"
+                    + "reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=50;"
+                    + "auto_flush_rows=2147483647;auto_flush_bytes=0;auto_flush_interval=2147483646;"
+                    + "close_flush_timeout_millis=0;")) {
+                // AUTO (the default) never waits on a wire that has not come up. The
+                // recovered backlog still pins the capability requirement for the
+                // reconnect, but this row takes the legacy contract right away.
+                sender.table("events").stringColumn("legacy_value", "A").atNow();
+
+                SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 97, 98);
+                server = new TestWebSocketServer(handler, false, null, port);
+                server.setAdvertiseSchema(true);
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                Assert.assertTrue("schema-capable connection was not installed", handler.awaitPong());
+                sender.flush();
+
+                // The recovered schema frame replays first, then the legacy batch.
+                List<byte[]> frames = handler.awaitDataFrames(2);
+                FrameReader recovered = new FrameReader(frames.get(0));
+                recovered.schemaTable("events", 97, 98, 1, "id", QwpConstants.TYPE_UUID);
+                Assert.assertEquals(0, recovered.u8());
+                Assert.assertEquals(1, recovered.i64());
+                Assert.assertEquals(2, recovered.i64());
+                recovered.eof();
+                new FrameReader(frames.get(1)).legacyVarcharTable("events", "legacy_value", "A");
+                Assert.assertEquals(0, handler.describeRequests.get());
+            } finally {
+                if (server != null) {
+                    server.close();
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 10_000)
+    public void testAutoOutageWritesUnseenTableLegacyAndNextBatchAdoptsSchema() throws Exception {
+        assertMemoryLeak(() -> {
+            int port = TestPorts.findUnusedPort();
+            SchemaHandler first = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 111, 112);
+            TestWebSocketServer server = schemaServer(first, port);
+            CountDownLatch disconnected = new CountDownLatch(1);
+            Sender sender = outageSender(port, "", disconnected);
+            TestWebSocketServer restarted = null;
+            try {
+                sender.table("events").uuidColumn("id", 1, 2).atNow();
+                sender.flush();
+                Assert.assertTrue((first.awaitDataFrame()[QwpConstants.HEADER_OFFSET_FLAGS]
+                        & QwpConstants.FLAG_SCHEMA) != 0);
+                server.close();
+                Assert.assertTrue("sender did not observe the connection closing",
+                        disconnected.await(5, TimeUnit.SECONDS));
+
+                // The wire is down and "other" is not cached. AUTO must not wait out
+                // the 30 s default schema budget (the test timeout proves it); the row
+                // takes the legacy contract and queues in store-and-forward.
+                sender.table("other").stringColumn("legacy_value", "A").atNow();
+
+                SchemaHandler second = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 113, 114);
+                restarted = schemaServer(second, port);
+                Assert.assertTrue("schema-capable connection was not installed", second.awaitPong());
+                sender.flush();
+                // The first row after the flush consults the schema again: "other" is
+                // looked up on the fresh connection and adopts the strict contract.
+                sender.table("other").uuidColumn("id", 3, 4).atNow();
+                sender.flush();
+
+                List<byte[]> frames = second.awaitDataFrames(2);
+                new FrameReader(frames.get(0)).legacyVarcharTable("other", "legacy_value", "A");
+                FrameReader schema = new FrameReader(frames.get(1));
+                schema.schemaTable("other", 113, 114, 1, "id", QwpConstants.TYPE_UUID);
+                Assert.assertEquals(0, schema.u8());
+                Assert.assertEquals(3, schema.i64());
+                Assert.assertEquals(4, schema.i64());
+                schema.eof();
+                Assert.assertEquals(1, second.describeRequests.get());
+            } finally {
+                sender.close();
+                server.close();
+                if (restarted != null) {
+                    restarted.close();
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 10_000)
+    public void testAutoOutagePublishesPendingSchemaBatchBeforeLegacyRow() throws Exception {
+        assertMemoryLeak(() -> {
+            int port = TestPorts.findUnusedPort();
+            SchemaHandler first = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 121, 122);
+            TestWebSocketServer server = schemaServer(first, port);
+            CountDownLatch disconnected = new CountDownLatch(1);
+            Sender sender = outageSender(port, "", disconnected);
+            TestWebSocketServer restarted = null;
+            try {
+                // A schema row is pending and unflushed when the wire drops.
+                sender.table("events").uuidColumn("id", 1, 2).atNow();
+                server.close();
+                Assert.assertTrue("sender did not observe the connection closing",
+                        disconnected.await(5, TimeUnit.SECONDS));
+
+                // A QWP frame has one wire family: the legacy row cannot join the
+                // pending schema batch, so that batch is published to store-and-forward
+                // first and the legacy row opens a new batch.
+                sender.table("other").stringColumn("legacy_value", "A").atNow();
+                Assert.assertEquals(0, ((QwpWebSocketSender) sender).getTableBuffer("events").getRowCount());
+
+                SchemaHandler second = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 121, 122);
+                restarted = schemaServer(second, port);
+                Assert.assertTrue("schema-capable connection was not installed", second.awaitPong());
+                sender.flush();
+
+                List<byte[]> frames = second.awaitDataFrames(2);
+                FrameReader schema = new FrameReader(frames.get(0));
+                schema.schemaTable("events", 121, 122, 1, "id", QwpConstants.TYPE_UUID);
+                Assert.assertEquals(0, schema.u8());
+                Assert.assertEquals(1, schema.i64());
+                Assert.assertEquals(2, schema.i64());
+                schema.eof();
+                new FrameReader(frames.get(1)).legacyVarcharTable("other", "legacy_value", "A");
+                Assert.assertEquals(0, second.describeRequests.get());
+            } finally {
+                sender.close();
+                server.close();
+                if (restarted != null) {
+                    restarted.close();
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 10_000)
+    public void testStrictOutageFailsUnseenTableWithinSchemaWaitAndRecovers() throws Exception {
+        assertMemoryLeak(() -> {
+            int port = TestPorts.findUnusedPort();
+            SchemaHandler first = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 131, 132);
+            TestWebSocketServer server = schemaServer(first, port);
+            CountDownLatch disconnected = new CountDownLatch(1);
+            Sender sender = outageSender(port, "schema_mode=strict;schema_wait_millis=250;", disconnected);
+            TestWebSocketServer restarted = null;
+            try {
+                sender.table("events").uuidColumn("id", 1, 2).atNow();
+                sender.flush();
+                Assert.assertTrue((first.awaitDataFrame()[QwpConstants.HEADER_OFFSET_FLAGS]
+                        & QwpConstants.FLAG_SCHEMA) != 0);
+                server.close();
+                Assert.assertTrue("sender did not observe the connection closing",
+                        disconnected.await(5, TimeUnit.SECONDS));
+
+                // STRICT keeps waiting for the wire and fails typed at the budget.
+                try {
+                    sender.table("other");
+                    Assert.fail("STRICT fell back to legacy encoding during an outage");
+                } catch (LineSenderSchemaException e) {
+                    Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE, e.getReason());
+                }
+                // A cached table is still writable offline: "events" was pinned by the
+                // flushed batch's snapshot and the cache survives until reconnect.
+                sender.table("events").uuidColumn("id", 3, 4).atNow();
+
+                SchemaHandler second = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 131, 132);
+                restarted = schemaServer(second, port);
+                Assert.assertTrue("schema-capable connection was not installed", second.awaitPong());
+                sender.table("other").uuidColumn("id", 5, 6).atNow();
+                sender.flush();
+
+                List<byte[]> frames = second.awaitDataFrames(1);
+                Assert.assertTrue((frames.get(0)[QwpConstants.HEADER_OFFSET_FLAGS]
+                        & QwpConstants.FLAG_SCHEMA) != 0);
+                Assert.assertEquals(2, ByteBuffer.wrap(frames.get(0)).order(ByteOrder.LITTLE_ENDIAN)
+                        .getShort(6) & 0xffff);
+                Assert.assertEquals(1, second.describeRequests.get());
+            } finally {
+                sender.close();
+                server.close();
+                if (restarted != null) {
+                    restarted.close();
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 10_000)
+    public void testSchemaModeOffNeverDescribesOnSchemaCapableServer() throws Exception {
+        assertMemoryLeak(() -> {
+            SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 141, 142);
+            try (TestWebSocketServer server = schemaServer(handler);
+                 Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                         + ";schema_mode=off;auto_flush_rows=2147483647;auto_flush_bytes=0;"
+                         + "auto_flush_interval=2147483646;close_flush_timeout_millis=0;")) {
+                sender.table("events").stringColumn("legacy_value", "A").atNow();
+                sender.flush();
+                new FrameReader(handler.awaitDataFrame()).legacyVarcharTable("events", "legacy_value", "A");
+                Assert.assertEquals(0, handler.describeRequests.get());
+            }
+        });
+    }
+
+    @Test(timeout = 10_000)
+    public void testAutoAbandonsLookupWhenWireDropsUnderIt() throws Exception {
+        assertMemoryLeak(() -> {
+            int port = TestPorts.findUnusedPort();
+            SchemaHandler first = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 151, 152);
+            first.respondToDescribe = false;
+            TestWebSocketServer server = schemaServer(first, port);
+            CountDownLatch disconnected = new CountDownLatch(1);
+            // A budget far beyond the test timeout: only the wire drop can end the wait.
+            Sender sender = outageSender(port, "schema_wait_millis=60000;", disconnected);
+            ExecutorService executor = Executors.newSingleThreadExecutor();
+            TestWebSocketServer restarted = null;
+            try {
+                Future<?> row = executor.submit(() -> {
+                    sender.table("events").stringColumn("legacy_value", "A").atNow();
+                    return null;
+                });
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                while (first.describeRequests.get() == 0) {
+                    Assert.assertTrue("lookup was never sent", System.nanoTime() < deadline);
+                    Thread.sleep(5);
+                }
+                server.close();
+                Assert.assertTrue("sender did not observe the connection closing",
+                        disconnected.await(5, TimeUnit.SECONDS));
+                // The connection loss fails the pending lookup and AUTO falls back to
+                // the legacy contract instead of sitting out the schema budget.
+                row.get(5, TimeUnit.SECONDS);
+
+                SchemaHandler second = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 151, 152);
+                restarted = schemaServer(second, port);
+                Assert.assertTrue("schema-capable connection was not installed", second.awaitPong());
+                sender.flush();
+                new FrameReader(second.awaitDataFrame()).legacyVarcharTable("events", "legacy_value", "A");
+            } finally {
+                executor.shutdownNow();
+                sender.close();
+                server.close();
+                if (restarted != null) {
+                    restarted.close();
                 }
             }
         });
@@ -2410,8 +2658,54 @@ public class QwpSchemaSenderIntegrationTest {
         }
     }
 
+    /**
+     * A sender for the outage tests: no auto-flush, fast reconnect backoff, and a
+     * connection listener that trips {@code disconnected} when the wire drops.
+     * {@code extraConfig} is appended verbatim (e.g. {@code schema_mode=strict;}).
+     */
+    private static Sender outageSender(int port, String extraConfig, CountDownLatch disconnected) {
+        return Sender.builder("ws::addr=localhost:" + port
+                        + ";auto_flush_rows=2147483647;auto_flush_bytes=0;auto_flush_interval=2147483646;"
+                        + "reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=50;"
+                        + "close_flush_timeout_millis=0;" + extraConfig)
+                .connectionListener(event -> {
+                    if (event.getKind() == SenderConnectionEvent.Kind.DISCONNECTED) {
+                        disconnected.countDown();
+                    }
+                })
+                .build();
+    }
+
+    /**
+     * Writes one schema-encoded UUID row for "events" through a sender rooted at
+     * {@code sfRoot} against a server that never acknowledges data, so the frame
+     * stays in store-and-forward for a later sender to recover. Returns the port
+     * the server listened on, which is free again when this method returns.
+     */
+    private static int publishUnackedSchemaBacklog(File sfRoot, int tableId, long version) throws Exception {
+        SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, tableId, version, false);
+        try (TestWebSocketServer server = schemaServer(handler)) {
+            String cfg = "ws::addr=localhost:" + server.getPort()
+                    + ";sf_dir=" + sfRoot.getAbsolutePath()
+                    + ";sender_id=recovery;close_flush_timeout_millis=0;";
+            try (Sender sender = Sender.fromConfig(cfg)) {
+                sender.table("events").uuidColumn("id", 1, 2).atNow();
+                sender.flush();
+                Assert.assertTrue((handler.awaitDataFrame()[QwpConstants.HEADER_OFFSET_FLAGS]
+                        & QwpConstants.FLAG_SCHEMA) != 0);
+            }
+            return server.getPort();
+        }
+    }
+
     private static TestWebSocketServer schemaServer(TestWebSocketServer.WebSocketServerHandler handler) throws Exception {
         TestWebSocketServer server = new TestWebSocketServer(handler);
+        server.setAdvertiseSchema(true);
+        return start(server);
+    }
+
+    private static TestWebSocketServer schemaServer(TestWebSocketServer.WebSocketServerHandler handler, int port) throws Exception {
+        TestWebSocketServer server = new TestWebSocketServer(handler, false, null, port);
         server.setAdvertiseSchema(true);
         return start(server);
     }
