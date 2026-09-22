@@ -1917,16 +1917,19 @@ public class QwpSchemaSenderIntegrationTest {
     @Test
     public void testOldPeerUsesLegacyFrameAndNeverDescribes() throws Exception {
         assertMemoryLeak(() -> {
-            SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 1, 1);
-            try (TestWebSocketServer server = legacyServer(handler);
-                 Sender sender = sender(server)) {
-                sender.table("events").stringColumn("value", "legacy").atNow();
-                sender.flush();
-                byte[] frame = handler.awaitDataFrame();
-                Assert.assertEquals(0, frame[QwpConstants.HEADER_OFFSET_FLAGS] & QwpConstants.FLAG_SCHEMA);
-                FrameReader reader = new FrameReader(frame);
-                reader.legacyVarcharTable("events", "value", "legacy");
-                Assert.assertEquals(0, handler.describeRequests.get());
+            for (boolean isStrict : new boolean[]{false, true}) {
+                SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 1, 1);
+                try (TestWebSocketServer server = legacyServer(handler);
+                     Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                             + ";schema_mode=" + (isStrict ? "strict" : "auto") + ";close_flush_timeout_millis=0;")) {
+                    sender.table("events").stringColumn("value", "legacy").atNow();
+                    sender.flush();
+                    byte[] frame = handler.awaitDataFrame();
+                    Assert.assertEquals(0, frame[QwpConstants.HEADER_OFFSET_FLAGS] & QwpConstants.FLAG_SCHEMA);
+                    FrameReader reader = new FrameReader(frame);
+                    reader.legacyVarcharTable("events", "value", "legacy");
+                    Assert.assertEquals(0, handler.describeRequests.get());
+                }
             }
         });
     }
@@ -2041,65 +2044,67 @@ public class QwpSchemaSenderIntegrationTest {
     @Test
     public void testPendingLegacyBatchStaysLegacyAcrossUpgradeAndNextBatchAdoptsSchema() throws Exception {
         assertMemoryLeak(() -> {
-            int port = TestPorts.findUnusedPort();
-            SchemaHandler legacyHandler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 1, 1);
-            TestWebSocketServer legacy = new TestWebSocketServer(legacyHandler, false, null, port);
-            legacy.start();
-            Assert.assertTrue(legacy.awaitStart(5, TimeUnit.SECONDS));
-            CountDownLatch disconnected = new CountDownLatch(1);
-            Sender sender = Sender.builder("ws::addr=localhost:" + port
-                    + ";auto_flush_rows=2147483647;auto_flush_bytes=0;auto_flush_interval=2147483646;"
-                    + "reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=50;"
-                    + "close_flush_timeout_millis=0;")
-                    .connectionListener(event -> {
-                        if (event.getKind() == SenderConnectionEvent.Kind.DISCONNECTED) {
-                            disconnected.countDown();
-                        }
-                    })
-                    .build();
-            TestWebSocketServer upgraded = null;
-            try {
-                sender.table("events").stringColumn("legacy_value", "A").atNow();
-                legacy.close();
-                Assert.assertTrue("sender did not observe the legacy connection closing",
-                        disconnected.await(5, TimeUnit.SECONDS));
-                sender.table("events").stringColumn("legacy_value", "B");
-                SchemaHandler schemaHandler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 61, 62);
-                upgraded = new TestWebSocketServer(schemaHandler, false, null, port);
-                upgraded.setAdvertiseSchema(true);
-                upgraded.start();
-                Assert.assertTrue(upgraded.awaitStart(5, TimeUnit.SECONDS));
-                Assert.assertTrue("schema-capable connection was not installed and servicing frames",
-                        schemaHandler.awaitPong());
-                sender.atNow();
-                // A batch has one wire contract: the pending batch already holds
-                // legacy rows, so this row stays legacy although the supporting
-                // connection is up. The first row after the flush adopts schema mode.
-                sender.table("events").stringColumn("legacy_value", "C").atNow();
-                sender.flush();
-                sender.table("events").uuidColumn("id", 3, 4).atNow();
-                sender.flush();
-                List<byte[]> frames = schemaHandler.awaitDataFrames(2);
-                Assert.assertEquals(0, frames.get(0)[QwpConstants.HEADER_OFFSET_FLAGS] & QwpConstants.FLAG_SCHEMA);
-                Assert.assertEquals(0, frames.get(0)[QwpConstants.HEADER_OFFSET_FLAGS]
-                        & QwpConstants.FLAG_DEFER_COMMIT);
-                Assert.assertTrue((frames.get(1)[QwpConstants.HEADER_OFFSET_FLAGS]
-                        & QwpConstants.FLAG_SCHEMA) != 0);
-                Assert.assertEquals(0, frames.get(1)[QwpConstants.HEADER_OFFSET_FLAGS]
-                        & QwpConstants.FLAG_DEFER_COMMIT);
-                new FrameReader(frames.get(0)).legacyVarcharTable("events", "legacy_value", "A", "B", "C");
-                FrameReader schema = new FrameReader(frames.get(1));
-                schema.schemaTable("events", 61, 62, 1, "id", QwpConstants.TYPE_UUID);
-                Assert.assertEquals(0, schema.u8());
-                Assert.assertEquals(3, schema.i64());
-                Assert.assertEquals(4, schema.i64());
-                schema.eof();
-                Assert.assertEquals(1, schemaHandler.describeRequests.get());
-            } finally {
-                sender.close();
-                legacy.close();
-                if (upgraded != null) {
-                    upgraded.close();
+            for (boolean isStrict : new boolean[]{false, true}) {
+                int port = TestPorts.findUnusedPort();
+                SchemaHandler legacyHandler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 1, 1);
+                TestWebSocketServer legacy = new TestWebSocketServer(legacyHandler, false, null, port);
+                legacy.start();
+                Assert.assertTrue(legacy.awaitStart(5, TimeUnit.SECONDS));
+                CountDownLatch disconnected = new CountDownLatch(1);
+                Sender sender = Sender.builder("ws::addr=localhost:" + port
+                        + ";schema_mode=" + (isStrict ? "strict" : "auto") + ";auto_flush_rows=2147483647;auto_flush_bytes=0;auto_flush_interval=2147483646;"
+                        + "reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=50;"
+                        + "close_flush_timeout_millis=0;")
+                        .connectionListener(event -> {
+                            if (event.getKind() == SenderConnectionEvent.Kind.DISCONNECTED) {
+                                disconnected.countDown();
+                            }
+                        })
+                        .build();
+                TestWebSocketServer upgraded = null;
+                try {
+                    sender.table("events").stringColumn("legacy_value", "A").atNow();
+                    legacy.close();
+                    Assert.assertTrue("sender did not observe the legacy connection closing",
+                            disconnected.await(5, TimeUnit.SECONDS));
+                    sender.table("events").stringColumn("legacy_value", "B");
+                    SchemaHandler schemaHandler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 61, 62);
+                    upgraded = new TestWebSocketServer(schemaHandler, false, null, port);
+                    upgraded.setAdvertiseSchema(true);
+                    upgraded.start();
+                    Assert.assertTrue(upgraded.awaitStart(5, TimeUnit.SECONDS));
+                    Assert.assertTrue("schema-capable connection was not installed and servicing frames",
+                            schemaHandler.awaitPong());
+                    sender.atNow();
+                    // A batch has one wire contract: the pending batch already holds
+                    // legacy rows, so this row stays legacy although the supporting
+                    // connection is up. The first row after the flush adopts schema mode.
+                    sender.table("events").stringColumn("legacy_value", "C").atNow();
+                    sender.flush();
+                    sender.table("events").uuidColumn("id", 3, 4).atNow();
+                    sender.flush();
+                    List<byte[]> frames = schemaHandler.awaitDataFrames(2);
+                    Assert.assertEquals(0, frames.get(0)[QwpConstants.HEADER_OFFSET_FLAGS] & QwpConstants.FLAG_SCHEMA);
+                    Assert.assertEquals(0, frames.get(0)[QwpConstants.HEADER_OFFSET_FLAGS]
+                            & QwpConstants.FLAG_DEFER_COMMIT);
+                    Assert.assertTrue((frames.get(1)[QwpConstants.HEADER_OFFSET_FLAGS]
+                            & QwpConstants.FLAG_SCHEMA) != 0);
+                    Assert.assertEquals(0, frames.get(1)[QwpConstants.HEADER_OFFSET_FLAGS]
+                            & QwpConstants.FLAG_DEFER_COMMIT);
+                    new FrameReader(frames.get(0)).legacyVarcharTable("events", "legacy_value", "A", "B", "C");
+                    FrameReader schema = new FrameReader(frames.get(1));
+                    schema.schemaTable("events", 61, 62, 1, "id", QwpConstants.TYPE_UUID);
+                    Assert.assertEquals(0, schema.u8());
+                    Assert.assertEquals(3, schema.i64());
+                    Assert.assertEquals(4, schema.i64());
+                    schema.eof();
+                    Assert.assertEquals(1, schemaHandler.describeRequests.get());
+                } finally {
+                    sender.close();
+                    legacy.close();
+                    if (upgraded != null) {
+                        upgraded.close();
+                    }
                 }
             }
         });
@@ -2483,6 +2488,106 @@ public class QwpSchemaSenderIntegrationTest {
         });
     }
 
+    @Test(timeout = 15_000)
+    public void testOffRetainedLegacyFramesFailOverFromCapableToLegacyPeer() throws Exception {
+        assertMemoryLeak(() -> {
+            int port = TestPorts.findUnusedPort();
+            SchemaHandler first = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 141, 142, false);
+            TestWebSocketServer server = schemaServer(first, port);
+            CountDownLatch disconnected = new CountDownLatch(1);
+            Sender sender = outageSender(port, "schema_mode=off;", disconnected);
+            TestWebSocketServer replacement = null;
+            try {
+                sender.table("events").stringColumn("legacy_value", "A").atNow();
+                sender.flush();
+                byte[] retained = first.awaitDataFrame();
+                server.close();
+                Assert.assertTrue(disconnected.await(5, TimeUnit.SECONDS));
+                SchemaHandler second = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 141, 142);
+                replacement = start(new TestWebSocketServer(second, false, null, port));
+                Assert.assertArrayEquals(retained, second.awaitDataFrame());
+                Assert.assertTrue(sender.drain(5_000));
+                Assert.assertFalse(server.hasRequestedSchema());
+                Assert.assertFalse(replacement.hasRequestedSchema());
+                Assert.assertEquals(0, first.describeRequests.get());
+                Assert.assertEquals(0, second.describeRequests.get());
+            } finally {
+                sender.close();
+                server.close();
+                if (replacement != null) {
+                    replacement.close();
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 15_000)
+    public void testStrictRemembersSchemaHandshakeWithoutPublishedFrames() throws Exception {
+        assertMemoryLeak(() -> {
+            int port = TestPorts.findUnusedPort();
+            SchemaHandler first = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 141, 142);
+            TestWebSocketServer server = schemaServer(first, port);
+            CountDownLatch disconnected = new CountDownLatch(1);
+            Sender sender = outageSender(port, "schema_mode=strict;schema_wait_millis=100;", disconnected);
+            TestWebSocketServer replacement = null;
+            try {
+                Assert.assertTrue(first.awaitPong());
+                server.close();
+                Assert.assertTrue(disconnected.await(5, TimeUnit.SECONDS));
+                LineSenderSchemaException outage = Assert.assertThrows(LineSenderSchemaException.class,
+                        () -> sender.table("events"));
+                Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE, outage.getReason());
+                SchemaHandler second = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 141, 142);
+                replacement = start(new TestWebSocketServer(second, false, null, port));
+                Assert.assertTrue("legacy replacement was not installed", second.awaitPong());
+                LineSenderSchemaException downgrade = Assert.assertThrows(LineSenderSchemaException.class,
+                        () -> sender.table("other"));
+                Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE, downgrade.getReason());
+                Assert.assertEquals(0, first.describeRequests.get());
+                Assert.assertEquals(0, second.describeRequests.get());
+                Assert.assertEquals(0, second.dataFrames.size());
+            } finally {
+                sender.close();
+                server.close();
+                if (replacement != null) {
+                    replacement.close();
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 15_000)
+    public void testAutoDowngradesBeforePublishingSchemaFrames() throws Exception {
+        assertMemoryLeak(() -> {
+            int port = TestPorts.findUnusedPort();
+            SchemaHandler first = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 141, 142);
+            TestWebSocketServer server = schemaServer(first, port);
+            CountDownLatch disconnected = new CountDownLatch(1);
+            Sender sender = outageSender(port, "", disconnected);
+            TestWebSocketServer replacement = null;
+            try {
+                // Lookup alone must not turn a schema-capable peer into a replay requirement.
+                sender.table("events");
+                Assert.assertEquals(1, first.describeRequests.get());
+                server.close();
+                Assert.assertTrue(disconnected.await(5, TimeUnit.SECONDS));
+                SchemaHandler second = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 141, 142);
+                replacement = start(new TestWebSocketServer(second, false, null, port));
+                Assert.assertTrue("legacy replacement was not installed", second.awaitPong());
+                sender.table("other").stringColumn("legacy_value", "A").atNow();
+                sender.flush();
+                new FrameReader(second.awaitDataFrame()).legacyVarcharTable("other", "legacy_value", "A");
+                Assert.assertEquals(0, second.describeRequests.get());
+            } finally {
+                sender.close();
+                server.close();
+                if (replacement != null) {
+                    replacement.close();
+                }
+            }
+        });
+    }
+
     @Test(timeout = 10_000)
     public void testSchemaModeOffNeverDescribesOnSchemaCapableServer() throws Exception {
         assertMemoryLeak(() -> {
@@ -2495,6 +2600,7 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.flush();
                 new FrameReader(handler.awaitDataFrame()).legacyVarcharTable("events", "legacy_value", "A");
                 Assert.assertEquals(0, handler.describeRequests.get());
+                Assert.assertFalse(server.hasRequestedSchema());
             }
         });
     }

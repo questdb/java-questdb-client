@@ -126,6 +126,7 @@ public class TestWebSocketServer implements Closeable {
     // several frames. Live-updatable via setAdvertisedMaxBatchSize().
     private volatile int advertisedMaxBatchSize;
     private volatile boolean advertiseSchema;
+    private volatile boolean hasRequestedSchema;
 
     public TestWebSocketServer(WebSocketServerHandler handler) throws IOException {
         this(handler, false);
@@ -229,6 +230,10 @@ public class TestWebSocketServer implements Closeable {
      */
     public int getPort() {
         return port;
+    }
+
+    public boolean hasRequestedSchema() {
+        return hasRequestedSchema;
     }
 
     /**
@@ -622,6 +627,8 @@ public class TestWebSocketServer implements Closeable {
                 return false;
             }
             capturedAuthHeaders.add(authorization);
+            hasRequestedSchema |= request.toString().toLowerCase(java.util.Locale.ROOT)
+                    .contains("x-qwp-request-schema: true\r\n");
 
             // Read-path reject: drop the egress upgrade before the 101 so the
             // query pool's connect fails fast, while ingest write-path upgrades

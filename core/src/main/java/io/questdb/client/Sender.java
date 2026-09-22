@@ -878,16 +878,17 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      *       the first upgrade, because the server's capability is unknown until
      *       then.</li>
      *   <li>{@link #OFF} — every row uses the legacy conversion contract and
-     *       the sender never looks up schemas. The WebSocket upgrade is
-     *       unchanged, so schema-encoded backlog recovered from a
-     *       store-and-forward directory still replays.</li>
+     *       the sender never looks up schemas. It requests schema support only
+     *       when its stream must replay schema-encoded backlog recovered from
+     *       a store-and-forward directory. Legacy-only streams can fail over
+     *       to servers without schema support.</li>
      * </ul>
      * <p>
      * A batch keeps the contract under which its first row was written: rows
      * added to a pending legacy batch stay legacy even after a schema becomes
      * obtainable, and a pending schema batch is published before a legacy row
-     * starts a new batch. A server that negotiates legacy QWP gets legacy rows
-     * in every mode.
+     * starts a new batch. STRICT permits legacy rows only until a connection
+     * successfully negotiates schema support.
      */
     enum SchemaMode {
         AUTO,

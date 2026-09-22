@@ -395,9 +395,6 @@ public class QwpWebSocketSender implements Sender {
     private long reconnectMaxDurationMillis =
             CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_DURATION_MILLIS;
     private boolean requestDurableAck;
-    // One-way owner capability: shared by foreground and every background
-    // reconnect supplier created by this sender.
-    private volatile boolean schemaRequired;
     // Row-encoding contract when a schema is not obtainable; see
     // resolveSchemaForCurrentTable().
     private Sender.SchemaMode schemaMode = Sender.SchemaMode.AUTO;
@@ -3598,10 +3595,10 @@ public class QwpWebSocketSender implements Sender {
                 newClient.setQwpMaxVersion(QwpConstants.VERSION);
                 newClient.setQwpClientId(QwpConstants.CLIENT_ID);
                 newClient.setQwpRequestDurableAck(requestDurableAck);
-                // Every Sender connection probes the schema extension. Absence on the
-                // first successful handshake selects legacy mode; once confirmation is
-                // observed, the existing engine/factory latch makes it mandatory.
-                newClient.requestQwpSchema();
+                // OFF still negotiates when this stream must replay schema frames.
+                if (schemaMode != Sender.SchemaMode.OFF || ctx.requiresSchema()) {
+                    newClient.requestQwpSchema();
+                }
                 newClient.setConnectTimeout(effectiveConnectTimeoutMs(background, connectTimeoutMs));
                 if (cancellation != null) {
                     // Publish the client we are about to block on so a
@@ -4471,11 +4468,14 @@ public class QwpWebSocketSender implements Sender {
             }
             return cursorSendLoop.resolveSchema(currentTableName, remainingSchemaMillis(deadlineNanos));
         }
-        if (!cursorSendLoop.hasEverConnected() || !cursorEngine.requiresSchema()) {
+        if (!cursorSendLoop.hasEverConnected()) {
             return null;
         }
         if (!cursorSendLoop.isWireUp()) {
             return cursorSendLoop.peekSchema(currentTableName);
+        }
+        if (!cursorSendLoop.isSchemaEnabled()) {
+            return null;
         }
         try {
             return cursorSendLoop.resolveSchema(currentTableName, remainingSchemaMillis(deadlineNanos));
@@ -5767,6 +5767,8 @@ public class QwpWebSocketSender implements Sender {
          */
         private final java.util.function.BooleanSupplier abortCheck;
         private final String abortMessage;
+        // Each factory serves one engine; other streams can still use legacy peers.
+        private volatile boolean hasSchemaRequirement;
         private int previousIdx = -1;
 
         private ReconnectSupplier() {
@@ -5804,12 +5806,12 @@ public class QwpWebSocketSender implements Sender {
         }
 
         boolean requiresSchema() {
-            return schemaRequired;
+            return hasSchemaRequirement;
         }
 
         @Override
         public void requireSchema() {
-            schemaRequired = true;
+            hasSchemaRequirement = true;
         }
 
         @Override

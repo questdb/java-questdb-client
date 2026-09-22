@@ -225,24 +225,26 @@ public class CursorWebSocketSchemaCoordinatorTest {
     }
 
     @Test
-    public void testUnnegotiatedConnectionIsUnsupported() throws Exception {
-        DescribeHandler handler = new DescribeHandler(true);
-        try (TestWebSocketServer server = new TestWebSocketServer(handler);
-             CursorSendEngine engine = new CursorSendEngine(temp.newFolder("legacy").getAbsolutePath(), 1 << 20)) {
-            server.start();
-            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-            try (WebSocketClient client = connect(server.getPort(), false)) {
-                CursorWebSocketSendLoop loop = loop(client, engine);
-                try {
-                    loop.start();
-                    assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
-                            () -> loop.resolveSchema("t", 5_000));
-                    Assert.assertEquals(0, handler.requests.get());
-                } finally {
-                    loop.close();
+    public void testUnnegotiatedConnectionIsUnavailable() throws Exception {
+        io.questdb.client.test.tools.TestUtils.assertMemoryLeak(() -> {
+            DescribeHandler handler = new DescribeHandler(true);
+            try (TestWebSocketServer server = new TestWebSocketServer(handler);
+                 CursorSendEngine engine = new CursorSendEngine(temp.newFolder("legacy").getAbsolutePath(), 1 << 20)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                try (WebSocketClient client = connect(server.getPort(), false)) {
+                    CursorWebSocketSendLoop loop = loop(client, engine);
+                    try {
+                        loop.start();
+                        assertReason(LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE,
+                                () -> loop.resolveSchema("t", 5_000));
+                        Assert.assertEquals(0, handler.requests.get());
+                    } finally {
+                        loop.close();
+                    }
                 }
             }
-        }
+        });
     }
 
     @Test

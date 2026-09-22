@@ -182,6 +182,35 @@ public class CursorWebSocketSchemaLifecycleTest {
     }
 
     @Test
+    public void testQueuedLookupBecomesUnavailableAtLegacyReplacement() throws Exception {
+        SchemaHandler handler = new SchemaHandler();
+        try (TestWebSocketServer server = server(handler);
+             CursorSendEngine engine = engine("queued-legacy-replacement");
+             DisconnectingClient client = new DisconnectingClient()) {
+            server.setAdvertiseSchema(false);
+            GatedReconnectFactory reconnect = new GatedReconnectFactory(server.getPort());
+            reconnect.allow.countDown();
+            try (CursorWebSocketSendLoop loop = loop(client, engine, reconnect)) {
+                try {
+                    loop.start();
+                    Assert.assertTrue(client.receiving.await(5, TimeUnit.SECONDS));
+                    Lookup queued = lookup(loop, "queued", 5_000, null);
+                    queued.awaitWaiting();
+                    client.disconnect.countDown();
+                    queued.join();
+                    assertUnavailable(queued.error.get());
+                    Assert.assertTrue(loop.isWireUp());
+                    Assert.assertFalse(loop.isSchemaEnabled());
+                    Assert.assertFalse(engine.requiresSchema());
+                    Assert.assertEquals(0, handler.requests);
+                } finally {
+                    client.disconnect.countDown();
+                }
+            }
+        }
+    }
+
+    @Test
     public void testReconnectWaitCountsAgainstOriginalLookupDeadline() throws Exception {
         SchemaHandler handler = new SchemaHandler();
         handler.reply = true;

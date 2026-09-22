@@ -8057,3 +8057,19 @@ The poll bit is already on `master`, while `FLAG_SCHEMA` is unreleased, so
 `QwpConstants`. This supersedes the `FLAG_SCHEMA=0x02` value recorded in design
 revision 13. The trade-off: store-and-forward frames persisted by an earlier
 build of this branch carry `0x02` and no longer replay as schema frames.
+
+## OFF failover and per-stream replay requirements
+
+Schema negotiation no longer marks an engine as requiring schema-framed replay.
+The engine latches that requirement from live or recovered frame content, before
+publication, and retains it for its lifetime even after those frames are acknowledged.
+Each reconnect factory carries only its own engine's requirement. OFF requests
+schema support only to replay such a backlog; new rows remain legacy.
+
+AUTO chooses lookup eligibility from the installed connection and uses the cache
+while disconnected. A pending lookup reaching a legacy replacement fails with
+SCHEMA_UNAVAILABLE, allowing AUTO's existing fallback. STRICT separately remembers
+a successfully installed schema connection, so a handshake alone still prevents
+new legacy rows during an outage or downgrade. Neither policy memory nor another
+stream's backlog rejects a legacy endpoint. Recovered schema backlog still waits
+for a supporting connection before replay.

@@ -993,10 +993,6 @@ public final class CursorSendEngine implements QuietCloseable {
         return requiresSchema;
     }
 
-    public void requireSchema() {
-        requiresSchema = true;
-    }
-
     private void latchSchemaRequirement(long payloadAddr, int payloadLen) {
         if (!requiresSchema
                 && payloadAddr != 0

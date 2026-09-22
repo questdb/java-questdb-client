@@ -43,6 +43,7 @@ import org.junit.Assert;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
+import io.questdb.client.test.tools.TestUtils;
 
 import java.io.File;
 import java.io.IOException;
@@ -124,6 +125,54 @@ public class QwpSchemaReplayNetworkTest {
         Assert.assertArrayEquals(expected[0], supportingHandler.frames.get(0));
         Assert.assertArrayEquals(expected[1], supportingHandler.frames.get(1));
         assertNoQuarantine(root);
+    }
+
+    @Test(timeout = 15_000)
+    public void testOffReplaysRecoveredSchemaFramesInForegroundAndOrphan() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            for (boolean isOrphan : new boolean[]{false, true}) {
+                File root = temp.newFolder(isOrphan ? "off-orphan" : "off-foreground");
+                String slot = new File(root, isOrphan ? "ghost" : "default").getAbsolutePath();
+                byte[][] expected = seedMixed(slot);
+                RecordingHandler handler = new RecordingHandler(true, "replay");
+                try (TestWebSocketServer peer = new TestWebSocketServer(handler)) {
+                    peer.setAdvertiseSchema(true);
+                    peer.start();
+                    Assert.assertTrue(peer.awaitStart(5, TimeUnit.SECONDS));
+                    if (isOrphan) {
+                        // The owner itself has no schema backlog; only this drainer opts in.
+                        try (QwpWebSocketSender sender = (QwpWebSocketSender) Sender.fromConfig(
+                                "ws::addr=localhost:" + peer.getPort() + ";schema_mode=off;")) {
+                            Assert.assertFalse(peer.hasRequestedSchema());
+                            BackgroundDrainer drainer = new BackgroundDrainer(
+                                    slot, SEGMENT_SIZE, 4L * SEGMENT_SIZE,
+                                    sender.newBackgroundReconnectFactory(() -> false),
+                                    5_000, 1, 4, false, 0);
+                            Thread thread = new Thread(drainer, "off-schema-orphan");
+                            thread.start();
+                            try {
+                                thread.join(5_000);
+                                Assert.assertFalse("drainer did not finish", thread.isAlive());
+                                Assert.assertEquals(BackgroundDrainer.DrainOutcome.SUCCESS, drainer.outcome());
+                            } finally {
+                                drainer.requestStop();
+                                thread.join(5_000);
+                            }
+                        }
+                    } else {
+                        try (Sender sender = Sender.fromConfig(config(peer.getPort(), root, false)
+                                + "schema_mode=off;")) {
+                            Assert.assertTrue(sender.drain(5_000));
+                        }
+                    }
+                    Assert.assertTrue(peer.hasRequestedSchema());
+                }
+                Assert.assertEquals(2, handler.frames.size());
+                Assert.assertArrayEquals(expected[0], handler.frames.get(0));
+                Assert.assertArrayEquals(expected[1], handler.frames.get(1));
+                assertNoQuarantine(root);
+            }
+        });
     }
 
     @Test
@@ -288,15 +337,17 @@ public class QwpSchemaReplayNetworkTest {
     }
 
     @Test
-    public void testSchemaRequirementIsSharedAcrossForegroundAndBackgroundFactories() throws Exception {
-        RecordingHandler oldHandler = new RecordingHandler(false, "unused");
-        try (TestWebSocketServer oldPeer = new TestWebSocketServer(oldHandler)) {
-            oldPeer.start();
-            Assert.assertTrue(oldPeer.awaitStart(5, TimeUnit.SECONDS));
-            assertSchemaRequirementShared(oldPeer.getPort(), true);
-            assertSchemaRequirementShared(oldPeer.getPort(), false);
-            Assert.assertEquals(0, oldHandler.frames.size());
-        }
+    public void testSchemaRequirementIsIsolatedAcrossForegroundAndBackgroundFactories() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            RecordingHandler oldHandler = new RecordingHandler(false, "unused");
+            try (TestWebSocketServer oldPeer = new TestWebSocketServer(oldHandler)) {
+                oldPeer.start();
+                Assert.assertTrue(oldPeer.awaitStart(5, TimeUnit.SECONDS));
+                assertSchemaRequirementIsolated(oldPeer.getPort(), true);
+                assertSchemaRequirementIsolated(oldPeer.getPort(), false);
+                Assert.assertEquals(0, oldHandler.frames.size());
+            }
+        });
     }
 
     private static void assertNoQuarantine(File root) {
@@ -336,7 +387,7 @@ public class QwpSchemaReplayNetworkTest {
         }
     }
 
-    private static void assertSchemaRequirementShared(int port, boolean foregroundFirst) throws Exception {
+    private static void assertSchemaRequirementIsolated(int port, boolean foregroundFirst) throws Exception {
         try (QwpWebSocketSender sender = (QwpWebSocketSender) Sender.fromConfig(
                 "ws::addr=localhost:" + port + ';')) {
             CursorWebSocketSendLoop.ReconnectFactory foreground;
@@ -345,12 +396,18 @@ public class QwpSchemaReplayNetworkTest {
                 foreground = sender.newReconnectFactory();
                 background = sender.newBackgroundReconnectFactory(() -> false);
                 foreground.requireSchema();
-                assertSchemaMismatch(background);
+                assertSchemaMismatch(foreground);
+                try (WebSocketClient client = background.reconnect()) {
+                    Assert.assertFalse(client.isQwpSchemaEnabled());
+                }
             } else {
                 background = sender.newBackgroundReconnectFactory(() -> false);
                 foreground = sender.newReconnectFactory();
                 background.requireSchema();
-                assertSchemaMismatch(foreground);
+                assertSchemaMismatch(background);
+                try (WebSocketClient client = foreground.reconnect()) {
+                    Assert.assertFalse(client.isQwpSchemaEnabled());
+                }
             }
         }
     }
@@ -359,9 +416,9 @@ public class QwpSchemaReplayNetworkTest {
         WebSocketClient client = null;
         try {
             client = factory.reconnect();
-            Assert.fail("an old peer must be rejected after either factory requires schema");
+            Assert.fail("an old peer must be rejected by the schema-required factory");
         } catch (QwpSchemaCapabilityMismatchException expected) {
-            // Expected: the requirement belongs to the sender owner, not one factory instance.
+            // Expected: the requirement belongs to this factory's stream.
         } finally {
             if (client != null) {
                 client.close();

@@ -436,6 +436,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // foreground sender's transient auth blip becomes a producer-fatal terminal -- the
     // exact failure this policy exists to prevent.
     private volatile boolean hasEverConnected;
+    // STRICT row policy remembers successful schema negotiation independently of replay.
+    private volatile boolean hasNegotiatedSchema;
     // Producer-visible wire state. True from the moment swapClient installs a
     // connection until the I/O thread enters the reconnect loop for it. The
     // sender's schema contract selection reads it to decide between a lookup
@@ -932,14 +934,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // already know we reached the server at least once. ASYNC startup
         // hands null and lets the I/O thread connect — hasEverConnected
         // stays false until swapClient sees its first success.
+        this.hasNegotiatedSchema = client != null && client.isQwpSchemaEnabled();
         this.hasEverConnected = client != null;
         this.isWireUp = client != null;
         if (engine.requiresSchema()) {
-            if (reconnectFactory != null) {
-                reconnectFactory.requireSchema();
-            }
-        } else if (client != null && client.isQwpSchemaEnabled()) {
-            engine.requireSchema();
             if (reconnectFactory != null) {
                 reconnectFactory.requireSchema();
             }
@@ -1600,6 +1598,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         return hasEverConnected;
     }
 
+    public boolean isSchemaEnabled() {
+        WebSocketClient activeClient = client;
+        return activeClient != null && activeClient.isQwpSchemaEnabled();
+    }
+
     /**
      * Whether a connection is currently installed. False before the first
      * upgrade completes and from the moment the I/O thread enters the reconnect
@@ -1610,9 +1613,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
-     * Waits for the first completed WebSocket upgrade and returns whether that
-     * handshake selected schema mode. A failed or still-pending handshake is
-     * never interpreted as a legacy peer.
+     * Waits for the first completed WebSocket upgrade and returns whether any
+     * installed connection has selected schema mode. A failed or still-pending
+     * handshake is never interpreted as a legacy peer.
      */
     public boolean awaitInitialSchemaMode(long timeoutMillis) {
         long timeoutNanos = timeoutMillis > Long.MAX_VALUE / 1_000_000L
@@ -1639,9 +1642,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             LockSupport.parkNanos(Math.min(50_000L,
                     timeoutNanos - (System.nanoTime() - start)));
         }
-        // swapClient/constructor publishes the sticky engine requirement before
-        // hasEverConnected becomes visible. Read the authority, not client state.
-        return engine.requiresSchema();
+        // Publish negotiation before hasEverConnected; recovered frames alone
+        // do not establish the first connection's row policy.
+        return hasNegotiatedSchema;
     }
 
     public boolean isRunning() {
@@ -2786,12 +2789,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             }
             throw new QwpSchemaCapabilityMismatchException();
         }
-        if (newClient.isQwpSchemaEnabled()) {
-            engine.requireSchema();
-            if (reconnectFactory != null) {
-                reconnectFactory.requireSchema();
-            }
-        }
         WebSocketClient old = this.client;
         this.client = newClient;
         schemaCoordinator.clearCache();
@@ -2835,6 +2832,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // dies inside the dictionary catch-up above was never fully
         // established, so the sender stays INITIALIZING and a subsequent
         // endpoint-policy rejection still latches the startup terminal.
+        if (newClient.isQwpSchemaEnabled()) {
+            this.hasNegotiatedSchema = true;
+        }
         this.isWireUp = true;
         this.hasEverConnected = true;
     }
@@ -3551,7 +3551,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             return false;
         }
         if (!activeClient.isQwpSchemaEnabled()) {
-            schemaCoordinator.fail(request, LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+            schemaCoordinator.fail(request, LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE,
                     "server did not negotiate schema lookup support");
             return true;
         }
