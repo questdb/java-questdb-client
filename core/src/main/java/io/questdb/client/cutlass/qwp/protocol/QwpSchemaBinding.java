@@ -396,7 +396,7 @@ public final class QwpSchemaBinding {
             return this;
         }
         long value = bits & ((1L << precisionBits) - 1L);
-        if (ColumnType.isGeoHash(targetType)) {
+        if (!ColumnType.isArray(targetType) && ColumnType.isGeoHash(targetType)) {
             int targetBits = ColumnType.getGeoHashBits(targetType);
             if (targetBits != precisionBits) {
                 throw unsupported(name, "GEOHASH", targetType,
@@ -601,7 +601,7 @@ public final class QwpSchemaBinding {
         if (column == null) {
             return this;
         }
-        if (ColumnType.isGeoHash(targetType)) {
+        if (!ColumnType.isArray(targetType) && ColumnType.isGeoHash(targetType)) {
             int precision = ColumnType.getGeoHashBits(targetType);
             column.initGeoHashPrecision(precision);
             if (value == null || value.length() == 0) {

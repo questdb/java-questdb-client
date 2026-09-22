@@ -193,6 +193,60 @@ public class QwpSchemaBindingDoubleArrayTest {
         }
     }
 
+    @Test
+    public void testRejectsStringValuesForAllArrayRanks() throws Exception {
+        assertMemoryLeak(() -> {
+            for (int dimensions = 1; dimensions <= ColumnType.ARRAY_NDIMS_LIMIT; dimensions++) {
+                try (QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                    QwpSchemaBinding binding = binding(buffer, column("a", arrayType(dimensions)));
+                    assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+                            () -> binding.stringColumn("a", "zz"));
+                    buffer.cancelCurrentRow();
+                    buffer.rollbackUncommittedColumns();
+                    assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+                            () -> binding.stringColumn("a", ""));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testRejectsGeoHashValuesForAllArrayRanks() throws Exception {
+        assertMemoryLeak(() -> {
+            for (int dimensions = 1; dimensions <= ColumnType.ARRAY_NDIMS_LIMIT; dimensions++) {
+                try (QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                    QwpSchemaBinding binding = binding(buffer, column("a", arrayType(dimensions)));
+                    assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+                            () -> binding.geoHashColumn("a", 1023L, 10));
+                    buffer.cancelCurrentRow();
+                    buffer.rollbackUncommittedColumns();
+                    assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+                            () -> binding.geoHashColumn("a", "zz"));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testStringNullUsesArrayNullWireForAllArrayRanks() throws Exception {
+        assertMemoryLeak(() -> {
+            for (int dimensions = 1; dimensions <= ColumnType.ARRAY_NDIMS_LIMIT; dimensions++) {
+                try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                     QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                    QwpSchemaBinding binding = binding(buffer, column("a", arrayType(dimensions)));
+                    binding.stringColumn("a", null);
+                    buffer.nextRow();
+                    int size = encoder.encodeSchema(buffer);
+                    QwpTestWireReader reader = tableHeader(encoder, size, 1, 1);
+                    columnDef(reader, "a");
+                    Assert.assertEquals(1, reader.u8());
+                    Assert.assertEquals(1, reader.u8());
+                    Assert.assertEquals(size, reader.position());
+                }
+            }
+        });
+    }
+
     private static void array(QwpTestWireReader reader, int[] shape, double... values) {
         Assert.assertEquals(0, reader.u8());
         rawArray(reader, shape.length, shape, values);
