@@ -4454,8 +4454,9 @@ public class QwpWebSocketSender implements Sender {
      * never waits on a dead wire: before the first upgrade it takes the legacy
      * contract outright, while the wire is down it consults only the cache, and
      * a lookup that ends in {@code SCHEMA_UNAVAILABLE} (a drop under it, a timeout,
-     * a server-side unavailability) selects the legacy contract instead of failing
-     * the row. Access denial and unsupported responses still fail the row.
+     * a server-side unavailability) or {@code UNSUPPORTED_FEATURE} (an oversized
+     * or unsupported schema response) selects the legacy contract instead of failing
+     * the row. Access denial still fails the row.
      */
     private QwpSchemaResponse resolveSchemaForCurrentTable() {
         if (schemaMode == Sender.SchemaMode.OFF) {
@@ -4480,7 +4481,8 @@ public class QwpWebSocketSender implements Sender {
         try {
             return cursorSendLoop.resolveSchema(currentTableName, remainingSchemaMillis(deadlineNanos));
         } catch (LineSenderSchemaException e) {
-            if (e.getReason() == LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE) {
+            if (e.getReason() == LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE
+                    || e.getReason() == LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE) {
                 return null;
             }
             throw e;

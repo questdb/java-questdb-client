@@ -1803,6 +1803,48 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test
+    public void testAutoUnavailableSchemaUsesLegacyFrame() throws Exception {
+        assertMemoryLeak(() -> {
+            for (int result : new int[]{QwpSchemaProtocol.RESULT_UNAVAILABLE, QwpSchemaProtocol.RESULT_TOO_LARGE}) {
+                SchemaHandler handler = new SchemaHandler(result, -1, -1);
+                try (TestWebSocketServer server = schemaServer(handler);
+                     Sender sender = sender(server)) {
+                    sender.table("events").stringColumn("value", "legacy").atNow();
+                    sender.flush();
+
+                    new FrameReader(handler.awaitDataFrame()).legacyVarcharTable("events", "value", "legacy");
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testAutoTooLargeSchemaPublishesPendingSchemaBatchBeforeLegacyRow() throws Exception {
+        assertMemoryLeak(() -> {
+            SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 121, 122);
+            try (TestWebSocketServer server = schemaServer(handler);
+                 Sender sender = sender(server)) {
+                sender.table("events").uuidColumn("id", 1, 2).atNow();
+                handler.result = QwpSchemaProtocol.RESULT_TOO_LARGE;
+
+                // The new table cannot join the pending schema batch: publish it
+                // before the legacy row starts a new frame.
+                sender.table("other").stringColumn("legacy_value", "A").atNow();
+                sender.flush();
+
+                List<byte[]> frames = handler.awaitDataFrames(2);
+                FrameReader schema = new FrameReader(frames.get(0));
+                schema.schemaTable("events", 121, 122, 1, "id", QwpConstants.TYPE_UUID);
+                Assert.assertEquals(0, schema.u8());
+                Assert.assertEquals(1, schema.i64());
+                Assert.assertEquals(2, schema.i64());
+                schema.eof();
+                new FrameReader(frames.get(1)).legacyVarcharTable("other", "legacy_value", "A");
+            }
+        });
+    }
+
+    @Test
     public void testStrictInvalidateAllFeedbackMakesNextBatchLookUpAndSurfaceFailure() throws Exception {
         assertMemoryLeak(() -> {
             int[] results = {
@@ -1819,7 +1861,7 @@ public class QwpSchemaSenderIntegrationTest {
                 SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_MISSING, -1, -1);
                 handler.isSchemaFeedbackEnabled = true;
                 // STRICT surfaces every lookup failure; AUTO would write the
-                // RESULT_UNAVAILABLE case with the legacy contract instead.
+                // RESULT_UNAVAILABLE and RESULT_TOO_LARGE cases with the legacy contract instead.
                 try (TestWebSocketServer server = schemaServer(handler);
                      Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
                              + ";schema_mode=strict;auto_flush_rows=2147483647;auto_flush_bytes=0;"
