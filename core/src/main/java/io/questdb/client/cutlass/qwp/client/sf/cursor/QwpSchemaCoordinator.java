@@ -129,12 +129,12 @@ final class QwpSchemaCoordinator {
             complete(current, null, failure(SCHEMA_UNAVAILABLE, current.key, "schema lookup timed out"));
             return;
         }
+        if (isCacheable(response.getResult())) {
+            put(current.key, response);
+            complete(current, response, null);
+            return;
+        }
         switch (response.getResult()) {
-            case QwpSchemaProtocol.RESULT_KNOWN:
-            case QwpSchemaProtocol.RESULT_MISSING:
-                put(current.key, response);
-                complete(current, response, null);
-                return;
             case QwpSchemaProtocol.RESULT_DENIED:
                 remove(current.key);
                 complete(current, null, failure(ACCESS_DENIED, current.key, "schema access denied"));
@@ -143,10 +143,9 @@ final class QwpSchemaCoordinator {
                 remove(current.key);
                 complete(current, null, failure(SCHEMA_UNAVAILABLE, current.key, "schema is unavailable"));
                 return;
-            case QwpSchemaProtocol.RESULT_TOO_LARGE:
             default:
                 remove(current.key);
-                complete(current, null, failure(UNSUPPORTED_FEATURE, current.key, "schema response is too large or unsupported"));
+                complete(current, null, failure(UNSUPPORTED_FEATURE, current.key, "unsupported schema result"));
         }
     }
 
@@ -167,8 +166,7 @@ final class QwpSchemaCoordinator {
                 if (closed) {
                     return;
                 }
-                if (schema.getResult() == QwpSchemaProtocol.RESULT_KNOWN
-                        || schema.getResult() == QwpSchemaProtocol.RESULT_MISSING) {
+                if (isCacheable(schema.getResult())) {
                     put(key, schema);
                 } else {
                     remove(key);
@@ -236,6 +234,19 @@ final class QwpSchemaCoordinator {
             complete(request, null, failure(SCHEMA_UNAVAILABLE, request.key, "schema coordinator is closed"));
         }
         notifyAll();
+    }
+
+    /**
+     * Results that stay true until the table's schema version changes, which
+     * the server then reports through ACK feedback. TOO_LARGE is a negative entry,
+     * like MISSING: without it, AUTO would pay a DESCRIBE round trip every batch
+     * for a table too wide to describe. DENIED and UNAVAILABLE may clear at any
+     * time, so they are never cached.
+     */
+    private static boolean isCacheable(int result) {
+        return result == QwpSchemaProtocol.RESULT_KNOWN
+                || result == QwpSchemaProtocol.RESULT_MISSING
+                || result == QwpSchemaProtocol.RESULT_TOO_LARGE;
     }
 
     private static LineSenderSchemaException failure(LineSenderSchemaException.Reason reason, String table, String detail) {

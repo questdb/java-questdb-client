@@ -1819,6 +1819,42 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test
+    public void testTooLargeSchemaIsDescribedOnce() throws Exception {
+        assertMemoryLeak(() -> {
+            SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_TOO_LARGE, -1, -1);
+            try (TestWebSocketServer server = schemaServer(handler);
+                 Sender sender = sender(server)) {
+                // AUTO once re-sent a blocking DESCRIBE for every batch of a table
+                // too wide to describe; the cached negative answer now serves them.
+                for (int i = 0; i < 5; i++) {
+                    sender.table("events").stringColumn("value", "legacy").atNow();
+                    sender.flush();
+                }
+                for (byte[] frame : handler.awaitDataFrames(5)) {
+                    Assert.assertEquals(0, frame[QwpConstants.HEADER_OFFSET_FLAGS] & QwpConstants.FLAG_SCHEMA);
+                }
+                Assert.assertEquals(1, handler.describeRequests.get());
+            }
+            SchemaHandler strictHandler = new SchemaHandler(QwpSchemaProtocol.RESULT_TOO_LARGE, -1, -1);
+            try (TestWebSocketServer server = schemaServer(strictHandler);
+                 Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                         + ";schema_mode=strict;auto_flush_rows=2147483647;auto_flush_bytes=0;"
+                         + "auto_flush_interval=2147483646;close_flush_timeout_millis=0;")) {
+                for (int i = 0; i < 2; i++) {
+                    try {
+                        sender.table("events").stringColumn("value", "strict");
+                        Assert.fail("STRICT must reject a table too wide to describe");
+                    } catch (LineSenderSchemaException e) {
+                        Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
+                    }
+                }
+                // STRICT has no legacy rows to earn feedback, so it asks again each time.
+                Assert.assertEquals(2, strictHandler.describeRequests.get());
+            }
+        });
+    }
+
+    @Test
     public void testAutoTooLargeSchemaPublishesPendingSchemaBatchBeforeLegacyRow() throws Exception {
         assertMemoryLeak(() -> {
             SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 121, 122);

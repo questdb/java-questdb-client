@@ -1220,7 +1220,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
-     * Resolves a schema through this loop's I/O thread, returning a KNOWN or MISSING response.
+     * Resolves a schema through this loop's I/O thread, returning a KNOWN, MISSING or TOO_LARGE response.
      * This producer-side API permits one outstanding lookup. The timeout covers the entire
      * operation, including connection and I/O; zero permits only an existing cache hit.
      * Failures are reported as {@link LineSenderSchemaException}. This does not mutate rows,
@@ -1252,7 +1252,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * Evicts the named cache entry at admission and resolves it again through the I/O thread.
      * This producer-side API permits one outstanding lookup. The timeout covers the entire
      * operation, including connection and I/O, and must leave time for a request. It returns
-     * a KNOWN or MISSING response and reports failures as {@link LineSenderSchemaException}.
+     * a KNOWN, MISSING or TOO_LARGE response and reports failures as {@link LineSenderSchemaException}.
      * This does not mutate rows, store-and-forward state, or acknowledgment watermarks.
      */
     public QwpSchemaResponse refreshSchema(CharSequence tableName, long timeoutMillis) {

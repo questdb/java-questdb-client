@@ -86,7 +86,65 @@ public class CursorWebSocketSchemaCoordinatorTest {
         }
         assertRemoteReason(QwpSchemaProtocol.RESULT_DENIED, LineSenderSchemaException.Reason.ACCESS_DENIED, "denied");
         assertRemoteReason(QwpSchemaProtocol.RESULT_UNAVAILABLE, LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE, "unavailable");
-        assertRemoteReason(QwpSchemaProtocol.RESULT_TOO_LARGE, LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, "too-large");
+    }
+
+    @Test
+    public void testTooLargeIsCachedButUnavailableIsNot() throws Exception {
+        // A table too wide to describe stays too wide until its version changes,
+        // which ACK feedback reports; re-asking every batch would cost a round trip.
+        DescribeHandler tooLarge = new DescribeHandler(true, QwpSchemaProtocol.RESULT_TOO_LARGE);
+        try (TestWebSocketServer server = server(tooLarge);
+             CursorSendEngine engine = new CursorSendEngine(temp.newFolder("too-large").getAbsolutePath(), 1 << 20);
+             WebSocketClient client = connect(server.getPort())) {
+            CursorWebSocketSendLoop loop = loop(client, engine);
+            try {
+                loop.start();
+                Assert.assertEquals(QwpSchemaProtocol.RESULT_TOO_LARGE, loop.resolveSchema("Wide", 5_000).getResult());
+                Assert.assertEquals(QwpSchemaProtocol.RESULT_TOO_LARGE, loop.resolveSchema("WIDE", 0).getResult());
+                Assert.assertEquals(QwpSchemaProtocol.RESULT_TOO_LARGE, loop.peekSchema("wide").getResult());
+                Assert.assertEquals(1, tooLarge.requests.get());
+            } finally {
+                loop.close();
+            }
+        }
+        DescribeHandler unavailable = new DescribeHandler(true, QwpSchemaProtocol.RESULT_UNAVAILABLE);
+        try (TestWebSocketServer server = server(unavailable);
+             CursorSendEngine engine = new CursorSendEngine(temp.newFolder("unavailable").getAbsolutePath(), 1 << 20);
+             WebSocketClient client = connect(server.getPort())) {
+            CursorWebSocketSendLoop loop = loop(client, engine);
+            try {
+                loop.start();
+                assertReason(LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE, () -> loop.resolveSchema("t", 5_000));
+                assertReason(LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE, () -> loop.resolveSchema("t", 5_000));
+                Assert.assertEquals(2, unavailable.requests.get());
+                Assert.assertNull(loop.peekSchema("t"));
+            } finally {
+                loop.close();
+            }
+        }
+    }
+
+    @Test
+    public void testTooLargeFeedbackIsCached() throws Exception {
+        DescribeHandler handler = new DescribeHandler(true);
+        try (TestWebSocketServer server = server(handler);
+             CursorSendEngine engine = new CursorSendEngine(temp.newFolder("too-large-feedback").getAbsolutePath(), 1 << 20);
+             WebSocketClient client = connect(server.getPort())) {
+            CursorWebSocketSendLoop loop = loop(client, engine);
+            try {
+                loop.start();
+                loop.resolveSchema("seed", 5_000);
+                handler.sendFeedback("Wide", QwpSchemaProtocol.RESULT_TOO_LARGE);
+                // The marker reply follows the feedback on the wire, so the I/O thread
+                // has applied the feedback once the marker lookup returns.
+                loop.refreshSchema("marker", 5_000);
+                int afterMarker = handler.requests.get();
+                Assert.assertEquals(QwpSchemaProtocol.RESULT_TOO_LARGE, loop.resolveSchema("wide", 0).getResult());
+                Assert.assertEquals(afterMarker, handler.requests.get());
+            } finally {
+                loop.close();
+            }
+        }
     }
 
     @Test

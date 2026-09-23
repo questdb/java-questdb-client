@@ -50,6 +50,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderErrorHandler;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderProgressHandler;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.protocol.QwpSchemaBinding;
+import io.questdb.client.cutlass.qwp.protocol.QwpSchemaProtocol;
 import io.questdb.client.cutlass.qwp.protocol.QwpSchemaResponse;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderConnectionDispatcher;
@@ -4461,6 +4462,20 @@ public class QwpWebSocketSender implements Sender {
      * the row. Access denial still fails the row.
      */
     private QwpSchemaResponse resolveSchemaForCurrentTable() {
+        QwpSchemaResponse schema = lookUpSchemaForCurrentTable();
+        if (schema == null || schema.getResult() != QwpSchemaProtocol.RESULT_TOO_LARGE) {
+            return schema;
+        }
+        // The coordinator caches TOO_LARGE, so this costs no round trip per batch.
+        if (schemaMode == Sender.SchemaMode.STRICT) {
+            throw new LineSenderSchemaException(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+                    "schema lookup failed [reason=UNSUPPORTED_FEATURE, table=" + currentTableName
+                            + ", detail=schema could not be returned within the discovery response limit]");
+        }
+        return null;
+    }
+
+    private QwpSchemaResponse lookUpSchemaForCurrentTable() {
         if (schemaMode == Sender.SchemaMode.OFF) {
             return null;
         }
@@ -4469,6 +4484,13 @@ public class QwpWebSocketSender implements Sender {
         if (schemaMode == Sender.SchemaMode.STRICT) {
             if (!cursorSendLoop.awaitInitialSchemaMode(remainingSchemaMillis(startNanos, budgetNanos))) {
                 return null;
+            }
+            // STRICT writes no rows to a table it cannot describe, so no ACK feedback
+            // ever reports that the table shrank: ask again instead of trusting a
+            // cached TOO_LARGE. AUTO keeps the cache hit; its legacy rows earn feedback.
+            QwpSchemaResponse cached = cursorSendLoop.peekSchema(currentTableName);
+            if (cached != null && cached.getResult() == QwpSchemaProtocol.RESULT_TOO_LARGE) {
+                return cursorSendLoop.refreshSchema(currentTableName, remainingSchemaMillis(startNanos, budgetNanos));
             }
             return cursorSendLoop.resolveSchema(currentTableName, remainingSchemaMillis(startNanos, budgetNanos));
         }
