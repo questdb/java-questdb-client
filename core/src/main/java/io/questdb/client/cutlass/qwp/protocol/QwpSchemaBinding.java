@@ -151,28 +151,21 @@ public final class QwpSchemaBinding {
         if (value == null || value.length() == 0) {
             return this;
         }
-        int index = targetIndex(name, "DECIMAL256");
+        QwpTableBuffer.ColumnBuffer existing = existingColumn(name);
+        int index = targetIndex(existing, name, "DECIMAL256");
         int targetType = targetType(index, ColumnType.DECIMAL256);
         if (index < 0) {
-            QwpTableBuffer.ColumnBuffer inferred = buffer.getExistingColumnByName(name);
-            if (inferred != null && inferred.getSize() > buffer.getRowCount()) {
+            if (!isInferredWritable(existing, name, "DECIMAL256", QwpConstants.TYPE_DECIMAL256)) {
                 return this;
             }
-            if (inferred != null && inferred.getType() != QwpConstants.TYPE_DECIMAL256) {
-                throw unsupported(name, "DECIMAL256", -1, "inferred column type conflict [inferredType="
-                        + QwpConstants.getTypeName(inferred.getType()) + ']');
-            }
             parseDecimalText(name, value, scratch, targetType);
-            inferred = buffer.getOrCreateColumn(name, QwpConstants.TYPE_DECIMAL256, true);
-            if (inferred != null) {
-                // Keep the legacy public-overload contract: infer DECIMAL256 at
-                // the parsed natural scale. A parsed special is an effective
-                // null but does not pin the scale of a later finite value.
-                inferred.addDecimal256(scratch);
-            }
+            // Keep the legacy public-overload contract: infer DECIMAL256 at
+            // the parsed natural scale. A parsed special is an effective
+            // null but does not pin the scale of a later finite value.
+            claimInferred(existing, name, QwpConstants.TYPE_DECIMAL256).addDecimal256(scratch);
             return this;
         }
-        QwpTableBuffer.ColumnBuffer column = targetColumn(name, "DECIMAL256", index, targetType);
+        QwpTableBuffer.ColumnBuffer column = targetColumn(existing, name, "DECIMAL256", index, targetType);
         if (column == null) {
             return this;
         }
@@ -222,9 +215,10 @@ public final class QwpSchemaBinding {
 
     public QwpSchemaBinding boolColumn(CharSequence name, boolean value) {
         buffer.requireSchemaBinding(this);
-        int index = targetIndex(name, "BOOLEAN");
+        QwpTableBuffer.ColumnBuffer existing = existingColumn(name);
+        int index = targetIndex(existing, name, "BOOLEAN");
         int targetType = targetType(index, ColumnType.BOOLEAN);
-        QwpTableBuffer.ColumnBuffer column = targetColumn(name, "BOOLEAN", index, targetType);
+        QwpTableBuffer.ColumnBuffer column = targetColumn(existing, name, "BOOLEAN", index, targetType);
         if (column == null) {
             return this;
         }
@@ -301,12 +295,12 @@ public final class QwpSchemaBinding {
         if (array == null) {
             return this;
         }
-        int index = targetIndex(name, "DOUBLE_ARRAY");
-        QwpTableBuffer.ColumnBuffer existing = buffer.getExistingColumnByName(name);
+        QwpTableBuffer.ColumnBuffer existing = existingColumn(name);
+        int index = targetIndex(existing, name, "DOUBLE_ARRAY");
         if (existing != null && existing.getSize() > buffer.getRowCount()) {
             return this;
         }
-        QwpTableBuffer.ColumnBuffer column = targetDoubleArrayColumn(name, index, array.getDimensionality());
+        QwpTableBuffer.ColumnBuffer column = targetDoubleArrayColumn(existing, name, index, array.getDimensionality());
         if (column != null) {
             column.addDoubleArray(array);
         }
@@ -389,9 +383,10 @@ public final class QwpSchemaBinding {
                     "invalid GEOHASH precision: " + precisionBits + " (must be 1-60)");
         }
         int sourceType = ColumnType.getGeoHashTypeWithBits(precisionBits);
-        int index = targetIndex(name, "GEOHASH");
+        QwpTableBuffer.ColumnBuffer existing = existingColumn(name);
+        int index = targetIndex(existing, name, "GEOHASH");
         int targetType = targetType(index, sourceType);
-        QwpTableBuffer.ColumnBuffer column = targetColumn(name, "GEOHASH", index, targetType);
+        QwpTableBuffer.ColumnBuffer column = targetColumn(existing, name, "GEOHASH", index, targetType);
         if (column == null) {
             return this;
         }
@@ -440,9 +435,10 @@ public final class QwpSchemaBinding {
 
     public QwpSchemaBinding ipv4Column(CharSequence name, int address) {
         buffer.requireSchemaBinding(this);
-        int index = targetIndex(name, "IPv4");
+        QwpTableBuffer.ColumnBuffer existing = existingColumn(name);
+        int index = targetIndex(existing, name, "IPv4");
         int targetType = targetType(index, ColumnType.IPv4);
-        QwpTableBuffer.ColumnBuffer column = targetColumn(name, "IPv4", index, targetType);
+        QwpTableBuffer.ColumnBuffer column = targetColumn(existing, name, "IPv4", index, targetType);
         if (column == null) {
             return this;
         }
@@ -466,9 +462,10 @@ public final class QwpSchemaBinding {
         if (address == null) {
             return this;
         }
-        int index = targetIndex(name, "IPv4");
+        QwpTableBuffer.ColumnBuffer existing = existingColumn(name);
+        int index = targetIndex(existing, name, "IPv4");
         int targetType = targetType(index, ColumnType.IPv4);
-        QwpTableBuffer.ColumnBuffer column = targetColumn(name, "IPv4", index, targetType);
+        QwpTableBuffer.ColumnBuffer column = targetColumn(existing, name, "IPv4", index, targetType);
         if (column == null) {
             return this;
         }
@@ -499,9 +496,10 @@ public final class QwpSchemaBinding {
 
     public QwpSchemaBinding longColumn(CharSequence name, long value) {
         buffer.requireSchemaBinding(this);
-        int index = targetIndex(name, "LONG");
+        QwpTableBuffer.ColumnBuffer existing = existingColumn(name);
+        int index = targetIndex(existing, name, "LONG");
         int targetType = targetType(index, ColumnType.LONG);
-        QwpTableBuffer.ColumnBuffer column = targetColumn(name, "LONG", index, targetType);
+        QwpTableBuffer.ColumnBuffer column = targetColumn(existing, name, "LONG", index, targetType);
         if (column == null) {
             return this;
         }
@@ -567,9 +565,10 @@ public final class QwpSchemaBinding {
 
     public QwpSchemaBinding long256Column(CharSequence name, long l0, long l1, long l2, long l3) {
         buffer.requireSchemaBinding(this);
-        int index = targetIndex(name, "LONG256");
+        QwpTableBuffer.ColumnBuffer existing = existingColumn(name);
+        int index = targetIndex(existing, name, "LONG256");
         int targetType = targetType(index, ColumnType.LONG256);
-        QwpTableBuffer.ColumnBuffer column = targetColumn(name, "LONG256", index, targetType);
+        QwpTableBuffer.ColumnBuffer column = targetColumn(existing, name, "LONG256", index, targetType);
         if (column == null) {
             return this;
         }
@@ -595,9 +594,10 @@ public final class QwpSchemaBinding {
 
     public QwpSchemaBinding stringColumn(CharSequence name, CharSequence value) {
         buffer.requireSchemaBinding(this);
-        int index = targetIndex(name, "STRING");
+        QwpTableBuffer.ColumnBuffer existing = existingColumn(name);
+        int index = targetIndex(existing, name, "STRING");
         int targetType = targetType(index, ColumnType.VARCHAR);
-        QwpTableBuffer.ColumnBuffer column = targetColumn(name, "STRING", index, targetType);
+        QwpTableBuffer.ColumnBuffer column = targetColumn(existing, name, "STRING", index, targetType);
         if (column == null) {
             return this;
         }
@@ -696,9 +696,10 @@ public final class QwpSchemaBinding {
 
     public QwpSchemaBinding charColumn(CharSequence name, char value) {
         buffer.requireSchemaBinding(this);
-        int index = targetIndex(name, "CHAR");
+        QwpTableBuffer.ColumnBuffer existing = existingColumn(name);
+        int index = targetIndex(existing, name, "CHAR");
         int targetType = targetType(index, ColumnType.CHAR);
-        QwpTableBuffer.ColumnBuffer column = targetColumn(name, "CHAR", index, targetType);
+        QwpTableBuffer.ColumnBuffer column = targetColumn(existing, name, "CHAR", index, targetType);
         if (column == null) {
             return this;
         }
@@ -728,9 +729,10 @@ public final class QwpSchemaBinding {
 
     public QwpSchemaBinding symbol(CharSequence name, CharSequence value) {
         buffer.requireSchemaBinding(this);
-        int index = targetIndex(name, "SYMBOL");
+        QwpTableBuffer.ColumnBuffer existing = existingColumn(name);
+        int index = targetIndex(existing, name, "SYMBOL");
         int targetType = targetType(index, ColumnType.SYMBOL);
-        QwpTableBuffer.ColumnBuffer column = targetColumn(name, "SYMBOL", index, targetType);
+        QwpTableBuffer.ColumnBuffer column = targetColumn(existing, name, "SYMBOL", index, targetType);
         if (column == null) {
             return this;
         }
@@ -757,10 +759,11 @@ public final class QwpSchemaBinding {
      */
     public QwpSchemaBinding timestampColumn(CharSequence name, long value, ChronoUnit unit) {
         buffer.requireSchemaBinding(this);
-        int index = targetIndex(name, "TIMESTAMP");
+        QwpTableBuffer.ColumnBuffer existing = existingColumn(name);
+        int index = targetIndex(existing, name, "TIMESTAMP");
         int targetType = targetType(index,
                 unit == ChronoUnit.NANOS ? ColumnType.TIMESTAMP_NANO : ColumnType.TIMESTAMP_MICRO);
-        QwpTableBuffer.ColumnBuffer column = targetColumn(name, "TIMESTAMP", index, targetType);
+        QwpTableBuffer.ColumnBuffer column = targetColumn(existing, name, "TIMESTAMP", index, targetType);
         if (column == null) {
             return this;
         }
@@ -801,9 +804,10 @@ public final class QwpSchemaBinding {
      */
     public QwpSchemaBinding timestampColumn(CharSequence name, Instant value) {
         buffer.requireSchemaBinding(this);
-        int index = targetIndex(name, "TIMESTAMP");
+        QwpTableBuffer.ColumnBuffer existing = existingColumn(name);
+        int index = targetIndex(existing, name, "TIMESTAMP");
         int targetType = targetType(index, ColumnType.TIMESTAMP_MICRO);
-        QwpTableBuffer.ColumnBuffer column = targetColumn(name, "TIMESTAMP", index, targetType);
+        QwpTableBuffer.ColumnBuffer column = targetColumn(existing, name, "TIMESTAMP", index, targetType);
         if (column == null) {
             return this;
         }
@@ -834,9 +838,10 @@ public final class QwpSchemaBinding {
 
     public QwpSchemaBinding uuidColumn(CharSequence name, long lo, long hi) {
         buffer.requireSchemaBinding(this);
-        int index = targetIndex(name, "UUID");
+        QwpTableBuffer.ColumnBuffer existing = existingColumn(name);
+        int index = targetIndex(existing, name, "UUID");
         int targetType = targetType(index, ColumnType.UUID);
-        QwpTableBuffer.ColumnBuffer column = targetColumn(name, "UUID", index, targetType);
+        QwpTableBuffer.ColumnBuffer column = targetColumn(existing, name, "UUID", index, targetType);
         if (column == null) {
             return this;
         }
@@ -858,8 +863,9 @@ public final class QwpSchemaBinding {
     /** Rejects an effective input family whose schema-mode conversion is not implemented. */
     public QwpSchemaBinding unsupportedColumn(CharSequence name, String inputType) {
         buffer.requireSchemaBinding(this);
-        int index = targetIndex(name, inputType);
-        QwpTableBuffer.ColumnBuffer inferred = index < 0 ? buffer.getExistingColumnByName(name) : null;
+        QwpTableBuffer.ColumnBuffer existing = existingColumn(name);
+        int index = targetIndex(existing, name, inputType);
+        QwpTableBuffer.ColumnBuffer inferred = index < 0 ? existing : null;
         if (inferred != null && inferred.getSize() > buffer.getRowCount()) {
             return this;
         }
@@ -867,7 +873,7 @@ public final class QwpSchemaBinding {
             throw unsupported(name, inputType, -1, "input conversion is not implemented");
         }
         int targetType = schema.getColumnType(index);
-        QwpTableBuffer.ColumnBuffer column = targetColumn(name, inputType, index, targetType);
+        QwpTableBuffer.ColumnBuffer column = targetColumn(existing, name, inputType, index, targetType);
         if (column != null) {
             throw unsupported(name, inputType, targetType, "input conversion is not implemented");
         }
@@ -941,10 +947,56 @@ public final class QwpSchemaBinding {
         }
     }
 
+    /** Claims or creates the column for a name the schema lacks; call after {@link #isInferredWritable}. */
+    private QwpTableBuffer.ColumnBuffer claimInferred(
+            QwpTableBuffer.ColumnBuffer existing,
+            CharSequence name,
+            byte wireType
+    ) {
+        QwpTableBuffer.ColumnBuffer column = existing != null
+                ? buffer.claimColumn(existing)
+                : buffer.getOrCreateColumn(name, wireType, true);
+        column.setSchemaIndex(-1);
+        return column;
+    }
+
+    /**
+     * Finds the buffer column for {@code name}, advancing the buffer's
+     * sequential cursor. An invalid name never matches, so the caller still
+     * rejects it through {@link #targetIndex}.
+     */
+    private QwpTableBuffer.ColumnBuffer existingColumn(CharSequence name) {
+        return name == null || name.length() == 0 ? null : buffer.findColumn(name);
+    }
+
+    /**
+     * Returns false for a duplicate write to a column the schema lacks, and
+     * rejects a write whose wire type conflicts with the inferred column.
+     */
+    private boolean isInferredWritable(
+            QwpTableBuffer.ColumnBuffer existing,
+            CharSequence name,
+            String inputType,
+            byte wireType
+    ) {
+        if (existing == null) {
+            return true;
+        }
+        if (existing.getSize() > buffer.getRowCount()) {
+            return false;
+        }
+        if (existing.getType() != wireType) {
+            throw unsupported(name, inputType, -1, "inferred column type conflict [inferredType="
+                    + QwpConstants.getTypeName(existing.getType()) + ']');
+        }
+        return true;
+    }
+
     private QwpTableBuffer.ColumnBuffer targetColumn(CharSequence name, String inputType, int expectedTargetType) {
-        int index = targetIndex(name, inputType);
+        QwpTableBuffer.ColumnBuffer existing = existingColumn(name);
+        int index = targetIndex(existing, name, inputType);
         int targetType = targetType(index, expectedTargetType);
-        QwpTableBuffer.ColumnBuffer column = targetColumn(name, inputType, index, targetType);
+        QwpTableBuffer.ColumnBuffer column = targetColumn(existing, name, inputType, index, targetType);
         if (column != null && targetType != expectedTargetType) {
             throw unsupported(name, inputType, targetType, "conversion is not implemented");
         }
@@ -952,17 +1004,19 @@ public final class QwpSchemaBinding {
     }
 
     private QwpTableBuffer.ColumnBuffer targetDoubleArrayColumn(CharSequence name, int sourceDimensions) {
-        int index = targetIndex(name, "DOUBLE_ARRAY");
-        return targetDoubleArrayColumn(name, index, sourceDimensions);
+        QwpTableBuffer.ColumnBuffer existing = existingColumn(name);
+        int index = targetIndex(existing, name, "DOUBLE_ARRAY");
+        return targetDoubleArrayColumn(existing, name, index, sourceDimensions);
     }
 
     private QwpTableBuffer.ColumnBuffer targetDoubleArrayColumn(
+            QwpTableBuffer.ColumnBuffer existing,
             CharSequence name,
             int index,
             int sourceDimensions
     ) {
         int targetType = targetType(index, ColumnType.encodeArrayType(ColumnType.DOUBLE, sourceDimensions));
-        QwpTableBuffer.ColumnBuffer column = targetColumn(name, "DOUBLE_ARRAY", index, targetType);
+        QwpTableBuffer.ColumnBuffer column = targetColumn(existing, name, "DOUBLE_ARRAY", index, targetType);
         if (column == null) {
             return null;
         }
@@ -991,35 +1045,46 @@ public final class QwpSchemaBinding {
         return column;
     }
 
+    /**
+     * Returns the column {@code name} writes to for the in-progress row, or
+     * {@code null} for a duplicate write. {@code existing} is the buffer's
+     * column for {@code name}, found by {@link #existingColumn}.
+     */
     private QwpTableBuffer.ColumnBuffer targetColumn(
+            QwpTableBuffer.ColumnBuffer existing,
             CharSequence name,
             String inputType,
             int index,
             int targetType
     ) {
         if (index < 0) {
-            QwpTableBuffer.ColumnBuffer inferred = buffer.getExistingColumnByName(name);
-            if (inferred != null && inferred.getSize() > buffer.getRowCount()) {
+            final byte wireType = wireType(targetType);
+            if (!isInferredWritable(existing, name, inputType, wireType)) {
                 return null;
             }
-            if (inferred != null && inferred.getType() != wireType(targetType)) {
-                throw unsupported(name, inputType, -1, "inferred column type conflict [inferredType="
-                        + QwpConstants.getTypeName(inferred.getType()) + ']');
+            if (wireType == 0) {
+                throw unsupported(name, inputType, targetType, "conversion is not implemented");
             }
+            return claimInferred(existing, name, wireType);
         }
-        if (index >= 0 && index == schema.getDesignatedIndex()) {
+        if (existing != null && existing.isSchemaResolved()) {
+            // Every check below depends only on the schema column, and passed
+            // when this binding created the column.
+            return buffer.claimColumn(existing);
+        }
+        if (index == schema.getDesignatedIndex()) {
             throw unsupported(name, inputType, targetType, "designated timestamp writes are not implemented");
         }
         final byte wireType = wireType(targetType);
         if (wireType == 0) {
             throw unsupported(name, inputType, targetType, "conversion is not implemented");
         }
-        QwpTableBuffer.ColumnBuffer column = buffer.getOrCreateColumn(name, wireType, true);
-        if (column == null) {
-            return null;
-        }
-        if (index >= 0 && schema.hasColumnExtensionParameters(index)) {
+        if (schema.hasColumnExtensionParameters(index)) {
             throw unsupported(name, inputType, targetType, "parameterized target type");
+        }
+        QwpTableBuffer.ColumnBuffer column = buffer.getOrCreateColumn(name, wireType, true);
+        if (column != null) {
+            column.setSchemaIndex(index);
         }
         return column;
     }
@@ -1124,20 +1189,13 @@ public final class QwpSchemaBinding {
         if (value == null || value.isNull()) {
             return this;
         }
-        int index = targetIndex(name, inputType);
+        QwpTableBuffer.ColumnBuffer existing = existingColumn(name);
+        int index = targetIndex(existing, name, inputType);
         if (index < 0) {
-            QwpTableBuffer.ColumnBuffer inferred = buffer.getExistingColumnByName(name);
-            if (inferred != null && inferred.getSize() > buffer.getRowCount()) {
+            if (!isInferredWritable(existing, name, inputType, inferredWireType)) {
                 return this;
             }
-            if (inferred != null && inferred.getType() != inferredWireType) {
-                throw unsupported(name, inputType, -1, "inferred column type conflict [inferredType="
-                        + QwpConstants.getTypeName(inferred.getType()) + ']');
-            }
-            inferred = buffer.getOrCreateColumn(name, inferredWireType, true);
-            if (inferred == null) {
-                return this;
-            }
+            QwpTableBuffer.ColumnBuffer inferred = claimInferred(existing, name, inferredWireType);
             if (value instanceof Decimal64) {
                 inferred.addDecimal64((Decimal64) value);
             } else if (value instanceof Decimal128) {
@@ -1148,7 +1206,7 @@ public final class QwpSchemaBinding {
             return this;
         }
         int targetType = targetType(index, ColumnType.DECIMAL256);
-        QwpTableBuffer.ColumnBuffer column = targetColumn(name, inputType, index, targetType);
+        QwpTableBuffer.ColumnBuffer column = targetColumn(existing, name, inputType, index, targetType);
         if (column == null) {
             return this;
         }
@@ -1224,9 +1282,10 @@ public final class QwpSchemaBinding {
             boolean sourceNull
     ) {
         buffer.requireSchemaBinding(this);
-        int index = targetIndex(name, inputType);
+        QwpTableBuffer.ColumnBuffer existing = existingColumn(name);
+        int index = targetIndex(existing, name, inputType);
         int targetType = targetType(index, inferredType);
-        QwpTableBuffer.ColumnBuffer column = targetColumn(name, inputType, index, targetType);
+        QwpTableBuffer.ColumnBuffer column = targetColumn(existing, name, inputType, index, targetType);
         if (column == null) {
             return this;
         }
@@ -1666,10 +1725,11 @@ public final class QwpSchemaBinding {
 
     private QwpSchemaBinding floatingNumericColumn(CharSequence name, double value, String inputType) {
         buffer.requireSchemaBinding(this);
-        int index = targetIndex(name, inputType);
+        QwpTableBuffer.ColumnBuffer existing = existingColumn(name);
+        int index = targetIndex(existing, name, inputType);
         int targetType = targetType(index,
                 "FLOAT".equals(inputType) ? ColumnType.FLOAT : ColumnType.DOUBLE);
-        QwpTableBuffer.ColumnBuffer column = targetColumn(name, inputType, index, targetType);
+        QwpTableBuffer.ColumnBuffer column = targetColumn(existing, name, inputType, index, targetType);
         if (column == null) {
             return this;
         }
@@ -1837,7 +1897,15 @@ public final class QwpSchemaBinding {
         throw unsupported(null, "TIMESTAMP", targetType, "designated timestamp conversion is not implemented");
     }
 
-    private int targetIndex(CharSequence name, String inputType) {
+    /**
+     * Returns the schema index of {@code name}, or -1 when the schema lacks it.
+     * A column this binding already resolved answers without re-validating or
+     * re-hashing the name: it can only match a name equal to its own valid one.
+     */
+    private int targetIndex(QwpTableBuffer.ColumnBuffer existing, CharSequence name, String inputType) {
+        if (existing != null && existing.isSchemaResolved()) {
+            return existing.getSchemaIndex();
+        }
         if (name == null || !TableUtils.isValidColumnName(name, QwpSchemaProtocol.MAX_NAME_UTF16_LENGTH)) {
             throw error(INVALID_VALUE, name, inputType, null, "invalid column name");
         }

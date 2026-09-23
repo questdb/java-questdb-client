@@ -199,6 +199,37 @@ public class QwpTableBuffer implements QuietCloseable {
     }
 
     /**
+     * Claims {@code column}, found by {@link #findColumn}, for the in-progress
+     * row. Returns {@code null} when the row already holds a value for it, with
+     * the same first-value-wins semantics as {@link #getOrCreateColumn}.
+     */
+    ColumnBuffer claimColumn(ColumnBuffer column) {
+        if (column.size > rowCount) {
+            return null;
+        }
+        inProgressColumnCount++;
+        return column;
+    }
+
+    /**
+     * Finds a column by name without checking its type, advancing the
+     * sequential access cursor on a predicted hit exactly like
+     * {@link #getOrCreateColumn}. Returns {@code null} when absent.
+     */
+    ColumnBuffer findColumn(CharSequence name) {
+        int n = columns.size();
+        if (columnAccessCursor < n) {
+            ColumnBuffer candidate = fastColumns[columnAccessCursor];
+            if (Chars.equalsIgnoreCase(candidate.name, name)) {
+                columnAccessCursor++;
+                return candidate;
+            }
+        }
+        int idx = columnNameToIndex.get(name);
+        return idx >= 0 ? columns.get(idx) : null;
+    }
+
+    /**
      * Gets or creates a column with the given name and type.
      * <p>
      * Optimized for the common case where columns are accessed in the same
@@ -219,11 +250,7 @@ public class QwpTableBuffer implements QuietCloseable {
             // col.size > rowCount means this column already received a value
             // for the in-progress row.  Silently ignore the duplicate (first
             // value wins, same as the ILP server behaviour).
-            if (existing.size > rowCount) {
-                return null;
-            }
-            inProgressColumnCount++;
-            return existing;
+            return claimColumn(existing);
         }
         if (TableUtils.isValidColumnName(name, MAX_COLUMN_NAME_LENGTH)) {
             ColumnBuffer col = createColumn(name, type, useNullBitmap);
@@ -457,26 +484,11 @@ public class QwpTableBuffer implements QuietCloseable {
     }
 
     private ColumnBuffer lookupColumn(CharSequence name, byte type) {
-        // Fast path: predict next column in sequence
-        int n = columns.size();
-        if (columnAccessCursor < n) {
-            ColumnBuffer candidate = fastColumns[columnAccessCursor];
-            if (Chars.equalsIgnoreCase(candidate.name, name)) {
-                columnAccessCursor++;
-                assertColumnType(name, type, candidate);
-                return candidate;
-            }
-        }
-
-        // Slow path: hash map lookup
-        int idx = columnNameToIndex.get(name);
-        if (idx >= 0) {
-            ColumnBuffer existing = columns.get(idx);
+        ColumnBuffer existing = findColumn(name);
+        if (existing != null) {
             assertColumnType(name, type, existing);
-            return existing;
         }
-
-        return null;
+        return existing;
     }
 
     private void rebuildColumnAccessStructures() {
@@ -645,6 +657,7 @@ public class QwpTableBuffer implements QuietCloseable {
      * operation and efficient bulk copy to network buffers.
      */
     public static class ColumnBuffer implements QuietCloseable {
+        static final int SCHEMA_UNRESOLVED = Integer.MIN_VALUE;
         private static final long DOUBLE_ARRAY_BASE_OFFSET = Unsafe.getUnsafe().arrayBaseOffset(double[].class);
         final int elemSize;
         final String name;
@@ -664,6 +677,9 @@ public class QwpTableBuffer implements QuietCloseable {
         // Decimal storage
         private byte decimalScale = -1;
         private boolean schemaDecimalScaleLocked;
+        // Schema column index the binding resolved this column to, -1 when the
+        // schema lacks it, or SCHEMA_UNRESOLVED before any binding resolved it.
+        private int schemaIndex = SCHEMA_UNRESOLVED;
         private int inferredArrayDimensionality = -1;
         private double[] doubleArrayData;
         // GeoHash precision (number of bits, 1-60)
@@ -1531,8 +1547,16 @@ public class QwpTableBuffer implements QuietCloseable {
             return nullBufPtr;
         }
 
+        int getSchemaIndex() {
+            return schemaIndex;
+        }
+
         public int getSize() {
             return size;
+        }
+
+        void setSchemaIndex(int schemaIndex) {
+            this.schemaIndex = schemaIndex;
         }
 
         int pinInferredArrayDimensionality(int dimensionality) {
@@ -1586,6 +1610,10 @@ public class QwpTableBuffer implements QuietCloseable {
 
         public boolean hasSymbol(CharSequence value) {
             return symbolDict != null && symbolDict.get(value) != CharSequenceIntHashMap.NO_ENTRY_VALUE;
+        }
+
+        boolean isSchemaResolved() {
+            return schemaIndex != SCHEMA_UNRESOLVED;
         }
 
         public boolean isNull(int index) {
