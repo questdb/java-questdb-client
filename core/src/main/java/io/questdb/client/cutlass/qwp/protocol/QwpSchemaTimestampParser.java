@@ -29,22 +29,16 @@ import java.util.Map;
  * this is deliberately not a general date-format compiler.
  */
 final class QwpSchemaTimestampParser {
-    private static final long DAY = 86_400_000_000L;
-    private static final long GREEDY_MILLIS_FAILED = -1L;
-    private static final long DATE_DAY = 86_400_000L;
-    private static final long DATE_HOUR = 3_600_000L;
-    private static final long DATE_MINUTE = 60_000L;
-    private static final long DATE_SECOND = 1_000L;
-    private static final long[] DATE_MONTH_COMMON = dateMonthStarts(false);
-    private static final long[] DATE_MONTH_LEAP = dateMonthStarts(true);
     private static final int DAYS_0000_TO_1970 = 719527;
-    private static final long HOUR = 3_600_000_000L;
-    private static final long MINUTE = 60_000_000L;
-    private static final long SECOND = 1_000_000L;
-    private static final long WEEK = 7 * DAY;
-    private static final long[] MONTH_COMMON = monthStarts(false);
-    private static final long[] MONTH_LEAP = monthStarts(true);
+    private static final long GREEDY_MILLIS_FAILED = -1L;
+    private static final int[] MONTH_START_DAYS_COMMON = monthStartDays(false);
+    private static final int[] MONTH_START_DAYS_LEAP = monthStartDays(true);
     private static final int REFERENCE_CENTURY = referenceCentury();
+    // The server parses TIMESTAMP text with MicrosFormatUtils over UTF-8 bytes,
+    // and DATE text with DateFormatUtils over UTF-16. Its two parsers also differ
+    // in year overflow and in zone rules for negative years.
+    private static final Target DATE = new Target(1L, false, false, true);
+    private static final Target TIMESTAMP = new Target(1_000L, true, true, false);
 
     private QwpSchemaTimestampParser() {
     }
@@ -98,7 +92,7 @@ final class QwpSchemaTimestampParser {
         require(value, pos++, n, '-');
         int day = fixedInt(value, pos, pos += 2, n);
         if (pos == n) {
-            return computeDate(year, month, day, 0, 0, 0, 0, null, 0, 0);
+            return localTime(DATE, year, month, day, 0, 0, 0, 0, 0);
         }
         require(value, pos++, n, ' ');
         int tail = pos;
@@ -117,9 +111,9 @@ final class QwpSchemaTimestampParser {
                 millis = (int) parsed;
                 pos += 1 + (int) (parsed >>> 32);
             }
-            return computeDate(year, month, day, hour, minute, second, millis, value, pos, n);
+            return zoned(DATE, localTime(DATE, year, month, day, hour, minute, second, millis, 0), year, value, pos, n);
         } catch (NumericException ignored) {
-            return computeDate(year, month, day, 0, 0, 0, 0, value, tail, n);
+            return zoned(DATE, localTime(DATE, year, month, day, 0, 0, 0, 0, 0), year, value, tail, n);
         }
     }
 
@@ -139,7 +133,7 @@ final class QwpSchemaTimestampParser {
         int second = fixedInt(value, pos, pos += 2, n);
         require(value, pos++, n, '.');
         int millis = fixedInt(value, pos, pos += 3, n);
-        return computeDate(year, month, day, hour, minute, second, millis, value, pos, n);
+        return zoned(DATE, localTime(DATE, year, month, day, hour, minute, second, millis, 0), year, value, pos, n);
     }
 
     private static long parseIso(CharSequence value) throws NumericException {
@@ -147,7 +141,7 @@ final class QwpSchemaTimestampParser {
         int pos = n > 0 && value.charAt(0) == '-' ? 5 : 4;
         int year = pos == 5 ? -fixedInt(value, 1, pos, n) : fixedInt(value, 0, pos, n);
         if (pos == n) {
-            return localMicros(year, 1, 1, 0, 0, 0, 0, 0);
+            return localTime(TIMESTAMP, year, 1, 1, 0, 0, 0, 0, 0);
         }
         require(value, pos++, n, '-');
         if (pos + 3 <= n && value.charAt(pos) == 'W') {
@@ -159,17 +153,17 @@ final class QwpSchemaTimestampParser {
         }
         int month = fixedInt(value, pos, pos += 2, n);
         if (pos == n) {
-            return localMicros(year, month, 1, 0, 0, 0, 0, 0);
+            return localTime(TIMESTAMP, year, month, 1, 0, 0, 0, 0, 0);
         }
         require(value, pos++, n, '-');
         int day = fixedInt(value, pos, pos += 2, n);
         if (pos == n) {
-            return localMicros(year, month, day, 0, 0, 0, 0, 0);
+            return localTime(TIMESTAMP, year, month, day, 0, 0, 0, 0, 0);
         }
         require(value, pos++, n, 'T');
         int hour = fixedInt(value, pos, pos += 2, n);
         if (pos == n) {
-            return localMicros(year, month, day, hour, 0, 0, 0, 0);
+            return localTime(TIMESTAMP, year, month, day, hour, 0, 0, 0, 0);
         }
         require(value, pos++, n, ':');
         int minute = fixedInt(value, pos, pos += 2, n);
@@ -178,7 +172,7 @@ final class QwpSchemaTimestampParser {
         if (pos < n && value.charAt(pos) == '.') {
             return parseIsoFraction(value, pos + 1, n, year, month, day, hour, minute, second);
         }
-        return zoned(localMicros(year, month, day, hour, minute, second, 0, 0), year, value, pos, n);
+        return zoned(TIMESTAMP, localTime(TIMESTAMP, year, month, day, hour, minute, second, 0, 0), year, value, pos, n);
     }
 
     /**
@@ -200,8 +194,8 @@ final class QwpSchemaTimestampParser {
         long parsed = greedyMillis(value, pos, n);
         if (parsed != GREEDY_MILLIS_FAILED) {
             try {
-                long local = localMicros(year, month, day, hour, minute, second, (int) parsed, 0);
-                return zoned(local, year, value, pos + (int) (parsed >>> 32), n);
+                long local = localTime(TIMESTAMP, year, month, day, hour, minute, second, (int) parsed, 0);
+                return zoned(TIMESTAMP, local, year, value, pos + (int) (parsed >>> 32), n);
             } catch (NumericException ignored) {
             }
         }
@@ -209,7 +203,7 @@ final class QwpSchemaTimestampParser {
             try {
                 int millis = fixedInt(value, pos, pos + 3, n);
                 int micros = fixedInt(value, pos + 3, pos + 6, n);
-                return zoned(localMicros(year, month, day, hour, minute, second, millis, micros), year, value, pos + 6, n);
+                return zoned(TIMESTAMP, localTime(TIMESTAMP, year, month, day, hour, minute, second, millis, micros), year, value, pos + 6, n);
             } catch (NumericException ignored) {
             }
         }
@@ -218,8 +212,8 @@ final class QwpSchemaTimestampParser {
                 fixedInt(value, pos, pos + 1, n);
                 parsed = greedyMillis(value, pos + 1, n);
                 if (parsed != GREEDY_MILLIS_FAILED) {
-                    long local = localMicros(year, month, day, hour, minute, second, (int) parsed, 0);
-                    return zoned(local, year, value, pos + 1 + (int) (parsed >>> 32), n);
+                    long local = localTime(TIMESTAMP, year, month, day, hour, minute, second, (int) parsed, 0);
+                    return zoned(TIMESTAMP, local, year, value, pos + 1 + (int) (parsed >>> 32), n);
                 }
             } catch (NumericException ignored) {
             }
@@ -230,7 +224,7 @@ final class QwpSchemaTimestampParser {
         if (pos + 3 <= n) {
             try {
                 int millis = fixedInt(value, pos, pos + 3, n);
-                return zoned(localMicros(year, month, day, hour, minute, second, millis, 0), year, value, pos + 3, n);
+                return zoned(TIMESTAMP, localTime(TIMESTAMP, year, month, day, hour, minute, second, millis, 0), year, value, pos + 3, n);
             } catch (NumericException ignored) {
             }
         }
@@ -255,7 +249,7 @@ final class QwpSchemaTimestampParser {
         int second = fixedInt(value, pos, pos += 2, n);
         require(value, pos++, n, '.');
         int millis = fixedInt(value, pos, pos += 3, n);
-        return zoned(localMicros(year, month, day, hour, minute, second, millis, 0), year, value, pos, n);
+        return zoned(TIMESTAMP, localTime(TIMESTAMP, year, month, day, hour, minute, second, millis, 0), year, value, pos, n);
     }
 
     /**
@@ -284,7 +278,9 @@ final class QwpSchemaTimestampParser {
         return ((long) (p - lo) << 32) | ((negative ? -parsed : parsed) & 0xffffffffL);
     }
 
-    private static long localMicros(
+    /** Local time in {@code t}'s unit, from validated fields. */
+    private static long localTime(
+            Target t,
             int year,
             int month,
             int day,
@@ -300,57 +296,35 @@ final class QwpSchemaTimestampParser {
                 || second < 0 || second > 59) {
             throw NumericException.instance();
         }
-        return yearMicros(year, leap) + monthMicros(month, leap) + (day - 1L) * DAY
-                + (hour % 24L) * HOUR + minute * MINUTE + second * SECOND
-                + millis * 1000L + micros;
+        return yearStart(t, year, leap) + monthStart(t, month, leap) + (day - 1L) * t.day
+                + (hour % 24L) * t.hour + minute * t.minute + second * t.second
+                + millis * t.milli + micros;
     }
 
     private static long weekMicros(int year, int week) throws NumericException {
         if (week == -1) {
             // The server's "no week" sentinel is -1, so an explicit W-1 parses
             // as the bare year.
-            return localMicros(year, 1, 1, 0, 0, 0, 0, 0);
+            return localTime(TIMESTAMP, year, 1, 1, 0, 0, 0, 0, 0);
         }
         if (week < 1 || week > weeks(year)) {
             throw NumericException.instance();
         }
         boolean leap = CommonUtils.isLeapYear(year);
-        long first = yearMicros(year, leap) + (week - 1L) * WEEK + isoYearDayOffset(year) * DAY;
+        long first = yearStart(TIMESTAMP, year, leap) + (week - 1L) * 7 * TIMESTAMP.day
+                + isoYearDayOffset(year) * TIMESTAMP.day;
         int actualYear = year(first);
         int month = monthOfYear(first, actualYear, CommonUtils.isLeapYear(actualYear));
         int weekYear = year + (week == 1 && isoYearDayOffset(year) < 0 ? -1 : 0);
         int day = dayOfMonth(first, weekYear, month, CommonUtils.isLeapYear(weekYear));
         // GenericMicrosFormat retains the originally parsed year's leap flag
         // after an ISO week crosses a calendar-year boundary.
-        return yearMicros(weekYear, leap) + monthMicros(month, leap) + (day - 1L) * DAY;
+        return yearStart(TIMESTAMP, weekYear, leap) + monthStart(TIMESTAMP, month, leap) + (day - 1L) * TIMESTAMP.day;
     }
 
-    /** Converts local micros to UTC using the zone text in {@code [lo, hi)}. */
-    private static long zoned(long local, int year, CharSequence value, int lo, int hi) throws NumericException {
-        return local - ZoneMatcher.offset(value, lo, hi, local, year);
-    }
-
-    private static long computeDate(
-            int year,
-            int month,
-            int day,
-            int hour,
-            int minute,
-            int second,
-            int millis,
-            CharSequence zone,
-            int zoneLo,
-            int zoneHi
-    ) throws NumericException {
-        boolean leap = CommonUtils.isLeapYear(year);
-        if (month < 1 || month > 12 || day < 1 || day > CommonUtils.getDaysPerMonth(month, leap)
-                || hour < 0 || hour > 24 || minute < 0 || minute > 59
-                || second < 0 || second > 59) {
-            throw NumericException.instance();
-        }
-        long out = dateYearMillis(year, leap) + dateMonthMillis(month, leap) + (day - 1L) * DATE_DAY
-                + (hour % 24L) * DATE_HOUR + minute * DATE_MINUTE + second * DATE_SECOND + millis;
-        return zone == null ? out : out - ZoneMatcher.offsetMillis(zone, zoneLo, zoneHi, out, year);
+    /** Converts {@code local}, in {@code t}'s unit, to UTC using the zone text in {@code [lo, hi)}. */
+    private static long zoned(Target t, long local, int year, CharSequence value, int lo, int hi) throws NumericException {
+        return local - ZoneMatcher.offset(t, value, lo, hi, local, year);
     }
 
     private static int fixedInt(CharSequence s, int lo, int hi, int limit) throws NumericException {
@@ -407,71 +381,19 @@ final class QwpSchemaTimestampParser {
         return offset + 20 > 100 ? year - offset + 100 : year - offset;
     }
 
-    private static long[] monthStarts(boolean leap) {
-        long[] result = new long[12];
+    private static int[] monthStartDays(boolean leap) {
+        int[] result = new int[12];
         for (int i = 1; i < 12; i++) {
-            result[i] = result[i - 1] + CommonUtils.getDaysPerMonth(i, leap) * DAY;
+            result[i] = result[i - 1] + CommonUtils.getDaysPerMonth(i, leap);
         }
         return result;
     }
-
-    private static long[] dateMonthStarts(boolean leap) {
-        long[] result = new long[12];
-        for (int i = 1; i < 12; i++) {
-            result[i] = result[i - 1] + CommonUtils.getDaysPerMonth(i, leap) * DATE_DAY;
-        }
-        return result;
+    private static long monthStart(Target t, int month, boolean leap) {
+        return (leap ? MONTH_START_DAYS_LEAP : MONTH_START_DAYS_COMMON)[month - 1] * t.day;
     }
-
-    private static long dateMonthMillis(int month, boolean leap) {
-        return (leap ? DATE_MONTH_LEAP : DATE_MONTH_COMMON)[month - 1];
-    }
-
-    private static long dateYearMillis(int year, boolean leap) {
-        int leapYears = year / 100;
-        if (year < 0) {
-            leapYears = ((year + 3) >> 2) - leapYears + ((leapYears + 3) >> 2) - 1;
-        } else {
-            leapYears = (year >> 2) - leapYears + (leapYears >> 2);
-            if (leap) {
-                leapYears--;
-            }
-        }
-        return (year * 365L + leapYears - DAYS_0000_TO_1970) * DATE_DAY;
-    }
-
-    private static int dateDayOfWeek(long millis) {
-        long d;
-        if (millis > -1) {
-            d = millis / DATE_DAY;
-        } else {
-            d = (millis - (DATE_DAY - 1)) / DATE_DAY;
-            if (d < -3) {
-                return 7 + (int) ((d + 4) % 7);
-            }
-        }
-        return 1 + (int) ((d + 3) % 7);
-    }
-
-    private static long nextDateOrSame(long millis, int dow) {
-        int current = dateDayOfWeek(millis);
-        return current <= dow ? millis + (dow - current) * DATE_DAY
-                : millis + (7 - current + dow) * DATE_DAY;
-    }
-
-    private static long previousDateOrSame(long millis, int dow) {
-        int current = dateDayOfWeek(millis);
-        return current >= dow ? millis - (current - dow) * DATE_DAY
-                : millis - (7 + current - dow) * DATE_DAY;
-    }
-
-    private static long monthMicros(int month, boolean leap) {
-        return (leap ? MONTH_LEAP : MONTH_COMMON)[month - 1];
-    }
-
-    private static long yearMicros(int year, boolean leap) {
-        // Preserve server Micros.yearMicros arithmetic, including unchecked
-        // multiplication and its asymmetric negative-overflow saturation.
+    private static long yearStart(Target t, int year, boolean leap) {
+        // Preserve the server's unchecked multiplication. Only its micros
+        // variant saturates on negative overflow, and asymmetrically.
         int leapYears = year / 100;
         if (year < 0) {
             leapYears = ((year + 3) >> 2) - leapYears + ((leapYears + 3) >> 2) - 1;
@@ -482,23 +404,21 @@ final class QwpSchemaTimestampParser {
             }
         }
         long days = year * 365L + leapYears - DAYS_0000_TO_1970;
-        long micros = days * DAY;
-        return days < 0 && micros > 0 ? Long.MIN_VALUE : micros;
+        long start = days * t.day;
+        return t.isYearSaturating && days < 0 && start > 0 ? Long.MIN_VALUE : start;
     }
-
-    private static int dayOfWeek(long micros) {
+    private static int dayOfWeek(Target t, long time) {
         long d;
-        if (micros > -1) {
-            d = micros / DAY;
+        if (time > -1) {
+            d = time / t.day;
         } else {
-            d = (micros - (DAY - 1)) / DAY;
+            d = (time - (t.day - 1)) / t.day;
             if (d < -3) {
                 return 7 + (int) ((d + 4) % 7);
             }
         }
         return 1 + (int) ((d + 3) % 7);
     }
-
     private static int endYearDow(int year) {
         return (year + Math.abs(year / 4) - Math.abs(year / 100) + Math.abs(year / 400)) % 7;
     }
@@ -513,69 +433,52 @@ final class QwpSchemaTimestampParser {
     }
 
     private static int monthOfYear(long micros, int year, boolean leap) {
-        long elapsed = micros - yearMicros(year, leap);
-        long[] starts = leap ? MONTH_LEAP : MONTH_COMMON;
+        long elapsed = micros - yearStart(TIMESTAMP, year, leap);
         int month = 12;
-        while (month > 1 && elapsed < starts[month - 1]) {
+        while (month > 1 && elapsed < monthStart(TIMESTAMP, month, leap)) {
             month--;
         }
         return month;
     }
-
     private static int year(long micros) {
         int estimate = 1970 + (int) (micros / 31_556_952_000_000L);
         if (micros < 0 && estimate >= 1970) {
             estimate = 1969;
         }
         boolean leap = CommonUtils.isLeapYear(estimate);
-        long diff = micros - yearMicros(estimate, leap);
+        long diff = micros - yearStart(TIMESTAMP, estimate, leap);
         if (diff < 0) {
             return estimate - 1;
         }
-        return diff >= (leap ? 366L : 365L) * DAY ? estimate + 1 : estimate;
+        return diff >= (leap ? 366L : 365L) * TIMESTAMP.day ? estimate + 1 : estimate;
     }
-
     private static int dayOfMonth(long micros, int year, int month, boolean leap) {
-        return (int) ((micros - yearMicros(year, leap) - monthMicros(month, leap)) / DAY) + 1;
+        return (int) ((micros - yearStart(TIMESTAMP, year, leap) - monthStart(TIMESTAMP, month, leap)) / TIMESTAMP.day) + 1;
     }
-
-    private static long nextOrSame(long micros, int dow) {
-        int current = dayOfWeek(micros);
-        return current <= dow ? micros + (dow - current) * DAY : micros + (7 - current + dow) * DAY;
+    private static long nextOrSame(Target t, long time, int dow) {
+        int current = dayOfWeek(t, time);
+        return current <= dow ? time + (dow - current) * t.day : time + (7 - current + dow) * t.day;
     }
-
-    private static long previousOrSame(long micros, int dow) {
-        int current = dayOfWeek(micros);
-        return current >= dow ? micros - (current - dow) * DAY : micros - (7 + current - dow) * DAY;
+    private static long previousOrSame(Target t, long time, int dow) {
+        int current = dayOfWeek(t, time);
+        return current >= dow ? time - (current - dow) * t.day : time - (7 + current - dow) * t.day;
     }
-
     private static final class ZoneMatcher {
 
         /**
-         * TIMESTAMP zone offset in micros. The server matches TIMESTAMP zone
-         * text against UTF-8 bytes, so a non-ASCII name never matches.
+         * Zone offset in {@code t}'s unit. The server matches TIMESTAMP zone text
+         * against UTF-8 bytes, where a non-ASCII name never matches, and DATE zone
+         * text case-insensitively as UTF-16.
          */
-        private static long offset(CharSequence s, int lo, int hi, long epoch, int year) throws NumericException {
+        private static long offset(Target t, CharSequence s, int lo, int hi, long epoch, int year) throws NumericException {
             if (lo >= hi) {
                 throw NumericException.instance();
             }
             int minutes = numericOffset(s, lo, hi);
             if (minutes != Integer.MIN_VALUE) {
-                return minutes * MINUTE;
+                return minutes * t.minute;
             }
-            return NamedZones.find(s, lo, hi, true).offset(epoch, year);
-        }
-
-        /** DATE zone offset in millis, matching zone names case-insensitively as UTF-16. */
-        private static long offsetMillis(CharSequence s, int lo, int hi, long epoch, int year) throws NumericException {
-            if (lo >= hi) {
-                throw NumericException.instance();
-            }
-            int minutes = numericOffset(s, lo, hi);
-            if (minutes != Integer.MIN_VALUE) {
-                return minutes * DATE_MINUTE;
-            }
-            return NamedZones.find(s, lo, hi, false).offsetMillis(epoch, year);
+            return NamedZones.find(s, lo, hi, t.isZoneAsciiOnly).offset(t, epoch, year);
         }
 
         private static int numericOffset(CharSequence s, int lo, int hi) {
@@ -734,156 +637,116 @@ final class QwpSchemaTimestampParser {
         }
 
         private static final class Zone {
-            private final long cutoff;
-            private final long fixedOffset;
-            private final long lastWall;
+            // Seconds, or Long.MIN_VALUE when absent.
+            private final long cutoffSeconds;
+            private final long fixedOffsetSeconds;
+            private final long lastWallSeconds;
             private final List<ZoneOffsetTransitionRule> recurring;
             private final ZoneRules rules;
-
-            private Zone(long fixedOffset) {
-                this.cutoff = Long.MIN_VALUE;
-                this.fixedOffset = fixedOffset;
-                this.lastWall = fixedOffset;
-                this.recurring = java.util.Collections.emptyList();
-                this.rules = null;
-            }
 
             private Zone(ZoneRules rules) {
                 this.rules = rules;
                 List<ZoneOffsetTransition> history = rules.getTransitions();
-                cutoff = history.isEmpty() ? Long.MIN_VALUE : history.get(history.size() - 1).toEpochSecond() * SECOND;
+                cutoffSeconds = history.isEmpty() ? Long.MIN_VALUE : history.get(history.size() - 1).toEpochSecond();
                 recurring = rules.getTransitionRules();
-                fixedOffset = rules.isFixedOffset() ? rules.getOffset(Instant.EPOCH).getTotalSeconds() * SECOND : Long.MIN_VALUE;
-                lastWall = history.isEmpty() ? rules.getOffset(Instant.EPOCH).getTotalSeconds() * SECOND
-                        : history.get(history.size() - 1).getOffsetAfter().getTotalSeconds() * SECOND;
+                fixedOffsetSeconds = rules.isFixedOffset() ? rules.getOffset(Instant.EPOCH).getTotalSeconds() : Long.MIN_VALUE;
+                lastWallSeconds = history.isEmpty() ? rules.getOffset(Instant.EPOCH).getTotalSeconds()
+                        : history.get(history.size() - 1).getOffsetAfter().getTotalSeconds();
             }
 
-            private long offset(long epoch, int year) {
-                if (fixedOffset != Long.MIN_VALUE) {
-                    return fixedOffset;
+            private static long transitionEpoch(Target t, ZoneOffsetTransitionRule rule, int year) {
+                boolean leap = CommonUtils.isLeapYear(year);
+                int month = rule.getMonth().getValue();
+                int dom = rule.getDayOfMonthIndicator();
+                int dow = rule.getDayOfWeek() == null ? -1 : rule.getDayOfWeek().getValue();
+                long time = rule.getLocalTime().getHour() * t.hour + rule.getLocalTime().getMinute() * t.minute
+                        + rule.getLocalTime().getSecond() * t.second;
+                long timestamp;
+                if (dom < 0) {
+                    timestamp = yearStart(t, year, leap) + monthStart(t, month, leap)
+                            + (CommonUtils.getDaysPerMonth(month, leap) + dom) * t.day + time;
+                    if (dow > -1) {
+                        timestamp = previousOrSame(t, timestamp, dow);
+                    }
+                } else {
+                    timestamp = yearStart(t, year, leap) + monthStart(t, month, leap) + (dom - 1L) * t.day + time;
+                    if (dow > -1) {
+                        timestamp = nextOrSame(t, timestamp, dow);
+                    }
                 }
+                if (rule.isMidnightEndOfDay()) {
+                    timestamp += t.day;
+                }
+                int before = rule.getOffsetBefore().getTotalSeconds();
+                if (rule.getTimeDefinition() == ZoneOffsetTransitionRule.TimeDefinition.UTC) {
+                    timestamp += before * t.second;
+                } else if (rule.getTimeDefinition() == ZoneOffsetTransitionRule.TimeDefinition.STANDARD) {
+                    timestamp += (before - rule.getStandardOffset().getTotalSeconds()) * t.second;
+                }
+                return timestamp - before * t.second;
+            }
+
+            private long offset(Target t, long epoch, int year) throws NumericException {
+                if (fixedOffsetSeconds != Long.MIN_VALUE) {
+                    return fixedOffsetSeconds * t.second;
+                }
+                long cutoff = cutoffSeconds == Long.MIN_VALUE ? Long.MIN_VALUE : cutoffSeconds * t.second;
                 if (!recurring.isEmpty() && epoch > cutoff) {
+                    if (t.isNegativeYearRuleRejected && year < 0) {
+                        // The server's DATE recurring-rule cache rejects negative
+                        // year keys. This is only reachable after full-width DATE
+                        // arithmetic wraps past the cutoff.
+                        throw NumericException.instance();
+                    }
                     // The server computes future rules with the parsed year,
                     // even when calendar arithmetic has wrapped the epoch.
                     long after = 0;
                     for (int i = 0, n = recurring.size(); i < n; i++) {
                         ZoneOffsetTransitionRule rule = recurring.get(i);
-                        long transition = transitionEpoch(rule, year);
-                        long before = rule.getOffsetBefore().getTotalSeconds() * SECOND;
-                        if (epoch < transition) {
-                            return before;
+                        if (epoch < transitionEpoch(t, rule, year)) {
+                            return rule.getOffsetBefore().getTotalSeconds() * t.second;
                         }
-                        after = rule.getOffsetAfter().getTotalSeconds() * SECOND;
+                        after = rule.getOffsetAfter().getTotalSeconds() * t.second;
                     }
                     return after;
                 }
                 if (epoch > cutoff) {
-                    return lastWall;
+                    return lastWallSeconds * t.second;
                 }
-                Instant instant = Instant.ofEpochSecond(Math.floorDiv(epoch, SECOND), Math.floorMod(epoch, SECOND) * 1000);
-                return rules.getOffset(instant).getTotalSeconds() * SECOND;
+                Instant instant = Instant.ofEpochSecond(Math.floorDiv(epoch, t.second), Math.floorMod(epoch, t.second) * t.nanos);
+                return rules.getOffset(instant).getTotalSeconds() * t.second;
             }
+        }
+    }
 
-            private long offsetMillis(long epoch, int year) throws NumericException {
-                if (fixedOffset != Long.MIN_VALUE) {
-                    return fixedOffset / 1000L;
-                }
-                long cutoffMillis = cutoff == Long.MIN_VALUE ? Long.MIN_VALUE : cutoff / 1000L;
-                if (!recurring.isEmpty() && epoch > cutoffMillis) {
-                    // The server's recurring-rule cache rejects negative year keys. This can
-                    // only be reached after full-width DATE arithmetic wraps past its cutoff;
-                    // reject it as an invalid value instead of silently accepting bytes that
-                    // the server's STRING conversion cannot produce.
-                    if (year < 0) {
-                        throw NumericException.instance();
-                    }
-                    long after = 0;
-                    for (int i = 0, n = recurring.size(); i < n; i++) {
-                        ZoneOffsetTransitionRule rule = recurring.get(i);
-                        long transition = transitionEpochMillis(rule, year);
-                        long before = rule.getOffsetBefore().getTotalSeconds() * DATE_SECOND;
-                        if (epoch < transition) {
-                            return before;
-                        }
-                        after = rule.getOffsetAfter().getTotalSeconds() * DATE_SECOND;
-                    }
-                    return after;
-                }
-                if (epoch > cutoffMillis) {
-                    return lastWall / 1000L;
-                }
-                return rules.getOffset(Instant.ofEpochMilli(epoch)).getTotalSeconds() * DATE_SECOND;
-            }
+    /** The server's TIMESTAMP (micros) or DATE (millis) text parser family. */
+    private static final class Target {
+        private final long day;
+        private final long hour;
+        private final boolean isNegativeYearRuleRejected;
+        private final boolean isYearSaturating;
+        private final boolean isZoneAsciiOnly;
+        private final long milli;
+        private final long minute;
+        // Nanos per unit.
+        private final long nanos;
+        private final long second;
 
-            private static long transitionEpoch(ZoneOffsetTransitionRule rule, int year) {
-                boolean leap = CommonUtils.isLeapYear(year);
-                int month = rule.getMonth().getValue();
-                int dom = rule.getDayOfMonthIndicator();
-                int dow = rule.getDayOfWeek() == null ? -1 : rule.getDayOfWeek().getValue();
-                long timestamp;
-                if (dom < 0) {
-                    timestamp = yearMicros(year, leap) + monthMicros(month, leap)
-                            + (CommonUtils.getDaysPerMonth(month, leap) + dom) * DAY
-                            + rule.getLocalTime().getHour() * HOUR + rule.getLocalTime().getMinute() * MINUTE
-                            + rule.getLocalTime().getSecond() * SECOND;
-                    if (dow > -1) {
-                        timestamp = previousOrSame(timestamp, dow);
-                    }
-                } else {
-                    timestamp = yearMicros(year, leap) + monthMicros(month, leap) + (dom - 1L) * DAY
-                            + rule.getLocalTime().getHour() * HOUR + rule.getLocalTime().getMinute() * MINUTE
-                            + rule.getLocalTime().getSecond() * SECOND;
-                    if (dow > -1) {
-                        timestamp = nextOrSame(timestamp, dow);
-                    }
-                }
-                if (rule.isMidnightEndOfDay()) {
-                    timestamp += DAY;
-                }
-                int before = rule.getOffsetBefore().getTotalSeconds();
-                if (rule.getTimeDefinition() == ZoneOffsetTransitionRule.TimeDefinition.UTC) {
-                    timestamp += before * SECOND;
-                } else if (rule.getTimeDefinition() == ZoneOffsetTransitionRule.TimeDefinition.STANDARD) {
-                    timestamp += (before - rule.getStandardOffset().getTotalSeconds()) * SECOND;
-                }
-                return timestamp - before * SECOND;
-            }
-
-            private static long transitionEpochMillis(ZoneOffsetTransitionRule rule, int year) {
-                boolean leap = CommonUtils.isLeapYear(year);
-                int month = rule.getMonth().getValue();
-                int dom = rule.getDayOfMonthIndicator();
-                int dow = rule.getDayOfWeek() == null ? -1 : rule.getDayOfWeek().getValue();
-                long timestamp;
-                if (dom < 0) {
-                    timestamp = dateYearMillis(year, leap) + dateMonthMillis(month, leap)
-                            + (CommonUtils.getDaysPerMonth(month, leap) + dom) * DATE_DAY
-                            + rule.getLocalTime().getHour() * DATE_HOUR
-                            + rule.getLocalTime().getMinute() * DATE_MINUTE
-                            + rule.getLocalTime().getSecond() * DATE_SECOND;
-                    if (dow > -1) {
-                        timestamp = previousDateOrSame(timestamp, dow);
-                    }
-                } else {
-                    timestamp = dateYearMillis(year, leap) + dateMonthMillis(month, leap) + (dom - 1L) * DATE_DAY
-                            + rule.getLocalTime().getHour() * DATE_HOUR
-                            + rule.getLocalTime().getMinute() * DATE_MINUTE
-                            + rule.getLocalTime().getSecond() * DATE_SECOND;
-                    if (dow > -1) {
-                        timestamp = nextDateOrSame(timestamp, dow);
-                    }
-                }
-                if (rule.isMidnightEndOfDay()) {
-                    timestamp += DATE_DAY;
-                }
-                int before = rule.getOffsetBefore().getTotalSeconds();
-                if (rule.getTimeDefinition() == ZoneOffsetTransitionRule.TimeDefinition.UTC) {
-                    timestamp += before * DATE_SECOND;
-                } else if (rule.getTimeDefinition() == ZoneOffsetTransitionRule.TimeDefinition.STANDARD) {
-                    timestamp += (before - rule.getStandardOffset().getTotalSeconds()) * DATE_SECOND;
-                }
-                return timestamp - before * DATE_SECOND;
-            }
+        private Target(
+                long unitsPerMilli,
+                boolean isYearSaturating,
+                boolean isZoneAsciiOnly,
+                boolean isNegativeYearRuleRejected
+        ) {
+            this.milli = unitsPerMilli;
+            this.second = 1_000L * unitsPerMilli;
+            this.minute = 60_000L * unitsPerMilli;
+            this.hour = 3_600_000L * unitsPerMilli;
+            this.day = 86_400_000L * unitsPerMilli;
+            this.nanos = 1_000_000L / unitsPerMilli;
+            this.isYearSaturating = isYearSaturating;
+            this.isZoneAsciiOnly = isZoneAsciiOnly;
+            this.isNegativeYearRuleRejected = isNegativeYearRuleRejected;
         }
     }
 }
