@@ -111,18 +111,7 @@ public abstract class HttpClient implements QuietCloseable {
             if (stagedBufLo != 0) {
                 Unsafe.free(stagedBufLo, bufferSize, MemoryTag.NATIVE_DEFAULT);
             }
-            if (stagedSocket != null) {
-                // Cleanup is secondary to the construction failure. A custom or TLS socket can
-                // throw from close(), but callers still need the exception that explains why the
-                // client could not be constructed.
-                try {
-                    stagedSocket.close();
-                } catch (Throwable closeFailure) {
-                    if (closeFailure != t) {
-                        t.addSuppressed(closeFailure);
-                    }
-                }
-            }
+            Misc.freeSuppressing(stagedSocket, t);
             throw t;
         }
         this.socket = stagedSocket;

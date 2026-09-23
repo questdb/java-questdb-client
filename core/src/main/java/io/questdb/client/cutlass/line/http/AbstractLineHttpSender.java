@@ -224,18 +224,8 @@ public abstract class AbstractLineHttpSender implements Sender {
             this.userAgent = "QuestDB/java/" + questDBVersion;
             this.request = newRequest();
         } catch (Throwable th) {
-            if (this.client != null) {
-                // Attach a close failure to the primary one rather than let it replace it: a TLS
-                // socket can throw from close(), and the caller has to see why construction failed.
-                try {
-                    this.client.close();
-                } catch (Throwable closeFailure) {
-                    if (closeFailure != th) {
-                        th.addSuppressed(closeFailure);
-                    }
-                }
-                this.client = null;
-            }
+            Misc.freeSuppressing(this.client, th);
+            this.client = null;
             throw th;
         }
         this.maxNameLength = maxNameLength;
