@@ -48,15 +48,22 @@ import java.util.TreeSet;
  * parameter in place, and the twenty-three-arg {@code QwpWebSocketSender.connectWithCredentialSupplier}
  * overload gained the symbol-dictionary recycle knobs in place instead of through a new overload. All four
  * sit in packages {@code module-info.java} exports and that ship a javadoc jar, so a caller compiled against
- * an earlier release would have failed with {@code NoSuchMethodError}, and an external {@code Response}
- * implementation with {@code AbstractMethodError}. Nothing in this repository, in questdb, or in
- * questdb-enterprise calls them, which is why the break was latent rather than observed - and why nothing
- * would have caught it coming back.
+ * an earlier release - or, for the credential-supplier overload, against main before this branch - would
+ * have failed with {@code NoSuchMethodError}, and an external {@code Response} implementation with
+ * {@code AbstractMethodError}. Nothing in this repository, in questdb, or in questdb-enterprise calls them,
+ * which is why the break was latent rather than observed - and why nothing would have caught it coming back.
  * <p>
  * There is no japicmp or revapi gate on this build, so this test is the gate. The expected signatures below
- * are the ones present at this branch's merge base ({@code 2489b243}); they are written out literally rather
+ * are the ones present at this branch's merge base ({@code 981bdb02}); they are written out literally rather
  * than derived from the current classes, because a pin computed from the thing it pins proves nothing.
  * Adding an overload is fine and this test stays green; retyping or removing one turns it red.
+ * <p>
+ * Not every pin guards a signature that shipped. The {@code connect}, {@code createLineSender} and
+ * {@code Response.recv} pins, and the seven {@link #RELEASED_CONSTRUCTOR_SIGNATURES} constructor pins, all
+ * guard signatures present in a published jar - 1.3.9 has every one of them. The two
+ * {@code connectWithCredentialSupplier} pins are different: that signature is on {@code main} since the OIDC
+ * device-flow change ({@code 0b9b5766}), after 1.3.9, and has not shipped in a release, so the pin protects
+ * a caller building against {@code main}, not against a published jar.
  * <p>
  * {@link #RELEASED_CONSTRUCTOR_SIGNATURES} pins every public {@code CursorWebSocketSendLoop} constructor
  * present in the published {@code org.questdb:questdb-client:1.3.9} jar, copied from {@code javap} of that
