@@ -25,9 +25,11 @@
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketEncoder;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
+import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.UnreplayableSlotException;
 import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
@@ -790,6 +792,29 @@ public class CursorSendEngineTest {
     }
 
     @Test
+    public void testSchemaRequirementTracksUnackedSchemaFrames() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 1 << 20);
+                 QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 QwpTableBuffer rows = schemaTestRows()) {
+                assertEquals(0L, appendLegacy(engine, encoder, rows));
+                assertFalse(engine.requiresSchema());
+                assertEquals(1L, appendSchema(engine, encoder, rows));
+                assertTrue(engine.requiresSchema());
+                assertEquals(2L, appendLegacy(engine, encoder, rows));
+                assertTrue(engine.acknowledge(0L));
+                assertTrue("the schema frame is still unacked", engine.requiresSchema());
+                assertTrue(engine.acknowledge(1L));
+                assertFalse(engine.requiresSchema());
+                assertEquals(3L, appendSchema(engine, encoder, rows));
+                assertTrue(engine.requiresSchema());
+                assertTrue(engine.acknowledge(3L));
+                assertFalse(engine.requiresSchema());
+            }
+        });
+    }
+
+    @Test
     public void testSealedSegmentsAccumulateAfterRotation() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             // segSize fits exactly 2 frames -> the 3rd append seals the active
@@ -1038,6 +1063,14 @@ public class CursorSendEngineTest {
     // a bounded wait. The probe is a second mapping of the same file the manager
     // worker writes through; its MAP_SHARED reads observe the worker's writes, and
     // it is closed before the next session opens the slot.
+    private static long appendLegacy(CursorSendEngine engine, QwpWebSocketEncoder encoder, QwpTableBuffer rows) {
+        return engine.appendBlocking(encoder.getBuffer().getBufferPtr(), encoder.encode(rows));
+    }
+
+    private static long appendSchema(CursorSendEngine engine, QwpWebSocketEncoder encoder, QwpTableBuffer rows) {
+        return engine.appendBlocking(encoder.getBuffer().getBufferPtr(), encoder.encodeSchema(rows, -1, -1));
+    }
+
     private static void awaitManagerPersistedWatermark(String slotDir, long expected) {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
         long last = AckWatermark.INVALID;
@@ -1053,6 +1086,13 @@ public class CursorSendEngineTest {
         }
         fail("manager did not persist watermark=" + expected
                 + " within 10s (last on-disk read=" + last + ")");
+    }
+
+    private static QwpTableBuffer schemaTestRows() {
+        QwpTableBuffer rows = new QwpTableBuffer("schema_requirement");
+        rows.getOrCreateColumn("n", QwpConstants.TYPE_LONG, true).addLong(1);
+        rows.nextRow();
+        return rows;
     }
 
 }

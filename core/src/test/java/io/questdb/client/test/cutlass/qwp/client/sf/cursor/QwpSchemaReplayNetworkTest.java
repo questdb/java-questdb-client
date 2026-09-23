@@ -55,11 +55,45 @@ import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.LockSupport;
 
 public class QwpSchemaReplayNetworkTest {
     private static final int SEGMENT_SIZE = 1 << 20;
     @Rule
     public final TemporaryFolder temp = TemporaryFolder.builder().parentFolder(taskTempRoot()).build();
+
+    @Test
+    public void testBackgroundDrainerRetiresOrphanSchemaTailWithoutConnecting() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            File root = temp.newFolder("drainer-orphan-schema-tail");
+            String slot = new File(root, "ghost").getAbsolutePath();
+            seedDeferredSchemaTail(slot);
+            RecordingHandler oldHandler = new RecordingHandler(false, "deferred");
+            try (TestWebSocketServer oldPeer = new TestWebSocketServer(oldHandler)) {
+                oldPeer.start();
+                Assert.assertTrue(oldPeer.awaitStart(5, TimeUnit.SECONDS));
+                IgnoringFactory factory = new IgnoringFactory(oldPeer.getPort(), 1);
+                BackgroundDrainer drainer = new BackgroundDrainer(
+                        slot, SEGMENT_SIZE, 4L * SEGMENT_SIZE, factory,
+                        5_000, 1, 4, false, 0
+                );
+                Thread thread = new Thread(drainer::run, "schema-orphan-tail-drainer");
+                thread.start();
+                try {
+                    thread.join(5_000);
+                    Assert.assertFalse("drainer did not finish", thread.isAlive());
+                } finally {
+                    drainer.requestStop();
+                    thread.join(5_000);
+                }
+                // The aborted tail is retired locally, so the drainer never needs a peer.
+                Assert.assertEquals(BackgroundDrainer.DrainOutcome.SUCCESS, drainer.outcome());
+                Assert.assertEquals(0, factory.attempts.get());
+                Assert.assertEquals(0, oldHandler.frames.size());
+            }
+            assertNoQuarantine(root);
+        });
+    }
 
     @Test
     public void testBackgroundDrainerRejectsUnconfirmedClientReturnedByFactoryWithoutQuarantine() throws Exception {
@@ -93,6 +127,58 @@ public class QwpSchemaReplayNetworkTest {
         }
         assertRetained(slot, 1);
         assertNoQuarantine(root);
+    }
+
+    @Test(timeout = 20_000)
+    public void testAckedSchemaFramesDoNotBlockLegacyPeerAfterDowngrade() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            File root = temp.newFolder("acked-then-downgrade");
+            String slot = new File(root, "default").getAbsolutePath();
+            RecordingHandler supportingHandler = new RecordingHandler(true, "downgrade");
+            RecordingHandler legacyHandler = new RecordingHandler(true, "downgrade");
+            try (TestWebSocketServer legacyPeer = new TestWebSocketServer(legacyHandler);
+                 CursorSendEngine engine = new CursorSendEngine(slot, SEGMENT_SIZE);
+                 QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 QwpTableBuffer schemaRows = table("downgrade", 1);
+                 QwpTableBuffer legacyRows = table("downgrade", 2)) {
+                legacyPeer.start();
+                Assert.assertTrue(legacyPeer.awaitStart(5, TimeUnit.SECONDS));
+                SchemaAwareFactory factory = new SchemaAwareFactory(legacyPeer.getPort(), 1);
+                CursorWebSocketSendLoop loop = null;
+                try {
+                    try (TestWebSocketServer supportingPeer = new TestWebSocketServer(supportingHandler)) {
+                        supportingPeer.setAdvertiseSchema(true);
+                        supportingPeer.start();
+                        Assert.assertTrue(supportingPeer.awaitStart(5, TimeUnit.SECONDS));
+                        WebSocketClient initialClient = connectLegacyClient(supportingPeer.getPort(), true);
+                        loop = new CursorWebSocketSendLoop(
+                                initialClient, engine, 0, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                                factory, 1, 4, false);
+                        Assert.assertTrue(initialClient.isQwpSchemaEnabled());
+                        loop.start();
+                        int length = encoder.encodeSchema(schemaRows, -1, -1);
+                        Assert.assertEquals(0, engine.appendBlocking(encoder.getBuffer().getBufferPtr(), length));
+                        Assert.assertTrue(engine.requiresSchema());
+                        awaitAckedFsn(engine, 0);
+                        Assert.assertFalse("an acked schema frame must not pin the capability",
+                                engine.requiresSchema());
+                    }
+                    // The schema-capable peer is gone; the loop must accept the legacy peer.
+                    int length = encoder.encode(legacyRows);
+                    Assert.assertEquals(1, engine.appendBlocking(encoder.getBuffer().getBufferPtr(), length));
+                    awaitAckedFsn(engine, 1);
+                    Assert.assertNull(loop.getTerminalError());
+                    Assert.assertEquals(1, supportingHandler.frames.size());
+                    Assert.assertEquals(1, legacyHandler.frames.size());
+                    Assert.assertEquals(0, legacyHandler.frames.get(0)[QwpConstants.HEADER_OFFSET_FLAGS]
+                            & QwpConstants.FLAG_SCHEMA);
+                } finally {
+                    if (loop != null) {
+                        loop.close();
+                    }
+                }
+            }
+        });
     }
 
     @Test
@@ -395,7 +481,7 @@ public class QwpSchemaReplayNetworkTest {
             if (foregroundFirst) {
                 foreground = sender.newReconnectFactory();
                 background = sender.newBackgroundReconnectFactory(() -> false);
-                foreground.requireSchema();
+                foreground.setSchemaRequired(true);
                 assertSchemaMismatch(foreground);
                 try (WebSocketClient client = background.reconnect()) {
                     Assert.assertFalse(client.isQwpSchemaEnabled());
@@ -403,7 +489,7 @@ public class QwpSchemaReplayNetworkTest {
             } else {
                 background = sender.newBackgroundReconnectFactory(() -> false);
                 foreground = sender.newReconnectFactory();
-                background.requireSchema();
+                background.setSchemaRequired(true);
                 assertSchemaMismatch(background);
                 try (WebSocketClient client = foreground.reconnect()) {
                     Assert.assertFalse(client.isQwpSchemaEnabled());
@@ -423,6 +509,16 @@ public class QwpSchemaReplayNetworkTest {
             if (client != null) {
                 client.close();
             }
+        }
+    }
+
+    private static void awaitAckedFsn(CursorSendEngine engine, long fsn) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (engine.ackedFsn() < fsn) {
+            if (System.nanoTime() > deadline) {
+                Assert.fail("timed out waiting for ackedFsn " + fsn + ", actual " + engine.ackedFsn());
+            }
+            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(1));
         }
     }
 
@@ -627,7 +723,7 @@ public class QwpSchemaReplayNetworkTest {
         }
 
         @Override
-        public void requireSchema() {
+        public void setSchemaRequired(boolean isRequired) {
             // Deliberately ignored: returned-client validation must still reject it.
         }
     }
@@ -705,7 +801,7 @@ public class QwpSchemaReplayNetworkTest {
     private static final class SchemaAwareFactory implements CursorWebSocketSendLoop.ReconnectFactory {
         private final CountDownLatch attemptsLatch;
         private final int port;
-        private volatile boolean schemaRequired;
+        private volatile boolean isSchemaRequired;
 
         private SchemaAwareFactory(int port, int expectedAttempts) {
             this.port = port;
@@ -719,12 +815,12 @@ public class QwpSchemaReplayNetworkTest {
         @Override
         public WebSocketClient reconnect() {
             attemptsLatch.countDown();
-            return connectLegacyClient(port, schemaRequired);
+            return connectLegacyClient(port, isSchemaRequired);
         }
 
         @Override
-        public void requireSchema() {
-            schemaRequired = true;
+        public void setSchemaRequired(boolean isRequired) {
+            isSchemaRequired = isRequired;
         }
     }
 }

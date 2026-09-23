@@ -4261,9 +4261,7 @@ public class QwpWebSocketSender implements Sender {
                     connectionListener, connectionListenerInboxCapacity);
         }
         CursorWebSocketSendLoop.ReconnectFactory reconnectFactory = newReconnectFactory();
-        if (cursorEngine.requiresSchema()) {
-            reconnectFactory.requireSchema();
-        }
+        reconnectFactory.setSchemaRequired(cursorEngine.requiresSchema());
         switch (initialConnectMode) {
             case SYNC:
                 client = CursorWebSocketSendLoop.connectWithRetry(
@@ -5770,7 +5768,7 @@ public class QwpWebSocketSender implements Sender {
         private final java.util.function.BooleanSupplier abortCheck;
         private final String abortMessage;
         // Each factory serves one engine; other streams can still use legacy peers.
-        private volatile boolean hasSchemaRequirement;
+        private volatile boolean isSchemaRequired;
         private int previousIdx = -1;
 
         private ReconnectSupplier() {
@@ -5808,12 +5806,12 @@ public class QwpWebSocketSender implements Sender {
         }
 
         boolean requiresSchema() {
-            return hasSchemaRequirement;
+            return isSchemaRequired;
         }
 
         @Override
-        public void requireSchema() {
-            hasSchemaRequirement = true;
+        public void setSchemaRequired(boolean isRequired) {
+            isSchemaRequired = isRequired;
         }
 
         @Override

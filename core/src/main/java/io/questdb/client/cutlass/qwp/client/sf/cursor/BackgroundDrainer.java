@@ -482,6 +482,9 @@ public final class BackgroundDrainer implements Runnable {
             // to the deadline (which would otherwise busy-loop once past it).
             boolean boundedByBudget = false;
             try {
+                if (schemaEngine != null) {
+                    clientFactory.setSchemaRequired(schemaEngine.requiresSchema());
+                }
                 WebSocketClient connected = clientFactory.reconnect();
                 if (connected != null && schemaEngine != null && schemaEngine.requiresSchema()
                         && !connected.isQwpSchemaEnabled()) {
@@ -1072,9 +1075,6 @@ public final class BackgroundDrainer implements Runnable {
                 return;
             }
             engineForTesting = engine;
-            if (engine.requiresSchema()) {
-                clientFactory.requireSchema();
-            }
             if (logicalSlotLock != null) {
                 logicalSlotLock.close();
                 logicalSlotLock = null;

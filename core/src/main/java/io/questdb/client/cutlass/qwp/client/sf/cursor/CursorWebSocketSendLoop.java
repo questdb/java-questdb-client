@@ -937,11 +937,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         this.hasNegotiatedSchema = client != null && client.isQwpSchemaEnabled();
         this.hasEverConnected = client != null;
         this.isWireUp = client != null;
-        if (engine.requiresSchema()) {
-            if (reconnectFactory != null) {
-                reconnectFactory.requireSchema();
-            }
-        }
         // Adopt the engine's recovered orphaned-deferred-tail range (if any).
         // See the field docs on orphanSkipStartFsn/orphanSkipTipFsn; the
         // BackgroundDrainer path builds its loop through this same
@@ -1910,9 +1905,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             attempts++;
             totalReconnectAttempts.incrementAndGet();
             try {
-                if (engine.requiresSchema()) {
-                    reconnectFactory.requireSchema();
-                }
+                reconnectFactory.setSchemaRequired(engine.requiresSchema());
                 WebSocketClient newClient = reconnectFactory.reconnect(connectCancellation);
                 if (newClient != null) {
                     if (!running) {
@@ -3789,8 +3782,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         if (orphanSkipTipFsn < 0) {
             return true;
         }
-        if (!engine.retireRecoveredOrphanTailIfReady(
-                client != null && client.isQwpSchemaEnabled())) {
+        if (!engine.retireRecoveredOrphanTailIfReady()) {
             return false;
         }
         orphanSkipStartFsn = -1L;
@@ -3829,7 +3821,13 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     public interface ReconnectFactory {
         WebSocketClient reconnect() throws Exception;
 
-        default void requireSchema() {
+        /**
+         * Tells the factory whether the engine currently holds unacked
+         * schema-framed frames, so it requests schema framing and rejects peers
+         * without it. Callers refresh this before each attempt; the send loop
+         * re-checks the engine when it installs the client.
+         */
+        default void setSchemaRequired(boolean isRequired) {
         }
 
         /**

@@ -126,7 +126,7 @@ public class RecoveredFrameAnalysisTest {
     }
 
     @Test
-    public void testExtendedDeferredTailCannotRetireBeforeConfirmation() throws Exception {
+    public void testExtendedDeferredTailRetiresLocallyAndDropsSchemaRequirement() throws Exception {
         assertMemoryLeak(() -> {
             Path slot = temporaryFolder.newFolder("qwp-schema-tail").toPath();
             long payload = qwpFrame((byte) (QwpConstants.FLAG_SCHEMA | QwpConstants.FLAG_DEFER_COMMIT));
@@ -136,10 +136,10 @@ public class RecoveredFrameAnalysisTest {
                 }
                 try (CursorSendEngine recovered = new CursorSendEngine(slot.toString(), 4_096)) {
                     Assert.assertTrue(recovered.requiresSchema());
-                    Assert.assertFalse(recovered.retireRecoveredOrphanTailIfReady());
-                    Assert.assertEquals(-1, recovered.ackedFsn());
-                    Assert.assertTrue(recovered.retireRecoveredOrphanTailIfReady(true));
+                    // Retirement transmits nothing, so it needs no schema-capable peer.
+                    Assert.assertTrue(recovered.retireRecoveredOrphanTailIfReady());
                     Assert.assertEquals(0, recovered.ackedFsn());
+                    Assert.assertFalse(recovered.requiresSchema());
                 }
             } finally {
                 Unsafe.free(payload, frameLength(payload), MemoryTag.NATIVE_DEFAULT);

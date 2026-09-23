@@ -572,7 +572,7 @@ public class CursorWebSocketSchemaLifecycleTest {
         }
 
         @Override
-        public void requireSchema() {
+        public void setSchemaRequired(boolean isRequired) {
         }
     }
 
