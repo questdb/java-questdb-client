@@ -26,6 +26,7 @@ package io.questdb.client.cutlass.http;
 
 import io.questdb.client.std.LowerCaseUtf8SequenceObjHashMap;
 import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.Misc;
 import io.questdb.client.std.Mutable;
 import io.questdb.client.std.Numbers;
 import io.questdb.client.std.NumericException;
@@ -46,9 +47,7 @@ import static io.questdb.client.cutlass.http.HttpConstants.HEADER_CONTENT_TYPE;
 public class HttpHeaderParser implements Mutable, QuietCloseable, HttpRequestHeader {
     private final ObjectPool<DirectUtf8String> csPool;
     private final LowerCaseUtf8SequenceObjHashMap<DirectUtf8String> headers = new LowerCaseUtf8SequenceObjHashMap<>();
-    // Deliberately not a field initialiser: those run before the constructor body, so a throw from
-    // the header-buffer malloc would strand the sink with nothing able to close it. The constructor
-    // allocates it inside its own try instead.
+    // Allocate inside the constructor's try so later initialization failures release the sink.
     private final DirectUtf8Sink sink;
     private final DirectUtf8String temp = new DirectUtf8String();
     private final Utf8SequenceObjHashMap<DirectUtf8String> urlParams = new Utf8SequenceObjHashMap<>();
@@ -76,30 +75,15 @@ public class HttpHeaderParser implements Mutable, QuietCloseable, HttpRequestHea
     private DirectUtf8String statusCode;
 
     public HttpHeaderParser(int bufferSize, ObjectPool<DirectUtf8String> csPool) {
-        // A local mirrors the sink field: the catch cannot read a blank final that the failing
-        // statement never assigned, so it frees this instead.
-        DirectUtf8Sink utf8Sink = null;
         try {
-            this.sink = utf8Sink = new DirectUtf8Sink(0);
+            this.sink = new DirectUtf8Sink(0);
             this.csPool = csPool;
             this.headerPtr = this._wptr = Unsafe.malloc(bufferSize, MemoryTag.NATIVE_HTTP_CONN);
             this.hi = headerPtr + bufferSize;
             clear();
         } catch (Throwable th) {
-            // Both native allocations sit inside this try, so the catch really can free every block
-            // the constructor managed to take. Unsafe.malloc throws whenever the JVM cannot hand out
-            // the block, and DirectUtf8Sink allocates even at capacity 0, so the caller can be left
-            // dropping a half-built parser that nothing will ever close. Free by hand rather than
-            // through close(): HttpClient.ResponseHeaders overrides close() to keep parser memory
-            // alive for the client to free later and to disconnect the outer client's socket, so
-            // routing this path through it would dispatch into a subclass mid-construction, tear
-            // down a live socket, and skip the frees entirely.
-            if (headerPtr != 0) {
-                headerPtr = _wptr = hi = Unsafe.free(headerPtr, hi - headerPtr, MemoryTag.NATIVE_HTTP_CONN);
-            }
-            if (utf8Sink != null) {
-                utf8Sink.close();
-            }
+            // Avoid invoking an overridden close() during construction.
+            freeNative();
             throw th;
         }
     }
@@ -133,10 +117,7 @@ public class HttpHeaderParser implements Mutable, QuietCloseable, HttpRequestHea
     @Override
     public void close() {
         clear();
-        if (headerPtr != 0) {
-            headerPtr = _wptr = hi = Unsafe.free(headerPtr, hi - headerPtr, MemoryTag.NATIVE_HTTP_CONN);
-        }
-        sink.close();
+        freeNative();
         csPool.clear();
     }
 
@@ -227,6 +208,13 @@ public class HttpHeaderParser implements Mutable, QuietCloseable, HttpRequestHea
             }
         }
         return p;
+    }
+
+    private void freeNative() {
+        if (headerPtr != 0) {
+            headerPtr = _wptr = hi = Unsafe.free(headerPtr, hi - headerPtr, MemoryTag.NATIVE_HTTP_CONN);
+        }
+        Misc.free(sink);
     }
 
     private void parseContentLength() {
