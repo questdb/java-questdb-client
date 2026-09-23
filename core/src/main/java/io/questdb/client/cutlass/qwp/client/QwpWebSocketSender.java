@@ -148,14 +148,16 @@ public class QwpWebSocketSender implements Sender {
     public static final boolean DEFAULT_SYMBOL_DICT_RESET_ENABLED = true;
     // Default for symbol_dict_reset_max_wait_millis: 2 s. Once a recycle has
     // been armed that long without a table() call finding the backlog already
-    // drained, the next table() call blocks the producing thread for up to
-    // that long waiting for the backlog to drain, then recycles. A producer
+    // drained, the next table() call that finds the I/O loop holding a live
+    // connection blocks the producing thread for up to that long waiting for
+    // the backlog to drain, then recycles; a table() call made while the loop
+    // is reconnecting skips the wait and leaves the recycle armed. A producer
     // that keeps a few frames in flight at every row start (a continuous
     // stream) never exposes a drained instant on its own; on a healthy link
     // the pause is one ack round trip, since the paused producer stops
     // refilling the ring. On timeout the call gives up (still armed, retried
     // only at a later drained table() call): the wait runs at most once per
-    // armed window, so an outage costs the producer one bounded pause. Kept
+    // armed window, so a drop costs the producer at most one bounded pause. Kept
     // well below QuestDBBuilder.DEFAULT_ACQUIRE_TIMEOUT_MILLIS (5 s): a
     // pooled sender inherits an armed recycle at give-back, and a borrower
     // paying this wait while holding its lease must release before other
@@ -2665,9 +2667,11 @@ public class QwpWebSocketSender implements Sender {
      * while {@link #getSymbolDictEpoch()} keeps advancing means recycles are
      * completing, but each one first had to pause the producer; a count that
      * stops growing while {@link #isResetArmed()} stays {@code true} and the
-     * epoch does not advance means the one wait this armed window gets has
-     * already timed out and the recycle now depends on a row start finding
-     * the backlog drained on its own. At {@code symbol_dict_reset_max_wait_millis=0}
+     * epoch does not advance means either that the one wait this armed window
+     * gets has already timed out and the recycle now depends on a row start
+     * finding the backlog drained on its own, or that the sender is between
+     * connections (the barrier skips the wait while the I/O loop is
+     * reconnecting). At {@code symbol_dict_reset_max_wait_millis=0}
      * the wait never runs and this counter is structurally 0, so 0 does NOT
      * mean "no starvation" -- sample {@link #isResetArmed()} alongside
      * {@link #getSymbolDictEpoch()} instead.

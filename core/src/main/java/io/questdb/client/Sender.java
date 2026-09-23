@@ -697,11 +697,14 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     /**
      * Advisory request to start a fresh symbol-dictionary epoch. The reset
      * runs at the next {@code table(...)} call that finds all published data
-     * acknowledged and no row in progress. A request outstanding longer than
+     * acknowledged, no row in progress and the I/O loop holding a live
+     * connection. A request outstanding longer than
      * {@link LineSenderBuilder#symbolDictResetMaxWaitMillis(long)} pauses one
-     * {@code table(...)} call for up to that long to drain the backlog; if
-     * the backlog still does not drain, the request stays pending and may be
-     * deferred indefinitely under sustained saturation. {@code table(...)}
+     * {@code table(...)} call for up to that long to drain the backlog; a
+     * call made while the loop is reconnecting skips that pause and leaves
+     * the request pending. If the backlog still does not drain, the request
+     * stays pending and may be deferred indefinitely under sustained
+     * saturation or a long outage. {@code table(...)}
      * is the only trigger point: a caller that never starts another row
      * never starts a recycle. A recycle that a {@code table(...)} call has
      * already started but could not finish (a transient failure mid-swap) is
@@ -1921,12 +1924,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * so a long-lived sender's dictionary does not grow without bound.
          * <p>
          * The recycle itself runs at a {@code table()} call that finds the backlog
-         * already acknowledged. A recycle armed longer than
-         * {@link #symbolDictResetMaxWaitMillis(long)} without such a call pauses
-         * one {@code table()} call for up to that long to drain the backlog; if
-         * the backlog still does not drain, the recycle stays armed and under
-         * sustained saturation may be deferred indefinitely (see
-         * {@link Sender#resetSymbolDictionary()}).
+         * already acknowledged and the I/O loop holding a live connection. A
+         * recycle armed longer than {@link #symbolDictResetMaxWaitMillis(long)}
+         * without such a call pauses one {@code table()} call for up to that long
+         * to drain the backlog (a call made while the loop is reconnecting skips
+         * the pause); if the backlog still does not drain, the recycle stays armed
+         * and under sustained saturation or a long outage may be deferred
+         * indefinitely (see {@link Sender#resetSymbolDictionary()}).
          * <p>
          * Switching it off also disables the manual valve:
          * {@link Sender#resetSymbolDictionary()} becomes a permanent no-op,
@@ -1981,18 +1985,21 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * recycle stays armed before it may block the calling thread to force
          * progress. Once a recycle has been armed for longer than this window
          * without an opportunistic (idle) drain, the NEXT row-start call
-         * ({@code table(...)}) BLOCKS the producing thread for up to this many
-         * millis waiting for the outstanding backlog to drain, then recycles
-         * before returning. A producer that keeps frames in flight at every row
+         * ({@code table(...)}) that finds the I/O loop holding a live connection
+         * BLOCKS the producing thread for up to this many millis waiting for the
+         * outstanding backlog to drain, then recycles before returning; a row
+         * start made while the loop is reconnecting skips the wait and leaves
+         * the recycle armed. A producer that keeps frames in flight at every row
          * start never exposes a drained instant on its own; on a healthy link
          * the pause is about one acknowledgement round trip, because the paused
          * producer stops refilling the backlog. If the backlog still has not
-         * drained by the deadline (an outage, or a producer that outruns the
-         * wire), that call gives up (logging a warning) and the recycle stays
-         * armed for a later opportunistic retry. At most one blocking wait
-         * happens per armed window, so an outage costs the producer one bounded
-         * pause, and a timeout during that one wait leaves the recycle waiting
-         * for a row start that finds the backlog drained on its own.
+         * drained by the deadline (a drop the loop has not observed yet, or a
+         * producer that outruns the wire), that call gives up (logging a warning)
+         * and the recycle stays armed for a later opportunistic retry. At most
+         * one blocking wait happens per armed window, so a drop costs the
+         * producer at most one bounded pause, and a timeout during that one wait
+         * leaves the recycle waiting for a row start that finds the backlog
+         * drained on its own.
          * <p>
          * {@code 0} disables blocking entirely (opportunistic-only): the recycle
          * then only ever runs when a {@code table(...)} call finds the backlog
@@ -2002,8 +2009,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * with {@code getSymbolDictEpoch()} and
          * {@code getSymbolDictResetStarvationTimeouts()}: armed staying
          * {@code true} while the epoch does not advance means no row start
-         * observes a drained backlog. Either raise this value, or drain
-         * explicitly ({@code drain(...)}) at a quiet point of your choosing.
+         * observes a drained backlog, or the sender is between connections.
+         * Either raise this value, or drain explicitly ({@code drain(...)}) at
+         * a quiet point of your choosing.
          * <p>
          * The default is kept below the sender pool's acquire timeout: a pooled
          * sender inherits an armed recycle at give-back, and the next borrower
