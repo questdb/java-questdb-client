@@ -202,43 +202,27 @@ public final class Unsafe {
         if (isJava8Or11()) {
             return getFieldOffset(AccessibleObject.class, "override");
         }
-        // From Java 12 onwards, AccessibleObject#override is protected and cannot be accessed reflectively.
-        boolean is32BitJVM = is32BitJVM();
-        if (is32BitJVM) {
-            return 8L;
-        }
-        if (getOrdinaryObjectPointersCompressionStatus(is32BitJVM)) {
-            return 12L;
-        }
-        return 16L;
+        // From Java 12 onwards, AccessibleObject#override is filtered from
+        // reflection, so its offset cannot be read directly. It is laid out at
+        // the first-field boundary -- immediately after the object header -- so
+        // the offset of the first (and only) field of a minimal probe class is
+        // identical. Measure it rather than hard-coding a value: JDK 24+ compact
+        // object headers (JEP 450, enabled by default in JDK 27) shrink the
+        // header from 12 to 8 bytes, and a hard-coded 12/16 would then point
+        // inside the header -- the Unsafe write to `override` would silently
+        // miss and setAccessible() would have no effect (surfacing as
+        // IllegalAccessError from the FdBig double-formatting bridge on JDK 27).
+        // The probe tracks compact (8), compressed (12), uncompressed (16) and
+        // 32-bit (8) layouts automatically.
+        return firstFieldBoundaryOffset();
     }
 
-    private static boolean getOrdinaryObjectPointersCompressionStatus(boolean is32BitJVM) {
+    private static long firstFieldBoundaryOffset() {
         class Probe {
             @SuppressWarnings("unused")
-            private int intField; // Accessed through reflection
-
-            boolean probe() {
-                long offset = getFieldOffset(Probe.class, "intField");
-                if (offset == 8L) {
-                    assert is32BitJVM;
-                    return false;
-                }
-                if (offset == 12L) {
-                    return true;
-                }
-                if (offset == 16L) {
-                    return false;
-                }
-                throw new AssertionError(offset);
-            }
+            int intField; // read reflectively; sits at the object's first-field boundary
         }
-        return new Probe().probe();
-    }
-
-    private static boolean is32BitJVM() {
-        String sunArchDataModel = System.getProperty("sun.arch.data.model");
-        return sunArchDataModel.equals("32");
+        return getFieldOffset(Probe.class, "intField");
     }
 
     private static boolean isJava8Or11() {
