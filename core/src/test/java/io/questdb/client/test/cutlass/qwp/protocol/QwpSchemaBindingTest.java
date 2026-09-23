@@ -44,6 +44,7 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.UUID;
 
 import static io.questdb.client.test.cutlass.qwp.protocol.QwpSchemaTestFixtures.assertReason;
 import static io.questdb.client.test.cutlass.qwp.protocol.QwpSchemaTestFixtures.column;
@@ -59,10 +60,12 @@ public class QwpSchemaBindingTest {
         Assert.assertNotNull(stream);
         try (BufferedReader lines = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))) {
             String line;
+            int count = 0;
             while ((line = lines.readLine()) != null) {
                 if (line.startsWith("#")) {
                     continue;
                 }
+                count++;
                 String[] fields = line.split("\t", -1);
                 Assert.assertEquals(line, 7, fields.length);
                 try {
@@ -100,6 +103,8 @@ public class QwpSchemaBindingTest {
                     throw new AssertionError("case_id=" + fields[0] + ": " + e.getMessage(), e);
                 }
             }
+            // An emptied or unparsed corpus must not pass vacuously.
+            Assert.assertEquals(102, count);
         }
     }
 
@@ -179,10 +184,12 @@ public class QwpSchemaBindingTest {
         Assert.assertNotNull(stream);
         try (BufferedReader lines = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))) {
             String line;
+            int count = 0;
             while ((line = lines.readLine()) != null) {
                 if (line.startsWith("#")) {
                     continue;
                 }
+                count++;
                 String[] fields = line.split("\t", -1);
                 Assert.assertEquals(line, 6, fields.length);
                 try {
@@ -210,6 +217,8 @@ public class QwpSchemaBindingTest {
                     throw new AssertionError("case_id=" + fields[0] + ": " + e.getMessage(), e);
                 }
             }
+            // An emptied or unparsed corpus must not pass vacuously.
+            Assert.assertEquals(48, count);
         }
     }
 
@@ -936,10 +945,12 @@ public class QwpSchemaBindingTest {
         Assert.assertNotNull(stream);
         try (BufferedReader lines = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))) {
             String line;
+            int count = 0;
             while ((line = lines.readLine()) != null) {
                 if (line.startsWith("#")) {
                     continue;
                 }
+                count++;
                 String[] fields = line.split("\t", -1);
                 Assert.assertEquals(line, 4, fields.length);
                 try {
@@ -975,6 +986,8 @@ public class QwpSchemaBindingTest {
                     throw new AssertionError("case_id=" + fields[0] + ": " + e.getMessage(), e);
                 }
             }
+            // An emptied or unparsed corpus must not pass vacuously.
+            Assert.assertEquals(47, count);
         }
     }
 
@@ -1331,29 +1344,52 @@ public class QwpSchemaBindingTest {
 
     @Test
     public void testUuidConformanceCorpus() throws Exception {
-        InputStream stream = QwpSchemaBindingTest.class.getResourceAsStream(
-                "/io/questdb/client/cutlass/qwp/uuid-string-conformance.tsv");
-        Assert.assertNotNull(stream);
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                if (line.startsWith("#")) {
-                    continue;
-                }
-                String[] fields = line.split("\t", -1);
-                Assert.assertEquals(line, 3, fields.length);
-                CharSequence input = "<NULL>".equals(fields[1]) ? null : fields[1];
-                try (QwpTableBuffer buffer = new QwpTableBuffer("t")) {
-            QwpSchemaBinding rows = rows(buffer, column("u", ColumnType.UUID));
-                    if ("<INVALID>".equals(fields[2])) {
-                        assertReason(LineSenderSchemaException.Reason.INVALID_VALUE, () -> rows.stringColumn("u", input));
-                    } else {
+        assertMemoryLeak(() -> {
+            InputStream stream = QwpSchemaBindingTest.class.getResourceAsStream(
+                    "/io/questdb/client/cutlass/qwp/uuid-string-conformance.tsv");
+            Assert.assertNotNull(stream);
+            int count = 0;
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    if (line.startsWith("#")) {
+                        continue;
+                    }
+                    count++;
+                    String[] fields = line.split("\t", -1);
+                    Assert.assertEquals(line, 3, fields.length);
+                    CharSequence input = "<NULL>".equals(fields[1]) ? null : fields[1];
+                    String expected = fields[2];
+                    try (QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                        QwpSchemaBinding rows = rows(buffer, column("u", ColumnType.UUID));
+                        if ("<INVALID>".equals(expected)) {
+                            assertReason(LineSenderSchemaException.Reason.INVALID_VALUE, () -> rows.stringColumn("u", input));
+                            continue;
+                        }
                         rows.stringColumn("u", input);
-                buffer.nextRow();
+                        buffer.nextRow();
+                        QwpTableBuffer.ColumnBuffer column = buffer.getColumnCount() == 0 ? null : buffer.getColumn(0);
+                        if ("<NULL>".equals(expected)) {
+                            // NULL is either a null-bitmap entry or the UUID null sentinel
+                            // (both limbs Long.MIN_VALUE), which the server reads as NULL.
+                            Assert.assertTrue(fields[0], column == null || column.isNull(0)
+                                    || (Unsafe.getUnsafe().getLong(column.getDataAddress()) == Long.MIN_VALUE
+                                    && Unsafe.getUnsafe().getLong(column.getDataAddress() + Long.BYTES) == Long.MIN_VALUE));
+                        } else {
+                            UUID uuid = UUID.fromString(expected);
+                            Assert.assertNotNull(fields[0], column);
+                            Assert.assertFalse(fields[0], column.isNull(0));
+                            // The buffer stores the low limb first, as on the wire.
+                            Assert.assertEquals(fields[0], uuid.getLeastSignificantBits(),
+                                    Unsafe.getUnsafe().getLong(column.getDataAddress()));
+                            Assert.assertEquals(fields[0], uuid.getMostSignificantBits(),
+                                    Unsafe.getUnsafe().getLong(column.getDataAddress() + Long.BYTES));
+                        }
                     }
                 }
             }
-        }
+            Assert.assertEquals(20, count);
+        });
     }
 
     @Test

@@ -36,6 +36,9 @@ import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 
+import static io.questdb.client.test.cutlass.qwp.protocol.QwpSchemaTestFixtures.column;
+import static io.questdb.client.test.cutlass.qwp.protocol.QwpSchemaTestFixtures.frame;
+
 public class QwpSchemaProtocolTest {
     @Test
     public void testAcceptsMaximumResponseColumnNameBoundaries() {
@@ -260,10 +263,6 @@ public class QwpSchemaProtocolTest {
         }
     }
 
-    private static byte[] column(String name, int type, byte[] params) {
-        return columnBytes(name.getBytes(StandardCharsets.UTF_8), type, params);
-    }
-
     private static byte[] columnBytes(byte[] name, int type, byte[] params) {
         ByteBuffer b = ByteBuffer.allocate(2 + name.length + 4 + 2 + params.length).order(ByteOrder.LITTLE_ENDIAN);
         b.putShort((short) name.length).put(name).putInt(type).putShort((short) params.length).put(params);
@@ -292,13 +291,6 @@ public class QwpSchemaProtocolTest {
         } finally {
             Unsafe.free(address, frame.length, MemoryTag.NATIVE_DEFAULT);
         }
-    }
-
-    private static byte[] frame(byte[] payload) {
-        ByteBuffer b = ByteBuffer.allocate(QwpConstants.HEADER_SIZE + payload.length).order(ByteOrder.LITTLE_ENDIAN);
-        b.putInt(QwpConstants.MAGIC_MESSAGE).put((byte) 1).put(QwpSchemaProtocol.FLAG_CONTROL)
-                .putShort((short) 0).putInt(payload.length).put(payload);
-        return b.array();
     }
 
     private static byte[] knownResponse(long requestId, int tableId, long version, int designated, byte[]... columns) {
