@@ -42,14 +42,16 @@ import java.util.TreeSet;
 /**
  * Pins the public signatures this branch had to restore after replacing them in place.
  * <p>
- * Three exported methods were changed rather than added to - {@code Response.recv(int)} arrived as an
+ * Four exported methods were changed rather than added to - {@code Response.recv(int)} arrived as an
  * abstract interface method, two {@code QwpWebSocketSender.connect(..., String, ...)} overloads were retyped
- * to {@code Supplier<String>}, and the multi-host {@code AbstractLineHttpSender.createLineSender} gained a
- * parameter in place. All three sit in packages {@code module-info.java} exports and that ship a javadoc jar,
- * so a caller compiled against an earlier release would have failed with {@code NoSuchMethodError}, and an
- * external {@code Response} implementation with {@code AbstractMethodError}. Nothing in this repository, in
- * questdb, or in questdb-enterprise calls them, which is why the break was latent rather than observed - and
- * why nothing would have caught it coming back.
+ * to {@code Supplier<String>}, the multi-host {@code AbstractLineHttpSender.createLineSender} gained a
+ * parameter in place, and the twenty-three-arg {@code QwpWebSocketSender.connectWithCredentialSupplier}
+ * overload gained the symbol-dictionary recycle knobs in place instead of through a new overload. All four
+ * sit in packages {@code module-info.java} exports and that ship a javadoc jar, so a caller compiled against
+ * an earlier release would have failed with {@code NoSuchMethodError}, and an external {@code Response}
+ * implementation with {@code AbstractMethodError}. Nothing in this repository, in questdb, or in
+ * questdb-enterprise calls them, which is why the break was latent rather than observed - and why nothing
+ * would have caught it coming back.
  * <p>
  * There is no japicmp or revapi gate on this build, so this test is the gate. The expected signatures below
  * are the ones present at this branch's merge base ({@code 2489b243}); they are written out literally rather
@@ -64,8 +66,9 @@ import java.util.TreeSet;
 public class ExportedApiCompatibilityTest {
 
     /**
-     * Every {@code QwpWebSocketSender.connect} and {@code AbstractLineHttpSender.createLineSender} signature
-     * that existed at the merge base, as {@code name(paramType,...)returnType} over erased type names.
+     * Every {@code QwpWebSocketSender.connect}, {@code QwpWebSocketSender.connectWithCredentialSupplier} and
+     * {@code AbstractLineHttpSender.createLineSender} signature that existed at the merge base, as
+     * {@code name(paramType,...)returnType} over erased type names.
      */
     private static final String[] PRE_BRANCH_SIGNATURES = {
             // ---- QwpWebSocketSender.connect ----
@@ -80,6 +83,9 @@ public class ExportedApiCompatibilityTest {
             "connect(java.util.List,io.questdb.client.ClientTlsConfiguration,int,int,long,java.lang.String,boolean,io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine,long,long,long,long,io.questdb.client.Sender$InitialConnectMode,io.questdb.client.SenderErrorHandler,int,long,long)io.questdb.client.cutlass.qwp.client.QwpWebSocketSender",
             "connect(java.util.List,io.questdb.client.ClientTlsConfiguration,int,int,long,java.lang.String,boolean,io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine,long,long,long,long,io.questdb.client.Sender$InitialConnectMode,io.questdb.client.SenderErrorHandler,int,long,long,int,io.questdb.client.SenderConnectionListener,int)io.questdb.client.cutlass.qwp.client.QwpWebSocketSender",
             "connect(java.util.List,io.questdb.client.ClientTlsConfiguration,int,int,long,java.lang.String,boolean,io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine,long,long,long,long,io.questdb.client.Sender$InitialConnectMode,io.questdb.client.SenderErrorHandler,int,long,long,int,io.questdb.client.SenderConnectionListener,int,int,long,long)io.questdb.client.cutlass.qwp.client.QwpWebSocketSender",
+            // ---- QwpWebSocketSender.connectWithCredentialSupplier ----
+            "connectWithCredentialSupplier(java.util.List,io.questdb.client.ClientTlsConfiguration,int,int,long,java.util.function.Supplier,boolean,io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine,long,long,long,long,io.questdb.client.Sender$InitialConnectMode,io.questdb.client.SenderErrorHandler,int,long,long,int,io.questdb.client.SenderConnectionListener,int)io.questdb.client.cutlass.qwp.client.QwpWebSocketSender",
+            "connectWithCredentialSupplier(java.util.List,io.questdb.client.ClientTlsConfiguration,int,int,long,java.util.function.Supplier,boolean,io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine,long,long,long,long,io.questdb.client.Sender$InitialConnectMode,io.questdb.client.SenderErrorHandler,int,long,long,int,io.questdb.client.SenderConnectionListener,int,int,long,long)io.questdb.client.cutlass.qwp.client.QwpWebSocketSender",
             // ---- AbstractLineHttpSender.createLineSender ----
             "createLineSender(java.lang.String,int,java.lang.String,io.questdb.client.HttpClientConfiguration,io.questdb.client.ClientTlsConfiguration,int,java.lang.String,java.lang.String,java.lang.String,int,long,int,long,long,int)io.questdb.client.cutlass.line.http.AbstractLineHttpSender",
             "createLineSender(io.questdb.client.std.ObjList,io.questdb.client.std.IntList,java.lang.String,io.questdb.client.HttpClientConfiguration,io.questdb.client.ClientTlsConfiguration,int,java.lang.String,java.lang.String,java.lang.String,int,long,int,long,long,int)io.questdb.client.cutlass.line.http.AbstractLineHttpSender",
@@ -107,6 +113,11 @@ public class ExportedApiCompatibilityTest {
     @Test
     public void testPreBranchQwpWebSocketSenderConnectOverloadsStillLink() {
         assertSignaturesPresent(QwpWebSocketSender.class, "connect");
+    }
+
+    @Test
+    public void testPreBranchQwpWebSocketSenderConnectWithCredentialSupplierOverloadsStillLink() {
+        assertSignaturesPresent(QwpWebSocketSender.class, "connectWithCredentialSupplier");
     }
 
     @Test

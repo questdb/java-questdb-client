@@ -1126,6 +1126,54 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * As the twenty-three-arg {@code connect} overload above, but takes the credential as a
+     * {@link Supplier} instead of wrapping a constant header -- the rotating-credential counterpart to
+     * {@link #connect(List, ClientTlsConfiguration, int, int, long, String, boolean, CursorSendEngine,
+     * long, long, long, long, Sender.InitialConnectMode, SenderErrorHandler, int, long, long, int,
+     * SenderConnectionListener, int, int, long, long)}. Kept as its own overload, delegating to the master
+     * below with the symbol-dictionary recycle knobs defaulted, so a caller compiled before those knobs'
+     * arity moved into the master keeps linking; {@code ExportedApiCompatibilityTest} pins it.
+     */
+    public static QwpWebSocketSender connectWithCredentialSupplier(
+            List<Endpoint> endpoints,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            Supplier<String> authorizationHeaderSupplier,
+            boolean requestDurableAck,
+            CursorSendEngine cursorEngine,
+            long closeFlushTimeoutMillis,
+            long reconnectMaxDurationMillis,
+            long reconnectInitialBackoffMillis,
+            long reconnectMaxBackoffMillis,
+            Sender.InitialConnectMode initialConnectMode,
+            SenderErrorHandler errorHandler,
+            int errorInboxCapacity,
+            long durableAckKeepaliveIntervalMillis,
+            long authTimeoutMs,
+            int connectTimeoutMs,
+            SenderConnectionListener connectionListener,
+            int connectionListenerInboxCapacity,
+            int maxFrameRejections,
+            long poisonMinEscalationWindowMillis,
+            long catchUpCapGapMinEscalationWindowMillis
+    ) {
+        return connectWithCredentialSupplier(endpoints, tlsConfig, autoFlushRows, autoFlushBytes,
+                autoFlushIntervalNanos, authorizationHeaderSupplier, requestDurableAck,
+                cursorEngine, closeFlushTimeoutMillis, reconnectMaxDurationMillis,
+                reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
+                initialConnectMode, errorHandler, errorInboxCapacity,
+                durableAckKeepaliveIntervalMillis, authTimeoutMs, connectTimeoutMs,
+                connectionListener, connectionListenerInboxCapacity,
+                maxFrameRejections, poisonMinEscalationWindowMillis,
+                catchUpCapGapMinEscalationWindowMillis,
+                DEFAULT_SYMBOL_DICT_RESET_ENABLED,
+                DEFAULT_SYMBOL_DICT_RESET_THRESHOLD_SYMBOLS,
+                DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS);
+    }
+
+    /**
      * Master connect entry point — also accepts the poison-frame detector
      * threshold ({@code max_frame_rejections}) and the symbol-dictionary
      * recycle knobs ({@code symbol_dict_reset}, {@code symbol_dict_reset_threshold},
