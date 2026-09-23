@@ -36,6 +36,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 public class CursorWebSocketSchemaLifecycleTest {
@@ -308,6 +309,43 @@ public class CursorWebSocketSchemaLifecycleTest {
     }
 
     @Test
+    public void testLookupsDuringOutageDoNotShortenReconnectBackoff() throws Exception {
+        SchemaHandler handler = new SchemaHandler();
+        FailingReconnectFactory reconnect = new FailingReconnectFactory();
+        try (CursorSendEngine engine = engine("outage-backoff")) {
+            TestWebSocketServer server = server(handler);
+            CursorWebSocketSendLoop loop = null;
+            try {
+                loop = new CursorWebSocketSendLoop(connect(server.getPort()), engine, 0,
+                        CursorWebSocketSendLoop.DEFAULT_PARK_NANOS, reconnect, 200, 200);
+                loop.start();
+                server.close();
+                Assert.assertTrue(reconnect.firstAttempt.await(5, TimeUnit.SECONDS));
+                int attemptsBefore = reconnect.attempts.get();
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
+                int lookups = 0;
+                while (System.nanoTime() < deadline) {
+                    try {
+                        loop.resolveSchema("outage", 1);
+                        Assert.fail("the wire is down");
+                    } catch (LineSenderSchemaException expected) {
+                        lookups++;
+                    }
+                }
+                int attempts = reconnect.attempts.get() - attemptsBefore;
+                // A 200 ms backoff plus up to 200 ms jitter allows at most 5 attempts per second.
+                Assert.assertTrue("lookups=" + lookups + ", attempts=" + attempts, attempts <= 6);
+                Assert.assertTrue("lookups=" + lookups, lookups > 50);
+            } finally {
+                if (loop != null) {
+                    loop.close();
+                }
+                server.close();
+            }
+        }
+    }
+
+    @Test
     public void testMalformedCurrentReplyCancelsLookupEvenWithReconnectAvailable() throws Exception {
         SchemaHandler handler = new SchemaHandler();
         handler.malformedReply = true;
@@ -542,6 +580,18 @@ public class CursorWebSocketSchemaLifecycleTest {
         private void join() throws InterruptedException {
             thread.join(5_000);
             Assert.assertFalse("lookup thread did not finish", thread.isAlive());
+        }
+    }
+
+    private static final class FailingReconnectFactory implements CursorWebSocketSendLoop.ReconnectFactory {
+        private final AtomicInteger attempts = new AtomicInteger();
+        private final CountDownLatch firstAttempt = new CountDownLatch(1);
+
+        @Override
+        public WebSocketClient reconnect() {
+            attempts.incrementAndGet();
+            firstAttempt.countDown();
+            throw new RuntimeException("server is down");
         }
     }
 

@@ -15,7 +15,6 @@ import io.questdb.client.std.Chars;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.concurrent.locks.LockSupport;
 
 import static io.questdb.client.LineSenderSchemaException.Reason.ACCESS_DENIED;
 import static io.questdb.client.LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE;
@@ -29,7 +28,7 @@ final class QwpSchemaCoordinator {
     private long nextRequestId = 1;
     private Request request;
 
-    QwpSchemaResponse resolve(CharSequence tableName, long timeoutMillis, boolean refresh, Thread ioThread) {
+    QwpSchemaResponse resolve(CharSequence tableName, long timeoutMillis, boolean refresh) {
         final long startNanos = System.nanoTime();
         if (timeoutMillis < 0) {
             throw new IllegalArgumentException("timeoutMillis must be non-negative");
@@ -67,8 +66,9 @@ final class QwpSchemaCoordinator {
             nextRequestId++;
             Request own = new Request(id, key, tableName.toString(), startNanos, timeoutNanos, message);
             request = own;
+            // The I/O loop polls hasPendingRequest on every pass; waking it would
+            // cut its reconnect backoff short while the wire is down.
             hasPendingRequest = true;
-            LockSupport.unpark(ioThread);
             while (!own.done) {
                 try {
                     await(own, key);

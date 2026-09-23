@@ -1227,7 +1227,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * store-and-forward state, or acknowledgment watermarks.
      */
     public QwpSchemaResponse resolveSchema(CharSequence tableName, long timeoutMillis) {
-        return schemaCoordinator.resolve(tableName, timeoutMillis, false, ioThread);
+        return schemaCoordinator.resolve(tableName, timeoutMillis, false);
     }
 
     /**
@@ -1256,7 +1256,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * This does not mutate rows, store-and-forward state, or acknowledgment watermarks.
      */
     public QwpSchemaResponse refreshSchema(CharSequence tableName, long timeoutMillis) {
-        return schemaCoordinator.resolve(tableName, timeoutMillis, true, ioThread);
+        return schemaCoordinator.resolve(tableName, timeoutMillis, true);
     }
 
     /**
