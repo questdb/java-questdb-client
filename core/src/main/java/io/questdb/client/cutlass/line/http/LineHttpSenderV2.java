@@ -26,6 +26,7 @@ package io.questdb.client.cutlass.line.http;
 
 import io.questdb.client.ClientTlsConfiguration;
 import io.questdb.client.HttpClientConfiguration;
+import io.questdb.client.HttpTokenProvider;
 import io.questdb.client.Sender;
 import io.questdb.client.cairo.ColumnType;
 import io.questdb.client.cairo.MicrosTimestampDriver;
@@ -99,7 +100,8 @@ public class LineHttpSenderV2 extends AbstractLineHttpSender {
             long minRequestThroughput,
             long flushIntervalNanos,
             int currentAddressIndex,
-            Rnd rnd
+            Rnd rnd,
+            HttpTokenProvider httpTokenProvider
     ) {
         super(
                 hosts,
@@ -118,7 +120,8 @@ public class LineHttpSenderV2 extends AbstractLineHttpSender {
                 minRequestThroughput,
                 flushIntervalNanos,
                 currentAddressIndex,
-                rnd
+                rnd,
+                httpTokenProvider
         );
     }
 

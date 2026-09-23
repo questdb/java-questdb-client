@@ -91,6 +91,40 @@ public class LineHttpSenderConstructorTest {
     }
 
     @Test
+    public void testProviderClientIsReleasedWhenRequestPreambleDoesNotFit() throws Exception {
+        for (int protocolVersion : new int[]{Sender.PROTOCOL_VERSION_V1, Sender.PROTOCOL_VERSION_V2, Sender.PROTOCOL_VERSION_V3}) {
+            TestUtils.assertMemoryLeak(() -> {
+                try {
+                    buildAndClose(AbstractLineHttpSender.createLineSender(
+                            new ObjList<>("localhost"),
+                            IntList.createWithValues(9000),
+                            "/write",
+                            TINY_BUFFER_CONFIGURATION,
+                            null,
+                            1000,
+                            null,
+                            null,
+                            null,
+                            127,
+                            0,
+                            0,
+                            0,
+                            Long.MAX_VALUE,
+                            protocolVersion,
+                            () -> {
+                                Assert.fail("provider must not be queried during construction");
+                                return null;
+                            }
+                    ));
+                    Assert.fail("expected HttpClientException");
+                } catch (HttpClientException ignore) {
+                    // newRequest() could not fit the preamble
+                }
+            });
+        }
+    }
+
+    @Test
     public void testSelfBuiltClientIsReleasedWhenRequestPreambleDoesNotFit() throws Exception {
         // An explicit protocol version skips detection, so createLineSender() passes a null client
         // and the constructor builds its own. HttpClientFactory pins PlainSocketFactory on that
@@ -146,7 +180,8 @@ public class LineHttpSenderConstructorTest {
                 0,
                 Long.MAX_VALUE,
                 0,
-                new Rnd()
+                new Rnd(),
+                null
         );
     }
 
