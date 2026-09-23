@@ -203,13 +203,7 @@ public abstract class AbstractLineHttpSender implements Sender {
 
         this.isTls = tlsConfig != null;
 
-        // The sender owns the client from the assignment on, whether the caller handed it in or
-        // this constructor built it - close() frees it either way. newRequest() writes the request
-        // preamble into the client's request buffer and throws when the path, the User-Agent
-        // header or an auth header does not fit, so a throw past the assignment would strand a
-        // socket and two native buffers that no caller ever receives a reference to.
-        // The caller cannot clean that up on our behalf because a failed constructor returns no
-        // sender reference.
+        // Close the supplied or newly created client if sender initialization fails.
         try {
             if (client != null) {
                 this.client = client;
