@@ -24,13 +24,16 @@
 
 package io.questdb.client.impl;
 
+import io.questdb.client.HttpTokenProvider;
 import io.questdb.client.Sender;
 import io.questdb.client.SenderConnectionListener;
+import io.questdb.client.SenderError;
 import io.questdb.client.SenderErrorHandler;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerListener;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLockContentionException;
 import io.questdb.client.std.Files;
@@ -152,6 +155,14 @@ public final class SenderPool implements AutoCloseable {
     private final BackgroundDrainerListener drainerListener;
     private final SenderErrorHandler errorHandler;
     private final long idleTimeoutMillis;
+    private final HttpTokenProvider tokenProvider;
+    // Delivery channel for recovery-delegate errors that pass the
+    // isRecoveryEventUserRelevant filter. Pool-owned so a slow user handler
+    // can never stall the recovery driver / housekeeper thread or overrun
+    // its stop budget; the dispatcher thread starts lazily on first offer,
+    // so pools that never hit a recovery event pay zero thread cost. Null
+    // when the user registered no errorHandler or SF is off.
+    private final SenderErrorDispatcher recoveryErrorDispatcher;
     // Test seam. Production builds delegates via defaultSender(); white-box
     // tests in io.questdb.client.test.impl reach the package-private
     // constructor by reflection to inject a factory that throws a non-
@@ -222,6 +233,11 @@ public final class SenderPool implements AutoCloseable {
     // production; regression tests release a retired slot here to prove that
     // the terminal pass re-probes returned capacity before throwing.
     private volatile Runnable borrowWaitExpiredHook;
+    // Test seam invoked after close() handles an interrupt and confirms the
+    // original creation-wait deadline still permits another wait. Null in
+    // production; lifecycle tests use it to acknowledge distinct retries
+    // without inspecting transient Condition queue membership.
+    private volatile Runnable creationWaitRetryHook;
     // Slots removed from `all` whose delegate is still releasing its flock.
     // They keep reserving capacity (and their slotInUse mark) until the
     // flock drops, so the cap check and the slot allocator stay consistent
@@ -238,10 +254,6 @@ public final class SenderPool implements AutoCloseable {
     // (cancelling recovery) WITHOUT making a later close() short-circuit the
     // teardown. Guarded by lock.
     private boolean closeStarted;
-    // Threads currently inside close()'s bounded creation-wait loop. Exists so
-    // hasCreationWaiterForTesting() can report that region as a stable state
-    // rather than probing the condition queue; see that method. Guarded by lock.
-    private int closeCreationWaiters;
     private int inFlightCreations;
     // Lease teardowns currently running on borrower threads (retireLease's
     // delegate-close section, outside the lock). close() counts these as
@@ -344,7 +356,7 @@ public final class SenderPool implements AutoCloseable {
             long maxLifetimeMillis
     ) {
         this(configurationString, minSize, maxSize, acquireTimeoutMillis,
-                idleTimeoutMillis, maxLifetimeMillis, null, false, null, null, null, null, null, null, null);
+                idleTimeoutMillis, maxLifetimeMillis, null, false, null, null, null, null, null, null, null, null);
     }
 
     // Test-only constructor exposing the senderFactory seam: production builds
@@ -387,7 +399,7 @@ public final class SenderPool implements AutoCloseable {
     ) {
         this(configurationString, minSize, maxSize, acquireTimeoutMillis,
                 idleTimeoutMillis, maxLifetimeMillis, senderFactory,
-                deferStartupRecovery, null, null, null, null, null, null, null);
+                deferStartupRecovery, null, null, null, null, null, null, null, null);
     }
 
     // Test-only constructor adding a deterministic fault hook for the ownership
@@ -406,7 +418,7 @@ public final class SenderPool implements AutoCloseable {
     ) {
         this(configurationString, minSize, maxSize, acquireTimeoutMillis,
                 idleTimeoutMillis, maxLifetimeMillis, senderFactory,
-                deferStartupRecovery, null, null, null, postFactoryHook, null, null, null);
+                deferStartupRecovery, null, null, null, postFactoryHook, null, null, null, null);
     }
 
     @TestOnly
@@ -423,6 +435,7 @@ public final class SenderPool implements AutoCloseable {
         return new SenderPool(configurationString, minSize, maxSize, acquireTimeoutMillis,
                 Long.MAX_VALUE, Long.MAX_VALUE, senderFactory, false,
                 null, null, null, null, recoveryThreadFactory, recoveryWaiter,
+                null,
                 beforeFailedRecoveryJoinHook);
     }
 
@@ -447,7 +460,27 @@ public final class SenderPool implements AutoCloseable {
         this(configurationString, minSize, maxSize, acquireTimeoutMillis,
                 idleTimeoutMillis, maxLifetimeMillis, senderFactory,
                 deferStartupRecovery, errorHandler, connectionListener,
-                drainerListener, null, null, null, null);
+                drainerListener, null);
+    }
+
+    SenderPool(
+            String configurationString,
+            int minSize,
+            int maxSize,
+            long acquireTimeoutMillis,
+            long idleTimeoutMillis,
+            long maxLifetimeMillis,
+            IntFunction<Sender> senderFactory,
+            boolean deferStartupRecovery,
+            SenderErrorHandler errorHandler,
+            SenderConnectionListener connectionListener,
+            BackgroundDrainerListener drainerListener,
+            HttpTokenProvider tokenProvider
+    ) {
+        this(configurationString, minSize, maxSize, acquireTimeoutMillis,
+                idleTimeoutMillis, maxLifetimeMillis, senderFactory,
+                deferStartupRecovery, errorHandler, connectionListener,
+                drainerListener, null, null, null, tokenProvider, null);
     }
 
     private SenderPool(
@@ -465,6 +498,7 @@ public final class SenderPool implements AutoCloseable {
             Runnable postFactoryHook,
             ThreadFactory recoveryThreadFactory,
             Runnable recoveryWaiter,
+            HttpTokenProvider tokenProvider,
             Runnable beforeFailedRecoveryJoinHook
     ) {
         if (minSize < 0 || maxSize < 1 || minSize > maxSize) {
@@ -473,6 +507,7 @@ public final class SenderPool implements AutoCloseable {
         this.errorHandler = errorHandler;
         this.connectionListener = connectionListener;
         this.drainerListener = drainerListener;
+        this.tokenProvider = tokenProvider;
         this.senderFactory = senderFactory != null ? senderFactory : this::defaultSender;
         // An injected factory (tests) drives recovery too, preserving the
         // white-box recovery seam; production recovery forces OFF-mode connects
@@ -501,10 +536,19 @@ public final class SenderPool implements AutoCloseable {
         // us whether SF is on and, if so, the base slot id to derive
         // per-sender ids from.
         Sender.LineSenderBuilder probe = Sender.builder(configurationString);
+        if (tokenProvider != null) {
+            // Validate fixed-config credentials vs. the provider even when the
+            // pool is fully lazy and no sender is built yet.
+            probe.httpTokenProvider(tokenProvider);
+        }
         this.storeAndForward = probe.isStoreAndForwardEnabled();
         this.slotBaseId = this.storeAndForward ? probe.getConfiguredSenderId() : null;
         this.sfDir = this.storeAndForward ? probe.getConfiguredSfDir() : null;
         this.slotInUse = this.storeAndForward ? new boolean[maxSize] : null;
+        this.recoveryErrorDispatcher = (errorHandler != null && this.storeAndForward)
+                ? new SenderErrorDispatcher(errorHandler, SenderErrorDispatcher.DEFAULT_CAPACITY,
+                        "qdb-sf-pool-recovery-errors")
+                : null;
         // Pre-warm minSize connections. Pre-warm runs single-threaded in the
         // constructor, so slots 0..minSize-1 are reserved directly.
         int built = 0;
@@ -716,7 +760,12 @@ public final class SenderPool implements AutoCloseable {
      * minutes-long block a {@code reconnect_*}-tuned config used to cause (M1).
      * One residual window remains and is NOT closed here: a single in-flight
      * connect to a black-holed/firewalled host blocks on the OS connect timeout
-     * (the transport exposes no application-level connect timeout to clamp it).
+     * (the transport exposes no application-level connect timeout to clamp it)
+     * and the stop path's interrupt cannot break that syscall. Only a deferred,
+     * PoolHousekeeper-driven pool can carry a token provider: QuestDBImpl is the
+     * sole caller of that constructor and passes {@code deferStartupRecovery=true}.
+     * Its potentially much longer credential pull is therefore interrupted by
+     * {@link PoolHousekeeper#stop()}, never by this pool's private-driver stop.
      * If {@code close()} lands during that one connect, its driver join can
      * still time out and the detached build releases the slot flock shortly
      * after {@code close()} returns. No data is lost (the slot stays durable on
@@ -1343,17 +1392,11 @@ public final class SenderPool implements AutoCloseable {
         return startupRecoveryThread;
     }
 
-    // True while a close() is inside its bounded creation wait. Deliberately not
-    // lock.hasWaiters(creationFinished): an interrupt moves the waiter out of the
-    // condition queue and into the lock's sync queue to reacquire before await
-    // rethrows, so under an interrupt storm hasWaiters() reads false for a
-    // measurable fraction of the wait even though close() never left it. Tests
-    // that assert on the wait region need a state that does not flicker.
     @TestOnly
     public boolean hasCreationWaiterForTesting() {
         lock.lock();
         try {
-            return closeCreationWaiters > 0;
+            return lock.hasWaiters(creationFinished);
         } finally {
             lock.unlock();
         }
@@ -1418,6 +1461,11 @@ public final class SenderPool implements AutoCloseable {
     @TestOnly
     public void setBorrowWaitExpiredHook(Runnable hook) {
         this.borrowWaitExpiredHook = hook;
+    }
+
+    @TestOnly
+    public void setCreationWaitRetryHookForTesting(Runnable hook) {
+        this.creationWaitRetryHook = hook;
     }
 
     /**
@@ -1493,18 +1541,21 @@ public final class SenderPool implements AutoCloseable {
             final long creationWaitDeadlineNanos = System.nanoTime() + creationWaitNanos;
             long creationRemainingNanos = creationWaitNanos;
             boolean creationWaitInterrupted = false;
-            closeCreationWaiters++;
-            try {
-                while (inFlightCreations > 0 && creationRemainingNanos > 0) {
-                    try {
-                        creationFinished.awaitNanos(creationRemainingNanos);
-                    } catch (InterruptedException e) {
-                        creationWaitInterrupted = true;
-                    }
-                    creationRemainingNanos = creationWaitDeadlineNanos - System.nanoTime();
+            while (inFlightCreations > 0 && creationRemainingNanos > 0) {
+                boolean isRetryingAfterInterrupt = false;
+                try {
+                    creationFinished.awaitNanos(creationRemainingNanos);
+                } catch (InterruptedException e) {
+                    creationWaitInterrupted = true;
+                    isRetryingAfterInterrupt = true;
                 }
-            } finally {
-                closeCreationWaiters--;
+                creationRemainingNanos = creationWaitDeadlineNanos - System.nanoTime();
+                if (isRetryingAfterInterrupt && inFlightCreations > 0 && creationRemainingNanos > 0) {
+                    Runnable hook = creationWaitRetryHook;
+                    if (hook != null) {
+                        hook.run();
+                    }
+                }
             }
             if (creationWaitInterrupted) {
                 Thread.currentThread().interrupt();
@@ -1560,6 +1611,11 @@ public final class SenderPool implements AutoCloseable {
                 // Best-effort: an Error from one delegate's teardown must not
                 // abort the loop and strand the remaining delegates unclosed.
             }
+        }
+        // After delegate teardown so a quarantine fired by a late recovery
+        // step still gets its bounded (100 ms) delivery window.
+        if (recoveryErrorDispatcher != null) {
+            recoveryErrorDispatcher.close();
         }
     }
 
@@ -1654,13 +1710,33 @@ public final class SenderPool implements AutoCloseable {
             if (beforeStartupRecoveryJoinHook != null) {
                 beforeStartupRecoveryJoinHook.run();
             }
+            // A private startup-recovery driver and a token provider are mutually exclusive by construction:
+            // QuestDBImpl passes deferStartupRecovery=true on the only path that supplies a provider. This
+            // escalation therefore does NOT break credential pulls (PoolHousekeeper.stop() owns that live
+            // protection). It is still a last resort for an unexpected interruptible overrun in a direct
+            // driver's build, drain, or teardown after the closed signal and normal unpark failed to stop it.
+            //
+            // Keep the whole two-join protocol interrupt-neutral. A carried caller flag, or an interrupt
+            // delivered DURING the first join, must be remembered without jumping past the target interrupt
+            // and second join; restore it only once the shutdown protocol has completed.
+            boolean callerWasInterrupted = Thread.interrupted();
             try {
-                startupRecoveryThread.join(PoolHousekeeper.STOP_TIMEOUT_MILLIS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-            if (afterStartupRecoveryJoinHook != null) {
-                afterStartupRecoveryJoinHook.run();
+                callerWasInterrupted |= PoolHousekeeper.joinIgnoringCallerInterrupts(
+                        startupRecoveryThread, PoolHousekeeper.STOP_TIMEOUT_MILLIS);
+                if (startupRecoveryThread.isAlive()) {
+                    // The closed flag reaches the driver only between operations. Interrupt an overrun and
+                    // spend a second bounded join giving its finally/close path time to release the slot flock.
+                    startupRecoveryThread.interrupt();
+                    callerWasInterrupted |= PoolHousekeeper.joinIgnoringCallerInterrupts(
+                            startupRecoveryThread, PoolHousekeeper.STOP_TIMEOUT_MILLIS);
+                }
+                if (afterStartupRecoveryJoinHook != null) {
+                    afterStartupRecoveryJoinHook.run();
+                }
+            } finally {
+                if (callerWasInterrupted) {
+                    Thread.currentThread().interrupt();
+                }
             }
         }
     }
@@ -1958,6 +2034,27 @@ public final class SenderPool implements AutoCloseable {
         return buildManagedSlotSender(slotIndex, true);
     }
 
+    private Sender.LineSenderBuilder applyRecoveryCallbacks(Sender.LineSenderBuilder builder) {
+        if (recoveryErrorDispatcher != null) {
+            builder.errorHandler(new SenderErrorHandler() {
+                @Override
+                public void onError(SenderError error) {
+                    if (isRecoveryEventUserRelevant(error)) {
+                        recoveryErrorDispatcher.offer(error);
+                    }
+                }
+            });
+        }
+        return builder;
+    }
+
+    private Sender.LineSenderBuilder applyTokenProvider(Sender.LineSenderBuilder builder) {
+        if (tokenProvider != null) {
+            builder.httpTokenProvider(tokenProvider);
+        }
+        return builder;
+    }
+
     // Applies the user-supplied ingest callbacks to a sender builder. Null
     // callbacks are skipped so the sender keeps its loud-not-silent default.
     private Sender.LineSenderBuilder applyUserCallbacks(Sender.LineSenderBuilder builder) {
@@ -1973,9 +2070,20 @@ public final class SenderPool implements AutoCloseable {
         return builder;
     }
 
+    // Provenance, not severity: "did a server judge these bytes, or is the
+    // client reporting they are gone?" A recovery delegate's own environment
+    // troubles -- the never-connected auth / durable-ack TERMINALs that repeat
+    // roughly once a second while a misconfiguration lasts -- all carry
+    // NO_STATUS_BYTE and stay suppressed; a plain transport failure dispatches
+    // no SenderError at all, so an unreachable server costs this path nothing.
+    private static boolean isRecoveryEventUserRelevant(SenderError e) {
+        return e.getCategory() == SenderError.Category.DATA_LOSS
+                || e.getServerStatusByte() != SenderError.NO_STATUS_BYTE;
+    }
+
     private Sender buildManagedSlotSender(int slotIndex, boolean forRecovery) {
         if (!storeAndForward) {
-            return applyUserCallbacks(Sender.builder(configurationString)).build();
+            return applyUserCallbacks(applyTokenProvider(Sender.builder(configurationString))).build();
         }
         // Give this pooled sender its own slot dir <sf_dir>/<base>-<index>
         // so concurrent SF senders sharing one sf_dir never collide on
@@ -2029,9 +2137,22 @@ public final class SenderPool implements AutoCloseable {
             // returns).
             builder.drainOrphans(false);
         }
-        // Recovery delegates are internal, short-lived, OFF-mode drain senders;
-        // don't surface their connect/error events to the user's callbacks.
-        return (forRecovery ? builder : applyUserCallbacks(builder)).build();
+        // Recovery delegates drain the user's OWN data from a previous run, so
+        // the two things they can say about it -- "it was abandoned"
+        // (DATA_LOSS from a build()-time quarantine) and "the server rejected
+        // it" (a NACK carrying its wire status byte) -- must reach the user's
+        // errorHandler: this client ships slf4j-api with no binding, so
+        // LOG.error alone can announce them nowhere. What stays excluded is
+        // the delegate's own environment noise: connection events (up to one
+        // sweep per second while a slot stays stranded) and the
+        // never-connected auth / durable-ack TERMINALs, which the recovery
+        // scan already logs and dedupes per slot. See applyRecoveryCallbacks:
+        // delivery is filtered on provenance and routed through the pool's own
+        // SenderErrorDispatcher so a slow handler cannot stall the recovery
+        // driver or housekeeper thread. connectionListener and drainerListener
+        // remain unset on recovery builds.
+        builder = applyTokenProvider(builder);
+        return (forRecovery ? applyRecoveryCallbacks(builder) : applyUserCallbacks(builder)).build();
     }
 
     /**

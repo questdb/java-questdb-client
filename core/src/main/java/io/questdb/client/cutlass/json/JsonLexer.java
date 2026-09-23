@@ -55,10 +55,12 @@ public class JsonLexer implements Mutable, Closeable {
     private final int cacheSizeLimit;
     private final IntStack objDepthStack = new IntStack(64);
     private final StringSink sink = new StringSink();
+    private final StringSink unescapeSink = new StringSink();
     private int arrayDepth = 0;
     private long cache;
     private int cacheCapacity;
     private int cacheSize = 0;
+    private boolean hasEscape = false;
     private boolean ignoreNext = false;
     private int objDepth = 0;
     private int position = 0;
@@ -85,6 +87,7 @@ public class JsonLexer implements Mutable, Closeable {
         arrayDepth = 0;
         ignoreNext = false;
         quoted = false;
+        hasEscape = false;
         cacheSize = 0;
         useCache = false;
         position = 0;
@@ -93,6 +96,9 @@ public class JsonLexer implements Mutable, Closeable {
     @Override
     public void close() {
         if (cacheCapacity > 0 && cache != 0) {
+            // The stash may contain raw credential bytes from a value split across parse() calls. Do not hand
+            // those bytes back to the native allocator, where they remain readable until the block is reused.
+            Vect.memset(cache, cacheCapacity, 0);
             Unsafe.free(cache, cacheCapacity, MemoryTag.NATIVE_TEXT_PARSER_RSS);
             cache = 0;
         }
@@ -109,6 +115,7 @@ public class JsonLexer implements Mutable, Closeable {
         int state = this.state;
         boolean quoted = this.quoted;
         boolean ignoreNext = this.ignoreNext;
+        boolean hasEscape = this.hasEscape;
         boolean useCache = this.useCache;
         int objDepth = this.objDepth;
         int arrayDepth = this.arrayDepth;
@@ -125,6 +132,7 @@ public class JsonLexer implements Mutable, Closeable {
                 if (quoted) {
                     if (c == '\\') {
                         ignoreNext = true;
+                        hasEscape = true;
                         continue;
                     }
 
@@ -137,10 +145,10 @@ public class JsonLexer implements Mutable, Closeable {
 
                 int vp = (int) (posAtStart + valueStart - lo + 1 - cacheSize);
                 if (state == S_EXPECT_NAME || state == S_EXPECT_FIRST_NAME) {
-                    listener.onEvent(EVT_NAME, getCharSequence(valueStart, p, vp), vp);
+                    listener.onEvent(EVT_NAME, getCharSequence(valueStart, p, vp, hasEscape), vp);
                     state = S_EXPECT_COLON;
                 } else {
-                    listener.onEvent(arrayDepth > 0 ? EVT_ARRAY_VALUE : EVT_VALUE, getCharSequence(valueStart, p, vp), vp);
+                    listener.onEvent(arrayDepth > 0 ? EVT_ARRAY_VALUE : EVT_VALUE, getCharSequence(valueStart, p, vp, hasEscape), vp);
                     state = S_EXPECT_COMMA;
                 }
 
@@ -240,6 +248,7 @@ public class JsonLexer implements Mutable, Closeable {
                     }
                     valueStart = p;
                     quoted = true;
+                    hasEscape = false;
                     break;
                 default:
                     if (state != S_EXPECT_VALUE) {
@@ -248,6 +257,7 @@ public class JsonLexer implements Mutable, Closeable {
                     // this isn't a quote, include this character
                     valueStart = p - 1;
                     quoted = false;
+                    hasEscape = false;
                     break;
             }
         }
@@ -257,6 +267,7 @@ public class JsonLexer implements Mutable, Closeable {
         this.state = state;
         this.quoted = quoted;
         this.ignoreNext = ignoreNext;
+        this.hasEscape = hasEscape;
         this.objDepth = objDepth;
         this.arrayDepth = arrayDepth;
 
@@ -282,8 +293,49 @@ public class JsonLexer implements Mutable, Closeable {
         }
     }
 
+    /**
+     * Overwrites the decode buffers, so a secret this lexer parsed is no longer legible through them.
+     * <p>
+     * Every name and value the lexer emits is assembled in {@link #sink} first, and an escaped one is
+     * then resolved into {@link #unescapeSink}; a listener that copies the value out leaves the lexer's
+     * own copy behind. When a value spans parse calls, its raw bytes are also assembled in the native
+     * {@link #cache}. {@link #clear()} does not help - it rewinds the parse state and never touches these
+     * buffers, and {@link StringSink#clear()} would only rewind the write position anyway, leaving a long
+     * secret legible in the tail past a shorter later write. None is reachable from outside this class.
+     * <p>
+     * Callers that parse credentials should wipe rather than clear between documents - {@code
+     * OidcDeviceAuth} parses the token endpoint's response with a long-lived lexer, so its access, id
+     * and refresh tokens would otherwise stay on the heap for the life of that instance. Like
+     * {@link StringSink#wipe()} this is best effort: it reaches this lexer's own storage, not a copy a
+     * listener has already taken.
+     */
+    public void wipe() {
+        sink.wipe();
+        unescapeSink.wipe();
+        if (cacheCapacity > 0 && cache != 0) {
+            // Wipe the whole allocation, not cacheSize: a completed value resets cacheSize to zero, and a
+            // shorter later split value can leave the tail of an earlier credential beyond the current size.
+            Vect.memset(cache, cacheCapacity, 0);
+        }
+    }
+
     private static boolean isNotATerminator(char c) {
         return unquotedTerminators.excludes(c);
+    }
+
+    private static int parseHex4(CharSequence value, int offset) {
+        int result = 0;
+        for (int j = 0; j < 4; j++) {
+            final char c = value.charAt(offset + j);
+            // shared hex table lookup (-1 for non-hex), cheaper than Character.digit; the table is
+            // ASCII-sized, so a code point above 127 is never a hex digit
+            final int digit = c < 128 ? Numbers.hexNumbers[c] : -1;
+            if (digit < 0) {
+                return -1;
+            }
+            result = (result << 4) | digit;
+        }
+        return result;
     }
 
     private static JsonException unsupportedEncoding(int position) {
@@ -313,13 +365,17 @@ public class JsonLexer implements Mutable, Closeable {
         long ptr = Unsafe.malloc(n, MemoryTag.NATIVE_TEXT_PARSER_RSS);
         if (cacheCapacity > 0) {
             Vect.memcpy(ptr, cache, cacheSize);
+            // Growth replaces the allocation before a credential owner has an opportunity to call wipe().
+            // Zero the old block before returning it to the allocator so a copied split token is not retained
+            // in freed native memory.
+            Vect.memset(cache, cacheCapacity, 0);
             Unsafe.free(cache, cacheCapacity, MemoryTag.NATIVE_TEXT_PARSER_RSS);
         }
         cacheCapacity = n;
         cache = ptr;
     }
 
-    private CharSequence getCharSequence(long lo, long hi, int position) throws JsonException {
+    private CharSequence getCharSequence(long lo, long hi, int position, boolean hasEscape) throws JsonException {
         sink.clear();
         if (cacheSize == 0) {
             if (!Utf8s.utf8ToUtf16(lo, hi - 1, sink)) {
@@ -328,7 +384,81 @@ public class JsonLexer implements Mutable, Closeable {
         } else {
             utf8DecodeCacheAndBuffer(lo, hi - 1, position);
         }
-        return sink;
+        // the decode above assembled the raw bytes verbatim; resolve JSON escapes only when the scan saw a
+        // backslash, so escape-free values and names skip unescape() and return the assembled sink directly.
+        return hasEscape ? unescape(sink) : sink;
+    }
+
+    private CharSequence unescape(CharSequence raw) {
+        // called only when the scan saw a backslash, so at least one escape is present; walk the value once,
+        // copying plain chars and resolving each escape - no leading scan to re-find the first backslash.
+        final int n = raw.length();
+        unescapeSink.clear();
+        int i = 0;
+        while (i < n) {
+            char c = raw.charAt(i);
+            if (c != '\\' || i + 1 >= n) {
+                unescapeSink.put(c);
+                i++;
+                continue;
+            }
+            char esc = raw.charAt(i + 1);
+            switch (esc) {
+                case '"':
+                    unescapeSink.put('"');
+                    i += 2;
+                    break;
+                case '\\':
+                    unescapeSink.put('\\');
+                    i += 2;
+                    break;
+                case '/':
+                    unescapeSink.put('/');
+                    i += 2;
+                    break;
+                case 'b':
+                    unescapeSink.put('\b');
+                    i += 2;
+                    break;
+                case 'f':
+                    unescapeSink.put('\f');
+                    i += 2;
+                    break;
+                case 'n':
+                    unescapeSink.put('\n');
+                    i += 2;
+                    break;
+                case 'r':
+                    unescapeSink.put('\r');
+                    i += 2;
+                    break;
+                case 't':
+                    unescapeSink.put('\t');
+                    i += 2;
+                    break;
+                case 'u':
+                    int cp = i + 6 <= n ? parseHex4(raw, i + 2) : -1;
+                    if (cp >= 0) {
+                        unescapeSink.put((char) cp);
+                        i += 6;
+                    } else {
+                        // malformed unicode escape: keep the backslash and the 'u' verbatim (lenient), so a
+                        // non-conformant server's literal text survives rather than silently losing a byte
+                        unescapeSink.put('\\').put(esc);
+                        i += 2;
+                    }
+                    break;
+                default:
+                    // an unrecognized escape letter: keep the backslash and the char verbatim (lenient), so a
+                    // stray '\' before a non-escape char in non-conformant input survives rather than being
+                    // dropped. A '\' before a RECOGNIZED escape letter (" \ / b f n r t u) is still decoded by
+                    // the cases above - standard JSON unescape - so only genuinely unknown sequences reach here.
+                    unescapeSink.put('\\').put(esc);
+                    i += 2;
+                    break;
+            }
+        }
+        return unescapeSink;
     }
 
     private void utf8DecodeCacheAndBuffer(long lo, long hi, int position) throws JsonException {

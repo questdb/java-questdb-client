@@ -65,6 +65,21 @@ public interface FilesFacade {
 
     int close(int fd);
 
+    /**
+     * The error code of this thread's most recent failed filesystem call:
+     * {@code errno} on POSIX, the saved {@code GetLastError()} value on
+     * Windows (see {@link Os#errno()}). Meaningful only when read immediately
+     * after a facade call reported failure. Lives on the facade so a
+     * fault-injecting test can pin a deterministic code next to an injected
+     * failure -- a facade that fakes {@code length(path) < 0} must also fake
+     * the errno that classifies it (e.g. via
+     * {@link Files#isNotFoundError(int)}), or the classification would read
+     * whatever the last REAL syscall left behind.
+     */
+    default int errno() {
+        return Os.errno();
+    }
+
     boolean exists(String path);
 
     void findClose(long findPtr);
@@ -87,6 +102,16 @@ public interface FilesFacade {
 
     default int fsyncDir(String dir) {
         return Files.fsyncDir(dir);
+    }
+
+    /**
+     * Whether callers should use this facade's mmap path. The production facade
+     * returns {@code true}; wrapping fault facades retain positioned I/O unless
+     * they explicitly opt in, preserving their ability to inject short reads and
+     * writes.
+     */
+    default boolean isMmapAllowed() {
+        return this == INSTANCE;
     }
 
     /**
@@ -118,6 +143,10 @@ public interface FilesFacade {
         return Files.mlock(addr, len);
     }
 
+    /**
+     * Maps a file region. Kept on the facade so mmap failures can be injected
+     * without relying on platform-specific filesystem behavior.
+     */
     default long mmap(int fd, long len, long offset, int flags, int memoryTag) {
         return Files.mmap(fd, len, offset, flags, memoryTag);
     }
@@ -134,6 +163,7 @@ public interface FilesFacade {
         return Files.munlock(addr, len);
     }
 
+    /** Releases a region returned by {@link #mmap(int, long, long, int, int)}. */
     default void munmap(long address, long len, int memoryTag) {
         Files.munmap(address, len, memoryTag);
     }

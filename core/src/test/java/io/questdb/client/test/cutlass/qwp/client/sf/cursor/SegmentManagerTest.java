@@ -225,6 +225,49 @@ public class SegmentManagerTest {
         });
     }
 
+    /**
+     * SegmentManager creates every rotation spare with manifestRequired
+     * stamped from birth (unlike the engine's own initial segment, which is
+     * created without the flag and stamped separately only after its
+     * manifest is durable -- see CursorSendEngine's fresh-start branch). By
+     * the time a rotation can happen the manifest this slot needs already
+     * exists, so there is no crash window to protect against here; this
+     * pins the byte manager actually writes rather than just the argument it
+     * passes, the same way testHeaderShapeMatchesTheDocumentedLayout pins
+     * MmapSegment's own header bytes rather than restating a constant.
+     */
+    @Test
+    public void testRotationSpareCarriesManifestRequiredFlagOnDisk() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE
+                    + 2 * (MmapSegment.FRAME_HEADER_SIZE + 32);
+            MmapSegment seg0 = MmapSegment.create(tmpDir + "/0000000000000000.sfa", 0, segSize);
+            long buf = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
+            try (SegmentRing ring = new SegmentRing(seg0, segSize);
+                 SegmentManager mgr = new SegmentManager(segSize, 200_000L)) {
+                mgr.start();
+                mgr.register(ring, tmpDir);
+
+                // Fill seg0 (2 frames) and force rotation by appending a third.
+                for (int i = 0; i < 2; i++) ring.appendOrFsn(buf, 32);
+                assertTrue("spare must land before rotation",
+                        waitFor(() -> !ring.needsHotSpare(), 2000));
+                ring.appendOrFsn(buf, 32); // FSN 2, rotates active to the spare
+
+                MmapSegment spare = ring.getActive();
+                assertNotEquals("rotation must have installed a new active segment", seg0, spare);
+                byte[] bytes = java.nio.file.Files.readAllBytes(Paths.get(spare.path()));
+                assertEquals("spare must carry the current on-disk VERSION",
+                        MmapSegment.VERSION, bytes[4]);
+                assertEquals("spare must be created with the manifestRequired flag "
+                                + "already stamped in its header",
+                        MmapSegment.MANIFEST_REQUIRED_FLAG, bytes[5]);
+            } finally {
+                Unsafe.free(buf, 32, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
     @Test
     public void testMaxTotalBytesCapBlocksProvisioningUntilTrimFrees() throws Exception {
         TestUtils.assertMemoryLeak(() -> {

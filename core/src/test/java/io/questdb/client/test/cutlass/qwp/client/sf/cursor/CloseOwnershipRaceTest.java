@@ -60,20 +60,23 @@ public class CloseOwnershipRaceTest {
                 sfDir.getRoot().getAbsolutePath(), 16_384)) {
             Throwable leaked = null;
             for (int i = 0; i < ROUNDS && leaked == null; i++) {
-                // A null client and a reconnect factory that throws a genuine
-                // terminal auth reject: start()'s real I/O thread walks the
-                // production async-initial-connect path and latches a genuine
-                // (SECURITY_ERROR) terminal within microseconds. One authentic
-                // null->error latch transition per round. (Under Invariant B a
-                // connection error / budget would retry forever and never latch;
-                // only a genuine terminal like auth does.)
+                // A null client and an ORPHAN reconnect policy whose factory
+                // throws a terminal auth reject: start()'s real I/O thread latches
+                // a genuine SECURITY_ERROR within microseconds. Foreground ASYNC
+                // policy intentionally retries this state forever, while orphan
+                // policy must hand it back to the quarantine owner.
                 CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
                         null, engine, 0, 1_000_000L,
                         () -> {
                             throw new QwpAuthFailedException(401, "localhost", 1);
                         },
+                        1, 1,
+                        false,
                         0,
-                        1, 1);
+                        CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
+                        0,
+                        0,
+                        CursorWebSocketSendLoop.ReconnectPolicy.ORPHAN);
                 loop.start();
                 // Race close()'s exact ownership snapshot against the latch
                 // transition, stopping once the latch has landed. Nothing in

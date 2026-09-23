@@ -25,6 +25,7 @@
 package io.questdb.client.std.str;
 
 import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.Unsafe;
 import io.questdb.client.std.bytes.DirectByteSink;
 import io.questdb.client.std.bytes.NativeByteSink;
 import org.jetbrains.annotations.NotNull;
@@ -100,6 +101,28 @@ public class DirectUtf8Sink implements MutableUtf8Sink, BorrowableUtf8Sink, Dire
         assert b < 0 : "b is ascii";
         setAscii(false);
         sink.put(b);
+        return this;
+    }
+
+    /**
+     * Appends the bytes of {@code src} in {@code [lo, hi)} verbatim in a single bulk copy, rather than byte by
+     * byte. The ascii hint is set to {@code false} conservatively (the bytes are treated as opaque), so callers
+     * that rely on {@link #isAscii()} should not use this overload for ascii-only content.
+     */
+    public DirectUtf8Sink put(byte[] src, int lo, int hi) {
+        // a real check, not an assert: this is public API doing an unchecked Unsafe.copyMemory, and client apps
+        // typically run without -ea, so a bad range must fail with a clear exception rather than a native
+        // out-of-bounds read that corrupts memory or crashes the JVM
+        if (lo < 0 || hi > src.length || lo > hi) {
+            throw new IndexOutOfBoundsException("put(byte[]) range out of bounds [lo=" + lo + ", hi=" + hi + ", len=" + src.length + ']');
+        }
+        final int len = hi - lo;
+        if (len > 0) {
+            setAscii(false);
+            final long dest = sink.ensureCapacity(len);
+            Unsafe.getUnsafe().copyMemory(src, Unsafe.BYTE_OFFSET + lo, null, dest, len);
+            sink.advance(len);
+        }
         return this;
     }
 

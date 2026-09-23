@@ -68,6 +68,12 @@ public class WebSocketResponse {
     public static final int MIN_ERROR_RESPONSE_SIZE = 11; // status + sequence + error length
     public static final int MIN_OK_RESPONSE_SIZE = 11; // status + sequence + tableCount
     /**
+     * A delta symbol dictionary began above the server's connection dictionary. Wire
+     * {@code 0x0D}. Server state decides this, not the frame bytes, so it is retriable:
+     * recycling the wire re-runs the catch-up from id 0 and the same frames then land.
+     */
+    public static final byte STATUS_DICTIONARY_GAP = 0x0D;
+    /**
      * Per-table durable-upload acknowledgment. Emitted by servers where
      * primary replication is enabled and the connection opted in via
      * X-QWP-Request-Durable-Ack. Payload: status + tableCount + per-table
@@ -224,6 +230,8 @@ public class WebSocketResponse {
                 return "INTERNAL_ERROR";
             case STATUS_NOT_WRITABLE:
                 return "NOT_WRITABLE";
+            case STATUS_DICTIONARY_GAP:
+                return "DICTIONARY_GAP";
             default:
                 return "UNKNOWN(" + (status & 0xFF) + ")";
         }

@@ -29,14 +29,19 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
+import org.junit.Assume;
 import org.junit.Test;
 
 import java.io.IOException;
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadMXBean;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Paths;
+import java.util.Arrays;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -153,6 +158,47 @@ public class CloseDrainTest {
                     "close() took only " + elapsedMs + "ms — did not wait for ACK; "
                             + "drain timeout is broken or never enabled",
                     elapsedMs >= ackDelayMs / 2);
+        }
+    }
+
+    @Test(timeout = 30_000L)
+    public void testInterruptDuringSuccessfulCloseDrainIsRestoredAfterTeardown() throws Exception {
+        DelayingAckHandler handler = new DelayingAckHandler(800L);
+        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+            QwpWebSocketSender sender = (QwpWebSocketSender) Sender.fromConfig(
+                    "ws::addr=localhost:" + server.getPort() + ";");
+            sender.table("foo").longColumn("v", 1L).atNow();
+            sender.flush();
+            sender.setCloseDrainWaitingHook(() -> {
+                // PoolHousekeeper.stop() uses this signal after its first join budget. The close drain owns it
+                // while waiting for the ACK; later teardown waits must not mistake the carried signal for a new
+                // failure to stop their own worker.
+                Thread.currentThread().interrupt();
+            });
+
+            Throwable closeFailure = null;
+            boolean interruptedAtReturn;
+            try {
+                sender.close();
+            } catch (Throwable t) {
+                closeFailure = t;
+            } finally {
+                interruptedAtReturn = Thread.currentThread().isInterrupted();
+                Thread.interrupted();
+            }
+
+            Assert.assertNull("an interrupt consumed by a successful ACK drain poisoned later teardown",
+                    closeFailure);
+            Assert.assertTrue("close() must return its consumed cancellation signal to the caller",
+                    interruptedAtReturn);
+            Assert.assertTrue("the delayed ACK must have completed the close drain", handler.nextSeq.get() >= 1L);
+            Assert.assertTrue("successful ACK drain must release its slot before close returns",
+                    sender.isSlotLockReleased());
+            Assert.assertTrue("all close-owned resources must be released before close returns",
+                    sender.isCloseCleanupComplete());
         }
     }
 
@@ -291,8 +337,13 @@ public class CloseDrainTest {
                     sender.close();
                     Assert.fail("close() should have thrown a drain-timeout error");
                 } catch (LineSenderException e) {
-                    Assert.assertTrue("expected drain-timeout message, got: " + e.getMessage(),
-                            e.getMessage().contains("drain timed out"));
+                    String msg = e.getMessage();
+                    Assert.assertTrue("expected drain-timeout message, got: " + msg,
+                            msg.contains("drain timed out"));
+                    Assert.assertFalse("no outage may be named when the wire never dropped, got: " + msg,
+                            msg.contains("the wire is not draining:"));
+                    Assert.assertTrue("expected the generic guidance tail, got: " + msg,
+                            msg.contains("data may be lost (use larger closeFlushTimeoutMillis or smaller batches)"));
                 }
                 elapsedMs = (System.nanoTime() - t0) / 1_000_000;
             }
@@ -301,6 +352,128 @@ public class CloseDrainTest {
                     elapsedMs >= timeoutMs);
             Assert.assertTrue("close() exceeded the bounded timeout by too much: " + elapsedMs + "ms",
                     elapsedMs < timeoutMs * 4);
+        }
+    }
+
+    @Test(timeout = 30_000L)
+    public void testInterruptedCloseDrainRemainsPaced() throws Exception {
+        ThreadMXBean threadMxBean = ManagementFactory.getThreadMXBean();
+        Assume.assumeTrue("current-thread CPU time is required for this regression",
+                threadMxBean.isCurrentThreadCpuTimeSupported());
+        if (!threadMxBean.isThreadCpuTimeEnabled()) {
+            threadMxBean.setThreadCpuTimeEnabled(true);
+        }
+
+        final long timeoutMillis = 750L;
+        try (TestWebSocketServer server = new TestWebSocketServer(new SilentHandler())) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            String cfg = "ws::addr=localhost:" + server.getPort()
+                    + ";close_flush_timeout_millis=" + timeoutMillis + ";";
+            QwpWebSocketSender sender = (QwpWebSocketSender) Sender.fromConfig(cfg);
+            sender.table("foo").longColumn("v", 1L).atNow();
+            sender.flush();
+
+            AtomicBoolean drainReached = new AtomicBoolean();
+            AtomicLong closeCpuNanos = new AtomicLong(-1L);
+            AtomicLong closeWallNanos = new AtomicLong(-1L);
+            AtomicReference<Throwable> closeFailure = new AtomicReference<>();
+            sender.setCloseDrainWaitingHook(() -> {
+                drainReached.set(true);
+                // PoolHousekeeper.stop() applies this escalation after its first join budget expires.
+                Thread.currentThread().interrupt();
+            });
+            Thread closer = new Thread(() -> {
+                long cpuStart = threadMxBean.getCurrentThreadCpuTime();
+                long wallStart = System.nanoTime();
+                try {
+                    sender.close();
+                } catch (Throwable t) {
+                    closeFailure.set(t);
+                } finally {
+                    closeWallNanos.set(System.nanoTime() - wallStart);
+                    closeCpuNanos.set(threadMxBean.getCurrentThreadCpuTime() - cpuStart);
+                    Thread.interrupted();
+                }
+            }, "interrupted-close-drain");
+            try {
+                closer.start();
+                closer.join(10_000L);
+            } finally {
+                if (closer.isAlive()) {
+                    closer.interrupt();
+                    closer.join(10_000L);
+                }
+                sender.close();
+            }
+
+            Assert.assertFalse("interrupted close drain did not finish", closer.isAlive());
+            Assert.assertTrue("close never reached a real unacknowledged drain target", drainReached.get());
+            Assert.assertTrue("silent server must end in the configured drain timeout",
+                    closeFailure.get() instanceof LineSenderException
+                            && closeFailure.get().getMessage().contains("drain timed out"));
+            long wallMillis = TimeUnit.NANOSECONDS.toMillis(closeWallNanos.get());
+            long cpuMillis = TimeUnit.NANOSECONDS.toMillis(closeCpuNanos.get());
+            Assert.assertTrue("close drain returned before its timeout [wallMillis=" + wallMillis + ']',
+                    wallMillis >= timeoutMillis);
+            Assert.assertTrue("interrupted close drain spun instead of parking [cpuMillis=" + cpuMillis
+                            + ", wallMillis=" + wallMillis + ']',
+                    cpuMillis < timeoutMillis / 2);
+        }
+    }
+
+    @Test
+    public void testCloseDrainTimeoutNamesTheReconnectOutage() throws Exception {
+        // The drain-timeout message exists to name the outage the I/O thread is
+        // riding out: a revoked token must read as an auth failure, not as a
+        // timeout-tuning problem. The server accepts the first connection, drops
+        // it on the first frame without acking, and 401s every reconnect.
+        long timeoutMs = 1500;
+        try (TestWebSocketServer server = new TestWebSocketServer(new ReceiveThenDropHandler())) {
+            int port = server.getPort();
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            String cfg = "ws::addr=localhost:" + port
+                    + ";initial_connect_retry=sync"
+                    + ";reconnect_initial_backoff_millis=20"
+                    + ";reconnect_max_backoff_millis=100"
+                    + ";close_flush_timeout_millis=" + timeoutMs + ";";
+            QwpWebSocketSender sender = (QwpWebSocketSender) Sender.fromConfig(cfg);
+            boolean closeAttempted = false;
+            try {
+                // The sender is already connected; from here every NEW handshake
+                // is rejected with 401.
+                server.setRejectWithStatus(401, "Unauthorized");
+                sender.table("foo").longColumn("v", 1L).atNow();
+                sender.flush();
+                // The handler drops the connection on that frame. Wait until the
+                // reconnect loop has been through at least one full failed attempt
+                // so lastReconnectError holds the 401 before close() gives up.
+                long deadline = System.currentTimeMillis() + 5_000;
+                while (sender.getTotalReconnectAttempts() < 2
+                        && System.currentTimeMillis() < deadline) {
+                    Thread.sleep(20);
+                }
+                Assert.assertTrue("the reconnect loop must have retried against the 401",
+                        sender.getTotalReconnectAttempts() >= 2);
+                try {
+                    closeAttempted = true;
+                    sender.close();
+                    Assert.fail("close() should have thrown a drain-timeout error");
+                } catch (LineSenderException e) {
+                    String msg = e.getMessage();
+                    Assert.assertTrue("expected drain-timeout prefix, got: " + msg,
+                            msg.contains("drain timed out"));
+                    Assert.assertTrue("expected the outage to be named, got: " + msg,
+                            msg.contains("the wire is not draining:"));
+                    Assert.assertTrue("expected the 401 to be named, got: " + msg,
+                            msg.contains("WebSocket upgrade rejected with HTTP 401"));
+                }
+            } finally {
+                if (!closeAttempted) {
+                    sender.close();
+                }
+            }
         }
     }
 
@@ -598,11 +771,134 @@ public class CloseDrainTest {
         }
     }
 
+    /**
+     * A batch the server cap can never fit is RETAINED for retry, so on close()
+     * {@code flushPendingRows} throws {@code BatchTooLargeForCapException}. close() must
+     * discard that batch and keep going -- commit, seal and DRAIN what an earlier
+     * successful flush already published -- before rethrowTerminal surfaces the retained
+     * batch's error. Letting the throw escape instead skips all three and abandons the
+     * earlier rows.
+     * <p>
+     * The e2e sibling {@code QwpSenderOversizeRowInBatchTest} asserts a real server's row
+     * count, which pins the COMMIT half: let the exception escape and those rows never
+     * reach a transaction at all. It cannot pin the DRAIN half. Over localhost the earlier
+     * rows are normally acked before close() is even entered, so
+     * {@code drainOnClose} returns at its {@code ackedFsn >= target} early-out and removing
+     * the drain changes nothing there -- verified by mutation: skipping only
+     * {@code drainOnClose} leaves that test green.
+     * <p>
+     * Here the handler withholds every ack until the close-drain witness releases it, so
+     * the earlier row is PROVABLY unacknowledged when close() reaches the drain. The
+     * witness runs only past that early-out, so observing it fire is proof the drain had
+     * real work to do -- and releasing the acks from inside it is what lets close()
+     * finish, making the assertion impossible to satisfy without the drain.
+     */
+    @Test(timeout = 30_000L)
+    public void testCloseDrainsEarlierRowsBeforeSurfacingRetainedBatchError() throws Exception {
+        GatedAckHandler handler = new GatedAckHandler();
+        try (TestWebSocketServer server = new TestWebSocketServer(handler, false, "PRIMARY")) {
+            // Small enough that a handful of modest rows cannot fit, while every
+            // individual row stays far below it (so the per-row guard cannot fire).
+            server.setAdvertisedMaxBatchSize(4096);
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+            String cfg = "ws::addr=localhost:" + server.getPort()
+                    + ";auto_flush_rows=10000"
+                    + ";auto_flush_bytes=off"
+                    + ";auto_flush_interval=60000"
+                    + ";close_flush_timeout_millis=10000;";
+            QwpWebSocketSender sender = (QwpWebSocketSender) Sender.fromConfig(cfg);
+
+            CountDownLatch drainWaiting = new CountDownLatch(1);
+            sender.setCloseDrainWaitingHook(() -> {
+                drainWaiting.countDown();
+                handler.releaseAcks();
+            });
+
+            // The earlier row: flushed successfully, then held unacked by the handler.
+            sender.table("earlier").longColumn("v", 1L).atNow();
+            sender.flush();
+
+            // 8 x ~1 KB into ONE table: no split can fit this under the 4 KB cap, and no
+            // single row comes close to it.
+            char[] chunkChars = new char[1024];
+            Arrays.fill(chunkChars, 'x');
+            String chunk = new String(chunkChars);
+            LineSenderException flushThrown = null;
+            try {
+                for (int i = 0; i < 8; i++) {
+                    sender.table("oversize").stringColumn("payload", chunk).atNow();
+                }
+                sender.flush();
+            } catch (LineSenderException e) {
+                flushThrown = e;
+            }
+            Assert.assertNotNull("flush() must refuse a batch no split can fit under the cap",
+                    flushThrown);
+            Assert.assertTrue("expected the batch-cap rejection, got: " + flushThrown.getMessage(),
+                    flushThrown.getMessage().contains("batch too large for server batch cap"));
+
+            Assert.assertEquals("the earlier row must still be unacknowledged when close() starts,"
+                            + " or the drain has nothing to wait for and this test proves nothing",
+                    -1L, sender.getAckedFsn());
+
+            LineSenderException closeThrown = null;
+            try {
+                sender.close();
+            } catch (LineSenderException e) {
+                closeThrown = e;
+            }
+
+            Assert.assertEquals("close() must reach the bounded drain with the earlier row still"
+                            + " unacknowledged; the witness fires only past drainOnClose's"
+                            + " ackedFsn >= target early-out, so a skipped drain leaves it unfired",
+                    0L, drainWaiting.getCount());
+            Assert.assertNotNull("close() must still surface the retained batch's error after"
+                    + " committing and draining the earlier row", closeThrown);
+            Assert.assertTrue("expected the batch-cap rejection from close(), got: "
+                            + closeThrown.getMessage(),
+                    closeThrown.getMessage().contains("batch too large for server batch cap"));
+            // close() surfaced the batch-cap error rather than a "drain timed out" one, so
+            // the drain ran to completion; the handler's counter is the server-side witness
+            // that the earlier row's frame really was carried across and acked.
+            Assert.assertTrue("the drain must have carried the earlier row's frame to the server"
+                            + " and taken its ack [acksSent=" + handler.nextSeq.get() + ']',
+                    handler.nextSeq.get() >= 1L);
+        }
+    }
+
     private static String sfDirOpt() {
         String dir = Paths.get(
                 System.getProperty("java.io.tmpdir"),
                 "qdb-close-drain-" + System.nanoTime()).toString();
         return ";sf_dir=" + dir;
+    }
+
+    /**
+     * Receives frames but withholds every ack until {@link #releaseAcks()} is called, so a
+     * close-time drain provably has an unacknowledged target to wait on.
+     */
+    private static class GatedAckHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private final AtomicLong nextSeq = new AtomicLong(0);
+        private final CountDownLatch released = new CountDownLatch(1);
+
+        @Override
+        public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            try {
+                if (!released.await(20, TimeUnit.SECONDS)) {
+                    throw new AssertionError("close-drain witness never released the ack gate");
+                }
+                client.sendBinary(buildAck(nextSeq.getAndIncrement()));
+            } catch (IOException | InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException(e);
+            }
+        }
+
+        void releaseAcks() {
+            released.countDown();
+        }
     }
 
     /** Acks every binary frame after a fixed delay, so we can observe close() blocking. */
@@ -652,6 +948,23 @@ public class CloseDrainTest {
                 }
             }
             // frames past the first are deferred: withhold their acks
+        }
+    }
+
+    /**
+     * Receives the first frame, closes the connection without acking it, and
+     * ignores everything after -- the drop forces the sender into its reconnect
+     * loop with data still undrained.
+     */
+    private static class ReceiveThenDropHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private boolean dropped;
+
+        @Override
+        public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            if (!dropped) {
+                dropped = true;
+                client.close();
+            }
         }
     }
 

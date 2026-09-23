@@ -35,12 +35,6 @@ import sun.misc.FDBigInteger;
  * single, JDK-agnostic copy of the algorithm.
  */
 final class FdBig {
-    static {
-        // No-op on Java 8: sun.misc is open, no module export is needed. Kept
-        // for symmetry with the Java 9+ variant.
-        Compat.exportFdBigInteger();
-    }
-
     private final FDBigInteger value;
 
     private FdBig(FDBigInteger value) {

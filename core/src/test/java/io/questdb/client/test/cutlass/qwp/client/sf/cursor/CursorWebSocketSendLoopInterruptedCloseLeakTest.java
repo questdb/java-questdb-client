@@ -107,7 +107,7 @@ public class CursorWebSocketSendLoopInterruptedCloseLeakTest {
                         null /* async-initial-connect: the I/O thread drives the connect */,
                         engine, 0L, 1_000L,
                         stuckConnect,
-                        5_000L, 100L, 5_000L, false);
+                        100L, 5_000L, false);
                 loop.start();
                 Assert.assertTrue("I/O thread never reached the reconnect factory",
                         enteredReconnect.await(5, TimeUnit.SECONDS));

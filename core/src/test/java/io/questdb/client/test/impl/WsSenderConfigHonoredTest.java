@@ -76,6 +76,8 @@ public class WsSenderConfigHonoredTest {
         assertHonored("max_background_drainers=6", "max_background_drainers", 6);
         assertHonored("max_frame_rejections=6", "max_frame_rejections", 6);
         assertHonored("poison_min_escalation_window_millis=7500", "poison_min_escalation_window_millis", 7500L);
+        assertHonored("catch_up_cap_gap_min_escalation_window_millis=90000",
+                "catch_up_cap_gap_min_escalation_window_millis", 90000L);
         assertHonored("error_inbox_capacity=128", "error_inbox_capacity", 128);
         assertHonored("connection_listener_inbox_capacity=64", "connection_listener_inbox_capacity", 64);
         assertHonored("token=ey.abc", "token", "ey.abc");
@@ -119,6 +121,15 @@ public class WsSenderConfigHonoredTest {
                         honored.contains(spec.name()));
             }
         }
+    }
+
+    @Test
+    public void testSnapshotReportsTheRawUnsetSentinel() {
+        // Every sibling key puts the raw field. Resolving the sentinel to its default
+        // makes the snapshot unable to distinguish "unset" from "explicitly set to the
+        // default", which is the distinction this guard exists to catch.
+        Map<String, Object> snap = snapshot("ws::addr=localhost:9000;");
+        Assert.assertEquals(-1L, snap.get("catch_up_cap_gap_min_escalation_window_millis"));
     }
 
     private void assertHonored(String kv, String snapKey, Object expected) {

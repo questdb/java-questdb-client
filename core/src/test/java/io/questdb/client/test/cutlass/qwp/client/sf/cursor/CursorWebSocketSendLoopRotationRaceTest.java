@@ -92,7 +92,7 @@ public class CursorWebSocketSendLoopRotationRaceTest {
                     () -> {
                         throw new UnsupportedOperationException("no reconnect in this test");
                     },
-                    5_000L, 100L, 5_000L, false);
+                    100L, 5_000L, false);
 
             long buf = Unsafe.malloc(PAYLOAD_LEN, MemoryTag.NATIVE_DEFAULT);
             try {

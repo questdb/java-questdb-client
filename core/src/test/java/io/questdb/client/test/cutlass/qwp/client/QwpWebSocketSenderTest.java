@@ -30,6 +30,7 @@ import io.questdb.client.cutlass.line.array.LongArray;
 import io.questdb.client.cutlass.qwp.client.MicrobatchBuffer;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
 import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.Decimal256;
@@ -340,10 +341,12 @@ public class QwpWebSocketSenderTest {
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
-                // Memory-only engine with a 33-byte budget and a 1 ns append
+                // Memory-only engine with the smallest viable segment budget (just
+                // enough for the header plus one minimal frame) and a 1 ns append
                 // deadline guarantees every appendBlocking() call trips the
                 // backpressure deadline and throws.
-                CursorSendEngine engine = new CursorSendEngine(null, 33, 33, 1L);
+                long minSegmentBytes = MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + 1;
+                CursorSendEngine engine = new CursorSendEngine(null, minSegmentBytes, minSegmentBytes, 1L);
                 try (QwpWebSocketSender sender = QwpWebSocketSender.connect(
                         "localhost", port, null, Integer.MAX_VALUE, 0, 0L, null,
                         false, engine, 0L)) {
@@ -625,6 +628,104 @@ public class QwpWebSocketSenderTest {
     }
 
     @Test
+    public void testRowAcceptedWhenServerAdvertisesNoCap() throws Exception {
+        // serverMaxBatchSize == 0 means "no cap" (an older server, or a failover to a
+        // node that advertises none). The per-row guard in sendRow must be skipped, so
+        // even a large row is accepted rather than rejected against a "cap" of 0. This
+        // is the invariant the sendRow cap snapshot protects: the I/O thread can lower
+        // the volatile serverMaxBatchSize to 0 mid-row, and a torn read that observed
+        // the drop between the guard and the throw must not spuriously reject the row.
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                    "localhost", 9000,
+                    /*autoFlushRows*/ Integer.MAX_VALUE,
+                    /*autoFlushBytes*/ 0,
+                    /*autoFlushIntervalNanos*/ 0L)) {
+                sender.setConnectedForTest(true);
+                sender.applyServerBatchSizeLimit(0);
+                Assert.assertEquals(0, sender.getServerMaxBatchSize());
+
+                StringBuilder big = new StringBuilder();
+                for (int i = 0; i < 256; i++) {
+                    big.append('x');
+                }
+                // A row far larger than any small cap still commits when the server
+                // advertises no cap; the guard leaves it alone.
+                sender.table("t").stringColumn("s", big.toString()).atNow();
+
+                QwpTableBuffer buf = sender.getTableBuffer("t");
+                Assert.assertEquals(1, buf.getRowCount());
+            }
+        });
+    }
+
+    @Test
+    public void testRowExceedingServerBatchCapThrows() throws Exception {
+        // The per-row guard in sendRow rejects a single row whose encoded bytes
+        // already exceed the server's advertised cap, before nextRow() commits it, so
+        // the flush cannot build an oversize WS frame the server closes with 1009.
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                    "localhost", 9000,
+                    /*autoFlushRows*/ Integer.MAX_VALUE,
+                    /*autoFlushBytes*/ 0,
+                    /*autoFlushIntervalNanos*/ 0L)) {
+                sender.setConnectedForTest(true);
+                sender.applyServerBatchSizeLimit(64);
+                Assert.assertEquals(64, sender.getServerMaxBatchSize());
+
+                StringBuilder big = new StringBuilder();
+                for (int i = 0; i < 256; i++) {
+                    big.append('x');
+                }
+                sender.table("t").stringColumn("s", big.toString());
+                try {
+                    sender.atNow();
+                    Assert.fail("Expected LineSenderException");
+                } catch (LineSenderException e) {
+                    Assert.assertTrue(
+                            "expected 'row too large for server batch cap', got: " + e.getMessage(),
+                            e.getMessage().contains("row too large for server batch cap"));
+                    // The message reports the single snapshotted cap, not a torn value.
+                    Assert.assertTrue(
+                            "expected the snapshotted cap in the message, got: " + e.getMessage(),
+                            e.getMessage().contains("serverMaxBatchSize=64"));
+                }
+                // The rejected row was rolled back before commit, leaving no row behind.
+                QwpTableBuffer buf = sender.getTableBuffer("t");
+                Assert.assertEquals(0, buf.getRowCount());
+            }
+        });
+    }
+
+    @Test
+    public void testCumulativeBufferedBytesDoNotTripPerRowCap() throws Exception {
+        // The guard budget is nextRow(currentTableBufferSnapshotBytes, cap): each
+        // row is measured against the snapshot taken at the previous commit, not
+        // against offset zero. A mutation to nextRow(0, cap) would reject every
+        // row once the table's CUMULATIVE buffered bytes crossed the cap; this
+        // pins the wiring the single-row tests cannot distinguish.
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                    "localhost", 9000,
+                    /*autoFlushRows*/ Integer.MAX_VALUE,
+                    /*autoFlushBytes*/ 0,
+                    /*autoFlushIntervalNanos*/ 0L)) {
+                sender.setConnectedForTest(true);
+                sender.applyServerBatchSizeLimit(64);
+
+                // Three rows of 22-26 bytes each: every row fits the 64-byte cap,
+                // but the running total (70 after row 3) exceeds it.
+                for (int i = 0; i < 3; i++) {
+                    sender.table("t").stringColumn("s", "abcdefghijklmnopqr").atNow();
+                }
+                QwpTableBuffer buf = sender.getTableBuffer("t");
+                Assert.assertEquals(3, buf.getRowCount());
+            }
+        });
+    }
+
+    @Test
     public void testStringColumnAfterCloseThrows() throws Exception {
         assertMemoryLeak(() -> {
             QwpWebSocketSender sender = createUnconnectedSender();
@@ -730,6 +831,30 @@ public class QwpWebSocketSenderTest {
                     "expected message to mention 'closed', got: " + e.getMessage(),
                     e.getMessage() != null && e.getMessage().contains("closed"));
         }
+    }
+
+    @Test
+    public void testIllegalTableNameIsEscapedInTheMessage() throws Exception {
+        assertMemoryLeak(() -> {
+            // A rejected table name is attacker-influenced text on its way to a log line or a terminal, so
+            // it is escaped rather than concatenated. Three of the four callsites that do this are covered -
+            // QwpUdpSender and QwpTableBuffer by QwpUdpSenderTest, the ILP names by AbstractLineSender's
+            // tests - and this one, the WebSocket sender's own check, was not: its message could regress to
+            // a raw concatenation with the suite still green.
+            try (QwpWebSocketSender sender = createUnconnectedSender()) {
+                try {
+                    sender.table("bad" + (char) 0x01 + "name");
+                    Assert.fail("an illegal table name must be rejected");
+                } catch (LineSenderException e) {
+                    final String message = e.getMessage();
+                    Assert.assertTrue(message, message.contains("table name contains illegal characters"));
+                    Assert.assertTrue("the offending char must be escaped: " + message,
+                            message.contains("\\u0001"));
+                    Assert.assertTrue("the raw control char must not reach the message",
+                            message.indexOf(0x01) < 0);
+                }
+            }
+        });
     }
 
     private static MicrobatchBuffer getMicrobatchBuffer(QwpWebSocketSender sender, String fieldName) throws Exception {

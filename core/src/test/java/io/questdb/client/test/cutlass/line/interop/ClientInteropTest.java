@@ -36,7 +36,6 @@ import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Numbers;
 import io.questdb.client.std.NumericException;
 import io.questdb.client.std.bytes.DirectByteSink;
-import io.questdb.client.std.str.StringSink;
 import io.questdb.client.test.cutlass.line.tcp.ByteChannel;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
@@ -91,7 +90,6 @@ public class ClientInteropTest {
         public static final int TAG_TEST_NAME = 0;
         private final ByteChannel byteChannel;
         private final Sender sender;
-        private final StringSink stringSink = new StringSink();
         private int columnType = -1;
         private boolean encounteredError;
         private String name;
@@ -105,7 +103,7 @@ public class ClientInteropTest {
 
         @Override
         public void onEvent(int code, CharSequence tag, int position) throws JsonException {
-            tag = unescape(tag, stringSink);
+            // JsonLexer already resolves JSON string escape sequences, so `tag` arrives fully decoded.
             switch (code) {
                 case JsonLexer.EVT_NAME:
                     if (Chars.equalsIgnoreCase(tag, "testname")) {
@@ -267,70 +265,6 @@ public class ClientInteropTest {
                     && (tok.charAt(1) | 32) == 'r'
                     && (tok.charAt(2) | 32) == 'u'
                     && (tok.charAt(3) | 32) == 'e';
-        }
-
-        private static CharSequence unescape(CharSequence tag, StringSink stringSink) {
-            if (tag == null) {
-                return null;
-            }
-            stringSink.clear();
-
-            for (int i = 0, n = tag.length(); i < n; i++) {
-                char sourceChar = tag.charAt(i);
-                if (sourceChar != '\\') {
-                    // happy-path, nothing to unescape
-                    stringSink.put(sourceChar);
-                } else {
-                    // slow path. either there is a code unit sequence. think of this: foo\u0001bar
-                    // or a simple escaping: \n, \r, \\, \", etc.
-                    // in both cases we will consume more than 1 character from the input,
-                    // so we have to adjust "i" accordingly
-
-                    // malformed input could throw IndexOutOfBoundsException, but given we control
-                    // the test data then we are OK.
-                    char nextChar = tag.charAt(i + 1);
-                    if (nextChar == 'u') {
-                        // code unit sequence
-                        char ch;
-                        try {
-                            ch = (char) Numbers.parseHexInt(tag, i + 2, i + 6);
-                        } catch (NumericException e) {
-                            throw new AssertionError("cannot parse code sequence in " + tag);
-                        }
-                        stringSink.put(ch);
-                        i += 5;
-                    } else if (nextChar == '\\') {
-                        stringSink.put('\\');
-                        i++;
-                    } else if (nextChar == '\"') {
-                        stringSink.put('\"');
-                        i++;
-                    } else if (nextChar == 'b') {
-                        // backspace
-                        stringSink.put('\b');
-                        i++;
-                    } else if (nextChar == 'f') {
-                        // form-feed
-                        stringSink.put('\f');
-                        i++;
-                    } else if (nextChar == 'n') {
-                        // new line
-                        stringSink.put('\n');
-                        i++;
-                    } else if (nextChar == 'r') {
-                        // carriage return
-                        stringSink.put('\r');
-                        i++;
-                    } else if (nextChar == 't') {
-                        // tab
-                        stringSink.put('\t');
-                        i++;
-                    } else {
-                        throw new AssertionError("Unknown escaping sequence at " + tag);
-                    }
-                }
-            }
-            return stringSink.toString();
         }
 
         private void assertSuccessfulLine(byte[] tag) {

@@ -153,8 +153,44 @@ public class Crc32cTest {
                 }
                 int crc = Crc32c.update(Crc32c.INIT, buf, msg.length);
                 assertEquals(0xE3069283, crc);
+                assertEquals(crc, Crc32c.updateUnsafe(Crc32c.INIT, buf, msg.length));
             } finally {
                 Unsafe.free(buf, msg.length, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testUnsafeMatchesNativeAcrossAlignmentsLengthsAndSeeds() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            int[] lengths = {
+                    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 16, 17,
+                    31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256,
+                    257, 1_023, 4_096
+            };
+            int[] seeds = {Crc32c.INIT, 0x1234_5678, -1};
+            int capacity = 4_096 + Long.BYTES - 1;
+            long buf = Unsafe.malloc(capacity, MemoryTag.NATIVE_DEFAULT);
+            try {
+                int value = 0x1357_9BDF;
+                for (int i = 0; i < capacity; i++) {
+                    value ^= value << 13;
+                    value ^= value >>> 17;
+                    value ^= value << 5;
+                    Unsafe.getUnsafe().putByte(buf + i, (byte) value);
+                }
+                for (int offset = 0; offset < Long.BYTES; offset++) {
+                    for (int len : lengths) {
+                        for (int seed : seeds) {
+                            Assert.assertEquals(
+                                    "offset=" + offset + " len=" + len + " seed=" + seed,
+                                    Crc32c.update(seed, buf + offset, len),
+                                    Crc32c.updateUnsafe(seed, buf + offset, len));
+                        }
+                    }
+                }
+            } finally {
+                Unsafe.free(buf, capacity, MemoryTag.NATIVE_DEFAULT);
             }
         });
     }

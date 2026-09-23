@@ -51,6 +51,8 @@ public class QwpQueryClientPostConnectGuardTest {
         assertRejects(c -> c.withBasicAuth("u", "p"), "withBasicAuth");
         // withBearerToken
         assertRejects(c -> c.withBearerToken("tok"), "withBearerToken");
+        // withBearerTokenProvider
+        assertRejects(c -> c.withBearerTokenProvider(() -> "tok"), "withBearerTokenProvider");
         // withBufferPoolSize
         assertRejects(c -> c.withBufferPoolSize(2), "withBufferPoolSize");
         // withClientId

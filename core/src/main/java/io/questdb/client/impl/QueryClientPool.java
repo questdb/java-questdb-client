@@ -24,6 +24,7 @@
 
 package io.questdb.client.impl;
 
+import io.questdb.client.HttpTokenProvider;
 import io.questdb.client.QueryException;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 import org.jetbrains.annotations.TestOnly;
@@ -91,16 +92,18 @@ public final class QueryClientPool implements AutoCloseable {
     private final int maxSize;
     private final int minSize;
     private final AtomicInteger nextSlotIndex = new AtomicInteger();
+    private final HttpTokenProvider tokenProvider;
     private final Condition workerReleased;
     private volatile boolean closed;
     // Upper bound on the Query.close() drain wait; see
     // DEFAULT_CLOSE_QUERY_TIMEOUT_MILLIS. Volatile because QuestDBImpl sets it
     // once at build time on a different thread than the borrowers that read it.
     private volatile long closeQueryTimeoutMillis = DEFAULT_CLOSE_QUERY_TIMEOUT_MILLIS;
-    // Threads currently inside close()'s bounded creation-wait loop. Exists so
-    // hasCreationWaiterForTesting() can report that region as a stable state
-    // rather than probing the condition queue; see that method. Guarded by lock.
-    private int closeCreationWaiters;
+    // Test seam invoked after close() handles an interrupt and confirms the
+    // original creation-wait deadline still permits another wait. Null in
+    // production; lifecycle tests use it to acknowledge distinct retries
+    // without inspecting transient Condition queue membership.
+    private volatile Runnable creationWaitRetryHook;
     private int inFlightCreations;
 
     public QueryClientPool(
@@ -112,7 +115,7 @@ public final class QueryClientPool implements AutoCloseable {
             long maxLifetimeMillis
     ) {
         this(configurationString, minSize, maxSize, acquireTimeoutMillis,
-                idleTimeoutMillis, maxLifetimeMillis, null);
+                idleTimeoutMillis, maxLifetimeMillis, null, null, null);
     }
 
     // Constructor exposing the connectHook seam. Production (QuestDBImpl) passes
@@ -130,7 +133,7 @@ public final class QueryClientPool implements AutoCloseable {
             Consumer<QwpQueryClient> connectHook
     ) {
         this(configurationString, minSize, maxSize, acquireTimeoutMillis,
-                idleTimeoutMillis, maxLifetimeMillis, connectHook, null);
+                idleTimeoutMillis, maxLifetimeMillis, connectHook, null, null);
     }
 
     // Constructor exposing both the connectHook and startHook seams. Production
@@ -148,11 +151,27 @@ public final class QueryClientPool implements AutoCloseable {
             Consumer<QwpQueryClient> connectHook,
             Consumer<QueryWorker> startHook
     ) {
+        this(configurationString, minSize, maxSize, acquireTimeoutMillis,
+                idleTimeoutMillis, maxLifetimeMillis, connectHook, startHook, null);
+    }
+
+    QueryClientPool(
+            String configurationString,
+            int minSize,
+            int maxSize,
+            long acquireTimeoutMillis,
+            long idleTimeoutMillis,
+            long maxLifetimeMillis,
+            Consumer<QwpQueryClient> connectHook,
+            Consumer<QueryWorker> startHook,
+            HttpTokenProvider tokenProvider
+    ) {
         if (minSize < 0 || maxSize < 1 || minSize > maxSize) {
             throw new IllegalArgumentException("invalid pool sizing: min=" + minSize + ", max=" + maxSize);
         }
         this.connectHook = connectHook != null ? connectHook : QwpQueryClient::connect;
         this.startHook = startHook != null ? startHook : QueryWorker::start;
+        this.tokenProvider = tokenProvider;
         this.configurationString = configurationString;
         this.minSize = minSize;
         this.maxSize = maxSize;
@@ -343,18 +362,21 @@ public final class QueryClientPool implements AutoCloseable {
             final long creationWaitDeadlineNanos = System.nanoTime() + creationWaitNanos;
             long creationRemainingNanos = creationWaitNanos;
             boolean creationWaitInterrupted = false;
-            closeCreationWaiters++;
-            try {
-                while (inFlightCreations > 0 && creationRemainingNanos > 0) {
-                    try {
-                        creationFinished.awaitNanos(creationRemainingNanos);
-                    } catch (InterruptedException e) {
-                        creationWaitInterrupted = true;
-                    }
-                    creationRemainingNanos = creationWaitDeadlineNanos - System.nanoTime();
+            while (inFlightCreations > 0 && creationRemainingNanos > 0) {
+                boolean isRetryingAfterInterrupt = false;
+                try {
+                    creationFinished.awaitNanos(creationRemainingNanos);
+                } catch (InterruptedException e) {
+                    creationWaitInterrupted = true;
+                    isRetryingAfterInterrupt = true;
                 }
-            } finally {
-                closeCreationWaiters--;
+                creationRemainingNanos = creationWaitDeadlineNanos - System.nanoTime();
+                if (isRetryingAfterInterrupt && inFlightCreations > 0 && creationRemainingNanos > 0) {
+                    Runnable hook = creationWaitRetryHook;
+                    if (hook != null) {
+                        hook.run();
+                    }
+                }
             }
             if (creationWaitInterrupted) {
                 Thread.currentThread().interrupt();
@@ -537,17 +559,11 @@ public final class QueryClientPool implements AutoCloseable {
         }
     }
 
-    // True while a close() is inside its bounded creation wait. Deliberately not
-    // lock.hasWaiters(creationFinished): an interrupt moves the waiter out of the
-    // condition queue and into the lock's sync queue to reacquire before await
-    // rethrows, so under an interrupt storm hasWaiters() reads false for a
-    // measurable fraction of the wait even though close() never left it. Tests
-    // that assert on the wait region need a state that does not flicker.
     @TestOnly
     public boolean hasCreationWaiterForTesting() {
         lock.lock();
         try {
-            return closeCreationWaiters > 0;
+            return lock.hasWaiters(creationFinished);
         } finally {
             lock.unlock();
         }
@@ -572,9 +588,17 @@ public final class QueryClientPool implements AutoCloseable {
         return closed;
     }
 
+    @TestOnly
+    public void setCreationWaitRetryHookForTesting(Runnable hook) {
+        this.creationWaitRetryHook = hook;
+    }
+
     private QueryWorker createUnlocked() {
         QwpQueryClient client = QwpQueryClient.fromConfig(configurationString);
         try {
+            if (tokenProvider != null) {
+                client.withBearerTokenProvider(tokenProvider);
+            }
             connectHook.accept(client);
         } catch (Throwable e) {
             // Catch Throwable, not just RuntimeException: connect() runs a heavy

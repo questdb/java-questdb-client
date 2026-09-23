@@ -100,10 +100,12 @@ public class SenderConnectionDispatcherTest {
         // entry and admit the new one. Later connection events carry the
         // freshest state, so dropping the head loses the least information.
         CountDownLatch unblock = new CountDownLatch(1);
+        CountDownLatch listenerEntered = new CountDownLatch(1);
         List<SenderConnectionEvent> received = new ArrayList<>();
         Object lock = new Object();
         CountDownLatch allDelivered = new CountDownLatch(5);
         try (SenderConnectionDispatcher d = new SenderConnectionDispatcher(ev -> {
+            listenerEntered.countDown();
             try {
                 unblock.await();
             } catch (InterruptedException ignored) {
@@ -114,11 +116,12 @@ public class SenderConnectionDispatcherTest {
             }
             allDelivered.countDown();
         }, /*capacity=*/ 4)) {
-            // First offer starts the dispatcher and lands in the listener
-            // immediately (and blocks there), freeing one slot. Now we can
-            // fill the bounded inbox to capacity (4), then overflow.
+            // First offer starts the dispatcher. Wait until it lands in the
+            // listener and blocks there before filling the bounded inbox and
+            // overflowing it.
             Assert.assertTrue(d.offer(buildEvent(0)));
-            TimeUnit.MILLISECONDS.sleep(50);
+            Assert.assertTrue("dispatcher should take the head into the listener within 5s",
+                    listenerEntered.await(5, TimeUnit.SECONDS));
             for (int i = 1; i <= 4; i++) {
                 Assert.assertTrue("inbox should accept offer " + i,
                         d.offer(buildEvent(i)));

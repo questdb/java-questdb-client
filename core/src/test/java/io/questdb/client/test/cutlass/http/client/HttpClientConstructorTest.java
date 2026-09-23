@@ -30,12 +30,10 @@ import io.questdb.client.cutlass.http.client.HttpClient;
 import io.questdb.client.cutlass.http.client.HttpClientFactory;
 import io.questdb.client.cutlass.http.client.HttpClientLinux;
 import io.questdb.client.cutlass.http.client.HttpClientOsx;
-import io.questdb.client.cutlass.http.client.HttpClientWindows;
 import io.questdb.client.network.EpollFacade;
 import io.questdb.client.network.KqueueFacade;
 import io.questdb.client.network.NetworkFacade;
 import io.questdb.client.network.PlainSocket;
-import io.questdb.client.network.SelectFacade;
 import io.questdb.client.network.Socket;
 import io.questdb.client.network.SocketFactory;
 import io.questdb.client.test.tools.TestUtils;
@@ -82,17 +80,39 @@ public class HttpClientConstructorTest {
     }
 
     @Test
-    public void testBaseConstructorFailureAfterSocketClosesSocket() throws Exception {
-        // getTimeout() is the first configuration read after the socket, so this fails with the
-        // socket taken and no native block allocated yet.
+    public void testBaseConstructorFailurePreservesOriginalFailureWhenSocketCloseFails() throws Exception {
         final HttpClientConfiguration configuration = new DefaultHttpClientConfiguration() {
             @Override
-            public int getTimeout() {
-                throw new InjectedFailure();
+            public int getInitialRequestBufferSize() {
+                return 1024;
+            }
+
+            @Override
+            public int getResponseBufferSize() {
+                return -1;
             }
         };
 
-        assertInjectedFailureRollback(socketFactory -> HttpClientFactory.newInstance(configuration, socketFactory));
+        TestUtils.assertMemoryLeak(() -> {
+            final CloseFailure closeFailure = new CloseFailure();
+            final SocketFactory socketFactory = (nf, log) -> new PlainSocket(nf, log) {
+                @Override
+                public synchronized void close() {
+                    super.close();
+                    throw closeFailure;
+                }
+            };
+            try {
+                buildAndClose(() -> HttpClientFactory.newInstance(configuration, socketFactory));
+                Assert.fail("expected IllegalArgumentException");
+            } catch (IllegalArgumentException constructionFailure) {
+                Assert.assertArrayEquals(
+                        "socket close failure must remain secondary",
+                        new Throwable[]{closeFailure},
+                        constructionFailure.getSuppressed()
+                );
+            }
+        });
     }
 
     @Test
@@ -121,21 +141,6 @@ public class HttpClientConstructorTest {
         };
 
         assertInjectedFailureRollback(socketFactory -> new HttpClientOsx(configuration, socketFactory));
-    }
-
-    @Test
-    public void testWindowsConstructorFailureClosesBaseClient() throws Exception {
-        // The Windows constructor reads the select facade before it takes the FD set, so this
-        // failure lands with only the base class holding resources - and, unlike a failing
-        // new FDSet(...), it never initialises the Windows-only SelectAccessor natives.
-        final HttpClientConfiguration configuration = new DefaultHttpClientConfiguration() {
-            @Override
-            public SelectFacade getSelectFacade() {
-                throw new InjectedFailure();
-            }
-        };
-
-        assertInjectedFailureRollback(socketFactory -> new HttpClientWindows(configuration, socketFactory));
     }
 
     private static void assertInjectedFailureRollback(ClientFactory clientFactory) throws Exception {
@@ -181,6 +186,12 @@ public class HttpClientConstructorTest {
                     super.close();
                 }
             };
+        }
+    }
+
+    private static class CloseFailure extends RuntimeException {
+        CloseFailure() {
+            super("injected socket close failure", null, false, false);
         }
     }
 

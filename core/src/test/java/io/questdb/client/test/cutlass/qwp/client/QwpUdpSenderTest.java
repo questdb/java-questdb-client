@@ -881,6 +881,26 @@ public class QwpUdpSenderTest {
     }
 
     @Test
+    public void testColumnRejectsInvalidCharactersAreEscaped() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1)) {
+                // a rejected COLUMN name carrying a display-unsafe char must be ESCAPED in the message, not
+                // spliced in raw (M6 parity with the ILP name/error render, at the QwpTableBuffer layer)
+                try {
+                    sender.table("t").longColumn("bad" + (char) 0x01 + "col", 1L);
+                    Assert.fail("expected an illegal column name to be rejected");
+                } catch (LineSenderException e) {
+                    Assert.assertTrue("the control char must be escaped: " + e.getMessage(),
+                            e.getMessage().contains("\\u0001"));
+                    Assert.assertTrue("a raw control char must not leak into the message",
+                            e.getMessage().indexOf((char) 0x01) < 0);
+                }
+            }
+        });
+    }
+
+    @Test
     public void testDuplicateColumnAfterSchemaFlushReplayIsRejected() throws Exception {
         assertMemoryLeak(() -> {
             CapturingNetworkFacade nf = new CapturingNetworkFacade();
@@ -1714,6 +1734,19 @@ public class QwpUdpSenderTest {
                 assertThrowsContains("table name contains illegal characters", () ->
                         sender.table(".leading_dot")
                 );
+
+                // a rejected name carrying a display-unsafe char (here a control char; also bidi/BOM/zero-width)
+                // must be ESCAPED in the message, not spliced in raw where it could reorder, hide or forge what a
+                // human reads - M6 parity with the ILP name/error render
+                try {
+                    sender.table("bad" + (char) 0x01 + "name");
+                    Assert.fail("expected an illegal table name to be rejected");
+                } catch (LineSenderException e) {
+                    Assert.assertTrue("the control char must be escaped: " + e.getMessage(),
+                            e.getMessage().contains("\\u0001"));
+                    Assert.assertTrue("a raw control char must not leak into the message",
+                            e.getMessage().indexOf((char) 0x01) < 0);
+                }
 
                 // Sender must remain usable after rejected names
                 sender.table("valid")

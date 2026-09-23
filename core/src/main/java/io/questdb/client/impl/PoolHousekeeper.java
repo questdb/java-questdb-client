@@ -24,6 +24,8 @@
 
 package io.questdb.client.impl;
 
+import java.util.concurrent.TimeUnit;
+
 /**
  * Daemon thread that periodically asks both pools to reap idle / over-age
  * slots. Owned by {@link QuestDBImpl}; one instance per {@code QuestDB}
@@ -36,10 +38,13 @@ final class PoolHousekeeper {
     // in flight when close() arrives finishes well within this join (C1 fix).
     // The recovery build that precedes the drain is bounded separately --
     // recoverers force initial_connect_mode=OFF, so the build makes at most one
-    // connect attempt rather than a SYNC reconnect-budget retry (M1). The lone
-    // case that can still overrun this join is an in-flight connect to a
-    // black-holed host (no application-level connect timeout in the transport);
-    // see the residual-window note on SenderPool.recoverOneSlotStep.
+    // connect attempt rather than a SYNC reconnect-budget retry (M1). A recovery
+    // build also pulls a credential when a token provider is configured, and
+    // that wait dwarfs this join; stop() escalates to an interrupt for it. The
+    // lone case that survives even that is an in-flight connect to a black-holed
+    // host, which blocks in a syscall no interrupt breaks (the transport exposes
+    // no application-level connect timeout); see the residual-window note on
+    // SenderPool.recoverOneSlotStep.
     static final long STOP_TIMEOUT_MILLIS = 2_000;
 
     private final long intervalMillis;
@@ -66,11 +71,84 @@ final class PoolHousekeeper {
         synchronized (signalLock) {
             signalLock.notifyAll();
         }
+        // Clear the caller's cancellation for the duration and hand it back at the end -- the shape
+        // QueryWorker.shutdown() and QwpQueryClient.close() already use. Thread.join(millis) consults the
+        // CALLING thread's interrupt flag before it ever looks at whether the target is alive, so a caller
+        // that arrives interrupted -- a close() from a task cancelled by shutdownNow(), or from a finally on
+        // a thread the application cancelled -- made the first join throw at 0 ms and skip the escalation
+        // below entirely. That is the one case the escalation is most needed in: it exists because the
+        // target may be parked in a credential pull only an interrupt can break, and skipping it returns
+        // from close() with the recoverer still holding its store-and-forward slot flock. The flag is
+        // restored before returning, so the caller's own cancellation bookkeeping still sees it. A fresh
+        // interrupt during either join is handled the same way: remember it, finish the shutdown protocol,
+        // then restore it.
+        boolean callerWasInterrupted = Thread.interrupted();
         try {
-            thread.join(STOP_TIMEOUT_MILLIS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+            callerWasInterrupted |= joinIgnoringCallerInterrupts(thread, STOP_TIMEOUT_MILLIS);
+            if (thread.isAlive()) {
+                // The stop flag only reaches the loop BETWEEN steps. A step blocked inside a recovery
+                // build is unreachable by it, and since recovery builds acquired a token provider the
+                // longest such block is a credential pull: OidcDeviceAuth.getToken() documents a wait of up
+                // to six times httpTimeoutMillis behind a peer's refresh, plus a token-store lock wait,
+                // which together dwarf this join. Returning anyway leaves the recoverer holding its
+                // store-and-forward slot flock after close() has returned, so an immediate reopen fails
+                // with "sf slot already in use" and the detached build's engine, mmaps and I/O thread leak
+                // -- the very window this pool's per-slot ids and the drain_orphans(false) forced on
+                // recovery builds exist to eliminate.
+                //
+                // Interrupt and re-join. The waits this is aimed at are interruptible: acquireForGetToken
+                // polls a timed tryLock, and FileTokenStore's two lock waits abandon and re-assert the flag.
+                // The pull then throws, the step's caller swallows it (recovery is best-effort), and the
+                // loop reaches its stop check and releases the flock on its own.
+                //
+                // Not ALL of the pull is interruptible, and the join above is the only bound on the rest:
+                // the token POST's connect, send, await and parse phases run on the native HTTP client
+                // (raw fd + epoll/kqueue), which no interrupt breaks -- each is bounded by
+                // httpTimeoutMillis, and DNS resolution is not bounded at all. So a pull already inside its
+                // round trip outlives both joins, exactly as an in-flight connect to a black-holed host
+                // does. This escalation shortens the common case; it does not make the window impossible.
+                //
+                // The flag must not outlive the interrupt's target. Sender.close() and QwpQueryClient
+                // close() are interrupt-neutral precisely because this thread goes on to close delegates:
+                // a CARRIED flag makes CountDownLatch.await return instantly and would report a flock still
+                // held that was released fine.
+                thread.interrupt();
+                callerWasInterrupted |= joinIgnoringCallerInterrupts(thread, STOP_TIMEOUT_MILLIS);
+            }
+        } finally {
+            if (callerWasInterrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
+    }
+
+    /**
+     * Waits up to the supplied budget without letting cancellation skip the caller's remaining shutdown
+     * work. Every {@link InterruptedException} clears the caller's flag, so remember it and spend only the
+     * remainder of the original budget before handing the information back to {@link #stop()}.
+     * <p>
+     * Package-private so SenderPool's direct recovery driver can use the same deadline-preserving shutdown
+     * primitive. Keeping the two stop paths identical matters when an interrupt arrives during the first
+     * join: it must be remembered without skipping the target interrupt and second join that follow.
+     */
+    static boolean joinIgnoringCallerInterrupts(Thread target, long timeoutMillis) {
+        final long timeoutNanos = TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+        final long deadlineNanos = System.nanoTime() + timeoutNanos;
+        boolean callerWasInterrupted = false;
+        while (target.isAlive()) {
+            final long remainingNanos = deadlineNanos - System.nanoTime();
+            if (remainingNanos <= 0L) {
+                break;
+            }
+            final long waitMillis = TimeUnit.NANOSECONDS.toMillis(remainingNanos);
+            final int waitNanos = (int) (remainingNanos - TimeUnit.MILLISECONDS.toNanos(waitMillis));
+            try {
+                target.join(waitMillis, waitNanos);
+            } catch (InterruptedException e) {
+                callerWasInterrupted = true;
+            }
+        }
+        return callerWasInterrupted;
     }
 
     private void runLoop() {
@@ -84,9 +162,10 @@ final class PoolHousekeeper {
             // forced OFF (at most one connect attempt, never a SYNC
             // reconnect-budget retry -- M1), and we re-check stop every step, so
             // a close() landing mid-recovery normally only waits out a single
-            // bounded drain and the join in stop() does not time out. The sole
-            // residual overrun is an in-flight connect to a black-holed host;
-            // see SenderPool.recoverOneSlotStep.
+            // bounded drain and the join in stop() does not time out. A step
+            // blocked in a credential pull is broken by stop()'s interrupt; the
+            // sole residual overrun is an in-flight connect to a black-holed
+            // host, which no interrupt breaks. See SenderPool.recoverOneSlotStep.
             // While recovery still has work we skip the idle wait so the backlog
             // drains promptly; once done we fall back to the normal interval.
             // No-op once recovery completes or the pool is closing. Best-effort:

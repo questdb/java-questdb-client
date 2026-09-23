@@ -35,18 +35,16 @@ public class HttpClientOsx extends HttpClient {
 
     public HttpClientOsx(HttpClientConfiguration configuration, SocketFactory socketFactory) {
         super(configuration, socketFactory);
+        // See HttpClientLinux: a kqueue() failure here would strand the socket and native buffers the base
+        // constructor already took, on an object nobody can close.
         try {
             this.kqueue = new Kqueue(
                     configuration.getKQueueFacade(),
                     configuration.getWaitQueueCapacity()
             );
-        } catch (Throwable th) {
-            // super() has already taken the socket, both buffers and the response parser. A throw
-            // here leaves a half-built client the caller never receives, so nothing would close it.
-            // super.close() rather than close(): kqueue is still null and only the base class holds
-            // anything to release.
+        } catch (Throwable t) {
             super.close();
-            throw th;
+            throw t;
         }
     }
 

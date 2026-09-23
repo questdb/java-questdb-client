@@ -43,7 +43,7 @@
         <logback.version>1.5.25</logback.version>
     </properties>
 
-    <version>1.3.7-SNAPSHOT</version>
+    <version>1.3.10-SNAPSHOT</version>
     <groupId>org.questdb</groupId>
     <artifactId>questdb-client</artifactId>
     <packaging>jar</packaging>
@@ -80,8 +80,6 @@
                 <version>3.11.0</version>
                 <configuration>
                     <compilerArgs>
-                        <arg>${compilerArg1}</arg>
-                        <arg>${compilerArg2}</arg>
                         <arg>-J-XX:-TieredCompilation</arg>
                         <arg>-J-XX:TieredStopAtLevel=1</arg>
                     </compilerArgs>
@@ -119,6 +117,12 @@
                         <manifestEntries>
                             <QuestDB-Client-Build-Commit-Hash>${buildNumber}</QuestDB-Client-Build-Commit-Hash>
                             <QuestDB-Client-Version>${project.version}</QuestDB-Client-Version>
+                            <!-- JDK 8 release builds cannot compile module-info.java, so the
+                                 module name must be pinned here or it degrades to the
+                                 filename-derived "questdb.client" (the 1.3.5-1.3.7 regression).
+                                 On JDK 11+ builds the real module-info.class takes precedence. -->
+                            <Automatic-Module-Name>io.questdb.client</Automatic-Module-Name>
+                            <Multi-Release>true</Multi-Release>
                         </manifestEntries>
                     </archive>
                 </configuration>
@@ -185,7 +189,34 @@
                     </includes>
                     <excludes>
                         <exclude>${test.exclude}</exclude>
+                        <!-- *IT classes need the packaged jar; failsafe runs them after `package` -->
+                        <exclude>**/*IT.class</exclude>
                     </excludes>
+                </configuration>
+            </plugin>
+            <!-- Packaging integration tests (JarPackagingIT): the sun.misc.FDBigInteger /
+                 module-name regressions in 1.3.5-1.3.7 were invisible to unit tests because
+                 they run against target/classes, where Multi-Release selection never
+                 happens. These ITs inspect and execute the packaged jar itself. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-failsafe-plugin</artifactId>
+                <version>3.5.3</version>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>integration-test</goal>
+                            <goal>verify</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <useModulePath>false</useModulePath>
+                    <systemPropertyVariables>
+                        <questdb.client.jar>${project.build.directory}/${project.build.finalName}.jar</questdb.client.jar>
+                        <questdb.client.test.classes>${project.build.testOutputDirectory}</questdb.client.test.classes>
+                        <questdb.client.java11.src>${project.basedir}/src/main/java11</questdb.client.java11.src>
+                    </systemPropertyVariables>
                 </configuration>
             </plugin>
             <!-- Adds the JDK-version-specific source root (src/main/java11 or src/main/java8)
@@ -233,10 +264,6 @@
                             <doclint>none</doclint>
                             <source>${javac.compile.source}</source>
                             <detectJavaApiLink>false</detectJavaApiLink>
-                            <additionalJOptions>
-                                <additionalJOption>${javadocJOption1}</additionalJOption>
-                                <additionalJOption>${javadocJOption2}</additionalJOption>
-                            </additionalJOptions>
                             <sourceFileExcludes>
                                 <sourceFileExclude>${excludePattern1}</sourceFileExclude>
                                 <sourceFileExclude>module-info.java</sourceFileExclude>
@@ -365,10 +392,6 @@
                             <doclint>none</doclint>
                             <source>${javac.compile.source}</source>
                             <detectJavaApiLink>false</detectJavaApiLink>
-                            <additionalJOptions>
-                                <additionalJOption>${javadocJOption1}</additionalJOption>
-                                <additionalJOption>${javadocJOption2}</additionalJOption>
-                            </additionalJOptions>
                             <sourceFileExcludes>
                                 <sourceFileExclude>${excludePattern1}</sourceFileExclude>
                                 <sourceFileExclude>module-info.java</sourceFileExclude>
@@ -416,6 +439,30 @@
             <id>maven-central-publish</id>
             <build>
                 <plugins>
+                    <!-- The shipped artifact must be the JDK 8 build: a JDK 11+ build puts the
+                         jdk.internal.math FdBig bridge and module-info.class into the jar ROOT,
+                         which breaks Java 8 consumers. Refuse to publish from any other JDK. -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-enforcer-plugin</artifactId>
+                        <version>3.0.0-M3</version>
+                        <executions>
+                            <execution>
+                                <id>enforce-publish-from-jdk8</id>
+                                <goals>
+                                    <goal>enforce</goal>
+                                </goals>
+                                <configuration>
+                                    <rules>
+                                        <requireJavaVersion>
+                                            <version>[1.8,1.9)</version>
+                                            <message>questdb-client must be published from JDK 8; a JDK 11+ build produces a jar that breaks Java 8 consumers.</message>
+                                        </requireJavaVersion>
+                                    </rules>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
                     <plugin>
                         <groupId>org.sonatype.central</groupId>
                         <artifactId>central-publishing-maven-plugin</artifactId>
@@ -467,13 +514,6 @@
                 <jdk.version>11</jdk.version>
                 <java.enforce.version>11</java.enforce.version>
                 <questdb.artifactid>questdb</questdb.artifactid>
-                <compilerArg1>--add-exports</compilerArg1>
-                <compilerArg2>java.base/jdk.internal.math=io.questdb.client</compilerArg2>
-                <!-- javadoc needs the same module export to resolve jdk.internal.math.FDBigInteger
-                     referenced by the src/main/java11 FdBig bridge. Kept separate from the javac
-                     compilerArgs because javadoc and javac accept different option sets. -->
-                <javadocJOption1>--add-exports</javadocJOption1>
-                <javadocJOption2>java.base/jdk.internal.math=io.questdb.client</javadocJOption2>
                 <excludePattern1>nothing-to-exclude-dummy-value-include-all-java11plus</excludePattern1>
                 <excludeTestPattern1>nothing-to-exclude-dummy-value-include-all-java11plus</excludeTestPattern1>
                 <javac.compile.source>${javac.target}</javac.compile.source>
@@ -502,13 +542,6 @@
                 <jdk.version>8</jdk.version>
                 <java.enforce.version>[1.8,11)</java.enforce.version>
                 <questdb.artifactid>questdb</questdb.artifactid>
-                <!-- JDK8 javac rejects the add-exports flag; use a harmless no-op flag instead -->
-                <compilerArg1>-Xlint:none</compilerArg1>
-                <compilerArg2>-Xlint:none</compilerArg2>
-                <!-- JDK8 javadoc rejects javac's -Xlint and needs no module export (the java8 FdBig
-                     bridge uses the open sun.misc.FDBigInteger). Pass a harmless no-op instead. -->
-                <javadocJOption1>-quiet</javadocJOption1>
-                <javadocJOption2>-quiet</javadocJOption2>
                 <!-- module-info.java cannot be compiled on JDK8; exclude it from both the main
                      (<excludes> = excludeTestPattern1) and test (<testExcludes> = excludePattern1)
                      source sets. -->
@@ -519,10 +552,59 @@
                 <javac.compile.target>1.8</javac.compile.target>
                 <!-- logback 1.5.x requires Java 11; the 1.3.x line is the Java 8 compatible branch -->
                 <logback.version>1.3.15</logback.version>
+                <!-- JDK used to compile src/main/java11 into META-INF/versions/11 (see the
+                     antrun execution below). Override with -Djava11.home=/path/to/jdk11. -->
+                <java11.home>${env.JAVA11_HOME}</java11.home>
             </properties>
             <activation>
                 <jdk>1.8</jdk>
             </activation>
+            <build>
+                <plugins>
+                    <!-- JDK 8 javac can only compile the src/main/java8 FdBig bridge
+                         (sun.misc.FDBigInteger), which does not exist on Java 9+. Package the
+                         src/main/java11 bridge (jdk.internal.math.FDBigInteger) into
+                         META-INF/versions/11 so the Multi-Release jar works on every JDK.
+                         Shipping a JDK 8-built jar without this breaks double formatting on
+                         Java 9+ with NoClassDefFoundError (the 1.3.5-1.3.7 regression), hence
+                         a missing JDK 11 fails the build instead of skipping. -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-antrun-plugin</artifactId>
+                        <version>3.1.0</version>
+                        <executions>
+                            <execution>
+                                <id>compile-mrjar-versions-11</id>
+                                <phase>prepare-package</phase>
+                                <goals>
+                                    <goal>run</goal>
+                                </goals>
+                                <configuration>
+                                    <target>
+                                        <fail message="Packaging on JDK 8 needs a JDK 11+ to compile src/main/java11 into META-INF/versions/11. Set JAVA11_HOME (or -Djava11.home=...) to a JDK 11+ home.">
+                                            <condition>
+                                                <not>
+                                                    <or>
+                                                        <available file="${java11.home}/bin/javac" />
+                                                        <available file="${java11.home}/bin/javac.exe" />
+                                                    </or>
+                                                </not>
+                                            </condition>
+                                        </fail>
+                                        <mkdir dir="${project.build.outputDirectory}/META-INF/versions/11" />
+                                        <!-- whole source root, not an explicit file list: a file
+                                             added to src/main/java11 must ship in versions/11 or
+                                             the jar is broken on Java 9+ again (JarPackagingIT
+                                             cross-checks the packaged jar against the source root) -->
+                                        <javac srcdir="${project.basedir}/src/main/java11" destdir="${project.build.outputDirectory}/META-INF/versions/11" classpath="${project.build.outputDirectory}" source="11" target="11" encoding="UTF-8" debug="true" includeantruntime="false" fork="true" executable="${java11.home}/bin/javac" compiler="extJavac">
+                                        </javac>
+                                    </target>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
             <dependencies>
                 <dependency>
                     <groupId>org.jetbrains</groupId>

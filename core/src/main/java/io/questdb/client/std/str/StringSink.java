@@ -28,6 +28,8 @@ import io.questdb.client.std.Chars;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
+import java.util.Arrays;
+
 public class StringSink implements MutableUtf16Sink, CharSequence, Utf16Sink {
 
     private char[] buffer;
@@ -125,6 +127,25 @@ public class StringSink implements MutableUtf16Sink, CharSequence, Utf16Sink {
         return new String(buffer, 0, pos);
     }
 
+    /**
+     * Empties the sink AND overwrites its whole backing buffer, so nothing it has held remains readable
+     * through it. Best-effort hygiene for a sink that carried a secret - a bearer token, a refresh token, a
+     * device code - where {@link #clear()} is not enough: clear only rewinds the write position, leaving
+     * every character past that position in the array, so a long secret followed by a short write stays
+     * legible in the tail. It cannot reach a copy already handed out (a {@link #toString()} result, anything
+     * downstream wrote elsewhere), only this sink's own storage.
+     * <p>
+     * Storage the sink has OUTGROWN is covered, but not by this method: {@link #checkCapacity(int)} zeroes
+     * each array as it hands off to a larger one, because by the time wipe() runs those generations are
+     * unreachable from here. Without that a sink small enough to grow while holding a secret - which is
+     * every default-sized one that carries a token - would leave a full copy per growth on the heap, and
+     * wiping the survivor would say nothing about them.
+     */
+    public void wipe() {
+        Arrays.fill(buffer, (char) 0);
+        pos = 0;
+    }
+
     private void checkCapacity(int extra) {
         int len = pos + extra;
         if (buffer.length >= len) {
@@ -133,6 +154,15 @@ public class StringSink implements MutableUtf16Sink, CharSequence, Utf16Sink {
         len = Math.max(pos * 2, len);
         final char[] n = new char[len];
         System.arraycopy(buffer, 0, n, 0, pos);
+        // Zero the array being abandoned. wipe() can only reach the CURRENT buffer, so without this every
+        // generation growth leaves behind keeps its contents legible on the heap until the collector happens
+        // to overwrite that memory - which it is under no obligation to do, and a heap dump taken meanwhile
+        // shows the lot. That is not hypothetical for the sinks wipe() exists for: OidcDeviceAuth's formSink
+        // starts at 16 chars and builds "...&refresh_token=<token>&client_id=...&scope=...", so it grows
+        // several times while already holding the whole refresh token, and each array it hands off carries a
+        // copy of it. The WHOLE array is zeroed, not just the live prefix: a sink cleared after holding a
+        // long secret keeps that secret past pos, which is the same retention wipe() itself closes.
+        Arrays.fill(buffer, (char) 0);
         buffer = n;
     }
 }

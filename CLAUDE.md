@@ -68,6 +68,14 @@ Build on a JDK 8 to validate the shipping artifact (the source-of-truth
 target); also confirm it compiles on a modern JDK (11+) before merging, the
 same two fronts CI guards.
 
+Packaging on JDK 8 additionally needs `JAVA11_HOME` pointing at a JDK 11+:
+the jar is a Multi-Release jar whose `META-INF/versions/11` classes (the
+`src/main/java11` FdBig/Compat bridge) cannot be compiled by JDK 8 javac.
+Without them a JDK 8-built jar throws `NoClassDefFoundError:
+sun/misc/FDBigInteger` on Java 9+ (the 1.3.5–1.3.7 regression), so the build
+fails fast instead of skipping. Test-only runs (`mvn -pl core test`) don't
+need it.
+
 The parent `questdb` repo's `local-client` profile pulls this module as a
 sub-module so server changes can build against unpublished client code; if
 you change client code, install it (or pass `-P local-client` in the parent)

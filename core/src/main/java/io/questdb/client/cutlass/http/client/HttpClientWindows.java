@@ -37,18 +37,19 @@ public class HttpClientWindows extends HttpClient {
 
     public HttpClientWindows(HttpClientConfiguration configuration, SocketFactory socketFactory) {
         super(configuration, socketFactory);
+        // See HttpClientLinux: an allocation failure here would strand the socket and native buffers the
+        // base constructor already took, on an object nobody can close.
+        // getSelectFacade() is inside the guard, not after it: the shipped default cannot throw, but this
+        // takes a caller-supplied HttpClientConfiguration, and an override that does would have stranded the
+        // FDSet as well as everything the base constructor took. Linux and Osx evaluate every configuration
+        // getter inside their guard already; this was the odd one out.
         try {
-            // Read the facade before taking the FD set, so nothing between the acquisition and the
-            // end of the constructor can throw and the catch has only the base class to release.
-            this.sf = configuration.getSelectFacade();
             this.fdSet = new FDSet(configuration.getWaitQueueCapacity());
-        } catch (Throwable th) {
-            // super() has already taken the socket, both buffers and the response parser. A throw
-            // here leaves a half-built client the caller never receives, so nothing would close it.
-            // super.close() rather than close(): fdSet is still null and only the base class holds
-            // anything to release.
+            this.sf = configuration.getSelectFacade();
+        } catch (Throwable t) {
+            this.fdSet = Misc.free(fdSet); // null when FDSet itself threw; Misc.free tolerates that
             super.close();
-            throw th;
+            throw t;
         }
     }
 

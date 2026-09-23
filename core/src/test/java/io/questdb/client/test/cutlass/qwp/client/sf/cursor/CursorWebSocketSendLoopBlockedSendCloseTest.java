@@ -55,7 +55,6 @@ public class CursorWebSocketSendLoopBlockedSendCloseTest {
                     0L,
                     CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                     null,
-                    100L,
                     1_000L,
                     5_000L,
                     false
@@ -132,7 +131,6 @@ public class CursorWebSocketSendLoopBlockedSendCloseTest {
                     0L,
                     CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                     null,
-                    100L,
                     1_000L,
                     5_000L,
                     false

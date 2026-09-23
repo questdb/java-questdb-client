@@ -274,6 +274,43 @@ public class NativeBufferWriterTest {
     }
 
     @Test
+    public void testRawVarintBoundariesAndReturnedAddress() throws Exception {
+        assertMemoryLeak(() -> {
+            try (NativeBufferWriter writer = new NativeBufferWriter(16)) {
+                assertRawVarint(writer, 0, 0x00);
+                assertRawVarint(writer, 1, 0x01);
+                assertRawVarint(writer, 127, 0x7F);
+                assertRawVarint(writer, 128, 0x80, 0x01);
+                assertRawVarint(writer, 16_383, 0xFF, 0x7F);
+                assertRawVarint(writer, 16_384, 0x80, 0x80, 0x01);
+                assertRawVarint(writer, Long.MAX_VALUE,
+                        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F);
+            }
+        });
+    }
+
+    @Test
+    public void testRawVarintRejectsNegativeWithoutWriting() throws Exception {
+        assertMemoryLeak(() -> {
+            try (NativeBufferWriter writer = new NativeBufferWriter(16)) {
+                long addr = writer.getBufferPtr();
+                Unsafe.getUnsafe().putByte(addr, (byte) 0x5A);
+                boolean rejected = false;
+                try {
+                    NativeBufferWriter.writeVarint(addr, -1);
+                } catch (AssertionError expected) {
+                    rejected = true;
+                    assertTrue(expected.getMessage().contains(
+                            "unsigned LEB128 varint requires a non-negative value: -1"));
+                }
+                assertTrue("negative raw varint must be rejected", rejected);
+                assertEquals("rejection must happen before the first write",
+                        (byte) 0x5A, Unsafe.getUnsafe().getByte(addr));
+            }
+        });
+    }
+
+    @Test
     public void testReset() throws Exception {
         assertMemoryLeak(() -> {
             try (NativeBufferWriter writer = new NativeBufferWriter()) {
@@ -617,5 +654,22 @@ public class NativeBufferWriterTest {
                 Assert.assertEquals((byte) 127, Unsafe.getUnsafe().getByte(writer.getBufferPtr()));
             }
         });
+    }
+
+    private static void assertRawVarint(NativeBufferWriter writer, long value, int... expectedBytes) {
+        long addr = writer.getBufferPtr();
+        for (int i = 0; i <= expectedBytes.length; i++) {
+            Unsafe.getUnsafe().putByte(addr + i, (byte) 0x5A);
+        }
+        long end = NativeBufferWriter.writeVarint(addr, value);
+        assertEquals("returned address for value=" + value, addr + expectedBytes.length, end);
+        assertEquals("varintSize for value=" + value,
+                expectedBytes.length, NativeBufferWriter.varintSize(value));
+        for (int i = 0; i < expectedBytes.length; i++) {
+            assertEquals("byte " + i + " for value=" + value,
+                    (byte) expectedBytes[i], Unsafe.getUnsafe().getByte(addr + i));
+        }
+        assertEquals("writer overran value=" + value,
+                (byte) 0x5A, Unsafe.getUnsafe().getByte(end));
     }
 }

@@ -35,6 +35,11 @@ import io.questdb.client.std.str.DirectUtf8String;
  */
 public abstract class AbstractChunkedResponse implements Response, Fragment {
     private final static int CRLF_LEN = 2;
+    // Most hex digits a chunk-size line may carry once leading zeros are stripped. 16^15 - 1 is about
+    // 1.15e18 and always fits a long; a 16th digit can push it past Long.MAX_VALUE and wrap. The
+    // smallest thing this turns away is a 2^60-byte (1 EiB) chunk, so it costs no real server
+    // anything, and it rejects absurd-but-representable sizes that a mere overflow check admits.
+    private static final int MAX_CHUNK_SIZE_HEX_DIGITS = 15;
     private static final int STATE_CHUNK_DATA = 1;
     private static final int STATE_CHUNK_DATA_END = 2;
     private static final int STATE_CHUNK_SIZE = 0;
@@ -90,11 +95,32 @@ public abstract class AbstractChunkedResponse implements Response, Fragment {
         return dataAddr;
     }
 
+    @Override
     public Fragment recv(int timeout) {
+        // A positive timeout bounds the whole call, not each socket read. This loop re-reads while a
+        // chunk-size line (or the chunk-data-end CRLF) is incomplete, so without one shared deadline a server
+        // dribbling those bytes - one per timeout window - would run a single recv() for (line length) x
+        // timeout and defeat a caller's elapsed-time bound (e.g. OidcDeviceAuth.parseBody). A non-positive
+        // timeout keeps the legacy "no bound" behaviour.
+        final boolean bounded = timeout > 0;
+        final long startNanos = bounded ? System.nanoTime() : 0L;
         while (true) {
+            // Consult the deadline on EVERY pass, not only on the passes that read. A pass that neither
+            // reads nor advances the state machine re-enters the loop with receive == false and
+            // dataLo < dataHi, which skips the read gate below - so a deadline checked only inside that
+            // gate is never reached, and the loop spins without the bound this method promises. Keeping
+            // the check above the gate makes the bound hold for every pass, however the state machine got
+            // there.
+            int callTimeout = timeout;
+            if (bounded) {
+                callTimeout = timeout - (int) ((System.nanoTime() - startNanos) / 1_000_000L);
+                if (callTimeout <= 0) {
+                    throw new HttpClientException("timed out reading the chunked response body");
+                }
+            }
             if (receive || dataLo == dataHi) {
                 compactBuffer();
-                dataHi += recvOrDie(dataHi, bufHi, timeout);
+                dataHi += recvOrDie(dataHi, bufHi, callTimeout);
             }
             long p; // moving data pointer for scanning buffer
             switch (state) {
@@ -126,8 +152,26 @@ public abstract class AbstractChunkedResponse implements Response, Fragment {
                     if (res != -1) {
                         // at this stage we consumed the chunk size end (CRLF)
                         chunkSize.of(dataLo, res + 1);
+                        final CharSequence chunkSizeHex = chunkSize.asAsciiCharSequence();
+                        // Bound the SIZE LINE here, before parsing it. Numbers.parseHexLong wraps on
+                        // overflow like every other hex-word parser in that class, which is right for a
+                        // general-purpose utility and wrong for a count the peer chose - and the size line
+                        // is chosen by the server, which for an OIDC discovery or token response is
+                        // untrusted. Each residue breaks framing its own way: a negative one
+                        // (8000000000000000 is the smallest) matches neither the "size > 0" data branch nor
+                        // the "size == 0" terminator below, so the state machine loops on it forever; zero
+                        // (10000000000000000) reads as the TERMINAL chunk, truncating the response and
+                        // losing framing for the next keep-alive response on the connection; a positive
+                        // residue frames a short data chunk and mis-reads everything after it.
+                        //
+                        // It has to happen BEFORE the parse, not after: the zero residue is
+                        // indistinguishable from a genuine 0 once the high bits are gone, so no check on
+                        // the returned value can catch the worst of the three.
+                        if (isChunkSizeTooLong(chunkSizeHex)) {
+                            throw new HttpClientException("malformed chunk size");
+                        }
                         try {
-                            size = Numbers.parseHexLong(chunkSize.asAsciiCharSequence());
+                            size = Numbers.parseHexLong(chunkSizeHex);
                             consumed = 0;
                             // consume data buffer ignoring chunk size value and its furniture
                             state = STATE_CHUNK_DATA;
@@ -228,6 +272,22 @@ public abstract class AbstractChunkedResponse implements Response, Fragment {
         assert addr >= bufLo;
         assert addr < bufHi;
         return Unsafe.getUnsafe().getByte(addr);
+    }
+
+    /**
+     * Whether a chunk-size line carries more significant hex digits than a long can hold.
+     * <p>
+     * Counts SIGNIFICANT digits, skipping leading zeros: {@code 0000000000000001} is sixteen characters
+     * and a perfectly ordinary size, so a raw length check would reject legitimate input from a server
+     * that pads.
+     */
+    private static boolean isChunkSizeTooLong(CharSequence hex) {
+        final int n = hex.length();
+        int i = 0;
+        while (i < n && hex.charAt(i) == '0') {
+            i++;
+        }
+        return n - i > MAX_CHUNK_SIZE_HEX_DIGITS;
     }
 
     /**

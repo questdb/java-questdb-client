@@ -76,6 +76,27 @@ public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
         return (64 - Long.numberOfLeadingZeros(value) + 6) / 7;
     }
 
+    /**
+     * Writes {@code value} as an unsigned LEB128 varint directly at native address
+     * {@code addr} and returns the address just past the last byte. The canonical
+     * raw-address varint writer shared by the SF cursor's persisted dictionary and
+     * catch-up frame builder.
+     * <p>
+     * {@code value} must be non-negative: the signed {@code value > 0x7F} loop emits
+     * a SINGLE truncated byte for a negative long, whereas {@link #varintSize}
+     * returns 10 for it -- a size/write mismatch that would corrupt the stream. All
+     * callers pass ids/lengths/counts (non-negative); the assert pins that contract.
+     */
+    public static long writeVarint(long addr, long value) {
+        assert value >= 0 : "unsigned LEB128 varint requires a non-negative value: " + value;
+        while (value > 0x7F) {
+            Unsafe.getUnsafe().putByte(addr++, (byte) ((value & 0x7F) | 0x80));
+            value >>>= 7;
+        }
+        Unsafe.getUnsafe().putByte(addr++, (byte) value);
+        return addr;
+    }
+
     @Override
     public void close() {
         if (bufferPtr != 0) {
@@ -305,6 +326,7 @@ public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
      */
     @Override
     public void putVarint(long value) {
+        assert value >= 0 : "unsigned LEB128 varint requires a non-negative value: " + value;
         ensureCapacity(10); // max varint bytes
         long addr = bufferPtr + position;
         while (value > 0x7F) {
@@ -336,11 +358,7 @@ public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
     }
 
     private static void writeVarintDirect(long addr, long value) {
-        while (value > 0x7F) {
-            Unsafe.getUnsafe().putByte(addr++, (byte) ((value & 0x7F) | 0x80));
-            value >>>= 7;
-        }
-        Unsafe.getUnsafe().putByte(addr, (byte) value);
+        writeVarint(addr, value);
     }
 
     private void encodeUtf8(CharSequence value, int utf8Len) {

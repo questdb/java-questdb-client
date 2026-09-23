@@ -24,14 +24,17 @@
 
 package io.questdb.client.test.cutlass.json;
 
+import io.questdb.client.Sender;
 import io.questdb.client.cutlass.json.JsonException;
 import io.questdb.client.cutlass.json.JsonLexer;
 import io.questdb.client.cutlass.json.JsonParser;
+import io.questdb.client.cutlass.line.http.AbstractLineHttpSender;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.IntStack;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Mutable;
 import io.questdb.client.std.Unsafe;
+import io.questdb.client.std.str.StringSink;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.AfterClass;
 import org.junit.Assert;
@@ -243,7 +246,9 @@ public class JsonLexerTest {
 
     @Test
     public void testQuoteEscape() throws Exception {
-        assertThat("{\"x\":\"a\\\"bc\"}", "{\"x\": \"a\\\"bc\"}");
+        // the lexer decodes the escaped quote: the value a\"bc becomes a"bc (the assembling parser does
+        // not re-escape, so the decoded quote shows bare in the re-serialized form)
+        assertThat("{\"x\":\"a\"bc\"}", "{\"x\": \"a\\\"bc\"}");
     }
 
     @Test
@@ -661,6 +666,185 @@ public class JsonLexerTest {
     @Test
     public void testWrongQuote() {
         assertError("Unexpected symbol", 10, "{\"x\": \"a\"bc\",}");
+    }
+
+    @Test
+    public void testStringEscapesAreDecoded() throws Exception {
+        assertMemoryLeak(() -> {
+            // JSON string escapes must be resolved, not handed back to the listener literally
+            assertDecodedValue("{\"v\":\"https:\\/\\/h\\/p\"}", "https://h/p"); // escaped slash -> slash
+            assertDecodedValue("{\"v\":\"a\\\"b\"}", "a\"b");                   // escaped quote -> quote
+            assertDecodedValue("{\"v\":\"a\\\\b\"}", "a\\b");                   // escaped backslash -> backslash
+            assertDecodedValue("{\"v\":\"X\\u0041Y\"}", "XAY");                // 4-hex unicode escape decoded
+            assertDecodedValue("{\"v\":\"X\\u0041\"}", "XA");                  // \\uXXXX at end of value (i+6==n boundary)
+            assertDecodedValue("{\"v\":\"tab\\tend\"}", "tab\tend");            // escaped tab -> tab
+            assertDecodedValue("{\"v\":\"plain\"}", "plain");                  // no escapes (fast path)
+        });
+    }
+
+    @Test
+    public void testStringEscapesDecodedAcrossSplitParseCalls() throws Exception {
+        assertMemoryLeak(() -> {
+            // a value whose backslash escape straddles two parse() calls (a real HTTP-fragment boundary)
+            // must still be decoded: the "saw a backslash" flag that gates the unescape pass has to persist
+            // across the calls, not reset to false at the start of the second one
+            String json = "{\"v\":\"ab\\ncd\"}"; // value ab\ncd -> ab<newline>cd
+            int len = json.length();
+            long address = TestUtils.toMemory(json);
+            StringSink captured = new StringSink();
+            JsonParser parser = (code, tag, position) -> {
+                if (code == JsonLexer.EVT_VALUE) {
+                    captured.clear();
+                    captured.put(tag);
+                }
+            };
+            try (JsonLexer lexer = new JsonLexer(4, 1024)) {
+                // split immediately after the backslash, so the escape's '\' is in the first chunk and the
+                // 'n' it escapes is in the second
+                int split = json.indexOf('\\') + 1;
+                lexer.parse(address, address + split, parser);
+                lexer.parse(address + split, address + len, parser);
+                lexer.parseLast();
+                TestUtils.assertEquals("ab\ncd", captured);
+            } finally {
+                Unsafe.free(address, len, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testUnicodeEscapeDecodedAcrossSplitParseCalls() throws Exception {
+        assertMemoryLeak(() -> {
+            // a backslash-u-XXXX escape whose four hex digits straddle two parse() calls (a real HTTP-fragment
+            // boundary) must still decode to one character: the lexer stashes the partial value and resolves the
+            // escape only once the whole value is assembled, so parseHex4 never sees a truncated escape
+            String bs = String.valueOf((char) 92); // a single backslash, built without a literal escape
+            String json = "{\"v\":\"x" + bs + "u0041y\"}"; // value x then the escape for A then y -> xAy
+            int len = json.length();
+            long address = TestUtils.toMemory(json);
+            StringSink captured = new StringSink();
+            JsonParser parser = (code, tag, position) -> {
+                if (code == JsonLexer.EVT_VALUE) {
+                    captured.clear();
+                    captured.put(tag);
+                }
+            };
+            try (JsonLexer lexer = new JsonLexer(4, 1024)) {
+                // split inside the four hex digits: backslash-u-0-0 lands in the first chunk, 4-1 in the second
+                int split = json.indexOf(bs) + 4;
+                lexer.parse(address, address + split, parser);
+                lexer.parse(address + split, address + len, parser);
+                lexer.parseLast();
+                TestUtils.assertEquals("xAy", captured);
+            } finally {
+                Unsafe.free(address, len, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testUnicodeEscapeWithNonAsciiCharInWindow() throws Exception {
+        assertMemoryLeak(() -> {
+            // a backslash-u escape whose four-hex window's first char is a non-ASCII code point, fed as the
+            // valid UTF-8 a hostile IdP response would carry (0xC3 0xA9 -> U+00E9, 233). parseHex4 indexes
+            // Numbers.hexNumbers (int[128]) only behind a c<128 guard, so 233 is a non-hex digit and the escape
+            // is kept verbatim (lenient), not decoded. WITHOUT the guard, hexNumbers[233] throws an
+            // ArrayIndexOutOfBoundsException that escapes as an unchecked exception - the OIDC callers catch
+            // only JsonException - so this pins that the guard is present.
+            byte[] bytes = {'{', '"', 'v', '"', ':', '"', 'x', '\\', 'u',
+                    (byte) 0xC3, (byte) 0xA9, // valid UTF-8 for U+00E9 (e-acute); lands right after the backslash-u
+                    'A', 'B', 'C', 'y', '"', '}'};
+            int len = bytes.length;
+            long address = Unsafe.malloc(len, MemoryTag.NATIVE_DEFAULT);
+            StringSink captured = new StringSink();
+            JsonParser parser = (code, tag, position) -> {
+                if (code == JsonLexer.EVT_VALUE) {
+                    captured.clear();
+                    captured.put(tag);
+                }
+            };
+            try {
+                for (int i = 0; i < len; i++) {
+                    Unsafe.getUnsafe().putByte(address + i, bytes[i]);
+                }
+                try (JsonLexer lexer = new JsonLexer(4, 1024)) {
+                    lexer.parse(address, address + len, parser);
+                    lexer.parseLast();
+                    // the escape stayed literal (lenient): x, then a verbatim backslash-u, then the decoded
+                    // e-acute (U+00E9), then ABCy
+                    TestUtils.assertEquals("x\\u\u00e9ABCy", captured);
+                }
+            } finally {
+                Unsafe.free(address, len, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testStringEscapesExoticAndLenient() throws Exception {
+        assertMemoryLeak(() -> {
+            String bs = String.valueOf((char) 92); // a single backslash, built without a literal escape
+            // a surrogate pair (two backslash-u escapes) reassembles into the supplementary point U+1F600
+            assertDecodedValue("{\"v\":\"x" + bs + "uD83D" + bs + "uDE00y\"}",
+                    "x" + new String(Character.toChars(0x1F600)) + "y");
+            // the backspace and form-feed arms
+            assertDecodedValue("{\"v\":\"a" + bs + "bb" + bs + "fc\"}",
+                    "a" + ((char) 8) + "b" + ((char) 12) + "c");
+            // the lexer is deliberately lenient (not RFC 8259-strict) about malformed or unknown escapes:
+            // it keeps the backslash and the following text verbatim rather than failing the parse, so a
+            // literal backslash in non-conformant input is not silently lost. These pin that behavior and
+            // cover the lenient arms that otherwise carry most of the file's coverage:
+            assertDecodedValue("{\"v\":\"a" + bs + "xb\"}", "a" + bs + "xb");         // unknown escape -> kept verbatim
+            assertDecodedValue("{\"v\":\"a" + bs + "uZZZZb\"}", "a" + bs + "uZZZZb"); // non-hex unicode escape -> literal
+            assertDecodedValue("{\"v\":\"ab" + bs + "u12\"}", "ab" + bs + "u12");     // too few hex digits -> literal
+            // a lone (unpaired) high surrogate is emitted as-is, not dropped or replaced
+            assertDecodedValue("{\"v\":\"x" + bs + "uD83Dy\"}", "x" + ((char) 0xD83D) + "y");
+        });
+    }
+
+    @Test
+    public void testSettingsParserKeysDecodedThroughUnescape() throws Exception {
+        assertMemoryLeak(() -> {
+            // the line-protocol version probe parses /settings with JsonSettingsParser, whose keys now flow
+            // through the lexer's unescape pass. An escaped key (here a JSON unicode escape standing in for
+            // the letter 'o') must decode to the real key, otherwise the probe would miss the advertised
+            // versions and silently fall back to V1. The backslash is built from char 92, so this source
+            // carries no literal backslash-u sequence.
+            String esc = ((char) 92) + "u006f"; // a JSON unicode escape for 'o'
+            String json = "{\"line.proto.support.versi" + esc + "ns\":[1,2,3],\"cairo.max.file.name.length\":127}";
+            long address = TestUtils.toMemory(json);
+            int len = json.length();
+            try (AbstractLineHttpSender.JsonSettingsParser parser = new AbstractLineHttpSender.JsonSettingsParser();
+                 JsonLexer lexer = new JsonLexer(1024, 1024)) {
+                lexer.parse(address, address + len, parser);
+                lexer.parseLast();
+                // the escaped "versions" key decoded and matched, so the highest advertised version was
+                // picked; a non-decoded key would leave the versions empty and fall back to V1
+                Assert.assertEquals(Sender.PROTOCOL_VERSION_V3, parser.getDefaultProtocolVersion());
+                Assert.assertEquals(127, parser.getMaxNameLen());
+            } finally {
+                Unsafe.free(address, len, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    private static void assertDecodedValue(String json, String expected) throws JsonException {
+        int len = json.length();
+        long address = TestUtils.toMemory(json);
+        StringSink captured = new StringSink();
+        JsonParser parser = (code, tag, position) -> {
+            if (code == JsonLexer.EVT_VALUE) {
+                captured.clear();
+                captured.put(tag);
+            }
+        };
+        try (JsonLexer lexer = new JsonLexer(4, 1024)) {
+            lexer.parse(address, address + len, parser);
+            lexer.parseLast();
+            TestUtils.assertEquals(expected, captured);
+        } finally {
+            Unsafe.free(address, len, MemoryTag.NATIVE_DEFAULT);
+        }
     }
 
     private void assertError(String expected, int expectedPosition, String input) {

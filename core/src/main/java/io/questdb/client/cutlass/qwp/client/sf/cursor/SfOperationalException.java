@@ -35,4 +35,8 @@ public final class SfOperationalException extends IllegalStateException {
     public SfOperationalException(String message) {
         super(message);
     }
+
+    public SfOperationalException(String message, Throwable cause) {
+        super(message, cause);
+    }
 }

@@ -27,7 +27,18 @@ open module io.questdb.client {
     requires static org.jetbrains.annotations;
     requires static java.management;
     requires jdk.management;
-    requires java.desktop;
+    // STATIC, not mandatory: the only java.desktop reference is BrowserLauncher's java.awt.Desktop, used
+    // best-effort by the default DeviceCodePrompt.openBrowser() to pop the verification URL. A mandatory
+    // requires is resolved BEFORE any code runs, so on a runtime without java.desktop - a jlink image, a
+    // --limit-modules run - the whole module failed to resolve at startup and the LinkageError catch in
+    // openBrowser() never got the chance to degrade to "print the URL and carry on". As a static requires
+    // the dependency is compile-time only: java.desktop's absence surfaces as the NoClassDefFoundError that
+    // catch already handles. Note the consequence for a MODULAR application - a static requires is not
+    // followed during runtime resolution, so such an application only gets the browser launch when
+    // java.desktop is in its graph anyway (it requires it, or --add-modules java.desktop); everything else,
+    // including every class-path application, is unaffected because java.desktop is resolved there by
+    // default. See DeviceCodePrompt#openBrowser().
+    requires static java.desktop;
     requires java.sql;
     requires org.slf4j;
 

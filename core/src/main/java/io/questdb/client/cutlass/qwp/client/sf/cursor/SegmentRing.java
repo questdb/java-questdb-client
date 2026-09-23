@@ -367,6 +367,49 @@ public final class SegmentRing implements QuietCloseable {
             long activeBase;
             if (manifest == null) {
                 if (data.size() > 0) {
+                    // Legacy migration is the one branch with no recorded boundary
+                    // to check a set-aside file against: validateContiguous only
+                    // compares SURVIVORS, so a file that sat BELOW data.get(0)
+                    // leaves a contiguous chain, and the manifest this branch is
+                    // about to create would record headBase as if that file's
+                    // frames had been acked. They never were -- the ack seed
+                    // derives from the head.
+                    //
+                    // A chain based at 0 needs no check: nothing can precede it,
+                    // so a set-aside file of any kind was a stray or a spare. And
+                    // a chain based above 0 is the NORMAL steady state for a
+                    // long-lived legacy slot whose head was ack-trimmed, so the
+                    // refusal has to key off positive evidence that a file was
+                    // set aside during THIS recovery, never off the base alone.
+                    long legacyChainStart = data.get(0).baseSeq();
+                    if (legacyChainStart != 0L) {
+                        if (corruptPaths != null) {
+                            // A corrupt file's own baseSeq is unreadable (it is
+                            // inside the bytes that failed), so nothing can place
+                            // it above the chain head. Fail closed.
+                            throw new SfRecoveryException("cannot migrate the legacy SF chain in "
+                                    + sfDir + " based at " + legacyChainStart + ": a corrupt segment"
+                                    + " of unknown identity could be its head, and no manifest"
+                                    + " boundary exists to prove otherwise");
+                        }
+                        for (int i = 0, n = all.size(); i < n; i++) {
+                            MmapSegment segment = all.get(i);
+                            // A frameless segment carrying torn-tail residue is a
+                            // segment whose frame[0] failed: bytes were written to
+                            // it, so it is not an untouched spare. Its header IS
+                            // readable, so its position is provable -- refuse only
+                            // when it really sat below the chain head.
+                            if (segment.frameCount() == 0
+                                    && segment.tornTailBytes() > 0
+                                    && segment.baseSeq() < legacyChainStart) {
+                                throw new SfRecoveryException("cannot migrate the legacy SF chain in "
+                                        + sfDir + " based at " + legacyChainStart + ": the segment at"
+                                        + " base " + segment.baseSeq() + " lost its frames to a torn"
+                                        + " write and sits below that head, so its range cannot be"
+                                        + " shown already-acked");
+                            }
+                        }
+                    }
                     validateContiguous(data);
                     for (int i = 0, n = data.size(); i < n; i++) {
                         chain.add(data.get(i));
@@ -461,9 +504,41 @@ public final class SegmentRing implements QuietCloseable {
                             long torn = segment.tornTailBytes();
                             segment.close();
                             if (torn > 0) {
+                                // Preserve, not destroy: on success the bytes move to
+                                // .corrupt; if even the rename fails, they stay under
+                                // their original name instead (quarantineFile only
+                                // logs a warning on a failed rename, so a torn,
+                                // data-bearing leftover really can remain a plain
+                                // .sfa file here). Either way the file survives for
+                                // the NEXT recovery to re-examine -- and it is THAT
+                                // recovery's FSN boundary checks, not the name, that
+                                // keep it from being mistaken for this generation's:
+                                // a base above activeBase throws ("segment exists
+                                // beyond committed SF active boundary"), a base
+                                // colliding with the new chain fails
+                                // validateContiguous's expected-next-base check, and
+                                // a base wholly below headBase is excluded from the
+                                // chain and quarantined again as a non-retained extra.
                                 quarantineFile(filesFacade, path);
                             } else if (!filesFacade.remove(path)) {
-                                LOG.warn("could not remove drained SF leftover {}", path);
+                                // Returning EMPTY here makes the caller start fresh at
+                                // baseSeq 0 in a directory that still holds a prior
+                                // generation's file. Their FSN ranges then overlap while
+                                // their symbol ids describe different strings, and no
+                                // downstream guard can see it: contiguity and the
+                                // manifest boundaries both reason about FSNs, and both
+                                // generations number theirs from the same origin. Refuse
+                                // the slot so the state stays representable-by-refusal
+                                // rather than silently mixed.
+                                //
+                                // Operational, not terminal: an unlink can fail for a
+                                // transient reason (a share lock, an antivirus or backup
+                                // handle), exactly as the manifest unlink below can. The
+                                // plain type aborts startup for a retry instead of
+                                // quarantining a slot whose bytes may be perfectly intact.
+                                throw new MmapSegmentException("could not remove drained SF leftover "
+                                        + path + "; refusing to start fresh in a slot that still"
+                                        + " holds a prior generation's segment");
                             }
                         }
                         all.clear();
@@ -1252,32 +1327,28 @@ public final class SegmentRing implements QuietCloseable {
     }
 
     /**
-     * Walks every published frame in the ring (sealed segments plus the active
-     * segment) and returns the FSN of the LAST frame whose payload does NOT
-     * carry the given flag bit, or {@code -1} when every published frame
-     * carries it (or the ring is empty). All frames above the returned FSN
-     * carry the flag.
+     * Performs the one ordered recovery fold across sealed segments and the
+     * active segment. The returned native suffix remains owned by the caller.
      * <p>
-     * Recovery-time helper: locates the last commit-bearing QWP frame below a
-     * potentially orphaned FLAG_DEFER_COMMIT tail left behind by a producer
-     * that crashed (or closed) mid-transaction. Call before the I/O loop and
-     * producer start appending; the walk is not synchronized against appends
-     * into the active segment. See
-     * {@link MmapSegment#findLastFrameFsnWithoutPayloadFlag} for the
-     * positive-identification contract: frames that do not parse as protocol
-     * messages count as commit-bearing (retirement barriers), never as
-     * trimmable.
+     * Replaces the former {@code findLastFsnWithoutPayloadFlag} walk: the
+     * deferred-commit tail scan is one of several verdicts the single fold now
+     * produces, so the ring is walked once rather than once per question. Call
+     * before the I/O loop and producer start appending; the walk is not
+     * synchronized against appends into the active segment.
      */
-    public synchronized long findLastFsnWithoutPayloadFlag(int flagsOffset, int flagMask, int headerMagic, int minPayloadLen) {
-        long best = -1L;
-        for (int i = sealedHead, n = sealedSegments.size(); i < n; i++) {
-            long fsn = sealedSegments.get(i).findLastFrameFsnWithoutPayloadFlag(flagsOffset, flagMask, headerMagic, minPayloadLen);
-            if (fsn > best) {
-                best = fsn;
+    synchronized RecoveredFrameAnalysis analyzeRecovery(int symbolBaseline) {
+        RecoveredFrameAnalysis analysis = new RecoveredFrameAnalysis(symbolBaseline, ackedFsn);
+        try {
+            for (int i = sealedHead, n = sealedSegments.size(); i < n; i++) {
+                sealedSegments.get(i).scanRecovery(analysis);
             }
+            active.scanRecovery(analysis);
+            analysis.finish();
+            return analysis;
+        } catch (Throwable t) {
+            analysis.close();
+            throw t;
         }
-        long fsn = active.findLastFrameFsnWithoutPayloadFlag(flagsOffset, flagMask, headerMagic, minPayloadLen);
-        return Math.max(best, fsn);
     }
 
     public MmapSegment getActive() {

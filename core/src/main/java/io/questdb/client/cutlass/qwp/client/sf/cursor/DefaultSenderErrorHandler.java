@@ -31,15 +31,12 @@ import org.slf4j.LoggerFactory;
 
 /**
  * Default handler installed when the user does not call
- * {@code LineSenderBuilder.errorHandler(...)}. Logs every server rejection so
+ * {@code LineSenderBuilder.errorHandler(...)}. Logs every server rejection,
+ * plus every client-side {@link SenderError.Category#DATA_LOSS} verdict, so
  * silence is never the default — connect-string-only users still see errors
  * in their logs.
  *
- * <p>{@link SenderError.Policy#TERMINAL} fires at ERROR level; {@link
- * SenderError.Policy#RETRIABLE} / {@link SenderError.Policy#RETRIABLE_OTHER}
- * fire at WARN level (the batch is replayed, not lost). All carry the
- * full structured payload (category, status byte, FSN span, table, server
- * message) so the log line is sufficient for diagnosis.
+ * <p>{@link SenderError.Policy#TERMINAL} and {@link SenderError.Policy#ABANDONED} fire at ERROR level; the retriable policies fire at WARN (the batch is replayed, not lost).
  */
 public final class DefaultSenderErrorHandler implements SenderErrorHandler {
 
@@ -51,6 +48,14 @@ public final class DefaultSenderErrorHandler implements SenderErrorHandler {
 
     @Override
     public void onError(SenderError e) {
+        if (e.getCategory() == SenderError.Category.DATA_LOSS) {
+            // No server verdict exists for this category, so the headline must not claim
+            // one; the server-shaped fields (status byte, fsn span, seq, table) are always
+            // sentinels here and would be noise.
+            LOG.error("buffered data abandoned [category={}, policy={}, quarantined={}, msg={}]",
+                    e.getCategory(), e.getAppliedPolicy(), e.getQuarantinedPath(), e.getServerMessage());
+            return;
+        }
         // Single template; SLF4J fans out the levels so the call site stays
         // identical and the message format is reviewable in one place.
         String fmt = "server rejected batch [category={}, policy={}, status=0x{}, "
@@ -65,7 +70,8 @@ public final class DefaultSenderErrorHandler implements SenderErrorHandler {
                 e.getMessageSequence(),
                 e.getServerMessage()
         };
-        if (e.getAppliedPolicy() == SenderError.Policy.TERMINAL) {
+        if (e.getAppliedPolicy() == SenderError.Policy.TERMINAL
+                || e.getAppliedPolicy() == SenderError.Policy.ABANDONED) {
             LOG.error(fmt, args);
         } else {
             LOG.warn(fmt, args);

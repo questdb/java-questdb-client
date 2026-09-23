@@ -26,20 +26,27 @@ package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.std.Compat;
 import io.questdb.client.std.Files;
+import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
 import org.jetbrains.annotations.TestOnly;
 
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 
 /**
- * Advisory exclusive lock for a single SF slot directory.
+ * Advisory exclusive locks for a single SF slot.
  * <p>
- * One {@code .lock} file per slot, held via {@code flock}/{@code LockFileEx}
- * for the entire lifetime of the engine that owns the slot. Normal teardown
- * explicitly unlocks it before closing the fd; hard process exit remains a
- * backstop because the kernel cleans up file locks for terminated processes.
+ * {@link #acquire(String)} locks a {@code .lock} file inside the slot directory
+ * for the entire lifetime of the engine that owns it. {@link #acquireLogical(String)}
+ * locks a sibling file under the parent SF directory for short-lived pathname
+ * transitions and orphan adoption; because it is outside the slot directory,
+ * it remains stable if that directory is renamed. Both use
+ * {@code flock}/{@code LockFileEx}. Normal teardown explicitly unlocks the
+ * descriptor before closing it; hard process exit remains a backstop because
+ * the kernel cleans up file locks for terminated processes.
  * <p>
  * The holder's PID is written to a sibling {@code .lock.pid} file at
  * acquisition time. A failed acquisition reads it back so the error message
@@ -60,6 +67,7 @@ public final class SlotLock implements QuietCloseable {
     private static final int DEAD_FD_FOR_TESTING = 1_000_000_000;
     private static final String LOCK_FILE_NAME = ".lock";
     private static final String LOCK_PID_FILE_NAME = ".lock.pid";
+    private static final String LOGICAL_LOCK_DIR_NAME = ".slot-locks";
     private static final Object RELEASE_RETRY_LOCK = new Object();
     private static SlotLock releaseRetryHead;
     private final String slotDir;
@@ -89,48 +97,144 @@ public final class SlotLock implements QuietCloseable {
      * parent directory before any segment file is created.
      */
     public static SlotLock acquire(String slotDir, boolean syncParentDirectory) {
-        if (slotDir == null || slotDir.isEmpty()) {
-            throw new IllegalArgumentException("slotDir must not be empty");
-        }
+        validateSlotDir(slotDir);
         // Construction cleanup may have retained locks after explicit unlock
         // failures. Drive every pending owner before opening a new descriptor.
         // Path text cannot identify a physical file portably (symlinks and
         // Windows case aliases are counterexamples), while the pending list is
         // cold, error-only state and normally empty.
         retryPendingReleases();
-        if (!Files.exists(slotDir)) {
-            int rc = Files.mkdir(slotDir, Files.DIR_MODE_DEFAULT);
-            if (rc != 0) {
-                throw new SfOperationalException(
-                        "could not create slot dir: " + slotDir + " rc=" + rc);
-            }
-        }
+        // DIR_MODE_DEFAULT is right here: one process creates its own slot
+        // directory and only that process writes inside it.
+        ensureDirectory(FilesFacade.INSTANCE, slotDir, "slot dir", Files.DIR_MODE_DEFAULT);
         if (syncParentDirectory && Files.fsyncParentDir(slotDir) != 0) {
             throw new SfOperationalException(
                     "could not sync parent directory for SF slot: " + slotDir);
         }
         String lockPath = slotDir + "/" + LOCK_FILE_NAME;
         String pidPath = slotDir + "/" + LOCK_PID_FILE_NAME;
-        int fd = Files.openRW(lockPath);
+        return acquireAt(FilesFacade.INSTANCE, slotDir, lockPath, pidPath);
+    }
+
+    /**
+     * Acquires the stable logical lock for {@code slotDir}, creating its
+     * {@code .slot-locks} parent at {@link Files#DIR_MODE_DEFAULT}. Unlike the
+     * directory-local {@code .lock}, this lock is anchored in the parent SF
+     * directory, so renaming the slot cannot move the lock inode away from the
+     * logical slot name it guards.
+     * <p>
+     * Callers use this as a short-lived transition/adoption lock, always before
+     * acquiring the directory-local lock. In particular it must cover an
+     * unreplayable slot's close -&gt; rename -&gt; recreate transition, preventing a
+     * queued orphan drainer from adopting the renamed inode and later touching
+     * the fresh directory through the old pathname.
+     */
+    public static SlotLock acquireLogical(String slotDir) {
+        return acquireLogical(FilesFacade.INSTANCE, slotDir);
+    }
+
+    /** Facade-aware variant used to exercise logical-lock I/O failures. */
+    @TestOnly
+    public static SlotLock acquireLogical(FilesFacade ff, String slotDir) {
+        validateSlotDir(slotDir);
+        // Same pre-step as acquire(): a logical lock this process retained after
+        // an unconfirmed unlock would otherwise contend with its own successor.
+        retryPendingReleases();
+        String[] paths = resolveLogicalLock(slotDir);
+        if (paths == null) {
+            throw new IllegalArgumentException(
+                    "slotDir must contain a parent and slot name: " + slotDir);
+        }
+        ensureDirectory(ff, paths[0], "logical slot lock dir", Files.DIR_MODE_DEFAULT);
+        return acquireAt(ff, slotDir, paths[1], paths[2]);
+    }
+
+    /**
+     * Best-effort removal of the parent-anchored logical lock files
+     * ({@code <parent>/.slot-locks/<slotName>.lock} and its {@code .lock.pid}
+     * sidecar) for {@code slotDir}, mirroring {@link AckWatermark#removeOrphan}
+     * and {@link PersistedSymbolDict#removeOrphan} for the slot's in-directory
+     * side-files. The fully-drained close that permanently retires a slot calls
+     * this: the logical lock lives OUTSIDE the slot dir (so it survives a slot
+     * rename), so nothing else reclaims it, and without this
+     * {@code <sf_dir>/.slot-locks} accumulates one dead lock+pid pair per
+     * distinct slot name for the lifetime of {@code sf_dir} -- unbounded under
+     * rotating {@code senderId}s.
+     * <p>
+     * The unlink is best-effort and safe: the retiring engine still holds the
+     * slot's directory-local {@link #acquire} lock (the real multi-writer guard)
+     * across this cleanup, and fully-drained retirement performs no rename, so
+     * the logical lock -- which only guards the close/rename/recreate transition
+     * -- is not in use. An orphan drainer momentarily mid-{@link #acquireLogical}
+     * fails its immediately-following candidacy / directory-lock check (the slot
+     * is gone) and backs off. Unlike {@link #acquireLogical}, an unusable
+     * {@code slotDir} is a silent no-op here rather than a throw.
+     */
+    public static void removeOrphanLogical(String slotDir) {
+        removeOrphanLogical(FilesFacade.INSTANCE, slotDir);
+    }
+
+    /** Facade-aware variant of {@link #removeOrphanLogical(String)}. */
+    public static void removeOrphanLogical(FilesFacade ff, String slotDir) {
+        if (slotDir == null || slotDir.isEmpty()) {
+            return;
+        }
+        String[] paths = resolveLogicalLock(slotDir);
+        if (paths == null) {
+            return;
+        }
+        // Unlink ONLY while holding the lock. Removing a lock file another party holds
+        // does not release that party's flock, but it does free the pathname, so the
+        // next acquirer creates a SECOND inode and locks it successfully -- two owners
+        // of a lock whose only job is mutual exclusion.
+        //
+        // The retiring engine's directory-local lock does not stand in for this. It says
+        // nothing about the LOGICAL lock, which Sender.build() holds across its whole
+        // construct -> connect -> quarantine transition, in a frame ABOVE this one: an
+        // ordinary failed connect closes the engine from inside that scope, reaches here,
+        // and used to unlink the very file build() was holding. Acquiring first narrows
+        // that to a single-syscall window instead of silent double-ownership.
+        SlotLock guard;
+        try {
+            guard = acquireAt(ff, slotDir, paths[1], paths[2]);
+        } catch (Throwable t) {
+            // Contended (someone holds it, possibly a caller above us) or unopenable.
+            // Leaving the pair on disk is the safe outcome -- a live holder's lock must
+            // outlive our cleanup. The next fully-drained retirement reclaims it.
+            return;
+        }
+        try {
+            // Sidecar first: once paths[1] (.lock) is unlinked, a racing acquirer can
+            // create a fresh lock inode and write its own .lock.pid inside our window;
+            // removing the pid file first means no successor's sidecar can be hit.
+            ff.remove(paths[2]);
+            ff.remove(paths[1]);
+        } finally {
+            guard.close();
+        }
+    }
+
+    private static SlotLock acquireAt(FilesFacade ff, String slotDir, String lockPath, String pidPath) {
+        int fd = ff.openRW(lockPath);
         if (fd < 0) {
             throw new SfOperationalException(
                     "could not open slot lock file: " + lockPath);
         }
         boolean ok = false;
         try {
-            int rc = Files.lock(fd);
+            int rc = ff.lock(fd);
             if (rc != 0) {
                 String holder = readHolder(pidPath);
                 throw new SlotLockContentionException(
                         "sf slot already in use by another process [slot="
                                 + slotDir + ", holder=" + holder + "]");
             }
-            writePid(pidPath);
+            writePid(ff, pidPath);
             ok = true;
             return new SlotLock(slotDir, fd);
         } finally {
             if (!ok) {
-                Files.close(fd);
+                ff.close(fd);
             }
         }
     }
@@ -184,6 +288,49 @@ public final class SlotLock implements QuietCloseable {
         // never leak a held flock.
         new SlotLock(slotDir, fd).close();
         return null;
+    }
+
+    private static void ensureDirectory(FilesFacade ff, String path, String description, int mode) {
+        if (!ff.exists(path)) {
+            int rc = ff.mkdir(path, mode);
+            // Multiple senders may create the shared parent lock directory
+            // concurrently. Treat EEXIST as success, just as the builder does
+            // for the SF root itself.
+            if (rc != 0 && !ff.exists(path)) {
+                throw new SfOperationalException(
+                        "could not create " + description + ": " + path + " rc=" + rc);
+            }
+        }
+    }
+
+    /**
+     * Resolves the parent-anchored logical lock layout for {@code slotDir}:
+     * {@code [0]} the {@code .slot-locks} directory, {@code [1]} the
+     * {@code <slotName>.lock} path, {@code [2]} the {@code .lock.pid} path.
+     * Returns {@code null} when {@code slotDir} has no usable parent or name.
+     * Shared by {@link #acquireLogical} and {@link #removeOrphanLogical} so the
+     * two can never target different files.
+     */
+    private static String[] resolveLogicalLock(String slotDir) {
+        Path slotPath = Paths.get(slotDir);
+        Path parentPath = slotPath.getParent();
+        Path slotNamePath = slotPath.getFileName();
+        if (parentPath == null || slotNamePath == null || slotNamePath.toString().isEmpty()) {
+            return null;
+        }
+        String logicalLockDir = parentPath + "/" + LOGICAL_LOCK_DIR_NAME;
+        String slotName = slotNamePath.toString();
+        return new String[]{
+                logicalLockDir,
+                logicalLockDir + "/" + slotName + LOCK_FILE_NAME,
+                logicalLockDir + "/" + slotName + LOCK_PID_FILE_NAME
+        };
+    }
+
+    private static void validateSlotDir(String slotDir) {
+        if (slotDir == null || slotDir.isEmpty()) {
+            throw new IllegalArgumentException("slotDir must not be empty");
+        }
     }
 
     /**
@@ -327,7 +474,7 @@ public final class SlotLock implements QuietCloseable {
         }
     }
 
-    private static void writePid(String pidPath) {
+    private static void writePid(FilesFacade ff, String pidPath) {
         long pid;
         try {
             pid = Compat.currentPid();
@@ -335,25 +482,25 @@ public final class SlotLock implements QuietCloseable {
             // Diagnostic-only — never block lock acquisition on it.
             pid = -1L;
         }
-        int wfd = Files.openRW(pidPath);
+        int wfd = ff.openRW(pidPath);
         if (wfd < 0) {
             // Diagnostic-only — never block lock acquisition on it.
             return;
         }
         try {
-            Files.truncate(wfd, 0L);
+            ff.truncate(wfd, 0L);
             byte[] payload = (pid + "\n").getBytes(StandardCharsets.UTF_8);
             long addr = Unsafe.malloc(payload.length, MemoryTag.NATIVE_DEFAULT);
             try {
                 for (int i = 0; i < payload.length; i++) {
                     Unsafe.getUnsafe().putByte(addr + i, payload[i]);
                 }
-                Files.write(wfd, addr, payload.length, 0L);
+                ff.write(wfd, addr, payload.length, 0L);
             } finally {
                 Unsafe.free(addr, payload.length, MemoryTag.NATIVE_DEFAULT);
             }
         } finally {
-            Files.close(wfd);
+            ff.close(wfd);
         }
     }
 

@@ -26,8 +26,6 @@ package io.questdb.client.std.str;
 
 import org.jetbrains.annotations.Nullable;
 
-import static io.questdb.client.std.Numbers.hexDigits;
-
 /**
  * Family of sinks that write out <b>character</b> value as UTF16 encoded bytes. This interface
  * is separate from {@link CharSink} to achieve two goals:
@@ -45,24 +43,61 @@ public interface Utf16Sink extends CharSink<Utf16Sink> {
     }
 
     default void putAsPrintable(CharSequence nonPrintable) {
-        for (int i = 0, n = nonPrintable.length(); i < n; i++) {
-            char c = nonPrintable.charAt(i);
-            putAsPrintable(c);
+        // Scan by code point, not UTF-16 unit. A supplementary-plane format char (e.g. a U+E00xx language
+        // tag char) arrives as a surrogate pair whose halves report SURROGATE rather than FORMAT, and a
+        // lone surrogate likewise - per-unit scanning would pass both through raw. Judging the whole code
+        // point (via DisplaySafe, the shared classifier) escapes them, while a normal supplementary char
+        // such as an emoji is neither control nor format and is emitted verbatim.
+        //
+        // Classify before copying, and when nothing needs escaping hand the whole sequence to
+        // put(CharSequence) instead of walking it a character at a time. The escaping loop below appends
+        // with put(char), so an implementation like StringSink pays a capacity check per CHARACTER, where
+        // its put(CharSequence) override pays one for the whole sequence and then copies in a tight loop.
+        // That matters because the biggest input here is a server-supplied error body on a failed ILP
+        // flush, which the client does not cap - and which is almost always entirely printable, so the
+        // scan finds nothing and the copy is the bulk one. Mixed input costs this extra scan and then
+        // takes the loop as before; that is the rare case, and it is the one where correctness, not
+        // speed, is the point. Mirrors OidcDeviceAuth.sanitizeForDisplay, which returns its input
+        // untouched on the same test.
+        final int n = nonPrintable.length();
+        int firstUnsafe = -1;
+        for (int i = 0; i < n; ) {
+            final int cp = Character.codePointAt(nonPrintable, i);
+            if (!DisplaySafe.isDisplaySafe(cp)) {
+                firstUnsafe = i;
+                break;
+            }
+            i += Character.charCount(cp);
+        }
+        if (firstUnsafe < 0) {
+            put(nonPrintable);
+            return;
+        }
+        for (int i = 0; i < n; ) {
+            final int cp = Character.codePointAt(nonPrintable, i);
+            final int count = Character.charCount(cp);
+            if (DisplaySafe.isDisplaySafe(cp)) {
+                if (count == 1) {
+                    put((char) cp); // BMP: cp already is the char, so skip the redundant charAt re-read
+                } else {
+                    put(nonPrintable.charAt(i));
+                    put(nonPrintable.charAt(i + 1));
+                }
+            } else {
+                DisplaySafe.putUnicodeEscape(this, cp);
+            }
+            i += count;
         }
     }
 
     default void putAsPrintable(char c) {
-        if (c > 0x1F && c != 0x7F) {
+        // A single UTF-16 unit: escape control chars, Unicode format chars, and a lone surrogate (which has
+        // no displayable meaning). Supplementary-plane format chars are caught by the code-point-aware
+        // putAsPrintable(CharSequence).
+        if (DisplaySafe.isDisplaySafe(c)) {
             put(c);
         } else {
-            put('\\');
-            put('u');
-
-            final int s = (int) c & 0xFF;
-            put('0');
-            put('0');
-            put(hexDigits[s / 0x10]);
-            put(hexDigits[s % 0x10]);
+            DisplaySafe.putUnicodeEscape(this, c);
         }
     }
 
@@ -93,5 +128,4 @@ public interface Utf16Sink extends CharSink<Utf16Sink> {
         Utf8s.utf8ToUtf16(lo, hi, this);
         return this;
     }
-
 }

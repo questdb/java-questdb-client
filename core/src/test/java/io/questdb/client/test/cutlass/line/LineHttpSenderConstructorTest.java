@@ -49,8 +49,7 @@ import org.slf4j.Logger;
  * Covers the rollback the sender constructor runs when {@code newRequest()} throws. The sender owns
  * its client from the assignment on - {@code close()} frees it whether the caller handed it in or
  * the constructor built it - but a failed constructor hands no reference back, so nothing else can
- * close it. {@link AbstractLineHttpSender#createLineSender} cannot cover this either: it builds the
- * sender in a return expression, past every catch it has.
+ * close it.
  */
 public class LineHttpSenderConstructorTest {
     // Smaller than "POST /write HTTP/1.1\r\n", so newRequest() cannot fit the preamble and throws

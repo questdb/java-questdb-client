@@ -102,10 +102,12 @@ public class SenderErrorDispatcherTest {
         // and admit the new one. The latest entry is always the most
         // informative, so the FIFO head loses, not the new arrival.
         CountDownLatch unblock = new CountDownLatch(1);
+        CountDownLatch handlerEntered = new CountDownLatch(1);
         List<SenderError> received = new ArrayList<>();
         Object lock = new Object();
         CountDownLatch allDelivered = new CountDownLatch(5);
         try (SenderErrorDispatcher d = new SenderErrorDispatcher(err -> {
+            handlerEntered.countDown();
             try {
                 unblock.await();
             } catch (InterruptedException ignored) {
@@ -120,9 +122,11 @@ public class SenderErrorDispatcherTest {
             // immediately (and blocks there). Now we can fill the bounded
             // inbox to capacity, then overflow.
             Assert.assertTrue(d.offer(buildError(0)));
-            // Give the dispatcher a moment to take the head into the
-            // handler so subsequent offers don't get an extra slot.
-            TimeUnit.MILLISECONDS.sleep(50);
+            // The dispatcher polls the head off the inbox before invoking
+            // the handler, so once the handler is entered the head's slot
+            // is free and subsequent offers cannot get an extra slot.
+            Assert.assertTrue("dispatcher should take the head into the handler within 5s",
+                    handlerEntered.await(5, TimeUnit.SECONDS));
             for (int i = 1; i <= 4; i++) {
                 Assert.assertTrue("inbox should accept offer " + i,
                         d.offer(buildError(i)));
