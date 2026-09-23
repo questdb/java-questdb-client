@@ -911,12 +911,7 @@ public abstract class HttpClient implements QuietCloseable {
 
         public ResponseHeaders(long respParserBufLo, int respParserBufSize, int defaultTimeout, int headerBufSize, ObjectPool<DirectUtf8String> pool) {
             super(headerBufSize, pool);
-            // super() mallocs the header parse buffer as its FIRST statement, so from here on this object owns
-            // native memory while still being unreachable by anyone who could free it. A heap OOM in either
-            // allocation below would strand those bytes past the enclosing constructor's catch (Throwable),
-            // which frees only what IT staged - it never holds a reference to a ResponseHeaders that failed
-            // to finish constructing. Same rule as out there: whoever took it frees it when construction
-            // cannot complete.
+            // Release native memory allocated by the superclass if subclass initialization fails.
             try {
                 this.defaultTimeout = defaultTimeout;
                 this.response = new ResponseImpl(respParserBufLo, respParserBufLo + respParserBufSize, defaultTimeout);
