@@ -32,11 +32,14 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
+import org.junit.Assume;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
 import java.io.IOException;
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadMXBean;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -456,10 +459,11 @@ public class SymbolDictRecycleDeferredCloseTest {
     /**
      * The deferred-close park shares {@code maybeBlockForStarvedReset()}'s
      * interrupt policy: an interrupt flag set as the park begins is cleared
-     * per iteration (so the park cannot busy-spin) and handed back on the
-     * completed exit, and the swap's remaining steps (rebuild, reconnect)
-     * commit with it set. A caller cancelled mid-park still sees its
-     * cancellation.
+     * per iteration (so the park cannot busy-spin;
+     * {@link #testInterruptAtParkEntryIsRestoredWhenAwaitTimesOut} pins that
+     * with a CPU-time bound) and handed back on the completed exit, and the
+     * swap's remaining steps (rebuild, reconnect) commit with it set. A
+     * caller cancelled mid-park still sees its cancellation.
      */
     @Test(timeout = 60_000L)
     public void testInterruptAtParkEntryIsHandedBackWhenCloseCompletes() throws Exception {
@@ -571,11 +575,16 @@ public class SymbolDictRecycleDeferredCloseTest {
      * The timeout exit of the deferred-close park must RESTORE the interrupt
      * flag it cleared to keep its budget: the park achieved nothing, so the
      * caller's interrupt is not its to eat. The throw itself stays the
-     * ordinary transient verdict (pending, not latched), and the cleared flag
-     * must not let the park spin out before its deadline.
+     * ordinary transient verdict (pending, not latched), the cleared flag
+     * must not let the park spin out before its deadline, and the park must
+     * actually sleep meanwhile: the caller's CPU time over the call stays far
+     * below its wall time.
      */
     @Test(timeout = 60_000L)
     public void testInterruptAtParkEntryIsRestoredWhenAwaitTimesOut() throws Exception {
+        ThreadMXBean threads = ManagementFactory.getThreadMXBean();
+        Assume.assumeTrue("thread CPU time is not measurable on this JVM",
+                threads.isCurrentThreadCpuTimeSupported() && threads.isThreadCpuTimeEnabled());
         assertMemoryLeak(() -> {
             String sfDir = temporaryFolder.getRoot().toPath().resolve("recycle-deferred-interrupt-restore").toString();
             try (TestWebSocketServer server = ackingServer()) {
@@ -627,7 +636,9 @@ public class SymbolDictRecycleDeferredCloseTest {
 
                         boolean flagAfter;
                         long elapsedMs;
+                        long cpuMs;
                         long t0 = System.nanoTime();
+                        long cpu0 = threads.getCurrentThreadCpuTime();
                         try {
                             sender.table("t").symbol("s", "b").longColumn("v", 2L).atNow();
                             Assert.fail("expected the exhausted deferred-close await to throw "
@@ -636,6 +647,7 @@ public class SymbolDictRecycleDeferredCloseTest {
                             TestUtils.assertContains(e.getMessage(),
                                     "deferred close did not release the slot lock");
                         } finally {
+                            cpuMs = (threads.getCurrentThreadCpuTime() - cpu0) / 1_000_000L;
                             elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
                             flagAfter = Thread.interrupted(); // read AND clear for JUnit's sake
                         }
@@ -643,6 +655,8 @@ public class SymbolDictRecycleDeferredCloseTest {
                         Assert.assertTrue("timeout exit must restore the interrupt flag", flagAfter);
                         Assert.assertTrue("must wait out the deadline, not spin out early: got "
                                 + elapsedMs + "ms", elapsedMs >= maxWaitMillis - 50);
+                        Assert.assertTrue("the park must sleep, not spin: " + cpuMs + " ms of CPU over "
+                                + elapsedMs + " ms of wall time", cpuMs < elapsedMs / 2);
                         Assert.assertEquals("the swap must not have committed",
                                 0, ws.getSymbolDictEpoch());
 

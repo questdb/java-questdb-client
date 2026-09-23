@@ -30,9 +30,12 @@ import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
+import org.junit.Assume;
 import org.junit.Test;
 
 import java.io.IOException;
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadMXBean;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -456,10 +459,12 @@ public class SymbolDictRecycleStarvationTest {
     /**
      * An interrupt flag set when the bounded wait begins is handed back once
      * the ring drains: the wait clears the flag per park iteration (so it
-     * cannot busy-spin) and restores it on every exit, and the swap that
-     * follows commits regardless -- its loop-close join clears and restores
-     * a carried flag itself, and nothing after the join depends on a cleared
-     * flag. A caller cancelled mid-wait therefore still sees its cancellation.
+     * cannot busy-spin; {@link #testInterruptedWaitTimesOutAndRestoresFlag}
+     * pins that with a CPU-time bound) and restores it on every exit, and
+     * the swap that follows commits regardless -- its loop-close join
+     * clears and restores a carried flag itself, and nothing after the
+     * join depends on a cleared flag. A caller cancelled mid-wait
+     * therefore still sees its cancellation.
      */
     @Test(timeout = 60_000L)
     public void testInterruptDuringWaitDoesNotManufactureAbandon() throws Exception {
@@ -515,10 +520,16 @@ public class SymbolDictRecycleStarvationTest {
     /**
      * The timeout exit of the bounded wait must RESTORE the interrupt flag it
      * cleared to keep its budget -- the caller's interrupt is not the wait's
-     * to eat when the wait achieved nothing.
+     * to eat when the wait achieved nothing -- and the wait must actually park
+     * meanwhile: the per-iteration clear is what keeps {@code parkNanos}
+     * sleeping under a set flag, so the caller's CPU time over the call stays
+     * far below its wall time.
      */
     @Test(timeout = 60_000L)
     public void testInterruptedWaitTimesOutAndRestoresFlag() throws Exception {
+        ThreadMXBean threads = ManagementFactory.getThreadMXBean();
+        Assume.assumeTrue("thread CPU time is not measurable on this JVM",
+                threads.isCurrentThreadCpuTimeSupported() && threads.isThreadCpuTimeEnabled());
         assertMemoryLeak(() -> {
             GatedAckHandler handler = new GatedAckHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
@@ -538,20 +549,28 @@ public class SymbolDictRecycleStarvationTest {
 
                     boolean flagAfter;
                     long elapsedMs;
+                    long cpuMs;
                     try {
                         Thread.currentThread().interrupt();
                         long t0 = System.nanoTime();
+                        long cpu0 = threads.getCurrentThreadCpuTime();
                         sender.table("t"); // acks never come: must wait out the deadline
+                        cpuMs = (threads.getCurrentThreadCpuTime() - cpu0) / 1_000_000;
                         elapsedMs = (System.nanoTime() - t0) / 1_000_000;
                     } finally {
                         flagAfter = Thread.interrupted(); // read AND clear for JUnit's sake
                     }
-                    Assert.assertTrue("timeout exit must restore the interrupt flag", flagAfter);
-                    Assert.assertTrue("must wait out the deadline, not spin out early: got "
-                            + elapsedMs + "ms", elapsedMs >= maxWaitMillis - 50);
-                    Assert.assertEquals(1L, ws.getSymbolDictResetStarvationTimeouts());
-                    Assert.assertTrue(ws.isResetArmed());
-                    handler.releaseAcks(); // or close()'s drain hangs on the gated acks
+                    try {
+                        Assert.assertTrue("timeout exit must restore the interrupt flag", flagAfter);
+                        Assert.assertTrue("must wait out the deadline, not spin out early: got "
+                                + elapsedMs + "ms", elapsedMs >= maxWaitMillis - 50);
+                        Assert.assertTrue("the wait must park, not spin: " + cpuMs + " ms of CPU over "
+                                + elapsedMs + " ms of wall time", cpuMs < elapsedMs / 2);
+                        Assert.assertEquals(1L, ws.getSymbolDictResetStarvationTimeouts());
+                        Assert.assertTrue(ws.isResetArmed());
+                    } finally {
+                        handler.releaseAcks(); // or close()'s drain hangs on the gated acks
+                    }
                 }
             }
         });
