@@ -17,13 +17,10 @@ import java.time.zone.ZoneOffsetTransition;
 import java.time.zone.ZoneOffsetTransitionRule;
 import java.time.zone.ZoneRules;
 import java.time.zone.ZoneRulesProvider;
-import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Set;
 
 /**
  * Source-faithful parser for the fixed formats accepted by QWP STRING-to-timestamp
@@ -33,6 +30,7 @@ import java.util.Set;
  */
 final class QwpSchemaTimestampParser {
     private static final long DAY = 86_400_000_000L;
+    private static final long GREEDY_MILLIS_FAILED = -1L;
     private static final long DATE_DAY = 86_400_000L;
     private static final long DATE_HOUR = 3_600_000L;
     private static final long DATE_MINUTE = 60_000L;
@@ -51,42 +49,46 @@ final class QwpSchemaTimestampParser {
     private QwpSchemaTimestampParser() {
     }
 
+    /**
+     * Parses TIMESTAMP text to epoch micros. The server parses the UTF-8 bytes,
+     * where no non-ASCII byte matches anything, so any non-ASCII character fails.
+     */
     static long parse(CharSequence value) throws NumericException {
-        NumericException failure = NumericException.instance();
-        try {
-            return parsePg(value);
-        } catch (NumericException ignored) {
-        }
-        try {
-            return parseIso(value);
-        } catch (NumericException ignored) {
-        }
-        throw failure;
-    }
-
-    static long parseDate(CharSequence value) throws NumericException {
-        NumericException failure = NumericException.instance();
-        try {
-            return parsePgDate(value);
-        } catch (NumericException ignored) {
-        }
-        try {
-            return parseUtcDate(value);
-        } catch (NumericException ignored) {
-        }
-        try {
-            return Numbers.parseLong(value);
-        } catch (NumericException ignored) {
-        }
-        throw failure;
-    }
-
-    private static long parsePgDate(CharSequence value) throws NumericException {
+        // Only the PG layout has a space after the day, and a space there fails
+        // every ISO layout, so that one character selects the parser.
         int n = value.length();
-        int dash = indexOf(value, '-', n > 0 && value.charAt(0) == '-' ? 1 : 0, n);
-        if (dash < 1) {
-            throw NumericException.instance();
+        int dash = firstDash(value, n);
+        if (dash >= 1 && dash + 6 < n && value.charAt(dash + 6) == ' ') {
+            return parsePg(value, dash);
         }
+        return parseIso(value);
+    }
+
+    /** Parses DATE text to epoch millis; the server parses DATE text as UTF-16. */
+    static long parseDate(CharSequence value) throws NumericException {
+        int n = value.length();
+        int dash = firstDash(value, n);
+        if (dash < 1) {
+            // Both date layouts need an inner dash and a raw number cannot hold one.
+            return Numbers.parseLong(value);
+        }
+        // PG ends at the day or continues with a space; only UTC has a 'T' there.
+        int separator = dash + 6;
+        if (separator >= n || value.charAt(separator) == ' ') {
+            return parsePgDate(value, dash);
+        }
+        if (value.charAt(separator) == 'T') {
+            return parseUtcDate(value);
+        }
+        throw NumericException.instance();
+    }
+
+    private static int firstDash(CharSequence value, int n) {
+        return indexOf(value, '-', n > 0 && value.charAt(0) == '-' ? 1 : 0, n);
+    }
+
+    private static long parsePgDate(CharSequence value, int dash) throws NumericException {
+        int n = value.length();
         int year = greedyInt(value, 0, dash);
         if (dash == 2) {
             year += REFERENCE_CENTURY;
@@ -96,7 +98,7 @@ final class QwpSchemaTimestampParser {
         require(value, pos++, n, '-');
         int day = fixedInt(value, pos, pos += 2, n);
         if (pos == n) {
-            return computeDate(year, month, day, 0, 0, 0, 0, null);
+            return computeDate(year, month, day, 0, 0, 0, 0, null, 0, 0);
         }
         require(value, pos++, n, ' ');
         int tail = pos;
@@ -109,14 +111,15 @@ final class QwpSchemaTimestampParser {
             int millis = 0;
             if (pos < n && value.charAt(pos) == '.') {
                 long parsed = greedyMillis(value, pos + 1, n);
+                if (parsed == GREEDY_MILLIS_FAILED) {
+                    throw NumericException.instance();
+                }
                 millis = (int) parsed;
                 pos += 1 + (int) (parsed >>> 32);
             }
-            return computeDate(year, month, day, hour, minute, second, millis,
-                    ZoneMatcher.parse(value, pos, n));
+            return computeDate(year, month, day, hour, minute, second, millis, value, pos, n);
         } catch (NumericException ignored) {
-            return computeDate(year, month, day, 0, 0, 0, 0,
-                    ZoneMatcher.parse(value, tail, n));
+            return computeDate(year, month, day, 0, 0, 0, 0, value, tail, n);
         }
     }
 
@@ -136,112 +139,130 @@ final class QwpSchemaTimestampParser {
         int second = fixedInt(value, pos, pos += 2, n);
         require(value, pos++, n, '.');
         int millis = fixedInt(value, pos, pos += 3, n);
-        return computeDate(year, month, day, hour, minute, second, millis,
-                ZoneMatcher.parse(value, pos, n));
+        return computeDate(year, month, day, hour, minute, second, millis, value, pos, n);
     }
 
     private static long parseIso(CharSequence value) throws NumericException {
         int n = value.length();
-        Parsed p = new Parsed();
-        int pos = parseFixedYear(value, 0, n, p);
+        int pos = n > 0 && value.charAt(0) == '-' ? 5 : 4;
+        int year = pos == 5 ? -fixedInt(value, 1, pos, n) : fixedInt(value, 0, pos, n);
         if (pos == n) {
-            return compute(p, null);
+            return localMicros(year, 1, 1, 0, 0, 0, 0, 0);
         }
         require(value, pos++, n, '-');
         if (pos + 3 <= n && value.charAt(pos) == 'W') {
-            p.week = Numbers.parseInt(value, pos + 1, pos + 3);
+            int week = Numbers.parseInt(value, pos + 1, pos + 3);
             if (pos + 3 != n) {
                 throw NumericException.instance();
             }
-            return compute(p, null);
+            return weekMicros(year, week);
         }
-        p.month = fixedInt(value, pos, pos += 2, n);
+        int month = fixedInt(value, pos, pos += 2, n);
         if (pos == n) {
-            return compute(p, null);
+            return localMicros(year, month, 1, 0, 0, 0, 0, 0);
         }
         require(value, pos++, n, '-');
-        p.day = fixedInt(value, pos, pos += 2, n);
+        int day = fixedInt(value, pos, pos += 2, n);
         if (pos == n) {
-            return compute(p, null);
+            return localMicros(year, month, day, 0, 0, 0, 0, 0);
         }
         require(value, pos++, n, 'T');
-        p.hour = fixedInt(value, pos, pos += 2, n);
+        int hour = fixedInt(value, pos, pos += 2, n);
         if (pos == n) {
-            return compute(p, null);
+            return localMicros(year, month, day, hour, 0, 0, 0, 0);
         }
         require(value, pos++, n, ':');
-        p.minute = fixedInt(value, pos, pos += 2, n);
+        int minute = fixedInt(value, pos, pos += 2, n);
         require(value, pos++, n, ':');
-        p.second = fixedInt(value, pos, pos += 2, n);
+        int second = fixedInt(value, pos, pos += 2, n);
         if (pos < n && value.charAt(pos) == '.') {
-            pos++;
+            return parseIsoFraction(value, pos + 1, n, year, month, day, hour, minute, second);
+        }
+        return zoned(localMicros(year, month, day, hour, minute, second, 0, 0), year, value, pos, n);
+    }
+
+    /**
+     * Tries the server's fraction layouts in its order: greedy S to SSS, then
+     * SSSUUU, then S followed by greedy S to SSS, then fixed SSS. A layout whose
+     * fraction, fields or zone fails hands over to the next one.
+     */
+    private static long parseIsoFraction(
+            CharSequence value,
+            int pos,
+            int n,
+            int year,
+            int month,
+            int day,
+            int hour,
+            int minute,
+            int second
+    ) throws NumericException {
+        long parsed = greedyMillis(value, pos, n);
+        if (parsed != GREEDY_MILLIS_FAILED) {
             try {
-                Parsed copy = new Parsed(p);
-                long parsed = greedyMillis(value, pos, n);
-                copy.millis = (int) parsed;
-                return compute(copy, ZoneMatcher.parse(value, pos + (int) (parsed >>> 32), n));
+                long local = localMicros(year, month, day, hour, minute, second, (int) parsed, 0);
+                return zoned(local, year, value, pos + (int) (parsed >>> 32), n);
             } catch (NumericException ignored) {
             }
-            if (pos + 6 <= n) {
-                try {
-                    Parsed copy = new Parsed(p);
-                    copy.millis = fixedInt(value, pos, pos + 3, n);
-                    copy.micros = fixedInt(value, pos + 3, pos + 6, n);
-                    return compute(copy, ZoneMatcher.parse(value, pos + 6, n));
-                } catch (NumericException ignored) {
-                }
-            }
-            if (pos + 2 <= n) {
-                try {
-                    fixedInt(value, pos, pos + 1, n);
-                    Parsed copy = new Parsed(p);
-                    long parsed = greedyMillis(value, pos + 1, n);
-                    copy.millis = (int) parsed;
-                    return compute(copy, ZoneMatcher.parse(value, pos + 1 + (int) (parsed >>> 32), n));
-                } catch (NumericException ignored) {
-                }
-            }
-            // Final UTC_PATTERN fallback is fixed SSS. It intentionally follows
-            // the greedy S and SS forms, and therefore accepts parseInt forms
-            // such as +12 and 1_2 as well as a numeric-zone suffix after 3 chars.
-            if (pos + 3 <= n) {
-                try {
-                    Parsed copy = new Parsed(p);
-                    copy.millis = fixedInt(value, pos, pos + 3, n);
-                    return compute(copy, ZoneMatcher.parse(value, pos + 3, n));
-                } catch (NumericException ignored) {
-                }
-            }
-            throw NumericException.instance();
         }
-        return compute(p, ZoneMatcher.parse(value, pos, n));
+        if (pos + 6 <= n) {
+            try {
+                int millis = fixedInt(value, pos, pos + 3, n);
+                int micros = fixedInt(value, pos + 3, pos + 6, n);
+                return zoned(localMicros(year, month, day, hour, minute, second, millis, micros), year, value, pos + 6, n);
+            } catch (NumericException ignored) {
+            }
+        }
+        if (pos + 2 <= n) {
+            try {
+                fixedInt(value, pos, pos + 1, n);
+                parsed = greedyMillis(value, pos + 1, n);
+                if (parsed != GREEDY_MILLIS_FAILED) {
+                    long local = localMicros(year, month, day, hour, minute, second, (int) parsed, 0);
+                    return zoned(local, year, value, pos + 1 + (int) (parsed >>> 32), n);
+                }
+            } catch (NumericException ignored) {
+            }
+        }
+        // Final UTC_PATTERN fallback is fixed SSS. It intentionally follows
+        // the greedy S and SS forms, and therefore accepts parseInt forms
+        // such as +12 and 1_2 as well as a numeric-zone suffix after 3 chars.
+        if (pos + 3 <= n) {
+            try {
+                int millis = fixedInt(value, pos, pos + 3, n);
+                return zoned(localMicros(year, month, day, hour, minute, second, millis, 0), year, value, pos + 3, n);
+            } catch (NumericException ignored) {
+            }
+        }
+        throw NumericException.instance();
     }
 
-    private static long parsePg(CharSequence value) throws NumericException {
+    private static long parsePg(CharSequence value, int dash) throws NumericException {
         int n = value.length();
-        int dash = indexOf(value, '-', value.length() > 0 && value.charAt(0) == '-' ? 1 : 0, n);
-        if (dash < 1) {
-            throw NumericException.instance();
-        }
-        Parsed p = new Parsed();
         int year = greedyInt(value, 0, dash);
-        p.year = dash == 2 ? REFERENCE_CENTURY + year : year;
+        if (dash == 2) {
+            year += REFERENCE_CENTURY;
+        }
         int pos = dash + 1;
-        p.month = fixedInt(value, pos, pos += 2, n);
+        int month = fixedInt(value, pos, pos += 2, n);
         require(value, pos++, n, '-');
-        p.day = fixedInt(value, pos, pos += 2, n);
+        int day = fixedInt(value, pos, pos += 2, n);
         require(value, pos++, n, ' ');
-        p.hour = fixedInt(value, pos, pos += 2, n);
+        int hour = fixedInt(value, pos, pos += 2, n);
         require(value, pos++, n, ':');
-        p.minute = fixedInt(value, pos, pos += 2, n);
+        int minute = fixedInt(value, pos, pos += 2, n);
         require(value, pos++, n, ':');
-        p.second = fixedInt(value, pos, pos += 2, n);
+        int second = fixedInt(value, pos, pos += 2, n);
         require(value, pos++, n, '.');
-        p.millis = fixedInt(value, pos, pos += 3, n);
-        return compute(p, ZoneMatcher.parse(value, pos, n));
+        int millis = fixedInt(value, pos, pos += 3, n);
+        return zoned(localMicros(year, month, day, hour, minute, second, millis, 0), year, value, pos, n);
     }
 
-    private static long greedyMillis(CharSequence value, int lo, int hi) throws NumericException {
+    /**
+     * Returns {@code (width << 32) | millis} for a greedy 1-3 digit fraction with
+     * an optional minus sign, or {@link #GREEDY_MILLIS_FAILED}.
+     */
+    private static long greedyMillis(CharSequence value, int lo, int hi) {
         int p = lo;
         boolean negative = p < hi && value.charAt(p) == '-';
         if (negative) {
@@ -254,7 +275,7 @@ final class QwpSchemaTimestampParser {
         }
         int width = p - lo;
         if (p == digitStart || width > 3) {
-            throw NumericException.instance();
+            return GREEDY_MILLIS_FAILED;
         }
         while (width < 3) {
             parsed *= 10;
@@ -263,27 +284,50 @@ final class QwpSchemaTimestampParser {
         return ((long) (p - lo) << 32) | ((negative ? -parsed : parsed) & 0xffffffffL);
     }
 
-    private static long compute(Parsed p, ZoneMatcher.Zone zone) throws NumericException {
-        boolean leap = CommonUtils.isLeapYear(p.year);
-        if (p.month < 1 || p.month > 12 || p.day < 1 || p.day > CommonUtils.getDaysPerMonth(p.month, leap)
-                || p.hour < 0 || p.hour > 24 || p.minute < 0 || p.minute > 59
-                || p.second < 0 || p.second > 59 || (p.week != -1 && (p.week < 1 || p.week > weeks(p.year)))) {
+    private static long localMicros(
+            int year,
+            int month,
+            int day,
+            int hour,
+            int minute,
+            int second,
+            int millis,
+            int micros
+    ) throws NumericException {
+        boolean leap = CommonUtils.isLeapYear(year);
+        if (month < 1 || month > 12 || day < 1 || day > CommonUtils.getDaysPerMonth(month, leap)
+                || hour < 0 || hour > 24 || minute < 0 || minute > 59
+                || second < 0 || second > 59) {
             throw NumericException.instance();
         }
-        if (p.week != -1) {
-            long first = yearMicros(p.year, CommonUtils.isLeapYear(p.year))
-                    + (p.week - 1L) * WEEK + isoYearDayOffset(p.year) * DAY;
-            int actualYear = year(first);
-            p.month = monthOfYear(first, actualYear, CommonUtils.isLeapYear(actualYear));
-            p.year += p.week == 1 && isoYearDayOffset(p.year) < 0 ? -1 : 0;
-            p.day = dayOfMonth(first, p.year, p.month, CommonUtils.isLeapYear(p.year));
-            // GenericMicrosFormat retains the originally parsed year's leap flag
-            // after an ISO week crosses a calendar-year boundary.
+        return yearMicros(year, leap) + monthMicros(month, leap) + (day - 1L) * DAY
+                + (hour % 24L) * HOUR + minute * MINUTE + second * SECOND
+                + millis * 1000L + micros;
+    }
+
+    private static long weekMicros(int year, int week) throws NumericException {
+        if (week == -1) {
+            // The server's "no week" sentinel is -1, so an explicit W-1 parses
+            // as the bare year.
+            return localMicros(year, 1, 1, 0, 0, 0, 0, 0);
         }
-        long out = yearMicros(p.year, leap) + monthMicros(p.month, leap) + (p.day - 1L) * DAY
-                + (p.hour % 24L) * HOUR + p.minute * MINUTE + p.second * SECOND
-                + p.millis * 1000L + p.micros;
-        return zone == null ? out : out - zone.offset(out, p.year);
+        if (week < 1 || week > weeks(year)) {
+            throw NumericException.instance();
+        }
+        boolean leap = CommonUtils.isLeapYear(year);
+        long first = yearMicros(year, leap) + (week - 1L) * WEEK + isoYearDayOffset(year) * DAY;
+        int actualYear = year(first);
+        int month = monthOfYear(first, actualYear, CommonUtils.isLeapYear(actualYear));
+        int weekYear = year + (week == 1 && isoYearDayOffset(year) < 0 ? -1 : 0);
+        int day = dayOfMonth(first, weekYear, month, CommonUtils.isLeapYear(weekYear));
+        // GenericMicrosFormat retains the originally parsed year's leap flag
+        // after an ISO week crosses a calendar-year boundary.
+        return yearMicros(weekYear, leap) + monthMicros(month, leap) + (day - 1L) * DAY;
+    }
+
+    /** Converts local micros to UTC using the zone text in {@code [lo, hi)}. */
+    private static long zoned(long local, int year, CharSequence value, int lo, int hi) throws NumericException {
+        return local - ZoneMatcher.offset(value, lo, hi, local, year);
     }
 
     private static long computeDate(
@@ -294,7 +338,9 @@ final class QwpSchemaTimestampParser {
             int minute,
             int second,
             int millis,
-            ZoneMatcher.Zone zone
+            CharSequence zone,
+            int zoneLo,
+            int zoneHi
     ) throws NumericException {
         boolean leap = CommonUtils.isLeapYear(year);
         if (month < 1 || month > 12 || day < 1 || day > CommonUtils.getDaysPerMonth(month, leap)
@@ -304,15 +350,7 @@ final class QwpSchemaTimestampParser {
         }
         long out = dateYearMillis(year, leap) + dateMonthMillis(month, leap) + (day - 1L) * DATE_DAY
                 + (hour % 24L) * DATE_HOUR + minute * DATE_MINUTE + second * DATE_SECOND + millis;
-        return zone == null ? out : out - zone.offsetMillis(out, year);
-    }
-
-    private static int parseFixedYear(CharSequence s, int pos, int hi, Parsed p) throws NumericException {
-        int width = pos < hi && s.charAt(pos) == '-' ? 5 : 4;
-        p.year = width == 5
-                ? -fixedInt(s, pos + 1, pos + width, hi)
-                : fixedInt(s, pos, pos + width, hi);
-        return pos + width;
+        return zone == null ? out : out - ZoneMatcher.offsetMillis(zone, zoneLo, zoneHi, out, year);
     }
 
     private static int fixedInt(CharSequence s, int lo, int hi, int limit) throws NumericException {
@@ -511,50 +549,33 @@ final class QwpSchemaTimestampParser {
         return current >= dow ? micros - (current - dow) * DAY : micros - (7 + current - dow) * DAY;
     }
 
-    private static final class Parsed {
-        private int day = 1;
-        private int hour;
-        private int micros;
-        private int millis;
-        private int minute;
-        private int month = 1;
-        private int second;
-        private int week = -1;
-        private int year;
-
-        private Parsed() {
-        }
-
-        private Parsed(Parsed that) {
-            day = that.day;
-            hour = that.hour;
-            micros = that.micros;
-            millis = that.millis;
-            minute = that.minute;
-            month = that.month;
-            second = that.second;
-            week = that.week;
-            year = that.year;
-        }
-    }
-
     private static final class ZoneMatcher {
-        private static final List<Token> TOKENS = tokens();
 
-        private static Zone parse(CharSequence value, int lo, int hi) throws NumericException {
+        /**
+         * TIMESTAMP zone offset in micros. The server matches TIMESTAMP zone
+         * text against UTF-8 bytes, so a non-ASCII name never matches.
+         */
+        private static long offset(CharSequence s, int lo, int hi, long epoch, int year) throws NumericException {
             if (lo >= hi) {
                 throw NumericException.instance();
             }
-            int minutes = numericOffset(value, lo, hi);
+            int minutes = numericOffset(s, lo, hi);
             if (minutes != Integer.MIN_VALUE) {
-                return new Zone(minutes * MINUTE);
+                return minutes * MINUTE;
             }
-            for (Token token : TOKENS) {
-                if (token.text.length() == hi - lo && regionMatches(value, lo, token.text)) {
-                    return token.zone;
-                }
+            return NamedZones.find(s, lo, hi, true).offset(epoch, year);
+        }
+
+        /** DATE zone offset in millis, matching zone names case-insensitively as UTF-16. */
+        private static long offsetMillis(CharSequence s, int lo, int hi, long epoch, int year) throws NumericException {
+            if (lo >= hi) {
+                throw NumericException.instance();
             }
-            throw NumericException.instance();
+            int minutes = numericOffset(s, lo, hi);
+            if (minutes != Integer.MIN_VALUE) {
+                return minutes * DATE_MINUTE;
+            }
+            return NamedZones.find(s, lo, hi, false).offsetMillis(epoch, year);
         }
 
         private static int numericOffset(CharSequence s, int lo, int hi) {
@@ -593,53 +614,8 @@ final class QwpSchemaTimestampParser {
                     : Integer.MIN_VALUE;
         }
 
-        private static List<Token> tokens() {
-            List<Token> result = new ArrayList<>();
-            Set<String> seen = new java.util.HashSet<>();
-            Map<String, Zone> rules = new HashMap<>();
-            for (String id : ZoneRulesProvider.getAvailableZoneIds()) {
-                rules.put(id, new Zone(ZoneRulesProvider.getRules(id, true)));
-            }
-            for (Map.Entry<String, String> alias : ZoneId.SHORT_IDS.entrySet()) {
-                if (!rules.containsKey(alias.getKey())) {
-                    Zone target = rules.get(alias.getValue());
-                    if (target == null) {
-                        target = new Zone(ZoneId.of(alias.getValue()).getRules());
-                    }
-                    rules.put(alias.getKey(), target);
-                }
-            }
-            add(result, seen, rules.get("UTC"), "UTC");
-            String[][] names = new DateFormatSymbols(Locale.ENGLISH).getZoneStrings();
-            for (String[] row : names) {
-                if (row.length == 0 || !rules.containsKey(row[0])) {
-                    continue;
-                }
-                for (String name : row) {
-                    add(result, seen, rules.get(row[0]), name);
-                }
-            }
-            result.sort(Comparator.comparingInt((Token t) -> t.text.length()).reversed());
-            return result;
-        }
-
-        private static void add(List<Token> tokens, Set<String> seen, Zone zone, String name) {
-            if (zone != null && name != null && !name.isEmpty() && seen.add(name)) {
-                tokens.add(new Token(name.toUpperCase(), zone));
-            }
-        }
-
         private static boolean digit(char c) {
             return c >= '0' && c <= '9';
-        }
-
-        private static boolean regionMatches(CharSequence value, int lo, String token) {
-            for (int i = 0; i < token.length(); i++) {
-                if (Character.toUpperCase(value.charAt(lo + i)) != token.charAt(i)) {
-                    return false;
-                }
-            }
-            return true;
         }
 
         private static boolean startsWithIgnoreCase(CharSequence value, int lo, int hi, String prefix) {
@@ -654,13 +630,106 @@ final class QwpSchemaTimestampParser {
             return true;
         }
 
-        private static final class Token {
-            private final String text;
-            private final Zone zone;
+        /**
+         * Zone names by case-insensitive text. A holder class, so that only a
+         * named-zone lookup loads every zone's rules; 'Z' and numeric offsets
+         * never initialize it.
+         */
+        private static final class NamedZones {
+            private static final int MASK;
+            private static final String[] NAMES;
+            private static final Zone[] ZONES;
 
-            private Token(String text, Zone zone) {
-                this.text = text;
-                this.zone = zone;
+            static {
+                Map<String, Zone> rules = new HashMap<>();
+                for (String id : ZoneRulesProvider.getAvailableZoneIds()) {
+                    rules.put(id, new Zone(ZoneRulesProvider.getRules(id, true)));
+                }
+                for (Map.Entry<String, String> alias : ZoneId.SHORT_IDS.entrySet()) {
+                    if (!rules.containsKey(alias.getKey())) {
+                        Zone target = rules.get(alias.getValue());
+                        if (target == null) {
+                            target = new Zone(ZoneId.of(alias.getValue()).getRules());
+                        }
+                        rules.put(alias.getKey(), target);
+                    }
+                }
+                String[][] rows = new DateFormatSymbols(Locale.ENGLISH).getZoneStrings();
+                int names = 1;
+                for (String[] row : rows) {
+                    names += row.length;
+                }
+                // At most half full, so a miss ends at an empty slot quickly.
+                int capacity = 16;
+                while (capacity < 2 * names) {
+                    capacity <<= 1;
+                }
+                MASK = capacity - 1;
+                NAMES = new String[capacity];
+                ZONES = new Zone[capacity];
+                // The first definition of a name wins; UTC goes first.
+                define(rules.get("UTC"), "UTC");
+                for (String[] row : rows) {
+                    if (row.length == 0 || !rules.containsKey(row[0])) {
+                        continue;
+                    }
+                    Zone zone = rules.get(row[0]);
+                    for (String name : row) {
+                        define(zone, name);
+                    }
+                }
+            }
+
+            private static void define(Zone zone, String name) {
+                if (zone == null || name == null || name.isEmpty()) {
+                    return;
+                }
+                String text = name.toUpperCase(Locale.ROOT);
+                int hash = 0;
+                for (int i = 0, n = text.length(); i < n; i++) {
+                    hash = 31 * hash + text.charAt(i);
+                }
+                int slot = spread(hash) & MASK;
+                while (NAMES[slot] != null) {
+                    if (NAMES[slot].equals(text)) {
+                        return;
+                    }
+                    slot = (slot + 1) & MASK;
+                }
+                NAMES[slot] = text;
+                ZONES[slot] = zone;
+            }
+
+            private static Zone find(CharSequence s, int lo, int hi, boolean isAsciiOnly) throws NumericException {
+                int hash = 0;
+                for (int i = lo; i < hi; i++) {
+                    char c = s.charAt(i);
+                    if (isAsciiOnly && c > 0x7f) {
+                        throw NumericException.instance();
+                    }
+                    hash = 31 * hash + Character.toUpperCase(c);
+                }
+                int length = hi - lo;
+                for (int slot = spread(hash) & MASK; NAMES[slot] != null; slot = (slot + 1) & MASK) {
+                    String name = NAMES[slot];
+                    if (name.length() == length && regionMatches(s, lo, name)) {
+                        return ZONES[slot];
+                    }
+                }
+                throw NumericException.instance();
+            }
+
+            private static boolean regionMatches(CharSequence value, int lo, String name) {
+                for (int i = 0, n = name.length(); i < n; i++) {
+                    if (Character.toUpperCase(value.charAt(lo + i)) != name.charAt(i)) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+
+            private static int spread(int hash) {
+                return hash ^ (hash >>> 16);
             }
         }
 
@@ -697,7 +766,8 @@ final class QwpSchemaTimestampParser {
                     // The server computes future rules with the parsed year,
                     // even when calendar arithmetic has wrapped the epoch.
                     long after = 0;
-                    for (ZoneOffsetTransitionRule rule : recurring) {
+                    for (int i = 0, n = recurring.size(); i < n; i++) {
+                        ZoneOffsetTransitionRule rule = recurring.get(i);
                         long transition = transitionEpoch(rule, year);
                         long before = rule.getOffsetBefore().getTotalSeconds() * SECOND;
                         if (epoch < transition) {
@@ -728,7 +798,8 @@ final class QwpSchemaTimestampParser {
                         throw NumericException.instance();
                     }
                     long after = 0;
-                    for (ZoneOffsetTransitionRule rule : recurring) {
+                    for (int i = 0, n = recurring.size(); i < n; i++) {
+                        ZoneOffsetTransitionRule rule = recurring.get(i);
                         long transition = transitionEpochMillis(rule, year);
                         long before = rule.getOffsetBefore().getTotalSeconds() * DATE_SECOND;
                         if (epoch < transition) {

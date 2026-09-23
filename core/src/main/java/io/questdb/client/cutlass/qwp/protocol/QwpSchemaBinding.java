@@ -1598,15 +1598,8 @@ public final class QwpSchemaBinding {
             CharSequence value,
             int targetType
     ) {
-        Utf8StringSink sink = timestampTextSink;
-        if (sink == null) {
-            timestampTextSink = sink = new Utf8StringSink(Math.max(32, value.length()));
-        } else {
-            sink.clear();
-        }
-        sink.put(value);
         try {
-            long micros = QwpSchemaTimestampParser.parse(sink.asAsciiCharSequence());
+            long micros = QwpSchemaTimestampParser.parse(value);
             if (targetType == ColumnType.TIMESTAMP_NANO) {
                 if (micros > Long.MAX_VALUE / 1000 || micros < Long.MIN_VALUE / 1000) {
                     throw NumericException.instance();
