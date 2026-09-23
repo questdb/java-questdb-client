@@ -1156,14 +1156,17 @@ public class QwpWebSocketSender implements Sender {
         if (timeoutMillis <= 0L) {
             return false;
         }
-        long deadlineNanos = System.nanoTime() + timeoutMillis * 1_000_000L;
+        // Elapsed-versus-budget, not an absolute deadline: toNanos saturates, so
+        // Long.MAX_VALUE waits indefinitely instead of wrapping to no wait.
+        final long startNanos = System.nanoTime();
+        final long budgetNanos = TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
         while (cursorEngine.ackedFsn() < targetFsn) {
             cursorEngine.checkDurability();
             if (cursorSendLoop != null) {
                 cursorSendLoop.checkError();
             }
             checkConnectionError();
-            if (System.nanoTime() >= deadlineNanos) {
+            if (System.nanoTime() - startNanos >= budgetNanos) {
                 return false;
             }
             java.util.concurrent.locks.LockSupport.parkNanos(50_000L);
@@ -4160,7 +4163,8 @@ public class QwpWebSocketSender implements Sender {
                 LOG.error("Error in close-drain-waiting test hook: {}", String.valueOf(t));
             }
         }
-        long deadlineNanos = System.nanoTime() + closeFlushTimeoutMillis * 1_000_000L;
+        final long startNanos = System.nanoTime();
+        final long budgetNanos = TimeUnit.MILLISECONDS.toNanos(closeFlushTimeoutMillis);
         restoreInterrupt[0] |= Thread.interrupted();
         try {
             while (cursorEngine.ackedFsn() < target) {
@@ -4180,7 +4184,7 @@ public class QwpWebSocketSender implements Sender {
                 } else {
                     cursorSendLoop.checkError();
                 }
-                if (System.nanoTime() >= deadlineNanos) {
+                if (System.nanoTime() - startNanos >= budgetNanos) {
                     long acked = cursorEngine.ackedFsn();
                     // Name the outage the I/O thread is riding out, when there is one. A
                     // foreground sender now retries endpoint-policy rejections indefinitely,
@@ -4460,12 +4464,13 @@ public class QwpWebSocketSender implements Sender {
         if (schemaMode == Sender.SchemaMode.OFF) {
             return null;
         }
-        final long deadlineNanos = System.nanoTime() + schemaWaitMillis * 1_000_000L;
+        final long startNanos = System.nanoTime();
+        final long budgetNanos = TimeUnit.MILLISECONDS.toNanos(schemaWaitMillis);
         if (schemaMode == Sender.SchemaMode.STRICT) {
-            if (!cursorSendLoop.awaitInitialSchemaMode(remainingSchemaMillis(deadlineNanos))) {
+            if (!cursorSendLoop.awaitInitialSchemaMode(remainingSchemaMillis(startNanos, budgetNanos))) {
                 return null;
             }
-            return cursorSendLoop.resolveSchema(currentTableName, remainingSchemaMillis(deadlineNanos));
+            return cursorSendLoop.resolveSchema(currentTableName, remainingSchemaMillis(startNanos, budgetNanos));
         }
         if (!cursorSendLoop.hasEverConnected()) {
             return null;
@@ -4477,7 +4482,7 @@ public class QwpWebSocketSender implements Sender {
             return null;
         }
         try {
-            return cursorSendLoop.resolveSchema(currentTableName, remainingSchemaMillis(deadlineNanos));
+            return cursorSendLoop.resolveSchema(currentTableName, remainingSchemaMillis(startNanos, budgetNanos));
         } catch (LineSenderSchemaException e) {
             if (e.getReason() == LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE
                     || e.getReason() == LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE) {
@@ -4539,8 +4544,13 @@ public class QwpWebSocketSender implements Sender {
         return (RuntimeException) e;
     }
 
-    private static long remainingSchemaMillis(long deadlineNanos) {
-        long remaining = deadlineNanos - System.nanoTime();
+    /**
+     * Milliseconds left of a saturated nanosecond budget, rounded up. Comparing
+     * elapsed time against the budget cannot wrap, unlike an absolute deadline,
+     * so a budget of Long.MAX_VALUE millis means no limit.
+     */
+    private static long remainingSchemaMillis(long startNanos, long budgetNanos) {
+        long remaining = budgetNanos - (System.nanoTime() - startNanos);
         return remaining <= 0 ? 0 : 1L + (remaining - 1L) / 1_000_000L;
     }
 

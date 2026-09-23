@@ -1613,8 +1613,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * handshake is never interpreted as a legacy peer.
      */
     public boolean awaitInitialSchemaMode(long timeoutMillis) {
-        long timeoutNanos = timeoutMillis > Long.MAX_VALUE / 1_000_000L
-                ? Long.MAX_VALUE : timeoutMillis * 1_000_000L;
+        long timeoutNanos = TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
         long start = System.nanoTime();
         while (!hasEverConnected) {
             checkError();

@@ -502,7 +502,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      *
      * @param timeoutMillis upper bound on the wait; {@code <= 0} returns the
      *                      current state without blocking (the flush still
-     *                      happens before the check)
+     *                      happens before the check), and {@code Long.MAX_VALUE}
+     *                      waits without a limit
      * @return {@code true} if the server has acknowledged every published
      *         frame on return, {@code false} on timeout
      * @throws LineSenderException if the transport has latched a terminal error
@@ -2000,7 +2001,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * {@link Sender#drain(long)} explicitly before close().
          * <p>
          * Set to {@code 0} or {@code -1} to opt out — close() will not wait
-         * at all (fast close). Pending data is then lost in memory mode and
+         * at all (fast close). {@code Long.MAX_VALUE} waits without a limit. Pending data is then lost in memory mode and
          * recovered by the next sender in SF mode.
          * <p>
          * WebSocket transport only.
@@ -3046,8 +3047,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         /**
          * Upper bound for one schema wait: the first WebSocket upgrade, if it
          * has not completed yet, plus one schema lookup round trip. Reconnects
-         * consume the same budget; they do not restart it. Default 30 s. At the
-         * bound, {@link SchemaMode#AUTO} writes the row with the legacy contract
+         * consume the same budget; they do not restart it. Default 30 s;
+         * {@code Long.MAX_VALUE} waits without a limit. At the bound, {@link SchemaMode#AUTO} writes the row with the legacy contract
          * and {@link SchemaMode#STRICT} fails it. WebSocket transport only.
          */
         public LineSenderBuilder schemaWaitMillis(long millis) {

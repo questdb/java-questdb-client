@@ -2239,6 +2239,28 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test(timeout = 10_000)
+    public void testUnboundedSchemaWaitStillResolves() throws Exception {
+        assertMemoryLeak(() -> {
+            for (String mode : new String[]{"strict", "auto"}) {
+                SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 91, 92);
+                // Long.MAX_VALUE once overflowed the absolute deadline into a zero
+                // wait: STRICT failed the row and AUTO fell back to legacy framing.
+                try (TestWebSocketServer server = schemaServer(handler);
+                     Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                             + ";schema_mode=" + mode + ";schema_wait_millis=" + Long.MAX_VALUE + ";"
+                             + "auto_flush_rows=2147483647;auto_flush_bytes=0;auto_flush_interval=2147483646;"
+                             + "close_flush_timeout_millis=0;")) {
+                    sender.table("events").uuidColumn("id", 1, 2).atNow();
+                    sender.flush();
+                    Assert.assertEquals(mode, 1, handler.describeRequests.get());
+                    Assert.assertTrue(mode, (handler.awaitDataFrame()[QwpConstants.HEADER_OFFSET_FLAGS]
+                            & QwpConstants.FLAG_SCHEMA) != 0);
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 10_000)
     public void testStrictSchemaLookupDeadlineFailsTypedThenRetryUsesAvailableSchema() throws Exception {
         assertMemoryLeak(() -> {
             SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 91, 92);

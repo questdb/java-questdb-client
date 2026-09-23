@@ -15,6 +15,7 @@ import io.questdb.client.std.Chars;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 import static io.questdb.client.LineSenderSchemaException.Reason.ACCESS_DENIED;
 import static io.questdb.client.LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE;
@@ -39,7 +40,7 @@ final class QwpSchemaCoordinator {
                     + QwpSchemaProtocol.MAX_NAME_UTF16_LENGTH + " UTF-16 units");
         }
         final String key = normalize(tableName);
-        final long timeoutNanos = timeoutNanos(timeoutMillis);
+        final long timeoutNanos = TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
         synchronized (this) {
             if (closed) {
                 throw failure(SCHEMA_UNAVAILABLE, key, "schema coordinator is closed");
@@ -235,10 +236,6 @@ final class QwpSchemaCoordinator {
             complete(request, null, failure(SCHEMA_UNAVAILABLE, request.key, "schema coordinator is closed"));
         }
         notifyAll();
-    }
-
-    private static long timeoutNanos(long timeoutMillis) {
-        return timeoutMillis > Long.MAX_VALUE / 1_000_000L ? Long.MAX_VALUE : timeoutMillis * 1_000_000L;
     }
 
     private static LineSenderSchemaException failure(LineSenderSchemaException.Reason reason, String table, String detail) {
