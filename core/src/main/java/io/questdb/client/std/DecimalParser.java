@@ -338,8 +338,10 @@ public final class DecimalParser {
      * @return true if "NaN" or "Infinity" is found at position lo, false otherwise
      */
     private static boolean isNanOrInfinite(char ch, CharSequence cs, int lo, int hi) {
-        return (ch == 'N' && hi - lo == 3 && cs.charAt(lo + 1) == 'a' && cs.charAt(lo + 2) == 'N') ||
-                (ch == 'I' && hi - lo == 8 && cs.charAt(lo + 1) == 'n' && cs.charAt(lo + 2) == 'f'
+        // A prefix match, like the server's DecimalParser: "NaNjunk" parses as NULL on
+        // every server ingest path, so the client must not reject it.
+        return (ch == 'N' && lo + 2 < hi && cs.charAt(lo + 1) == 'a' && cs.charAt(lo + 2) == 'N') ||
+                (ch == 'I' && lo + 7 < hi && cs.charAt(lo + 1) == 'n' && cs.charAt(lo + 2) == 'f'
                         && cs.charAt(lo + 3) == 'i' && cs.charAt(lo + 4) == 'n' && cs.charAt(lo + 5) == 'i'
                         && cs.charAt(lo + 6) == 't' && cs.charAt(lo + 7) == 'y');
     }

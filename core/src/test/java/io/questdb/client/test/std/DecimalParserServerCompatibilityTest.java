@@ -40,11 +40,15 @@ public class DecimalParserServerCompatibilityTest {
     }
 
     @Test
-    public void testSpecialValuesRequireTheCompleteToken() throws NumericException {
+    public void testSpecialValuesMatchByPrefixLikeServer() throws NumericException {
         assertNullParsed("NaN", 38, 4);
         assertNullParsed("-Infinity", 76, 8);
-        assertRejected("NaNjunk", 38, 4);
-        assertRejected("Infinitygarbage", 76, 8);
+        // The server's DecimalParser treats NaN and Infinity as prefixes.
+        assertNullParsed("NaNjunk", 38, 4);
+        assertNullParsed("NaN ", 38, 4);
+        assertNullParsed("Infinitygarbage", 76, 8);
+        assertRejected("Na", 38, 4);
+        assertRejected("Infinit", 76, 8);
     }
 
     @Test
