@@ -766,9 +766,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * to finalize the row. You can then start a new row by calling this method again.
      * <br>
      * If you want to cancel the current row, you can call {@link #cancelRow()}.
-     * QWP WebSocket senders resolve the table's schema here when the server speaks schema-aware QWP, so this call may
-     * wait for or fail schema discovery; {@link SchemaMode} decides what happens when the schema is not obtainable.
-     * Setters may resolve it again when an implicitly started row crosses a batch boundary.
+     * QWP WebSocket senders resolve the table's schema here when the server speaks schema-aware QWP. The call may
+     * therefore wait up to {@code schema_wait_millis} (with an asynchronous initial connect, that includes waiting for
+     * the first connection), and it publishes the pending batch when this table's wire contract differs from it. So
+     * schema errors, and the flush-timeout and backpressure errors of that publish, can surface here, before the row
+     * has any values. A failure leaves the table selected and no row started; calling this method again retries the
+     * resolution. {@link SchemaMode} decides what happens when the schema is not obtainable. Setters may resolve it
+     * again when an implicitly started row crosses a batch boundary.
      *
      * @param table name of the table
      * @return this instance for method chaining
