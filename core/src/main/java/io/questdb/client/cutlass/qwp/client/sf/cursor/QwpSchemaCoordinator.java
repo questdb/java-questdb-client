@@ -12,9 +12,7 @@ import io.questdb.client.cutlass.qwp.protocol.QwpSchemaProtocol;
 import io.questdb.client.cutlass.qwp.protocol.QwpSchemaResponse;
 import io.questdb.client.std.Chars;
 
-import java.util.Iterator;
-import java.util.LinkedHashMap;
-import java.util.Map;
+import java.util.HashMap;
 import java.util.concurrent.TimeUnit;
 
 import static io.questdb.client.LineSenderSchemaException.Reason.ACCESS_DENIED;
@@ -22,8 +20,9 @@ import static io.questdb.client.LineSenderSchemaException.Reason.SCHEMA_UNAVAILA
 import static io.questdb.client.LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE;
 
 final class QwpSchemaCoordinator {
-    static final int MAX_CACHE_ENTRIES = 1_000_000;
-    private LinkedHashMap<String, QwpSchemaResponse> cache;
+    // Bounded by the tables this sender writes, like its per-table buffers,
+    // each far heavier than an entry, so it needs no eviction.
+    private final HashMap<String, QwpSchemaResponse> cache = new HashMap<>();
     private volatile boolean closed;
     private volatile boolean hasPendingRequest;
     private long nextRequestId = 1;
@@ -46,12 +45,12 @@ final class QwpSchemaCoordinator {
                 throw failure(SCHEMA_UNAVAILABLE, key, "schema coordinator is closed");
             }
             if (!refresh) {
-                QwpSchemaResponse cached = cache == null ? null : cache.get(key);
+                QwpSchemaResponse cached = cache.get(key);
                 if (cached != null) {
                     return cached;
                 }
             } else {
-                remove(key);
+                cache.remove(key);
             }
             if (timeoutNanos - (System.nanoTime() - startNanos) <= 0) {
                 throw failure(SCHEMA_UNAVAILABLE, key, "schema lookup timed out");
@@ -59,13 +58,7 @@ final class QwpSchemaCoordinator {
             if (request != null) {
                 throw failure(SCHEMA_UNAVAILABLE, key, "another schema lookup is already in progress");
             }
-            if (nextRequestId <= 0 || nextRequestId == Long.MAX_VALUE) {
-                throw failure(UNSUPPORTED_FEATURE, key, "schema request id space is exhausted");
-            }
-            long id = nextRequestId;
-            byte[] message = QwpSchemaProtocol.encodeDescribe(id, tableName);
-            nextRequestId++;
-            Request own = new Request(id, key, tableName.toString(), startNanos, timeoutNanos, message);
+            Request own = new Request(key, tableName.toString(), startNanos, timeoutNanos);
             request = own;
             // The I/O loop polls hasPendingRequest on every pass; waking it would
             // cut its reconnect backoff short while the wire is down.
@@ -97,6 +90,8 @@ final class QwpSchemaCoordinator {
             complete(request, null, failure(SCHEMA_UNAVAILABLE, request.key, "schema lookup timed out"));
             return null;
         }
+        // Every send attempt, first or after a reconnect, takes a fresh id, so a
+        // reply to an earlier attempt can never match this one.
         if (request.id == 0) {
             if (nextRequestId <= 0 || nextRequestId == Long.MAX_VALUE) {
                 complete(request, null, failure(UNSUPPORTED_FEATURE, request.key, "schema request id space is exhausted"));
@@ -130,21 +125,19 @@ final class QwpSchemaCoordinator {
             return;
         }
         if (isCacheable(response.getResult())) {
-            put(current.key, response);
+            cache.put(current.key, response);
             complete(current, response, null);
             return;
         }
+        cache.remove(current.key);
         switch (response.getResult()) {
             case QwpSchemaProtocol.RESULT_DENIED:
-                remove(current.key);
                 complete(current, null, failure(ACCESS_DENIED, current.key, "schema access denied"));
                 return;
             case QwpSchemaProtocol.RESULT_UNAVAILABLE:
-                remove(current.key);
                 complete(current, null, failure(SCHEMA_UNAVAILABLE, current.key, "schema is unavailable"));
                 return;
             default:
-                remove(current.key);
                 complete(current, null, failure(UNSUPPORTED_FEATURE, current.key, "unsupported schema result"));
         }
     }
@@ -167,9 +160,9 @@ final class QwpSchemaCoordinator {
                     return;
                 }
                 if (isCacheable(schema.getResult())) {
-                    put(key, schema);
+                    cache.put(key, schema);
                 } else {
-                    remove(key);
+                    cache.remove(key);
                 }
             }
         }
@@ -203,7 +196,7 @@ final class QwpSchemaCoordinator {
      * or {@code null}. Never sends a request and never waits.
      */
     synchronized QwpSchemaResponse peek(CharSequence tableName) {
-        if (closed || cache == null) {
+        if (closed) {
             return null;
         }
         return cache.get(normalize(tableName));
@@ -223,13 +216,13 @@ final class QwpSchemaCoordinator {
 
     synchronized void clearCache() {
         if (!closed) {
-            cache = null;
+            cache.clear();
         }
     }
 
     synchronized void close() {
         closed = true;
-        cache = null;
+        cache.clear();
         if (request != null) {
             complete(request, null, failure(SCHEMA_UNAVAILABLE, request.key, "schema coordinator is closed"));
         }
@@ -284,23 +277,6 @@ final class QwpSchemaCoordinator {
         notifyAll();
     }
 
-    private void put(String key, QwpSchemaResponse schema) {
-        if (cache == null) {
-            cache = new LinkedHashMap<>();
-        }
-        cache.put(key, schema);
-        while (cache.size() > MAX_CACHE_ENTRIES) {
-            Iterator<Map.Entry<String, QwpSchemaResponse>> iterator = cache.entrySet().iterator();
-            iterator.next();
-            iterator.remove();
-        }
-    }
-
-    private void remove(String key) {
-        if (cache != null) {
-            cache.remove(key);
-        }
-    }
 
     static final class Request {
         final long startNanos;
@@ -314,13 +290,11 @@ final class QwpSchemaCoordinator {
         QwpSchemaResponse response;
         WebSocketClient sentClient;
 
-        Request(long id, String key, String tableName, long startNanos, long timeoutNanos, byte[] message) {
-            this.id = id;
+        Request(String key, String tableName, long startNanos, long timeoutNanos) {
             this.key = key;
             this.tableName = tableName;
             this.startNanos = startNanos;
             this.timeoutNanos = timeoutNanos;
-            this.message = message;
         }
 
         long remainingNanos() {
