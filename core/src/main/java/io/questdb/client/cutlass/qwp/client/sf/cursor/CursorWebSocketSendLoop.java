@@ -932,6 +932,31 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * The policy-aware constructor as released in 1.3.x: equivalent to the overload
+     * below with {@code externalFsnBase = 0L}, the value every caller outside a
+     * symbol-dictionary recycle passes. Kept so callers compiled against a released
+     * jar keep linking; {@code ExportedApiCompatibilityTest} pins it.
+     */
+    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
+                                   long fsnAtZero, long parkNanos,
+                                   ReconnectFactory reconnectFactory,
+                                   long reconnectInitialBackoffMillis,
+                                   long reconnectMaxBackoffMillis,
+                                   boolean durableAckMode,
+                                   long durableAckKeepaliveIntervalMillis,
+                                   int maxHeadFrameRejections,
+                                   long poisonMinEscalationWindowMillis,
+                                   long catchUpCapGapMinEscalationWindowMillis,
+                                   ReconnectPolicy reconnectPolicy) {
+        this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
+                reconnectInitialBackoffMillis,
+                reconnectMaxBackoffMillis, durableAckMode,
+                durableAckKeepaliveIntervalMillis, maxHeadFrameRejections,
+                poisonMinEscalationWindowMillis, catchUpCapGapMinEscalationWindowMillis,
+                reconnectPolicy, 0L);
+    }
+
+    /**
      * Policy-aware master constructor. A foreground sender fails fast while
      * establishing its first connection, then retries endpoint-policy failures
      * indefinitely after it has been live. An orphan drainer returns such failures

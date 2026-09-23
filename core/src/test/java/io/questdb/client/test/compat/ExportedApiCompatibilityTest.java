@@ -28,9 +28,11 @@ import io.questdb.client.cutlass.http.client.Fragment;
 import io.questdb.client.cutlass.http.client.Response;
 import io.questdb.client.cutlass.line.http.AbstractLineHttpSender;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.util.LinkedHashSet;
@@ -53,6 +55,11 @@ import java.util.TreeSet;
  * are the ones present at this branch's merge base ({@code 2489b243}); they are written out literally rather
  * than derived from the current classes, because a pin computed from the thing it pins proves nothing.
  * Adding an overload is fine and this test stays green; retyping or removing one turns it red.
+ * <p>
+ * {@link #RELEASED_CONSTRUCTOR_SIGNATURES} pins every public {@code CursorWebSocketSendLoop} constructor
+ * present in the published {@code org.questdb:questdb-client:1.3.9} jar, copied from {@code javap} of that
+ * jar for the same reason: the policy-aware constructor was widened in place on this branch and the
+ * released 13-argument form had to be restored as an overload.
  */
 public class ExportedApiCompatibilityTest {
 
@@ -78,6 +85,20 @@ public class ExportedApiCompatibilityTest {
             "createLineSender(io.questdb.client.std.ObjList,io.questdb.client.std.IntList,java.lang.String,io.questdb.client.HttpClientConfiguration,io.questdb.client.ClientTlsConfiguration,int,java.lang.String,java.lang.String,java.lang.String,int,long,int,long,long,int)io.questdb.client.cutlass.line.http.AbstractLineHttpSender",
     };
 
+    /**
+     * Every public {@code CursorWebSocketSendLoop} constructor in the 1.3.9 jar, as {@code (paramType,...)}
+     * over erased type names, in the order {@code javap} printed them.
+     */
+    private static final String[] RELEASED_CONSTRUCTOR_SIGNATURES = {
+            "(io.questdb.client.cutlass.http.client.WebSocketClient,io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine,long,long,io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop$ReconnectFactory,long,long)",
+            "(io.questdb.client.cutlass.http.client.WebSocketClient,io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine,long,long,io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop$ReconnectFactory,long,long,boolean)",
+            "(io.questdb.client.cutlass.http.client.WebSocketClient,io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine,long,long,io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop$ReconnectFactory,long,long,boolean,long)",
+            "(io.questdb.client.cutlass.http.client.WebSocketClient,io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine,long,long,io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop$ReconnectFactory,long,long,boolean,long,int)",
+            "(io.questdb.client.cutlass.http.client.WebSocketClient,io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine,long,long,io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop$ReconnectFactory,long,long,boolean,long,int,long)",
+            "(io.questdb.client.cutlass.http.client.WebSocketClient,io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine,long,long,io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop$ReconnectFactory,long,long,boolean,long,int,long,long)",
+            "(io.questdb.client.cutlass.http.client.WebSocketClient,io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine,long,long,io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop$ReconnectFactory,long,long,boolean,long,int,long,long,io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop$ReconnectPolicy)",
+    };
+
     @Test
     public void testPreBranchCreateLineSenderOverloadsStillLink() {
         assertSignaturesPresent(AbstractLineHttpSender.class, "createLineSender");
@@ -86,6 +107,11 @@ public class ExportedApiCompatibilityTest {
     @Test
     public void testPreBranchQwpWebSocketSenderConnectOverloadsStillLink() {
         assertSignaturesPresent(QwpWebSocketSender.class, "connect");
+    }
+
+    @Test
+    public void testReleasedCursorWebSocketSendLoopConstructorsStillLink() {
+        assertConstructorsPresent(CursorWebSocketSendLoop.class, RELEASED_CONSTRUCTOR_SIGNATURES);
     }
 
     @Test
@@ -127,6 +153,26 @@ public class ExportedApiCompatibilityTest {
         Assert.assertEquals(3, legacy.calls);
     }
 
+    private static void assertConstructorsPresent(Class<?> type, String[] expectedSignatures) {
+        final Set<String> actual = new TreeSet<>();
+        for (Constructor<?> c : type.getConstructors()) {
+            actual.add(signatureOf(c));
+        }
+        final Set<String> missing = new LinkedHashSet<>();
+        for (String signature : expectedSignatures) {
+            if (!actual.contains(signature)) {
+                missing.add(signature);
+            }
+        }
+        Assert.assertTrue(
+                "these public " + type.getSimpleName() + " constructors are in the released jar and no longer "
+                        + "exist, so a caller compiled against that release breaks with NoSuchMethodError. "
+                        + "Add an overload instead of widening one in place.\n  missing:\n    "
+                        + String.join("\n    ", missing) + "\n  present:\n    "
+                        + String.join("\n    ", actual),
+                missing.isEmpty());
+    }
+
     private static void assertSignaturesPresent(Class<?> type, String methodName) {
         final Set<String> actual = new TreeSet<>();
         for (Method m : type.getMethods()) {
@@ -153,6 +199,18 @@ public class ExportedApiCompatibilityTest {
                         + String.join("\n    ", missing) + "\n  present:\n    "
                         + String.join("\n    ", actual),
                 missing.isEmpty());
+    }
+
+    private static String signatureOf(Constructor<?> c) {
+        final StringBuilder sb = new StringBuilder("(");
+        final Class<?>[] params = c.getParameterTypes();
+        for (int i = 0; i < params.length; i++) {
+            if (i > 0) {
+                sb.append(',');
+            }
+            sb.append(params[i].getName());
+        }
+        return sb.append(')').toString();
     }
 
     private static String signatureOf(Method m) {
