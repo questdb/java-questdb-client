@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.Sender;
 import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.line.LineSenderException;
@@ -345,7 +346,7 @@ public class DeltaDictRecoveryTest {
 
                     BackgroundDrainer queuedDrainer = new BackgroundDrainer(
                             staleSnapshotPath, 256, 8192, () -> null,
-                            1000, 1, 10, true, 0);
+                            1000, 1, 10, DurableAckTiers.REPLICATED, 0);
                     Thread drainerThread = new Thread(queuedDrainer, "qwp-queued-orphan");
                     drainerThread.start();
                     drainerThread.join(5_000);
@@ -982,7 +983,7 @@ public class DeltaDictRecoveryTest {
                         slot, 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
                         CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, ff);
                 Sender sender = QwpWebSocketSender.connect(
-                        "localhost", port, null, 0, 0, 0L, null, false, engine);
+                        "localhost", port, null, 0, 0, 0L, null, DurableAckTiers.NONE, engine);
                 try {
                     ff.armed = true; // the next dictionary append cannot grow its window
                     sender.table("m").symbol("s", "boom").longColumn("v", 1L).atNow();
@@ -1552,7 +1553,7 @@ public class DeltaDictRecoveryTest {
                         slot.toString(), 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
                         CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, phase1DictFf);
                 try (Sender s1 = QwpWebSocketSender.connect(
-                        "localhost", port, null, 0, 0, 0L, null, false, phase1Engine, 0L)) {
+                        "localhost", port, null, 0, 0, 0L, null, DurableAckTiers.NONE, phase1Engine, 0L)) {
                     for (int i = 0; i < DISTINCT_SYMBOLS; i++) {
                         s1.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
                         s1.flush();
@@ -1639,7 +1640,7 @@ public class DeltaDictRecoveryTest {
                         slot.toString(), 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
                         CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, new UnopenableDictFacade());
                 try (Sender s1 = QwpWebSocketSender.connect(
-                        "localhost", port, null, 0, 0, 0L, null, false, phase1Engine, 0L)) {
+                        "localhost", port, null, 0, 0, 0L, null, DurableAckTiers.NONE, phase1Engine, 0L)) {
                     for (int i = 0; i < DISTINCT_SYMBOLS; i++) {
                         s1.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
                         s1.flush();
@@ -1720,7 +1721,7 @@ public class DeltaDictRecoveryTest {
                         slot.toString(), 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
                         CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, phase1DictFf);
                 try (Sender s1 = QwpWebSocketSender.connect(
-                        "localhost", port, null, 0, 0, 0L, null, false, phase1Engine, 0L)) {
+                        "localhost", port, null, 0, 0, 0L, null, DurableAckTiers.NONE, phase1Engine, 0L)) {
                     for (int i = 0; i < DISTINCT_SYMBOLS; i++) {
                         s1.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
                         s1.flush();
@@ -2119,7 +2120,7 @@ public class DeltaDictRecoveryTest {
                         slot, 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
                         CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, ff);
                 Sender sender = QwpWebSocketSender.connect(
-                        "localhost", port, null, 0, 0, 0L, null, false, engine);
+                        "localhost", port, null, 0, 0, 0L, null, DurableAckTiers.NONE, engine);
                 try {
                     // Armed from the start, so the very first ensureAppendMap is refused --
                     // a later append would sit inside the window already mapped and never
@@ -2354,7 +2355,7 @@ public class DeltaDictRecoveryTest {
                         slot.toString(), 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
                         CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, new UnopenableDictFacade());
                 try (Sender s1 = QwpWebSocketSender.connect(
-                        "localhost", port, null, 0, 0, 0L, null, false, phase1Engine, 0L)) {
+                        "localhost", port, null, 0, 0, 0L, null, DurableAckTiers.NONE, phase1Engine, 0L)) {
                     for (int i = 0; i < DISTINCT_SYMBOLS; i++) {
                         s1.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
                         s1.flush();

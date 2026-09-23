@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
@@ -101,7 +102,7 @@ public class MmapFaultDegradesTest {
                         slot, 4L * 1024 * 1024, 64L * 1024 * 1024,
                         CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, ff);
                 QwpWebSocketSender sender = QwpWebSocketSender.connect(
-                        "localhost", port, null, 0, 0, 0L, null, false, engine);
+                        "localhost", port, null, 0, 0, 0L, null, DurableAckTiers.NONE, engine);
                 try {
                     ff.armed = true; // the next dictionary mmap growth raises the fault
                     sender.table("m").symbol("s", "boom").longColumn("v", 1L).atNow();
@@ -190,7 +191,7 @@ public class MmapFaultDegradesTest {
                 // now so ONLY the heal's later MAP_RW growth of that same fd raises the fault.
                 ff.armed = true;
                 QwpWebSocketSender resumed = QwpWebSocketSender.connect(
-                        "localhost", port, null, 0, 0, 0L, null, false, engine);
+                        "localhost", port, null, 0, 0, 0L, null, DurableAckTiers.NONE, engine);
                 try {
                     Assert.assertFalse("a recognised mmap access fault during the dictionary heal "
                                     + "must degrade the sender to self-sufficient frames, not escape build()",

@@ -60,6 +60,10 @@ public class TestWebSocketServer implements Closeable {
     // Authorization header value captured from each well-formed upgrade request ("" when absent), in
     // arrival order. Tests poll this to assert the token a provider supplied at each (re)handshake.
     private final BlockingQueue<String> capturedAuthHeaders = new LinkedBlockingQueue<>();
+    // X-QWP-Request-Durable-Ack header value captured from each well-formed upgrade request
+    // ("" when absent), in arrival order. Tests poll this to assert the exact request token
+    // the client sent for a configured tier set ("true", "local", "local,replicated", ...).
+    private final BlockingQueue<String> capturedDurableAckRequests = new LinkedBlockingQueue<>();
     private final List<ClientHandler> clients = new CopyOnWriteArrayList<>();
     private final boolean emitDurableAckHeader;
     private final WebSocketServerHandler handler;
@@ -115,6 +119,11 @@ public class TestWebSocketServer implements Closeable {
     // Live-updatable via setSuppressDurableAckHeader(), so a test can start
     // in the gap and later let the cluster "settle".
     private volatile boolean suppressDurableAckHeader;
+    // When non-null, 101 upgrade responses carry this exact X-QWP-Durable-Ack value
+    // instead of the granted-set echo -- simulating a server that grants a set other
+    // than the one requested (e.g. "enabled" to a client asking for "local"). The
+    // client must treat any token other than its expected one as a denial.
+    private volatile String durableAckHeaderValue;
     // When > 0, the next handshake responds with this status code + the
     // reason phrase from {@link #rejectingStatusReason}. Used to simulate
     // 401, 403, 404, 426, 503, etc. that the failover loop should
@@ -321,6 +330,25 @@ public class TestWebSocketServer implements Closeable {
      * advertising, the way a rolling upgrade eventually settles. The setting
      * applies to every new handshake until cleared.
      */
+    /**
+     * Blocks up to {@code timeout} for the next captured X-QWP-Request-Durable-Ack
+     * header value ("" when the upgrade request carried none). Values arrive in
+     * handshake order, one per well-formed upgrade request.
+     */
+    public String pollDurableAckRequest(long timeout, TimeUnit unit) throws InterruptedException {
+        return capturedDurableAckRequests.poll(timeout, unit);
+    }
+
+    /**
+     * Forces 101 upgrade responses to carry this exact {@code X-QWP-Durable-Ack}
+     * value instead of echoing the client's requested set. Pass null to restore
+     * the echo behavior. Only takes effect on a server constructed with
+     * {@code emitDurableAckHeader}.
+     */
+    public void setDurableAckHeaderValue(String value) {
+        this.durableAckHeaderValue = value;
+    }
+
     public void setSuppressDurableAckHeader(boolean suppressDurableAckHeader) {
         this.suppressDurableAckHeader = suppressDurableAckHeader;
     }
@@ -583,6 +611,7 @@ public class TestWebSocketServer implements Closeable {
 
             String key = null;
             String authorization = "";
+            String durableAckRequest = "";
             String[] lines = request.toString().split("\r\n");
             if (lines.length > 0) {
                 // GET <path> HTTP/1.1
@@ -597,6 +626,8 @@ public class TestWebSocketServer implements Closeable {
                     key = line.substring(18).trim();
                 } else if (lower.startsWith("authorization:")) {
                     authorization = line.substring("authorization:".length()).trim();
+                } else if (lower.startsWith("x-qwp-request-durable-ack:")) {
+                    durableAckRequest = line.substring("x-qwp-request-durable-ack:".length()).trim();
                 }
             }
 
@@ -604,6 +635,7 @@ public class TestWebSocketServer implements Closeable {
                 return false;
             }
             capturedAuthHeaders.add(authorization);
+            capturedDurableAckRequests.add(durableAckRequest);
 
             // Read-path reject: drop the egress upgrade before the 101 so the
             // query pool's connect fails fast, while ingest write-path upgrades
@@ -655,7 +687,18 @@ public class TestWebSocketServer implements Closeable {
                     .append("Connection: Upgrade\r\n")
                     .append("Sec-WebSocket-Accept: ").append(acceptKey).append("\r\n");
             if (emitDurableAckHeader && !suppressDurableAckHeader) {
-                sb.append("X-QWP-Durable-Ack: enabled\r\n");
+                String granted = durableAckHeaderValue;
+                if (granted == null) {
+                    // Grant exactly what the client asked for: the legacy "true"
+                    // request is confirmed with the "enabled" token, an explicit
+                    // tier list is echoed verbatim. A client that did not ask
+                    // still sees "enabled" -- it ignores the header without the
+                    // opt-in.
+                    granted = durableAckRequest.isEmpty() || "true".equalsIgnoreCase(durableAckRequest)
+                            ? "enabled"
+                            : durableAckRequest;
+                }
+                sb.append("X-QWP-Durable-Ack: ").append(granted).append("\r\n");
             }
             String role = advertisedRole;
             if (role != null) {

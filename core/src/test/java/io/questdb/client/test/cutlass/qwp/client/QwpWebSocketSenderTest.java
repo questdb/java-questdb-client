@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
@@ -349,7 +350,7 @@ public class QwpWebSocketSenderTest {
                 CursorSendEngine engine = new CursorSendEngine(null, minSegmentBytes, minSegmentBytes, 1L);
                 try (QwpWebSocketSender sender = QwpWebSocketSender.connect(
                         "localhost", port, null, Integer.MAX_VALUE, 0, 0L, null,
-                        false, engine, 0L)) {
+                        DurableAckTiers.NONE, engine, 0L)) {
                     sender.table("t").longColumn("v", 1L).atNow();
 
                     try {

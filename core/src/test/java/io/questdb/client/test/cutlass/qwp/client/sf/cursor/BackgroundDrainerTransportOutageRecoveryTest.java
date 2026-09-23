@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketClientFactory;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
@@ -108,7 +109,7 @@ public class BackgroundDrainerTransportOutageRecoveryTest {
                     RECONNECT_MAX_DURATION_MILLIS,
                     FAST_BACKOFF_MILLIS,
                     FAST_BACKOFF_MAX_MILLIS,
-                    /* requestDurableAck */ true,
+                    /* durableAckTiers */ DurableAckTiers.REPLICATED,
                     /* durableAckKeepaliveIntervalMillis */ 200L);
             CountingListener listener = new CountingListener();
             drainer.setListener(listener);
@@ -305,7 +306,7 @@ public class BackgroundDrainerTransportOutageRecoveryTest {
             WebSocketClient c = WebSocketClientFactory.newPlainTextInstance();
             try {
                 c.setQwpMaxVersion(1);
-                c.setQwpRequestDurableAck(true);
+                c.setQwpDurableAckTiers(DurableAckTiers.REPLICATED | DurableAckTiers.LEGACY_TRUE);
                 c.setConnectTimeout(5_000);
                 c.connect("localhost", port);
                 c.upgrade("/write/v4", 5_000, null);
