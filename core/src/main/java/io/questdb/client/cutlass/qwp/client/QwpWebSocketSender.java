@@ -1036,6 +1036,11 @@ public class QwpWebSocketSender implements Sender {
      * unambiguous. Symbol-dictionary recycling defaults to
      * {@link #DEFAULT_SYMBOL_DICT_RESET_ENABLED} / {@link #DEFAULT_SYMBOL_DICT_RESET_THRESHOLD_SYMBOLS} /
      * {@link #DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS}; the overload below takes those knobs explicitly.
+     * <p>
+     * Recycling requires a non-null engine rebuild factory installed via
+     * {@link #setEngineRebuildFactory(EngineRebuildFactory)};
+     * {@link io.questdb.client.Sender.LineSenderBuilder#build() Sender.LineSenderBuilder.build()}
+     * installs one automatically for WebSocket senders.
      */
     public static QwpWebSocketSender connect(
             List<Endpoint> endpoints,
@@ -1084,6 +1089,11 @@ public class QwpWebSocketSender implements Sender {
      * constant-credential counterpart to the master {@code connectWithCredentialSupplier} overload below.
      * A distinct (wider) arity, not a retyped signature, so callers compiled against the twenty-three-arg
      * form keep linking.
+     * <p>
+     * Recycling requires a non-null engine rebuild factory installed via
+     * {@link #setEngineRebuildFactory(EngineRebuildFactory)};
+     * {@link io.questdb.client.Sender.LineSenderBuilder#build() Sender.LineSenderBuilder.build()}
+     * installs one automatically for WebSocket senders.
      */
     public static QwpWebSocketSender connect(
             List<Endpoint> endpoints,
@@ -1135,6 +1145,11 @@ public class QwpWebSocketSender implements Sender {
      * SenderConnectionListener, int, int, long, long)}. Kept as its own overload, delegating to the master
      * below with the symbol-dictionary recycle knobs defaulted, so a caller compiled before those knobs'
      * arity moved into the master keeps linking; {@code ExportedApiCompatibilityTest} pins it.
+     * <p>
+     * Recycling requires a non-null engine rebuild factory installed via
+     * {@link #setEngineRebuildFactory(EngineRebuildFactory)};
+     * {@link io.questdb.client.Sender.LineSenderBuilder#build() Sender.LineSenderBuilder.build()}
+     * installs one automatically for WebSocket senders.
      */
     public static QwpWebSocketSender connectWithCredentialSupplier(
             List<Endpoint> endpoints,
@@ -1187,6 +1202,11 @@ public class QwpWebSocketSender implements Sender {
      * {@link #connectWithCredentialSupplier(List, ClientTlsConfiguration, int, int, long, Supplier,
      * boolean, CursorSendEngine, long, long, long, long, Sender.InitialConnectMode, SenderErrorHandler,
      * int, long, long, int, SenderConnectionListener, int)}.
+     * <p>
+     * Recycling requires a non-null engine rebuild factory installed via
+     * {@link #setEngineRebuildFactory(EngineRebuildFactory)};
+     * {@link io.questdb.client.Sender.LineSenderBuilder#build() Sender.LineSenderBuilder.build()}
+     * installs one automatically for WebSocket senders.
      */
     public static QwpWebSocketSender connectWithCredentialSupplier(
             List<Endpoint> endpoints,
