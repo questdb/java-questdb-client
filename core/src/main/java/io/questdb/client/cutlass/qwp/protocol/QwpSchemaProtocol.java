@@ -237,16 +237,6 @@ public final class QwpSchemaProtocol {
         if (value == null || value.length() == 0 || value.length() > MAX_NAME_UTF16_LENGTH) {
             throw new IllegalArgumentException(what + " must contain 1 to " + MAX_NAME_UTF16_LENGTH + " UTF-16 units");
         }
-        for (int i = 0; i < value.length(); i++) {
-            char c = value.charAt(i);
-            if (Character.isHighSurrogate(c)) {
-                if (++i >= value.length() || !Character.isLowSurrogate(value.charAt(i))) {
-                    throw new IllegalArgumentException(what + " contains an unpaired surrogate");
-                }
-            } else if (Character.isLowSurrogate(c)) {
-                throw new IllegalArgumentException(what + " contains an unpaired surrogate");
-            }
-        }
         byte[] bytes = value.toString().getBytes(StandardCharsets.UTF_8);
         if (bytes.length > MAX_NAME_UTF8_LENGTH) {
             throw new IllegalArgumentException(what + " exceeds " + MAX_NAME_UTF8_LENGTH + " UTF-8 bytes");

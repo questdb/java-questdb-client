@@ -864,6 +864,22 @@ public class QwpWebSocketSenderTest {
         });
     }
 
+    @Test
+    public void testUnpairedSurrogateTableNameIsRejectedBeforeConnect() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = createUnconnectedSender()) {
+                for (char invalidChar : new char[]{'\uD800', '\uDB80', '\uDFFF'}) {
+                    try {
+                        sender.table("bad" + invalidChar + "name");
+                        Assert.fail("an unpaired surrogate must be rejected");
+                    } catch (LineSenderException e) {
+                        Assert.assertTrue(e.getMessage().contains("table name contains illegal characters"));
+                    }
+                }
+            }
+        });
+    }
+
     private static MicrobatchBuffer getMicrobatchBuffer(QwpWebSocketSender sender, String fieldName) throws Exception {
         Field field = QwpWebSocketSender.class.getDeclaredField(fieldName);
         field.setAccessible(true);
