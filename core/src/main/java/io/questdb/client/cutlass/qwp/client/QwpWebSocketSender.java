@@ -4412,7 +4412,8 @@ public class QwpWebSocketSender implements Sender {
      * A table pins one schema snapshot per batch. Once the table holds pending rows,
      * later rows of the same batch validate against that snapshot without consulting
      * the cache; the first row after a flush or reset adopts whatever the cache holds
-     * by then, which ACK schema feedback and reconnects keep current.
+     * by then, which ACK schema feedback keeps current. A rejection that a column
+     * type change could explain evicts the snapshot; see {@link #onRowFailure}.
      * <p>
      * When no snapshot is pinned, the configured {@link Sender.SchemaMode} decides
      * between a schema lookup and the legacy contract; see
@@ -4557,8 +4558,19 @@ public class QwpWebSocketSender implements Sender {
 
     // Single home of the row-failure policy: roll the whole row back, then report
     // the failure as raised. A schema rejection is final for the batch's snapshot;
-    // the sender never looks up fresh metadata from a failed setter.
+    // the sender never looks up fresh metadata from a failed setter. When the
+    // snapshot type of a known column rejected the value, the column may have
+    // changed type since, and no frame may ever reach the server to earn feedback.
+    // The sender then evicts the snapshot, so the next batch looks the table up.
     private RuntimeException onRowFailure(Throwable e) {
+        QwpSchemaBinding binding = currentTableBuffer != null ? currentTableBuffer.getSchemaBinding() : null;
+        if (binding != null && binding.hasTargetTypeConflict()) {
+            binding.clearTargetTypeConflict();
+            CursorWebSocketSendLoop loop = cursorSendLoop;
+            if (loop != null) {
+                loop.evictSchema(currentTableBuffer.getTableName(), binding.getTableId(), binding.getMetadataVersion());
+            }
+        }
         rollbackRow();
         if (e instanceof Error) {
             throw (Error) e;

@@ -1240,6 +1240,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * Evicts the cached KNOWN snapshot of {@code tableName} if it still has the
+     * given identity, so the next batch that writes the table looks it up again.
+     */
+    public void evictSchema(CharSequence tableName, int tableId, long metadataVersion) {
+        schemaCoordinator.evictKnown(tableName, tableId, metadataVersion);
+    }
+
+    /**
      * Selects what happens to a schema lookup in flight when the connection
      * drops: {@code true} fails it immediately, {@code false} (the default) keeps
      * it pending with its original deadline for the replacement connection.
@@ -2783,7 +2791,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         }
         WebSocketClient old = this.client;
         this.client = newClient;
-        schemaCoordinator.clearCache();
+        // The schema cache survives the reconnect. The server ingests by column name
+        // and ignores the identity a frame carries, except to decide on feedback. A
+        // new connection has reported nothing yet, so the first ACK for each table
+        // refreshes any snapshot that went stale during the outage. Clearing here
+        // would cost one blocking DESCRIBE per table on the next batch.
         this.lastReconnectError = null;
         if (old != null) {
             try {

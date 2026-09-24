@@ -79,6 +79,7 @@ public final class QwpSchemaBinding {
     private final QwpTableBuffer buffer;
     private final QwpSchemaResponse schema;
     private final String tableName;
+    private boolean hasTargetTypeConflict;
     private Decimal256 decimalTextScratch;
     private StringSink charTextSink;
     private StringSink floatingTextSink;
@@ -171,7 +172,7 @@ public final class QwpSchemaBinding {
         }
         if (!ColumnType.isDecimal(targetType)
                 && targetType != ColumnType.STRING && targetType != ColumnType.VARCHAR) {
-            throw unsupported(name, "DECIMAL256", targetType, "conversion is not implemented");
+            throw targetTypeConflict(name, "DECIMAL256", targetType, "conversion is not implemented");
         }
         parseDecimalText(name, value, scratch, targetType);
         if (scratch.isNull()) {
@@ -249,7 +250,7 @@ public final class QwpSchemaBinding {
                 column.addString(value ? "true" : "false");
                 break;
             default:
-                throw unsupported(name, "BOOLEAN", targetType, "conversion is not implemented");
+                throw targetTypeConflict(name, "BOOLEAN", targetType, "conversion is not implemented");
         }
         return this;
     }
@@ -401,7 +402,7 @@ public final class QwpSchemaBinding {
         } else if (targetType == ColumnType.STRING || targetType == ColumnType.VARCHAR) {
             column.addString(formatGeoHash(value, precisionBits));
         } else {
-            throw unsupported(name, "GEOHASH", targetType, "conversion is not implemented");
+            throw targetTypeConflict(name, "GEOHASH", targetType, "conversion is not implemented");
         }
         return this;
     }
@@ -445,7 +446,7 @@ public final class QwpSchemaBinding {
         if (targetType != ColumnType.IPv4
                 && targetType != ColumnType.STRING
                 && targetType != ColumnType.VARCHAR) {
-            throw unsupported(name, "IPv4", targetType, "conversion is not implemented");
+            throw targetTypeConflict(name, "IPv4", targetType, "conversion is not implemented");
         }
         if (address == Numbers.IPv4_NULL) {
             column.addNull();
@@ -472,7 +473,7 @@ public final class QwpSchemaBinding {
         if (targetType != ColumnType.IPv4
                 && targetType != ColumnType.STRING
                 && targetType != ColumnType.VARCHAR) {
-            throw unsupported(name, "IPv4", targetType, "conversion is not implemented");
+            throw targetTypeConflict(name, "IPv4", targetType, "conversion is not implemented");
         }
         if (Chars.equalsIgnoreCase("null", address) || Chars.equals("0.0.0.0", address)) {
             throw error(INVALID_VALUE, name, "IPv4", targetType,
@@ -509,7 +510,7 @@ public final class QwpSchemaBinding {
                 && targetType != ColumnType.DATE
                 && targetType != ColumnType.TIMESTAMP_MICRO
                 && targetType != ColumnType.TIMESTAMP_NANO) {
-            throw unsupported(name, "LONG", targetType, "conversion is not implemented");
+            throw targetTypeConflict(name, "LONG", targetType, "conversion is not implemented");
         }
         if (ColumnType.isDecimal(targetType)) {
             appendIntegerDecimal(column, name, value, "LONG", targetType, value == Long.MIN_VALUE);
@@ -558,7 +559,7 @@ public final class QwpSchemaBinding {
                 column.addSymbol(formatLong(value));
                 break;
             default:
-                throw unsupported(name, "LONG", targetType, "conversion is not implemented");
+                throw targetTypeConflict(name, "LONG", targetType, "conversion is not implemented");
         }
         return this;
     }
@@ -575,7 +576,7 @@ public final class QwpSchemaBinding {
         if (targetType != ColumnType.LONG256
                 && targetType != ColumnType.STRING
                 && targetType != ColumnType.VARCHAR) {
-            throw unsupported(name, "LONG256", targetType, "conversion is not implemented");
+            throw targetTypeConflict(name, "LONG256", targetType, "conversion is not implemented");
         }
         if (l0 == Long.MIN_VALUE && l1 == Long.MIN_VALUE
                 && l2 == Long.MIN_VALUE && l3 == Long.MIN_VALUE) {
@@ -620,7 +621,7 @@ public final class QwpSchemaBinding {
             }
             try {
                 if (!column.addSchemaStringDecimal(value, targetPrecision, targetScale)) {
-                    throw error(INVALID_VALUE, name, "STRING", targetType, "decimal value exceeds target precision");
+                    throw targetValueConflict(name, "STRING", targetType, "decimal value exceeds target precision");
                 }
             } catch (NumericException e) {
                 throw error(INVALID_VALUE, name, "STRING", targetType, "invalid decimal text");
@@ -688,7 +689,7 @@ public final class QwpSchemaBinding {
                     appendStringLong256(column, name, value);
                     break;
                 default:
-                    throw unsupported(name, "STRING", targetType, "conversion is not implemented");
+                    throw targetTypeConflict(name, "STRING", targetType, "conversion is not implemented");
             }
         }
         return this;
@@ -722,7 +723,7 @@ public final class QwpSchemaBinding {
                 column.addString(sink);
                 break;
             default:
-                throw unsupported(name, "CHAR", targetType, "conversion is not implemented");
+                throw targetTypeConflict(name, "CHAR", targetType, "conversion is not implemented");
         }
         return this;
     }
@@ -745,7 +746,7 @@ public final class QwpSchemaBinding {
                 column.addSymbol(value);
                 break;
             default:
-                throw unsupported(name, "SYMBOL", targetType, "conversion is not implemented");
+                throw targetTypeConflict(name, "SYMBOL", targetType, "conversion is not implemented");
         }
         return this;
     }
@@ -771,7 +772,7 @@ public final class QwpSchemaBinding {
                 && targetType != ColumnType.TIMESTAMP_NANO
                 && targetType != ColumnType.STRING
                 && targetType != ColumnType.VARCHAR) {
-            throw unsupported(name, "TIMESTAMP", targetType, "conversion is not implemented");
+            throw targetTypeConflict(name, "TIMESTAMP", targetType, "conversion is not implemented");
         }
         if (unit == null) {
             throw error(INVALID_VALUE, name, "TIMESTAMP", targetType, "timestamp unit is null");
@@ -785,7 +786,7 @@ public final class QwpSchemaBinding {
                     ? NanosTimestampDriver.INSTANCE.from(value, unit)
                     : MicrosTimestampDriver.INSTANCE.from(value, unit);
         } catch (ArithmeticException e) {
-            throw error(INVALID_VALUE, name, "TIMESTAMP", targetType, "value is outside target timestamp range");
+            throw targetValueConflict(name, "TIMESTAMP", targetType, "value is outside target timestamp range");
         }
         if (targetType == ColumnType.STRING || targetType == ColumnType.VARCHAR) {
             appendTimestampText(column, converted);
@@ -815,7 +816,7 @@ public final class QwpSchemaBinding {
                 && targetType != ColumnType.TIMESTAMP_NANO
                 && targetType != ColumnType.STRING
                 && targetType != ColumnType.VARCHAR) {
-            throw unsupported(name, "TIMESTAMP", targetType, "conversion is not implemented");
+            throw targetTypeConflict(name, "TIMESTAMP", targetType, "conversion is not implemented");
         }
         if (value == null) {
             throw error(INVALID_VALUE, name, "TIMESTAMP", targetType, "timestamp value is null");
@@ -826,7 +827,7 @@ public final class QwpSchemaBinding {
                     ? instantTimestamp(value, 1_000_000_000L, value.getNano())
                     : instantTimestamp(value, 1_000_000L, value.getNano() / 1_000L);
         } catch (ArithmeticException e) {
-            throw error(INVALID_VALUE, name, "TIMESTAMP", targetType, "value is outside target timestamp range");
+            throw targetValueConflict(name, "TIMESTAMP", targetType, "value is outside target timestamp range");
         }
         if (targetType == ColumnType.STRING || targetType == ColumnType.VARCHAR) {
             appendTimestampText(column, converted);
@@ -850,7 +851,7 @@ public final class QwpSchemaBinding {
             return this;
         }
         if (targetType != ColumnType.STRING && targetType != ColumnType.VARCHAR) {
-            throw unsupported(name, "UUID", targetType, "conversion is not implemented");
+            throw targetTypeConflict(name, "UUID", targetType, "conversion is not implemented");
         }
         if (lo == Long.MIN_VALUE && hi == Long.MIN_VALUE) {
             column.addNull();
@@ -909,6 +910,24 @@ public final class QwpSchemaBinding {
         return schema.getMetadataVersion();
     }
 
+    /**
+     * Clears the conflict that {@link #hasTargetTypeConflict()} reports, once the
+     * caller has acted on it.
+     */
+    public void clearTargetTypeConflict() {
+        hasTargetTypeConflict = false;
+    }
+
+    /**
+     * Reports whether the last rejected value targeted a schema column whose
+     * snapshot type cannot take it. A column type change after the snapshot
+     * causes exactly this, so the caller evicts the snapshot from its cache.
+     * Input families that no column type can take never set it.
+     */
+    public boolean hasTargetTypeConflict() {
+        return hasTargetTypeConflict;
+    }
+
     private LineSenderSchemaException error(
             LineSenderSchemaException.Reason reason,
             CharSequence column,
@@ -929,6 +948,14 @@ public final class QwpSchemaBinding {
         }
         message.put(", detail=").put(detail).put(']');
         return new LineSenderSchemaException(reason, message);
+    }
+
+    // Only a column the snapshot knows records the conflict; an inferred column's
+    // type comes from this batch, so a fresh snapshot could not change the outcome.
+    private void recordTargetTypeConflict(CharSequence name) {
+        if (name != null && schema.getColumnIndex(name) >= 0) {
+            hasTargetTypeConflict = true;
+        }
     }
 
     private void requireUsableSchema() {
@@ -998,7 +1025,7 @@ public final class QwpSchemaBinding {
         int targetType = targetType(index, expectedTargetType);
         QwpTableBuffer.ColumnBuffer column = targetColumn(existing, name, inputType, index, targetType);
         if (column != null && targetType != expectedTargetType) {
-            throw unsupported(name, inputType, targetType, "conversion is not implemented");
+            throw targetTypeConflict(name, inputType, targetType, "conversion is not implemented");
         }
         return column;
     }
@@ -1022,15 +1049,15 @@ public final class QwpSchemaBinding {
         }
         if (!ColumnType.isArray(targetType)
                 || ColumnType.decodeArrayElementType(targetType) != ColumnType.DOUBLE) {
-            throw unsupported(name, "DOUBLE_ARRAY", targetType, "conversion is not implemented");
+            throw targetTypeConflict(name, "DOUBLE_ARRAY", targetType, "conversion is not implemented");
         }
         int targetDimensions = ColumnType.decodeWeakArrayDimensionality(targetType);
         if (targetDimensions < 1
                 || targetType != ColumnType.encodeArrayType(ColumnType.DOUBLE, targetDimensions)) {
-            throw unsupported(name, "DOUBLE_ARRAY", targetType, "invalid target array type");
+            throw targetTypeConflict(name, "DOUBLE_ARRAY", targetType, "invalid target array type");
         }
         if (targetDimensions != sourceDimensions) {
-            throw unsupported(name, "DOUBLE_ARRAY", targetType,
+            throw targetTypeConflict(name, "DOUBLE_ARRAY", targetType,
                     "array dimensionality mismatch [sourceDims=" + sourceDimensions
                             + ", targetDims=" + targetDimensions + ']');
         }
@@ -1063,7 +1090,7 @@ public final class QwpSchemaBinding {
                 return null;
             }
             if (wireType == 0) {
-                throw unsupported(name, inputType, targetType, "conversion is not implemented");
+                throw targetTypeConflict(name, inputType, targetType, "conversion is not implemented");
             }
             return claimInferred(existing, name, wireType);
         }
@@ -1077,7 +1104,7 @@ public final class QwpSchemaBinding {
         }
         final byte wireType = wireType(targetType);
         if (wireType == 0) {
-            throw unsupported(name, inputType, targetType, "conversion is not implemented");
+            throw targetTypeConflict(name, inputType, targetType, "conversion is not implemented");
         }
         if (schema.hasColumnExtensionParameters(index)) {
             throw unsupported(name, inputType, targetType, "parameterized target type");
@@ -1227,10 +1254,10 @@ public final class QwpSchemaBinding {
         int targetScale = ColumnType.getDecimalScale(targetType);
         try {
             if (!column.addSchemaDecimal(value, targetPrecision, targetScale)) {
-                throw error(INVALID_VALUE, name, inputType, targetType, "decimal value exceeds target precision");
+                throw targetValueConflict(name, inputType, targetType, "decimal value exceeds target precision");
             }
         } catch (NumericException e) {
-            throw error(INVALID_VALUE, name, inputType, targetType, "decimal value cannot be rescaled exactly");
+            throw targetValueConflict(name, inputType, targetType, "decimal value cannot be rescaled exactly");
         }
         return this;
     }
@@ -1259,11 +1286,11 @@ public final class QwpSchemaBinding {
             column.addString(sink);
             return this;
         }
-        throw unsupported(name, inputType, targetType, "conversion is not implemented");
+        throw targetTypeConflict(name, inputType, targetType, "conversion is not implemented");
     }
 
     private LineSenderSchemaException invalidRange(CharSequence name, String inputType, int targetType) {
-        return error(INVALID_VALUE, name, inputType, targetType, "value is outside target type range");
+        return targetValueConflict(name, inputType, targetType, "value is outside target type range");
     }
 
     private void parseDecimalText(CharSequence name, CharSequence value, Decimal256 scratch, int targetType) {
@@ -1296,7 +1323,7 @@ public final class QwpSchemaBinding {
                 && targetType != ColumnType.DATE
                 && targetType != ColumnType.TIMESTAMP_MICRO
                 && targetType != ColumnType.TIMESTAMP_NANO) {
-            throw unsupported(name, inputType, targetType, "conversion is not implemented");
+            throw targetTypeConflict(name, inputType, targetType, "conversion is not implemented");
         }
         if (ColumnType.isDecimal(targetType)) {
             appendIntegerDecimal(column, name, value, inputType, targetType, sourceNull);
@@ -1370,10 +1397,10 @@ public final class QwpSchemaBinding {
         }
         try {
             if (!column.addSchemaLongDecimal(value, targetPrecision, targetScale)) {
-                throw error(INVALID_VALUE, name, inputType, targetType, "decimal value exceeds target precision");
+                throw targetValueConflict(name, inputType, targetType, "decimal value exceeds target precision");
             }
         } catch (NumericException e) {
-            throw error(INVALID_VALUE, name, inputType, targetType, "decimal value cannot be rescaled exactly");
+            throw targetValueConflict(name, inputType, targetType, "decimal value cannot be rescaled exactly");
         }
     }
 
@@ -1778,7 +1805,7 @@ public final class QwpSchemaBinding {
             }
             try {
                 if (!column.addSchemaStringDecimal(formatFloating(value), targetPrecision, targetScale)) {
-                    throw error(INVALID_VALUE, name, inputType, targetType, "decimal value exceeds target precision");
+                    throw targetValueConflict(name, inputType, targetType, "decimal value exceeds target precision");
                 }
             } catch (NumericException e) {
                 throw error(INVALID_VALUE, name, inputType, targetType,
@@ -1787,7 +1814,7 @@ public final class QwpSchemaBinding {
             return this;
         }
         if (!isTextTarget(targetType)) {
-            throw unsupported(name, inputType, targetType, "conversion is not implemented");
+            throw targetTypeConflict(name, inputType, targetType, "conversion is not implemented");
         }
         if (Double.isNaN(value)) {
             column.addNull();
@@ -1802,7 +1829,7 @@ public final class QwpSchemaBinding {
                 column.addSymbol(formatFloating(value));
                 break;
             default:
-                throw unsupported(name, inputType, targetType, "conversion is not implemented");
+                throw targetTypeConflict(name, inputType, targetType, "conversion is not implemented");
         }
         return this;
     }
@@ -1907,6 +1934,29 @@ public final class QwpSchemaBinding {
 
     private int targetType(int index, int inferredType) {
         return index >= 0 ? schema.getColumnType(index) : inferredType;
+    }
+
+    // Rejects an input that the snapshot type of the named column cannot take.
+    private LineSenderSchemaException targetTypeConflict(
+            CharSequence name,
+            String inputType,
+            int targetType,
+            String detail
+    ) {
+        recordTargetTypeConflict(name);
+        return unsupported(name, inputType, targetType, detail);
+    }
+
+    // Rejects a value that the snapshot type of the named column cannot hold, such
+    // as an INT overflow after the server widened the column to LONG.
+    private LineSenderSchemaException targetValueConflict(
+            CharSequence name,
+            String inputType,
+            int targetType,
+            String detail
+    ) {
+        recordTargetTypeConflict(name);
+        return error(INVALID_VALUE, name, inputType, targetType, detail);
     }
 
     private LineSenderSchemaException unsupported(CharSequence name, String inputType, int targetType, String detail) {

@@ -220,6 +220,25 @@ final class QwpSchemaCoordinator {
         }
     }
 
+    /**
+     * Drops the cached KNOWN snapshot of {@code tableName} when it still has the
+     * given identity. A newer snapshot, such as one that ACK feedback installed
+     * after the caller pinned its binding, stays cached.
+     */
+    synchronized void evictKnown(CharSequence tableName, int tableId, long metadataVersion) {
+        if (closed) {
+            return;
+        }
+        String key = normalize(tableName);
+        QwpSchemaResponse cached = cache.get(key);
+        if (cached != null
+                && cached.getResult() == QwpSchemaProtocol.RESULT_KNOWN
+                && cached.getTableId() == tableId
+                && cached.getMetadataVersion() == metadataVersion) {
+            cache.remove(key);
+        }
+    }
+
     synchronized void close() {
         closed = true;
         cache.clear();

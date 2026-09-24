@@ -1967,19 +1967,11 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test
-    public void testUnsupportedSetterCannotBypassSchemaAndInvalidNameDoesNotRefresh() throws Exception {
+    public void testUnsupportedSetterEvictsSnapshotAndInvalidNameDoesNotRefresh() throws Exception {
         assertMemoryLeak(() -> {
             SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 2, 3);
             try (TestWebSocketServer server = schemaServer(handler);
                  Sender sender = sender(server)) {
-                sender.table("events");
-                try {
-                    sender.longColumn("id", 1);
-                    Assert.fail("expected UUID target rejection");
-                } catch (LineSenderSchemaException e) {
-                    Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
-                }
-                Assert.assertEquals(1, handler.describeRequests.get());
                 sender.table("events");
                 try {
                     sender.stringColumn("bad\nname", "x");
@@ -1988,6 +1980,20 @@ public class QwpSchemaSenderIntegrationTest {
                     Assert.assertTrue(e.getMessage().contains("column name"));
                 }
                 Assert.assertEquals(1, handler.describeRequests.get());
+                sender.table("events");
+                try {
+                    sender.longColumn("id", 1);
+                    Assert.fail("expected UUID target rejection");
+                } catch (LineSenderSchemaException e) {
+                    Assert.assertEquals(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, e.getReason());
+                }
+                Assert.assertEquals("a rejected setter must not look up metadata", 1,
+                        handler.describeRequests.get());
+                // The snapshot type of a known column rejected the value, which a type
+                // change could explain, so the rejection evicted the snapshot and the
+                // next row looks the table up again.
+                sender.table("events").uuidColumn("id", 1, 2).atNow();
+                Assert.assertEquals(2, handler.describeRequests.get());
             }
         });
     }
@@ -2481,6 +2487,49 @@ public class QwpSchemaSenderIntegrationTest {
                 Assert.assertEquals(4, schema.i64());
                 schema.eof();
                 Assert.assertEquals(1, second.describeRequests.get());
+            } finally {
+                sender.close();
+                server.close();
+                if (restarted != null) {
+                    restarted.close();
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 10_000)
+    public void testReconnectKeepsCachedSchema() throws Exception {
+        assertMemoryLeak(() -> {
+            int port = TestPorts.findUnusedPort();
+            SchemaHandler first = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 121, 122);
+            TestWebSocketServer server = schemaServer(first, port);
+            CountDownLatch disconnected = new CountDownLatch(1);
+            Sender sender = outageSender(port, "", disconnected);
+            TestWebSocketServer restarted = null;
+            try {
+                sender.table("events").uuidColumn("id", 1, 2).atNow();
+                sender.flush();
+                new FrameReader(first.awaitDataFrame()).schemaTable("events", 121, 122, 1, "id", QwpConstants.TYPE_UUID);
+                Assert.assertEquals(1, first.describeRequests.get());
+                Assert.assertTrue(sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+                server.close();
+                Assert.assertTrue("sender did not observe the connection closing",
+                        disconnected.await(5, TimeUnit.SECONDS));
+
+                SchemaHandler second = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 121, 122);
+                restarted = schemaServer(second, port);
+                Assert.assertTrue("schema-capable connection was not installed", second.awaitPong());
+                // The next batch binds from the snapshot cached before the outage, so
+                // the reconnect costs no DESCRIBE round trip.
+                sender.table("events").uuidColumn("id", 3, 4).atNow();
+                sender.flush();
+                FrameReader frame = new FrameReader(second.awaitDataFrame());
+                frame.schemaTable("events", 121, 122, 1, "id", QwpConstants.TYPE_UUID);
+                Assert.assertEquals(0, frame.u8());
+                Assert.assertEquals(3, frame.i64());
+                Assert.assertEquals(4, frame.i64());
+                frame.eof();
+                Assert.assertEquals(0, second.describeRequests.get());
             } finally {
                 sender.close();
                 server.close();

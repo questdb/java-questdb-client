@@ -143,11 +143,11 @@ public class CursorWebSocketSchemaLifecycleTest {
                     Assert.assertSame(lost.response.get(), loop.resolveSchema("lost", 0));
                     Assert.assertEquals(3, server.handshakeCount());
 
+                    // The cache survives the reconnect. ACK feedback on the new
+                    // connection refreshes any entry that went stale meanwhile.
                     int requestsBeforeCacheProbe = handler.requests;
-                    QwpSchemaResponse replacement = loop.resolveSchema("cached", 5_000);
-                    Assert.assertTrue(replacement.getRequestId() > 0);
-                    Assert.assertNotSame(cached, replacement);
-                    Assert.assertEquals(requestsBeforeCacheProbe + 1, handler.requests);
+                    Assert.assertSame(cached, loop.resolveSchema("cached", 5_000));
+                    Assert.assertEquals(requestsBeforeCacheProbe, handler.requests);
                 } finally {
                     reconnect.allow.countDown();
                 }
