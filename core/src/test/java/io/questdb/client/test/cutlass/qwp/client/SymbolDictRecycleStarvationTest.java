@@ -298,6 +298,58 @@ public class SymbolDictRecycleStarvationTest {
         });
     }
 
+    @Test(timeout = 60_000L)
+    public void testContinuousFlushesPreserveStarvationWindow() throws Exception {
+        assertMemoryLeak(() -> {
+            GatedAckHandler handler = new GatedAckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                long maxWaitMillis = 300;
+                String cfg = "ws::addr=localhost:" + server.getPort()
+                        + ";symbol_dict_reset_threshold=2"
+                        + ";symbol_dict_reset_max_wait_millis=" + maxWaitMillis
+                        + ";auto_flush_rows=off;auto_flush_interval=60000;";
+
+                try (Sender sender = Sender.fromConfig(cfg)) {
+                    try {
+                        QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                        sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
+                        sender.table("t").symbol("s", "b").longColumn("v", 1L).atNow();
+                        sender.flush();
+                        Assert.assertTrue("must be armed after crossing threshold=2", ws.isResetArmed());
+
+                        // Frequent flushes must not restart the age measured from the first arm.
+                        long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                        while (ws.getSymbolDictResetStarvationTimeouts() == 0
+                                && System.nanoTime() < deadlineNanos) {
+                            sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
+                            sender.flush();
+                            Thread.sleep(maxWaitMillis / 3);
+                        }
+                        Assert.assertEquals("continuous flushing must still allow one starvation wait",
+                                1L, ws.getSymbolDictResetStarvationTimeouts());
+
+                        sender.table("t").symbol("s", "b").longColumn("v", 2L).atNow();
+                        sender.flush();
+                        // Expire even a wrongly restarted timer so only the once-per-arm guard
+                        // can prevent another wait. The flush also leaves no pending rows.
+                        Thread.sleep(maxWaitMillis + 50);
+                        sender.table("t");
+                        Assert.assertEquals("a later flush must not grant a second wait in the same arm",
+                                1L, ws.getSymbolDictResetStarvationTimeouts());
+                        Assert.assertTrue("withheld acks must leave the recycle armed", ws.isResetArmed());
+                        Assert.assertEquals("no recycle can complete while acks are gated",
+                                0L, ws.getSymbolDictEpoch());
+                    } finally {
+                        // Release before sender.close() drains, including on assertion failure.
+                        handler.releaseAcks();
+                    }
+                }
+            }
+        });
+    }
+
     /**
      * A terminal error latched WHILE the wait is parked must interrupt it
      * immediately -- the wait polls {@code cursorSendLoop.checkError()} /
