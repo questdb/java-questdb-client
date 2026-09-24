@@ -70,6 +70,19 @@ public class JarPackagingIT {
             Assert.assertNotNull("JAVA11_HOME (or -Djava11.home) must point at a JDK 11+", bridgeJdkHome);
             runSmokeAgainstJar(bridgeJdkHome);
         }
+        // Optional extra runtimes for local cross-JDK checks, e.g.
+        //   QUESTDB_SMOKE_JDKS=$HOME/.sdkman/candidates/java/17.0.14-amzn:$HOME/.sdkman/candidates/java/26.0.2-amzn
+        // CI covers the JDK 8 jar on newer JDKs in the mrjar-smoke matrix; this
+        // gives a developer with several JDKs installed the same check from
+        // `mvn install`. Absent or empty means no extra runs.
+        String extraJdks = System.getenv("QUESTDB_SMOKE_JDKS");
+        if (extraJdks != null && !extraJdks.trim().isEmpty()) {
+            for (String jdkHome : extraJdks.split(File.pathSeparator)) {
+                if (!jdkHome.trim().isEmpty()) {
+                    runSmokeAgainstJar(jdkHome.trim());
+                }
+            }
+        }
     }
 
     private static void runSmokeAgainstJar(String jdkHome) throws Exception {
@@ -149,6 +162,7 @@ public class JarPackagingIT {
             classBytes = readAll(in);
         }
         // the referenced class name appears verbatim as a constant-pool UTF-8 entry
+        // (slash form for a class constant, dotted form for a Class.forName literal)
         byte[] needle = constant.getBytes("UTF-8");
         for (int i = 0; i <= classBytes.length - needle.length; i++) {
             int j = 0;
