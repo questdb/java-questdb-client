@@ -36,6 +36,8 @@ import org.junit.Test;
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
 import java.lang.management.ThreadMXBean;
+import java.util.IdentityHashMap;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -351,6 +353,83 @@ public class SymbolDictRecycleStarvationTest {
     }
 
     /**
+     * Each armed window gets exactly one starvation wait, measured from ITS
+     * arm: after a recycle commits and the sender re-arms, a row start inside
+     * the fresh window returns without waiting, and a row start after it gets
+     * the second wait. Pins the arm-time resets ({@code armedSinceNanos},
+     * {@code starvationWaitDoneThisArm}) and the age guard, which a single
+     * armed window cannot distinguish from their field defaults.
+     */
+    @Test(timeout = 60_000L)
+    public void testEachArmedWindowGetsItsOwnStarvationWait() throws Exception {
+        assertMemoryLeak(() -> {
+            RegateableAckHandler handler = new RegateableAckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                long maxWaitMillis = 300;
+                String cfg = "ws::addr=localhost:" + server.getPort()
+                        + ";symbol_dict_reset_threshold=2"
+                        + ";symbol_dict_reset_max_wait_millis=" + maxWaitMillis
+                        + ";auto_flush_rows=off;auto_flush_interval=60000;";
+
+                try (Sender sender = Sender.fromConfig(cfg)) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    try {
+                        // Window 1: arm with the backlog gated; the wait runs once and times out.
+                        handler.closeGate();
+                        sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
+                        sender.table("t").symbol("s", "b").longColumn("v", 1L).atNow();
+                        sender.flush();
+                        Assert.assertTrue("armed after crossing threshold=2", ws.isResetArmed());
+                        Thread.sleep(maxWaitMillis + 50);
+                        sender.table("t"); // age >= maxWait: waits, backlog stays gated, times out
+                        Assert.assertEquals(1L, ws.getSymbolDictResetStarvationTimeouts());
+                        Assert.assertEquals(0L, ws.getSymbolDictEpoch());
+
+                        // Release the backlog; the next row start finds it drained and swaps.
+                        handler.openGate();
+                        Assert.assertTrue("backlog must drain once the gate opens", ws.drain(5_000));
+                        sender.table("t");
+                        Assert.assertEquals("drained barrier must swap", 1L, ws.getSymbolDictEpoch());
+                        Assert.assertFalse("the commit consumes the arming", ws.isResetArmed());
+
+                        // Window 2: gate again, publish one frame on the fresh epoch, re-arm.
+                        handler.closeGate();
+                        sender.table("t").symbol("s", "c").longColumn("v", 2L).atNow();
+                        sender.flush();
+                        sender.resetSymbolDictionary(); // nothing in flight: arms now
+                        Assert.assertTrue(ws.isResetArmed());
+                        long t0 = System.nanoTime();
+                        sender.table("t"); // inside the fresh window: must not wait
+                        long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
+                        Assert.assertTrue("a row start inside the fresh arm window must not wait, took "
+                                + elapsedMs + " ms", elapsedMs < maxWaitMillis / 2);
+                        Assert.assertEquals("the fresh window has not timed out yet",
+                                1L, ws.getSymbolDictResetStarvationTimeouts());
+
+                        // After the window elapses the second arm gets its own wait.
+                        Thread.sleep(maxWaitMillis + 50);
+                        long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                        while (ws.getSymbolDictResetStarvationTimeouts() < 2
+                                && System.nanoTime() < deadlineNanos) {
+                            sender.table("t"); // returns at once while the loop reconnects; waits once linked
+                            Thread.sleep(20);
+                        }
+                        Assert.assertEquals("the second armed window must get its own wait",
+                                2L, ws.getSymbolDictResetStarvationTimeouts());
+                        Assert.assertTrue(ws.isResetArmed());
+                        Assert.assertEquals(1L, ws.getSymbolDictEpoch());
+                    } finally {
+                        // Release before sender.close() drains, including on assertion failure.
+                        handler.openGate();
+                    }
+                }
+            }
+        });
+    }
+
+    /**
      * A terminal error latched WHILE the wait is parked must interrupt it
      * immediately -- the wait polls {@code cursorSendLoop.checkError()} /
      * {@code checkConnectionError()} every park interval, exactly like
@@ -653,6 +732,45 @@ public class SymbolDictRecycleStarvationTest {
 
         void releaseAcks() {
             released.countDown();
+        }
+    }
+
+    /**
+     * Acks per connection (each connection's wire sequence restarts at 0, so a
+     * post-recycle connection is never over-acked into a synthetic drain) and
+     * withholds every ack while the gate is closed: the handler blocks that
+     * connection's read thread until the gate opens, then acks the withheld
+     * frame. The gate can be closed again for a second window.
+     */
+    private static class RegateableAckHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private final Map<TestWebSocketServer.ClientHandler, Long> nextSeq = new IdentityHashMap<>();
+        private volatile CountDownLatch gate = new CountDownLatch(0);
+
+        @Override
+        public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            long seq;
+            synchronized (nextSeq) {
+                Long n = nextSeq.get(client);
+                seq = n == null ? 0L : n;
+                nextSeq.put(client, seq + 1L);
+            }
+            try {
+                if (!gate.await(20, TimeUnit.SECONDS)) {
+                    throw new AssertionError("the ack gate was never opened");
+                }
+                client.sendBinary(QwpWireTestUtils.buildAck(seq));
+            } catch (IOException | InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException(e);
+            }
+        }
+
+        void closeGate() {
+            gate = new CountDownLatch(1);
+        }
+
+        void openGate() {
+            gate.countDown();
         }
     }
 
