@@ -295,21 +295,35 @@ public class QwpSchemaReplayNetworkTest {
     }
 
     @Test
-    public void testDeferredOnlySchemaTailIsRetainedByOldPeerThenAbortedLocally() throws Exception {
-        File root = temp.newFolder("deferred");
+    public void testDeferredOnlySchemaTailIsAbortedLocallyBeforeConnectingToOldPeer() throws Exception {
+        File root = temp.newFolder("deferred-old-peer");
         String slot = new File(root, "default").getAbsolutePath();
         seedDeferredSchemaTail(slot);
 
-        RecordingHandler oldHandler = new RecordingHandler(false, "deferred");
+        RecordingHandler oldHandler = new RecordingHandler(true, "deferred");
         try (TestWebSocketServer oldPeer = new TestWebSocketServer(oldHandler)) {
             oldPeer.start();
             Assert.assertTrue(oldPeer.awaitStart(5, TimeUnit.SECONDS));
-            Assert.assertThrows(QwpSchemaCapabilityMismatchException.class,
-                    () -> Sender.fromConfig(config(oldPeer.getPort(), root, false)));
-            Assert.assertEquals(0, oldHandler.frames.size());
+            try (Sender sender = Sender.fromConfig(config(oldPeer.getPort(), root, false))) {
+                sender.table("deferred").longColumn("n", 2).atNow();
+                sender.flush();
+                Assert.assertTrue(sender.drain(10_000));
+            }
+            Assert.assertEquals("only the new legacy row may reach the old peer", 1, oldHandler.frames.size());
+            Assert.assertEquals(0, oldHandler.frames.get(0)[QwpConstants.HEADER_OFFSET_FLAGS] & QwpConstants.FLAG_SCHEMA);
         }
-        assertRetained(slot, 0);
+        try (CursorSendEngine recovered = new CursorSendEngine(slot, SEGMENT_SIZE)) {
+            Assert.assertFalse(recovered.requiresSchema());
+            Assert.assertEquals(recovered.publishedFsn(), recovered.ackedFsn());
+        }
         assertNoQuarantine(root);
+    }
+
+    @Test
+    public void testDeferredOnlySchemaTailIsAbortedLocallyBeforeConnectingToSupportingPeer() throws Exception {
+        File root = temp.newFolder("deferred");
+        String slot = new File(root, "default").getAbsolutePath();
+        seedDeferredSchemaTail(slot);
 
         RecordingHandler supportingHandler = new RecordingHandler(true, "deferred");
         try (TestWebSocketServer supportingPeer = new TestWebSocketServer(supportingHandler)) {

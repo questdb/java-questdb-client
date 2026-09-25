@@ -4265,6 +4265,11 @@ public class QwpWebSocketSender implements Sender {
             connectionDispatcher = new SenderConnectionDispatcher(
                     connectionListener, connectionListenerInboxCapacity);
         }
+        // A recovered deferred-only tail is an aborted transaction that never
+        // reaches the wire. Retire it locally before the capability check, as
+        // BackgroundDrainer does, so its schema frames cannot demand a
+        // schema-capable peer and block startup against a legacy server.
+        cursorEngine.retireRecoveredOrphanTailIfReady();
         CursorWebSocketSendLoop.ReconnectFactory reconnectFactory = newReconnectFactory();
         reconnectFactory.setSchemaRequired(cursorEngine.requiresSchema());
         switch (initialConnectMode) {
