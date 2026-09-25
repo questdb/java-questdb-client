@@ -370,6 +370,9 @@ public class QwpWebSocketSender implements Sender {
     // recycle rolls it while a monitor thread may be inside getAckedFsn /
     // awaitAckedFsn: a stale base paired with a fresh engine would report
     // an FSN dip to -1 (same reasoning as symbolDictEpoch).
+    // Both accessors read the base BEFORE the engine on every pass (awaitAckedFsn
+    // polls through getAckedFsn), so the recycle's engine=null -> base roll ->
+    // engine=fresh write order can never pair the old engine with the new base.
     private volatile long fsnEpochBase = 0;
     private boolean hasDeferredMessages;
     // Latched true the first time ensureConnected() completes. Once set,
@@ -1410,9 +1413,16 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Blocks until {@code ackedFsn() >= targetFsn}, or until {@code timeoutMillis}
-     * elapses. Polls the cursor engine on a 50us park; surfaces I/O loop errors
-     * synchronously via {@code cursorSendLoop.checkError()}.
+     * Blocks until {@link #getAckedFsn()} {@code >= targetFsn}, or until
+     * {@code timeoutMillis} elapses. Polls on a 50us park; surfaces I/O loop
+     * errors synchronously via {@code cursorSendLoop.checkError()}.
+     * <p>
+     * Every pass re-reads the epoch base and the cursor engine through
+     * {@link #getAckedFsn()} (base first, then engine, clamped to the durable
+     * watermark), so a symbol-dictionary recycle that swaps the engine while a
+     * monitor thread is parked here is observed on the next pass instead of
+     * pinning the wait to the engine it started on. While the engine is null
+     * mid-swap the durable watermark stands in, as in {@link #getAckedFsn()}.
      * <p>
      * Useful for tests and user code that need to confirm a specific publish
      * has been server-acknowledged. Pair with {@link #flushAndGetSequence()} to
@@ -1420,64 +1430,56 @@ public class QwpWebSocketSender implements Sender {
      *
      * @param targetFsn     FSN to wait for; typically {@link #flushAndGetSequence()}'s return value
      * @param timeoutMillis upper bound on the wait; {@code <= 0} returns immediately
-     * @return {@code true} if {@code ackedFsn() >= targetFsn} on return, {@code false} on timeout
+     * @return {@code true} if {@code getAckedFsn() >= targetFsn} on return, {@code false} on timeout
      * @throws LineSenderException if the I/O loop has latched a terminal error
      */
     @Override
     public boolean awaitAckedFsn(long targetFsn, long timeoutMillis) {
         checkNotClosed();
         checkRecycleFailure();
-        // Snapshot: the recycle transitions cursorEngine non-null -> null ->
-        // non-null on the producer thread; reading the field once keeps this
-        // method from dereferencing a half-swapped null. While it is null,
-        // anything at or below the watermark the recycle barrier proved
-        // durable is truthfully "acked".
-        CursorSendEngine engine = cursorEngine;
-        if (engine == null) {
-            return targetFsn < 0L || targetFsn <= lastRecycleDurableFsn;
-        }
-        engine.checkDurability();
         // Surface latched errors before any early-return path, so a caller
         // polling with timeoutMillis <= 0 to drive their own loop sees the
-        // throw instead of an indefinite "not yet". The durability latch
-        // above is transient: it throws while latched, and clears once a
-        // later periodic sync pass fully succeeds so producers can resume.
-        // Snapshot for the same reason as engine above: the recycle nulls
-        // cursorSendLoop on the producer thread, so a double read here could
-        // NPE between the check and the call.
-        CursorWebSocketSendLoop loop = cursorSendLoop;
-        if (loop != null) {
-            loop.checkError();
+        // throw instead of an indefinite "not yet".
+        checkAwaitAckedFsnErrors();
+        if (targetFsn < 0L) {
+            // -1 is the no-data sentinel: nothing to wait for.
+            return true;
         }
-        checkConnectionError();
-        if (targetFsn >= 0) {
-            long internalTarget = targetFsn - fsnEpochBase;
-            if (internalTarget < 0) {
-                // target belongs to a pre-recycle epoch: proven acked before the swap
-                return true;
-            }
-            targetFsn = internalTarget;
-        }
-        if (engine.ackedFsn() >= targetFsn) {
+        if (getAckedFsn() >= targetFsn) {
             return true;
         }
         if (timeoutMillis <= 0L) {
             return false;
         }
         long deadlineNanos = System.nanoTime() + timeoutMillis * 1_000_000L;
-        while (engine.ackedFsn() < targetFsn) {
-            engine.checkDurability();
-            loop = cursorSendLoop;
-            if (loop != null) {
-                loop.checkError();
-            }
-            checkConnectionError();
+        while (getAckedFsn() < targetFsn) {
+            checkAwaitAckedFsnErrors();
             if (System.nanoTime() >= deadlineNanos) {
                 return false;
             }
             java.util.concurrent.locks.LockSupport.parkNanos(50_000L);
         }
         return true;
+    }
+
+    /**
+     * The error checks {@link #awaitAckedFsn} runs before its early returns and
+     * on every poll pass. Snapshots both volatiles: the recycle transitions
+     * {@code cursorEngine} and {@code cursorSendLoop} non-null -> null -> non-null
+     * on the producer thread, so a double read could NPE between the check and
+     * the call. The durability latch is transient: it throws while latched and
+     * clears once a later periodic sync pass fully succeeds.
+     */
+    private void checkAwaitAckedFsnErrors() {
+        CursorSendEngine engine = cursorEngine;
+        if (engine != null) {
+            engine.checkDurability();
+        }
+        CursorWebSocketSendLoop loop = cursorSendLoop;
+        if (loop != null) {
+            loop.checkError();
+        }
+        checkConnectionError();
     }
 
     /**

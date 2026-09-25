@@ -432,6 +432,56 @@ public class SymbolDictRecycleFsnContinuityTest {
         });
     }
 
+    /**
+     * A monitor thread parked in {@code awaitAckedFsn} for the NEXT FSN when a
+     * recycle swaps the engine underneath it must observe the fresh epoch's
+     * ack: the poll re-reads the epoch base and the engine on every pass
+     * instead of pinning the engine it started on.
+     */
+    @Test(timeout = 60_000L)
+    public void testAwaitAckedFsnParkedAcrossARecycleSeesTheFreshEpochAck() throws Exception {
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = ackingServer()) {
+                String config = cfg(server) + "auto_flush_bytes=off;auto_flush_rows=1000000;auto_flush_interval=60000;";
+                try (QwpWebSocketSender ws = (QwpWebSocketSender) Sender.fromConfig(config)) {
+                    ws.table("t").longColumn("v", 1L).atNow();
+                    long ext0 = ws.flushAndGetSequence();
+                    Assert.assertTrue(ws.awaitAckedFsn(ext0, 5_000));
+                    final long target = ws.getAckedFsn() + 1; // the first FSN of the next epoch
+                    Assert.assertEquals(ext0 + 1, target);
+
+                    AtomicReference<Boolean> outcome = new AtomicReference<>();
+                    AtomicReference<Throwable> monitorError = new AtomicReference<>();
+                    Thread monitor = new Thread(() -> {
+                        try {
+                            outcome.set(ws.awaitAckedFsn(target, 10_000));
+                        } catch (Throwable t) {
+                            monitorError.set(t);
+                        }
+                    }, "acked-fsn-await-monitor");
+                    monitor.start();
+                    // Let the monitor enter its poll loop on the CURRENT engine.
+                    waitFor(() -> monitor.getState() == Thread.State.TIMED_WAITING, 5_000);
+
+                    ws.resetSymbolDictionary(); // arms immediately: nothing in flight
+                    ws.table("t");              // drained barrier -> recycle
+                    Assert.assertEquals(1, ws.getSymbolDictEpoch());
+                    ws.table("t").longColumn("v", 2L).atNow();
+                    Assert.assertEquals("the fresh epoch's first FSN continues the external scale",
+                            target, ws.flushAndGetSequence());
+
+                    monitor.join(15_000);
+                    Assert.assertFalse("monitor still parked", monitor.isAlive());
+                    if (monitorError.get() != null) {
+                        throw new AssertionError("monitor failed", monitorError.get());
+                    }
+                    Assert.assertEquals("the parked wait must see the fresh epoch's ack",
+                            Boolean.TRUE, outcome.get());
+                }
+            }
+        });
+    }
+
     private static TestWebSocketServer ackingServer() throws Exception {
         TestWebSocketServer server = new TestWebSocketServer(new AckAllHandler());
         server.start();
