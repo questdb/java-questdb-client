@@ -27,6 +27,7 @@ package io.questdb.client.test.cutlass.http;
 import io.questdb.client.cutlass.http.HttpException;
 import io.questdb.client.cutlass.http.HttpHeaderParser;
 import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.Misc;
 import io.questdb.client.std.ObjectPool;
 import io.questdb.client.std.Rnd;
 import io.questdb.client.std.Unsafe;
@@ -51,6 +52,29 @@ public class HttpHeaderParserTest {
             "Accept-Language: en-US,en;q=0.8\r\n" +
             "Cookie: textwrapon=false; textautoformat=false; wysiwyg=textarea\r\n" +
             "\r\n";
+
+    @Test
+    public void testConstructorFailureFreesNativeAllocations() throws Exception {
+        // The constructor takes the sink first and then mallocs the header buffer. Nothing ever
+        // closes a parser whose constructor threw, so the catch has to release the sink. A negative
+        // buffer size is how the client can fail that malloc deterministically: unlike the server it
+        // has no RSS-limit seam, and sun.misc.Unsafe.allocateMemory rejects a negative size with
+        // IllegalArgumentException on every supported JDK.
+        assertMemoryLeak(() -> {
+            // Holds the parser on the path where the constructor unexpectedly succeeds. Dropping it
+            // there would leak a built parser and make the enclosing leak check fail on top of the
+            // Assert.fail below, burying the failure that matters.
+            HttpHeaderParser parser = null;
+            try {
+                parser = new HttpHeaderParser(-1, pool);
+                Assert.fail("expected IllegalArgumentException");
+            } catch (IllegalArgumentException ignore) {
+                // the header-buffer malloc rejected the negative size
+            } finally {
+                Misc.free(parser);
+            }
+        });
+    }
 
     @Test
     public void testContentLengthLarge() throws Exception {

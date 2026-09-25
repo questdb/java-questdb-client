@@ -1296,11 +1296,7 @@ public class QwpWebSocketSender implements Sender {
             // the logical slot lock is held one frame up. Closing the engine with the
             // default reclaim would unlink the lock file build() is still holding.
             sender.reclaimLogicalSlotLockOnClose = false;
-            try {
-                sender.close();
-            } catch (Throwable closeFailure) {
-                t.addSuppressed(closeFailure);
-            }
+            Misc.freeSuppressing(sender, t);
             throw t;
         }
         return sender;
