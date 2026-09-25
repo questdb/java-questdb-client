@@ -31,6 +31,7 @@ import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
 import io.questdb.client.cutlass.qwp.client.QwpAuthFailedException;
 import io.questdb.client.cutlass.qwp.client.QwpCredentialUnavailableException;
 import io.questdb.client.cutlass.qwp.client.QwpDurableAckMismatchException;
+import io.questdb.client.cutlass.qwp.client.QwpSchemaCapabilityMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpIngressRoleRejectedException;
 import io.questdb.client.cutlass.qwp.client.QwpRoleMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpVersionMismatchException;
@@ -407,6 +408,10 @@ public final class BackgroundDrainer implements Runnable {
      *         {@link #outcome} has been set to FAILED or STOPPED
      */
     public WebSocketClient connectWithDurableAckRetry() {
+        return connectWithDurableAckRetry(null);
+    }
+
+    private WebSocketClient connectWithDurableAckRetry(CursorSendEngine schemaEngine) {
         // run() already set runnerThread; setting it again here is a no-op
         // on that path but wires up direct callers so requestStop()
         // can unpark them too.
@@ -477,7 +482,16 @@ public final class BackgroundDrainer implements Runnable {
             // to the deadline (which would otherwise busy-loop once past it).
             boolean boundedByBudget = false;
             try {
-                return clientFactory.reconnect();
+                if (schemaEngine != null) {
+                    clientFactory.setSchemaRequired(schemaEngine.requiresSchema());
+                }
+                WebSocketClient connected = clientFactory.reconnect();
+                if (connected != null && schemaEngine != null && schemaEngine.requiresSchema()
+                        && !connected.isQwpSchemaEnabled()) {
+                    connected.close();
+                    throw new QwpSchemaCapabilityMismatchException();
+                }
+                return connected;
             } catch (QwpAuthFailedException | WebSocketUpgradeException e) {
                 // A non-421 upgrade reject, and a 401/403 against a CONSTANT credential, are genuinely
                 // non-retriable across the cluster: waiting will not fix them, so quarantine immediately
@@ -589,6 +603,16 @@ public final class BackgroundDrainer implements Runnable {
                             slotPath, roleRejectAttempts);
                     lastReplicaWarnNanos = nowWarn;
                 }
+            } catch (QwpSchemaCapabilityMismatchException e) {
+                // Extended bytes cannot be downgraded, discarded or quarantined.
+                // Keep the slot and retry until a supporting endpoint returns.
+                capabilityGapAttempts = 0;
+                capabilityGapElapsedNanos = 0L;
+                lastCapabilityGapNanos = 0L;
+                firstDynamicCredentialAuthFailureNanos = 0L;
+                lastErrorMessage = e.getMessage();
+                LOG.warn("drainer slot {}: schema framing unavailable, retaining backlog and retrying",
+                        slotPath);
             } catch (QwpDurableAckMismatchException e) {
                 // Genuine cluster-wide durable-ack CAPABILITY gap: a server
                 // upgraded but does not advertise durable ack. Unlike a role
@@ -1072,7 +1096,7 @@ public final class BackgroundDrainer implements Runnable {
             // poll of a partially-drained slot read as progress and hand back a budget the initial connect
             // had legitimately spent.
             ackProgressWatermark = engine.ackedFsn();
-            client = connectWithDurableAckRetry();
+            client = connectWithDurableAckRetry(engine);
             if (client == null) {
                 // outcome already set (FAILED or STOPPED); markFailed sentinel
                 // already dropped on the FAILED path.
@@ -1181,7 +1205,8 @@ public final class BackgroundDrainer implements Runnable {
                         if (t.getCause() instanceof Error) {
                             throw (Error) t.getCause();
                         }
-                        if (loop.capabilityGapTerminal() != null || loop.authTerminal() != null) {
+                        if (loop.capabilityGapTerminal() != null
+                                || loop.authTerminal() != null) {
                             // The I/O thread publishes a durable ack before it latches a later terminal.
                             // That publication can land after the poll at the top of this iteration but
                             // before checkError() observes the terminal. Re-read here so recycling the wire
@@ -1243,7 +1268,7 @@ public final class BackgroundDrainer implements Runnable {
                             } catch (Throwable ignored) {
                             }
                             loop = null;
-                            client = connectWithDurableAckRetry();
+                            client = connectWithDurableAckRetry(engine);
                             if (client == null) {
                                 // outcome already set (FAILED after budget
                                 // exhaustion, or STOPPED); sentinel handled.

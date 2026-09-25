@@ -83,6 +83,8 @@ public final class ConfigSchema {
         str("reconnect_max_backoff_millis", Side.INGRESS);
         str("reconnect_max_duration_millis", Side.INGRESS);
         str("request_durable_ack", Side.INGRESS);
+        str("schema_mode", Side.INGRESS);
+        str("schema_wait_millis", Side.INGRESS);
         str("sender_id", Side.INGRESS);
         str("sf_append_deadline_millis", Side.INGRESS);
         str("sf_dir", Side.INGRESS);

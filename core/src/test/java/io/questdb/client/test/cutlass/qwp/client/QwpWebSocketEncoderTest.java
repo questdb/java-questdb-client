@@ -44,6 +44,153 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 public class QwpWebSocketEncoderTest {
 
     @Test
+    public void testHeaderRejectsTableCountOutsideUnsignedShortRange() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder()) {
+                encoder.writeHeader(0, 0);
+                encoder.writeHeader(0xffff, 0);
+                assertIllegalArgument(() -> encoder.writeHeader(-1, 0));
+                assertIllegalArgument(() -> encoder.writeHeader(0x1_0000, 0));
+            }
+        });
+    }
+
+    private static void assertIllegalArgument(Runnable action) {
+        try {
+            action.run();
+            Assert.fail("expected IllegalArgumentException");
+        } catch (IllegalArgumentException expected) {
+            // expected
+        }
+    }
+
+    private static void assertIllegalState(Runnable action) {
+        try {
+            action.run();
+            Assert.fail("expected IllegalStateException");
+        } catch (IllegalStateException expected) {
+            // expected
+        }
+    }
+
+    @Test
+    public void testEncodeSchemaKnownAndUnknownIdentityWire() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                buffer.getOrCreateColumn("x", TYPE_LONG, true).addLong(7);
+                buffer.nextRow();
+                int size = encoder.encodeSchema(buffer, 42, 19);
+                long p = encoder.getBuffer().getBufferPtr();
+                Assert.assertEquals(FLAG_GORILLA | FLAG_SCHEMA, Unsafe.getUnsafe().getByte(p + HEADER_OFFSET_FLAGS));
+                Assert.assertEquals(1, Unsafe.getUnsafe().getByte(p + 14));
+                Assert.assertEquals(42, Unsafe.getUnsafe().getInt(p + 15));
+                Assert.assertEquals(19, Unsafe.getUnsafe().getLong(p + 19));
+                Assert.assertEquals(size - HEADER_SIZE, Unsafe.getUnsafe().getInt(p + 8));
+
+                size = encoder.encodeSchema(buffer, -1, -1);
+                p = encoder.getBuffer().getBufferPtr();
+                Assert.assertEquals(0, Unsafe.getUnsafe().getByte(p + 14));
+                Assert.assertEquals(1, Unsafe.getUnsafe().getByte(p + 15));
+                Assert.assertEquals(size - HEADER_SIZE, Unsafe.getUnsafe().getInt(p + 8));
+            }
+        });
+    }
+
+    @Test
+    public void testSchemaMessageRejectsMixedModesAndInvalidIdentity() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                assertIllegalArgument(() -> encoder.encodeSchema(buffer, -1, 1));
+                assertIllegalArgument(() -> encoder.encodeSchema(buffer, 0, -1));
+                assertIllegalArgument(() -> encoder.beginSchemaMessage(0, new GlobalSymbolDictionary(), -1, -1));
+                encoder.beginSchemaMessage(1, new GlobalSymbolDictionary(), -1, -1);
+                assertIllegalState(() -> encoder.addTable(buffer));
+                encoder.beginMessage(1, new GlobalSymbolDictionary(), -1, -1);
+                assertIllegalState(() -> encoder.addSchemaTable(buffer, 1, 1));
+            }
+        });
+    }
+
+    @Test
+    public void testSchemaMultiTableAndLegacyReuseHaveExactFlags() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 QwpTableBuffer first = new QwpTableBuffer("a");
+                 QwpTableBuffer second = new QwpTableBuffer("b")) {
+                first.getOrCreateColumn("x", TYPE_LONG, true).addLong(1);
+                first.nextRow();
+                second.getOrCreateColumn("x", TYPE_LONG, true).addLong(2);
+                second.nextRow();
+                int legacySize = encoder.encode(first);
+                byte[] expectedLegacy = new byte[legacySize];
+                for (int i = 0; i < legacySize; i++) {
+                    expectedLegacy[i] = Unsafe.getUnsafe().getByte(encoder.getBuffer().getBufferPtr() + i);
+                }
+                encoder.beginSchemaMessage(2, new GlobalSymbolDictionary(), -1, -1);
+                encoder.addSchemaTable(first, 7, 8);
+                encoder.addSchemaTable(second, -1, -1);
+                int size = encoder.finishMessage();
+                long p = encoder.getBuffer().getBufferPtr();
+                Assert.assertEquals(FLAG_GORILLA | FLAG_DELTA_SYMBOL_DICT | FLAG_SCHEMA,
+                        Unsafe.getUnsafe().getByte(p + HEADER_OFFSET_FLAGS));
+                Assert.assertEquals(2, Unsafe.getUnsafe().getShort(p + 6));
+                Assert.assertEquals(size - HEADER_SIZE, Unsafe.getUnsafe().getInt(p + 8));
+
+                Assert.assertEquals(legacySize, encoder.encode(first));
+                Assert.assertEquals(FLAG_GORILLA,
+                        Unsafe.getUnsafe().getByte(encoder.getBuffer().getBufferPtr() + HEADER_OFFSET_FLAGS));
+                for (int i = 0; i < legacySize; i++) {
+                    Assert.assertEquals("legacy byte " + i, expectedLegacy[i],
+                            Unsafe.getUnsafe().getByte(encoder.getBuffer().getBufferPtr() + i));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testSchemaSplitPreservesIdentityBodyAndPerSplitDeferFlag() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 MicrobatchBuffer firstSplit = new MicrobatchBuffer(64);
+                 MicrobatchBuffer secondSplit = new MicrobatchBuffer(64);
+                 QwpTableBuffer first = new QwpTableBuffer("a");
+                 QwpTableBuffer second = new QwpTableBuffer("b")) {
+                first.getOrCreateColumn("x", TYPE_LONG, true).addLong(11);
+                first.nextRow();
+                second.getOrCreateColumn("x", TYPE_LONG, true).addLong(22);
+                second.nextRow();
+                encoder.beginSchemaMessage(2, new GlobalSymbolDictionary(), -1, -1);
+                int firstOffset = encoder.getBuffer().getPosition();
+                encoder.addSchemaTable(first, 7, 8);
+                int firstLength = encoder.getBuffer().getPosition() - firstOffset;
+                int secondOffset = encoder.getBuffer().getPosition();
+                encoder.addSchemaTable(second, 9, 10);
+                int secondLength = encoder.getBuffer().getPosition() - secondOffset;
+                encoder.finishMessage();
+
+                encoder.copySplitMessage(firstSplit, firstOffset, firstLength, true, -1, -1);
+                encoder.copySplitMessage(secondSplit, secondOffset, secondLength, false, -1, -1);
+                Assert.assertEquals(FLAG_GORILLA | FLAG_DELTA_SYMBOL_DICT | FLAG_SCHEMA | FLAG_DEFER_COMMIT,
+                        Unsafe.getUnsafe().getByte(firstSplit.getBufferPtr() + HEADER_OFFSET_FLAGS));
+                Assert.assertEquals(FLAG_GORILLA | FLAG_DELTA_SYMBOL_DICT | FLAG_SCHEMA,
+                        Unsafe.getUnsafe().getByte(secondSplit.getBufferPtr() + HEADER_OFFSET_FLAGS));
+                assertSliceEquals(encoder.getBuffer().getBufferPtr() + firstOffset, firstSplit, firstLength);
+                assertSliceEquals(encoder.getBuffer().getBufferPtr() + secondOffset, secondSplit, secondLength);
+            }
+        });
+    }
+
+    private static void assertSliceEquals(long expected, MicrobatchBuffer split, int length) {
+        long actual = split.getBufferPtr() + HEADER_SIZE + 2; // empty delta start/count varints
+        for (int i = 0; i < length; i++) {
+            Assert.assertEquals("table body byte " + i,
+                    Unsafe.getUnsafe().getByte(expected + i), Unsafe.getUnsafe().getByte(actual + i));
+        }
+    }
+
+    @Test
     public void testBufferResetAndReuse() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();

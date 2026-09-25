@@ -231,10 +231,22 @@ public final class ColumnType {
         return ((scale & 0xFF) << 18) | ((precision & 0xFF) << 8) | (DECIMAL8 + size);
     }
 
+    public static int getDecimalPrecision(int type) {
+        return (type >>> 8) & 0xFF;
+    }
+
+    public static int getDecimalScale(int type) {
+        return (type >>> 18) & 0xFF;
+    }
+
     public static int getGeoHashTypeWithBits(int bits) {
         assert bits > 0 && bits <= GEOLONG_MAX_BITS;
         // this logic relies on GeoHash type value to be clustered together
         return mkGeoHashType(bits, (short) (GEOBYTE + pow2SizeOfBits(bits)));
+    }
+
+    public static int getGeoHashBits(int type) {
+        return (type >>> BYTE_BITS) & 0xff;
     }
 
     /**
@@ -242,6 +254,15 @@ public final class ColumnType {
      */
     public static boolean isArray(int columnType) {
         return ColumnType.tagOf(columnType) == ColumnType.ARRAY;
+    }
+
+    public static boolean isDecimal(int columnType) {
+        short tag = tagOf(columnType);
+        return tag >= DECIMAL8 && tag <= DECIMAL256;
+    }
+
+    public static boolean isGeoHash(int columnType) {
+        return (columnType & TYPE_FLAG_GEO_HASH) != 0;
     }
 
     public static boolean isNull(int columnType) {

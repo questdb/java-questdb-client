@@ -70,7 +70,10 @@ public final class Numbers {
     private static final int[] insignificantDigitsNumber = new int[]{0, 0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 8, 8, 8, 9, 9, 9, 9, 10, 10, 10, 11, 11, 11, 12, 12, 12, 12, 13, 13, 13, 14, 14, 14, 15, 15, 15, 15, 16, 16, 16, 17, 17, 17, 18, 18, 18, 19};
     private static final LongHexAppender[] longHexAppender = new LongHexAppender[Long.SIZE + 1];
     private static final LongHexAppender[] longHexAppenderPad64 = new LongHexAppender[Long.SIZE + 1];
-    private final static ThreadLocal<char[]> tlDoubleDigitsBuffer = new ThreadLocal<>(() -> new char[21]);
+    // Scratch cell for RyuDouble.d2d()'s out-parameter. The server passes this
+    // through CharSink.ryuScratch(); the client's CharSink has no such method,
+    // so the single shared formatter keeps its own per-thread cell instead.
+    private final static ThreadLocal<int[]> tlRyuScratch = new ThreadLocal<>(() -> new int[1]);
 
     private Numbers() {
     }
@@ -175,47 +178,92 @@ public final class Numbers {
     }
 
     public static void append(CharSink<?> sink, double value, int scale) {
-        final char[] digits = tlDoubleDigitsBuffer.get();
         final long doubleBits = Double.doubleToRawLongBits(value);
-        boolean negative = (doubleBits & SIGN_BIT_MASK) != 0L;
-        long significantBitCount = doubleBits & SIGNIF_BIT_MASK;
-        int binExp = (int) ((doubleBits & EXP_BIT_MASK) >> EXP_SHIFT);
+        long ieeeMantissa = doubleBits & SIGNIF_BIT_MASK;
+        int ieeeExponent = (int) ((doubleBits & EXP_BIT_MASK) >> EXP_SHIFT);
 
-        if (binExp == 2047) {
-            if (significantBitCount == 0L) {
-                if (negative) {
-                    sink.putAscii("-Infinity");
-                } else {
-                    sink.putAscii("Infinity");
-                }
-            } else {
+        // NaN or Infinity
+        if (ieeeExponent == 2047) {
+            if (ieeeMantissa != 0) {
                 sink.putAscii("NaN");
+            } else if ((doubleBits & SIGN_BIT_MASK) != 0) {
+                sink.putAscii("-Infinity");
+            } else {
+                sink.putAscii("Infinity");
+            }
+            return;
+        }
+
+        // Negative sign (including -0.0)
+        if ((doubleBits & SIGN_BIT_MASK) != 0) {
+            sink.putAscii('-');
+        }
+
+        // Zero
+        if (ieeeExponent == 0 && ieeeMantissa == 0) {
+            sink.putAscii("0.0");
+            return;
+        }
+
+        // Decompose via Ryu
+        int[] e10 = tlRyuScratch.get();
+        long output = RyuDouble.d2d(ieeeMantissa, ieeeExponent, e10);
+        int olength = RyuDouble.decimalLength17(output);
+        int decExp = e10[0] + olength;
+
+        if (decExp > 0 && decExp < 8) {
+            // Fixed-point with integer part: e.g. "1234.567" or "1234000.0"
+            if (olength <= decExp) {
+                for (int i = 0; i < olength; i++) {
+                    sink.putAscii((char) ('0' + (int) (output / pow10[olength - 1 - i] % 10)));
+                }
+                for (int i = olength; i < decExp; i++) {
+                    sink.putAscii('0');
+                }
+                sink.putAscii(".0");
+            } else {
+                int fracDigits = olength - decExp;
+                if (scale < MAX_DOUBLE_SCALE && fracDigits > scale) {
+                    fracDigits = Math.max(scale, 1);
+                }
+                for (int i = 0; i < decExp; i++) {
+                    sink.putAscii((char) ('0' + (int) (output / pow10[olength - 1 - i] % 10)));
+                }
+                sink.putAscii('.');
+                for (int i = 0; i < fracDigits; i++) {
+                    sink.putAscii((char) ('0' + (int) (output / pow10[olength - 1 - decExp - i] % 10)));
+                }
+            }
+        } else if (decExp <= 0 && decExp > -3) {
+            // Leading-zero fixed-point: e.g. "0.00123"
+            int leadingZeros = -decExp;
+            int totalFrac = leadingZeros + olength;
+            int digitsFromOutput = olength;
+            if (scale < MAX_DOUBLE_SCALE && totalFrac > scale) {
+                totalFrac = Math.max(scale, 1);
+                digitsFromOutput = Math.max(totalFrac - leadingZeros, 0);
+            }
+            int zerosToWrite = Math.min(leadingZeros, totalFrac);
+            sink.putAscii("0.");
+            for (int i = 0; i < zerosToWrite; i++) {
+                sink.putAscii('0');
+            }
+            for (int i = 0; i < digitsFromOutput; i++) {
+                sink.putAscii((char) ('0' + (int) (output / pow10[olength - 1 - i] % 10)));
             }
         } else {
-            int fractionBits;
-            if (binExp == 0) {
-                if (significantBitCount == 0L) {
-                    if (negative) {
-                        sink.putAscii("-0.0");
-                    } else {
-                        sink.putAscii("0.0");
-                    }
-                    return;
+            // Scientific notation: e.g. "1.23E8" or "1.0E-4"
+            sink.putAscii((char) ('0' + (int) (output / pow10[olength - 1] % 10)));
+            sink.putAscii('.');
+            if (olength > 1) {
+                for (int i = 1; i < olength; i++) {
+                    sink.putAscii((char) ('0' + (int) (output / pow10[olength - 1 - i] % 10)));
                 }
-
-                int leadingZeros = Long.numberOfLeadingZeros(significantBitCount);
-                int shift = leadingZeros - (63 - EXP_SHIFT);
-                significantBitCount <<= shift;
-                binExp = 1 - shift;
-                fractionBits = 64 - leadingZeros;
             } else {
-                significantBitCount |= FRACT_HOB;
-                fractionBits = 53;
+                sink.putAscii('0');
             }
-
-            binExp -= EXP_BIAS;
-
-            appendDouble0(binExp, significantBitCount, fractionBits, negative, digits, sink, scale);
+            sink.putAscii('E');
+            append(sink, decExp - 1);
         }
     }
 
@@ -406,7 +454,10 @@ public final class Numbers {
             if (sign == '.') {
                 do {
                     lo++;
-                } while (sequence.charAt(lo) == '.');
+                } while (lo < lim && sequence.charAt(lo) == '.');
+                if (lo == lim) {
+                    throw NumericException.instance().put("IPv4 address must have 4 octets, found: 1");
+                }
             } else {
                 throw NumericException.instance().put("invalid IPv4 address: ").put(sequence);
             }
@@ -475,347 +526,6 @@ public final class Numbers {
             throw NumericException.instance().put("null string");
         }
         return parseLong0(sequence.asAsciiCharSequence(), sequence.size());
-    }
-
-    private static void appendDouble0(
-            int binExp,
-            long fractionBits,
-            int significantBitCount,
-            boolean negative,
-            char[] digits,
-            CharSink<?> out,
-            int outScale
-    ) {
-        assert fractionBits > 0L;
-        assert (fractionBits & FRACT_HOB) != 0L;
-
-        final int tailZeroes = Long.numberOfTrailingZeros(fractionBits);
-        final int fractBitCount = EXP_SHIFT + 1 - tailZeroes;
-        int decExp;
-        int firstDigitIndex;
-        int nDigits;
-
-        final int tinyBitCount = Math.max(0, fractBitCount - binExp - 1);
-        if (binExp < MAX_SMALL_BIN_EXP + 1 && binExp > MIN_SMALL_BIN_EXP - 1 && tinyBitCount < LONG_5_POW.length && fractBitCount + N_5_BITS[tinyBitCount] < 64 && tinyBitCount == 0) {
-            int insignificant;
-            if (binExp > significantBitCount) {
-                insignificant = insignificantDigitsForPow2(binExp - significantBitCount - 1);
-            } else {
-                insignificant = 0;
-            }
-
-            if (binExp >= EXP_SHIFT) {
-                fractionBits <<= binExp - EXP_SHIFT;
-            } else {
-                fractionBits >>>= EXP_SHIFT - binExp;
-            }
-
-            //
-            int binExp2 = 0;
-            if (insignificant != 0) {
-                long pow10 = LONG_5_POW[insignificant] << insignificant;
-                long residue = fractionBits % pow10;
-                fractionBits /= pow10;
-                binExp2 += insignificant;
-                if (residue >= pow10 >> 1) {
-                    ++fractionBits;
-                }
-            }
-
-            int digitIndex = digits.length - 1;
-            int digit;
-            if (fractionBits <= Integer.MAX_VALUE) {
-                assert fractionBits > 0L : fractionBits;
-
-                int fractRemaining = (int) fractionBits;
-                digit = fractRemaining % 10;
-
-                for (fractRemaining /= 10; digit == 0; fractRemaining /= 10) {
-                    ++binExp2;
-                    digit = fractRemaining % 10;
-                }
-
-                while (fractRemaining != 0) {
-                    digits[digitIndex--] = (char) (digit + '0');
-                    ++binExp2;
-                    digit = fractRemaining % 10;
-                    fractRemaining /= 10;
-                }
-
-            } else {
-                digit = (int) (fractionBits % 10L);
-
-                for (fractionBits /= 10L; digit == 0; fractionBits /= 10L) {
-                    ++binExp2;
-                    digit = (int) (fractionBits % 10L);
-                }
-
-                while (fractionBits != 0L) {
-                    digits[digitIndex--] = (char) (digit + '0');
-                    ++binExp2;
-                    digit = (int) (fractionBits % 10L);
-                    fractionBits /= 10L;
-                }
-
-            }
-            digits[digitIndex] = (char) (digit + '0');
-
-            decExp = binExp2 + 1;
-            firstDigitIndex = digitIndex;
-            nDigits = digits.length - digitIndex;
-        } else {
-            int estDecExp = estimateDecExpDouble(fractionBits, binExp);
-            int B5 = Math.max(0, -estDecExp);
-            int B2 = B5 + tinyBitCount + binExp;
-            int S5 = Math.max(0, estDecExp);
-            int S2 = S5 + tinyBitCount;
-            int M2 = B2 - significantBitCount;
-            fractionBits >>>= tailZeroes;
-            B2 -= fractBitCount - 1;
-            int common2factor = Math.min(B2, S2);
-            B2 -= common2factor;
-            S2 -= common2factor;
-            M2 -= common2factor;
-            if (fractBitCount == 1) {
-                --M2;
-            }
-
-            if (M2 < 0) {
-                B2 -= M2;
-                S2 -= M2;
-                M2 = 0;
-            }
-
-            int bBits = fractBitCount + B2 + (B5 < N_5_BITS.length ? N_5_BITS[B5] : B5 * 3);
-            int tenBits = S2 + 1 + (S5 + 1 < N_5_BITS.length ? N_5_BITS[S5 + 1] : (S5 + 1) * 3);
-            boolean low;
-            boolean high;
-            long lowDigitDifference;
-            int q;
-            int digitIndex;
-            if (bBits < 64 && tenBits < 64) {
-                if (bBits < 32 && tenBits < 32) {
-                    int b = (int) fractionBits * SMALL_5_POW[B5] << B2;
-                    int s = SMALL_5_POW[S5] << S2;
-                    int m = SMALL_5_POW[B5] << M2;
-                    int tens = s * 10;
-                    digitIndex = 0;
-                    q = b / s;
-                    b = 10 * (b % s);
-                    m *= 10;
-                    low = b < m;
-                    high = b + m > tens;
-
-                    assert q < 10 : q;
-
-                    if (q == 0 && !high) {
-                        --estDecExp;
-                    } else {
-                        digits[digitIndex++] = (char) ('0' + q);
-                    }
-
-                    if (estDecExp < -3 || estDecExp >= 8) {
-                        low = false;
-                        high = false;
-                    }
-
-                    for (; !low && !high; digits[digitIndex++] = (char) ('0' + q)) {
-                        q = b / s;
-                        b = 10 * (b % s);
-                        m *= 10;
-
-                        assert q < 10 : q;
-
-                        if ((long) m > 0L) {
-                            low = b < m;
-                            high = b + m > tens;
-                        } else {
-                            low = true;
-                            high = true;
-                        }
-                    }
-
-                    lowDigitDifference = ((long) b << 1) - tens;
-                } else {
-                    long b = fractionBits * LONG_5_POW[B5] << B2;
-                    long s = LONG_5_POW[S5] << S2;
-                    long m = LONG_5_POW[B5] << M2;
-                    long tens = s * 10L;
-                    digitIndex = 0;
-                    q = (int) (b / s);
-                    b = 10L * (b % s);
-                    m *= 10L;
-                    low = b < m;
-                    high = b + m > tens;
-
-                    assert q < 10 : q;
-
-                    if (q == 0 && !high) {
-                        --estDecExp;
-                    } else {
-                        digits[digitIndex++] = (char) ('0' + q);
-                    }
-
-                    if (estDecExp < -3 || estDecExp >= 8) {
-                        low = false;
-                        high = false;
-                    }
-
-                    for (; !low && !high; digits[digitIndex++] = (char) ('0' + q)) {
-                        q = (int) (b / s);
-                        b = 10L * (b % s);
-                        m *= 10L;
-
-                        assert q < 10 : q;
-
-                        if (m > 0L) {
-                            low = b < m;
-                            high = b + m > tens;
-                        } else {
-                            low = true;
-                            high = true;
-                        }
-                    }
-                    lowDigitDifference = (b << 1) - tens;
-                }
-            } else {
-                FdBig sVal = FdBig.valueOfPow52(S5, S2);
-                final int shiftBias = sVal.getNormalizationBias();
-                sVal = sVal.leftShift(shiftBias);
-                FdBig bVal = FdBig.valueOfMulPow52(fractionBits, B5, B2 + shiftBias);
-                FdBig mVal = FdBig.valueOfPow52(B5 + 1, M2 + shiftBias + 1);
-                FdBig tensVal = FdBig.valueOfPow52(S5 + 1, S2 + shiftBias + 1);
-                digitIndex = 0;
-                q = bVal.quoRemIteration(sVal);
-                low = bVal.cmp(mVal) < 0;
-                high = tensVal.addAndCmp(bVal, mVal) <= 0;
-
-                assert q < 10 : q;
-
-                if (q == 0 && !high) {
-                    --estDecExp;
-                } else {
-                    digits[digitIndex++] = (char) ('0' + q);
-                }
-
-                if (estDecExp < -3 || estDecExp >= 8) {
-                    low = false;
-                    high = false;
-                }
-
-                while (!low && !high) {
-                    q = bVal.quoRemIteration(sVal);
-
-                    assert q < 10 : q;
-
-                    mVal = mVal.multBy10();
-                    low = bVal.cmp(mVal) < 0;
-                    high = tensVal.addAndCmp(bVal, mVal) <= 0;
-                    digits[digitIndex++] = (char) ('0' + q);
-                }
-
-                if (high && low) {
-                    bVal = bVal.leftShift(1);
-                    lowDigitDifference = bVal.cmp(tensVal);
-                } else {
-                    lowDigitDifference = 0L;
-                }
-            }
-
-            decExp = estDecExp + 1;
-            firstDigitIndex = 0;
-            nDigits = digitIndex;
-            if (high) {
-                if (low) {
-                    if (lowDigitDifference == 0L) {
-                        if ((digits[firstDigitIndex + nDigits - 1] & 1) != 0) {
-                            if (roundupDouble(firstDigitIndex, digits, nDigits)) {
-                                decExp++;
-                            }
-                        }
-                    } else if (lowDigitDifference > 0L) {
-                        if (roundupDouble(firstDigitIndex, digits, nDigits)) {
-                            decExp++;
-                        }
-                    }
-                } else {
-                    if (roundupDouble(firstDigitIndex, digits, nDigits)) {
-                        decExp++;
-                    }
-                }
-            }
-        }
-
-        appendDouble00(digits, firstDigitIndex, nDigits, negative, decExp, out, outScale);
-    }
-
-    private static void appendDouble00(
-            char[] digits,
-            int firstDigitIndex,
-            int nDigits,
-            boolean isNegative,
-            int decExp,
-            CharSink<?> sink,
-            int outScale
-    ) {
-        assert nDigits <= MAX_DOUBLE_SCALE : nDigits;
-        if (isNegative) {
-            sink.putAscii('-');
-        }
-
-        int exp;
-        if (decExp > 0 && decExp < 8) {
-            exp = Math.min(nDigits, decExp);
-            sink.putAscii(digits, firstDigitIndex, exp);
-            if (exp < decExp) {
-                exp = decExp - exp;
-                sink.fillAscii('0', exp);
-                sink.putAscii('.');
-                sink.putAscii('0');
-            } else {
-                sink.putAscii('.');
-                if (exp < nDigits) {
-                    sink.putAscii(digits, firstDigitIndex + exp, Math.min(nDigits - exp, outScale));
-                } else {
-                    sink.putAscii('0');
-                }
-            }
-        } else if (decExp <= 0 && decExp > -3) {
-            sink.putAscii('0').putAscii('.');
-            if (decExp != 0) {
-                sink.fillAscii('0', -decExp);
-            }
-
-            sink.putAscii(digits, firstDigitIndex, Math.min(nDigits, outScale));
-        } else {
-            sink.putAscii(digits[firstDigitIndex]);
-            sink.putAscii('.');
-            if (nDigits > 1) {
-                sink.putAscii(digits, firstDigitIndex + 1, nDigits - 1);
-            } else {
-                sink.putAscii('0');
-            }
-
-            sink.putAscii('E');
-            if (decExp <= 0) {
-                sink.putAscii('-');
-                exp = -decExp + 1;
-            } else {
-                exp = decExp - 1;
-            }
-
-            if (exp < 10) {
-                sink.putAscii((char) (exp + '0'));
-            } else if (exp < 100) {
-                sink.putAscii((char) (exp / 10 + '0'));
-                sink.putAscii((char) (exp % 10 + '0'));
-            } else {
-                sink.putAscii((char) (exp / 100 + '0'));
-                exp %= 100;
-                sink.putAscii((char) (exp / 10 + '0'));
-                sink.putAscii((char) (exp % 10 + '0'));
-            }
-        }
     }
 
     private static void appendInt10(CharSink<?> sink, int i) {

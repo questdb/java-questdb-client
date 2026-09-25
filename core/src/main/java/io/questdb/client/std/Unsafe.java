@@ -210,8 +210,8 @@ public final class Unsafe {
         // object headers (JEP 450, enabled by default in JDK 27) shrink the
         // header from 12 to 8 bytes, and a hard-coded 12/16 would then point
         // inside the header -- the Unsafe write to `override` would silently
-        // miss and setAccessible() would have no effect (surfacing as
-        // IllegalAccessError from the FdBig double-formatting bridge on JDK 27).
+        // miss and setAccessible() would have no effect, so makeAccessible() callers
+        // would fail with IllegalAccessError on JDK 27.
         // The probe tracks compact (8), compressed (12), uncompressed (16) and
         // 32-bit (8) layouts automatically.
         return firstFieldBoundaryOffset();

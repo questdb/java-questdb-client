@@ -502,7 +502,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      *
      * @param timeoutMillis upper bound on the wait; {@code <= 0} returns the
      *                      current state without blocking (the flush still
-     *                      happens before the check)
+     *                      happens before the check), and {@code Long.MAX_VALUE}
+     *                      waits without a limit
      * @return {@code true} if the server has acknowledged every published
      *         frame on return, {@code false} on timeout
      * @throws LineSenderException if the transport has latched a terminal error
@@ -570,6 +571,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * Precision is locked the first time a value is added to the column: subsequent
      * rows must use the same precision or a {@link LineSenderException} is thrown.
      * To mark the value NULL, do not call this method for the current row.
+     * In schema-aware mode, the server column must be a GEOHASH with exactly the
+     * same precision, STRING, or VARCHAR. Text targets receive a binary string
+     * containing exactly {@code precisionBits} characters. Legacy mode keeps the
+     * native GEOHASH wire representation and server-side conversion behavior.
      *
      * @param name          name of the column
      * @param bits          packed geohash; low {@code precisionBits} bits significant
@@ -595,6 +600,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * <p>
      * The first call locks the column at {@code value.length() * 5} bits; all
      * subsequent rows must supply strings of the same length.
+     * In schema-aware mode, the server column must be a GEOHASH with exactly that
+     * precision, STRING, or VARCHAR. Text targets receive the corresponding binary
+     * bit string. Legacy mode keeps the native GEOHASH wire representation and
+     * server-side conversion behavior.
      *
      * @param name  name of the column
      * @param value base32 geohash string, 1..12 characters; must not be null or empty
@@ -653,10 +662,18 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     /**
      * Add an IPv4 column value from a dotted-quad string (e.g. "192.168.1.1").
      *
+     * A null reference skips the column for the current row. The literal
+     * {@code "null"} (case-insensitive) and the exact address
+     * {@code "0.0.0.0"} are rejected; omit the setter or pass a null reference
+     * to write a missing value.
+     * Legacy dotted aliases such as {@code ".0.0.0.0."} are accepted and
+     * normalized to the IPv4 NULL value.
+     *
      * @param name    name of the column
-     * @param address dotted-quad IPv4 address; must not be null
+     * @param address dotted-quad IPv4 address, or null to skip the column
      * @return this instance for method chaining
-     * @throws LineSenderException if the address fails to parse, or the
+     * @throws LineSenderException if the address fails to parse, represents a
+     *                             rejected NULL sentinel, or the
      *                             configured protocol version does not support IPv4
      */
     default Sender ipv4Column(CharSequence name, CharSequence address) {
@@ -666,6 +683,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     /**
      * Add a LONG256 column value, packed as four 64-bit words, least-significant first
      * (so the 256-bit value is {@code (l3 << 192) | (l2 << 128) | (l1 << 64) | l0}).
+     * In schema-aware mode, setting all four words to {@link Long#MIN_VALUE}
+     * writes SQL NULL. Any other combination, including a partial match, is a value.
+     * Legacy mode preserves its existing behavior: the four words are emitted as
+     * native LONG256 wire data and server-side null/conversion handling applies.
      *
      * @param name name of the column
      * @param l0   bits 0..63 (least significant)
@@ -745,6 +766,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * to finalize the row. You can then start a new row by calling this method again.
      * <br>
      * If you want to cancel the current row, you can call {@link #cancelRow()}.
+     * QWP WebSocket senders resolve the table's schema here when the server speaks schema-aware QWP. The call may
+     * therefore wait up to {@code schema_wait_millis} (with an asynchronous initial connect, that includes waiting for
+     * the first connection), and it publishes the pending batch when this table's wire contract differs from it. So
+     * schema errors, and the flush-timeout and backpressure errors of that publish, can surface here, before the row
+     * has any values. A failure leaves the table selected and no row started; calling this method again retries the
+     * resolution. {@link SchemaMode} decides what happens when the schema is not obtainable. Setters may resolve it
+     * again when an implicitly started row crosses a batch boundary.
      *
      * @param table name of the table
      * @return this instance for method chaining
@@ -799,7 +827,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      *       unconnected sender; the I/O thread runs the same retry loop in
      *       the background. The user thread can call {@code at()} /
      *       {@code flush()} immediately; rows accumulate in the cursor SF
-     *       engine until the wire is up. Transport failures (unreachable or
+     *       engine until the wire is up. {@link SchemaMode} decides whether a
+     *       row written before the first upgrade waits for schema negotiation
+     *       or uses the legacy conversion contract. Transport failures
+     *       (unreachable or
      *       dropped server) retry indefinitely and are never surfaced -- the
      *       buffered rows are safe in SF and the server may still appear. A
      *       terminal auth, upgrade or capability rejection on the initial
@@ -822,6 +853,52 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         OFF,
         SYNC,
         ASYNC
+    }
+
+    /**
+     * Row-encoding contract of the WebSocket (QWP) sender when the server speaks
+     * schema-aware QWP. It decides what a row does when its table's schema is
+     * not obtainable at the moment the row starts: before the first upgrade
+     * completes under {@link InitialConnectMode#ASYNC}, while the wire is down
+     * during an outage, or while a schema lookup is still pending. It is
+     * independent of {@link InitialConnectMode}, which only governs how
+     * {@code fromConfig} behaves before the first successful upgrade.
+     * <ul>
+     *   <li>{@link #AUTO} (default) — a row uses the strict schema contract
+     *       whenever a schema is obtainable: from the batch's pinned snapshot,
+     *       from the cache, or from a lookup that completes within
+     *       {@code schema_wait_millis} while the wire is up. Otherwise the row
+     *       uses the legacy conversion contract; schema unavailability never
+     *       fails a row and the producer never waits on a wire that is down.
+     *       Rows written that way keep store-and-forward's promise that an
+     *       outage never blocks the producer, but the server, not the client,
+     *       validates them, and values such as nanosecond timestamps use their
+     *       legacy representation.</li>
+     *   <li>{@link #STRICT} — once the server is known to speak schema-aware
+     *       QWP, no row is ever encoded with the legacy contract. A row whose
+     *       schema is not obtainable waits up to {@code schema_wait_millis},
+     *       across reconnects, and then fails with
+     *       {@link LineSenderSchemaException} ({@code SCHEMA_UNAVAILABLE}).
+     *       Under {@link InitialConnectMode#ASYNC} the first row also waits for
+     *       the first upgrade, because the server's capability is unknown until
+     *       then.</li>
+     *   <li>{@link #OFF} — every row uses the legacy conversion contract and
+     *       the sender never looks up schemas. It requests schema support only
+     *       when its stream must replay schema-encoded backlog recovered from
+     *       a store-and-forward directory. Legacy-only streams can fail over
+     *       to servers without schema support.</li>
+     * </ul>
+     * <p>
+     * A batch keeps the contract under which its first row was written: rows
+     * added to a pending legacy batch stay legacy even after a schema becomes
+     * obtainable, and a pending schema batch is published before a legacy row
+     * starts a new batch. STRICT permits legacy rows only until a connection
+     * successfully negotiates schema support.
+     */
+    enum SchemaMode {
+        AUTO,
+        STRICT,
+        OFF
     }
 
     /**
@@ -1147,6 +1224,14 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private long reconnectMaxDurationMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private boolean requestDurableAck;
         private int retryTimeoutMillis = PARAMETER_NOT_SET_EXPLICITLY;
+        // Row-encoding contract when a schema is not obtainable (WebSocket
+        // only). null means "not set explicitly", which build() resolves to
+        // AUTO.
+        private SchemaMode schemaMode = null;
+        // Upper bound for one schema wait: the initial handshake, if still
+        // pending, plus one DESCRIBE round trip. Reconnects consume the same
+        // budget.
+        private long schemaWaitMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private boolean transactional;
         private String senderId = DEFAULT_SENDER_ID;
         // Per-append deadline for SF appendBlocking spin-then-throw. Used to
@@ -1533,6 +1618,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 } else {
                     actualInitialConnectMode = InitialConnectMode.OFF;
                 }
+                SchemaMode actualSchemaMode = schemaMode == null ? SchemaMode.AUTO : schemaMode;
+                long actualSchemaWaitMillis = schemaWaitMillis == PARAMETER_NOT_SET_EXPLICITLY
+                        ? QwpWebSocketSender.DEFAULT_SCHEMA_WAIT_MILLIS
+                        : schemaWaitMillis;
                 long actualDurableAckKeepaliveIntervalMillis =
                         durableAckKeepaliveIntervalMillis == DURABLE_ACK_KEEPALIVE_NOT_SET
                                 ? CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS
@@ -1714,7 +1803,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                                     actualConnectionListenerInboxCapacity,
                                     actualMaxFrameRejections,
                                     actualPoisonMinEscalationWindowMillis,
-                                    actualCatchUpCapGapMinEscalationWindowMillis
+                                    actualCatchUpCapGapMinEscalationWindowMillis,
+                                    actualSchemaMode,
+                                    actualSchemaWaitMillis
                             );
                         } catch (UnreplayableSlotException e) {
                             // The one failure build() recovers from. The slot's frames reference ids
@@ -1914,7 +2005,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * {@link Sender#drain(long)} explicitly before close().
          * <p>
          * Set to {@code 0} or {@code -1} to opt out — close() will not wait
-         * at all (fast close). Pending data is then lost in memory mode and
+         * at all (fast close). {@code Long.MAX_VALUE} waits without a limit. Pending data is then lost in memory mode and
          * recovered by the next sender in SF mode.
          * <p>
          * WebSocket transport only.
@@ -2942,6 +3033,40 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
+         * Row-encoding contract when a table's schema is not obtainable --
+         * see {@link SchemaMode} for the value semantics. Default
+         * {@link SchemaMode#AUTO}. WebSocket transport only.
+         */
+        public LineSenderBuilder schemaMode(SchemaMode mode) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("schema_mode is only supported for WebSocket transport");
+            }
+            if (mode == null) {
+                throw new LineSenderException("schema_mode cannot be null");
+            }
+            this.schemaMode = mode;
+            return this;
+        }
+
+        /**
+         * Upper bound for one schema wait: the first WebSocket upgrade, if it
+         * has not completed yet, plus one schema lookup round trip. Reconnects
+         * consume the same budget; they do not restart it. Default 30 s;
+         * {@code Long.MAX_VALUE} waits without a limit. At the bound, {@link SchemaMode#AUTO} writes the row with the legacy contract
+         * and {@link SchemaMode#STRICT} fails it. WebSocket transport only.
+         */
+        public LineSenderBuilder schemaWaitMillis(long millis) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("schema_wait_millis is only supported for WebSocket transport");
+            }
+            if (millis <= 0) {
+                throw new LineSenderException("schema_wait_millis must be > 0: ").put(millis);
+            }
+            this.schemaWaitMillis = millis;
+            return this;
+        }
+
+        /**
          * Per-call deadline for {@code Sender.flush()} spinning on a full
          * cursor segment ring waiting for ACKs to drain space. Default
          * 30 s. Lower for fail-fast services that prefer surfacing
@@ -3881,6 +4006,18 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     } else {
                         throw new LineSenderException("invalid initial_connect_retry [value=").put(sink).put(", allowed-values=[on, off, true, false, sync, async]]");
                     }
+                } else if (Chars.equals("schema_mode", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("schema_mode is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "schema_mode");
+                    schemaMode(parseSchemaModeValue(sink));
+                } else if (Chars.equals("schema_wait_millis", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("schema_wait_millis is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "schema_wait_millis");
+                    schemaWaitMillis(parseLongValue(sink, "schema_wait_millis"));
                 } else if (Chars.equals("sf_append_deadline_millis", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException("sf_append_deadline_millis is only supported for WebSocket transport");
@@ -4144,6 +4281,15 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 if (view.has("sf_append_deadline_millis")) {
                     sfAppendDeadlineMillis(wsLong(view, v, "sf_append_deadline_millis"));
                 }
+                if (view.has("schema_wait_millis")) {
+                    schemaWaitMillis(wsLong(view, v, "schema_wait_millis"));
+                }
+                s = view.getStr("schema_mode");
+                if (s != null) {
+                    v.clear();
+                    v.put(s);
+                    schemaMode(parseSchemaModeValue(v));
+                }
                 if (view.has("sf_max_segment_bytes")) {
                     storeAndForwardMaxSegmentBytes(wsSize(view, v, "sf_max_segment_bytes"));
                 }
@@ -4281,6 +4427,20 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             return parseIntValue(v, key);
         }
 
+        private static SchemaMode parseSchemaModeValue(CharSequence value) {
+            if (Chars.equalsIgnoreCase("auto", value)) {
+                return SchemaMode.AUTO;
+            }
+            if (Chars.equalsIgnoreCase("strict", value)) {
+                return SchemaMode.STRICT;
+            }
+            if (Chars.equalsIgnoreCase("off", value)) {
+                return SchemaMode.OFF;
+            }
+            throw new LineSenderException("invalid schema_mode [value=").put(value)
+                    .put(", allowed-values=[auto, strict, off]]");
+        }
+
         private static long wsLong(ConfigView view, StringSink v, String key) {
             v.clear();
             v.put(view.getStr(key));
@@ -4313,6 +4473,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             m.put("sf_max_total_bytes", sfMaxTotalBytes);
             m.put("sf_durability", sfDurability == null ? null : sfDurability.name());
             m.put("sf_append_deadline_millis", sfAppendDeadlineMillis);
+            m.put("schema_mode", schemaMode == null ? null : schemaMode.name());
+            m.put("schema_wait_millis", schemaWaitMillis);
             m.put("sf_sync_interval_millis", sfSyncIntervalMillis);
             m.put("close_flush_timeout_millis", closeFlushTimeoutMillis);
             m.put("durable_ack_keepalive_interval_millis", durableAckKeepaliveIntervalMillis);

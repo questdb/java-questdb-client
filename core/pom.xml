@@ -194,7 +194,7 @@
                     </excludes>
                 </configuration>
             </plugin>
-            <!-- Packaging integration tests (JarPackagingIT): the sun.misc.FDBigInteger /
+            <!-- Packaging integration tests (JarPackagingIT): the versioned-shim /
                  module-name regressions in 1.3.5-1.3.7 were invisible to unit tests because
                  they run against target/classes, where Multi-Release selection never
                  happens. These ITs inspect and execute the packaged jar itself. -->
@@ -220,7 +220,7 @@
                 </configuration>
             </plugin>
             <!-- Adds the JDK-version-specific source root (src/main/java11 or src/main/java8)
-                 so the FDBigInteger bridge / module-access shim compiles on each JDK. -->
+                 so the Compat shim compiles on each JDK. -->
             <plugin>
                 <groupId>org.codehaus.mojo</groupId>
                 <artifactId>build-helper-maven-plugin</artifactId>
@@ -440,8 +440,8 @@
             <build>
                 <plugins>
                     <!-- The shipped artifact must be the JDK 8 build: a JDK 11+ build puts the
-                         jdk.internal.math FdBig bridge and module-info.class into the jar ROOT,
-                         which breaks Java 8 consumers. Refuse to publish from any other JDK. -->
+                         Java 9+ Compat shim and module-info.class into the jar ROOT, which
+                         breaks Java 8 consumers. Refuse to publish from any other JDK. -->
                     <plugin>
                         <groupId>org.apache.maven.plugins</groupId>
                         <artifactId>maven-enforcer-plugin</artifactId>
@@ -561,13 +561,13 @@
             </activation>
             <build>
                 <plugins>
-                    <!-- JDK 8 javac can only compile the src/main/java8 FdBig bridge
-                         (sun.misc.FDBigInteger), which does not exist on Java 9+. Package the
-                         src/main/java11 bridge (jdk.internal.math.FDBigInteger) into
-                         META-INF/versions/11 so the Multi-Release jar works on every JDK.
-                         Shipping a JDK 8-built jar without this breaks double formatting on
-                         Java 9+ with NoClassDefFoundError (the 1.3.5-1.3.7 regression), hence
-                         a missing JDK 11 fails the build instead of skipping. -->
+                    <!-- JDK 8 javac can only compile the src/main/java8 Compat shim, whose
+                         multiplyHigh/onSpinWait fallbacks exist only for Java 8. Package the
+                         src/main/java11 shim, which uses the Math.multiplyHigh and
+                         Thread.onSpinWait intrinsics, into META-INF/versions/11 so the
+                         Multi-Release jar picks the right variant on every JDK. The Ryu double
+                         formatter calls multiplyHigh on every value, so a missing JDK 11 fails
+                         the build instead of skipping. -->
                     <plugin>
                         <groupId>org.apache.maven.plugins</groupId>
                         <artifactId>maven-antrun-plugin</artifactId>

@@ -65,6 +65,8 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
     private int runningRawCount;
     private int runningRawLen;
     private long runningCoverage;
+    // FSN of the newest FLAG_SCHEMA frame visited; -1 when none.
+    private long maxSchemaFsn = -1L;
 
     RecoveredFrameAnalysis(int baseline, long ackedFsn) {
         this.baseline = baseline;
@@ -81,6 +83,11 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
         byte flags = isQwp
                 ? Unsafe.getUnsafe().getByte(payload + QwpConstants.HEADER_OFFSET_FLAGS)
                 : 0;
+        if (isQwp && (flags & QwpConstants.FLAG_SCHEMA) != 0) {
+            // Includes a retained deferred tail: it may still be replay-owned
+            // until the engine's orphan-tail retirement acknowledges it.
+            maxSchemaFsn = fsn;
+        }
         if (isQwp && (flags & QwpConstants.FLAG_DELTA_SYMBOL_DICT) != 0) {
             foldDelta(fsn, payload + QwpConstants.HEADER_SIZE, payload + payloadLen);
         }
@@ -187,6 +194,10 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
 
     long maxDeltaStart() {
         return committedMaxDeltaStart;
+    }
+
+    long maxSchemaFsn() {
+        return maxSchemaFsn;
     }
 
     long rawAddr() {

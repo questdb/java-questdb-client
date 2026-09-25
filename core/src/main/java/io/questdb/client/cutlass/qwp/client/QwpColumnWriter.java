@@ -53,11 +53,12 @@ class QwpColumnWriter {
             long stringDataSize,
             int symbolDictionarySize,
             boolean useGorilla,
-            boolean useGlobalSymbols
+            boolean useGlobalSymbols,
+            boolean forceNullBitmap
     ) {
         long dataAddr = col.getDataAddress();
 
-        writeNullHeader(col, rowCount, rowCount - valueCount);
+        writeNullHeader(col, rowCount, rowCount - valueCount, forceNullBitmap);
 
         switch (col.getType()) {
             case TYPE_BOOLEAN:
@@ -233,8 +234,13 @@ class QwpColumnWriter {
         }
     }
 
-    private void writeNullHeader(QwpTableBuffer.ColumnBuffer col, int rowCount, int nullCount) {
-        if (nullCount > 0) {
+    private void writeNullHeader(
+            QwpTableBuffer.ColumnBuffer col,
+            int rowCount,
+            int nullCount,
+            boolean forceNullBitmap
+    ) {
+        if (nullCount > 0 || forceNullBitmap) {
             buffer.putByte((byte) 1);
             col.ensureNullBitmapCapacity(rowCount);
             long nullAddr = col.getNullBitmapAddress();
@@ -281,6 +287,24 @@ class QwpColumnWriter {
 
     private void writeTableHeader(String tableName, int rowCount, QwpColumnDef[] columns) {
         buffer.putString(tableName);
+        writeTableShape(rowCount, columns);
+    }
+
+    private void writeSchemaTableHeader(String tableName, int tableId, long metadataVersion, int rowCount, QwpColumnDef[] columns) {
+        buffer.putString(tableName);
+        if (tableId == -1 && metadataVersion == -1) {
+            buffer.putByte((byte) 0);
+        } else if (tableId >= 0 && metadataVersion >= 0) {
+            buffer.putByte((byte) 1);
+            buffer.putInt(tableId);
+            buffer.putLong(metadataVersion);
+        } else {
+            throw new IllegalArgumentException("schema identity must be both known or both unknown");
+        }
+        writeTableShape(rowCount, columns);
+    }
+
+    private void writeTableShape(int rowCount, QwpColumnDef[] columns) {
         buffer.putVarint(rowCount);
         buffer.putVarint(columns.length);
         for (QwpColumnDef col : columns) {
@@ -319,6 +343,17 @@ class QwpColumnWriter {
         encodeTable(tableBuffer, tableBuffer.getRowCount(), null, null, null, useGlobalSymbols, useGorilla);
     }
 
+    void encodeSchemaTable(QwpTableBuffer tableBuffer, int tableId, long metadataVersion, boolean useGlobalSymbols, boolean useGorilla) {
+        QwpColumnDef[] columnDefs = tableBuffer.getColumnDefs();
+        writeSchemaTableHeader(tableBuffer.getTableName(), tableId, metadataVersion, tableBuffer.getRowCount(), columnDefs);
+        for (int i = 0; i < tableBuffer.getColumnCount(); i++) {
+            QwpTableBuffer.ColumnBuffer col = tableBuffer.getColumn(i);
+            encodeColumn(col, tableBuffer.getRowCount(), col.getValueCount(), col.getStringDataSize(),
+                    col.getSymbolDictionarySize(), useGorilla, useGlobalSymbols,
+                    col.getType() == TYPE_GEOHASH && col.usesNullBitmap());
+        }
+    }
+
     void encodeTable(
             QwpTableBuffer tableBuffer,
             int rowCount,
@@ -344,7 +379,8 @@ class QwpColumnWriter {
                 symbolDictionarySize = limitedSymbolDictionarySizes[i];
             }
 
-            encodeColumn(col, rowCount, valueCount, stringDataSize, symbolDictionarySize, useGorilla, useGlobalSymbols);
+            encodeColumn(col, rowCount, valueCount, stringDataSize, symbolDictionarySize,
+                    useGorilla, useGlobalSymbols, false);
         }
     }
 

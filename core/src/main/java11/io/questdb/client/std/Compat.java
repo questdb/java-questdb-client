@@ -46,6 +46,15 @@ public final class Compat {
     }
 
     /**
+     * Returns the most significant 64 bits of the 128-bit product of two longs.
+     * Delegates to {@code Math.multiplyHigh()} on Java 9+, which HotSpot
+     * intrinsifies; the Java 8 variant computes the same result by hand.
+     */
+    public static long multiplyHigh(long x, long y) {
+        return Math.multiplyHigh(x, y);
+    }
+
+    /**
      * Spin-loop pause hint. Delegates to {@code Thread.onSpinWait()} on Java 9+;
      * the Java 8 variant is a no-op (no such hint exists there).
      */

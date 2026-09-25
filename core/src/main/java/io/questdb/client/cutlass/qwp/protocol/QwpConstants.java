@@ -50,6 +50,8 @@ public final class QwpConstants {
      * Flag bit: Gorilla timestamp encoding enabled.
      */
     public static final byte FLAG_GORILLA = 0x04;
+    /** Flag bit: table headers carry schema identity information. */
+    public static final byte FLAG_SCHEMA = 0x40;
     /**
      * Flag bit: payload region after the prelude is zstd-compressed. Set only
      * when the handshake negotiated zstd compression. Mirror of the server-side
@@ -246,6 +248,7 @@ public final class QwpConstants {
             case TYPE_CHAR:
                 return 2;
             case TYPE_INT:
+            case TYPE_IPv4:
             case TYPE_FLOAT:
                 return 4;
             case TYPE_LONG:
@@ -291,6 +294,9 @@ public final class QwpConstants {
                 break;
             case TYPE_INT:
                 name = "INT";
+                break;
+            case TYPE_IPv4:
+                name = "IPv4";
                 break;
             case TYPE_LONG:
                 name = "LONG";
@@ -359,6 +365,7 @@ public final class QwpConstants {
                 (int) typeCode == TYPE_SHORT ||
                 (int) typeCode == TYPE_CHAR ||
                 (int) typeCode == TYPE_INT ||
+                (int) typeCode == TYPE_IPv4 ||
                 (int) typeCode == TYPE_LONG ||
                 (int) typeCode == TYPE_FLOAT ||
                 (int) typeCode == TYPE_DOUBLE ||
