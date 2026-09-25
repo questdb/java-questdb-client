@@ -41,8 +41,6 @@ public final class QwpConstants {
      * but skips the commit until a subsequent message without this flag.
      */
     public static final byte FLAG_DEFER_COMMIT = 0x01;
-    /** Flag bit: table headers carry schema identity information. */
-    public static final byte FLAG_SCHEMA = 0x40;
     /**
      * Flag bit: Delta symbol dictionary encoding enabled.
      * When set, symbol columns use global IDs and send only new dictionary entries.
@@ -52,6 +50,8 @@ public final class QwpConstants {
      * Flag bit: Gorilla timestamp encoding enabled.
      */
     public static final byte FLAG_GORILLA = 0x04;
+    /** Flag bit: table headers carry schema identity information. */
+    public static final byte FLAG_SCHEMA = 0x40;
     /**
      * Flag bit: payload region after the prelude is zstd-compressed. Set only
      * when the handshake negotiated zstd compression. Mirror of the server-side
