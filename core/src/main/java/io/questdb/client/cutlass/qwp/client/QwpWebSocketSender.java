@@ -365,6 +365,9 @@ public class QwpWebSocketSender implements Sender {
     // rollFsnEpochBaseForTesting (and its production counterpart in the
     // recycle path) advance it past every FSN already handed out, so the
     // external sequence stays strictly monotone across the internal reset.
+    // Memory-only by design: a restart on the same slot starts at 0 while the
+    // recovered ring keeps its raw numbering, so external FSNs are scoped to
+    // the sender instance (documented on Sender.flushAndGetSequence).
     // Rule everywhere it is applied: external = fsnEpochBase + raw: raw
     // -1 (no-data) sentinels are never translated. Volatile because the
     // recycle rolls it while a monitor thread may be inside getAckedFsn /

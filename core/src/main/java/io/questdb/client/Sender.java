@@ -549,6 +549,14 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * async error is delivered, or pass it to {@link #awaitAckedFsn(long, long)} for
      * a bounded blocking wait.
      * <br>
+     * FSNs are scoped to this sender instance. On the WebSocket transport a
+     * symbol-dictionary recycle keeps the sequence increasing for the life of
+     * the sender, but the offset it applies lives in memory only: a sender that
+     * restarts on the same store-and-forward slot numbers from the slot's
+     * on-disk state and does not continue the closed process's sequence. Join a
+     * {@link SenderError} span to the log of the sender instance that reported
+     * it, not to a previous process's.
+     * <br>
      * Returns {@code -1} when nothing was published by this call, and on transports that
      * do not track frame sequence numbers (HTTP, TCP, UDP).
      *
@@ -618,6 +626,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * {@code -1}: after a symbol-dictionary recycle the accessor keeps
      * reporting the last pre-swap durable watermark until the fresh epoch
      * publishes. (After {@code close()} the reading is unspecified.)
+     * Like every FSN this sender reports, the value is scoped to this sender
+     * instance; see {@link #flushAndGetSequence()}.
      * <br>
      * Snapshot accessor: for a bounded blocking wait, use
      * {@link #awaitAckedFsn(long, long)}.
