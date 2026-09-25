@@ -394,14 +394,21 @@ public class SymbolDictRecycleStarvationTest {
                         Assert.assertEquals("drained barrier must swap", 1L, ws.getSymbolDictEpoch());
                         Assert.assertFalse("the commit consumes the arming", ws.isResetArmed());
 
-                        // Window 2: gate again, publish one frame on the fresh epoch, re-arm.
-                        handler.closeGate();
+                        // Window 2. The post-swap reconnect runs on the I/O thread, and the
+                        // barrier skips both the recycle and the wait while the loop is not
+                        // linked, so first prove the fresh loop is up with an acked frame;
+                        // only then gate the acks, publish one frame that stays unacked, and
+                        // re-arm.
                         sender.table("t").symbol("s", "c").longColumn("v", 2L).atNow();
+                        Assert.assertTrue("the post-recycle loop must link and ack",
+                                sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+                        handler.closeGate();
+                        sender.table("t").symbol("s", "d").longColumn("v", 3L).atNow();
                         sender.flush();
                         sender.resetSymbolDictionary(); // nothing in flight: arms now
                         Assert.assertTrue(ws.isResetArmed());
                         long t0 = System.nanoTime();
-                        sender.table("t"); // inside the fresh window: must not wait
+                        sender.table("t"); // linked, not drained, inside the fresh window: must not wait
                         long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
                         Assert.assertTrue("a row start inside the fresh arm window must not wait, took "
                                 + elapsedMs + " ms", elapsedMs < maxWaitMillis / 2);
@@ -413,7 +420,7 @@ public class SymbolDictRecycleStarvationTest {
                         long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
                         while (ws.getSymbolDictResetStarvationTimeouts() < 2
                                 && System.nanoTime() < deadlineNanos) {
-                            sender.table("t"); // returns at once while the loop reconnects; waits once linked
+                            sender.table("t"); // age >= maxWait: waits once, times out
                             Thread.sleep(20);
                         }
                         Assert.assertEquals("the second armed window must get its own wait",
