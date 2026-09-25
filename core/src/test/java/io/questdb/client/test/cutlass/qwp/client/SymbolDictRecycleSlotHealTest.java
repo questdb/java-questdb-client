@@ -552,7 +552,7 @@ public class SymbolDictRecycleSlotHealTest {
      * with {@code publishedFsn > ackedFsn} -- the breach signature. Same
      * never-started shared {@link SegmentManager} as the acked variant.
      */
-    private static void prepareUnackedLeftoverSlot(String slot) {
+    static void prepareUnackedLeftoverSlot(String slot) {
         long payload = Unsafe.malloc(PAYLOAD_BYTES, MemoryTag.NATIVE_DEFAULT);
         SegmentManager manager = new SegmentManager(SEGMENT_BYTES, TimeUnit.SECONDS.toNanos(60));
         CursorSendEngine pred = null;
