@@ -1783,6 +1783,20 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                                     actualSfAppendDeadlineNanos, actualSfSyncIntervalNanos,
                                     liveHandler);
                         }
+
+                        @Override
+                        public SlotLock acquireLogicalSlotLock() {
+                            return slotPath == null ? null : SlotLock.acquireLogical(slotPath);
+                        }
+
+                        @Override
+                        public CursorSendEngine rebuildLocked(SenderErrorHandler liveHandler) {
+                            return LineSenderBuilder.constructEngineOnSlotLocked(
+                                    rebuildSfDir, rebuildSenderId, slotPath,
+                                    actualSfMaxSegmentBytes, actualSfMaxTotalBytes,
+                                    actualSfAppendDeadlineNanos, actualSfSyncIntervalNanos,
+                                    liveHandler).engine;
+                        }
                     });
                     // Install the drainer listener BEFORE startOrphanDrainers
                     // below: drainers must see the listener at submit time so
@@ -3437,8 +3451,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * {@link #constructEngineOnSlotLocked} wrapped in its own narrow acquisition of
          * {@code slotPath}'s logical lock. {@link #build} itself does not call this --
          * its own lock spans the connect loop too, see the comment at its call site --
-         * this entry point is for callers that only need a freshly (re)built engine on
-         * an already-owned slot, such as a symbol-dictionary epoch rebuild. Recovery
+         * this entry point is the unlocked fallback behind {@code EngineRebuildFactory.rebuild(...)};
+         * the symbol-dictionary recycle rebuilds through {@link #constructEngineOnSlotLocked}
+         * under the logical lock it holds across its swap. Recovery
          * verdicts still quarantine here exactly as they do under {@link #build} --
          * that happens inside {@link #constructEngineOnSlotLocked}. Only the
          * quarantined FLAG is discarded: it exists to seed {@code build}'s connect-loop
