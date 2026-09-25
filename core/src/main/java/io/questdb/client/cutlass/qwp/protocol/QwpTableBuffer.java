@@ -64,6 +64,8 @@ public class QwpTableBuffer implements QuietCloseable {
     private static final int MAX_COLUMN_NAME_LENGTH = 127;
     private final LowerCaseCharSequenceIntHashMap columnNameToIndex;
     private final ObjList<ColumnBuffer> columns;
+    // lower-cased table name, the schema cache key; the name itself when already lower case
+    private final String schemaKey;
     private final QwpWebSocketSender sender;
     private final String tableName;
     private QwpColumnDef[] cachedColumnDefs;
@@ -87,6 +89,8 @@ public class QwpTableBuffer implements QuietCloseable {
      */
     public QwpTableBuffer(String tableName, QwpWebSocketSender sender) {
         this.tableName = tableName;
+        String lowerCaseName = Chars.toLowerCase(tableName);
+        this.schemaKey = tableName.equals(lowerCaseName) ? tableName : lowerCaseName;
         this.sender = sender;
         this.columns = new ObjList<>();
         this.columnNameToIndex = new LowerCaseCharSequenceIntHashMap();
@@ -293,6 +297,14 @@ public class QwpTableBuffer implements QuietCloseable {
 
     public QwpSchemaBinding getSchemaBinding() {
         return schemaBinding;
+    }
+
+    /**
+     * Returns the lower-cased table name that keys the schema cache, computed
+     * once so a schema lookup does not allocate.
+     */
+    public String getSchemaKey() {
+        return schemaKey;
     }
 
     void attachSchemaBinding(QwpSchemaBinding binding) {

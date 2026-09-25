@@ -266,7 +266,22 @@ final class QwpSchemaCoordinator {
                 + ", table=" + table + ", detail=" + detail + ']');
     }
 
+    /**
+     * Lower-cases a table name into a cache key. A String that is already lower
+     * case is its own key, so the sender's pre-computed
+     * {@code QwpTableBuffer.getSchemaKey()} costs no allocation on a cache hit.
+     */
     private static String normalize(CharSequence tableName) {
+        if (tableName instanceof String) {
+            String name = (String) tableName;
+            for (int i = 0, n = name.length(); i < n; i++) {
+                char c = name.charAt(i);
+                if (Character.toLowerCase(c) != c) {
+                    return Chars.toLowerCase(name);
+                }
+            }
+            return name;
+        }
         return Chars.toLowerCase(tableName);
     }
 

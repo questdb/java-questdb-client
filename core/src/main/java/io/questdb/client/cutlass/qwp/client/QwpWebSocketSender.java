@@ -4494,23 +4494,23 @@ public class QwpWebSocketSender implements Sender {
             // STRICT writes no rows to a table it cannot describe, so no ACK feedback
             // ever reports that the table shrank: ask again instead of trusting a
             // cached TOO_LARGE. AUTO keeps the cache hit; its legacy rows earn feedback.
-            QwpSchemaResponse cached = cursorSendLoop.peekSchema(currentTableName);
+            QwpSchemaResponse cached = cursorSendLoop.peekSchema(currentTableBuffer.getSchemaKey());
             if (cached != null && cached.getResult() == QwpSchemaProtocol.RESULT_TOO_LARGE) {
-                return cursorSendLoop.refreshSchema(currentTableName, remainingSchemaMillis(startNanos, budgetNanos));
+                return cursorSendLoop.refreshSchema(currentTableBuffer.getSchemaKey(), remainingSchemaMillis(startNanos, budgetNanos));
             }
-            return cursorSendLoop.resolveSchema(currentTableName, remainingSchemaMillis(startNanos, budgetNanos));
+            return cursorSendLoop.resolveSchema(currentTableBuffer.getSchemaKey(), remainingSchemaMillis(startNanos, budgetNanos));
         }
         if (!cursorSendLoop.hasEverConnected()) {
             return null;
         }
         if (!cursorSendLoop.isWireUp()) {
-            return cursorSendLoop.peekSchema(currentTableName);
+            return cursorSendLoop.peekSchema(currentTableBuffer.getSchemaKey());
         }
         if (!cursorSendLoop.isSchemaEnabled()) {
             return null;
         }
         try {
-            return cursorSendLoop.resolveSchema(currentTableName, remainingSchemaMillis(startNanos, budgetNanos));
+            return cursorSendLoop.resolveSchema(currentTableBuffer.getSchemaKey(), remainingSchemaMillis(startNanos, budgetNanos));
         } catch (LineSenderSchemaException e) {
             if (e.getReason() == LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE
                     || e.getReason() == LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE) {
