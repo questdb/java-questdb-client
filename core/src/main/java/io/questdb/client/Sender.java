@@ -1769,6 +1769,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     final String rebuildSfDir = sfDir;
                     final String rebuildSenderId = senderId;
                     final SenderErrorHandler buildTimeHandler = errorHandler;
+                    // The recycle holds the slot's logical lock across its whole swap
+                    // (QwpWebSocketSender.recycleForDictReset step 0), so the rebuild
+                    // constructs under that lock and must not take it again.
                     connected.setEngineRebuildFactory(new QwpWebSocketSender.EngineRebuildFactory() {
                         @Override
                         public CursorSendEngine rebuild() {
@@ -1777,20 +1780,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
 
                         @Override
                         public CursorSendEngine rebuild(SenderErrorHandler liveHandler) {
-                            return LineSenderBuilder.constructEngineOnSlot(
-                                    rebuildSfDir, rebuildSenderId, slotPath,
-                                    actualSfMaxSegmentBytes, actualSfMaxTotalBytes,
-                                    actualSfAppendDeadlineNanos, actualSfSyncIntervalNanos,
-                                    liveHandler);
-                        }
-
-                        @Override
-                        public SlotLock acquireLogicalSlotLock() {
-                            return slotPath == null ? null : SlotLock.acquireLogical(slotPath);
-                        }
-
-                        @Override
-                        public CursorSendEngine rebuildLocked(SenderErrorHandler liveHandler) {
                             return LineSenderBuilder.constructEngineOnSlotLocked(
                                     rebuildSfDir, rebuildSenderId, slotPath,
                                     actualSfMaxSegmentBytes, actualSfMaxTotalBytes,
@@ -3366,7 +3355,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * Constructs a {@code CursorSendEngine} on {@code slotPath}, quarantining a torn
          * slot exactly as {@link #build}'s connect loop does when the constructor itself
          * hits a terminal recovery verdict. Assumes the caller already holds
-         * {@code slotPath}'s logical lock (or {@code slotPath == null}, memory mode).
+         * {@code slotPath}'s logical lock (or {@code slotPath == null}, memory mode):
+         * {@link #build} holds it across construction and connect, and the
+         * symbol-dictionary recycle holds it across its whole swap.
          */
         static ConstructedEngine constructEngineOnSlotLocked(
                 String sfDir, String senderId, String slotPath,
@@ -3445,33 +3436,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         syncIntervalNanos, errorHandler);
             }
             return new ConstructedEngine(cursorEngine, quarantined);
-        }
-
-        /**
-         * {@link #constructEngineOnSlotLocked} wrapped in its own narrow acquisition of
-         * {@code slotPath}'s logical lock. {@link #build} itself does not call this --
-         * its own lock spans the connect loop too, see the comment at its call site --
-         * this entry point is the unlocked fallback behind {@code EngineRebuildFactory.rebuild(...)};
-         * the symbol-dictionary recycle rebuilds through {@link #constructEngineOnSlotLocked}
-         * under the logical lock it holds across its swap. Recovery
-         * verdicts still quarantine here exactly as they do under {@link #build} --
-         * that happens inside {@link #constructEngineOnSlotLocked}. Only the
-         * quarantined FLAG is discarded: it exists to seed {@code build}'s connect-loop
-         * retry guard, and a recycle rebuild has no such loop. A rebuild that fails
-         * outright does not latch the sender terminal either; the recycle abandons and
-         * retries on the next send.
-         */
-        static CursorSendEngine constructEngineOnSlot(
-                String sfDir, String senderId, String slotPath,
-                long maxSegmentBytes, long maxTotalBytes,
-                long appendDeadlineNanos, long syncIntervalNanos,
-                SenderErrorHandler errorHandler) {
-            try (SlotLock logicalSlotLock = slotPath == null
-                    ? null : SlotLock.acquireLogical(slotPath)) {
-                return constructEngineOnSlotLocked(sfDir, senderId, slotPath,
-                        maxSegmentBytes, maxTotalBytes, appendDeadlineNanos,
-                        syncIntervalNanos, errorHandler).engine;
-            }
         }
 
         /**

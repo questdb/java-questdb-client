@@ -566,12 +566,13 @@ public class QwpWebSocketSender implements Sender {
     // Raw last-published FSN of the outgoing epoch (step-1 snapshot),
     // consumed by the commit when a REBUILD resume completes.
     private long recyclePendingLastPublishedFsn = -1L;
-    // The slot's parent-anchored logical lock, held by the recycle from before
-    // it tears the outgoing stack down (step 0) until the rebuilt engine holds
-    // the slot's directory flock -- across an abandoned CLOSE_LOOP or REBUILD
-    // too, so a colliding build() keeps failing fast for the whole swap. Null
-    // in memory mode and for factories that take no lock. Released by
-    // releaseRecycleSlotLock() on commit, on the breach latch and in close().
+    // The slot's parent-anchored logical lock, taken from the live engine's
+    // slot directory and held by the recycle from before it tears the outgoing
+    // stack down (step 0) until the rebuilt engine holds the slot's directory
+    // flock -- across an abandoned CLOSE_LOOP or REBUILD too, so a colliding
+    // build() keeps failing fast for the whole swap. Null in memory mode.
+    // Released by releaseRecycleSlotLock() on commit, on the breach latch and
+    // in close().
     private SlotLock recycleSlotLock;
     // Test seam: recycle step-7 fault injection. When set, runs (and is
     // expected to throw) inside ensureConnected()'s loop-construction try,
@@ -5741,7 +5742,7 @@ public class QwpWebSocketSender implements Sender {
      */
     private CursorSendEngine rebuildEngineOrAbandon(String message) {
         try {
-            return engineRebuildFactory.rebuildLocked(userErrorHandler());
+            return engineRebuildFactory.rebuild(userErrorHandler());
         } catch (Error e) {
             throw e;
         } catch (Throwable t) {
@@ -5854,20 +5855,26 @@ public class QwpWebSocketSender implements Sender {
      * {@link #maybeRecycleForDictReset()} requires {@code connected}.
      */
     private void recycleForDictReset() {
-        // step 0: own the slot for the whole swap. Nothing is torn down yet, so
-        // a contention here (a sibling's startup orphan drainer holding the
-        // logical lock for the microseconds between taking it and finding no
-        // segment files) costs the caller one refused row, leaves the outgoing
-        // stack and the arming intact, and the next drained barrier retries.
-        // Already held when a CLOSE_LOOP abandon re-fires this recycle.
+        // step 0: own the slot for the whole swap. The parent-anchored logical
+        // lock is taken from the live engine's slot directory (null in memory
+        // mode: nothing to lock) and held until the rebuilt engine owns the
+        // slot's directory flock -- across an abandon too. Nothing is torn
+        // down yet, so a contention here (a sibling's startup orphan drainer
+        // holding the logical lock for the microseconds between taking it and
+        // finding no segment files) costs the caller one refused row, leaves
+        // the outgoing stack and the arming intact, and the next drained
+        // barrier retries. Already held when a CLOSE_LOOP abandon re-fires.
         if (recycleSlotLock == null) {
-            try {
-                recycleSlotLock = engineRebuildFactory.acquireLogicalSlotLock();
-            } catch (Error e) {
-                throw e;
-            } catch (Throwable t) {
-                throw new LineSenderException(t).put("symbol dictionary recycle deferred: "
-                        + "could not take the slot's logical lock; retried at a later row start");
+            String slotDir = cursorEngine.sfDir();
+            if (slotDir != null) {
+                try {
+                    recycleSlotLock = SlotLock.acquireLogical(slotDir);
+                } catch (Error e) {
+                    throw e;
+                } catch (Throwable t) {
+                    throw new LineSenderException(t).put("symbol dictionary recycle deferred: "
+                            + "could not take the slot's logical lock; retried at a later row start");
+                }
             }
         }
         final long lastPublishedFsn = cursorEngine.publishedFsn(); // step 1
@@ -6925,18 +6932,16 @@ public class QwpWebSocketSender implements Sender {
      * through the identical construct/quarantine code path
      * {@link Sender.LineSenderBuilder#build} uses.
      * <p>
-     * The recycle keeps the slot owned across its swap: it calls
-     * {@link #acquireLogicalSlotLock()} before it tears the outgoing stack down,
-     * closes the outgoing engine without reclaiming that lock, rebuilds through
-     * {@link #rebuildLocked(SenderErrorHandler)} while still holding it, and
-     * releases it once the fresh engine holds the slot's directory flock. A
-     * colliding {@code build()} on the same {@code sf_dir}/{@code sender_id}
-     * therefore fails fast throughout the swap, exactly as it does against a
-     * live engine. The two methods are a pair: a factory that returns a lock
-     * from {@link #acquireLogicalSlotLock()} must construct without taking it
-     * again in {@link #rebuildLocked(SenderErrorHandler)}. The defaults (no
-     * lock, plain {@link #rebuild(SenderErrorHandler)}) keep memory-mode and
-     * test factories unchanged.
+     * The recycle keeps the slot owned across its swap: it takes the slot's
+     * parent-anchored logical lock ({@link SlotLock#acquireLogical}, from the
+     * live engine's slot directory) before it tears the outgoing stack down,
+     * closes the outgoing engine without reclaiming that lock, calls
+     * {@link #rebuild(SenderErrorHandler)} while still holding it, and releases
+     * it once the fresh engine holds the slot's directory flock. A factory
+     * therefore constructs on the slot WITHOUT taking the logical lock itself
+     * (the engine constructor's directory-local lock is the only lock it takes),
+     * and a colliding {@code build()} on the same {@code sf_dir}/{@code sender_id}
+     * fails fast throughout the swap, exactly as it does against a live engine.
      */
     public interface EngineRebuildFactory {
         CursorSendEngine rebuild();
@@ -6948,25 +6953,6 @@ public class QwpWebSocketSender implements Sender {
          */
         default CursorSendEngine rebuild(SenderErrorHandler liveHandler) {
             return rebuild();
-        }
-
-        /**
-         * Takes the slot's parent-anchored logical lock ({@link SlotLock#acquireLogical})
-         * for the recycle to hold across its swap; {@code null} when the slot has no
-         * lock to take (memory mode). Throws {@code SlotLockContentionException} when
-         * another party holds it; the recycle then leaves the outgoing stack intact
-         * and re-fires at a later row start.
-         */
-        default SlotLock acquireLogicalSlotLock() {
-            return null;
-        }
-
-        /**
-         * As {@link #rebuild(SenderErrorHandler)}, for a caller that already holds the
-         * lock {@link #acquireLogicalSlotLock()} returned: must not take it again.
-         */
-        default CursorSendEngine rebuildLocked(SenderErrorHandler liveHandler) {
-            return rebuild(liveHandler);
         }
     }
 
