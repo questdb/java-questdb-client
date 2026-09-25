@@ -214,7 +214,10 @@ public final class CursorSendEngine implements QuietCloseable {
     // lock file, which would otherwise free the pathname while the caller
     // still holds the flock on it. Latched by close(boolean) before any
     // cleanup runs; volatile because finishClose can run later on the manager
-    // worker's exit thread or the shared flock-release retry driver.
+    // worker's exit thread or the shared flock-release retry driver. The
+    // symbol-dictionary recycle is another such caller: it also holds the
+    // lock across its whole swap and closes the outgoing and healing engines
+    // with false.
     private volatile boolean reclaimLogicalSlotLock = true;
     // Published before deferredClose is registered. The manager lock provides
     // the callback handoff fence; volatile also covers a direct test/retry read.
@@ -1001,7 +1004,9 @@ public final class CursorSendEngine implements QuietCloseable {
      * lock file while build() still holds the flock on it. On POSIX that frees the
      * pathname without releasing the lock, so the next {@code acquireLogical} creates
      * a SECOND inode and locks it successfully: two parties owning a lock whose only
-     * job is serialising the quarantine close-&gt;rename-&gt;recreate window.
+     * job is serialising the quarantine close-&gt;rename-&gt;recreate window. The
+     * symbol-dictionary recycle is the other such caller: it holds the lock across
+     * its whole swap and closes the outgoing and healing engines with {@code false}.
      */
     public synchronized void close(boolean reclaimLogicalSlotLock) {
         // Latch before the early return: a retried close() must not widen a

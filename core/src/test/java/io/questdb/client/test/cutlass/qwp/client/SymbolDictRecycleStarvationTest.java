@@ -405,7 +405,7 @@ public class SymbolDictRecycleStarvationTest {
                         handler.closeGate();
                         sender.table("t").symbol("s", "d").longColumn("v", 3L).atNow();
                         sender.flush();
-                        sender.resetSymbolDictionary(); // nothing in flight: arms now
+                        sender.resetSymbolDictionary(); // no pending rows: arms now
                         Assert.assertTrue(ws.isResetArmed());
                         long t0 = System.nanoTime();
                         sender.table("t"); // linked, not drained, inside the fresh window: must not wait

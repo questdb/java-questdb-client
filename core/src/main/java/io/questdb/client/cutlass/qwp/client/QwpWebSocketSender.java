@@ -537,12 +537,12 @@ public class QwpWebSocketSender implements Sender {
     // External-scale FSN of the last frame proven durably acked by a recycle's
     // barrier, recorded at recycleForDictReset step 1 before any teardown.
     // -1 until the first recycle that had published anything. Lets the
-    // monitoring accessors (getAckedFsn, awaitAckedFsn's null-engine branch)
-    // keep reporting the durable watermark instead of collapsing to -1 while
-    // cursorEngine is transiently null mid-swap or permanently null after a
-    // failed recycle -- all pre-swap data really is acked, so the watermark
-    // stays truthful. Volatile: those accessors are exactly the surface a
-    // monitoring thread reads mid-swap, same reasoning as symbolDictEpoch.
+    // monitoring accessors (getAckedFsn, and awaitAckedFsn, which polls
+    // through it) keep reporting the durable watermark instead of collapsing
+    // to -1 while cursorEngine is transiently null mid-swap or permanently
+    // null after a failed recycle -- all pre-swap data really is acked, so
+    // the watermark stays truthful. Volatile: those accessors are exactly the
+    // surface a monitoring thread reads mid-swap, same reasoning as symbolDictEpoch.
     private volatile long lastRecycleDurableFsn = -1L;
     // Budget for recycleForDictReset's deferred-close await (see
     // RECYCLE_DEFERRED_CLOSE_MAX_WAIT_MILLIS); non-final only so tests can
@@ -1463,20 +1463,17 @@ public class QwpWebSocketSender implements Sender {
 
     /**
      * The error checks {@link #awaitAckedFsn} runs before its early returns and
-     * on every poll pass. Snapshots both volatiles: the recycle transitions
-     * {@code cursorEngine} and {@code cursorSendLoop} non-null -> null -> non-null
-     * on the producer thread, so a double read could NPE between the check and
-     * the call. The durability latch is transient: it throws while latched and
-     * clears once a later periodic sync pass fully succeeds.
+     * on every poll pass. Snapshots the {@code cursorEngine} volatile: the
+     * recycle transitions it non-null -> null -> non-null on the producer
+     * thread, so a double read could NPE between the check and the call. The
+     * durability latch is transient: it throws while latched and clears once
+     * a later periodic sync pass fully succeeds. The loop's own error check
+     * lives in {@link #checkConnectionError()}.
      */
     private void checkAwaitAckedFsnErrors() {
         CursorSendEngine engine = cursorEngine;
         if (engine != null) {
             engine.checkDurability();
-        }
-        CursorWebSocketSendLoop loop = cursorSendLoop;
-        if (loop != null) {
-            loop.checkError();
         }
         checkConnectionError();
     }
@@ -4350,8 +4347,11 @@ public class QwpWebSocketSender implements Sender {
         // checkNotClosed → checkConnectionError, so failing to poll here
         // means callers can keep accumulating rows long after the sender
         // is already broken.
-        if (cursorSendLoop != null) {
-            cursorSendLoop.checkError();
+        // Snapshot once: the recycle nulls cursorSendLoop on the producer
+        // thread while a monitor thread may be inside awaitAckedFsn.
+        CursorWebSocketSendLoop loop = cursorSendLoop;
+        if (loop != null) {
+            loop.checkError();
         }
     }
 
@@ -4424,6 +4424,11 @@ public class QwpWebSocketSender implements Sender {
                 }
                 client = null;
             }
+            // Release the recycle's logical lock FIRST: after an abandoned swap this
+            // sender may still hold it, and the owned engine's reclaiming close below
+            // unlinks the logical lock pair only when nothing holds it. The engine's
+            // directory flock keeps the slot exclusive until that close completes.
+            releaseRecycleSlotLock();
             if (ownsCursorEngine && cursorEngine != null) {
                 CursorSendEngine engine = cursorEngine;
                 try {
@@ -4451,9 +4456,6 @@ public class QwpWebSocketSender implements Sender {
                 // false and let isSlotLockReleased() re-probe it.
                 slotLockReleased = true;
             }
-            // A recycle abandoned mid-swap may still hold the slot's logical
-            // lock; a pool discarding this sender must get the slot back.
-            releaseRecycleSlotLock();
             if (errorDispatcher != null) {
                 try {
                     errorDispatcher.close();
