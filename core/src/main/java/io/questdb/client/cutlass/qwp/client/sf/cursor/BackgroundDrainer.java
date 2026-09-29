@@ -28,6 +28,7 @@ import io.questdb.client.SenderError;
 import io.questdb.client.SenderErrorHandler;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.cutlass.qwp.client.QwpAuthFailedException;
 import io.questdb.client.cutlass.qwp.client.QwpCredentialUnavailableException;
 import io.questdb.client.cutlass.qwp.client.QwpDurableAckMismatchException;
@@ -174,7 +175,7 @@ public final class BackgroundDrainer implements Runnable {
     private final long reconnectInitialBackoffMillis;
     private final long reconnectMaxBackoffMillis;
     private final long reconnectMaxDurationMillis;
-    private final boolean requestDurableAck;
+    private final int durableAckTiers;
     private final long segmentSizeBytes;
     private final long sfMaxTotalBytes;
     private final String slotPath;
@@ -267,12 +268,12 @@ public final class BackgroundDrainer implements Runnable {
             long reconnectMaxDurationMillis,
             long reconnectInitialBackoffMillis,
             long reconnectMaxBackoffMillis,
-            boolean requestDurableAck,
+            int durableAckTiers,
             long durableAckKeepaliveIntervalMillis
     ) {
         this(slotPath, segmentSizeBytes, sfMaxTotalBytes, clientFactory,
                 reconnectMaxDurationMillis, reconnectInitialBackoffMillis,
-                reconnectMaxBackoffMillis, requestDurableAck,
+                reconnectMaxBackoffMillis, durableAckTiers,
                 durableAckKeepaliveIntervalMillis,
                 CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
                 CursorWebSocketSendLoop.DEFAULT_POISON_MIN_ESCALATION_WINDOW_MILLIS,
@@ -293,7 +294,7 @@ public final class BackgroundDrainer implements Runnable {
             long reconnectMaxDurationMillis,
             long reconnectInitialBackoffMillis,
             long reconnectMaxBackoffMillis,
-            boolean requestDurableAck,
+            int durableAckTiers,
             long durableAckKeepaliveIntervalMillis,
             int maxHeadFrameRejections,
             long poisonMinEscalationWindowMillis,
@@ -301,7 +302,7 @@ public final class BackgroundDrainer implements Runnable {
     ) {
         this(slotPath, segmentSizeBytes, sfMaxTotalBytes, 0L, clientFactory,
                 reconnectMaxDurationMillis, reconnectInitialBackoffMillis,
-                reconnectMaxBackoffMillis, requestDurableAck,
+                reconnectMaxBackoffMillis, durableAckTiers,
                 durableAckKeepaliveIntervalMillis, maxHeadFrameRejections,
                 poisonMinEscalationWindowMillis,
                 catchUpCapGapMinEscalationWindowMillis);
@@ -320,7 +321,7 @@ public final class BackgroundDrainer implements Runnable {
             long reconnectMaxDurationMillis,
             long reconnectInitialBackoffMillis,
             long reconnectMaxBackoffMillis,
-            boolean requestDurableAck,
+            int durableAckTiers,
             long durableAckKeepaliveIntervalMillis,
             int maxHeadFrameRejections,
             long poisonMinEscalationWindowMillis,
@@ -334,7 +335,7 @@ public final class BackgroundDrainer implements Runnable {
         this.reconnectMaxDurationMillis = reconnectMaxDurationMillis;
         this.reconnectInitialBackoffMillis = reconnectInitialBackoffMillis;
         this.reconnectMaxBackoffMillis = reconnectMaxBackoffMillis;
-        this.requestDurableAck = requestDurableAck;
+        this.durableAckTiers = durableAckTiers;
         this.durableAckKeepaliveIntervalMillis = durableAckKeepaliveIntervalMillis;
         this.maxHeadFrameRejections = maxHeadFrameRejections;
         this.poisonMinEscalationWindowMillis = poisonMinEscalationWindowMillis;
@@ -350,7 +351,7 @@ public final class BackgroundDrainer implements Runnable {
      */
     @TestOnly
     public BackgroundDrainer() {
-        this(null, 0L, 0L, null, 0L, 0L, 0L, false, 0L,
+        this(null, 0L, 0L, null, 0L, 0L, 0L, DurableAckTiers.NONE, 0L,
                 CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS, 0L, 0L);
     }
 
@@ -1135,7 +1136,7 @@ public final class BackgroundDrainer implements Runnable {
                         clientFactory,
                         reconnectInitialBackoffMillis,
                         reconnectMaxBackoffMillis,
-                        requestDurableAck,
+                        durableAckTiers,
                         durableAckKeepaliveIntervalMillis,
                         maxHeadFrameRejections,
                         poisonMinEscalationWindowMillis,

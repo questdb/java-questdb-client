@@ -45,7 +45,7 @@ import java.nio.charset.StandardCharsets;
  * +--------+----------+------------+--------------------------------------+
  * </pre>
  * <p>
- * STATUS_DURABLE_ACK response format:
+ * STATUS_DURABLE_ACK / STATUS_LOCAL_DURABLE_ACK response format:
  * <pre>
  * +--------+------------+--------------------------------------+
  * | status | tableCount | table entries                         |
@@ -80,6 +80,14 @@ public class WebSocketResponse {
      * entries (nameLen + name + seqTxn).
      */
     public static final byte STATUS_DURABLE_ACK = 0x02;
+    /**
+     * Per-table local-durability acknowledgment. Emitted when the
+     * connection's granted durable-ack tier set includes {@code local}, as
+     * the tables' sequencer records are fdatasync'd on the server -- the
+     * acked transactions survive power loss, though not the loss of the
+     * server's disk. Same payload layout as {@link #STATUS_DURABLE_ACK}.
+     */
+    public static final byte STATUS_LOCAL_DURABLE_ACK = 0x0E;
     public static final byte STATUS_INTERNAL_ERROR = 0x06;
     /**
      * Node cannot serve writes (read-only replica / demoting primary). Reserved:
@@ -128,6 +136,19 @@ public class WebSocketResponse {
     }
 
     /**
+     * Creates a local-durability ACK response with a single table entry.
+     */
+    @TestOnly
+    public static WebSocketResponse localDurableAck(String tableName, long seqTxn) {
+        WebSocketResponse response = new WebSocketResponse();
+        response.status = STATUS_LOCAL_DURABLE_ACK;
+        response.sequence = -1;
+        response.tableNames.add(tableName);
+        response.tableSeqTxns.add(seqTxn);
+        return response;
+    }
+
+    /**
      * Creates an error response.
      */
     @TestOnly
@@ -160,7 +181,7 @@ public class WebSocketResponse {
             return validateTableEntries(ptr + 9, length - 9);
         }
 
-        if (status == STATUS_DURABLE_ACK) {
+        if (isDurableAckStatus(status)) {
             if (length < MIN_DURABLE_ACK_SIZE) {
                 return false;
             }
@@ -218,6 +239,8 @@ public class WebSocketResponse {
                 return "OK";
             case STATUS_DURABLE_ACK:
                 return "DURABLE_ACK";
+            case STATUS_LOCAL_DURABLE_ACK:
+                return "LOCAL_DURABLE_ACK";
             case STATUS_PARSE_ERROR:
                 return "PARSE_ERROR";
             case STATUS_SCHEMA_MISMATCH:
@@ -257,6 +280,20 @@ public class WebSocketResponse {
     }
 
     /**
+     * Returns true when this is a per-table local-durability ACK
+     * (STATUS_LOCAL_DURABLE_ACK).
+     */
+    public boolean isLocalDurableAck() {
+        return status == STATUS_LOCAL_DURABLE_ACK;
+    }
+
+    // Both durable-ack statuses share the sequence-less payload layout:
+    // status + tableCount + per-table entries.
+    private static boolean isDurableAckStatus(byte status) {
+        return status == STATUS_DURABLE_ACK || status == STATUS_LOCAL_DURABLE_ACK;
+    }
+
+    /**
      * Returns true if this is a success response (STATUS_OK).
      */
     public boolean isSuccess() {
@@ -290,7 +327,7 @@ public class WebSocketResponse {
             return readTableEntries(ptr + 9, length - 9);
         }
 
-        if (status == STATUS_DURABLE_ACK) {
+        if (isDurableAckStatus(status)) {
             if (length < MIN_DURABLE_ACK_SIZE) {
                 return false;
             }
@@ -333,7 +370,7 @@ public class WebSocketResponse {
         if (status == STATUS_OK) {
             return MIN_OK_RESPONSE_SIZE + tableEntriesSize();
         }
-        if (status == STATUS_DURABLE_ACK) {
+        if (isDurableAckStatus(status)) {
             return MIN_DURABLE_ACK_SIZE + tableEntriesSize();
         }
         return MIN_ERROR_RESPONSE_SIZE + getErrorMessageUtf8Length();
@@ -343,8 +380,8 @@ public class WebSocketResponse {
     public String toString() {
         if (isSuccess()) {
             return "WebSocketResponse{status=OK, seq=" + sequence + ", tables=" + tableNames.size() + "}";
-        } else if (isDurableAck()) {
-            return "WebSocketResponse{status=DURABLE_ACK, tables=" + tableNames.size() + "}";
+        } else if (isDurableAck() || isLocalDurableAck()) {
+            return "WebSocketResponse{status=" + getStatusName() + ", tables=" + tableNames.size() + "}";
         } else {
             return "WebSocketResponse{status=" + getStatusName() + ", seq=" + sequence +
                     ", error=" + errorMessage + "}";
@@ -368,7 +405,7 @@ public class WebSocketResponse {
             Unsafe.getUnsafe().putLong(ptr + offset, sequence);
             offset += 8;
             offset += writeTableEntries(ptr + offset);
-        } else if (status == STATUS_DURABLE_ACK) {
+        } else if (isDurableAckStatus(status)) {
             offset += writeTableEntries(ptr + offset);
         } else {
             Unsafe.getUnsafe().putLong(ptr + offset, sequence);
@@ -482,7 +519,7 @@ public class WebSocketResponse {
     }
 
     private int getErrorMessageUtf8Length() {
-        if (status == STATUS_OK || status == STATUS_DURABLE_ACK || errorMessage == null || errorMessage.isEmpty()) {
+        if (status == STATUS_OK || isDurableAckStatus(status) || errorMessage == null || errorMessage.isEmpty()) {
             errorMessageUtf8Length = 0;
             return 0;
         }

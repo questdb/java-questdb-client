@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
@@ -92,7 +93,7 @@ public class CursorWebSocketSendLoopRotationRaceTest {
                     () -> {
                         throw new UnsupportedOperationException("no reconnect in this test");
                     },
-                    100L, 5_000L, false);
+                    100L, 5_000L, DurableAckTiers.NONE);
 
             long buf = Unsafe.malloc(PAYLOAD_LEN, MemoryTag.NATIVE_DEFAULT);
             try {

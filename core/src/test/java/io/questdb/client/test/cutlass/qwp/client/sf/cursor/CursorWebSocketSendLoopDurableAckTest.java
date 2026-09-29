@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.LineSenderServerException;
 import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
@@ -292,6 +293,146 @@ public class CursorWebSocketSendLoopDurableAckTest {
     }
 
     @Test
+    public void testBothTiersLocalAckIsProgressOnly() throws Exception {
+        // With local,replicated requested the trim trigger is the replicated
+        // ack. A local ack must not pop the pending queue or move ackedFsn;
+        // it only bumps the local counter and the per-table local watermark.
+        // The replicated ack then trims as usual.
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                appendFrames(engine, 1);
+                CursorWebSocketSendLoop loop = newBothTiersLoop(engine);
+                setSentCount(loop, 1);
+                deliverOk(loop, 0, names("trades"), txns(7L));
+
+                deliverLocalDurableAck(loop, names("trades"), txns(7L));
+                assertEquals("local ack must not trim when replicated is requested",
+                        -1L, engine.ackedFsn());
+                assertEquals(1, pendingSize(loop));
+                assertEquals(1L, loop.getTotalLocalDurableAcks());
+                assertEquals(0L, loop.getTotalDurableTrimAdvances());
+                assertEquals("local watermark records the fsync frontier",
+                        7L, loop.getLocalDurableTableWatermark("trades"));
+
+                deliverDurableAck(loop, names("trades"), txns(7L));
+                assertEquals(0L, engine.ackedFsn());
+                assertEquals(0, pendingSize(loop));
+                assertEquals(1L, loop.getTotalDurableAcks());
+                assertEquals(1L, loop.getTotalDurableTrimAdvances());
+            }
+        });
+    }
+
+    @Test
+    public void testBothTiersLocalWatermarkIsMonotonic() throws Exception {
+        // A delayed/duplicate local ack naming a smaller seqTxn must not move
+        // the per-table local watermark backwards; the frame still counts.
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                CursorWebSocketSendLoop loop = newBothTiersLoop(engine);
+
+                deliverLocalDurableAck(loop, names("trades"), txns(10L));
+                assertEquals(10L, loop.getLocalDurableTableWatermark("trades"));
+
+                deliverLocalDurableAck(loop, names("trades"), txns(5L));
+                assertEquals("stale local ack must not unwind the watermark",
+                        10L, loop.getLocalDurableTableWatermark("trades"));
+                assertEquals(2L, loop.getTotalLocalDurableAcks());
+
+                assertEquals("unseen table reads as -1",
+                        -1L, loop.getLocalDurableTableWatermark("orders"));
+            }
+        });
+    }
+
+    @Test
+    public void testDefaultModeIgnoresStrayLocalDurableAck() throws Exception {
+        // Without any opt-in a STATUS_LOCAL_DURABLE_ACK frame is logged and
+        // dropped: no trim, no counter movement.
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                appendFrames(engine, 1);
+                CursorWebSocketSendLoop loop = newDefaultLoop(engine);
+                setSentCount(loop, 1);
+                deliverLocalDurableAck(loop, names("anything"), txns(99L));
+                assertEquals(-1L, engine.ackedFsn());
+                assertEquals(0L, loop.getTotalLocalDurableAcks());
+            }
+        });
+    }
+
+    @Test
+    public void testLocalOnlyModeLocalAckAdvancesTrim() throws Exception {
+        // With only the local tier requested, STATUS_LOCAL_DURABLE_ACK is the
+        // trim trigger: an OK queues the entry and the local ack drains it
+        // through the same watermark path the replicated ack drives otherwise.
+        // The progress-only watermark map stays untouched in this mode.
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                appendFrames(engine, 1);
+                CursorWebSocketSendLoop loop = newLocalLoop(engine);
+                setSentCount(loop, 1);
+
+                deliverOk(loop, 0, names("trades"), txns(7L));
+                assertEquals("OK alone must not trim in local-only mode",
+                        -1L, engine.ackedFsn());
+                assertEquals(1, pendingSize(loop));
+
+                deliverLocalDurableAck(loop, names("trades"), txns(7L));
+                assertEquals(0L, engine.ackedFsn());
+                assertEquals(0, pendingSize(loop));
+                assertEquals(1L, loop.getTotalLocalDurableAcks());
+                assertEquals(0L, loop.getTotalDurableAcks());
+                assertEquals(1L, loop.getTotalDurableTrimAdvances());
+                assertEquals("local-only mode feeds the trim watermarks, not the progress map",
+                        -1L, loop.getLocalDurableTableWatermark("trades"));
+            }
+        });
+    }
+
+    @Test
+    public void testLocalOnlyModeReplicatedAckAlsoTrims() throws Exception {
+        // The server grants all-or-nothing, so a local-only connection should
+        // never see STATUS_DURABLE_ACK -- but if one arrives, trimming on it
+        // is safe: object-store durability subsumes the local-fsync guarantee
+        // the caller asked for.
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                appendFrames(engine, 1);
+                CursorWebSocketSendLoop loop = newLocalLoop(engine);
+                setSentCount(loop, 1);
+                deliverOk(loop, 0, names("trades"), txns(7L));
+
+                deliverDurableAck(loop, names("trades"), txns(7L));
+                assertEquals(0L, engine.ackedFsn());
+                assertEquals(1L, loop.getTotalDurableAcks());
+                assertEquals(0L, loop.getTotalLocalDurableAcks());
+            }
+        });
+    }
+
+    @Test
+    public void testReconnectClearsLocalWatermarks() throws Exception {
+        // clearDurableAckTracking (invoked on every client swap) must drop the
+        // local progress watermarks along with the trim state: the new
+        // connection's server rebuilds both frontiers from scratch.
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                CursorWebSocketSendLoop loop = newBothTiersLoop(engine);
+                deliverLocalDurableAck(loop, names("trades"), txns(42L));
+                assertEquals(42L, loop.getLocalDurableTableWatermark("trades"));
+
+                Method m = CursorWebSocketSendLoop.class.getDeclaredMethod("clearDurableAckTracking");
+                m.setAccessible(true);
+                m.invoke(loop);
+
+                assertEquals("stale local watermarks must not survive a reconnect",
+                        -1L, loop.getLocalDurableTableWatermark("trades"));
+            }
+        });
+    }
+
+    @Test
     public void testNackInDurableModeIsTerminalAndDoesNotAdvanceTrim() throws Exception {
         // A SCHEMA_MISMATCH NACK is TERMINAL: it latches the typed error and
         // never enqueues a placeholder or advances trim. OK'd entries ahead of
@@ -542,13 +683,14 @@ public class CursorWebSocketSendLoopDurableAckTest {
         }
     }
 
-    private static long buildDurableAckPayload(String[] tableNames, long[] seqTxns) {
-        // STATUS_DURABLE_ACK frame: status(1) + tableCount(2) + entries(nameLen(2)+name+seqTxn(8))
+    private static long buildDurableAckPayload(byte status, String[] tableNames, long[] seqTxns) {
+        // Durable-ack frame (STATUS_DURABLE_ACK or STATUS_LOCAL_DURABLE_ACK,
+        // same layout): status(1) + tableCount(2) + entries(nameLen(2)+name+seqTxn(8))
         int size = 3;
         for (String t : tableNames) size += 2 + t.getBytes(StandardCharsets.UTF_8).length + 8;
         long ptr = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
         int offset = 0;
-        Unsafe.getUnsafe().putByte(ptr + offset, WebSocketResponse.STATUS_DURABLE_ACK);
+        Unsafe.getUnsafe().putByte(ptr + offset, status);
         offset += 1;
         Unsafe.getUnsafe().putShort(ptr + offset, (short) tableNames.length);
         offset += 2;
@@ -609,7 +751,15 @@ public class CursorWebSocketSendLoopDurableAckTest {
     }
 
     private static void deliverDurableAck(CursorWebSocketSendLoop loop, String[] tableNames, long[] seqTxns) throws Exception {
-        long packed = buildDurableAckPayload(tableNames, seqTxns);
+        deliverAck(loop, WebSocketResponse.STATUS_DURABLE_ACK, tableNames, seqTxns);
+    }
+
+    private static void deliverLocalDurableAck(CursorWebSocketSendLoop loop, String[] tableNames, long[] seqTxns) throws Exception {
+        deliverAck(loop, WebSocketResponse.STATUS_LOCAL_DURABLE_ACK, tableNames, seqTxns);
+    }
+
+    private static void deliverAck(CursorWebSocketSendLoop loop, byte status, String[] tableNames, long[] seqTxns) throws Exception {
+        long packed = buildDurableAckPayload(status, tableNames, seqTxns);
         long ptr = packed & 0xFFFFFFFFFFFFL;
         int size = (int) (packed >>> 48);
         try {
@@ -663,21 +813,28 @@ public class CursorWebSocketSendLoopDurableAckTest {
     }
 
     private CursorWebSocketSendLoop newDefaultLoop(CursorSendEngine engine) {
-        return new CursorWebSocketSendLoop(
-                null, engine, 0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
-                () -> {
-                    throw new UnsupportedOperationException("test loop is never started");
-                },
-                100L, 5_000L, false);
+        return newLoop(engine, DurableAckTiers.NONE);
     }
 
     private CursorWebSocketSendLoop newDurableLoop(CursorSendEngine engine) {
+        return newLoop(engine, DurableAckTiers.REPLICATED);
+    }
+
+    private CursorWebSocketSendLoop newLocalLoop(CursorSendEngine engine) {
+        return newLoop(engine, DurableAckTiers.LOCAL);
+    }
+
+    private CursorWebSocketSendLoop newBothTiersLoop(CursorSendEngine engine) {
+        return newLoop(engine, DurableAckTiers.LOCAL | DurableAckTiers.REPLICATED);
+    }
+
+    private CursorWebSocketSendLoop newLoop(CursorSendEngine engine, int durableAckTiers) {
         return new CursorWebSocketSendLoop(
                 null, engine, 0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                 () -> {
                     throw new UnsupportedOperationException("test loop is never started");
                 },
-                100L, 5_000L, true);
+                100L, 5_000L, durableAckTiers);
     }
 
     private static int pendingSize(CursorWebSocketSendLoop loop) throws Exception {

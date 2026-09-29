@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
@@ -74,7 +75,7 @@ public class BackgroundDrainerOrphanTailTest {
                     5_000L,
                     1L,
                     5L,
-                    true,
+                    DurableAckTiers.REPLICATED,
                     200L);
 
             drainer.run();
@@ -132,7 +133,7 @@ public class BackgroundDrainerOrphanTailTest {
                     5_000L,
                     1L,
                     5L,
-                    true,
+                    DurableAckTiers.REPLICATED,
                     200L);
 
             drainer.run();

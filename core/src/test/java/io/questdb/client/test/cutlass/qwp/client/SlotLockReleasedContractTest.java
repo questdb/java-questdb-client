@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.Sender;
 import io.questdb.client.SenderConnectionEvent;
@@ -412,7 +413,7 @@ public class SlotLockReleasedContractTest {
                         null /* async-initial-connect: the I/O thread drives the connect */,
                         engine, 0L, 1_000L,
                         stuckConnect,
-                        100L, 5_000L, false);
+                        100L, 5_000L, DurableAckTiers.NONE);
                 loop.start();
                 Assert.assertTrue("I/O thread never reached the connect factory",
                         enteredConnect.await(5, TimeUnit.SECONDS));
@@ -543,7 +544,7 @@ public class SlotLockReleasedContractTest {
                 };
                 loop = new CursorWebSocketSendLoop(
                         null, engine, 0L, 1_000L, stuckConnect,
-                        100L, 5_000L, false);
+                        100L, 5_000L, DurableAckTiers.NONE);
                 loop.start();
                 Assert.assertTrue("I/O thread never reached the connect factory",
                         enteredConnect.await(5, TimeUnit.SECONDS));

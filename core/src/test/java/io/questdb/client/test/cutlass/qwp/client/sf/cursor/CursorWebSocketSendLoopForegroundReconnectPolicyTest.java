@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketClientFactory;
@@ -95,7 +96,7 @@ public class CursorWebSocketSendLoopForegroundReconnectPolicyTest {
                         factory,
                         1L,
                         4L,
-                        false,
+                        DurableAckTiers.NONE,
                         0L,
                         CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
                         0L,
@@ -165,7 +166,7 @@ public class CursorWebSocketSendLoopForegroundReconnectPolicyTest {
                         factory,
                         1L,
                         4L,
-                        durableAck,
+                        durableAck ? DurableAckTiers.REPLICATED | DurableAckTiers.LEGACY_TRUE : DurableAckTiers.NONE,
                         durableAck ? 10L : 0L,
                         CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
                         0L,
@@ -222,7 +223,7 @@ public class CursorWebSocketSendLoopForegroundReconnectPolicyTest {
                         factory,
                         1L,
                         4L,
-                        durableAck,
+                        durableAck ? DurableAckTiers.REPLICATED | DurableAckTiers.LEGACY_TRUE : DurableAckTiers.NONE,
                         durableAck ? 10L : 0L,
                         CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
                         0L,
@@ -296,7 +297,9 @@ public class CursorWebSocketSendLoopForegroundReconnectPolicyTest {
         WebSocketClient client = WebSocketClientFactory.newPlainTextInstance();
         try {
             client.setQwpMaxVersion(1);
-            client.setQwpRequestDurableAck(durableAck);
+            client.setQwpDurableAckTiers(durableAck
+                    ? DurableAckTiers.REPLICATED | DurableAckTiers.LEGACY_TRUE
+                    : DurableAckTiers.NONE);
             client.setConnectTimeout(5_000);
             client.connect("localhost", port);
             client.upgrade("/write/v4", 5_000, null);

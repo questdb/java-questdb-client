@@ -25,6 +25,7 @@
 package io.questdb.client.cutlass.http.client;
 
 import io.questdb.client.HttpClientConfiguration;
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.cutlass.qwp.client.QwpVersionMismatchException;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketFrameParser;
@@ -80,7 +81,6 @@ public abstract class WebSocketClient implements QuietCloseable {
     private static final String QUESTDB_ROLE_HEADER_NAME = "X-QuestDB-Role:";
     private static final String QUESTDB_ZONE_HEADER_NAME = "X-QuestDB-Zone:";
     private static final String QWP_CONTENT_ENCODING_HEADER_NAME = "X-QWP-Content-Encoding:";
-    private static final String QWP_DURABLE_ACK_ENABLED_VALUE = "enabled";
     private static final String QWP_DURABLE_ACK_HEADER_NAME = "X-QWP-Durable-Ack:";
     private static final String QWP_MAX_BATCH_SIZE_HEADER_NAME = "X-QWP-Max-Batch-Size:";
     private static final String QWP_VERSION_HEADER_NAME = "X-QWP-Version:";
@@ -137,7 +137,7 @@ public abstract class WebSocketClient implements QuietCloseable {
     private int qwpMaxBatchRows;
     private int qwpMaxVersion = 1;
     // Opt-in for STATUS_DURABLE_ACK frames; sent as X-QWP-Request-Durable-Ack: true
-    private boolean qwpRequestDurableAck;
+    private int qwpDurableAckTiers = DurableAckTiers.NONE;
     // Receive buffer (native memory)
     private long recvBufPtr;
     private int recvBufSize;
@@ -586,13 +586,14 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
-     * Enables the opt-in X-QWP-Request-Durable-Ack upgrade header. When set,
-     * servers with primary replication configured will additionally emit
-     * STATUS_DURABLE_ACK frames as the WAL containing committed client
-     * messages reaches the object store.
+     * Sets the requested durable-ack tier set ({@link DurableAckTiers}
+     * bitmask) for the opt-in X-QWP-Request-Durable-Ack upgrade header. When
+     * granted, the server emits STATUS_DURABLE_ACK frames (replicated tier)
+     * and/or STATUS_LOCAL_DURABLE_ACK frames (local tier) as commits reach
+     * the corresponding durability frontier.
      */
-    public void setQwpRequestDurableAck(boolean enabled) {
-        this.qwpRequestDurableAck = enabled;
+    public void setQwpDurableAckTiers(int tiers) {
+        this.qwpDurableAckTiers = tiers;
     }
 
     /**
@@ -694,8 +695,10 @@ public abstract class WebSocketClient implements QuietCloseable {
             sendBuffer.putAscii(Integer.toString(qwpMaxBatchRows));
             sendBuffer.putAscii("\r\n");
         }
-        if (qwpRequestDurableAck) {
-            sendBuffer.putAscii("X-QWP-Request-Durable-Ack: true\r\n");
+        if (qwpDurableAckTiers != DurableAckTiers.NONE) {
+            sendBuffer.putAscii("X-QWP-Request-Durable-Ack: ");
+            sendBuffer.putAscii(DurableAckTiers.requestHeaderValue(qwpDurableAckTiers));
+            sendBuffer.putAscii("\r\n");
         }
         if (authorizationHeader != null) {
             sendBuffer.putAscii("Authorization: ");
@@ -798,7 +801,10 @@ public abstract class WebSocketClient implements QuietCloseable {
         return 0;
     }
 
-    private static boolean extractDurableAckEnabled(String response) {
+    private static boolean extractDurableAckConfirmed(String response, String expectedToken) {
+        if (expectedToken == null) {
+            return false;
+        }
         int headerLen = QWP_DURABLE_ACK_HEADER_NAME.length();
         int responseLen = response.length();
         for (int i = 0; i <= responseLen - headerLen; i++) {
@@ -809,7 +815,11 @@ public abstract class WebSocketClient implements QuietCloseable {
                     lineEnd = responseLen;
                 }
                 String value = response.substring(valueStart, lineEnd).trim();
-                return value.equalsIgnoreCase(QWP_DURABLE_ACK_ENABLED_VALUE);
+                // The server echoes the granted set verbatim (or the
+                // "enabled" token for a legacy "true" request); anything
+                // else is a partial or foreign grant and counts as a
+                // denial -- all-or-nothing, never a silent downgrade.
+                return value.equalsIgnoreCase(expectedToken);
             }
         }
         return false;
@@ -1390,7 +1400,8 @@ public abstract class WebSocketClient implements QuietCloseable {
         // Only meaningful when qwpRequestDurableAck is true; the sender
         // checks this value to fail at connect rather than silently
         // missing trim signals.
-        serverDurableAckEnabled = extractDurableAckEnabled(response);
+        serverDurableAckEnabled = extractDurableAckConfirmed(
+                response, DurableAckTiers.expectedConfirmToken(qwpDurableAckTiers));
 
         // Extract X-QWP-Max-Batch-Size (optional). Older servers omit it; the
         // sender falls back to its locally configured byte budget in that case.
