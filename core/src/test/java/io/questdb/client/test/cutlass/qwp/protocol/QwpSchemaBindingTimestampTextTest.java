@@ -67,7 +67,7 @@ public class QwpSchemaBindingTimestampTextTest {
                         append.run();
                         buffer.nextRow();
                         QwpTestWireReader reader = tableReader(
-                                encoder, encoder.encodeSchema(buffer), 1, QwpConstants.TYPE_VARCHAR);
+                                encoder, encoder.encode(buffer), 1, QwpConstants.TYPE_VARCHAR);
                         String expectedText = "<EMPTY>".equals(fields[6]) ? "" : fields[6];
                         byte[] expected = expectedText.getBytes(StandardCharsets.UTF_8);
                         Assert.assertEquals(0, reader.u8());
@@ -120,7 +120,7 @@ public class QwpSchemaBindingTimestampTextTest {
                 buffer.rollbackUncommittedColumns();
                 binding.timestampColumn("c", 1000, ChronoUnit.NANOS);
                 buffer.nextRow();
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableHeader(encoder, size, 5, 2);
                 Assert.assertEquals("a", reader.string());
                 Assert.assertEquals(QwpConstants.TYPE_VARCHAR, reader.u8());
@@ -133,7 +133,7 @@ public class QwpSchemaBindingTimestampTextTest {
                 buffer.reset();
                 binding.timestampColumn("a", 0, ChronoUnit.SECONDS);
                 buffer.nextRow();
-                int resetSize = encoder.encodeSchema(buffer);
+                int resetSize = encoder.encode(buffer);
                 QwpTestWireReader reset = tableHeader(encoder, resetSize, 1, 2);
                 Assert.assertEquals("a", reset.string());
                 Assert.assertEquals(QwpConstants.TYPE_VARCHAR, reset.u8());

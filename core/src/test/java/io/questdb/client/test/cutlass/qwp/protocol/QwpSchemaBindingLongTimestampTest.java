@@ -51,7 +51,7 @@ public class QwpSchemaBindingLongTimestampTest {
                         QwpSchemaBinding binding = binding(buffer, -1, column("value", target));
                         binding.longColumn("value", value);
                         buffer.nextRow();
-                        int size = encoder.encodeSchema(buffer);
+                        int size = encoder.encode(buffer);
                         QwpTestWireReader reader = tableReader(encoder, size, 1, "value", wireType);
                         if ("<NULL>".equals(fields[4])) {
                             Assert.assertEquals("true", fields[5]);
@@ -90,7 +90,7 @@ public class QwpSchemaBindingLongTimestampTest {
                     binding.longColumn("value", Long.MIN_VALUE + 1);
                     buffer.nextRow();
                     buffer.nextRow();
-                    int size = encoder.encodeSchema(buffer);
+                    int size = encoder.encode(buffer);
                     QwpTestWireReader reader = tableReader(encoder, size, 3, "value", wireType);
                     Assert.assertEquals(1, reader.u8());
                     Assert.assertEquals(5, reader.u8());
@@ -101,7 +101,7 @@ public class QwpSchemaBindingLongTimestampTest {
                     buffer.reset();
                     binding.longColumn("value", Long.MAX_VALUE);
                     buffer.nextRow();
-                    int resetSize = encoder.encodeSchema(buffer);
+                    int resetSize = encoder.encode(buffer);
                     QwpTestWireReader reset = tableReader(encoder, resetSize, 1, "value", wireType);
                     Assert.assertEquals(0, reset.u8());
                     Assert.assertEquals(0, reset.u8());
@@ -125,7 +125,7 @@ public class QwpSchemaBindingLongTimestampTest {
                 buffer.rollbackUncommittedColumns();
                 binding.longColumn("c", 4);
                 buffer.nextRow();
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableHeader(encoder, size, 2, 2);
                 Assert.assertEquals("a", reader.string());
                 Assert.assertEquals(QwpConstants.TYPE_TIMESTAMP, reader.u8());
@@ -150,11 +150,10 @@ public class QwpSchemaBindingLongTimestampTest {
             QwpSchemaBinding binding = new QwpSchemaBinding(buffer, missing());
             binding.longColumn("value", Long.MIN_VALUE);
             buffer.nextRow();
-            int size = encoder.encodeSchema(buffer);
+            int size = encoder.encode(buffer);
             QwpTestWireReader reader = new QwpTestWireReader(encoder.getBuffer().getBufferPtr(), size);
             reader.skip(QwpConstants.HEADER_SIZE);
             Assert.assertEquals("t", reader.string());
-            Assert.assertEquals(0, reader.u8());
             Assert.assertEquals(1, reader.varint());
             Assert.assertEquals(1, reader.varint());
             Assert.assertEquals("value", reader.string());

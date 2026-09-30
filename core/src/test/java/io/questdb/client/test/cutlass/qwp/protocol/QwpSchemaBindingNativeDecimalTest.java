@@ -65,7 +65,7 @@ public class QwpSchemaBindingNativeDecimalTest {
                         } else {
                             append(binding, value);
                             buffer.nextRow();
-                            int size = encoder.encodeSchema(buffer);
+                            int size = encoder.encode(buffer);
                             QwpTestWireReader reader = tableReader(encoder, size, wireType(f[7]));
                             Assert.assertEquals(0, reader.u8());
                             Assert.assertEquals(Integer.parseInt(f[9]), reader.u8());
@@ -96,7 +96,7 @@ public class QwpSchemaBindingNativeDecimalTest {
                     binding.decimalColumn("value", "1.2", new Decimal256());
                     buffer.nextRow();
 
-                    int size = encoder.encodeSchema(buffer);
+                    int size = encoder.encode(buffer);
                     QwpTestWireReader reader = tableReader(encoder, size, wireTypeForPrecision(precision));
                     Assert.assertEquals(0, reader.u8());
                     Assert.assertEquals(1, reader.u8());
@@ -138,7 +138,7 @@ public class QwpSchemaBindingNativeDecimalTest {
                         .decimalColumn("value", "", scratch);
                 buffer.nextRow();
 
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableHeader(encoder, size, 3, 1);
                 decimalDefinition(reader, "value", QwpConstants.TYPE_DECIMAL64);
                 Assert.assertEquals(1, reader.u8());
@@ -167,7 +167,7 @@ public class QwpSchemaBindingNativeDecimalTest {
                         .decimalColumn("value", "not-a-decimal", scratch);
                 buffer.nextRow();
 
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableHeader(encoder, size, 1, 1);
                 Assert.assertEquals("value", reader.string());
                 Assert.assertEquals(QwpConstants.TYPE_UUID, reader.u8());
@@ -191,7 +191,7 @@ public class QwpSchemaBindingNativeDecimalTest {
                 binding.decimalColumn("value", "12.3400", scratch);
                 buffer.nextRow();
 
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = unknownTableReader(encoder, size, QwpConstants.TYPE_DECIMAL256, 2);
                 Assert.assertEquals(1, reader.u8());
                 Assert.assertEquals(1, reader.u8());
@@ -214,7 +214,7 @@ public class QwpSchemaBindingNativeDecimalTest {
                 binding.decimalColumn("value", "-Infinity", new Decimal256());
                 buffer.nextRow();
 
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = unknownTableReader(encoder, size, QwpConstants.TYPE_DECIMAL256);
                 Assert.assertEquals(1, reader.u8());
                 Assert.assertEquals(1, reader.u8());
@@ -224,7 +224,7 @@ public class QwpSchemaBindingNativeDecimalTest {
                 buffer.reset();
                 binding.decimalColumn("value", "5.678", new Decimal256());
                 buffer.nextRow();
-                int resetSize = encoder.encodeSchema(buffer);
+                int resetSize = encoder.encode(buffer);
                 QwpTestWireReader reset = unknownTableReader(encoder, resetSize, QwpConstants.TYPE_DECIMAL256);
                 Assert.assertEquals(0, reset.u8());
                 Assert.assertEquals(3, reset.u8());
@@ -254,7 +254,7 @@ public class QwpSchemaBindingNativeDecimalTest {
                 buffer.rollbackUncommittedColumns();
                 binding.decimalColumn("c", new Decimal256(0, 0, 0, 25, 2));
                 buffer.nextRow();
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableHeader(encoder, size, 2, 2);
                 decimalDefinition(reader, "a", QwpConstants.TYPE_DECIMAL64);
                 decimalDefinition(reader, "c", QwpConstants.TYPE_DECIMAL64);
@@ -271,7 +271,7 @@ public class QwpSchemaBindingNativeDecimalTest {
                 buffer.reset();
                 binding.decimalColumn("c", new Decimal64(3, 0));
                 buffer.nextRow();
-                int resetSize = encoder.encodeSchema(buffer);
+                int resetSize = encoder.encode(buffer);
                 QwpTestWireReader reset = tableHeader(encoder, resetSize, 1, 2);
                 decimalDefinition(reset, "a", QwpConstants.TYPE_DECIMAL64);
                 decimalDefinition(reset, "c", QwpConstants.TYPE_DECIMAL64);
@@ -301,7 +301,7 @@ public class QwpSchemaBindingNativeDecimalTest {
                     QwpSchemaBinding binding = new QwpSchemaBinding(buffer, missing());
                     append(binding, values[i]);
                     buffer.nextRow();
-                    int size = encoder.encodeSchema(buffer);
+                    int size = encoder.encode(buffer);
                     QwpTestWireReader reader = unknownTableReader(encoder, size, types[i]);
                     Assert.assertEquals(0, reader.u8());
                     Assert.assertEquals(scale(values[i]), reader.u8());
@@ -521,7 +521,6 @@ public class QwpSchemaBindingNativeDecimalTest {
         QwpTestWireReader reader = new QwpTestWireReader(encoder.getBuffer().getBufferPtr(), size);
         reader.skip(QwpConstants.HEADER_SIZE);
         Assert.assertEquals("t", reader.string());
-        Assert.assertEquals(0, reader.u8());
         Assert.assertEquals(rows, reader.varint());
         Assert.assertEquals(1, reader.varint());
         decimalDefinition(reader, "value", type);

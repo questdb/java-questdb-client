@@ -48,7 +48,7 @@ public class QwpSchemaBindingBooleanTest {
                         Assert.assertTrue(fields[1], "TRUE".equals(fields[1]) || "FALSE".equals(fields[1]));
                         binding.boolColumn("value", "TRUE".equals(fields[1]));
                         buffer.nextRow();
-                        QwpTestWireReader reader = tableReader(encoder, encoder.encodeSchema(buffer), wireType(fields[3]), 1);
+                        QwpTestWireReader reader = tableReader(encoder, encoder.encode(buffer), wireType(fields[3]), 1);
                         Assert.assertEquals(0, reader.u8());
                         assertValue(reader, fields[3], fields[4]);
                         Assert.assertEquals(encoder.getBuffer().getPosition(), reader.position());
@@ -84,7 +84,7 @@ public class QwpSchemaBindingBooleanTest {
                         } else {
                             binding.stringColumn("value", value);
                             buffer.nextRow();
-                            QwpTestWireReader reader = tableReader(encoder, encoder.encodeSchema(buffer), QwpConstants.TYPE_BOOLEAN, 1);
+                            QwpTestWireReader reader = tableReader(encoder, encoder.encode(buffer), QwpConstants.TYPE_BOOLEAN, 1);
                             if (value == null) {
                                 Assert.assertEquals(1, reader.u8());
                                 Assert.assertEquals(1, reader.u8());
@@ -115,7 +115,7 @@ public class QwpSchemaBindingBooleanTest {
                     }
                     buffer.nextRow();
                 }
-                QwpTestWireReader reader = tableReader(encoder, encoder.encodeSchema(buffer), QwpConstants.TYPE_BOOLEAN, 137);
+                QwpTestWireReader reader = tableReader(encoder, encoder.encode(buffer), QwpConstants.TYPE_BOOLEAN, 137);
                 Assert.assertEquals(1, reader.u8());
                 byte[] nulls = new byte[18];
                 for (int i = 0; i < 17; i++) nulls[i] = (byte) 0xaa;
@@ -128,7 +128,7 @@ public class QwpSchemaBindingBooleanTest {
 
                 buffer.reset();
                 for (int row = 0; row < 70; row++) buffer.nextRow();
-                QwpTestWireReader allNull = tableReader(encoder, encoder.encodeSchema(buffer), QwpConstants.TYPE_BOOLEAN, 70);
+                QwpTestWireReader allNull = tableReader(encoder, encoder.encode(buffer), QwpConstants.TYPE_BOOLEAN, 70);
                 Assert.assertEquals(1, allNull.u8());
                 byte[] allNulls = new byte[9];
                 for (int i = 0; i < 8; i++) allNulls[i] = (byte) 0xff;
@@ -153,7 +153,7 @@ public class QwpSchemaBindingBooleanTest {
                 buffer.rollbackUncommittedColumns();
                 binding.boolColumn("c", true);
                 buffer.nextRow();
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = new QwpTestWireReader(encoder.getBuffer().getBufferPtr(), size);
                 reader.skip(QwpConstants.HEADER_SIZE);
                 skipTablePrefix(reader, 2, 2);
@@ -174,7 +174,7 @@ public class QwpSchemaBindingBooleanTest {
                 binding.stringColumn("a", mutable).boolColumn("a", false);
                 mutable.replace(0, mutable.length(), "false");
                 buffer.nextRow();
-                int resetSize = encoder.encodeSchema(buffer);
+                int resetSize = encoder.encode(buffer);
                 QwpTestWireReader reset = new QwpTestWireReader(encoder.getBuffer().getBufferPtr(), resetSize);
                 reset.skip(QwpConstants.HEADER_SIZE);
                 skipTablePrefix(reset, 1, 2);
@@ -203,7 +203,7 @@ public class QwpSchemaBindingBooleanTest {
                 binding.boolColumn("flag", true).stringColumn("flag", "invalid");
                 binding.stringColumn("sym", "first").boolColumn("sym", false);
                 buffer.nextRow();
-                Assert.assertTrue(encoder.encodeSchema(buffer) > 0);
+                Assert.assertTrue(encoder.encode(buffer) > 0);
             }
         });
     }

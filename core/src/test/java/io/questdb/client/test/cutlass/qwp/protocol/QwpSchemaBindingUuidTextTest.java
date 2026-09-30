@@ -51,7 +51,7 @@ public class QwpSchemaBindingUuidTextTest {
                         QwpSchemaBinding binding = binding(buffer, column("value", targetType(fields[3])));
                         binding.uuidColumn("value", Long.parseLong(fields[1]), Long.parseLong(fields[2]));
                         buffer.nextRow();
-                        int size = encoder.encodeSchema(buffer);
+                        int size = encoder.encode(buffer);
                         QwpTestWireReader reader = tableReader(encoder, size, 1);
                         if ("<NULL>".equals(fields[5])) {
                             Assert.assertEquals("<NULL>", fields[6]);
@@ -91,7 +91,7 @@ public class QwpSchemaBindingUuidTextTest {
                     binding.uuidColumn("value", 1, 0);
                     buffer.nextRow();
                     buffer.nextRow();
-                    int size = encoder.encodeSchema(buffer);
+                    int size = encoder.encode(buffer);
                     QwpTestWireReader reader = tableReader(encoder, size, 3);
                     Assert.assertEquals(1, reader.u8());
                     Assert.assertEquals(5, reader.u8());
@@ -115,13 +115,10 @@ public class QwpSchemaBindingUuidTextTest {
                 binding.uuidColumn("c", 4, 0);
                 buffer.nextRow();
                 buffer.nextRow();
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = new QwpTestWireReader(encoder.getBuffer().getBufferPtr(), size);
                 reader.skip(QwpConstants.HEADER_SIZE);
                 Assert.assertEquals("t", reader.string());
-                Assert.assertEquals(1, reader.u8());
-                Assert.assertEquals(1, reader.i32());
-                Assert.assertEquals(1, reader.i64());
                 Assert.assertEquals(3, reader.varint());
                 Assert.assertEquals(2, reader.varint());
                 Assert.assertEquals("a", reader.string());
@@ -135,13 +132,10 @@ public class QwpSchemaBindingUuidTextTest {
                 buffer.reset();
                 binding.uuidColumn("a", 5, 0);
                 buffer.nextRow();
-                int resetSize = encoder.encodeSchema(buffer);
+                int resetSize = encoder.encode(buffer);
                 QwpTestWireReader reset = new QwpTestWireReader(encoder.getBuffer().getBufferPtr(), resetSize);
                 reset.skip(QwpConstants.HEADER_SIZE);
                 Assert.assertEquals("t", reset.string());
-                Assert.assertEquals(1, reset.u8());
-                Assert.assertEquals(1, reset.i32());
-                Assert.assertEquals(1, reset.i64());
                 Assert.assertEquals(1, reset.varint());
                 Assert.assertEquals(2, reset.varint());
                 Assert.assertEquals("a", reset.string());
@@ -172,15 +166,10 @@ public class QwpSchemaBindingUuidTextTest {
             QwpSchemaBinding binding = new QwpSchemaBinding(buffer, schema);
             binding.uuidColumn("value", Long.MIN_VALUE, Long.MIN_VALUE);
             buffer.nextRow();
-            int size = encoder.encodeSchema(buffer);
+            int size = encoder.encode(buffer);
             QwpTestWireReader reader = new QwpTestWireReader(encoder.getBuffer().getBufferPtr(), size);
             reader.skip(QwpConstants.HEADER_SIZE);
             Assert.assertEquals("t", reader.string());
-            Assert.assertEquals(known ? 1 : 0, reader.u8());
-            if (known) {
-                Assert.assertEquals(1, reader.i32());
-                Assert.assertEquals(1, reader.i64());
-            }
             Assert.assertEquals(1, reader.varint());
             Assert.assertEquals(1, reader.varint());
             Assert.assertEquals("value", reader.string());
@@ -225,9 +214,6 @@ public class QwpSchemaBindingUuidTextTest {
         QwpTestWireReader reader = new QwpTestWireReader(encoder.getBuffer().getBufferPtr(), size);
         reader.skip(QwpConstants.HEADER_SIZE);
         Assert.assertEquals("t", reader.string());
-        Assert.assertEquals(1, reader.u8());
-        Assert.assertEquals(1, reader.i32());
-        Assert.assertEquals(1, reader.i64());
         Assert.assertEquals(rows, reader.varint());
         Assert.assertEquals(1, reader.varint());
         Assert.assertEquals(column, reader.string());

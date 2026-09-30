@@ -93,7 +93,7 @@ public class QwpSchemaBindingTest {
                         }
                         write.run();
                         buffer.nextRow();
-                        QwpTestWireReader reader = tableReader(encoder, encoder.encodeSchema(buffer), 1, wireType);
+                        QwpTestWireReader reader = tableReader(encoder, encoder.encode(buffer), 1, wireType);
                         Assert.assertEquals("supplied timestamp must be bitmap-present", 0, reader.u8());
                         Assert.assertEquals("short timestamp columns use raw encoding", 0, reader.u8());
                         Assert.assertEquals(Long.parseLong(fields[5]), reader.i64());
@@ -118,7 +118,7 @@ public class QwpSchemaBindingTest {
                         .timestampColumn("ts", (Instant) null)
                         .timestampColumn("ts", Long.MAX_VALUE, ChronoUnit.WEEKS);
                 buffer.nextRow();
-                QwpTestWireReader reader = tableReader(encoder, encoder.encodeSchema(buffer), 1,
+                QwpTestWireReader reader = tableReader(encoder, encoder.encode(buffer), 1,
                         QwpConstants.TYPE_TIMESTAMP_NANOS);
                 Assert.assertEquals(0, reader.u8());
                 Assert.assertEquals(0, reader.u8());
@@ -162,7 +162,7 @@ public class QwpSchemaBindingTest {
                 rows.timestampColumn("micro", Instant.ofEpochSecond(3))
                         .timestampColumn("late", Instant.ofEpochSecond(0, 4));
                 buffer.nextRow();
-                QwpTestWireReader reader = tableReader(encoder, encoder.encodeSchema(buffer), 2,
+                QwpTestWireReader reader = tableReader(encoder, encoder.encode(buffer), 2,
                         QwpConstants.TYPE_TIMESTAMP, QwpConstants.TYPE_TIMESTAMP_NANOS);
                 Assert.assertEquals(0, reader.u8());
                 Assert.assertEquals(0, reader.u8());
@@ -207,7 +207,7 @@ public class QwpSchemaBindingTest {
                         }
                         rows.timestampColumn("ts", input, unit);
                         buffer.nextRow();
-                        QwpTestWireReader reader = tableReader(encoder, encoder.encodeSchema(buffer), 1, wireType);
+                        QwpTestWireReader reader = tableReader(encoder, encoder.encode(buffer), 1, wireType);
                         Assert.assertEquals("supplied timestamp must be bitmap-present", 0, reader.u8());
                         Assert.assertEquals("short timestamp columns use raw encoding", 0, reader.u8());
                         Assert.assertEquals(Long.parseLong(fields[4]), reader.i64());
@@ -244,7 +244,7 @@ public class QwpSchemaBindingTest {
                 rows.timestampColumn("micro", 9, ChronoUnit.MICROS)
                         .timestampColumn("nano", 10, ChronoUnit.NANOS);
                 buffer.nextRow();
-                QwpTestWireReader reader = tableReader(encoder, encoder.encodeSchema(buffer), 2,
+                QwpTestWireReader reader = tableReader(encoder, encoder.encode(buffer), 2,
                         QwpConstants.TYPE_TIMESTAMP, QwpConstants.TYPE_TIMESTAMP_NANOS);
                 Assert.assertEquals(0, reader.u8());
                 Assert.assertEquals(0, reader.u8());
@@ -271,7 +271,7 @@ public class QwpSchemaBindingTest {
                 buffer.nextRow();
                 rows.stringColumn("micro", null);
                 buffer.nextRow();
-                QwpTestWireReader nulls = tableReader(encoder, encoder.encodeSchema(buffer), 2,
+                QwpTestWireReader nulls = tableReader(encoder, encoder.encode(buffer), 2,
                         QwpConstants.TYPE_TIMESTAMP, QwpConstants.TYPE_TIMESTAMP_NANOS);
                 Assert.assertEquals(1, nulls.u8());
                 Assert.assertEquals(3, nulls.u8());
@@ -376,7 +376,7 @@ public class QwpSchemaBindingTest {
                         .floatColumn("f", Float.intBitsToFloat(0x3fc00000))
                         .stringColumn("s", "quest");
                 buffer.nextRow();
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableReader(encoder, size, -1, -1, 1,
                         QwpConstants.TYPE_UUID, QwpConstants.TYPE_FLOAT, QwpConstants.TYPE_VARCHAR);
                 Assert.assertEquals(0, reader.u8());
@@ -439,7 +439,7 @@ public class QwpSchemaBindingTest {
                 buffer.rollbackUncommittedColumns();
                 rows.longColumn("a", 3);
                 buffer.nextRow();
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableReader(encoder, size, -1, -1, 2, QwpConstants.TYPE_LONG);
                 Assert.assertEquals(0, reader.u8());
                 Assert.assertEquals(1, reader.i64());
@@ -477,7 +477,7 @@ public class QwpSchemaBindingTest {
                 rows.stringColumn("u", "01234567-89ab-cdef-0123-456789abcdef")
                         .stringColumn("u", "malformed");
                 buffer.nextRow();
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableReader(encoder, size, 2, QwpConstants.TYPE_UUID, QwpConstants.TYPE_LONG);
                 Assert.assertEquals(0, reader.u8());
                 Assert.assertEquals(1, reader.i64());
@@ -498,16 +498,16 @@ public class QwpSchemaBindingTest {
             try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
                  QwpTableBuffer buffer = new QwpTableBuffer("t")) {
                  QwpSchemaBinding rows = rows(buffer, column("l", ColumnType.LONG));
-                Assert.assertEquals(0, encoder.encodeSchema(buffer));
+                Assert.assertEquals(0, encoder.encode(buffer));
                 rows.longColumn("l", 1);
-                assertIllegalState(() -> encoder.encodeSchema(buffer));
+                assertIllegalState(() -> encoder.encode(buffer));
                 buffer.nextRow();
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 assertLongFrame(encoder, size, 1);
                 int position = encoder.getBuffer().getPosition();
                 byte[] before = copyFrame(encoder, position);
                 buffer.reset();
-                Assert.assertEquals(0, encoder.encodeSchema(buffer));
+                Assert.assertEquals(0, encoder.encode(buffer));
                 Assert.assertEquals(position, encoder.getBuffer().getPosition());
                 Assert.assertArrayEquals(before, copyFrame(encoder, position));
             }
@@ -558,7 +558,7 @@ public class QwpSchemaBindingTest {
                         } else {
                             append.run();
                             buffer.nextRow();
-                            QwpTestWireReader reader = tableReader(encoder, encoder.encodeSchema(buffer), 1,
+                            QwpTestWireReader reader = tableReader(encoder, encoder.encode(buffer), 1,
                                     numericWireType(fields[3]));
                             if ("<NULL>".equals(fields[4])) {
                                 assertNumericNull(reader, fields[3]);
@@ -600,7 +600,7 @@ public class QwpSchemaBindingTest {
                         QwpSchemaBinding rows = rows(buffer, column("value", textColumnType(fields[3])));
                         appendSmallInteger(rows, fields[1], input, "value");
                         buffer.nextRow();
-                        QwpTestWireReader reader = tableReader(encoder, encoder.encodeSchema(buffer), 1, wireType);
+                        QwpTestWireReader reader = tableReader(encoder, encoder.encode(buffer), 1, wireType);
                         if ("<NULL>".equals(fields[4])) {
                             Assert.assertEquals("<NULL>", fields[5]);
                             Assert.assertEquals("NULL bitmap must be present", 1, reader.u8());
@@ -673,7 +673,7 @@ public class QwpSchemaBindingTest {
                         } else {
                             append.run();
                             buffer.nextRow();
-                            int size = encoder.encodeSchema(buffer);
+                            int size = encoder.encode(buffer);
                             QwpTestWireReader reader = tableReader(
                                     encoder,
                                     size,
@@ -740,7 +740,7 @@ public class QwpSchemaBindingTest {
                         buffer.nextRow();
                         QwpTestWireReader reader = tableReader(
                                 encoder,
-                                encoder.encodeSchema(buffer),
+                                encoder.encode(buffer),
                                 1,
                                 temporalWireType(fields[3])
                         );
@@ -787,7 +787,7 @@ public class QwpSchemaBindingTest {
 
                 rows.intColumn("c", 3);
                 buffer.nextRow();
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableReader(encoder, size, 2,
                         QwpConstants.TYPE_LONG, QwpConstants.TYPE_DOUBLE);
                 Assert.assertEquals(1, reader.u8());
@@ -813,7 +813,7 @@ public class QwpSchemaBindingTest {
                     buffer.nextRow();
                     rows.intColumn("n", 7);
                     buffer.nextRow();
-                    int size = encoder.encodeSchema(buffer);
+                    int size = encoder.encode(buffer);
                     QwpTestWireReader reader = tableReader(encoder, size, 3, numericWireType(target));
                     Assert.assertEquals(target, 1, reader.u8());
                     Assert.assertEquals(target, 3, reader.u8());
@@ -850,7 +850,7 @@ public class QwpSchemaBindingTest {
                 buffer.nextRow();
                 buffer.nextRow();
 
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableReader(encoder, size, 7, QwpConstants.TYPE_IPv4);
                 Assert.assertEquals("NULL bitmap must be present", 1, reader.u8());
                 Assert.assertEquals("INT null, IPv4 zero and omission must be NULL", 0x43, reader.u8());
@@ -871,7 +871,7 @@ public class QwpSchemaBindingTest {
                 QwpSchemaBinding rows = new QwpSchemaBinding(buffer, schemaResult(QwpSchemaProtocol.RESULT_MISSING));
                 rows.byteColumn("b", (byte) -1).shortColumn("s", (short) 2).intColumn("i", 3);
                 buffer.nextRow();
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableReader(encoder, size, -1, -1, 1,
                         QwpConstants.TYPE_BYTE, QwpConstants.TYPE_SHORT, QwpConstants.TYPE_INT);
                 Assert.assertEquals(0, reader.u8());
@@ -967,7 +967,7 @@ public class QwpSchemaBindingTest {
                         }
                         rows.longColumn("n", input);
                 buffer.nextRow();
-                        int size = encoder.encodeSchema(buffer);
+                        int size = encoder.encode(buffer);
                         QwpTestWireReader reader = tableReader(encoder, size, 1, wireType);
                         if ("<NULL>".equals(fields[3])) {
                             if (input == Long.MIN_VALUE) {
@@ -1006,7 +1006,7 @@ public class QwpSchemaBindingTest {
                 buffer.rollbackUncommittedColumns();
                 rows.longColumn("b", 3).longColumn("i", 4);
                 buffer.nextRow();
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableReader(encoder, size, 2, QwpConstants.TYPE_BYTE, QwpConstants.TYPE_INT);
                 Assert.assertEquals(0, reader.u8());
                 Assert.assertEquals(7, reader.u8());
@@ -1049,7 +1049,7 @@ public class QwpSchemaBindingTest {
                         () -> rows.longColumn("u", Long.MIN_VALUE));
                 rows.uuidColumn("u", 1, 2).longColumn("u", Long.MIN_VALUE);
                 buffer.nextRow();
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableReader(encoder, size, 1, QwpConstants.TYPE_UUID);
                 Assert.assertEquals(0, reader.u8());
                 Assert.assertEquals(1, reader.i64());
@@ -1075,7 +1075,7 @@ public class QwpSchemaBindingTest {
                 }
                 rows.longColumn("b", 128).longColumn("s", 32768).longColumn("i", 2147483648L);
                 buffer.nextRow();
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableReader(encoder, size, 1, QwpConstants.TYPE_BYTE, QwpConstants.TYPE_SHORT,
                         QwpConstants.TYPE_INT, QwpConstants.TYPE_LONG, QwpConstants.TYPE_FLOAT, QwpConstants.TYPE_DOUBLE);
                 Assert.assertEquals(0, reader.u8()); Assert.assertEquals(7, reader.u8());
@@ -1104,7 +1104,7 @@ public class QwpSchemaBindingTest {
                 buffer.rollbackUncommittedColumns();
                 rows.longColumn("a", 3);
                 buffer.nextRow();
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableReader(encoder, size, 2, QwpConstants.TYPE_LONG);
                 Assert.assertEquals(0, reader.u8());
                 Assert.assertEquals(1, reader.i64());
@@ -1138,7 +1138,7 @@ public class QwpSchemaBindingTest {
                 rows.stringColumn("b", null).stringColumn("s", null).stringColumn("i", null)
                         .stringColumn("l", null).stringColumn("f", null).stringColumn("d", null);
                 buffer.nextRow();
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableReader(encoder, size, 1, QwpConstants.TYPE_BYTE, QwpConstants.TYPE_SHORT,
                         QwpConstants.TYPE_INT, QwpConstants.TYPE_LONG, QwpConstants.TYPE_FLOAT, QwpConstants.TYPE_DOUBLE);
                 assertNumericNull(reader, "BYTE");
@@ -1160,7 +1160,7 @@ public class QwpSchemaBindingTest {
                  QwpSchemaBinding rows = rows(buffer, column("u", ColumnType.UUID), column("l", ColumnType.LONG));
                 rows.stringColumn("u", null).stringColumn("l", null);
                 buffer.nextRow();
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableReader(encoder, size, 1, QwpConstants.TYPE_UUID, QwpConstants.TYPE_LONG);
                 Assert.assertEquals(1, reader.u8());
                 Assert.assertEquals(1, reader.u8());
@@ -1179,7 +1179,7 @@ public class QwpSchemaBindingTest {
                  QwpSchemaBinding rows = rows(buffer, column("future", ColumnType.LONG, new byte[]{1}), column("plain", ColumnType.LONG));
                 rows.longColumn("plain", 1);
                 buffer.nextRow();
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 assertLongFrame(encoder, size, 1);
                 buffer.reset();
                 assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, () -> rows.longColumn("future", 2));
@@ -1195,7 +1195,7 @@ public class QwpSchemaBindingTest {
                  QwpSchemaBinding rows = rows(buffer, column("future", ColumnType.LONG | 0x10000), column("plain", ColumnType.LONG));
                 rows.longColumn("plain", 7);
                 buffer.nextRow();
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 assertLongFrame(encoder, size, 7);
                 buffer.reset();
                 assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE, () -> rows.longColumn("future", 2));
@@ -1216,12 +1216,12 @@ public class QwpSchemaBindingTest {
                 buffer.rollbackUncommittedColumns();
                 rows.longColumn("l", 3);
                 buffer.nextRow();
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 assertLongFrame(encoder, size, 1, 3);
                 buffer.reset();
                 rows.longColumn("l", 4);
                 buffer.nextRow();
-                size = encoder.encodeSchema(buffer);
+                size = encoder.encode(buffer);
                 assertLongFrame(encoder, size, 4);
             }
         });
@@ -1242,7 +1242,7 @@ public class QwpSchemaBindingTest {
                 buffer.rollbackUncommittedColumns();
                 rows.stringColumn("u", "01234567-89ab-cdef-0123-456789abcdef");
                 buffer.nextRow();
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableReader(encoder, size, 2, QwpConstants.TYPE_LONG, QwpConstants.TYPE_UUID);
                 Assert.assertEquals(1, reader.u8());
                 Assert.assertEquals(2, reader.u8());
@@ -1276,7 +1276,7 @@ public class QwpSchemaBindingTest {
                 assertIllegalState(() -> old.uuidColumn("u", 1, 2));
                 buffer.nextRow();
                 try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder()) {
-                    int size = encoder.encodeSchema(buffer);
+                    int size = encoder.encode(buffer);
                     QwpTestWireReader reader = tableReader(encoder, size, 1, QwpConstants.TYPE_LONG);
                     Assert.assertEquals(0, reader.u8());
                     Assert.assertEquals(7, reader.i64());
@@ -1307,22 +1307,14 @@ public class QwpSchemaBindingTest {
                 sentinel.nextRow();
                 encoder.encode(sentinel);
                 QwpSchemaBinding binding = rows(buffer, column("l", ColumnType.LONG));
+                // An empty bound table cannot join a multi-table message.
+                assertEncoderUnchanged(encoder, () -> encoder.encodeWithDeltaDict(
+                        buffer, new GlobalSymbolDictionary(), -1, -1));
+                binding.longColumn("l", 1);
+                // A bound table with an incomplete row cannot be encoded.
                 assertEncoderUnchanged(encoder, () -> encoder.encode(buffer));
                 assertEncoderUnchanged(encoder, () -> encoder.encodeWithDeltaDict(
                         buffer, new GlobalSymbolDictionary(), -1, -1));
-                assertEncoderUnchangedIllegalArgument(encoder, () -> encoder.encodeSchema(
-                        buffer, binding.getTableId() + 1, binding.getMetadataVersion()));
-                binding.longColumn("l", 1);
-                assertEncoderUnchanged(encoder, () -> encoder.encodeSchema(buffer));
-                buffer.nextRow();
-                int derivedSize = encoder.encodeSchema(buffer);
-                byte[] derived = copyFrame(encoder, derivedSize);
-                int explicitSize = encoder.encodeSchema(buffer, binding.getTableId(), binding.getMetadataVersion());
-                Assert.assertEquals(derivedSize, explicitSize);
-                Assert.assertArrayEquals(derived, copyFrame(encoder, explicitSize));
-
-                encoder.beginMessage(1, new GlobalSymbolDictionary(), -1, -1);
-                assertEncoderUnchanged(encoder, () -> encoder.addTable(buffer));
             }
         });
     }
@@ -1333,11 +1325,10 @@ public class QwpSchemaBindingTest {
             try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
                  QwpTableBuffer buffer = new QwpTableBuffer("t")) {
                 QwpSchemaBinding binding = rows(buffer, column("l", ColumnType.LONG));
-                Assert.assertEquals(0, encoder.encodeSchema(buffer));
+                Assert.assertEquals(0, encoder.encode(buffer));
                 Assert.assertEquals(0, encoder.getBuffer().getPosition());
-                encoder.beginSchemaMessage(1, new GlobalSymbolDictionary(), -1, -1);
-                assertEncoderUnchanged(encoder, () -> encoder.addSchemaTable(
-                        buffer, binding.getTableId(), binding.getMetadataVersion()));
+                encoder.beginMessage(1, new GlobalSymbolDictionary(), -1, -1);
+                assertEncoderUnchanged(encoder, () -> encoder.addTable(buffer));
             }
         });
     }
@@ -1404,7 +1395,7 @@ public class QwpSchemaBindingTest {
                 buffer.nextRow();
                 rows.uuidColumn("u", lo, hi);
                 buffer.nextRow();
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableReader(encoder, size, 2, QwpConstants.TYPE_UUID);
                 Assert.assertEquals(0, reader.u8());
                 Assert.assertEquals(lo, reader.i64());
@@ -1444,7 +1435,7 @@ public class QwpSchemaBindingTest {
                         byte wireType = targetType == ColumnType.IPv4
                                 ? QwpConstants.TYPE_IPv4
                                 : QwpConstants.TYPE_VARCHAR;
-                        QwpTestWireReader reader = tableReader(encoder, encoder.encodeSchema(buffer), 1, wireType);
+                        QwpTestWireReader reader = tableReader(encoder, encoder.encode(buffer), 1, wireType);
                         if ("NULL".equals(fields[3])) {
                             Assert.assertEquals(1, reader.u8());
                             Assert.assertEquals(1, reader.u8());
@@ -1498,7 +1489,7 @@ public class QwpSchemaBindingTest {
                 rows.ipv4Column("ip", 0x0d0e0f10);
                 buffer.nextRow();
 
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableReader(encoder, size, 5, QwpConstants.TYPE_IPv4);
                 Assert.assertEquals(1, reader.u8());
                 Assert.assertEquals(0x0e, reader.u8());
@@ -1515,7 +1506,7 @@ public class QwpSchemaBindingTest {
                 buffer.nextRow();
                 Assert.assertEquals(1, buffer.getColumnDefs().length);
                 Assert.assertEquals(QwpConstants.TYPE_IPv4, buffer.getColumnDefs()[0].getTypeCode());
-                QwpTestWireReader reader = tableReader(encoder, encoder.encodeSchema(buffer), -1, -1, 1,
+                QwpTestWireReader reader = tableReader(encoder, encoder.encode(buffer), -1, -1, 1,
                         QwpConstants.TYPE_IPv4);
                 Assert.assertEquals(0, reader.u8());
                 Assert.assertEquals(0xc0a80101, reader.i32());
@@ -1529,7 +1520,7 @@ public class QwpSchemaBindingTest {
                 buffer.nextRow();
                 Assert.assertEquals(1, buffer.getColumnDefs().length);
                 Assert.assertEquals(QwpConstants.TYPE_IPv4, buffer.getColumnDefs()[0].getTypeCode());
-                QwpTestWireReader reader = tableReader(encoder, encoder.encodeSchema(buffer), -1, -1, 1,
+                QwpTestWireReader reader = tableReader(encoder, encoder.encode(buffer), -1, -1, 1,
                         QwpConstants.TYPE_IPv4);
                 Assert.assertEquals(1, reader.u8());
                 Assert.assertEquals(1, reader.u8());
@@ -1587,7 +1578,7 @@ public class QwpSchemaBindingTest {
                             byte wireType = targetType == ColumnType.LONG256
                                     ? QwpConstants.TYPE_LONG256
                                     : QwpConstants.TYPE_VARCHAR;
-                            int size = encoder.encodeSchema(buffer);
+                            int size = encoder.encode(buffer);
                             QwpTestWireReader reader = tableReader(encoder, size, 1, wireType);
                             if ("NULL".equals(fields[5])) {
                                 Assert.assertEquals("-", fields[6]);
@@ -1641,7 +1632,7 @@ public class QwpSchemaBindingTest {
                 rows.long256Column("value", Long.MIN_VALUE, Long.MIN_VALUE, Long.MIN_VALUE, Long.MIN_VALUE);
                 buffer.nextRow();
 
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableReader(encoder, size, 3, QwpConstants.TYPE_LONG256);
                 Assert.assertEquals(1, reader.u8());
                 Assert.assertEquals(0x06, reader.u8());
@@ -1659,7 +1650,7 @@ public class QwpSchemaBindingTest {
                 buffer.nextRow();
                 Assert.assertEquals(1, buffer.getColumnDefs().length);
                 Assert.assertEquals(QwpConstants.TYPE_LONG256, buffer.getColumnDefs()[0].getTypeCode());
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableReader(encoder, size, -1, -1, 1, QwpConstants.TYPE_LONG256);
                 Assert.assertEquals(1, reader.u8());
                 Assert.assertEquals(1, reader.u8());
@@ -1717,7 +1708,7 @@ public class QwpSchemaBindingTest {
                             byte wireType = ColumnType.isGeoHash(targetType)
                                     ? QwpConstants.TYPE_GEOHASH
                                     : QwpConstants.TYPE_VARCHAR;
-                            int size = encoder.encodeSchema(buffer);
+                            int size = encoder.encode(buffer);
                             QwpTestWireReader reader = tableReader(encoder, size, 1, wireType);
                             if (wireType == QwpConstants.TYPE_GEOHASH) {
                                 Assert.assertEquals(1, reader.u8());
@@ -1754,7 +1745,7 @@ public class QwpSchemaBindingTest {
                     rows(buffer, column("value", ColumnType.STRING))
                             .geoHashColumn("value", -1, precision);
                     buffer.nextRow();
-                    int size = encoder.encodeSchema(buffer);
+                    int size = encoder.encode(buffer);
                     QwpTestWireReader reader = tableReader(encoder, size, 1, QwpConstants.TYPE_VARCHAR);
                     Assert.assertEquals(0, reader.u8());
                     Assert.assertEquals(0, reader.i32());
@@ -1787,7 +1778,7 @@ public class QwpSchemaBindingTest {
                 rows.geoHashColumn("value", 0x12345, 20);
                 buffer.nextRow();
 
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableReader(encoder, size, 3, QwpConstants.TYPE_GEOHASH);
                 Assert.assertEquals(1, reader.u8());
                 Assert.assertEquals(0x02, reader.u8());
@@ -1806,7 +1797,7 @@ public class QwpSchemaBindingTest {
                 rows.geoHashColumn("value", 0xabcde, 20);
                 buffer.nextRow();
                 Assert.assertEquals(QwpConstants.TYPE_GEOHASH, buffer.getColumnDefs()[0].getTypeCode());
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableReader(encoder, size, -1, -1, 1, QwpConstants.TYPE_GEOHASH);
                 Assert.assertEquals(1, reader.u8());
                 Assert.assertEquals(0, reader.u8());
@@ -1855,7 +1846,7 @@ public class QwpSchemaBindingTest {
                 rows.geoHashColumn("geo", "u33d")
                         .geoHashColumn("text", "U");
                 buffer.nextRow();
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableReader(encoder, size, 1,
                         QwpConstants.TYPE_GEOHASH, QwpConstants.TYPE_VARCHAR);
                 Assert.assertEquals(1, reader.u8());
@@ -1904,7 +1895,7 @@ public class QwpSchemaBindingTest {
             QwpSchemaBinding binding = rows(buffer, column("l", ColumnType.LONG));
             binding.longColumn("l", 7);
             buffer.nextRow();
-            assertLongFrame(encoder, encoder.encodeSchema(buffer), 7);
+            assertLongFrame(encoder, encoder.encode(buffer), 7);
         }
     }
 
@@ -2185,14 +2176,6 @@ public class QwpSchemaBindingTest {
         Assert.assertArrayEquals(before, copyFrame(encoder, position));
     }
 
-    private static void assertEncoderUnchangedIllegalArgument(QwpWebSocketEncoder encoder, Runnable action) {
-        int position = encoder.getBuffer().getPosition();
-        byte[] before = copyFrame(encoder, position);
-        assertIllegalArgument(action);
-        Assert.assertEquals(position, encoder.getBuffer().getPosition());
-        Assert.assertArrayEquals(before, copyFrame(encoder, position));
-    }
-
     private static QwpSchemaBinding rows(QwpTableBuffer buffer, byte[]... columns) {
         return new QwpSchemaBinding(buffer, known(columns));
     }
@@ -2212,17 +2195,10 @@ public class QwpSchemaBindingTest {
         QwpTestWireReader reader = new QwpTestWireReader(encoder.getBuffer().getBufferPtr(), size);
         Assert.assertEquals(QwpConstants.MAGIC_MESSAGE, reader.i32());
         Assert.assertEquals(1, reader.u8());
-        Assert.assertEquals(QwpConstants.FLAG_GORILLA | QwpConstants.FLAG_SCHEMA, reader.u8());
+        Assert.assertEquals(QwpConstants.FLAG_GORILLA, reader.u8());
         Assert.assertEquals(1, reader.u16());
         Assert.assertEquals(size - QwpConstants.HEADER_SIZE, reader.i32());
         Assert.assertEquals("t", reader.string());
-        if (tableId < 0) {
-            Assert.assertEquals(0, reader.u8());
-        } else {
-            Assert.assertEquals(1, reader.u8());
-            Assert.assertEquals(tableId, reader.i32());
-            Assert.assertEquals(metadataVersion, reader.i64());
-        }
         Assert.assertEquals(rows, reader.varint());
         Assert.assertEquals(wireTypes.length, reader.varint());
         for (byte wireType : wireTypes) {

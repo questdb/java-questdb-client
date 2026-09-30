@@ -332,9 +332,6 @@ public class QwpWebSocketSender implements Sender {
     //         (Invariant B); endpoint-policy and transport failures stay
     //         contained in that loop and never reach the producer.
     private Sender.InitialConnectMode initialConnectMode = Sender.InitialConnectMode.OFF;
-    // Wire contract of the pending batch, selected by its first committed row.
-    // Meaningful only while pendingRowCount > 0. Producer-thread only.
-    private boolean isPendingBatchLegacy;
     private boolean ownsCursorEngine;
     // Whether close() may let the engine reclaim the parent-anchored LOGICAL slot lock.
     // False only while an outer frame holds it: Sender.build() acquires it for the whole
@@ -3599,8 +3596,7 @@ public class QwpWebSocketSender implements Sender {
                 newClient.setQwpMaxVersion(QwpConstants.VERSION);
                 newClient.setQwpClientId(QwpConstants.CLIENT_ID);
                 newClient.setQwpRequestDurableAck(requestDurableAck);
-                // OFF still negotiates when this stream must replay schema frames.
-                if (schemaMode != Sender.SchemaMode.OFF || ctx.requiresSchema()) {
+                if (schemaMode != Sender.SchemaMode.OFF) {
                     newClient.requestQwpSchema();
                 }
                 newClient.setConnectTimeout(effectiveConnectTimeoutMs(background, connectTimeoutMs));
@@ -3730,22 +3726,6 @@ public class QwpWebSocketSender implements Sender {
             // rethrow. close() is CAS-gated, so re-closing after the
             // durable-ack arm's own close is a no-op.
             try {
-                if (ctx.requiresSchema() && !newClient.isQwpSchemaEnabled()) {
-                    newClient.close();
-                    hostTracker.recordRoleReject(idx, false, !background);
-                    QwpSchemaCapabilityMismatchException schemaErr = new QwpSchemaCapabilityMismatchException();
-                    // Schema-backed bytes may never enter the durable-ack
-                    // quarantine path, so schema evidence outranks every
-                    // other capability gap in this sweep.
-                    terminalUpgradeError = schemaErr;
-                    lastError = schemaErr;
-                    if (!background) {
-                        dispatchConnectionEvent(SenderConnectionEvent.Kind.ENDPOINT_ATTEMPT_FAILED,
-                                ep.host, ep.port, null, SenderConnectionEvent.NO_PORT,
-                                attemptNumber, roundSeq, schemaErr);
-                    }
-                    continue;
-                }
                 if (requestDurableAck && !newClient.isServerDurableAckEnabled()) {
                     newClient.close();
                     hostTracker.recordRoleReject(idx, false, !background);
@@ -4265,13 +4245,7 @@ public class QwpWebSocketSender implements Sender {
             connectionDispatcher = new SenderConnectionDispatcher(
                     connectionListener, connectionListenerInboxCapacity);
         }
-        // A recovered deferred-only tail is an aborted transaction that never
-        // reaches the wire. Retire it locally before the capability check, as
-        // BackgroundDrainer does, so its schema frames cannot demand a
-        // schema-capable peer and block startup against a legacy server.
-        cursorEngine.retireRecoveredOrphanTailIfReady();
         CursorWebSocketSendLoop.ReconnectFactory reconnectFactory = newReconnectFactory();
-        reconnectFactory.setSchemaRequired(cursorEngine.requiresSchema());
         switch (initialConnectMode) {
             case SYNC:
                 client = CursorWebSocketSendLoop.connectWithRetry(
@@ -4430,15 +4404,10 @@ public class QwpWebSocketSender implements Sender {
             return pinned;
         }
         ensureConnected();
-        if (pinned != null && currentTableBuffer.getRowCount() > 0) {
+        // A table buffer keeps one contract while it holds rows; the first row
+        // after the flush consults the schema again.
+        if (currentTableBuffer.getRowCount() > 0) {
             return pinned;
-        }
-        // A batch has one wire contract, because a QWP frame has one wire family.
-        // While the pending batch holds legacy rows, later rows stay legacy even if
-        // a schema has become obtainable since; the first row after the flush
-        // consults the schema again.
-        if (pendingRowCount > 0 && isPendingBatchLegacy) {
-            return selectLegacyContract();
         }
         QwpSchemaResponse latest = resolveSchemaForCurrentTable();
         if (latest == null) {
@@ -4521,15 +4490,11 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Commits the current table's next row to the legacy contract. A pending
-     * schema batch cannot take a legacy row, because a QWP frame has one wire
-     * family, so it is published first; a buffer still bound to an earlier batch's
-     * snapshot is unbound so the legacy setters lay out its columns afresh.
+     * Commits the current table's next row to the legacy contract. A buffer still
+     * bound to an earlier batch's snapshot is unbound so the legacy setters lay out
+     * its columns afresh.
      */
     private QwpSchemaBinding selectLegacyContract() {
-        if (pendingRowCount > 0 && !isPendingBatchLegacy) {
-            flushPendingRows(transactional);
-        }
         if (currentTableBuffer.getSchemaBinding() != null) {
             unbindCurrentTableBuffer();
         }
@@ -4754,14 +4719,8 @@ public class QwpWebSocketSender implements Sender {
      */
     private int encodeCombinedFrame(int tableCount, boolean deferCommit, int deltaBaseline) {
         encoder.setDeferCommit(deferCommit);
-        boolean schemaMessage = flushTableBuffers.getQuick(0).getSchemaBinding() != null;
-        if (schemaMessage) {
-            encoder.beginSchemaMessage(tableCount, globalSymbolDictionary,
-                    deltaBaseline, currentBatchMaxSymbolId);
-        } else {
-            encoder.beginMessage(tableCount, globalSymbolDictionary,
-                    deltaBaseline, currentBatchMaxSymbolId);
-        }
+        encoder.beginMessage(tableCount, globalSymbolDictionary,
+                deltaBaseline, currentBatchMaxSymbolId);
         splitFrameBodyBytes.clear();
         int combinedBodyStart = encoder.getBuffer().getPosition();
         int bodyStart = combinedBodyStart;
@@ -4773,15 +4732,7 @@ public class QwpWebSocketSender implements Sender {
                         flushTableNames.getQuick(i), tableBuffer.getRowCount(), currentBatchMaxSymbolId);
             }
 
-            QwpSchemaBinding binding = tableBuffer.getSchemaBinding();
-            if ((binding != null) != schemaMessage) {
-                throw new IllegalStateException("cannot mix legacy and schema table blocks in one frame");
-            }
-            if (binding != null) {
-                encoder.addSchemaTable(tableBuffer, binding.getTableId(), binding.getMetadataVersion());
-            } else {
-                encoder.addTable(tableBuffer);
-            }
+            encoder.addTable(tableBuffer);
             int bodyEnd = encoder.getBuffer().getPosition();
             splitFrameBodyBytes.add(bodyEnd - bodyStart);
             bodyStart = bodyEnd;
@@ -5674,9 +5625,6 @@ public class QwpWebSocketSender implements Sender {
 
         if (pendingRowCount == 0) {
             firstPendingRowTimeNanos = System.nanoTime();
-            // The batch's first row selects its wire contract; see
-            // bindingForEffectiveWrite.
-            isPendingBatchLegacy = currentTableBuffer.getSchemaBinding() == null;
         }
         pendingRowCount++;
 
@@ -5816,8 +5764,6 @@ public class QwpWebSocketSender implements Sender {
          */
         private final java.util.function.BooleanSupplier abortCheck;
         private final String abortMessage;
-        // Each factory serves one engine; other streams can still use legacy peers.
-        private volatile boolean isSchemaRequired;
         private int previousIdx = -1;
 
         private ReconnectSupplier() {
@@ -5852,15 +5798,6 @@ public class QwpWebSocketSender implements Sender {
             return abortCheck != null
                     ? abortCheck.getAsBoolean()
                     : (cursorSendLoop == null ? closed : !cursorSendLoop.isRunning());
-        }
-
-        boolean requiresSchema() {
-            return isSchemaRequired;
-        }
-
-        @Override
-        public void setSchemaRequired(boolean isRequired) {
-            isSchemaRequired = isRequired;
         }
 
         @Override

@@ -162,7 +162,7 @@ final class QwpSchemaTestFixtures {
         QwpTestWireReader reader = new QwpTestWireReader(encoder.getBuffer().getBufferPtr(), size);
         Assert.assertEquals(QwpConstants.MAGIC_MESSAGE, reader.i32());
         Assert.assertEquals(QwpConstants.VERSION, reader.u8());
-        Assert.assertEquals(QwpConstants.FLAG_GORILLA | QwpConstants.FLAG_SCHEMA, reader.u8());
+        Assert.assertEquals(QwpConstants.FLAG_GORILLA, reader.u8());
         Assert.assertEquals(1, reader.u16());
         Assert.assertEquals(size - QwpConstants.HEADER_SIZE, reader.i32());
         skipTablePrefix(reader, rows, columns, tableId, metadataVersion);
@@ -177,13 +177,6 @@ final class QwpSchemaTestFixtures {
             long metadataVersion
     ) {
         Assert.assertEquals("t", reader.string());
-        if (tableId < 0) {
-            Assert.assertEquals(0, reader.u8());
-        } else {
-            Assert.assertEquals(1, reader.u8());
-            Assert.assertEquals(tableId, reader.i32());
-            Assert.assertEquals(metadataVersion, reader.i64());
-        }
         Assert.assertEquals(rows, reader.varint());
         Assert.assertEquals(columns, reader.varint());
     }

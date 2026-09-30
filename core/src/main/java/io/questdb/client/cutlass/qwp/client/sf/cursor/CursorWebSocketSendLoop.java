@@ -36,7 +36,6 @@ import io.questdb.client.cutlass.qwp.client.NativeBufferWriter;
 import io.questdb.client.cutlass.qwp.client.QwpAuthFailedException;
 import io.questdb.client.cutlass.qwp.client.QwpCredentialUnavailableException;
 import io.questdb.client.cutlass.qwp.client.QwpDurableAckMismatchException;
-import io.questdb.client.cutlass.qwp.client.QwpSchemaCapabilityMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpIngressRoleRejectedException;
 import io.questdb.client.cutlass.qwp.client.QwpRoleMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpVersionMismatchException;
@@ -1699,10 +1698,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             throw new IllegalStateException("already started");
         }
         running = true;
-        if (engine.requiresSchema() && client != null && !client.isQwpSchemaEnabled()) {
-            running = false;
-            throw new QwpSchemaCapabilityMismatchException();
-        }
         // Position the cursor at the first unsent FSN before spinning the
         // I/O thread. For a fresh sender, ackedFsn=-1 → start at FSN 0,
         // which lands on the (empty) initial active — same as the prior
@@ -1912,7 +1907,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             attempts++;
             totalReconnectAttempts.incrementAndGet();
             try {
-                reconnectFactory.setSchemaRequired(engine.requiresSchema());
                 WebSocketClient newClient = reconnectFactory.reconnect(connectCancellation);
                 if (newClient != null) {
                     if (!running) {
@@ -2009,11 +2003,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                             phase, attempts, e.getMessage());
                     lastLogNanos = now;
                 }
-            } catch (QwpSchemaCapabilityMismatchException e) {
-                resetCatchUpCapGapEpisode();
-                lastReconnectError = e;
-                LOG.warn("schema framing unavailable during {}; retaining backlog and retrying: {}",
-                        phase, e.getMessage());
             } catch (QwpDurableAckMismatchException e) {
                 if (endpointPolicyFailureIsTerminal()) {
                     // Orphans hand a capability gap back to BackgroundDrainer's
@@ -2781,14 +2770,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * {@link #trySendOne} call replays the first unacked frame.
      */
     private void swapClient(WebSocketClient newClient) {
-        if (engine.requiresSchema() && !newClient.isQwpSchemaEnabled()) {
-            try {
-                newClient.close();
-            } catch (Throwable ignored) {
-                // best-effort
-            }
-            throw new QwpSchemaCapabilityMismatchException();
-        }
         WebSocketClient old = this.client;
         this.client = newClient;
         // The schema cache survives the reconnect. The server ingests by column name
@@ -3585,10 +3566,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * scheduling fairness.
      */
     private boolean trySendOne() {
-        if (engine.requiresSchema() && (client == null || !client.isQwpSchemaEnabled())) {
-            fail(new QwpSchemaCapabilityMismatchException());
-            return false;
-        }
         if (orphanSkipTipFsn >= 0 && fsnAtZero + nextWireSeq >= orphanSkipStartFsn) {
             // The send cursor reached the orphaned deferred tail. Its frames
             // belong to an aborted transaction and must never be transmitted
@@ -3678,14 +3655,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             return false; // payload not fully published yet
         }
         long frameAddr = base + sendOffset + MmapSegment.FRAME_HEADER_SIZE;
-        // The producer latches the requirement before publishing an extended
-        // frame. Re-check after observing publication so an append racing the
-        // early guard cannot expose either its legacy prefix or the extended
-        // frame to an already-connected legacy peer.
-        if (engine.requiresSchema() && (client == null || !client.isQwpSchemaEnabled())) {
-            fail(new QwpSchemaCapabilityMismatchException());
-            return false;
-        }
         // Torn-dictionary guard. sentDictCount is this loop's model of how many ids the
         // CURRENT server has been told about. A frame whose delta starts ABOVE that
         // coverage references ids the server was never given, and the server now rejects
@@ -3831,15 +3800,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     @FunctionalInterface
     public interface ReconnectFactory {
         WebSocketClient reconnect() throws Exception;
-
-        /**
-         * Tells the factory whether the engine currently holds unacked
-         * schema-framed frames, so it requests schema framing and rejects peers
-         * without it. Callers refresh this before each attempt; the send loop
-         * re-checks the engine when it installs the client.
-         */
-        default void setSchemaRequired(boolean isRequired) {
-        }
 
         /**
          * Whether this factory re-derives its {@code Authorization} header from a caller-supplied token

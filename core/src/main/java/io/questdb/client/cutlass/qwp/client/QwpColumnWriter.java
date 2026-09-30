@@ -290,20 +290,6 @@ class QwpColumnWriter {
         writeTableShape(rowCount, columns);
     }
 
-    private void writeSchemaTableHeader(String tableName, int tableId, long metadataVersion, int rowCount, QwpColumnDef[] columns) {
-        buffer.putString(tableName);
-        if (tableId == -1 && metadataVersion == -1) {
-            buffer.putByte((byte) 0);
-        } else if (tableId >= 0 && metadataVersion >= 0) {
-            buffer.putByte((byte) 1);
-            buffer.putInt(tableId);
-            buffer.putLong(metadataVersion);
-        } else {
-            throw new IllegalArgumentException("schema identity must be both known or both unknown");
-        }
-        writeTableShape(rowCount, columns);
-    }
-
     private void writeTableShape(int rowCount, QwpColumnDef[] columns) {
         buffer.putVarint(rowCount);
         buffer.putVarint(columns.length);
@@ -343,17 +329,6 @@ class QwpColumnWriter {
         encodeTable(tableBuffer, tableBuffer.getRowCount(), null, null, null, useGlobalSymbols, useGorilla);
     }
 
-    void encodeSchemaTable(QwpTableBuffer tableBuffer, int tableId, long metadataVersion, boolean useGlobalSymbols, boolean useGorilla) {
-        QwpColumnDef[] columnDefs = tableBuffer.getColumnDefs();
-        writeSchemaTableHeader(tableBuffer.getTableName(), tableId, metadataVersion, tableBuffer.getRowCount(), columnDefs);
-        for (int i = 0; i < tableBuffer.getColumnCount(); i++) {
-            QwpTableBuffer.ColumnBuffer col = tableBuffer.getColumn(i);
-            encodeColumn(col, tableBuffer.getRowCount(), col.getValueCount(), col.getStringDataSize(),
-                    col.getSymbolDictionarySize(), useGorilla, useGlobalSymbols,
-                    col.getType() == TYPE_GEOHASH && col.usesNullBitmap());
-        }
-    }
-
     void encodeTable(
             QwpTableBuffer tableBuffer,
             int rowCount,
@@ -364,6 +339,9 @@ class QwpColumnWriter {
             boolean useGorilla
     ) {
         QwpColumnDef[] columnDefs = tableBuffer.getColumnDefs();
+        // A schema-bound GEOHASH column always ships its null bitmap, so an
+        // all-ones value stays distinct from NULL.
+        boolean isSchemaBound = tableBuffer.getSchemaBinding() != null;
 
         writeTableHeader(tableBuffer.getTableName(), rowCount, columnDefs);
 
@@ -380,7 +358,8 @@ class QwpColumnWriter {
             }
 
             encodeColumn(col, rowCount, valueCount, stringDataSize, symbolDictionarySize,
-                    useGorilla, useGlobalSymbols, false);
+                    useGorilla, useGlobalSymbols,
+                    isSchemaBound && col.getType() == TYPE_GEOHASH && col.usesNullBitmap());
         }
     }
 

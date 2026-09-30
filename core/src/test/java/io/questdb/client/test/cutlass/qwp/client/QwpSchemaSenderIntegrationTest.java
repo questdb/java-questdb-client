@@ -1718,8 +1718,6 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events").uuidColumn("id", 5, 6).atNow();
                 sender.flush();
                 byte[] frame = handler.awaitDataFrame();
-                Assert.assertEquals(QwpConstants.FLAG_SCHEMA,
-                        frame[QwpConstants.HEADER_OFFSET_FLAGS] & QwpConstants.FLAG_SCHEMA);
             }
         });
     }
@@ -1831,7 +1829,6 @@ public class QwpSchemaSenderIntegrationTest {
                     sender.flush();
                 }
                 for (byte[] frame : handler.awaitDataFrames(5)) {
-                    Assert.assertEquals(0, frame[QwpConstants.HEADER_OFFSET_FLAGS] & QwpConstants.FLAG_SCHEMA);
                 }
                 Assert.assertEquals(1, handler.describeRequests.get());
             }
@@ -1855,7 +1852,7 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test
-    public void testAutoTooLargeSchemaPublishesPendingSchemaBatchBeforeLegacyRow() throws Exception {
+    public void testAutoTooLargeSchemaLegacyRowJoinsPendingSchemaBatch() throws Exception {
         assertMemoryLeak(() -> {
             SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 121, 122);
             try (TestWebSocketServer server = schemaServer(handler);
@@ -1863,19 +1860,14 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events").uuidColumn("id", 1, 2).atNow();
                 handler.result = QwpSchemaProtocol.RESULT_TOO_LARGE;
 
-                // The new table cannot join the pending schema batch: publish it
-                // before the legacy row starts a new frame.
+                // Schema-validated and legacy tables share one frame format, so the
+                // legacy row joins the pending batch.
                 sender.table("other").stringColumn("legacy_value", "A").atNow();
                 sender.flush();
 
-                List<byte[]> frames = handler.awaitDataFrames(2);
-                FrameReader schema = new FrameReader(frames.get(0));
-                schema.schemaTable("events", 121, 122, 1, "id", QwpConstants.TYPE_UUID);
-                Assert.assertEquals(0, schema.u8());
-                Assert.assertEquals(1, schema.i64());
-                Assert.assertEquals(2, schema.i64());
-                schema.eof();
-                new FrameReader(frames.get(1)).legacyVarcharTable("other", "legacy_value", "A");
+                List<byte[]> frames = handler.awaitDataFrames(1);
+                Assert.assertEquals(2, ByteBuffer.wrap(frames.get(0)).order(ByteOrder.LITTLE_ENDIAN)
+                        .getShort(6) & 0xffff);
             }
         });
     }
@@ -2009,7 +2001,6 @@ public class QwpSchemaSenderIntegrationTest {
                     sender.table("events").stringColumn("value", "legacy").atNow();
                     sender.flush();
                     byte[] frame = handler.awaitDataFrame();
-                    Assert.assertEquals(0, frame[QwpConstants.HEADER_OFFSET_FLAGS] & QwpConstants.FLAG_SCHEMA);
                     FrameReader reader = new FrameReader(frame);
                     reader.legacyVarcharTable("events", "value", "legacy");
                     Assert.assertEquals(0, handler.describeRequests.get());
@@ -2031,7 +2022,6 @@ public class QwpSchemaSenderIntegrationTest {
                         .atNow();
                 sender.flush();
                 byte[] frame = handler.awaitDataFrame();
-                Assert.assertEquals(0, frame[QwpConstants.HEADER_OFFSET_FLAGS] & QwpConstants.FLAG_SCHEMA);
                 new FrameReader(frame).legacySmallIntegerTable("events");
                 Assert.assertEquals(0, handler.describeRequests.get());
             }
@@ -2048,7 +2038,6 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events").ipv4Column("value", "10.20.30.40").atNow();
                 sender.flush();
                 byte[] frame = handler.awaitDataFrame();
-                Assert.assertEquals(0, frame[QwpConstants.HEADER_OFFSET_FLAGS] & QwpConstants.FLAG_SCHEMA);
                 new FrameReader(frame).legacyIpv4Table(
                         "events", "value", 0xc0a80101, 0x0a141e28);
                 Assert.assertEquals(0, handler.describeRequests.get());
@@ -2067,7 +2056,6 @@ public class QwpSchemaSenderIntegrationTest {
                         "value", Long.MIN_VALUE, Long.MIN_VALUE, Long.MIN_VALUE, Long.MIN_VALUE).atNow();
                 sender.flush();
                 byte[] frame = handler.awaitDataFrame();
-                Assert.assertEquals(0, frame[QwpConstants.HEADER_OFFSET_FLAGS] & QwpConstants.FLAG_SCHEMA);
                 new FrameReader(frame).legacyLong256Table("events", "value");
                 Assert.assertEquals(0, handler.describeRequests.get());
             }
@@ -2084,7 +2072,6 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events").geoHashColumn("value", "U").atNow();
                 sender.flush();
                 byte[] frame = handler.awaitDataFrame();
-                Assert.assertEquals(0, frame[QwpConstants.HEADER_OFFSET_FLAGS] & QwpConstants.FLAG_SCHEMA);
                 new FrameReader(frame).legacyGeoHashTable("events", "value");
                 Assert.assertEquals(0, handler.describeRequests.get());
             }
@@ -2168,11 +2155,8 @@ public class QwpSchemaSenderIntegrationTest {
                     sender.table("events").uuidColumn("id", 3, 4).atNow();
                     sender.flush();
                     List<byte[]> frames = schemaHandler.awaitDataFrames(2);
-                    Assert.assertEquals(0, frames.get(0)[QwpConstants.HEADER_OFFSET_FLAGS] & QwpConstants.FLAG_SCHEMA);
                     Assert.assertEquals(0, frames.get(0)[QwpConstants.HEADER_OFFSET_FLAGS]
                             & QwpConstants.FLAG_DEFER_COMMIT);
-                    Assert.assertTrue((frames.get(1)[QwpConstants.HEADER_OFFSET_FLAGS]
-                            & QwpConstants.FLAG_SCHEMA) != 0);
                     Assert.assertEquals(0, frames.get(1)[QwpConstants.HEADER_OFFSET_FLAGS]
                             & QwpConstants.FLAG_DEFER_COMMIT);
                     new FrameReader(frames.get(0)).legacyVarcharTable("events", "legacy_value", "A", "B", "C");
@@ -2241,12 +2225,13 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test
-    public void testSchemaBatchCapSplitsWithoutDroppingPinnedFlags() throws Exception {
+    public void testSchemaBoundBatchCapSplitsPerTable() throws Exception {
         assertMemoryLeak(() -> {
             SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 81, 82);
             TestWebSocketServer server = new TestWebSocketServer(handler);
             server.setAdvertiseSchema(true);
-            server.setAdvertisedMaxBatchSize(64);
+            // Each single-table frame fits the cap; the combined two-table frame does not.
+            server.setAdvertisedMaxBatchSize(48);
             try (TestWebSocketServer ignored = start(server);
                  Sender sender = sender(server)) {
                 sender.table("a").uuidColumn("id", 1, 2).atNow();
@@ -2255,8 +2240,7 @@ public class QwpSchemaSenderIntegrationTest {
                 List<byte[]> frames = handler.awaitDataFrames(2);
                 for (int i = 0; i < 2; i++) {
                     byte[] frame = frames.get(i);
-                    Assert.assertTrue(frame.length <= 64);
-                    Assert.assertTrue((frame[QwpConstants.HEADER_OFFSET_FLAGS] & QwpConstants.FLAG_SCHEMA) != 0);
+                    Assert.assertTrue(frame.length <= 48);
                     Assert.assertEquals(1,
                             ByteBuffer.wrap(frame).order(ByteOrder.LITTLE_ENDIAN).getShort(6) & 0xffff);
                 }
@@ -2295,8 +2279,7 @@ public class QwpSchemaSenderIntegrationTest {
                     sender.table("events").uuidColumn("id", 1, 2).atNow();
                     sender.flush();
                     Assert.assertEquals(mode, 1, handler.describeRequests.get());
-                    Assert.assertTrue(mode, (handler.awaitDataFrame()[QwpConstants.HEADER_OFFSET_FLAGS]
-                            & QwpConstants.FLAG_SCHEMA) != 0);
+                    handler.awaitDataFrame();
                 }
             }
         });
@@ -2331,8 +2314,7 @@ public class QwpSchemaSenderIntegrationTest {
                 Assert.assertEquals(1, events.getRowCount());
                 Assert.assertEquals(1, b.getRowCount());
                 sender.flush();
-                Assert.assertTrue((handler.awaitDataFrame()[QwpConstants.HEADER_OFFSET_FLAGS]
-                        & QwpConstants.FLAG_SCHEMA) != 0);
+                handler.awaitDataFrame();
             }
         });
     }
@@ -2458,8 +2440,7 @@ public class QwpSchemaSenderIntegrationTest {
             try {
                 sender.table("events").uuidColumn("id", 1, 2).atNow();
                 sender.flush();
-                Assert.assertTrue((first.awaitDataFrame()[QwpConstants.HEADER_OFFSET_FLAGS]
-                        & QwpConstants.FLAG_SCHEMA) != 0);
+                first.awaitDataFrame();
                 server.close();
                 Assert.assertTrue("sender did not observe the connection closing",
                         disconnected.await(5, TimeUnit.SECONDS));
@@ -2541,7 +2522,7 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test(timeout = 10_000)
-    public void testAutoOutagePublishesPendingSchemaBatchBeforeLegacyRow() throws Exception {
+    public void testAutoOutageLegacyRowJoinsPendingSchemaBatch() throws Exception {
         assertMemoryLeak(() -> {
             int port = TestPorts.findUnusedPort();
             SchemaHandler first = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 121, 122);
@@ -2556,25 +2537,19 @@ public class QwpSchemaSenderIntegrationTest {
                 Assert.assertTrue("sender did not observe the connection closing",
                         disconnected.await(5, TimeUnit.SECONDS));
 
-                // A QWP frame has one wire family: the legacy row cannot join the
-                // pending schema batch, so that batch is published to store-and-forward
-                // first and the legacy row opens a new batch.
+                // Schema-validated and legacy tables share one frame format, so the
+                // legacy row joins the pending batch instead of forcing a flush.
                 sender.table("other").stringColumn("legacy_value", "A").atNow();
-                Assert.assertEquals(0, ((QwpWebSocketSender) sender).getTableBuffer("events").getRowCount());
+                Assert.assertEquals(1, ((QwpWebSocketSender) sender).getTableBuffer("events").getRowCount());
 
                 SchemaHandler second = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 121, 122);
                 restarted = schemaServer(second, port);
                 Assert.assertTrue("schema-capable connection was not installed", second.awaitPong());
                 sender.flush();
 
-                List<byte[]> frames = second.awaitDataFrames(2);
-                FrameReader schema = new FrameReader(frames.get(0));
-                schema.schemaTable("events", 121, 122, 1, "id", QwpConstants.TYPE_UUID);
-                Assert.assertEquals(0, schema.u8());
-                Assert.assertEquals(1, schema.i64());
-                Assert.assertEquals(2, schema.i64());
-                schema.eof();
-                new FrameReader(frames.get(1)).legacyVarcharTable("other", "legacy_value", "A");
+                List<byte[]> frames = second.awaitDataFrames(1);
+                Assert.assertEquals(2, ByteBuffer.wrap(frames.get(0)).order(ByteOrder.LITTLE_ENDIAN)
+                        .getShort(6) & 0xffff);
                 Assert.assertEquals(0, second.describeRequests.get());
             } finally {
                 sender.close();
@@ -2598,8 +2573,7 @@ public class QwpSchemaSenderIntegrationTest {
             try {
                 sender.table("events").uuidColumn("id", 1, 2).atNow();
                 sender.flush();
-                Assert.assertTrue((first.awaitDataFrame()[QwpConstants.HEADER_OFFSET_FLAGS]
-                        & QwpConstants.FLAG_SCHEMA) != 0);
+                first.awaitDataFrame();
                 server.close();
                 Assert.assertTrue("sender did not observe the connection closing",
                         disconnected.await(5, TimeUnit.SECONDS));
@@ -2622,8 +2596,6 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.flush();
 
                 List<byte[]> frames = second.awaitDataFrames(1);
-                Assert.assertTrue((frames.get(0)[QwpConstants.HEADER_OFFSET_FLAGS]
-                        & QwpConstants.FLAG_SCHEMA) != 0);
                 Assert.assertEquals(2, ByteBuffer.wrap(frames.get(0)).order(ByteOrder.LITTLE_ENDIAN)
                         .getShort(6) & 0xffff);
                 Assert.assertEquals(1, second.describeRequests.get());
@@ -2946,8 +2918,7 @@ public class QwpSchemaSenderIntegrationTest {
             try (Sender sender = Sender.fromConfig(cfg)) {
                 sender.table("events").uuidColumn("id", 1, 2).atNow();
                 sender.flush();
-                Assert.assertTrue((handler.awaitDataFrame()[QwpConstants.HEADER_OFFSET_FLAGS]
-                        & QwpConstants.FLAG_SCHEMA) != 0);
+                handler.awaitDataFrame();
             }
             return server.getPort();
         }
@@ -3193,7 +3164,7 @@ public class QwpSchemaSenderIntegrationTest {
             in = ByteBuffer.wrap(frames.get(frameIndex)).order(ByteOrder.LITTLE_ENDIAN);
             Assert.assertEquals(QwpConstants.MAGIC_MESSAGE, in.getInt());
             Assert.assertEquals(QwpConstants.VERSION, u8());
-            Assert.assertTrue((u8() & QwpConstants.FLAG_SCHEMA) != 0);
+            u8();
             Assert.assertEquals(1, in.getShort() & 0xffff);
             Assert.assertEquals(in.remaining() - Integer.BYTES, in.getInt());
             varint();
@@ -3209,7 +3180,7 @@ public class QwpSchemaSenderIntegrationTest {
         private void legacyVarcharTable(String table, String column, String... values) {
             Assert.assertEquals(QwpConstants.MAGIC_MESSAGE, in.getInt());
             Assert.assertEquals(QwpConstants.VERSION, u8());
-            Assert.assertEquals(0, u8() & QwpConstants.FLAG_SCHEMA);
+            u8();
             Assert.assertEquals(1, in.getShort() & 0xffff);
             Assert.assertEquals(in.remaining() - Integer.BYTES, in.getInt());
             Assert.assertEquals(0, varint());
@@ -3238,7 +3209,7 @@ public class QwpSchemaSenderIntegrationTest {
         private void legacyTimestampTable(String table, String column, long... expectedMicros) {
             Assert.assertEquals(QwpConstants.MAGIC_MESSAGE, in.getInt());
             Assert.assertEquals(QwpConstants.VERSION, u8());
-            Assert.assertEquals(0, u8() & QwpConstants.FLAG_SCHEMA);
+            u8();
             Assert.assertEquals(1, in.getShort() & 0xffff);
             Assert.assertEquals(in.remaining() - Integer.BYTES, in.getInt());
             Assert.assertEquals(0, varint());
@@ -3276,7 +3247,7 @@ public class QwpSchemaSenderIntegrationTest {
         private void legacyIpv4Table(String table, String column, int... values) {
             Assert.assertEquals(QwpConstants.MAGIC_MESSAGE, in.getInt());
             Assert.assertEquals(QwpConstants.VERSION, u8());
-            Assert.assertEquals(0, u8() & QwpConstants.FLAG_SCHEMA);
+            u8();
             Assert.assertEquals(1, in.getShort() & 0xffff);
             Assert.assertEquals(in.remaining() - Integer.BYTES, in.getInt());
             Assert.assertEquals(0, varint());
@@ -3296,7 +3267,7 @@ public class QwpSchemaSenderIntegrationTest {
         private void legacyLong256Table(String table, String column) {
             Assert.assertEquals(QwpConstants.MAGIC_MESSAGE, in.getInt());
             Assert.assertEquals(QwpConstants.VERSION, u8());
-            Assert.assertEquals(0, u8() & QwpConstants.FLAG_SCHEMA);
+            u8();
             Assert.assertEquals(1, in.getShort() & 0xffff);
             Assert.assertEquals(in.remaining() - Integer.BYTES, in.getInt());
             Assert.assertEquals(0, varint());
@@ -3319,7 +3290,7 @@ public class QwpSchemaSenderIntegrationTest {
         private void legacySmallIntegerTable(String table) {
             Assert.assertEquals(QwpConstants.MAGIC_MESSAGE, in.getInt());
             Assert.assertEquals(QwpConstants.VERSION, u8());
-            Assert.assertEquals(0, u8() & QwpConstants.FLAG_SCHEMA);
+            u8();
             Assert.assertEquals(1, in.getShort() & 0xffff);
             Assert.assertEquals(in.remaining() - Integer.BYTES, in.getInt());
             Assert.assertEquals(0, varint());
@@ -3513,7 +3484,7 @@ public class QwpSchemaSenderIntegrationTest {
         private void legacyGeoHashTable(String table, String column) {
             Assert.assertEquals(QwpConstants.MAGIC_MESSAGE, in.getInt());
             Assert.assertEquals(QwpConstants.VERSION, u8());
-            Assert.assertEquals(0, u8() & QwpConstants.FLAG_SCHEMA);
+            u8();
             Assert.assertEquals(1, in.getShort() & 0xffff);
             Assert.assertEquals(in.remaining() - Integer.BYTES, in.getInt());
             Assert.assertEquals(0, varint());
@@ -4097,7 +4068,7 @@ public class QwpSchemaSenderIntegrationTest {
         private void messageHeader(int tableCount) {
             Assert.assertEquals(QwpConstants.MAGIC_MESSAGE, in.getInt());
             Assert.assertEquals(QwpConstants.VERSION, u8());
-            Assert.assertTrue((u8() & QwpConstants.FLAG_SCHEMA) != 0);
+            u8();
             if (frames.size() == 1) {
                 Assert.assertEquals(tableCount, in.getShort() & 0xffff);
             } else {
@@ -4118,9 +4089,6 @@ public class QwpSchemaSenderIntegrationTest {
         ) {
             nextFrameIfExhausted();
             Assert.assertEquals(table, string());
-            Assert.assertEquals(1, u8());
-            Assert.assertEquals(tableId, in.getInt());
-            Assert.assertEquals(version, in.getLong());
             Assert.assertEquals(rows, varint());
             Assert.assertEquals(1, varint());
             Assert.assertEquals(column, string());
@@ -4250,19 +4218,12 @@ public class QwpSchemaSenderIntegrationTest {
         private void schemaTable(String table, int tableId, long version, int rows, String column, byte type) {
             Assert.assertEquals(QwpConstants.MAGIC_MESSAGE, in.getInt());
             Assert.assertEquals(QwpConstants.VERSION, u8());
-            Assert.assertTrue((u8() & QwpConstants.FLAG_SCHEMA) != 0);
+            u8();
             Assert.assertEquals(1, in.getShort() & 0xffff);
             Assert.assertEquals(in.remaining() - Integer.BYTES, in.getInt());
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
             Assert.assertEquals(table, string());
-            if (tableId < 0) {
-                Assert.assertEquals(0, u8());
-            } else {
-                Assert.assertEquals(1, u8());
-                Assert.assertEquals(tableId, in.getInt());
-                Assert.assertEquals(version, in.getLong());
-            }
             Assert.assertEquals(rows, varint());
             int columns = varint();
             Assert.assertEquals(1, columns);
@@ -4288,7 +4249,6 @@ public class QwpSchemaSenderIntegrationTest {
             Assert.assertEquals(0, varint());
 
             Assert.assertEquals(table, string());
-            Assert.assertEquals(0, u8());
             Assert.assertEquals(1, varint());
             Assert.assertEquals(1, varint());
             Assert.assertEquals("id", string());

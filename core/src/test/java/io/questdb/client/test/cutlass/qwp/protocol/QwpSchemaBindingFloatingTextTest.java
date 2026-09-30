@@ -54,7 +54,7 @@ public class QwpSchemaBindingFloatingTextTest {
                                         binding(buffer, column("value", targetType(fields[3])));
                                 append(binding, fields[1], fields[2], "value");
                                 buffer.nextRow();
-                                int size = encoder.encodeSchema(buffer);
+                                int size = encoder.encode(buffer);
                                 QwpTestWireReader reader =
                                         tableReader(
                                                 encoder,
@@ -120,7 +120,7 @@ public class QwpSchemaBindingFloatingTextTest {
                             binding.doubleColumn("value", -0.0);
                             buffer.nextRow();
                             buffer.nextRow();
-                            int size = encoder.encodeSchema(buffer);
+                            int size = encoder.encode(buffer);
                             QwpTestWireReader reader = tableReader(encoder, size, wireType, 3);
                             Assert.assertEquals(1, reader.u8());
                             Assert.assertEquals(5, reader.u8());
@@ -156,13 +156,10 @@ public class QwpSchemaBindingFloatingTextTest {
                         binding.floatColumn("c", Float.intBitsToFloat(1));
                         buffer.nextRow();
                         buffer.nextRow();
-                        int size = encoder.encodeSchema(buffer);
+                        int size = encoder.encode(buffer);
                         QwpTestWireReader reader = new QwpTestWireReader(encoder.getBuffer().getBufferPtr(), size);
                         reader.skip(QwpConstants.HEADER_SIZE);
                         Assert.assertEquals("t", reader.string());
-                        Assert.assertEquals(1, reader.u8());
-                        Assert.assertEquals(1, reader.i32());
-                        Assert.assertEquals(1, reader.i64());
                         Assert.assertEquals(3, reader.varint());
                         Assert.assertEquals(2, reader.varint());
                         Assert.assertEquals("a", reader.string());
@@ -176,13 +173,10 @@ public class QwpSchemaBindingFloatingTextTest {
                         buffer.reset();
                         binding.doubleColumn("a", Double.NEGATIVE_INFINITY);
                         buffer.nextRow();
-                        int resetSize = encoder.encodeSchema(buffer);
+                        int resetSize = encoder.encode(buffer);
                         QwpTestWireReader reset = new QwpTestWireReader(encoder.getBuffer().getBufferPtr(), resetSize);
                         reset.skip(QwpConstants.HEADER_SIZE);
                         Assert.assertEquals("t", reset.string());
-                        Assert.assertEquals(1, reset.u8());
-                        Assert.assertEquals(1, reset.i32());
-                        Assert.assertEquals(1, reset.i64());
                         Assert.assertEquals(1, reset.varint());
                         Assert.assertEquals(2, reset.varint());
                         Assert.assertEquals("a", reset.string());
@@ -209,7 +203,7 @@ public class QwpSchemaBindingFloatingTextTest {
             buffer.nextRow();
             binding.doubleColumn("value", 42.0);
             buffer.nextRow();
-            int size = encoder.encodeSchema(buffer);
+            int size = encoder.encode(buffer);
             QwpTestWireReader reader = tableReader(encoder, size, QwpConstants.TYPE_SYMBOL, 3);
             Assert.assertEquals(0, reader.u8());
             Assert.assertEquals(2, reader.varint());
@@ -250,11 +244,10 @@ public class QwpSchemaBindingFloatingTextTest {
                             : String.format("%016x", bits),
                     name);
             buffer.nextRow();
-            int size = encoder.encodeSchema(buffer);
+            int size = encoder.encode(buffer);
             QwpTestWireReader reader = new QwpTestWireReader(encoder.getBuffer().getBufferPtr(), size);
             reader.skip(QwpConstants.HEADER_SIZE);
             Assert.assertEquals("t", reader.string());
-            Assert.assertEquals(0, reader.u8());
             Assert.assertEquals(1, reader.varint());
             Assert.assertEquals(1, reader.varint());
             Assert.assertEquals(name, reader.string());
@@ -293,9 +286,6 @@ public class QwpSchemaBindingFloatingTextTest {
         QwpTestWireReader reader = new QwpTestWireReader(encoder.getBuffer().getBufferPtr(), size);
         reader.skip(QwpConstants.HEADER_SIZE);
         Assert.assertEquals("t", reader.string());
-        Assert.assertEquals(1, reader.u8());
-        Assert.assertEquals(1, reader.i32());
-        Assert.assertEquals(1, reader.i64());
         Assert.assertEquals(rows, reader.varint());
         Assert.assertEquals(1, reader.varint());
         Assert.assertEquals("value", reader.string());

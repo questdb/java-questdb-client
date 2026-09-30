@@ -202,7 +202,6 @@ public class CursorWebSocketSchemaLifecycleTest {
                     assertUnavailable(queued.error.get());
                     Assert.assertTrue(loop.isWireUp());
                     Assert.assertFalse(loop.isSchemaEnabled());
-                    Assert.assertFalse(engine.requiresSchema());
                     Assert.assertEquals(0, handler.requests);
                 } finally {
                     client.disconnect.countDown();
@@ -619,10 +618,6 @@ public class CursorWebSocketSchemaLifecycleTest {
             WebSocketClient client = connect(port);
             connected.countDown();
             return client;
-        }
-
-        @Override
-        public void setSchemaRequired(boolean isRequired) {
         }
     }
 

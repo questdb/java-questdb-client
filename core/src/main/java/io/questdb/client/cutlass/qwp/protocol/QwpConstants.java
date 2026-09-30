@@ -50,8 +50,6 @@ public final class QwpConstants {
      * Flag bit: Gorilla timestamp encoding enabled.
      */
     public static final byte FLAG_GORILLA = 0x04;
-    /** Flag bit: table headers carry schema identity information. */
-    public static final byte FLAG_SCHEMA = 0x40;
     /**
      * Flag bit: payload region after the prelude is zstd-compressed. Set only
      * when the handshake negotiated zstd compression. Mirror of the server-side

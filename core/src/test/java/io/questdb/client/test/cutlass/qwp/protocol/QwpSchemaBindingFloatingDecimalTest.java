@@ -91,7 +91,7 @@ public class QwpSchemaBindingFloatingDecimalTest {
                 buffer.nextRow();
                 buffer.nextRow();
 
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableReader(encoder, size, QwpConstants.TYPE_DECIMAL64, 4);
                 Assert.assertEquals(1, reader.u8());
                 Assert.assertEquals(0x0a, reader.u8());
@@ -102,7 +102,7 @@ public class QwpSchemaBindingFloatingDecimalTest {
 
                 buffer.reset();
                 buffer.nextRow();
-                int resetSize = encoder.encodeSchema(buffer);
+                int resetSize = encoder.encode(buffer);
                 QwpTestWireReader reset = tableReader(encoder, resetSize, QwpConstants.TYPE_DECIMAL64, 1);
                 Assert.assertEquals(1, reset.u8());
                 Assert.assertEquals(1, reset.u8());
@@ -141,10 +141,7 @@ public class QwpSchemaBindingFloatingDecimalTest {
                         column("value", ColumnType.getDecimalType(vector.targetPrecision, vector.targetScale)));
                 vector.append(binding, "value");
                 buffer.nextRow();
-                int size = encoder.encodeSchema(buffer);
-                Assert.assertEquals(QwpConstants.FLAG_SCHEMA,
-                        Unsafe.getUnsafe().getByte(encoder.getBuffer().getBufferPtr()
-                                + QwpConstants.HEADER_OFFSET_FLAGS) & QwpConstants.FLAG_SCHEMA);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableReader(encoder, size, wireType(vector.targetType), 1);
                 if (vector.isNull()) {
                     Assert.assertEquals(vector.caseId, 1, reader.u8());
@@ -173,9 +170,6 @@ public class QwpSchemaBindingFloatingDecimalTest {
         QwpTestWireReader reader = new QwpTestWireReader(encoder.getBuffer().getBufferPtr(), size);
         reader.skip(QwpConstants.HEADER_SIZE);
         Assert.assertEquals("t", reader.string());
-        Assert.assertEquals(1, reader.u8());
-        Assert.assertEquals(1, reader.i32());
-        Assert.assertEquals(1, reader.i64());
         Assert.assertEquals(rows, reader.varint());
         Assert.assertEquals(1, reader.varint());
         Assert.assertEquals("value", reader.string());

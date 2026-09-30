@@ -56,7 +56,7 @@ public class QwpSchemaBindingStringDateTest {
                             Assert.assertTrue(line, "VALID".equals(fields[3]) || "NULL".equals(fields[3]));
                             binding.stringColumn("value", value);
                             buffer.nextRow();
-                            int size = encoder.encodeSchema(buffer);
+                            int size = encoder.encode(buffer);
                             QwpTestWireReader reader = tableReader(encoder, size, 1, "value", QwpConstants.TYPE_DATE);
                             if ("NULL".equals(fields[3])) {
                                 Assert.assertEquals(1, reader.u8());
@@ -97,7 +97,7 @@ public class QwpSchemaBindingStringDateTest {
                 binding.stringColumn("c", "1969-12-31");
                 buffer.nextRow();
 
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableHeader(encoder, size, 4, 2);
                 Assert.assertEquals("a", reader.string());
                 Assert.assertEquals(QwpConstants.TYPE_DATE, reader.u8());
@@ -114,7 +114,7 @@ public class QwpSchemaBindingStringDateTest {
                 buffer.reset();
                 binding.stringColumn("a", "1970-01-01 00:00:00.001UTC");
                 buffer.nextRow();
-                int resetSize = encoder.encodeSchema(buffer);
+                int resetSize = encoder.encode(buffer);
                 QwpTestWireReader reset = tableHeader(encoder, resetSize, 1, 2);
                 Assert.assertEquals("a", reset.string());
                 Assert.assertEquals(QwpConstants.TYPE_DATE, reset.u8());
@@ -135,11 +135,10 @@ public class QwpSchemaBindingStringDateTest {
             QwpSchemaBinding binding = new QwpSchemaBinding(buffer, missing());
             binding.stringColumn("value", "1970-01-01");
             buffer.nextRow();
-            int size = encoder.encodeSchema(buffer);
+            int size = encoder.encode(buffer);
             QwpTestWireReader reader = new QwpTestWireReader(encoder.getBuffer().getBufferPtr(), size);
             reader.skip(QwpConstants.HEADER_SIZE);
             Assert.assertEquals("t", reader.string());
-            Assert.assertEquals(0, reader.u8());
             Assert.assertEquals(1, reader.varint());
             Assert.assertEquals(1, reader.varint());
             Assert.assertEquals("value", reader.string());

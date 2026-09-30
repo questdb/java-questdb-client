@@ -6,7 +6,11 @@ Status: proposal 1 is implemented (see the "One schema snapshot per table per ba
 [schema-aware-sender.md](schema-aware-sender.md)), with one deviation: there is no explicit refresh
 operation. Batch-boundary adoption relies on ACK schema feedback and reconnects, because a caller cannot
 distinguish a stale-snapshot rejection from invalid input and so has no sound rule for when to refresh.
-Proposals 2 to 4 remain proposals for discussion, not approved contract or implemented behavior.
+Proposal 2 is implemented in part, as of 2026-09-29: data frames carry no schema identity and no
+`FLAG_SCHEMA`, so every persisted frame is an ordinary QWP frame that any server accepts. ACK schema
+feedback stays. The server sends a table's schema in the first ACK that covers it on a connection and
+again when its metadata version changes; see "Schema identity removal: measured cost" below.
+Proposals 3 and 4 remain proposals for discussion, not approved contract or implemented behavior.
 
 These ideas come from the second complexity review of client
 `7a73e58e8d9354a045c9895c563e8009cd6ff8cf`, including the corresponding server paths inspected at
@@ -115,6 +119,29 @@ Evidence: server
 client [QwpWebSocketEncoder](../core/src/main/java/io/questdb/client/cutlass/qwp/client/QwpWebSocketEncoder.java),
 [WebSocketResponse](../core/src/main/java/io/questdb/client/cutlass/qwp/client/WebSocketResponse.java), and
 [`QwpColumnWriter.encodeSchemaTable()`](../core/src/main/java/io/questdb/client/cutlass/qwp/client/QwpColumnWriter.java).
+
+### Schema identity removal: measured cost
+
+The identity let the server skip feedback for a client whose snapshot was current. Without it the
+server reports each table once per connection, so a reconnect costs feedback the client may already
+hold. Measured on loopback with a real server, 2 MiB buffers and one row per table per round:
+
+| Tables x columns | First ACK after reconnect | DESCRIBE requests in the next round |
+| --- | --- | --- |
+| 100 x 20 | 51 KB of schemas | 0 |
+| 1,000 x 20 | 519 KB of schemas | 0 |
+| 1,000 x 100 | invalidate-all | 1,000 |
+| 3,000 x 100 | invalidate-all | 3,000 |
+
+A schema costs about 26 bytes per column, so about 400 tables of 100 columns fit the 1 MiB feedback
+limit. Above the limit the server sends invalidate-all, the client clears its cache, and the next
+batch sends one DESCRIBE per table from the producer thread. The same happens on a cold start. The
+sender converges after that one round. With the identity on the wire every row of the table above
+read "no feedback, 0 DESCRIBE requests".
+
+The accepted trade-off is that senders above the limit pay that DESCRIBE round after every
+reconnect. A connect-time message that lists the versions the client holds would remove the cost
+without putting the identity back into persisted frames; it is not implemented.
 
 ## 3. Validate typed inputs instead of reproducing the server's casting catalogue
 

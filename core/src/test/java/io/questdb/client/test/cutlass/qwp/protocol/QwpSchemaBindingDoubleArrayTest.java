@@ -46,7 +46,7 @@ public class QwpSchemaBindingDoubleArrayTest {
                 binding.doubleArray("a32", array);
                 buffer.nextRow();
 
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableHeader(encoder, size, 1, 4);
                 columnDef(reader, "a1");
                 columnDef(reader, "a2");
@@ -81,7 +81,7 @@ public class QwpSchemaBindingDoubleArrayTest {
                 binding.doubleArray("value", array);
                 buffer.nextRow();
 
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableHeader(encoder, size, 1, 1, -1, -1);
                 columnDef(reader, "value");
                 Assert.assertEquals(0, reader.u8());
@@ -124,7 +124,7 @@ public class QwpSchemaBindingDoubleArrayTest {
 
                 binding.doubleArray("v", new double[0]);
                 buffer.nextRow();
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableHeader(encoder, size, 2, 1);
                 columnDef(reader, "v");
                 Assert.assertEquals(0, reader.u8());
@@ -152,7 +152,7 @@ public class QwpSchemaBindingDoubleArrayTest {
 
                 binding.doubleArray("v", new double[][]{{4.0}, {5.0}});
                 buffer.nextRow();
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableHeader(encoder, size, 2, 1, -1, -1);
                 columnDef(reader, "v");
                 Assert.assertEquals(0, reader.u8());
@@ -236,7 +236,7 @@ public class QwpSchemaBindingDoubleArrayTest {
                     QwpSchemaBinding binding = binding(buffer, column("a", arrayType(dimensions)));
                     binding.stringColumn("a", null);
                     buffer.nextRow();
-                    int size = encoder.encodeSchema(buffer);
+                    int size = encoder.encode(buffer);
                     QwpTestWireReader reader = tableHeader(encoder, size, 1, 1);
                     columnDef(reader, "a");
                     Assert.assertEquals(1, reader.u8());

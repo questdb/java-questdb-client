@@ -24,7 +24,6 @@
 
 package io.questdb.client.cutlass.qwp.client;
 
-import io.questdb.client.cutlass.qwp.protocol.QwpSchemaBinding;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
@@ -57,7 +56,6 @@ public class QwpWebSocketEncoder implements QuietCloseable {
     // values when delta-of-delta overflows int32.
     private byte flags = FLAG_GORILLA;
     private int payloadStart;
-    private boolean schemaMessage;
     private byte version = VERSION;
 
     public QwpWebSocketEncoder() {
@@ -69,20 +67,8 @@ public class QwpWebSocketEncoder implements QuietCloseable {
     }
 
     public void addTable(QwpTableBuffer tableBuffer) {
-        rejectBoundLegacyTable(tableBuffer);
-        if (schemaMessage) {
-            throw new IllegalStateException("legacy table cannot be added to a schema message");
-        }
+        validateBoundTable(tableBuffer, true);
         columnWriter.encodeTable(tableBuffer, true, true);
-    }
-
-    public void addSchemaTable(QwpTableBuffer tableBuffer, int tableId, long metadataVersion) {
-        validateBoundSchemaTable(tableBuffer, tableId, metadataVersion, true);
-        if (!schemaMessage) {
-            throw new IllegalStateException("schema table requires a schema message");
-        }
-        validateIdentity(tableId, metadataVersion);
-        columnWriter.encodeSchemaTable(tableBuffer, tableId, metadataVersion, true, true);
     }
 
     public void beginMessage(
@@ -91,34 +77,10 @@ public class QwpWebSocketEncoder implements QuietCloseable {
             int confirmedMaxId,
             int batchMaxId
     ) {
-        schemaMessage = false;
-        beginMessage0(tableCount, globalDict, confirmedMaxId, batchMaxId);
-    }
-
-    public void beginSchemaMessage(
-            int tableCount,
-            GlobalSymbolDictionary globalDict,
-            int confirmedMaxId,
-            int batchMaxId
-    ) {
-        if (tableCount <= 0) {
-            throw new IllegalArgumentException("schema message must contain at least one table");
-        }
-        rejectControlFlag();
-        schemaMessage = true;
-        beginMessage0(tableCount, globalDict, confirmedMaxId, batchMaxId);
-    }
-
-    private void beginMessage0(
-            int tableCount,
-            GlobalSymbolDictionary globalDict,
-            int confirmedMaxId,
-            int batchMaxId
-    ) {
         buffer.reset();
         deltaStart = confirmedMaxId + 1;
         deltaCount = Math.max(0, batchMaxId - confirmedMaxId);
-        byte headerFlags = (byte) (flags | FLAG_DELTA_SYMBOL_DICT | (schemaMessage ? FLAG_SCHEMA : 0));
+        byte headerFlags = (byte) (flags | FLAG_DELTA_SYMBOL_DICT);
         writeHeader(tableCount, 0, headerFlags);
         payloadStart = buffer.getPosition();
         buffer.putVarint(deltaStart);
@@ -199,8 +161,10 @@ public class QwpWebSocketEncoder implements QuietCloseable {
     }
 
     public int encode(QwpTableBuffer tableBuffer) {
-        rejectBoundLegacyTable(tableBuffer);
-        schemaMessage = false;
+        validateBoundTable(tableBuffer, false);
+        if (tableBuffer.getSchemaBinding() != null && tableBuffer.getRowCount() == 0) {
+            return 0;
+        }
         buffer.reset();
         writeHeader(1, 0);
         int payloadStart = buffer.getPosition();
@@ -211,38 +175,14 @@ public class QwpWebSocketEncoder implements QuietCloseable {
         return buffer.getPosition();
     }
 
-    public int encodeSchema(QwpTableBuffer tableBuffer, int tableId, long metadataVersion) {
-        validateIdentity(tableId, metadataVersion);
-        validateBoundSchemaTable(tableBuffer, tableId, metadataVersion, false);
-        if (tableBuffer.getSchemaBinding() != null && tableBuffer.getRowCount() == 0) {
-            return 0;
-        }
-        rejectControlFlag();
-        schemaMessage = true;
-        buffer.reset();
-        writeHeader(1, 0, (byte) (flags | FLAG_SCHEMA));
-        int payloadStart = buffer.getPosition();
-        columnWriter.setBuffer(buffer);
-        columnWriter.encodeSchemaTable(tableBuffer, tableId, metadataVersion, false, true);
-        buffer.patchInt(8, buffer.getPosition() - payloadStart);
-        return buffer.getPosition();
-    }
-
-    public int encodeSchema(QwpTableBuffer tableBuffer) {
-        QwpSchemaBinding binding = tableBuffer.getSchemaBinding();
-        if (binding == null) {
-            throw new IllegalStateException("schema encoding requires an attached schema binding");
-        }
-        return encodeSchema(tableBuffer, binding.getTableId(), binding.getMetadataVersion());
-    }
-
     public int encodeWithDeltaDict(
             QwpTableBuffer tableBuffer,
             GlobalSymbolDictionary globalDict,
             int confirmedMaxId,
             int batchMaxId
     ) {
-        rejectBoundLegacyTable(tableBuffer);
+        // Validate before beginMessage resets the staged buffer.
+        validateBoundTable(tableBuffer, true);
         beginMessage(1, globalDict, confirmedMaxId, batchMaxId);
         addTable(tableBuffer);
         return finishMessage();
@@ -254,30 +194,9 @@ public class QwpWebSocketEncoder implements QuietCloseable {
         return buffer.getPosition();
     }
 
-    private static void validateIdentity(int tableId, long metadataVersion) {
-        if (!((tableId == -1 && metadataVersion == -1) || (tableId >= 0 && metadataVersion >= 0))) {
-            throw new IllegalArgumentException("schema identity must be both known or both unknown");
-        }
-    }
-
-    private static void rejectBoundLegacyTable(QwpTableBuffer tableBuffer) {
-        if (tableBuffer.getSchemaBinding() != null) {
-            throw new IllegalStateException("schema-bound table cannot use legacy framing");
-        }
-    }
-
-    private static void validateBoundSchemaTable(
-            QwpTableBuffer tableBuffer,
-            int tableId,
-            long metadataVersion,
-            boolean additive
-    ) {
-        QwpSchemaBinding binding = tableBuffer.getSchemaBinding();
-        if (binding == null) {
+    private static void validateBoundTable(QwpTableBuffer tableBuffer, boolean additive) {
+        if (tableBuffer.getSchemaBinding() == null) {
             return;
-        }
-        if (binding.getTableId() != tableId || binding.getMetadataVersion() != metadataVersion) {
-            throw new IllegalArgumentException("explicit schema identity does not match the attached binding");
         }
         if (tableBuffer.hasInProgressRow()) {
             throw new IllegalStateException("cannot encode a schema-bound table with an incomplete row");
@@ -346,12 +265,6 @@ public class QwpWebSocketEncoder implements QuietCloseable {
         buffer.putByte(headerFlags);
         buffer.putShort((short) tableCount);
         buffer.putInt(payloadLength);
-    }
-
-    private void rejectControlFlag() {
-        if ((flags & io.questdb.client.cutlass.qwp.protocol.QwpSchemaProtocol.FLAG_CONTROL) != 0) {
-            throw new IllegalStateException("schema data messages cannot use the control flag");
-        }
     }
 
     private int splitDeltaEntriesLength(int splitDeltaStart, int splitDeltaCount) {

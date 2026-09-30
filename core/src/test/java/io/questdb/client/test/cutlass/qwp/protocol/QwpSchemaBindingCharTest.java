@@ -40,7 +40,7 @@ public class QwpSchemaBindingCharTest {
                 binding.charColumn("value", '\u03a9');
                 buffer.nextRow();
 
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableHeader(encoder, size, 2, 1);
                 Assert.assertEquals("value", reader.string());
                 Assert.assertEquals(QwpConstants.TYPE_VARCHAR, reader.u8());
@@ -92,7 +92,7 @@ public class QwpSchemaBindingCharTest {
                         throw new AssertionError("unknown input kind: " + fields[1]);
                     }
                     buffer.nextRow();
-                    int size = encoder.encodeSchema(buffer);
+                    int size = encoder.encode(buffer);
                     QwpTestWireReader reader = tableReader(encoder, size, QwpConstants.TYPE_CHAR);
                     if ("<NULL>".equals(fields[2])) {
                         Assert.assertEquals(1, reader.u8());
@@ -128,7 +128,7 @@ public class QwpSchemaBindingCharTest {
             buffer.rollbackUncommittedColumns();
             binding.stringColumn("c", "Z");
             buffer.nextRow();
-            int size = encoder.encodeSchema(buffer);
+            int size = encoder.encode(buffer);
             QwpTestWireReader reader = tableHeader(encoder, size, 3, 2);
             Assert.assertEquals("a", reader.string());
             Assert.assertEquals(QwpConstants.TYPE_CHAR, reader.u8());
@@ -145,7 +145,7 @@ public class QwpSchemaBindingCharTest {
             buffer.reset();
             binding.stringColumn("a", "Q");
             buffer.nextRow();
-            int resetSize = encoder.encodeSchema(buffer);
+            int resetSize = encoder.encode(buffer);
             QwpTestWireReader reset = tableHeader(encoder, resetSize, 1, 2);
             Assert.assertEquals("a", reset.string());
             Assert.assertEquals(QwpConstants.TYPE_CHAR, reset.u8());

@@ -58,7 +58,7 @@ public class QwpSchemaBindingTextTest {
                             QwpSchemaBinding binding = binding(buffer, column("value", targetType(fields[2])));
                             append(binding, fields[1], value);
                             buffer.nextRow();
-                            QwpTestWireReader reader = tableReader(encoder, encoder.encodeSchema(buffer), wireType);
+                            QwpTestWireReader reader = tableReader(encoder, encoder.encode(buffer), wireType);
                             if (value == null) {
                                 Assert.assertEquals(1, reader.u8());
                                 Assert.assertEquals(1, reader.u8());
@@ -113,7 +113,7 @@ public class QwpSchemaBindingTextTest {
                 Assert.assertArrayEquals("before".getBytes(StandardCharsets.UTF_8),
                         bytes(buffer.getColumn(0).getStringDataAddress(), "before".length()));
                 Assert.assertEquals("first", buffer.getColumn(1).getSymbolValue(0).toString());
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > QwpConstants.HEADER_SIZE);
                 Assert.assertEquals(3, buffer.getRowCount());
             }
@@ -141,18 +141,15 @@ public class QwpSchemaBindingTextTest {
                 Assert.assertEquals(2, buffer.getColumnCount());
                 Assert.assertEquals("a", buffer.getColumnDefs()[0].getName());
                 Assert.assertEquals("c", buffer.getColumnDefs()[1].getName());
-                Assert.assertTrue(encoder.encodeSchema(buffer) > 0);
+                Assert.assertTrue(encoder.encode(buffer) > 0);
 
                 buffer.reset();
                 binding.symbol("a", "reset");
                 buffer.nextRow();
-                int resetSize = encoder.encodeSchema(buffer);
+                int resetSize = encoder.encode(buffer);
                 QwpTestWireReader reset = new QwpTestWireReader(encoder.getBuffer().getBufferPtr(), resetSize);
                 reset.skip(QwpConstants.HEADER_SIZE);
                 Assert.assertEquals("t", new String(reset.stringBytes(), StandardCharsets.UTF_8));
-                Assert.assertEquals(1, reset.u8());
-                Assert.assertEquals(1, reset.i32());
-                Assert.assertEquals(1, reset.i64());
                 Assert.assertEquals(1, reset.varint());
                 Assert.assertEquals(2, reset.varint());
                 Assert.assertEquals("a", new String(reset.stringBytes(), StandardCharsets.UTF_8));
@@ -216,7 +213,7 @@ public class QwpSchemaBindingTextTest {
                         .symbol("uuid", null);
                 binding.longColumn("long", 7).symbol("long", null);
                 buffer.nextRow();
-                Assert.assertTrue(encoder.encodeSchema(buffer) > 0);
+                Assert.assertTrue(encoder.encode(buffer) > 0);
             }
         });
     }
@@ -257,8 +254,8 @@ public class QwpSchemaBindingTextTest {
                         mirror.getOrAddSymbol("\ud800");
                         Assert.assertEquals(0, buffer.getColumn(0).getSymbolDictionarySize());
 
-                        encoder.beginSchemaMessage(1, mirror, -1, 3);
-                        encoder.addSchemaTable(buffer, binding.getTableId(), binding.getMetadataVersion());
+                        encoder.beginMessage(1, mirror, -1, 3);
+                        encoder.addTable(buffer);
                         int size = encoder.finishMessage();
                         QwpTestWireReader reader = new QwpTestWireReader(encoder.getBuffer().getBufferPtr(), size);
                         reader.skip(QwpConstants.HEADER_SIZE);

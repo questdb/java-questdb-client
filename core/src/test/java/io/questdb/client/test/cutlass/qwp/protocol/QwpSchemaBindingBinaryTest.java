@@ -56,7 +56,7 @@ public class QwpSchemaBindingBinaryTest {
                             throw new AssertionError(fields[1]);
                         }
                         buffer.nextRow();
-                        QwpTestWireReader reader = tableReader(encoder, encoder.encodeSchema(buffer), 1, 1);
+                        QwpTestWireReader reader = tableReader(encoder, encoder.encode(buffer), 1, 1);
                         if ("<NULL>".equals(fields[4])) {
                             Assert.assertEquals(fields[0], 1, reader.u8());
                             Assert.assertEquals(fields[0], 1, reader.u8());
@@ -109,7 +109,7 @@ public class QwpSchemaBindingBinaryTest {
                 binding.binaryColumn("value", 0, 0);
                 buffer.nextRow();
 
-                QwpTestWireReader reader = tableReader(encoder, encoder.encodeSchema(buffer), 4, 1);
+                QwpTestWireReader reader = tableReader(encoder, encoder.encode(buffer), 4, 1);
                 Assert.assertEquals(0, reader.u8());
                 for (int offset : new int[]{0, 2, 4, 6, 6}) {
                     Assert.assertEquals(offset, reader.i32());
@@ -136,7 +136,7 @@ public class QwpSchemaBindingBinaryTest {
                         .binaryColumn("value", 1, (long) Integer.MAX_VALUE + 1)
                         .stringColumn("value", new ThrowingCharSequence(new TestCharSequenceException()));
                 buffer.nextRow();
-                QwpTestWireReader reader = tableReader(encoder, encoder.encodeSchema(buffer), 1, 1);
+                QwpTestWireReader reader = tableReader(encoder, encoder.encode(buffer), 1, 1);
                 Assert.assertEquals(0, reader.u8());
                 Assert.assertEquals(0, reader.i32());
                 Assert.assertEquals(1, reader.i32());
@@ -147,7 +147,7 @@ public class QwpSchemaBindingBinaryTest {
                 QwpSchemaBinding binding = binding(buffer, -1, column("value", ColumnType.BINARY));
                 binding.stringColumn("value", "x").binaryColumn("value", (byte[]) null);
                 buffer.nextRow();
-                QwpTestWireReader reader = tableReader(encoder, encoder.encodeSchema(buffer), 1, 1);
+                QwpTestWireReader reader = tableReader(encoder, encoder.encode(buffer), 1, 1);
                 Assert.assertEquals(0, reader.u8());
                 Assert.assertEquals(0, reader.i32());
                 Assert.assertEquals(1, reader.i32());
@@ -188,7 +188,7 @@ public class QwpSchemaBindingBinaryTest {
                     }
                     buffer.nextRow();
                 }
-                QwpTestWireReader reader = tableReader(encoder, encoder.encodeSchema(buffer), 130, 1);
+                QwpTestWireReader reader = tableReader(encoder, encoder.encode(buffer), 130, 1);
                 Assert.assertEquals(1, reader.u8());
                 for (int i = 0; i < 16; i++) {
                     Assert.assertEquals(0xaa, reader.u8());
@@ -226,7 +226,7 @@ public class QwpSchemaBindingBinaryTest {
                 binding.binaryColumn("c", new byte[]{3});
                 buffer.nextRow();
 
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = new QwpTestWireReader(encoder.getBuffer().getBufferPtr(), size);
                 reader.skip(QwpConstants.HEADER_SIZE);
                 skipTablePrefix(reader, 2, 3);
@@ -261,7 +261,7 @@ public class QwpSchemaBindingBinaryTest {
                     rollback(buffer);
                     binding.stringColumn("value", "c");
                     buffer.nextRow();
-                    QwpTestWireReader reader = tableReader(encoder, encoder.encodeSchema(buffer), 2, 1, QwpConstants.TYPE_VARCHAR);
+                    QwpTestWireReader reader = tableReader(encoder, encoder.encode(buffer), 2, 1, QwpConstants.TYPE_VARCHAR);
                     Assert.assertEquals(0, reader.u8());
                     for (int offset : new int[]{0, 1, 2}) {
                         Assert.assertEquals(offset, reader.i32());
@@ -283,7 +283,7 @@ public class QwpSchemaBindingBinaryTest {
                 buffer.reset();
                 binding.binaryColumn("value", new byte[]{8});
                 buffer.nextRow();
-                QwpTestWireReader reader = tableReader(encoder, encoder.encodeSchema(buffer), 1, 1);
+                QwpTestWireReader reader = tableReader(encoder, encoder.encode(buffer), 1, 1);
                 Assert.assertEquals(0, reader.u8());
                 Assert.assertEquals(0, reader.i32());
                 Assert.assertEquals(1, reader.i32());

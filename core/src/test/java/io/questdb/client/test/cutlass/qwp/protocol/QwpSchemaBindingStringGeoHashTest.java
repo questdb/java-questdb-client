@@ -65,7 +65,7 @@ public class QwpSchemaBindingStringGeoHashTest {
                         } else if ("VALUE".equals(fields[3]) || "NULL".equals(fields[3])) {
                             binding.stringColumn("value", value);
                             buffer.nextRow();
-                            int size = encoder.encodeSchema(buffer);
+                            int size = encoder.encode(buffer);
                             QwpTestWireReader reader = tableReader(encoder, size, 1);
                             if ("NULL".equals(fields[3])) {
                                 Assert.assertEquals(1, reader.u8());
@@ -116,7 +116,7 @@ public class QwpSchemaBindingStringGeoHashTest {
                 buffer.rollbackUncommittedColumns();
                 binding.stringColumn("c", "04");
                 buffer.nextRow();
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableHeader(encoder, size, 5, 2);
                 Assert.assertEquals("a", reader.string());
                 Assert.assertEquals(QwpConstants.TYPE_GEOHASH, reader.u8());
@@ -129,7 +129,7 @@ public class QwpSchemaBindingStringGeoHashTest {
             buffer.reset();
                 binding.stringColumn("a", "04");
                 buffer.nextRow();
-                int resetSize = encoder.encodeSchema(buffer);
+                int resetSize = encoder.encode(buffer);
                 QwpTestWireReader reset = tableHeader(encoder, resetSize, 1, 2);
                 Assert.assertEquals("a", reset.string());
                 Assert.assertEquals(QwpConstants.TYPE_GEOHASH, reset.u8());
@@ -205,7 +205,7 @@ public class QwpSchemaBindingStringGeoHashTest {
                             known(-1, column("value", targetType)));
                     binding.stringColumn("value", input);
                     buffer.nextRow();
-                    int size = encoder.encodeSchema(buffer);
+                    int size = encoder.encode(buffer);
                     QwpTestWireReader reader = tableReader(encoder, size, 1);
                     assertGeo(reader, 0, bits, max);
                     Assert.assertEquals(size, reader.position());
@@ -217,7 +217,7 @@ public class QwpSchemaBindingStringGeoHashTest {
                     buffer.nextRow();
                     binding.stringColumn("value", "");
                     buffer.nextRow();
-                    size = encoder.encodeSchema(buffer);
+                    size = encoder.encode(buffer);
                     reader = tableReader(encoder, size, 3);
                     assertGeo(reader, 6, bits, max);
                     Assert.assertEquals(size, reader.position());
@@ -250,7 +250,7 @@ public class QwpSchemaBindingStringGeoHashTest {
                 buffer.getOrCreateColumn("value", QwpConstants.TYPE_GEOHASH, false)
                         .addGeoHash(0x0fffffffffffffffL, 60);
                 buffer.nextRow();
-                int size = encoder.encodeSchema(buffer, 1, 1);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableReader(encoder, size, 1);
                 Assert.assertEquals(0, reader.u8());
                 Assert.assertEquals(60, reader.varint());

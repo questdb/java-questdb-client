@@ -58,10 +58,7 @@ public class QwpSchemaBindingLongDecimalTest {
                         } else {
                             binding.longColumn("value", vector.input);
                             buffer.nextRow();
-                            int size = encoder.encodeSchema(buffer);
-                            Assert.assertEquals(QwpConstants.FLAG_SCHEMA,
-                                    Unsafe.getUnsafe().getByte(encoder.getBuffer().getBufferPtr()
-                                            + QwpConstants.HEADER_OFFSET_FLAGS) & QwpConstants.FLAG_SCHEMA);
+                            int size = encoder.encode(buffer);
                             QwpTestWireReader reader = tableReader(encoder, size, wireType(vector.targetType));
                             if (vector.isNull()) {
                                 Assert.assertEquals(vector.caseId, 1, reader.u8());
@@ -113,7 +110,7 @@ public class QwpSchemaBindingLongDecimalTest {
                 buffer.nextRow();
                 buffer.nextRow();
 
-                int size = encoder.encodeSchema(buffer);
+                int size = encoder.encode(buffer);
                 QwpTestWireReader reader = tableHeader(encoder, size, 4, 1);
                 decimalDefinition(reader, "value", QwpConstants.TYPE_DECIMAL64);
                 Assert.assertEquals(1, reader.u8());
@@ -125,7 +122,7 @@ public class QwpSchemaBindingLongDecimalTest {
 
                 buffer.reset();
                 buffer.nextRow();
-                int resetSize = encoder.encodeSchema(buffer);
+                int resetSize = encoder.encode(buffer);
                 QwpTestWireReader reset = tableHeader(encoder, resetSize, 1, 1);
                 decimalDefinition(reset, "value", QwpConstants.TYPE_DECIMAL64);
                 Assert.assertEquals(1, reset.u8());
