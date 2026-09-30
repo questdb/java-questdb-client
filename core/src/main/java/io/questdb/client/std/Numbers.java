@@ -39,6 +39,7 @@ public final class Numbers {
     public static final char[] hexDigits = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'};
     public final static int[] hexNumbers;
     public static final long[] pow10;
+    private static final int[] DOUBLE_DIGIT_PAIRS = new int[100];
     private static final int EXP_BIAS = 1023;
     private static final long EXP_BIT_MASK = 0x7FF0000000000000L;
     private static final int EXP_SHIFT = SIGNIFICAND_WIDTH - 1;
@@ -70,10 +71,8 @@ public final class Numbers {
     private static final int[] insignificantDigitsNumber = new int[]{0, 0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 8, 8, 8, 9, 9, 9, 9, 10, 10, 10, 11, 11, 11, 12, 12, 12, 12, 13, 13, 13, 14, 14, 14, 15, 15, 15, 15, 16, 16, 16, 17, 17, 17, 18, 18, 18, 19};
     private static final LongHexAppender[] longHexAppender = new LongHexAppender[Long.SIZE + 1];
     private static final LongHexAppender[] longHexAppenderPad64 = new LongHexAppender[Long.SIZE + 1];
-    // Scratch cell for RyuDouble.d2d()'s out-parameter. The server passes this
-    // through CharSink.ryuScratch(); the client's CharSink has no such method,
-    // so the single shared formatter keeps its own per-thread cell instead.
-    private final static ThreadLocal<int[]> tlRyuScratch = new ThreadLocal<>(() -> new int[1]);
+    // Slot 0 holds RyuDouble.d2d()'s decimal exponent; slots 1-17 hold ASCII digits.
+    private final static ThreadLocal<int[]> tlRyuScratch = new ThreadLocal<>(() -> new int[18]);
 
     private Numbers() {
     }
@@ -206,16 +205,39 @@ public final class Numbers {
         }
 
         // Decompose via Ryu
-        int[] e10 = tlRyuScratch.get();
-        long output = RyuDouble.d2d(ieeeMantissa, ieeeExponent, e10);
+        int[] scratch = tlRyuScratch.get();
+        long output = RyuDouble.d2d(ieeeMantissa, ieeeExponent, scratch);
         int olength = RyuDouble.decimalLength17(output);
-        int decExp = e10[0] + olength;
+        int decExp = scratch[0] + olength;
+        int digitsToWrite = olength;
+        if (scale < MAX_DOUBLE_SCALE && decExp > -3 && decExp < 8 && olength > decExp) {
+            // Do not decode fractional digits that the fixed-point scale will discard.
+            digitsToWrite = Math.min(olength, Math.max(Math.max(scale, 1) + decExp, 0));
+            if (digitsToWrite > 0 && digitsToWrite < olength) {
+                output /= pow10[olength - digitsToWrite];
+            }
+        }
+        int digitIndex = digitsToWrite;
+        for (; digitIndex > 2; digitIndex -= 2) {
+            long quotient = output / 100;
+            int pair = DOUBLE_DIGIT_PAIRS[(int) (output - quotient * 100)];
+            scratch[digitIndex - 1] = pair >>> 8;
+            scratch[digitIndex] = pair & 0xff;
+            output = quotient;
+        }
+        if (digitIndex == 2) {
+            int pair = DOUBLE_DIGIT_PAIRS[(int) output];
+            scratch[1] = pair >>> 8;
+            scratch[2] = pair & 0xff;
+        } else if (digitIndex == 1) {
+            scratch[1] = '0' + (int) output;
+        }
 
         if (decExp > 0 && decExp < 8) {
             // Fixed-point with integer part: e.g. "1234.567" or "1234000.0"
             if (olength <= decExp) {
                 for (int i = 0; i < olength; i++) {
-                    sink.putAscii((char) ('0' + (int) (output / pow10[olength - 1 - i] % 10)));
+                    sink.putAscii((char) scratch[i + 1]);
                 }
                 for (int i = olength; i < decExp; i++) {
                     sink.putAscii('0');
@@ -227,11 +249,11 @@ public final class Numbers {
                     fracDigits = Math.max(scale, 1);
                 }
                 for (int i = 0; i < decExp; i++) {
-                    sink.putAscii((char) ('0' + (int) (output / pow10[olength - 1 - i] % 10)));
+                    sink.putAscii((char) scratch[i + 1]);
                 }
                 sink.putAscii('.');
                 for (int i = 0; i < fracDigits; i++) {
-                    sink.putAscii((char) ('0' + (int) (output / pow10[olength - 1 - decExp - i] % 10)));
+                    sink.putAscii((char) scratch[decExp + i + 1]);
                 }
             }
         } else if (decExp <= 0 && decExp > -3) {
@@ -249,15 +271,15 @@ public final class Numbers {
                 sink.putAscii('0');
             }
             for (int i = 0; i < digitsFromOutput; i++) {
-                sink.putAscii((char) ('0' + (int) (output / pow10[olength - 1 - i] % 10)));
+                sink.putAscii((char) scratch[i + 1]);
             }
         } else {
             // Scientific notation: e.g. "1.23E8" or "1.0E-4"
-            sink.putAscii((char) ('0' + (int) (output / pow10[olength - 1] % 10)));
+            sink.putAscii((char) scratch[1]);
             sink.putAscii('.');
             if (olength > 1) {
                 for (int i = 1; i < olength; i++) {
-                    sink.putAscii((char) ('0' + (int) (output / pow10[olength - 1 - i] % 10)));
+                    sink.putAscii((char) scratch[i + 1]);
                 }
             } else {
                 sink.putAscii('0');
@@ -1187,6 +1209,10 @@ public final class Numbers {
     }
 
     static {
+        for (int i = 0; i < DOUBLE_DIGIT_PAIRS.length; i++) {
+            DOUBLE_DIGIT_PAIRS[i] = (('0' + i / 10) << 8) | ('0' + i % 10);
+        }
+
         pow10 = new long[20];
         pow10[0] = 1;
         for (int i = 1; i < pow10.length; i++) {

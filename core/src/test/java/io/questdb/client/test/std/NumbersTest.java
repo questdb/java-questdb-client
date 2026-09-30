@@ -29,6 +29,7 @@ import io.questdb.client.std.NumericException;
 import io.questdb.client.std.Rnd;
 import io.questdb.client.std.str.StringSink;
 import io.questdb.client.std.str.Utf8Sequence;
+import io.questdb.client.std.str.Utf8StringSink;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Before;
@@ -39,6 +40,7 @@ import static org.junit.Assert.assertEquals;
 
 public class NumbersTest {
     private final StringSink sink = new StringSink();
+    private final Utf8StringSink utf8Sink = new Utf8StringSink();
     private Rnd rnd;
 
     @Test(expected = NumericException.class)
@@ -200,6 +202,57 @@ public class NumbersTest {
         sink.clear();
         Numbers.append(sink, 4455630333333333333333334444d);
         TestUtils.assertEquals("4.4556303333333335E27", sink);
+    }
+
+    @Test
+    public void testFormatDoubleRoundTrip() {
+        for (int i = 0; i < 100_000; i++) {
+            long bits = rnd.nextLong();
+            double value = Double.longBitsToDouble(bits);
+            if (Double.isNaN(value) || Double.isInfinite(value)) {
+                continue;
+            }
+            sink.clear();
+            utf8Sink.clear();
+            Numbers.append(sink, value);
+            Numbers.append(utf8Sink, value);
+            TestUtils.assertEquals(sink, utf8Sink);
+            assertEquals(bits, Double.doubleToRawLongBits(Double.parseDouble(sink.toString())));
+        }
+    }
+
+    @Test
+    public void testFormatDoubleScale() {
+        assertFormatDouble("450.31", 450.31, Numbers.MAX_DOUBLE_SCALE);
+        assertFormatDouble("120.25", 120.25, Numbers.MAX_DOUBLE_SCALE);
+        assertFormatDouble("123.4", 123.456, 0);
+        assertFormatDouble("123.4", 123.456, -1);
+        assertFormatDouble("123.45", 123.456, 2);
+        assertFormatDouble("123.456", 123.456, 3);
+        assertFormatDouble("0.0", 0.001234, 1);
+        assertFormatDouble("0.00", 0.001234, 2);
+        assertFormatDouble("0.0", 0.001234, Integer.MIN_VALUE);
+        assertFormatDouble("0.001", 0.001234, 3);
+        assertFormatDouble("-0.0012", -0.001234, 4);
+        assertFormatDouble("1234000.0", 1234000.0, 1);
+        // Scientific notation is not truncated by scale.
+        assertFormatDouble("1.23456789E7", 12345678.9, 1);
+        assertFormatDouble("1.234E-4", 0.0001234, 1);
+    }
+
+    @Test
+    public void testFormatDoubleScratchReuse() {
+        for (int i = 0; i < 3; i++) {
+            assertFormatDouble("1.7976931348623157E308", Double.MAX_VALUE, Numbers.MAX_DOUBLE_SCALE);
+            assertFormatDouble("1.0", 1.0, Numbers.MAX_DOUBLE_SCALE);
+            assertFormatDouble("1.2345678901234567", 1.2345678901234567, Numbers.MAX_DOUBLE_SCALE);
+            assertFormatDouble("0.001", 0.001, Numbers.MAX_DOUBLE_SCALE);
+            assertFormatDouble("-0.0", -0.0, Numbers.MAX_DOUBLE_SCALE);
+            assertFormatDouble("NaN", Double.NaN, Numbers.MAX_DOUBLE_SCALE);
+            assertFormatDouble("Infinity", Double.POSITIVE_INFINITY, Numbers.MAX_DOUBLE_SCALE);
+            assertFormatDouble("-Infinity", Double.NEGATIVE_INFINITY, Numbers.MAX_DOUBLE_SCALE);
+            assertFormatDouble("450.31", 450.31, Numbers.MAX_DOUBLE_SCALE);
+        }
     }
 
     @Test
@@ -741,6 +794,15 @@ public class NumbersTest {
     @Test(expected = NumericException.class)
     public void testParseWrongNan() {
         Numbers.parseDouble("NaN1");
+    }
+
+    private void assertFormatDouble(String expected, double value, int scale) {
+        sink.clear();
+        utf8Sink.clear();
+        Numbers.append(sink, value, scale);
+        Numbers.append(utf8Sink, value, scale);
+        TestUtils.assertEquals(expected, sink);
+        TestUtils.assertEquals(expected, utf8Sink);
     }
 
     private static void assertParseLongException(String input) {
