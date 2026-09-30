@@ -4405,6 +4405,12 @@ public class QwpWebSocketSender implements Sender {
         if (currentTableBuffer.getRowCount() > 0) {
             return pinned;
         }
+        // AUTO uses detected connection state to decide whether to attempt lookup.
+        // A silent peer can leave the wire marked up. Each lookup has its own
+        // budget: table() and the first setter can both wait on an empty batch,
+        // and later batches can repeat this (up to 60 s with default settings).
+        // This is an accepted trade-off: transient unavailability is not cached
+        // or latched into legacy mode, so later attempts can adopt schema again.
         QwpSchemaResponse latest = resolveSchemaForCurrentTable();
         if (latest == null) {
             return selectLegacyContract();

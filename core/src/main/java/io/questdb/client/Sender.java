@@ -867,11 +867,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      *       from the cache, or from a lookup that completes within
      *       {@code schema_wait_millis} while the wire is up. Otherwise the row
      *       uses the legacy conversion contract; schema unavailability never
-     *       fails a row and the producer never waits on a wire that is down.
-     *       Rows written that way keep store-and-forward's promise that an
-     *       outage never blocks the producer, but the server, not the client,
-     *       validates them, and values such as nanosecond timestamps use their
-     *       legacy representation.</li>
+     *       fails a row. AUTO avoids network schema waits once a disconnect
+     *       is detected. An open but unresponsive connection can still consume
+     *       {@code schema_wait_millis} on each lookup attempt. The server, not
+     *       the client, validates legacy rows, and values such as nanosecond
+     *       timestamps use their legacy representation.</li>
      *   <li>{@link #STRICT} — once the server is known to speak schema-aware
      *       QWP, no row is ever encoded with the legacy contract. A row whose
      *       schema is not obtainable waits up to {@code schema_wait_millis},
@@ -3047,11 +3047,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
-         * Upper bound for one schema wait: the first WebSocket upgrade, if it
-         * has not completed yet, plus one schema lookup round trip. Reconnects
-         * consume the same budget; they do not restart it. Default 30 s;
-         * {@code Long.MAX_VALUE} waits without a limit. At the bound, {@link SchemaMode#AUTO} writes the row with the legacy contract
-         * and {@link SchemaMode#STRICT} fails it. WebSocket transport only.
+         * Per-lookup wait budget, including negotiation and reconnects.
+         * Default 30 s; {@code Long.MAX_VALUE} waits indefinitely.
+         * On timeout, {@link SchemaMode#AUTO} uses legacy encoding and
+         * {@link SchemaMode#STRICT} fails the row. Later lookups may wait again.
+         * WebSocket only.
          */
         public LineSenderBuilder schemaWaitMillis(long millis) {
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
