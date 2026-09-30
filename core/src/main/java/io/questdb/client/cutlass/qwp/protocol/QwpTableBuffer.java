@@ -33,6 +33,7 @@ import io.questdb.client.cutlass.line.array.LongArray;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.std.CharSequenceIntHashMap;
 import io.questdb.client.std.Chars;
+import io.questdb.client.std.Decimal;
 import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.Decimal256;
 import io.questdb.client.std.Decimal64;
@@ -63,6 +64,8 @@ public class QwpTableBuffer implements QuietCloseable {
     private static final int MAX_COLUMN_NAME_LENGTH = 127;
     private final LowerCaseCharSequenceIntHashMap columnNameToIndex;
     private final ObjList<ColumnBuffer> columns;
+    // lower-cased table name, the schema cache key; the name itself when already lower case
+    private final String schemaKey;
     private final QwpWebSocketSender sender;
     private final String tableName;
     private QwpColumnDef[] cachedColumnDefs;
@@ -72,19 +75,22 @@ public class QwpTableBuffer implements QuietCloseable {
     private ColumnBuffer[] fastColumns; // plain array for O(1) sequential access
     private int inProgressColumnCount;
     private int rowCount;
+    private QwpSchemaBinding schemaBinding;
 
     public QwpTableBuffer(String tableName) {
         this(tableName, null);
     }
 
     /**
-     * Use this constructor overload to allow writing to a symbol column.
-     * {@link ColumnBuffer#addSymbol(CharSequence)} needs the sender to
-     * call {@link QwpWebSocketSender#getOrAddGlobalSymbol(CharSequence)}, registering
-     * the symbol in the global dictionary shared with the server.
+     * Use this constructor overload to encode symbol columns with the sender's
+     * global dictionary IDs. {@link ColumnBuffer#addSymbol(CharSequence)} calls
+     * {@link QwpWebSocketSender#getOrAddGlobalSymbol(CharSequence)}; buffers built
+     * without a sender instead maintain a local per-column symbol dictionary.
      */
     public QwpTableBuffer(String tableName, QwpWebSocketSender sender) {
         this.tableName = tableName;
+        String lowerCaseName = Chars.toLowerCase(tableName);
+        this.schemaKey = tableName.equals(lowerCaseName) ? tableName : lowerCaseName;
         this.sender = sender;
         this.columns = new ObjList<>();
         this.columnNameToIndex = new LowerCaseCharSequenceIntHashMap();
@@ -120,6 +126,7 @@ public class QwpTableBuffer implements QuietCloseable {
      * Frees all off-heap memory.
      */
     public void clear() {
+        schemaBinding = null;
         for (int i = 0, n = columns.size(); i < n; i++) {
             columns.get(i).close();
         }
@@ -190,6 +197,42 @@ public class QwpTableBuffer implements QuietCloseable {
         return lookupColumn(name, type);
     }
 
+    ColumnBuffer getExistingColumnByName(CharSequence name) {
+        int index = columnNameToIndex.get(name);
+        return index >= 0 ? columns.get(index) : null;
+    }
+
+    /**
+     * Claims {@code column}, found by {@link #findColumn}, for the in-progress
+     * row. Returns {@code null} when the row already holds a value for it, with
+     * the same first-value-wins semantics as {@link #getOrCreateColumn}.
+     */
+    ColumnBuffer claimColumn(ColumnBuffer column) {
+        if (column.size > rowCount) {
+            return null;
+        }
+        inProgressColumnCount++;
+        return column;
+    }
+
+    /**
+     * Finds a column by name without checking its type, advancing the
+     * sequential access cursor on a predicted hit exactly like
+     * {@link #getOrCreateColumn}. Returns {@code null} when absent.
+     */
+    ColumnBuffer findColumn(CharSequence name) {
+        int n = columns.size();
+        if (columnAccessCursor < n) {
+            ColumnBuffer candidate = fastColumns[columnAccessCursor];
+            if (Chars.equalsIgnoreCase(candidate.name, name)) {
+                columnAccessCursor++;
+                return candidate;
+            }
+        }
+        int idx = columnNameToIndex.get(name);
+        return idx >= 0 ? columns.get(idx) : null;
+    }
+
     /**
      * Gets or creates a column with the given name and type.
      * <p>
@@ -211,11 +254,7 @@ public class QwpTableBuffer implements QuietCloseable {
             // col.size > rowCount means this column already received a value
             // for the in-progress row.  Silently ignore the duplicate (first
             // value wins, same as the ILP server behaviour).
-            if (existing.size > rowCount) {
-                return null;
-            }
-            inProgressColumnCount++;
-            return existing;
+            return claimColumn(existing);
         }
         if (TableUtils.isValidColumnName(name, MAX_COLUMN_NAME_LENGTH)) {
             ColumnBuffer col = createColumn(name, type, useNullBitmap);
@@ -254,6 +293,31 @@ public class QwpTableBuffer implements QuietCloseable {
      */
     public String getTableName() {
         return tableName;
+    }
+
+    public QwpSchemaBinding getSchemaBinding() {
+        return schemaBinding;
+    }
+
+    /**
+     * Returns the lower-cased table name that keys the schema cache, computed
+     * once so a schema lookup does not allocate.
+     */
+    public String getSchemaKey() {
+        return schemaKey;
+    }
+
+    void attachSchemaBinding(QwpSchemaBinding binding) {
+        if (schemaBinding != null || rowCount != 0 || hasInProgressRow() || columns.size() != 0) {
+            throw new IllegalStateException("schema binding requires an empty, unbound table buffer");
+        }
+        schemaBinding = binding;
+    }
+
+    void requireSchemaBinding(QwpSchemaBinding binding) {
+        if (schemaBinding != binding) {
+            throw new IllegalStateException("schema binding is no longer attached to the table buffer");
+        }
     }
 
     /**
@@ -432,26 +496,11 @@ public class QwpTableBuffer implements QuietCloseable {
     }
 
     private ColumnBuffer lookupColumn(CharSequence name, byte type) {
-        // Fast path: predict next column in sequence
-        int n = columns.size();
-        if (columnAccessCursor < n) {
-            ColumnBuffer candidate = fastColumns[columnAccessCursor];
-            if (Chars.equalsIgnoreCase(candidate.name, name)) {
-                columnAccessCursor++;
-                assertColumnType(name, type, candidate);
-                return candidate;
-            }
-        }
-
-        // Slow path: hash map lookup
-        int idx = columnNameToIndex.get(name);
-        if (idx >= 0) {
-            ColumnBuffer existing = columns.get(idx);
+        ColumnBuffer existing = findColumn(name);
+        if (existing != null) {
             assertColumnType(name, type, existing);
-            return existing;
         }
-
-        return null;
+        return existing;
     }
 
     private void rebuildColumnAccessStructures() {
@@ -620,6 +669,7 @@ public class QwpTableBuffer implements QuietCloseable {
      * operation and efficient bulk copy to network buffers.
      */
     public static class ColumnBuffer implements QuietCloseable {
+        static final int SCHEMA_UNRESOLVED = Integer.MIN_VALUE;
         private static final long DOUBLE_ARRAY_BASE_OFFSET = Unsafe.getUnsafe().arrayBaseOffset(double[].class);
         final int elemSize;
         final String name;
@@ -638,6 +688,11 @@ public class QwpTableBuffer implements QuietCloseable {
         private OffHeapAppendMemory dataBuffer;
         // Decimal storage
         private byte decimalScale = -1;
+        private boolean schemaDecimalScaleLocked;
+        // Schema column index the binding resolved this column to, -1 when the
+        // schema lacks it, or SCHEMA_UNRESOLVED before any binding resolved it.
+        private int schemaIndex = SCHEMA_UNRESOLVED;
+        private int inferredArrayDimensionality = -1;
         private double[] doubleArrayData;
         // GeoHash precision (number of bits, 1-60)
         private int geohashPrecision = -1;
@@ -699,10 +754,17 @@ public class QwpTableBuffer implements QuietCloseable {
                 throw new LineSenderException(
                         "BINARY value cannot be null; mark the row null via the null bitmap instead");
             }
-            if (value.length > 0) {
-                stringData.putBytes(value, 0, value.length);
+            long dataOffset = stringData.getAppendOffset();
+            long offsetsOffset = stringOffsets.getAppendOffset();
+            try {
+                if (value.length > 0) {
+                    stringData.putBytes(value, 0, value.length);
+                }
+                stringOffsets.putInt(checkedStringOffset(stringData.getAppendOffset()));
+            } catch (RuntimeException | Error e) {
+                restoreStringAppendPositions(dataOffset, offsetsOffset);
+                throw e;
             }
-            stringOffsets.putInt(checkedStringOffset(stringData.getAppendOffset()));
             valueCount++;
             size++;
         }
@@ -720,10 +782,17 @@ public class QwpTableBuffer implements QuietCloseable {
             if (len > 0 && ptr == 0) {
                 throw new LineSenderException("BINARY pointer cannot be 0 for a non-empty value");
             }
-            if (len > 0) {
-                stringData.putBlockOfBytes(ptr, len);
+            long dataOffset = stringData.getAppendOffset();
+            long offsetsOffset = stringOffsets.getAppendOffset();
+            try {
+                if (len > 0) {
+                    stringData.putBlockOfBytes(ptr, len);
+                }
+                stringOffsets.putInt(checkedStringOffset(stringData.getAppendOffset()));
+            } catch (RuntimeException | Error e) {
+                restoreStringAppendPositions(dataOffset, offsetsOffset);
+                throw e;
             }
-            stringOffsets.putInt(checkedStringOffset(stringData.getAppendOffset()));
             valueCount++;
             size++;
         }
@@ -825,6 +894,77 @@ public class QwpTableBuffer implements QuietCloseable {
             }
             valueCount++;
             size++;
+        }
+
+        public boolean addSchemaDecimal(Decimal value, int targetPrecision, int targetScale) throws NumericException {
+            value.toDecimal256(rescaleTemp);
+            return appendSchemaDecimal(targetPrecision, targetScale);
+        }
+
+        public void addSchemaDecimalNull(int targetScale) {
+            lockSchemaDecimalScale(targetScale);
+            addNull();
+        }
+
+        public boolean addSchemaLongDecimal(long value, int targetPrecision, int targetScale) throws NumericException {
+            rescaleTemp.ofLong(value, 0);
+            return appendSchemaDecimal(targetPrecision, targetScale);
+        }
+
+        public boolean addSchemaStringDecimal(CharSequence value, int targetPrecision, int targetScale) throws NumericException {
+            rescaleTemp.ofString(value, 0, value.length(), targetPrecision, targetScale, false, false);
+            if (rescaleTemp.isNull()) {
+                addSchemaDecimalNull(targetScale);
+                return true;
+            }
+            return appendSchemaDecimal(targetPrecision, targetScale);
+        }
+
+        private boolean appendSchemaDecimal(int targetPrecision, int targetScale) throws NumericException {
+            if (rescaleTemp.getScale() != targetScale) {
+                rescaleTemp.rescale(targetScale);
+            }
+            if (!rescaleTemp.comparePrecision(targetPrecision)) {
+                return false;
+            }
+            int storageSizePow2;
+            switch (type) {
+                case TYPE_DECIMAL64:
+                    storageSizePow2 = 3;
+                    break;
+                case TYPE_DECIMAL128:
+                    storageSizePow2 = 4;
+                    break;
+                case TYPE_DECIMAL256:
+                    storageSizePow2 = 5;
+                    break;
+                default:
+                    throw new IllegalStateException("not a decimal column: " + type);
+            }
+            if (!rescaleTemp.fitsInStorageSizePow2(storageSizePow2)) {
+                return false;
+            }
+            lockSchemaDecimalScale(targetScale);
+            switch (type) {
+                case TYPE_DECIMAL64:
+                    dataBuffer.putLong(rescaleTemp.getLl());
+                    break;
+                case TYPE_DECIMAL128:
+                    dataBuffer.putLong(rescaleTemp.getLh());
+                    dataBuffer.putLong(rescaleTemp.getLl());
+                    break;
+                case TYPE_DECIMAL256:
+                    dataBuffer.putLong(rescaleTemp.getHh());
+                    dataBuffer.putLong(rescaleTemp.getHl());
+                    dataBuffer.putLong(rescaleTemp.getLh());
+                    dataBuffer.putLong(rescaleTemp.getLl());
+                    break;
+                default:
+                    throw new AssertionError();
+            }
+            valueCount++;
+            size++;
+            return true;
         }
 
         public void addDouble(double value) {
@@ -946,6 +1086,13 @@ public class QwpTableBuffer implements QuietCloseable {
          * @param precision number of bits (1-60)
          */
         public void addGeoHash(long value, int precision) {
+            initGeoHashPrecision(precision);
+            dataBuffer.putLong(value);
+            valueCount++;
+            size++;
+        }
+
+        public void initGeoHashPrecision(int precision) {
             if (precision < 1 || precision > 60) {
                 throw new LineSenderException("invalid GeoHash precision: " + precision + " (must be 1-60)");
             }
@@ -956,9 +1103,6 @@ public class QwpTableBuffer implements QuietCloseable {
                         "GeoHash precision mismatch: column has " + geohashPrecision + " bits, got " + precision
                 );
             }
-            dataBuffer.putLong(value);
-            valueCount++;
-            size++;
         }
 
         public void addInt(int value) {
@@ -1180,10 +1324,17 @@ public class QwpTableBuffer implements QuietCloseable {
                 ensureNullBitmapCapacity(size + 1);
                 markNull(size);
             } else {
-                if (value != null) {
-                    stringData.putUtf8(value);
+                long dataOffset = stringData.getAppendOffset();
+                long offsetsOffset = stringOffsets.getAppendOffset();
+                try {
+                    if (value != null) {
+                        stringData.putUtf8(value);
+                    }
+                    stringOffsets.putInt(checkedStringOffset(stringData.getAppendOffset()));
+                } catch (RuntimeException | Error e) {
+                    restoreStringAppendPositions(dataOffset, offsetsOffset);
+                    throw e;
                 }
-                stringOffsets.putInt(checkedStringOffset(stringData.getAppendOffset()));
                 valueCount++;
             }
             size++;
@@ -1373,7 +1524,11 @@ public class QwpTableBuffer implements QuietCloseable {
         }
 
         public byte getDecimalScale() {
-            return decimalScale;
+            // A decimal column containing only nulls has no natural scale yet.
+            // Scale -1 is internal state, not valid QWP metadata; emit the
+            // deterministic scale-zero representation without locking it so a
+            // later finite batch can still select its natural scale.
+            return decimalScale == -1 ? 0 : decimalScale;
         }
 
         public double[] getDoubleArrayData() {
@@ -1404,8 +1559,23 @@ public class QwpTableBuffer implements QuietCloseable {
             return nullBufPtr;
         }
 
+        int getSchemaIndex() {
+            return schemaIndex;
+        }
+
         public int getSize() {
             return size;
+        }
+
+        void setSchemaIndex(int schemaIndex) {
+            this.schemaIndex = schemaIndex;
+        }
+
+        int pinInferredArrayDimensionality(int dimensionality) {
+            if (inferredArrayDimensionality < 0) {
+                inferredArrayDimensionality = dimensionality;
+            }
+            return inferredArrayDimensionality;
         }
 
         public long getStringDataAddress() {
@@ -1454,6 +1624,10 @@ public class QwpTableBuffer implements QuietCloseable {
             return symbolDict != null && symbolDict.get(value) != CharSequenceIntHashMap.NO_ENTRY_VALUE;
         }
 
+        boolean isSchemaResolved() {
+            return schemaIndex != SCHEMA_UNRESOLVED;
+        }
+
         public boolean isNull(int index) {
             if (nullBufPtr == 0 || index >= nullBufCapRows) {
                 return false;
@@ -1491,7 +1665,9 @@ public class QwpTableBuffer implements QuietCloseable {
             maxGlobalSymbolId = -1;
             arrayShapeOffset = 0;
             arrayDataOffset = 0;
-            decimalScale = -1;
+            if (!schemaDecimalScaleLocked) {
+                decimalScale = -1;
+            }
             // geohashPrecision is intentionally NOT cleared here. It is a
             // schema property, locked on first write and matched by the
             // server's auto-created GEOHASH(Nb) type, so preserving it across
@@ -1610,7 +1786,9 @@ public class QwpTableBuffer implements QuietCloseable {
             // through ColumnBuffer.reset() and intentionally preserves
             // geohashPrecision there to keep its server-locked value.
             if (newValueCount == 0) {
-                decimalScale = -1;
+                if (!schemaDecimalScaleLocked) {
+                    decimalScale = -1;
+                }
                 geohashPrecision = -1;
                 maxGlobalSymbolId = -1;
                 storeGlobalSymbolIdsOnly = false;
@@ -1623,6 +1801,11 @@ public class QwpTableBuffer implements QuietCloseable {
 
         public boolean usesNullBitmap() {
             return useNullBitmap;
+        }
+
+        private void restoreStringAppendPositions(long dataOffset, long offsetsOffset) {
+            stringData.jumpTo(dataOffset);
+            stringOffsets.jumpTo(offsetsOffset);
         }
 
         private static int checkedElementCount(long product) {
@@ -1852,8 +2035,21 @@ public class QwpTableBuffer implements QuietCloseable {
             hasNulls = true;
         }
 
+        private void lockSchemaDecimalScale(int targetScale) {
+            if (schemaDecimalScaleLocked) {
+                if ((decimalScale & 0xFF) != targetScale) {
+                    throw new IllegalStateException("schema decimal scale changed");
+                }
+                return;
+            }
+            decimalScale = (byte) targetScale;
+            schemaDecimalScaleLocked = true;
+        }
+
         private void resetEmptyMetadata() {
-            decimalScale = -1;
+            if (!schemaDecimalScaleLocked) {
+                decimalScale = -1;
+            }
             geohashPrecision = -1;
             maxGlobalSymbolId = -1;
             storeGlobalSymbolIdsOnly = false;

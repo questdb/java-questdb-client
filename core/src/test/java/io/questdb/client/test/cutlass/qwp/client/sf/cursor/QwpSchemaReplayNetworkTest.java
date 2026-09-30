@@ -1,0 +1,369 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ * Copyright (c) 2014-2019 Appsicle
+ * Copyright (c) 2019-2026 QuestDB
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ ******************************************************************************/
+
+package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
+
+import io.questdb.client.Sender;
+import io.questdb.client.cairo.ColumnType;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketEncoder;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
+import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
+import io.questdb.client.cutlass.http.client.WebSocketClient;
+import io.questdb.client.cutlass.http.client.WebSocketClientFactory;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
+import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
+import io.questdb.client.cutlass.qwp.protocol.QwpSchemaProtocol;
+import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
+import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
+import org.junit.Assert;
+import org.junit.Rule;
+import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
+import io.questdb.client.test.tools.TestUtils;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.LockSupport;
+
+public class QwpSchemaReplayNetworkTest {
+    private static final int SEGMENT_SIZE = 1 << 20;
+    @Rule
+    public final TemporaryFolder temp = TemporaryFolder.builder().parentFolder(taskTempRoot()).build();
+
+    @Test
+    public void testPublicSenderSchemaFrameSurvivesRestartByteForByte() throws Exception {
+        File root = temp.newFolder("public-sender-restart");
+        String slot = new File(root, "default").getAbsolutePath();
+        SchemaRecordingHandler firstHandler = new SchemaRecordingHandler(false);
+        byte[] expected;
+        try (TestWebSocketServer firstPeer = new TestWebSocketServer(firstHandler)) {
+            firstPeer.setAdvertiseSchema(true);
+            firstPeer.start();
+            Assert.assertTrue(firstPeer.awaitStart(5, TimeUnit.SECONDS));
+            try (Sender sender = Sender.fromConfig(config(firstPeer.getPort(), root, false))) {
+                sender.table("small_replay").byteColumn("value", (byte) -7).atNow();
+                Assert.assertEquals(0, sender.flushAndGetSequence());
+                expected = firstHandler.awaitDataFrame();
+            }
+        }
+        assertRetained(slot, 0);
+
+        SchemaRecordingHandler replayHandler = new SchemaRecordingHandler(true);
+        try (TestWebSocketServer replayPeer = new TestWebSocketServer(replayHandler)) {
+            replayPeer.setAdvertiseSchema(true);
+            replayPeer.start();
+            Assert.assertTrue(replayPeer.awaitStart(5, TimeUnit.SECONDS));
+            try (Sender sender = Sender.fromConfig(config(replayPeer.getPort(), root, false))) {
+                Assert.assertTrue(sender.drain(10_000));
+            }
+        }
+        Assert.assertArrayEquals(expected, replayHandler.awaitDataFrame());
+        assertNoQuarantine(root);
+    }
+
+    @Test
+    public void testSchemaFeedbackAckAdvancesRecoveredBacklog() throws Exception {
+        File root = temp.newFolder("feedback-ack");
+        seedBacklog(new File(root, "default").getAbsolutePath());
+        FeedbackHandler handler = new FeedbackHandler(false);
+        try (TestWebSocketServer peer = new TestWebSocketServer(handler)) {
+            peer.setAdvertiseSchema(true);
+            peer.start();
+            Assert.assertTrue(peer.awaitStart(5, TimeUnit.SECONDS));
+            try (Sender sender = Sender.fromConfig(config(peer.getPort(), root, false))) {
+                Assert.assertTrue(sender.drain(10_000));
+            }
+        }
+        Assert.assertEquals(2, handler.frames.get());
+        assertNoQuarantine(root);
+    }
+
+    @Test
+    public void testMalformedSchemaFeedbackDoesNotAdvanceRecoveredBacklog() throws Exception {
+        File root = temp.newFolder("feedback-malformed");
+        String slot = new File(root, "default").getAbsolutePath();
+        seedBacklog(slot);
+        FeedbackHandler handler = new FeedbackHandler(true);
+        try (TestWebSocketServer peer = new TestWebSocketServer(handler)) {
+            peer.setAdvertiseSchema(true);
+            peer.start();
+            Assert.assertTrue(peer.awaitStart(5, TimeUnit.SECONDS));
+            Sender sender = Sender.fromConfig(config(peer.getPort(), root, false));
+            try {
+                Assert.assertTrue("malformed feedback must be parsed, rejected, and trigger replay",
+                        handler.awaitDistinctClients(5, TimeUnit.SECONDS));
+            } finally {
+                sender.close();
+            }
+        }
+        Assert.assertTrue(handler.frames.get() > 0);
+        assertRetained(slot, 1);
+        assertNoQuarantine(root);
+    }
+
+    @Test
+    public void testInvalidSchemaColumnsDoNotAdvanceRecoveredBacklog() throws Exception {
+        File root = temp.newFolder("feedback-invalid-columns");
+        String slot = new File(root, "default").getAbsolutePath();
+        seedBacklog(slot);
+        FeedbackHandler handler = new FeedbackHandler(false, true);
+        try (TestWebSocketServer peer = new TestWebSocketServer(handler)) {
+            peer.setAdvertiseSchema(true);
+            peer.start();
+            Assert.assertTrue(peer.awaitStart(5, TimeUnit.SECONDS));
+            Sender sender = Sender.fromConfig(config(peer.getPort(), root, false));
+            try {
+                Assert.assertTrue("invalid schema feedback must be rejected and replayed",
+                        handler.awaitDistinctClients(5, TimeUnit.SECONDS));
+            } finally {
+                sender.close();
+            }
+        }
+        Assert.assertTrue(handler.frames.get() > 0);
+        assertRetained(slot, 1);
+        assertNoQuarantine(root);
+    }
+
+    private static void assertNoQuarantine(File root) {
+        File[] files = root.listFiles();
+        Assert.assertNotNull(files);
+        for (File file : files) {
+            Assert.assertFalse(file.getName(), file.getName().contains(".unreplayable-"));
+            Assert.assertFalse(file.getName(), file.getName().equals(OrphanScanner.FAILED_SENTINEL_NAME));
+            File failed = new File(file, OrphanScanner.FAILED_SENTINEL_NAME);
+            Assert.assertFalse(failed.getAbsolutePath(), failed.exists());
+        }
+    }
+
+    private static void assertRetained(String slot, long publishedFsn) {
+        try (CursorSendEngine recovered = new CursorSendEngine(slot, SEGMENT_SIZE)) {
+            Assert.assertEquals(-1, recovered.ackedFsn());
+            Assert.assertEquals(publishedFsn, recovered.publishedFsn());
+        }
+    }
+
+    private static String config(int port, File root, boolean durableAck) {
+        return "ws::addr=localhost:" + port
+                + ";sf_dir=" + root.getAbsolutePath()
+                + ";sender_id=default;sf_max_segment_bytes=1m;request_durable_ack="
+                + (durableAck ? "on" : "off") + ";close_flush_timeout_millis=0;";
+    }
+
+    private static byte[] copy(QwpWebSocketEncoder encoder, int length) {
+        byte[] bytes = new byte[length];
+        long address = encoder.getBuffer().getBufferPtr();
+        for (int i = 0; i < length; i++) {
+            bytes[i] = io.questdb.client.std.Unsafe.getUnsafe().getByte(address + i);
+        }
+        return bytes;
+    }
+
+    private static byte[][] seedBacklog(String slot) {
+        try (CursorSendEngine engine = new CursorSendEngine(slot, SEGMENT_SIZE);
+             QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+             QwpTableBuffer legacy = table("replay", 1);
+             QwpTableBuffer schema = table("replay", 2)) {
+            byte[] first = copy(encoder, encoder.encode(legacy));
+            Assert.assertEquals(0, engine.appendBlocking(encoder.getBuffer().getBufferPtr(), first.length));
+            byte[] second = copy(encoder, encoder.encode(schema));
+            Assert.assertEquals(1, engine.appendBlocking(encoder.getBuffer().getBufferPtr(), second.length));
+            return new byte[][]{first, second};
+        }
+    }
+
+    private static QwpTableBuffer table(String name, long value) {
+        QwpTableBuffer table = new QwpTableBuffer(name);
+        table.getOrCreateColumn("n", QwpConstants.TYPE_LONG, true).addLong(value);
+        table.nextRow();
+        return table;
+    }
+
+    private static File taskTempRoot() {
+        File root = new File("target/schema-replay-network").getAbsoluteFile();
+        Assert.assertTrue(root.exists() || root.mkdirs());
+        return root;
+    }
+
+    private static final class SchemaRecordingHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private final boolean acknowledge;
+        private final List<byte[]> dataFrames = new ArrayList<>();
+
+        private SchemaRecordingHandler(boolean acknowledge) {
+            this.acknowledge = acknowledge;
+        }
+
+        @Override
+        public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            if (data.length >= QwpConstants.HEADER_SIZE
+                    && data[QwpConstants.HEADER_OFFSET_FLAGS] == QwpSchemaProtocol.FLAG_CONTROL) {
+                ByteBuffer request = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
+                sendSchema(client, request.getLong(QwpConstants.HEADER_SIZE + 1));
+                return;
+            }
+            dataFrames.add(data);
+            notifyAll();
+            if (acknowledge) {
+                try {
+                    client.sendBinary(ok(0));
+                } catch (IOException e) {
+                    throw new AssertionError(e);
+                }
+            }
+        }
+
+        private synchronized byte[] awaitDataFrame() throws InterruptedException {
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (dataFrames.isEmpty()) {
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0) {
+                    Assert.fail("timed out waiting for schema data frame");
+                }
+                TimeUnit.NANOSECONDS.timedWait(this, remaining);
+            }
+            return dataFrames.get(0);
+        }
+
+        private static byte[] ok(long sequence) {
+            return ByteBuffer.allocate(11).order(ByteOrder.LITTLE_ENDIAN)
+                    .put(WebSocketResponse.STATUS_OK).putLong(sequence).putShort((short) 0).array();
+        }
+
+        private static void sendSchema(TestWebSocketServer.ClientHandler client, long requestId) {
+            byte[] value = "value".getBytes(StandardCharsets.UTF_8);
+            byte[] timestamp = "ts".getBytes(StandardCharsets.UTF_8);
+            int payloadLength = 1 + Long.BYTES + 1 + Integer.BYTES + Long.BYTES
+                    + Short.BYTES + Short.BYTES
+                    + Short.BYTES + value.length + Integer.BYTES + Short.BYTES
+                    + Short.BYTES + timestamp.length + Integer.BYTES + Short.BYTES;
+            ByteBuffer response = ByteBuffer.allocate(QwpConstants.HEADER_SIZE + payloadLength)
+                    .order(ByteOrder.LITTLE_ENDIAN);
+            response.putInt(QwpConstants.MAGIC_MESSAGE)
+                    .put((byte) QwpConstants.VERSION)
+                    .put(QwpSchemaProtocol.FLAG_CONTROL)
+                    .putShort((short) 0)
+                    .putInt(payloadLength)
+                    .put(QwpSchemaProtocol.KIND_SCHEMA)
+                    .putLong(requestId)
+                    .put((byte) QwpSchemaProtocol.RESULT_KNOWN)
+                    .putInt(301)
+                    .putLong(401)
+                    .putShort((short) 1)
+                    .putShort((short) 2)
+                    .putShort((short) value.length)
+                    .put(value)
+                    .putInt(ColumnType.INT)
+                    .putShort((short) 0)
+                    .putShort((short) timestamp.length)
+                    .put(timestamp)
+                    .putInt(ColumnType.TIMESTAMP_NANO)
+                    .putShort((short) 0);
+            try {
+                client.sendBinary(response.array());
+            } catch (IOException e) {
+                throw new AssertionError(e);
+            }
+        }
+    }
+
+    private static final class FeedbackHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private final AtomicInteger frames = new AtomicInteger();
+        private final CountDownLatch distinctClients;
+        private final boolean malformed;
+        private final boolean invalidColumns;
+        private TestWebSocketServer.ClientHandler lastClient;
+
+        private FeedbackHandler(boolean malformed) {
+            this(malformed, false);
+        }
+
+        private FeedbackHandler(boolean malformed, boolean invalidColumns) {
+            this.malformed = malformed;
+            this.invalidColumns = invalidColumns;
+            this.distinctClients = new CountDownLatch(malformed || invalidColumns ? 2 : 1);
+        }
+
+        private boolean awaitDistinctClients(long timeout, TimeUnit unit) throws InterruptedException {
+            return distinctClients.await(timeout, unit);
+        }
+
+        @Override
+        public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            int sequence = frames.getAndIncrement();
+            byte[] response = schemaFeedbackOk(sequence);
+            if (malformed) {
+                response = java.util.Arrays.copyOf(response, response.length - 1);
+            } else if (invalidColumns) {
+                response = schemaFeedbackInvalidColumns(sequence);
+            }
+            try {
+                client.sendBinary(response);
+                if (client != lastClient) {
+                    lastClient = client;
+                    distinctClients.countDown();
+                }
+            } catch (IOException e) {
+                throw new AssertionError(e);
+            }
+        }
+
+        private static byte[] schemaFeedbackOk(long sequence) {
+            byte[] tableName = "replay".getBytes(StandardCharsets.UTF_8);
+            ByteBuffer buffer = ByteBuffer.allocate(11 + 2 + 2 + tableName.length + 4 + 10)
+                    .order(ByteOrder.LITTLE_ENDIAN);
+            buffer.put((byte) WebSocketResponse.SCHEMA_FEEDBACK_MODE_UPDATES)
+                    .putLong(sequence).putShort((short) 0).putShort((short) 1)
+                    .putShort((short) tableName.length).put(tableName).putInt(10)
+                    .put((byte) 2).putLong(0).put((byte) 1);
+            return buffer.array();
+        }
+
+        private static byte[] schemaFeedbackInvalidColumns(long sequence) {
+            byte[] tableName = "replay".getBytes(StandardCharsets.UTF_8);
+            byte[] column = "x".getBytes(StandardCharsets.UTF_8);
+            int payloadLength = 26 + 2 * (2 + column.length + 6);
+            ByteBuffer buffer = ByteBuffer.allocate(11 + 2 + 2 + tableName.length + 4 + payloadLength)
+                    .order(ByteOrder.LITTLE_ENDIAN);
+            buffer.put((byte) WebSocketResponse.SCHEMA_FEEDBACK_MODE_UPDATES)
+                    .putLong(sequence).putShort((short) 0).putShort((short) 1)
+                    .putShort((short) tableName.length).put(tableName).putInt(payloadLength)
+                    .put((byte) 2).putLong(0).put((byte) 0).putInt(1).putLong(1)
+                    .putShort((short) -1).putShort((short) 2);
+            for (byte name : new byte[]{'x', 'X'}) {
+                buffer.putShort((short) 1).put(name).putInt(5).putShort((short) 0);
+            }
+            return buffer.array();
+        }
+    }
+
+}

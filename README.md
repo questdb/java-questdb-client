@@ -555,7 +555,9 @@ Applied by the query pool to select and fail over between the nodes in the `addr
 | `client_id` |         | Opaque client identifier surfaced server-side for observability                          |
 
 The ingest side also accepts store-and-forward and reconnection tuning keys (`auto_flush_*`, `initial_connect_retry`,
-`reconnect_*`, `request_durable_ack`, `sf_*`, `max_frame_rejections`, `poison_min_escalation_window_millis`, …).
+`reconnect_*`, `request_durable_ack`, `sf_*`, `max_frame_rejections`, `poison_min_escalation_window_millis`, …) and
+the schema-aware keys `schema_mode` (`auto`, `strict`, `off`) and `schema_wait_millis`; see
+[docs/schema-aware-ingestion.md](docs/schema-aware-ingestion.md).
 `sf_durability=periodic` checkpoints mmap-published data in the background; `sf_sync_interval_millis` defaults to `5000`
 in that mode. The interval is a target cadence: JVM scheduling and storage-sync latency add to the actual loss window.
 Use `request_durable_ack=on` when end-to-end server durability is also required. See the

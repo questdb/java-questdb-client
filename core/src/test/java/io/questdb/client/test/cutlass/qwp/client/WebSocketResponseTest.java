@@ -400,7 +400,8 @@ public class WebSocketResponseTest {
             int size = WebSocketResponse.MIN_ERROR_RESPONSE_SIZE;
             long ptr = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
             try {
-                Unsafe.getUnsafe().putByte(ptr, (byte) 0xFF);
+                // Unknown low-six-bit status remains a legacy error response.
+                Unsafe.getUnsafe().putByte(ptr, (byte) 0x3F);
                 Unsafe.getUnsafe().putLong(ptr + 1, 1L);
                 Unsafe.getUnsafe().putShort(ptr + 9, (short) 0);
 
@@ -409,8 +410,8 @@ public class WebSocketResponseTest {
 
                 WebSocketResponse parsed = new WebSocketResponse();
                 Assert.assertTrue(parsed.readFrom(ptr, size));
-                Assert.assertEquals((byte) 0xFF, parsed.getStatus());
-                Assert.assertEquals("UNKNOWN(255)", parsed.getStatusName());
+                Assert.assertEquals((byte) 0x3F, parsed.getStatus());
+                Assert.assertEquals("UNKNOWN(63)", parsed.getStatusName());
             } finally {
                 Unsafe.free(ptr, size, MemoryTag.NATIVE_DEFAULT);
             }

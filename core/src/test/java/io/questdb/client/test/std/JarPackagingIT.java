@@ -43,14 +43,15 @@ import java.util.jar.JarFile;
  * <li>the module name silently changing from {@code io.questdb.client} to the
  * filename-derived {@code questdb.client} (no module-info.class on JDK 8
  * builds and no Automatic-Module-Name),</li>
- * <li>JDK 8 builds shipping only the {@code sun.misc.FDBigInteger} FdBig
- * bridge, which throws {@code NoClassDefFoundError} on Java 9+ without the
- * {@code META-INF/versions/11} counterpart.</li>
+ * <li>JDK 8 builds shipping only the Java 8 {@code Compat} shim, whose
+ * {@code multiplyHigh} fallback the Ryu double formatter calls on every
+ * value, without the {@code META-INF/versions/11} counterpart that lets
+ * Java 9+ use the {@code Math.multiplyHigh} intrinsic instead.</li>
  * </ul>
  */
 public class JarPackagingIT {
-    private static final String FD_BIG_ENTRY = "io/questdb/client/std/FdBig.class";
-    private static final String VERSIONED_FD_BIG_ENTRY = "META-INF/versions/11/" + FD_BIG_ENTRY;
+    private static final String COMPAT_ENTRY = "io/questdb/client/std/Compat.class";
+    private static final String VERSIONED_COMPAT_ENTRY = "META-INF/versions/11/" + COMPAT_ENTRY;
 
     @Test
     public void testDoubleFormattingAgainstPackagedJar() throws Exception {
@@ -106,19 +107,16 @@ public class JarPackagingIT {
                 // JDK 8 build: the shipping layout. Root classes target Java 8,
                 // the java11 bridge rides in META-INF/versions/11.
                 Assert.assertTrue(
-                        "root FdBig of a JDK 8 build must use sun.misc.FDBigInteger",
-                        classReferences(jar, FD_BIG_ENTRY, "sun/misc/FDBigInteger")
-                );
-                // the java11 bridge never names the class (JDK 26 made it package-private);
-                // it loads it by dotted name and binds method handles, so the
-                // constant-pool witness is the dotted string literal
-                Assert.assertTrue(
-                        "META-INF/versions/11 FdBig must bind jdk.internal.math.FDBigInteger",
-                        classReferences(jar, VERSIONED_FD_BIG_ENTRY, "jdk.internal.math.FDBigInteger")
+                        "root Compat of a JDK 8 build must use the Java 8 ManagementFactory variant",
+                        classReferences(jar, COMPAT_ENTRY, "java/lang/management/ManagementFactory")
                 );
                 Assert.assertNotNull(
                         "META-INF/versions/11 must carry the java11 Compat shim",
-                        jar.getEntry("META-INF/versions/11/io/questdb/client/std/Compat.class")
+                        jar.getEntry(VERSIONED_COMPAT_ENTRY)
+                );
+                Assert.assertTrue(
+                        "META-INF/versions/11 Compat must use the Math.multiplyHigh intrinsic",
+                        classReferences(jar, VERSIONED_COMPAT_ENTRY, "multiplyHigh")
                 );
                 // every source in src/main/java11 must ship in versions/11 -- a file added
                 // to the source root but missed by the packaging step would recreate the
@@ -133,8 +131,8 @@ public class JarPackagingIT {
                 // JDK 11+ build: dev/smoke only, never shipped. Root classes are the
                 // java11 variants and the real module descriptor is present.
                 Assert.assertTrue(
-                        "root FdBig of a JDK 11+ build must bind jdk.internal.math.FDBigInteger",
-                        classReferences(jar, FD_BIG_ENTRY, "jdk.internal.math.FDBigInteger")
+                        "root Compat of a JDK 11+ build must use the Math.multiplyHigh intrinsic",
+                        classReferences(jar, COMPAT_ENTRY, "multiplyHigh")
                 );
                 Assert.assertNotNull("module-info.class missing", jar.getEntry("module-info.class"));
             }

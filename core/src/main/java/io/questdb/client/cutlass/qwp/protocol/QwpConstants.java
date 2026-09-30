@@ -246,6 +246,7 @@ public final class QwpConstants {
             case TYPE_CHAR:
                 return 2;
             case TYPE_INT:
+            case TYPE_IPv4:
             case TYPE_FLOAT:
                 return 4;
             case TYPE_LONG:
@@ -291,6 +292,9 @@ public final class QwpConstants {
                 break;
             case TYPE_INT:
                 name = "INT";
+                break;
+            case TYPE_IPv4:
+                name = "IPv4";
                 break;
             case TYPE_LONG:
                 name = "LONG";
@@ -359,6 +363,7 @@ public final class QwpConstants {
                 (int) typeCode == TYPE_SHORT ||
                 (int) typeCode == TYPE_CHAR ||
                 (int) typeCode == TYPE_INT ||
+                (int) typeCode == TYPE_IPv4 ||
                 (int) typeCode == TYPE_LONG ||
                 (int) typeCode == TYPE_FLOAT ||
                 (int) typeCode == TYPE_DOUBLE ||

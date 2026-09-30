@@ -24,7 +24,11 @@
 
 package io.questdb.client.cutlass.qwp.client;
 
+import io.questdb.client.cairo.TableUtils;
+import io.questdb.client.cutlass.qwp.protocol.QwpSchemaProtocol;
+import io.questdb.client.cutlass.qwp.protocol.QwpSchemaResponse;
 import io.questdb.client.std.LongList;
+import io.questdb.client.std.LowerCaseCharSequenceIntHashMap;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.std.Utf8SequenceObjHashMap;
@@ -32,6 +36,9 @@ import io.questdb.client.std.str.DirectUtf8String;
 import io.questdb.client.std.str.Utf8s;
 import org.jetbrains.annotations.TestOnly;
 
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 
 /**
@@ -63,6 +70,9 @@ import java.nio.charset.StandardCharsets;
  */
 public class WebSocketResponse {
 
+    public static final int SCHEMA_FEEDBACK_MODE_INVALIDATE_ALL = 0xC0;
+    public static final int SCHEMA_FEEDBACK_MODE_MASK = 0xC0;
+    public static final int SCHEMA_FEEDBACK_MODE_UPDATES = 0x80;
     public static final int MAX_ERROR_MESSAGE_LENGTH = 1024;
     public static final int MIN_DURABLE_ACK_SIZE = 3; // status + tableCount
     public static final int MIN_ERROR_RESPONSE_SIZE = 11; // status + sequence + error length
@@ -102,9 +112,12 @@ public class WebSocketResponse {
     private final Utf8SequenceObjHashMap<String> tableNameCache = new Utf8SequenceObjHashMap<>();
     private final ObjList<String> tableNames = new ObjList<>();
     private final LongList tableSeqTxns = new LongList();
+    private final ObjList<String> schemaUpdateTableNames = new ObjList<>();
+    private final ObjList<QwpSchemaResponse> schemaUpdates = new ObjList<>();
     private String errorMessage;
     private int errorMessageUtf8Length;
     private long sequence;
+    private boolean schemaInvalidation;
     private byte status;
 
     public WebSocketResponse() {
@@ -249,6 +262,26 @@ public class WebSocketResponse {
         return tableSeqTxns.getQuick(index);
     }
 
+    public int getSchemaUpdateCount() {
+        return schemaUpdates.size();
+    }
+
+    public QwpSchemaResponse getSchemaUpdate(int index) {
+        return schemaUpdates.getQuick(index);
+    }
+
+    public String getSchemaUpdateTableName(int index) {
+        return schemaUpdateTableNames.getQuick(index);
+    }
+
+    public boolean hasSchemaUpdates() {
+        return schemaUpdates.size() > 0;
+    }
+
+    public boolean isSchemaInvalidation() {
+        return schemaInvalidation;
+    }
+
     /**
      * Returns true when this is a per-table durable-upload ACK (STATUS_DURABLE_ACK).
      */
@@ -271,14 +304,38 @@ public class WebSocketResponse {
      * @return true if successfully parsed, false if not enough data
      */
     public boolean readFrom(long ptr, int length) {
+        return readFrom(ptr, length, false);
+    }
+
+    /**
+     * Reads a response, accepting schema feedback only on a connection that
+     * negotiated schema support during its WebSocket upgrade.
+     */
+    public boolean readFrom(long ptr, int length, boolean schemaNegotiated) {
         tableNames.clear();
         tableSeqTxns.clear();
+        schemaUpdateTableNames.clear();
+        schemaUpdates.clear();
+        schemaInvalidation = false;
 
         if (length < 1) {
             return false;
         }
 
-        status = Unsafe.getUnsafe().getByte(ptr);
+        int wireStatus = Unsafe.getUnsafe().getByte(ptr) & 0xff;
+        int feedbackMode = wireStatus & SCHEMA_FEEDBACK_MODE_MASK;
+        if (feedbackMode == 0x40 || (feedbackMode != 0 && !schemaNegotiated)) {
+            return false;
+        }
+        if (feedbackMode == SCHEMA_FEEDBACK_MODE_UPDATES && length > QwpSchemaProtocol.MAX_FRAME_SIZE) {
+            return false;
+        }
+        byte baseStatus = (byte) (wireStatus & ~SCHEMA_FEEDBACK_MODE_MASK);
+        if (baseStatus == STATUS_DURABLE_ACK && feedbackMode != 0) {
+            return false;
+        }
+        status = baseStatus;
+        int baseEnd;
 
         if (status == STATUS_OK) {
             if (length < MIN_OK_RESPONSE_SIZE) {
@@ -287,7 +344,12 @@ public class WebSocketResponse {
             sequence = Unsafe.getUnsafe().getLong(ptr + 1);
             errorMessage = null;
             errorMessageUtf8Length = -1;
-            return readTableEntries(ptr + 9, length - 9);
+            baseEnd = readTableEntries(ptr + 9, length - 9, feedbackMode != 0);
+            if (baseEnd < 0) {
+                return false;
+            }
+            baseEnd += 9;
+            return readFeedback(ptr, length, baseEnd, feedbackMode);
         }
 
         if (status == STATUS_DURABLE_ACK) {
@@ -297,7 +359,7 @@ public class WebSocketResponse {
             sequence = -1;
             errorMessage = null;
             errorMessageUtf8Length = -1;
-            return readTableEntries(ptr + 1, length - 1);
+            return readTableEntries(ptr + 1, length - 1, false) >= 0;
         }
 
         // Error response
@@ -322,7 +384,8 @@ public class WebSocketResponse {
             errorMessage = null;
             errorMessageUtf8Length = 0;
         }
-        return true;
+        baseEnd = offset + msgLen;
+        return readFeedback(ptr, length, baseEnd, feedbackMode);
     }
 
     /**
@@ -391,15 +454,15 @@ public class WebSocketResponse {
     // entries, empty table names, or trailing garbage. On false, tableNames /
     // tableSeqTxns may hold partial state, but the caller (readFrom) clears
     // both lists at the start of every call so partial state never leaks.
-    private boolean readTableEntries(long ptr, int remaining) {
+    private int readTableEntries(long ptr, int remaining, boolean allowTrailing) {
         if (remaining < 2) {
-            return false;
+            return -1;
         }
         int tableCount = Unsafe.getUnsafe().getShort(ptr) & 0xFFFF;
         int offset = 2;
         for (int i = 0; i < tableCount; i++) {
             if (remaining < offset + 2) {
-                return false;
+                return -1;
             }
             int nameLen = Unsafe.getUnsafe().getShort(ptr + offset) & 0xFFFF;
             offset += 2;
@@ -407,7 +470,7 @@ public class WebSocketResponse {
             // table name is never zero bytes, and accepting empty names would
             // let a misbehaving server poison the per-table tracker with "" entries.
             if (nameLen == 0 || remaining < offset + nameLen + 8) {
-                return false;
+                return -1;
             }
             long nameLo = ptr + offset;
             long nameHi = nameLo + nameLen;
@@ -417,7 +480,87 @@ public class WebSocketResponse {
             tableNames.add(internTableName(nameLo, nameHi));
             tableSeqTxns.add(seqTxn);
         }
-        return remaining == offset;
+        return allowTrailing || remaining == offset ? offset : -1;
+    }
+
+    private boolean readFeedback(long ptr, int length, int offset, int mode) {
+        if (mode == 0) {
+            return offset == length;
+        }
+        if (mode == SCHEMA_FEEDBACK_MODE_INVALIDATE_ALL) {
+            if (offset != length) {
+                return false;
+            }
+            schemaInvalidation = true;
+            return true;
+        }
+        if (length - offset < 2) {
+            return false;
+        }
+        int count = Unsafe.getUnsafe().getShort(ptr + offset) & 0xffff;
+        offset += 2;
+        if (count == 0) {
+            return false;
+        }
+        // Each entry needs nameLen + one name byte + payloadLen + the shortest
+        // schema payload. Reject hostile counts before sizing collections.
+        if (count > (length - offset) / 17) {
+            return false;
+        }
+        ObjList<String> names = new ObjList<>(count);
+        ObjList<QwpSchemaResponse> responses = new ObjList<>(count);
+        LowerCaseCharSequenceIntHashMap seen = new LowerCaseCharSequenceIntHashMap(count);
+        try {
+            for (int i = 0; i < count; i++) {
+                if (length - offset < 2) {
+                    return false;
+                }
+                int nameLength = Unsafe.getUnsafe().getShort(ptr + offset) & 0xffff;
+                offset += 2;
+                if (nameLength == 0 || nameLength > QwpSchemaProtocol.MAX_NAME_UTF8_LENGTH || length - offset < nameLength + 4) {
+                    return false;
+                }
+                String name = decodeStrictUtf8(ptr + offset, nameLength);
+                if (!TableUtils.isValidTableName(name, QwpSchemaProtocol.MAX_NAME_UTF16_LENGTH) || !seen.put(name, i)) {
+                    return false;
+                }
+                offset += nameLength;
+                long payloadLength = Unsafe.getUnsafe().getInt(ptr + offset) & 0xffffffffL;
+                offset += 4;
+                if (payloadLength > QwpSchemaProtocol.MAX_FRAME_SIZE || payloadLength > length - offset) {
+                    return false;
+                }
+                QwpSchemaResponse response = QwpSchemaProtocol.decodeFeedbackPayload(ptr + offset, (int) payloadLength);
+                offset += (int) payloadLength;
+                names.add(name);
+                responses.add(response);
+            }
+        } catch (IllegalArgumentException e) {
+            return false;
+        }
+        if (offset != length) {
+            return false;
+        }
+        for (int i = 0; i < names.size(); i++) {
+            schemaUpdateTableNames.add(names.getQuick(i));
+            schemaUpdates.add(responses.getQuick(i));
+        }
+        return true;
+    }
+
+    private static String decodeStrictUtf8(long address, int length) {
+        byte[] bytes = new byte[length];
+        for (int i = 0; i < length; i++) {
+            bytes[i] = Unsafe.getUnsafe().getByte(address + i);
+        }
+        try {
+            return StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)
+                    .decode(ByteBuffer.wrap(bytes)).toString();
+        } catch (CharacterCodingException e) {
+            throw new IllegalArgumentException("invalid UTF-8 feedback table name", e);
+        }
     }
 
     private String internTableName(long lo, long hi) {
