@@ -418,28 +418,30 @@ public class LineHttpSenderTokenProviderTest {
 
     @Test
     public void testProviderTokenNotPulledAtBuildAndPulledOnFirstRow() throws Exception {
-        assertMemoryLeak(() -> {
-            AtomicInteger calls = new AtomicInteger();
-            HttpTokenProvider provider = () -> {
-                calls.incrementAndGet();
-                return "TOKEN";
-            };
-            try (Sender sender = Sender.builder(Sender.Transport.HTTP)
-                    .address("127.0.0.1:1")
-                    .protocolVersion(Sender.PROTOCOL_VERSION_V1)
-                    .disableAutoFlush()
-                    .httpTokenProvider(provider)
-                    .build()) {
-                // build() must not query the provider: a lazily-signing-in provider would not have a token yet
-                Assert.assertEquals("provider must not be queried at build time", 0, calls.get());
-                // the first row pulls the deferred token so the first send will carry it
-                sender.table("t").longColumn("v", 1L).atNow();
-                Assert.assertEquals("provider must be queried when the first row starts", 1, calls.get());
-                // a second row in the same un-flushed batch reuses the same request, so it does not re-pull
-                sender.table("t").longColumn("v", 2L).atNow();
-                Assert.assertEquals("provider must not be re-queried within the same batch", 1, calls.get());
-            }
-        });
+        for (int protocolVersion : new int[]{Sender.PROTOCOL_VERSION_V1, Sender.PROTOCOL_VERSION_V2, Sender.PROTOCOL_VERSION_V3}) {
+            assertMemoryLeak(() -> {
+                AtomicInteger calls = new AtomicInteger();
+                HttpTokenProvider provider = () -> {
+                    calls.incrementAndGet();
+                    return "TOKEN";
+                };
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:1")
+                        .protocolVersion(protocolVersion)
+                        .disableAutoFlush()
+                        .httpTokenProvider(provider)
+                        .build()) {
+                    // build() must not query the provider: a lazily-signing-in provider would not have a token yet
+                    Assert.assertEquals("provider must not be queried at build time", 0, calls.get());
+                    // the first row pulls the deferred token so the first send will carry it
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    Assert.assertEquals("provider must be queried when the first row starts", 1, calls.get());
+                    // a second row in the same un-flushed batch reuses the same request, so it does not re-pull
+                    sender.table("t").longColumn("v", 2L).atNow();
+                    Assert.assertEquals("provider must not be re-queried within the same batch", 1, calls.get());
+                }
+            });
+        }
     }
 
     @Test(timeout = 30_000)

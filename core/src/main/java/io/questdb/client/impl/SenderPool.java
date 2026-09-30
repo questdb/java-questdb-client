@@ -38,6 +38,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLockContentionException;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.IntList;
+import io.questdb.client.std.Misc;
 import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -1972,13 +1973,7 @@ public final class SenderPool implements AutoCloseable {
                     addSuppressed(failure, deregistrationFailure);
                 }
             }
-            if (delegate != null) {
-                try {
-                    delegate.close();
-                } catch (Throwable closeFailure) {
-                    addSuppressed(failure, closeFailure);
-                }
-            }
+            Misc.freeSuppressing(delegate, failure);
             throw failure;
         }
     }
