@@ -5452,6 +5452,23 @@ public class QwpWebSocketSender implements Sender {
         }
     }
 
+    /**
+     * {@link #closeLoopInterruptNeutral} for recycle step 2: stops the loop
+     * through {@link CursorWebSocketSendLoop#closeIfLinkUp()}, so it returns
+     * {@code false}, with nothing done, once the I/O thread has begun a
+     * connect walk.
+     */
+    private boolean closeLoopIfLinkUpInterruptNeutral(CursorWebSocketSendLoop loop) {
+        final boolean carried = Thread.interrupted();
+        try {
+            return loop.closeIfLinkUp();
+        } finally {
+            if (carried) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
     private void closeRecoveredEngine(CursorSendEngine recovered) {
         recyclePendingOutgoing = recovered;
         try {
@@ -5651,7 +5668,8 @@ public class QwpWebSocketSender implements Sender {
      * <p>
      * Otherwise waits (parked, {@code awaitAckedFsn}-shaped) until either the
      * ring drains -- in which case the recycle runs synchronously before
-     * returning -- or {@code resetMaxWaitMillis} elapses from THIS call, in
+     * returning, or stays armed if the I/O loop has begun a reconnect meanwhile
+     * (see {@link #recycleForDictReset()} step 2) -- or {@code resetMaxWaitMillis} elapses from THIS call, in
      * which case it gives up, counts the timeout, and leaves
      * {@link #resetArmed} set so a later drained {@link #table(CharSequence)}
      * call can still recycle opportunistically.
@@ -5712,7 +5730,12 @@ public class QwpWebSocketSender implements Sender {
      * close cancels a live socket in milliseconds, but a reconnect blocked in
      * a hostname resolve or a credential pull ignores the cancel and would
      * hold the caller for the join budget, so the recycle stays armed and
-     * runs at the first drained barrier after the reconnect. Otherwise
+     * runs at the first drained barrier after the reconnect. That check is
+     * only a pre-check -- a drop can start the reconnect at any moment after
+     * it, the starvation wait included -- so step 2 stops the loop through
+     * {@link CursorWebSocketSendLoop#closeIfLinkUp()}, which refuses
+     * atomically once the reconnect has begun and leaves the recycle armed
+     * the same way. Otherwise
      * proceeds to the ring-drained check: if the backlog is empty, recycle
      * immediately; if not, defer to {@link #maybeBlockForStarvedReset()}'s
      * starvation-wait policy instead of blocking the caller indefinitely here.
@@ -5776,7 +5799,11 @@ public class QwpWebSocketSender implements Sender {
      * <ol>
      *   <li>Snapshot the outgoing epoch's last published (raw) FSN.</li>
      *   <li>Close and null the cursor I/O loop -- joins the I/O thread and
-     *       closes the WebSocket client. {@code hasLoopEverConnected} is read
+     *       closes the WebSocket client -- but only while its link is still up
+     *       ({@link CursorWebSocketSendLoop#closeIfLinkUp()}); once the I/O
+     *       thread has begun a reconnect, the recycle gives back a step-0 lock
+     *       it took and returns still armed, nothing torn down.
+     *       {@code hasLoopEverConnected} is read
      *       only AFTER {@code close()} returns: the join makes even an
      *       ASYNC-initial sender's connect (observed only by the I/O thread,
      *       never by {@code ensureConnected}'s {@code client != null} branch)
@@ -5867,11 +5894,13 @@ public class QwpWebSocketSender implements Sender {
         // finding no segment files) costs the caller one refused row, leaves
         // the outgoing stack and the arming intact, and the next drained
         // barrier retries. Already held when a CLOSE_LOOP abandon re-fires.
+        boolean slotLockTakenHere = false;
         if (recycleSlotLock == null) {
             String slotDir = cursorEngine.sfDir();
             if (slotDir != null) {
                 try {
                     recycleSlotLock = SlotLock.acquireLogical(slotDir);
+                    slotLockTakenHere = true;
                 } catch (Error e) {
                     throw e;
                 } catch (Throwable t) {
@@ -5891,7 +5920,21 @@ public class QwpWebSocketSender implements Sender {
         // step 2: close the loop - joins the I/O thread, closes the client.
         try {
             if (cursorSendLoop != null) {
-                closeLoopInterruptNeutral(cursorSendLoop);
+                if (!closeLoopIfLinkUpInterruptNeutral(cursorSendLoop)) {
+                    // The I/O thread began a reconnect after the barrier's
+                    // link check -- typically a server close right behind the
+                    // ack that drained the ring. Stopping it now could hold
+                    // this caller for the whole join budget in a credential
+                    // pull or hostname resolve. Nothing is torn down: give
+                    // back a lock this call took and stay armed, exactly as
+                    // the barrier does for a loop it already sees reconnecting.
+                    if (slotLockTakenHere) {
+                        releaseRecycleSlotLock();
+                    }
+                    LOG.info("symbol dictionary recycle deferred: the I/O loop began a reconnect; "
+                            + "retried at the first drained row start after it [epoch={}]", symbolDictEpoch);
+                    return;
+                }
                 // Read the sticky AFTER close(): close joins the I/O thread,
                 // so a connect that landed mid-window is final here. This and
                 // the CLOSE_LOOP resume's re-close are the only places an

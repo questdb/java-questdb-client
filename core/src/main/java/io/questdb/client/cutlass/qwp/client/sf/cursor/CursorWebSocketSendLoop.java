@@ -54,6 +54,7 @@ import java.util.Arrays;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
 
@@ -201,6 +202,15 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * already shipped inside a data frame is never reclassified as unsendable.
      */
     static final int UNCAPPED_CATCHUP_PACKING_LIMIT = 64 * 1024;
+    // connectGate states, see closeIfLinkUp(). OPEN (the field's default, so a
+    // bare allocateInstance loop starts OPEN too): no connect walk is running.
+    // WALKING: the I/O thread is inside connectLoop. STOP_CLAIMED: the owner
+    // claimed a live-link stop, so no connect walk may start any more.
+    private static final AtomicIntegerFieldUpdater<CursorWebSocketSendLoop> CONNECT_GATE =
+            AtomicIntegerFieldUpdater.newUpdater(CursorWebSocketSendLoop.class, "connectGate");
+    private static final int CONNECT_GATE_OPEN = 0;
+    private static final int CONNECT_GATE_STOP_CLAIMED = 2;
+    private static final int CONNECT_GATE_WALKING = 1;
     private static final Logger LOG = LoggerFactory.getLogger(CursorWebSocketSendLoop.class);
     // Settle budget for the symbol-dict catch-up cap gap: how many cap-gap attempts
     // -- catch-ups that reached a fresh server and found a single dictionary entry
@@ -421,6 +431,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // deterministically without a multi-second real wait; production always
     // uses the default. Read only on the owner thread inside close().
     private long shutdownAwaitTimeoutMillis = DEFAULT_CLOSE_SHUTDOWN_AWAIT_MILLIS;
+    // Decides, atomically, between the owner's live-link stop (closeIfLinkUp)
+    // and the I/O thread's entry into a connect walk: exactly one of them wins.
+    // Updated only through CONNECT_GATE.
+    private volatile int connectGate;
     // Sticky flag: false until the very first time a live client is installed
     // (either via the constructor in SYNC/OFF mode or via swapClient on a
     // successful connect attempt in any mode). Once true, stays true.
@@ -1439,6 +1453,33 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * {@link #close()} for the symbol-dictionary recycle: stops the loop only
+     * while it holds a live link, and never after its I/O thread has started a
+     * connect walk. Returns {@code false}, leaving the loop untouched and
+     * running, when the link is down or a walk is under way -- a walk can sit
+     * in a credential pull or a hostname resolve that close() cannot cancel,
+     * which would hold the caller for the whole shutdown budget.
+     * <p>
+     * The decision is one CAS on {@code connectGate}, the same one
+     * {@link #connectLoop} takes before it does anything else, so exactly one
+     * side wins. After a successful claim the I/O thread never starts a walk:
+     * one that observes a drop parks until close() clears {@code running}. A
+     * drop the I/O thread has not observed yet therefore costs close() only
+     * the live-socket cancel it always handled in milliseconds.
+     *
+     * @return {@code true} if the claim succeeded and close() ran (it throws
+     * on the same failed-stop paths as a direct call); {@code false} if
+     * nothing was done
+     */
+    public boolean closeIfLinkUp() {
+        if (!isLinkUp() || !CONNECT_GATE.compareAndSet(this, CONNECT_GATE_OPEN, CONNECT_GATE_STOP_CLAIMED)) {
+            return false;
+        }
+        close();
+        return true;
+    }
+
+    /**
      * Hands complete owner cleanup to the I/O thread when it could not be
      * stopped. The callback runs after the thread's last client, buffer, and
      * engine access. Returns false if the thread already exited, in which case
@@ -1568,16 +1609,22 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
 
     /**
      * True while the I/O thread holds a live connection: the loop is running,
-     * not inside its reconnect loop, and the installed client is connected
-     * and upgraded. The recycle barrier swaps only in this state because
-     * {@link #close()} can cancel a live socket but not a reconnect blocked
-     * in a hostname resolve or a credential pull. A drop the I/O thread has
-     * not observed yet still reads as up; that window is the one close()'s
-     * bounded await already covers.
+     * not inside a connect walk (including a paced one's pre-attempt park),
+     * and the installed client is connected and upgraded. The recycle barrier
+     * swaps only in this state because {@link #close()} can cancel a live
+     * socket but not a reconnect blocked in a hostname resolve or a credential
+     * pull. This is only the barrier's cheap pre-check: a drop the I/O thread
+     * has not observed yet still reads as up, and the walk that follows it can
+     * start at any moment, so the stop itself goes through
+     * {@link #closeIfLinkUp()}.
      */
     public boolean isLinkUp() {
         WebSocketClient c = client;
-        return running && lastReconnectError == null && c != null && c.isConnected();
+        return running
+                && connectGate == CONNECT_GATE_OPEN
+                && lastReconnectError == null
+                && c != null
+                && c.isConnected();
     }
 
     public boolean isRunning() {
@@ -1814,8 +1861,38 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * and the {@link SenderError} message — control flow is identical.
      * {@code paceFirstAttemptMillis} > 0 parks for that long (+jitter)
      * before the first connect attempt — see {@link #failPaced}.
+     * <p>
+     * Entry takes {@code connectGate} (see {@link #closeIfLinkUp()}) before
+     * anything that can block. A walk the owner's live-link stop has already
+     * claimed out does not start: the thread parks until that stop's close()
+     * clears {@code running}, then returns without connecting.
      */
     private void connectLoop(Throwable initial, String phase, long paceFirstAttemptMillis) {
+        if (!CONNECT_GATE.compareAndSet(this, CONNECT_GATE_OPEN, CONNECT_GATE_WALKING)) {
+            if (connectGate == CONNECT_GATE_STOP_CLAIMED) {
+                // close() is running or imminent and unparks this thread.
+                while (running) {
+                    LockSupport.parkNanos(parkNanos);
+                }
+                return;
+            }
+            // WALKING: entered from inside a walk, which the design avoids
+            // (see CatchUpSendException). The outer frame owns the gate, so
+            // walk exactly as before the gate existed and leave it alone.
+            connectWalk(initial, phase, paceFirstAttemptMillis);
+            return;
+        }
+        try {
+            connectWalk(initial, phase, paceFirstAttemptMillis);
+        } finally {
+            CONNECT_GATE.compareAndSet(this, CONNECT_GATE_WALKING, CONNECT_GATE_OPEN);
+        }
+    }
+
+    /**
+     * The walk itself, entered only through {@link #connectLoop}.
+     */
+    private void connectWalk(Throwable initial, String phase, long paceFirstAttemptMillis) {
         if (!running) {
             return;
         }

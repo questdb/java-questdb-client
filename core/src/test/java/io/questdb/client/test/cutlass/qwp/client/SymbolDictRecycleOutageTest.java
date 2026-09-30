@@ -24,9 +24,13 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.HttpTokenProvider;
 import io.questdb.client.Sender;
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
+import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
 import org.junit.Rule;
@@ -34,10 +38,13 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -65,6 +72,10 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  * objects owned by {@code BackgroundDrainerPool}, so a recycle firing while a
  * drain is in flight must leave the drain untouched and able to complete
  * afterward.
+ * <p>
+ * (c) proves a drop that starts right behind the ack draining the ring --
+ * after the barrier's link check -- cannot hold the producer either: step 2
+ * stops the loop only if its I/O thread has not begun the reconnect.
  */
 public class SymbolDictRecycleOutageTest {
 
@@ -485,6 +496,146 @@ public class SymbolDictRecycleOutageTest {
         });
     }
 
+    /**
+     * (c) A server that answers the last outstanding frame with its ack and
+     * then closes -- a restart or drain sending GOING_AWAY -- while table()
+     * sits in the starvation wait. The ack ends the wait with the link still
+     * up, but the I/O thread starts its reconnect at once, typically while the
+     * recycle is still taking the slot lock, and that reconnect's credential
+     * pull ignores interrupts here, as a blocking java.net read or the bundled
+     * OidcDeviceAuth's native HTTP round trip does. A step-2 close() landing
+     * after the reconnect began used to wait out the whole shutdown budget,
+     * throw, and leave a CLOSE_LOOP resume that waited it out again on every
+     * send, so no row was accepted until the pull returned. Step 2 now stops
+     * the loop only if the reconnect has not begun: every call returns
+     * promptly without throwing, rows keep buffering while the pull is stuck,
+     * and the recycle either ran at once or stays armed and runs at the first
+     * drained barrier after the reconnect. The race is real, so a single
+     * iteration may not lose it even without the fix (roughly a third of them
+     * do): the loop repeats it, and the loop-close budget is shrunk so a
+     * regression fails in half a second instead of thirty. An iteration whose
+     * ack arrives only after the wait's deadline (a stalled CI box) never
+     * reaches the swap; it must still pass, but most iterations must race.
+     */
+    @Test(timeout = 120_000L)
+    public void testServerCloseBehindDrainingAckDoesNotStallProducer() throws Exception {
+        assertMemoryLeak(() -> {
+            int iterations = 15;
+            int raced = 0;
+            for (int i = 0; i < iterations; i++) {
+                if (assertServerCloseBehindDrainingAckDoesNotStall(i)) {
+                    raced++;
+                }
+            }
+            Assert.assertTrue("too few iterations reached the swap to exercise the race [raced="
+                    + raced + '/' + iterations + ']', raced >= 10);
+        });
+    }
+
+    private static CursorWebSocketSendLoop cursorSendLoop(QwpWebSocketSender ws) throws Exception {
+        Field f = QwpWebSocketSender.class.getDeclaredField("cursorSendLoop");
+        f.setAccessible(true);
+        return (CursorWebSocketSendLoop) f.get(ws);
+    }
+
+    /**
+     * Returns whether the ack ended the starvation wait, i.e. whether this
+     * iteration reached the swap while the reconnect was starting.
+     */
+    private boolean assertServerCloseBehindDrainingAckDoesNotStall(int iteration) throws Exception {
+        final long maxWaitMillis = 300;
+        final String at = "iteration " + iteration + ": ";
+        String sfDir = temporaryFolder.getRoot().toPath().resolve("close-behind-ack-" + iteration).toString();
+        HoldThenGoAwayHandler handler = new HoldThenGoAwayHandler();
+        BlockingTokenProvider tokens = new BlockingTokenProvider();
+        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            try (Sender sender = Sender.builder(Sender.Transport.WEBSOCKET)
+                    .address("localhost:" + server.getPort())
+                    .storeAndForwardDir(sfDir)
+                    .symbolDictResetThreshold(2)
+                    .symbolDictResetMaxWaitMillis(maxWaitMillis)
+                    .httpTokenProvider(tokens)
+                    .build()) {
+                QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                try {
+                    // A regression fails in half a second, not after the 30 s default.
+                    cursorSendLoop(ws).setShutdownAwaitTimeoutMillis(500);
+
+                    // Arm while the server withholds the arming batch's ack.
+                    handler.hold = true;
+                    sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
+                    sender.table("t").symbol("s", "b").longColumn("v", 2L).atNow();
+                    sender.flush();
+                    Assert.assertTrue(at + "the arming batch must reach the server",
+                            handler.awaitHeld(5, TimeUnit.SECONDS));
+                    Assert.assertTrue(at + "must be armed", ws.isResetArmed());
+                    // Let the armed window elapse so the next table() takes the starvation wait.
+                    Thread.sleep(maxWaitMillis + 50);
+                    handler.hold = false;
+                    tokens.block(); // the reconnect's credential pull will not return
+
+                    Thread releaser = new Thread(() -> {
+                        try {
+                            Thread.sleep(50);
+                            handler.ackHeldThenGoAway();
+                        } catch (Exception e) {
+                            throw new RuntimeException(e);
+                        }
+                    }, "ack-then-go-away");
+                    releaser.start();
+                    long elapsedMillis;
+                    try {
+                        long t0 = System.nanoTime();
+                        sender.table("t"); // parks in the starvation wait until the ack lands
+                        elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0);
+                    } catch (LineSenderException e) {
+                        throw new AssertionError(at + "a close behind the draining ack must not fail the "
+                                + "producer: " + e.getMessage(), e);
+                    } finally {
+                        releaser.join();
+                    }
+                    Assert.assertTrue(at + "table() must not wait on the reconnect [millis="
+                            + elapsedMillis + ']', elapsedMillis < 2_000);
+                    final boolean raced = ws.getSymbolDictResetStarvationTimeouts() == 0;
+                    if (ws.getSymbolDictEpoch() == 0) {
+                        Assert.assertTrue(at + "a recycle that lost the race stays armed", ws.isResetArmed());
+                    }
+
+                    // Either the old loop's reconnect or the fresh loop's first
+                    // connect is now stuck in its pull; rows must keep buffering.
+                    Assert.assertTrue(at + "the credential pull never blocked",
+                            tokens.awaitBlocked(5, TimeUnit.SECONDS));
+                    long fsn = -1L;
+                    for (int r = 0; r < 5; r++) {
+                        long t0 = System.nanoTime();
+                        sender.table("t").symbol("s", "x").longColumn("v", r).atNow();
+                        long next = sender.flushAndGetSequence();
+                        long callMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0);
+                        Assert.assertTrue(at + "a row must not wait on the stuck pull [millis="
+                                + callMillis + ']', callMillis < 2_000);
+                        Assert.assertTrue(at + "rows must keep buffering while the pull is stuck", next > fsn);
+                        fsn = next;
+                    }
+
+                    tokens.release();
+                    Assert.assertTrue(at + "the buffered rows must land once the pull returns",
+                            sender.awaitAckedFsn(fsn, 10_000));
+                    sender.table("t"); // drained barrier with the link back up
+                    Assert.assertEquals(at + "the recycle must commit exactly once", 1L, ws.getSymbolDictEpoch());
+                    Assert.assertFalse(at + "a committed recycle disarms", ws.isResetArmed());
+                    sender.symbol("s", "after").longColumn("v", 9L).atNow();
+                    long after = sender.flushAndGetSequence();
+                    Assert.assertTrue(at + "the post-recycle row must land", sender.awaitAckedFsn(after, 10_000));
+                    return raced;
+                } finally {
+                    tokens.release();
+                }
+            }
+        }
+    }
+
     /** ACKs every frame it receives immediately; does not otherwise inspect the wire. */
     private static class AckAllHandler implements TestWebSocketServer.WebSocketServerHandler {
         private final AtomicLong nextSeq = new AtomicLong(0);
@@ -496,6 +647,102 @@ public class SymbolDictRecycleOutageTest {
             } catch (IOException e) {
                 throw new RuntimeException(e);
             }
+        }
+    }
+
+    /**
+     * Hands out a token at once until {@link #block()}; from then on each pull
+     * parks until {@link #release()} and ignores interrupts, as a blocking
+     * java.net read or the bundled OidcDeviceAuth's native HTTP round trip
+     * does, so the loop's close() cannot cancel it.
+     */
+    private static class BlockingTokenProvider implements HttpTokenProvider {
+        private final CountDownLatch pullBlocked = new CountDownLatch(1);
+        private final CountDownLatch released = new CountDownLatch(1);
+        private volatile boolean blocking;
+
+        @Override
+        public CharSequence getToken() {
+            if (blocking) {
+                pullBlocked.countDown();
+                boolean interrupted = false;
+                while (released.getCount() != 0L) {
+                    try {
+                        released.await();
+                    } catch (InterruptedException e) {
+                        interrupted = true;
+                    }
+                }
+                if (interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            return "token";
+        }
+
+        boolean awaitBlocked(long timeout, TimeUnit unit) throws InterruptedException {
+            return pullBlocked.await(timeout, unit);
+        }
+
+        void block() {
+            blocking = true;
+        }
+
+        void release() {
+            blocking = false;
+            released.countDown();
+        }
+    }
+
+    /**
+     * Acks per connection (each connection's wire sequence restarts at 0)
+     * unless {@link #hold} is set, in which case it withholds the ack. {@link
+     * #ackHeldThenGoAway()} then answers the withheld frame and immediately
+     * closes with GOING_AWAY: a restart or drain acking its backlog on the way
+     * out.
+     */
+    private static class HoldThenGoAwayHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private final CountDownLatch held = new CountDownLatch(1);
+        private final Map<TestWebSocketServer.ClientHandler, Long> nextSeq = new IdentityHashMap<>();
+        volatile boolean hold;
+        private TestWebSocketServer.ClientHandler heldClient;
+        private long heldSeq = -1L;
+
+        @Override
+        public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            long seq;
+            synchronized (this) {
+                Long n = nextSeq.get(client);
+                seq = n == null ? 0L : n;
+                nextSeq.put(client, seq + 1L);
+                if (hold) {
+                    heldClient = client;
+                    heldSeq = seq;
+                    held.countDown();
+                    return;
+                }
+            }
+            try {
+                client.sendBinary(QwpWireTestUtils.buildAck(seq));
+            } catch (IOException e) {
+                // connection gone: the sender replays on its next one
+            }
+        }
+
+        void ackHeldThenGoAway() throws IOException {
+            TestWebSocketServer.ClientHandler client;
+            long seq;
+            synchronized (this) {
+                client = heldClient;
+                seq = heldSeq;
+            }
+            // The ack is cumulative: acking the last withheld frame drains the
+            // ring. One write, so the close lands right behind the ack.
+            client.sendBinaryThenClose(QwpWireTestUtils.buildAck(seq), WebSocketCloseCode.GOING_AWAY, "restart");
+        }
+
+        boolean awaitHeld(long timeout, TimeUnit unit) throws InterruptedException {
+            return held.await(timeout, unit);
         }
     }
 
