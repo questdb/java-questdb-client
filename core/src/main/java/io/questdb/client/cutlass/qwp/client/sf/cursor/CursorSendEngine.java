@@ -84,12 +84,14 @@ public final class CursorSendEngine implements QuietCloseable {
     private static volatile ThreadFactory flockReleaseRetryThreadFactory =
             DEFAULT_FLOCK_RELEASE_RETRY_THREAD_FACTORY;
     private final long appendDeadlineNanos;
-    // Number of times appendBlocking observed BACKPRESSURE_NO_SPARE on its first
-    // ring.appendOrFsn attempt. One increment per blocking-call that had to wait
-    // for the manager (or for ACKs) — not one per spin-park. Producer-thread
-    // writer; volatile because the user may sample it from any thread.
-    private final java.util.concurrent.atomic.AtomicLong backpressureStallCount =
-            new java.util.concurrent.atomic.AtomicLong();
+    // Sender-lifetime observability counters; only backpressureStalls is used
+    // here: one increment per blocking appendBlocking call that had to wait
+    // for the manager (or for ACKs), not one per spin-park. Producer-thread
+    // writer; any thread may read it. A fresh instance by default;
+    // QwpWebSocketSender hands every engine it attaches its own shared
+    // instance via adoptCounters(), so a symbol-dictionary recycle's rebuilt
+    // engine keeps counting where the outgoing one stopped.
+    private CursorSendCounters counters = new CursorSendCounters();
     // Constructed before an owned manager acquires its native path scratch, so
     // callback allocation failure cannot orphan manager resources. A timed-out
     // close can then hand it to either manager path without allocating.
@@ -212,7 +214,10 @@ public final class CursorSendEngine implements QuietCloseable {
     // lock file, which would otherwise free the pathname while the caller
     // still holds the flock on it. Latched by close(boolean) before any
     // cleanup runs; volatile because finishClose can run later on the manager
-    // worker's exit thread or the shared flock-release retry driver.
+    // worker's exit thread or the shared flock-release retry driver. The
+    // symbol-dictionary recycle is another such caller: it also holds the
+    // lock across its whole swap and closes the outgoing and healing engines
+    // with false.
     private volatile boolean reclaimLogicalSlotLock = true;
     // Published before deferredClose is registered. The manager lock provides
     // the callback handoff fence; volatile also covers a direct test/retry read.
@@ -923,7 +928,7 @@ public final class CursorSendEngine implements QuietCloseable {
         }
         // First miss → record one stall (not one per spin) and start the
         // deadline clock.
-        backpressureStallCount.incrementAndGet();
+        counters.backpressureStalls.incrementAndGet();
         long deadlineNs = System.nanoTime() + appendDeadlineNanos;
         while (true) {
             long now = System.nanoTime();
@@ -937,7 +942,7 @@ public final class CursorSendEngine implements QuietCloseable {
                 lastBackpressureLogNs = now;
                 LOG.warn("cursor producer backpressured ({} stalls so far); waiting for I/O or periodic disk sync; "
                                 + "will throw after {} ms",
-                        backpressureStallCount.get(), appendDeadlineNanos / 1_000_000L);
+                        counters.backpressureStalls.get(), appendDeadlineNanos / 1_000_000L);
             }
             LockSupport.parkNanos(50_000L); // 50 µs
             fsn = ring.appendOrFsn(payloadAddr, payloadLen);
@@ -999,7 +1004,9 @@ public final class CursorSendEngine implements QuietCloseable {
      * lock file while build() still holds the flock on it. On POSIX that frees the
      * pathname without releasing the lock, so the next {@code acquireLogical} creates
      * a SECOND inode and locks it successfully: two parties owning a lock whose only
-     * job is serialising the quarantine close-&gt;rename-&gt;recreate window.
+     * job is serialising the quarantine close-&gt;rename-&gt;recreate window. The
+     * symbol-dictionary recycle is the other such caller: it holds the lock across
+     * its whole swap and closes the outgoing and healing engines with {@code false}.
      */
     public synchronized void close(boolean reclaimLogicalSlotLock) {
         // Latch before the early return: a retried close() must not widen a
@@ -1350,6 +1357,11 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     @TestOnly
+    public Runnable getSlotLockReleaseListenerForTesting() {
+        return slotLockReleaseListener;
+    }
+
+    @TestOnly
     public long getSyncIntervalNanosForTesting() {
         return syncIntervalNanos;
     }
@@ -1624,6 +1636,32 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
+     * Replaces this engine's counters with the sender's shared, sender-lifetime
+     * instance, folding this engine's own backpressure-stall count into it
+     * (the other counters are the loop's, and an engine handed between
+     * senders must not carry a previous sender's totals). Producer thread
+     * only, before the first {@link #appendBlocking} on this engine -- the
+     * same attach window {@link #setSlotLockReleaseListener} uses.
+     */
+    public void adoptCounters(CursorSendCounters shared) {
+        if (shared == counters) {
+            return;
+        }
+        shared.backpressureStalls.addAndGet(counters.backpressureStalls.get());
+        counters = shared;
+    }
+
+    /**
+     * The engine's current counters holder -- the DEFAULT instance until
+     * {@link #adoptCounters} replaces it. Test-only seam to observe what
+     * {@link #adoptCounters} folds and what it leaves alone.
+     */
+    @TestOnly
+    public CursorSendCounters getCountersForTesting() {
+        return counters;
+    }
+
+    /**
      * Re-arms the shared terminal retry for an engine whose final watermark
      * barrier or confirmed flock release is still pending and no longer
      * scheduled because the retry driver thread failed to start (e.g. OOM at
@@ -1749,10 +1787,12 @@ public final class CursorSendEngine implements QuietCloseable {
      * Number of times {@link #appendBlocking} hit
      * {@link SegmentRing#BACKPRESSURE_NO_SPARE} on its first attempt and
      * had to wait for the segment manager (or for ACKs) to free space.
-     * One increment per blocking-call, not per spin-park. Cumulative.
+     * One increment per blocking-call, not per spin-park. Cumulative, and
+     * carried across a symbol-dictionary recycle once the owning sender has
+     * adopted this engine (see {@link #adoptCounters}).
      */
     public long getTotalBackpressureStalls() {
-        return backpressureStallCount.get();
+        return counters.backpressureStalls.get();
     }
 
     /**

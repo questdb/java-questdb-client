@@ -42,7 +42,10 @@ import org.jetbrains.annotations.Nullable;
  *
  * <p>The {@code [fromFsn, toFsn]} span is the load-bearing correlation key — join it to
  * whatever the producer thread logged alongside the published-sequence value returned by
- * the sender to identify the rejected data. Background orphan-drainer reports use
+ * the same sender instance to identify the rejected data. Both bounds are on the reporting
+ * sender's own FSN scale (see {@link Sender#flushAndGetSequence()}): a sender restarted on
+ * the same store-and-forward slot reports replayed frames on its own scale, not on the
+ * closed process's. Background orphan-drainer reports use
  * {@link #NO_MESSAGE_SEQUENCE} for both bounds because those FSNs belong to another sender
  * engine and must not be joined to the live producer's rows.
  *

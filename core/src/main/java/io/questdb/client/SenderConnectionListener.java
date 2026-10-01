@@ -49,7 +49,11 @@ import org.jetbrains.annotations.NotNull;
  * ({@link SenderConnectionEvent.Kind#CONNECTED},
  * {@link SenderConnectionEvent.Kind#FAILED_OVER},
  * {@link SenderConnectionEvent.Kind#RECONNECTED}) are guaranteed to fire on
- * each transition. Failure events ({@code ENDPOINT_ATTEMPT_FAILED},
+ * each transition. A symbol-dictionary recycle tears the wire connection down
+ * and reconnects deliberately; that reconnect reports {@code RECONNECTED}
+ * (or {@code FAILED_OVER}) with no {@code DISCONNECTED} before it, so a
+ * listener pairing the two must not assume every success follows an outage.
+ * Failure events ({@code ENDPOINT_ATTEMPT_FAILED},
  * {@code ALL_ENDPOINTS_UNREACHABLE}) may be coalesced under inbox pressure.
  * The terminal event {@code AUTH_FAILED}
  * fires before the producer-thread {@code LineSenderException} is observable on

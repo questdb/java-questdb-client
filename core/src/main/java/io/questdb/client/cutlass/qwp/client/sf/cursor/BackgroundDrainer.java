@@ -1140,7 +1140,8 @@ public final class BackgroundDrainer implements Runnable {
                         maxHeadFrameRejections,
                         poisonMinEscalationWindowMillis,
                         catchUpCapGapMinEscalationWindowMillis,
-                        CursorWebSocketSendLoop.ReconnectPolicy.ORPHAN);
+                        CursorWebSocketSendLoop.ReconnectPolicy.ORPHAN,
+                        0L);
                 // Without this the loop's ridden-out reports -- above all
                 // "credential-unavailable", the one endpoint-policy failure an ORPHAN
                 // loop retries rather than latching -- are dispatched into a null, and

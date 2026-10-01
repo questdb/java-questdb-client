@@ -41,9 +41,11 @@ import java.nio.file.Paths;
  * <p>
  * {@link #acquire(String)} locks a {@code .lock} file inside the slot directory
  * for the entire lifetime of the engine that owns it. {@link #acquireLogical(String)}
- * locks a sibling file under the parent SF directory for short-lived pathname
- * transitions and orphan adoption; because it is outside the slot directory,
- * it remains stable if that directory is renamed. Both use
+ * locks a sibling file under the parent SF directory for pathname transitions,
+ * orphan adoption, and the symbol-dictionary recycle's swap, which can hold it
+ * across an abandoned swap until the recycle re-fires or the sender closes;
+ * because it is outside the slot directory, it remains stable if that
+ * directory is renamed. Both use
  * {@code flock}/{@code LockFileEx}. Normal teardown explicitly unlocks the
  * descriptor before closing it; hard process exit remains a backstop because
  * the kernel cleans up file locks for terminated processes.
@@ -123,11 +125,13 @@ public final class SlotLock implements QuietCloseable {
      * directory, so renaming the slot cannot move the lock inode away from the
      * logical slot name it guards.
      * <p>
-     * Callers use this as a short-lived transition/adoption lock, always before
-     * acquiring the directory-local lock. In particular it must cover an
-     * unreplayable slot's close -&gt; rename -&gt; recreate transition, preventing a
-     * queued orphan drainer from adopting the renamed inode and later touching
-     * the fresh directory through the old pathname.
+     * Callers use this as a transition/adoption lock, always before acquiring
+     * the directory-local lock. In particular it must cover an unreplayable
+     * slot's close -&gt; rename -&gt; recreate transition, preventing a queued
+     * orphan drainer from adopting the renamed inode and later touching the
+     * fresh directory through the old pathname. The symbol-dictionary
+     * recycle holds it for the length of its swap instead, which can span an
+     * abandoned swap until the recycle re-fires or the sender closes.
      */
     public static SlotLock acquireLogical(String slotDir) {
         return acquireLogical(FilesFacade.INSTANCE, slotDir);
