@@ -4450,11 +4450,27 @@ public class QwpWebSocketSender implements Sender {
                     retainedEngine = engine;
                 }
             } else if (retainedEngine == null) {
-                // No engine and nothing retained: no flock left to report. A
-                // non-null retainedEngine (a recycle's deferred-close await
-                // timed out) still holds the slot flock, so leave the flag
-                // false and let isSlotLockReleased() re-probe it.
+                // No engine and nothing retained: no flock left to report.
                 slotLockReleased = true;
+            } else {
+                // A recycle retained this engine: its deferred-close await
+                // timed out, so it still holds the slot flock and the flag
+                // stays false for isSlotLockReleased() to re-probe. The recycle
+                // also detached its release listener, so that a late release
+                // could not mark a rebuilt engine's flock as released. A closed
+                // sender never rebuilds, which leaves this engine the only
+                // possible holder: re-attach the listener so the owning pool
+                // learns of the release the moment it lands, not at its next
+                // re-probe. The engine runs it at once if the release already
+                // happened. Guarded: a failing pool callback must not skip the
+                // dispatcher closes below.
+                try {
+                    retainedEngine.setSlotLockReleaseListener(this::onSlotLockReleased);
+                } catch (Throwable t) {
+                    LOG.error("Error attaching the slot-lock listener to the retained engine: {}",
+                            String.valueOf(t));
+                    terminalError = captureCloseError(terminalError, t);
+                }
             }
             if (errorDispatcher != null) {
                 try {
@@ -5385,7 +5401,9 @@ public class QwpWebSocketSender implements Sender {
      * stalled worker costs the producer one bounded wait, not one per call.
      * Before throwing, hand the still-locked engine to {@link #retainedEngine}
      * so a pool re-probe ({@link #isSlotLockReleased()}) can still recover the
-     * slot's capacity if the worker ever exits.
+     * slot's capacity if the worker ever exits; once the sender is closed,
+     * {@link #close()} re-attaches the release listener so the pool hears of
+     * that exit at once.
      */
     private void awaitDeferredEngineClose(CursorSendEngine outgoing) {
         if (outgoing.isCloseCompleted()) {
@@ -5972,6 +5990,9 @@ public class QwpWebSocketSender implements Sender {
         recyclePendingOutgoing = outgoing;
         recyclePendingLastPublishedFsn = lastPublishedFsn;
         try {
+            // Detached while the sender is live: a release landing after the
+            // commit must not mark the rebuilt engine's flock as released.
+            // close() re-attaches it if this engine is still retained then.
             outgoing.setSlotLockReleaseListener(null);
             outgoing.close(recycleSlotLock == null);
         } catch (Error e) {

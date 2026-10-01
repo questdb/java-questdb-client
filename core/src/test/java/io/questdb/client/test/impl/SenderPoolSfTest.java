@@ -1379,6 +1379,122 @@ public class SenderPoolSfTest {
         });
     }
 
+    @Test(timeout = 120_000L)
+    public void testBorrowerWokenWhenRecycleRetainedEngineReleasesSlot() throws Exception {
+        // A symbol-dictionary recycle whose deferred-close await runs out keeps
+        // the outgoing engine, its SF worker stalled, as the delegate's retained
+        // engine. Closing the lease then retires the slot. When the worker
+        // finally exits, the pool must hear of the release at once: a borrower
+        // parked on the full pool gets the slot right away instead of sitting
+        // out its acquire timeout. No housekeeper runs here, and the acquire
+        // timeout dwarfs the join below, so only the release notification can
+        // wake the borrower in time.
+        TestUtils.assertMemoryLeak(() -> {
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                Thread borrower = null;
+                try (SenderPool pool = new SenderPool(config, 1, 1, 60_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    PooledSender lease = pool.borrow();
+                    QwpWebSocketSender delegate = (QwpWebSocketSender) getDelegate(lease);
+                    lease.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
+                    Assert.assertTrue("setup: batch must be acked before the recycle",
+                            delegate.awaitAckedFsn(delegate.flushAndGetSequence(), 5_000));
+
+                    CursorSendEngine engine = delegate.getCursorEngineForTesting();
+                    SegmentManager manager = engine.getManagerForTesting();
+                    CountDownLatch workerBlocked = new CountDownLatch(1);
+                    CountDownLatch releaseWorker = new CountDownLatch(1);
+                    AtomicBoolean fired = new AtomicBoolean();
+                    AtomicReference<Throwable> hookErr = new AtomicReference<>();
+                    AtomicReference<PooledSender> borrowed = new AtomicReference<>();
+                    AtomicReference<Throwable> borrowErr = new AtomicReference<>();
+                    try {
+                        manager.setBeforeTrimSyncHook(() -> {
+                            if (!fired.compareAndSet(false, true)) return;
+                            workerBlocked.countDown();
+                            try {
+                                if (!releaseWorker.await(60, TimeUnit.SECONDS)) {
+                                    hookErr.compareAndSet(null, new AssertionError(
+                                            "timed out waiting for test to release worker"));
+                                }
+                            } catch (Throwable t) {
+                                hookErr.compareAndSet(null, t);
+                            }
+                        });
+                        manager.wakeWorker();
+                        Assert.assertTrue("manager worker never entered a service pass",
+                                workerBlocked.await(5, TimeUnit.SECONDS));
+                        manager.setWorkerJoinTimeoutMillis(50L);
+                        delegate.setRecycleDeferredCloseMaxWaitMillisForTesting(100L);
+
+                        delegate.resetSymbolDictionary();
+                        try {
+                            lease.table("t");
+                            Assert.fail("expected the recycle's deferred-close await to run out");
+                        } catch (LineSenderException e) {
+                            TestUtils.assertContains(e.getMessage(),
+                                    "deferred close did not release the slot lock");
+                        }
+                        // Closing the lease flushes, which resumes the pending recycle
+                        // and rethrows while the worker is stalled, so the pool discards
+                        // the lease: the delegate closes with the flock still held.
+                        try {
+                            lease.close();
+                            Assert.fail("expected the lease's flush to rethrow the pending recycle");
+                        } catch (LineSenderException e) {
+                            TestUtils.assertContains(e.getMessage(),
+                                    "deferred close did not release the slot lock");
+                        }
+                        Assert.assertEquals("the slot must retire while the stalled engine holds its flock",
+                                1, pool.leakedSlotCount());
+
+                        CountDownLatch borrowerParked = new CountDownLatch(1);
+                        pool.setBeforeBorrowWaitHook(borrowerParked::countDown);
+                        borrower = new Thread(() -> {
+                            try {
+                                borrowed.set(pool.borrow());
+                            } catch (Throwable t) {
+                                borrowErr.set(t);
+                            }
+                        }, "recycle-retained-borrower");
+                        borrower.start();
+                        Assert.assertTrue("borrower never parked on the full pool",
+                                borrowerParked.await(5, TimeUnit.SECONDS));
+
+                        releaseWorker.countDown();
+                        borrower.join(10_000L);
+                        Assert.assertFalse("borrower still waiting 10 s after the flock release: "
+                                + "the pool was never told", borrower.isAlive());
+                        Assert.assertNull("borrow failed: " + borrowErr.get(), borrowErr.get());
+                        Assert.assertNotNull("borrower got no sender", borrowed.get());
+                        Assert.assertTrue("deferred cleanup must have released the flock",
+                                engine.isCloseCompleted());
+                        Assert.assertEquals("recovered slot must leave the leaked count",
+                                0, pool.leakedSlotCount());
+                        borrowed.get().close();
+                        if (hookErr.get() != null) {
+                            throw new AssertionError("trim hook failed", hookErr.get());
+                        }
+                    } finally {
+                        pool.setBeforeBorrowWaitHook(null);
+                        manager.setBeforeTrimSyncHook(null);
+                        releaseWorker.countDown();
+                    }
+                } finally {
+                    // A failed run leaves the borrower parked; the pool close above wakes it.
+                    if (borrower != null) {
+                        borrower.join(10_000L);
+                    }
+                }
+            }
+        });
+    }
+
     @Test
     public void testPreallocatedExitHandoffCleansInRangeStartupRecoverer() throws Exception {
         assertPreallocatedExitHandoffCleansStartupRecoverer(0, 1);

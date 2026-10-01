@@ -43,6 +43,7 @@ import java.lang.management.ThreadMXBean;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -356,6 +357,29 @@ public class SymbolDictRecycleDeferredCloseTest {
                 }
             }
         });
+    }
+
+    /**
+     * A recycle whose deferred-close await ran out keeps the outgoing engine as
+     * the retained engine, with the listener step 3 detached. Closed, the
+     * sender can never rebuild, so close() must re-attach the listener: the
+     * owning pool then hears of the engine's late flock release the moment it
+     * happens instead of at its next re-probe -- a borrower waiting for the
+     * slot would otherwise sit out its whole acquire timeout.
+     */
+    @Test(timeout = 60_000L)
+    public void testCloseRelaysLateReleaseOfRecycleRetainedEngine() throws Exception {
+        assertRetainedEngineReleaseRelayedOnClose(false);
+    }
+
+    /**
+     * The other order: the retained engine's release lands before close()
+     * re-attaches the listener. The detached engine told nobody, so close()
+     * itself must relay the release before returning.
+     */
+    @Test(timeout = 60_000L)
+    public void testCloseRelaysEarlierReleaseOfRecycleRetainedEngine() throws Exception {
+        assertRetainedEngineReleaseRelayedOnClose(true);
     }
 
     /**
@@ -675,6 +699,103 @@ public class SymbolDictRecycleDeferredCloseTest {
                         long fsn2 = sender.flushAndGetSequence();
                         Assert.assertTrue("post-resume batch must still get acked",
                                 sender.awaitAckedFsn(fsn2, 5_000));
+                    } finally {
+                        manager.setBeforeTrimSyncHook(null);
+                        releaseWorker.countDown();
+                    }
+                }
+                if (auxErr.get() != null) {
+                    throw new AssertionError("auxiliary thread failed", auxErr.get());
+                }
+            }
+        });
+    }
+
+    private void assertRetainedEngineReleaseRelayedOnClose(boolean releaseBeforeClose) throws Exception {
+        assertMemoryLeak(() -> {
+            String sfDir = temporaryFolder.getRoot().toPath()
+                    .resolve("recycle-retained-relay-" + releaseBeforeClose).toString();
+            try (TestWebSocketServer server = ackingServer()) {
+                String cfg = "ws::addr=localhost:" + server.getPort() + ";sf_dir=" + sfDir + ";";
+                CountDownLatch workerBlocked = new CountDownLatch(1);
+                CountDownLatch releaseWorker = new CountDownLatch(1);
+                AtomicBoolean wedgeFired = new AtomicBoolean();
+                AtomicReference<Throwable> auxErr = new AtomicReference<>();
+                AtomicInteger relayed = new AtomicInteger();
+                CountDownLatch relayedLatch = new CountDownLatch(1);
+                try (Sender sender = Sender.fromConfig(cfg)) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    // Stands in for the owning pool's release callback.
+                    ws.setSlotLockReleaseListener(() -> {
+                        relayed.incrementAndGet();
+                        relayedLatch.countDown();
+                    });
+
+                    sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
+                    long fsn1 = sender.flushAndGetSequence();
+                    Assert.assertTrue("setup: batch must be acked before the recycle",
+                            sender.awaitAckedFsn(fsn1, 5_000));
+
+                    CursorSendEngine outgoing = ws.getCursorEngineForTesting();
+                    SegmentManager manager = outgoing.getManagerForTesting();
+                    try {
+                        manager.setBeforeTrimSyncHook(() -> {
+                            if (!wedgeFired.compareAndSet(false, true)) {
+                                return;
+                            }
+                            workerBlocked.countDown();
+                            try {
+                                if (!releaseWorker.await(30, TimeUnit.SECONDS)) {
+                                    auxErr.compareAndSet(null, new AssertionError(
+                                            "timed out waiting for the test to release the worker"));
+                                }
+                            } catch (Throwable t) {
+                                auxErr.compareAndSet(null, t);
+                            }
+                        });
+                        manager.wakeWorker();
+                        Assert.assertTrue("worker never reached the wedge hook",
+                                workerBlocked.await(5, TimeUnit.SECONDS));
+                        manager.setWorkerJoinTimeoutMillis(50L);
+                        ws.setRecycleDeferredCloseMaxWaitMillisForTesting(100L);
+
+                        sender.resetSymbolDictionary();
+                        try {
+                            sender.table("t");
+                            Assert.fail("expected the exhausted deferred-close await to throw "
+                                    + "while the worker stays wedged");
+                        } catch (LineSenderException e) {
+                            TestUtils.assertContains(e.getMessage(),
+                                    "deferred close did not release the slot lock");
+                        }
+                        Assert.assertNull("step 3 detaches the outgoing engine's listener",
+                                outgoing.getSlotLockReleaseListenerForTesting());
+
+                        if (releaseBeforeClose) {
+                            releaseWorker.countDown();
+                            long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+                            while (!outgoing.isCloseCompleted() && System.nanoTime() < deadlineNanos) {
+                                Thread.sleep(10L);
+                            }
+                            Assert.assertTrue("deferred cleanup did not complete after the release",
+                                    outgoing.isCloseCompleted());
+                            Assert.assertEquals("the detached engine relays nothing on its own",
+                                    0, relayed.get());
+                            sender.close();
+                            Assert.assertEquals("close() must relay the earlier release before returning",
+                                    1, relayed.get());
+                        } else {
+                            sender.close();
+                            Assert.assertFalse("the wedged engine still holds the slot flock",
+                                    ws.isSlotLockReleased());
+                            Assert.assertEquals("nothing is released yet", 0, relayed.get());
+                            releaseWorker.countDown();
+                            Assert.assertTrue("the retained engine's late release must reach the "
+                                            + "sender's listener",
+                                    relayedLatch.await(10, TimeUnit.SECONDS));
+                        }
+                        Assert.assertTrue(outgoing.isCloseCompleted());
+                        Assert.assertTrue(ws.isSlotLockReleased());
                     } finally {
                         manager.setBeforeTrimSyncHook(null);
                         releaseWorker.countDown();
