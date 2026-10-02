@@ -1,9 +1,10 @@
 # QWP dynamic bearer credentials: cross-language specification
 
-**Status:** v0.3, ready for implementation. All decisions are resolved (§12).
+**Status:** v0.4, ready for implementation. All decisions are resolved (§12).
 
 **Changes:**
 
+- **v0.4:** `azure_credential` selects one Azure credential deterministically (§7.1), and library errors are classified by how the credential was selected (§7.5, D10). This resolves the conflict between §4 and §7.5 over an unreachable managed-identity endpoint.
 - **v0.3:** decisions resolved, with D8 (§8.1) and D9 (§7.2) added; Java binding decided (Appendix B).
 - **v0.2:** connection health (§8.4), the optional authentication-outage deadline (§8.5), `WWW-Authenticate` handling (§8.2), and Appendices C and D.
 
@@ -86,7 +87,8 @@ Rules for `expires_at`:
 Classification:
 
 - **Retryable:** network failures, timeouts, HTTP 429, HTTP 5xx, and IMDS 404 or 410.
-- **Permanent:** configuration that is missing or wrong. Examples: no credential configured, identity not found, invalid client.
+- **Permanent:** configuration that is missing or wrong. Examples: the credential the source was told to use is not configured, identity not found, invalid client.
+- **Discovery:** a source that finds its credential by probing the environment MUST NOT treat "nothing found" as permanent on that evidence alone. A brief outage of a probed endpoint looks the same (§7.5) **[D10]**.
 - **When unsure:** treat the failure as retryable.
 - An error that carries no classification MUST be treated as retryable.
 
@@ -236,6 +238,7 @@ None of these MAY reveal the token itself.
 | `token_provider` | `azure`. The name `azure_imds` is reserved **[D5]**. | no | Selects a provider. |
 | `azure_resource` | `api://<app-id>` or `<app-id>` | when `token_provider=azure` | The application ID URI or the client ID of the QuestDB app registration. A trailing `/.default` MUST be stripped. The requested scope is `<azure_resource>/.default`. |
 | `azure_client_id` | a GUID | no | The client ID of a user-assigned managed identity or of a workload identity. |
+| `azure_credential` | `default`, `managed_identity`, `workload_identity`, `environment` | no | Which Azure credential `azure` uses (§7.5). `default`, the default, is the library's default credential: unless the platform's own selector (`AZURE_TOKEN_CREDENTIALS`) names one credential, it is a discovery chain, meant for development. Each other value selects that one credential and overrides the platform's selector. This deterministic mode is recommended in production **[D10]**. |
 
 ### 7.2 Validation
 
@@ -245,6 +248,8 @@ A client MUST reject the configuration, with an error that names the offending k
 - `token_provider` is empty, unknown, or not supported by this client. The error MUST list the supported values. A client MUST NOT silently connect without credentials;
 - a provider-specific key is present but the selected provider does not accept it. For example, `azure_resource` without `token_provider=azure`;
 - a provider key that is required is missing;
+- `azure_credential` has a value that §7.1 does not list. The error MUST list the supported values;
+- `azure_client_id` is combined with `azure_credential=environment`. That credential takes its client ID from the platform's configuration;
 - `token_provider` is used with any schema other than `wss::`:
   - plain `ws::` is rejected because the token would cross the network in cleartext **[D4]**;
   - non-QWP schemas, such as ILP's `http::`, are out of scope **[D9]**.
@@ -269,23 +274,29 @@ A client MUST reject the configuration, with an error that names the offending k
 
 ### 7.5 The `azure` provider
 
-- **How tokens are obtained:** through the language's Azure Identity default credential chain, for the scope `<azure_resource>/.default`. Depending on the environment, the chain finds:
-  - an environment service principal,
-  - a workload identity,
-  - a managed identity,
-  - developer tools.
+- **How tokens are obtained:** through the language's Azure Identity library, for the scope `<azure_resource>/.default`. `azure_credential` (§7.1) decides which credential is used:
+  - `default`: the library's default credential. Unless the platform's selector names one credential, this is a **discovery chain**. It tries an environment service principal, a workload identity, a managed identity and developer tools, in that order, and uses the first that works.
+  - `managed_identity`, `workload_identity` or `environment`: that credential alone, called **deterministic mode**. A platform selector that names one credential has the same effect.
+- **Why the mode matters:** to keep development machines fast, a discovery chain checks for the instance metadata service (IMDS) with one short request and no retries, and moves on when nothing answers. So it reports "no credential available" both on a machine without a managed identity and on an Azure host whose IMDS is briefly unreachable. In deterministic mode the library skips that check and retries the managed-identity endpoint with backoff, so the two cases are reported differently.
 - **`azure_client_id`:** when set, it selects both the managed identity and the workload identity.
 - **Expiry:** `expires_at`, and `refresh_at` when the library exposes it, come from the library's token result.
-- **Classification of library errors:**
-  - **Permanent:** "no credential available in the chain", and authentication failures that Entra reports (such as an invalid client or an application that does not exist).
-  - **Retryable:** network errors, timeouts, throttling, 5xx responses, and anything else.
+- **Classification of library errors [D10]:**
+  - **Deterministic mode:**
+    - **Permanent:** configuration that the selected credential reports as missing or wrong. That covers missing settings it requires (for example, no federated token file for a workload identity), an identity that is not found or not assigned to the host, and Entra rejecting the client, secret, assertion, application or tenant.
+    - **Retryable:** network errors, including a managed-identity endpoint that cannot be reached; timeouts; throttling; `404`, `410` and `5xx` responses from a managed-identity endpoint; and anything else.
+  - **Discovery chain:**
+    - "No credential available in the chain" is **retryable** (§4).
+    - A failure that one credential in the chain reports for itself is classified as in deterministic mode.
+    - A client SHOULD log once, when the provider starts, that a discovery chain does not retry a managed-identity outage, and recommend `azure_credential` for production.
+- **Error text:** libraries often report every managed-identity failure with one generic message and keep the reason, such as "Identity not found", in a nested cause. The error SHOULD carry that innermost reason, sanitized as §9 requires.
 - **Unsupported platforms:** a client whose platform has no Azure Identity library MAY leave `azure` unsupported, and must then reject it as described in §7.2.
 
 *Informative bindings:*
 
-- **Java:** the optional `questdb-client-azure` artifact, which uses `DefaultAzureCredential` and is found through `ServiceLoader`.
+- **Java:** the optional `questdb-client-azure` artifact, which uses `DefaultAzureCredential` and is found through `ServiceLoader`. It maps `azure_credential` onto the library's own selector (Appendix B).
 - **Python:** `azure-identity` as an optional extra.
 - **Rust and C:** not required.
+- **Platform support:** the Azure Identity libraries read `AZURE_TOKEN_CREDENTIALS`. When it selects `ManagedIdentityCredential`, they skip the IMDS check and retry with backoff from .NET 1.16.0, Java 1.18.1, Python 1.25.1, JavaScript 4.13.0, Go 1.13.0 and C++ 1.13.2.
 
 ## 8. Failure handling
 
@@ -437,6 +448,7 @@ Every client that implements this specification SHOULD pass these scenarios. The
 | C21 | Connection health | The snapshot moves through `connecting`, `connected`, `reconnecting` (with `401` and credential-unavailable failures) and back to `connected`. `outage_since` and `failed_rounds` reset on recovery; `last_failure` is kept. No credential appears in it. |
 | C22 | Authentication-outage deadline | Unset: retries continue indefinitely. Set: the sender becomes terminal only on an authentication-class round once the duration has passed. Other failures in between neither reset nor fire it. A successful upgrade resets it. Orphan drains are unaffected, and on-disk data remains. |
 | C23 | `WWW-Authenticate` challenge | A plain `401`, and a `401` with `Bearer error="invalid_token"`, both trigger the retry in §8.2. A `401` whose Bearer challenge carries another error does not. |
+| C24 | Azure credential selection | With `azure_credential=managed_identity`, an unreachable managed-identity endpoint is retryable, so `sync` initialization retries it within its budget; an identity that is not assigned is permanent, so initialization fails fast. With `default`, a chain that finds nothing is retryable, and the warning in §7.5 is logged once. |
 
 ## 11. Relation to existing specifications
 
@@ -461,6 +473,7 @@ All decisions below are resolved. Changing one after the Java implementation mer
 | D7 | Whether to offer the authentication-outage deadline, and its key | Yes, as an optional setting that is off by default: `auth_failure_max_duration_millis`. |
 | D8 | How to classify an exception from an application-supplied provider that is not a token-unavailable error | Permanent (§8.1). |
 | D9 | Whether `token_provider` applies to non-QWP schemas | No; `wss::` only (§7.2). |
+| D10 | How the `azure` provider classifies "no credential available", and how to make it resilient | `azure_credential` selects one credential, so the library itself reports an unreachable endpoint (retryable) apart from a misconfigured credential (permanent). In a discovery chain, "no credential available" is retryable, because an IMDS outage looks the same (§7.5). Only `sync` initialization depends on the difference (§8.3), so the cost is a wait of at most `reconnect_max_duration_millis`. This follows Azure Identity's split between fail-fast discovery and a resilient single credential (Appendix D). A local host check, as Google's library makes, was not adopted: Azure's SMBIOS asset tag identifies only the public cloud, not sovereign clouds or Azure Local. |
 
 **Still to verify in a real Entra tenant.** These checks don't block implementation, but they should be done before the spec freezes:
 
@@ -468,6 +481,7 @@ All decisions below are resolved. Changing one after the Java implementation mer
 - The v1 and v2 signing-key endpoints serve the same keys.
 - Whether IMDS returns the same token when asked again. This affects only the convergence note in §5.2.
 - How long `DefaultAzureCredential` takes on a cold start. This sizes `cold_wait`.
+- On a VM, with `azure_credential=managed_identity`: an unreachable IMDS is reported as retryable, and an identity that is not assigned as permanent. So far this was checked only against a stub endpoint, with Azure Identity for Java 1.18.4.
 
 ## Appendix A. QuestDB Enterprise and Entra configuration (informative)
 
@@ -525,6 +539,7 @@ New types live in `io.questdb.client.cutlass.auth` unless noted.
 | `azure` provider | The new reactor module `azure/`, artifact `org.questdb:questdb-client-azure` (the core client is `org.questdb:questdb-client`), package `io.questdb.client.azure`, classes `AzureTokenProviderFactory` and `AzureTokenSource`. It depends on `azure-identity` through `azure-sdk-bom`, keeps the Java 8 floor, and is released together with the client. |
 | Connection health | `io.questdb.client.ConnectionHealth`, an immutable snapshot. Returned by `Sender.health()` (a default method; non-QWP senders throw `UnsupportedOperationException`), by `QwpQueryClient.health()`, and as a `ConnectionHealth.Aggregate` by `QuestDB.health()`. |
 | Authentication-outage deadline | Key `auth_failure_max_duration_millis`; builder method `authFailureMaxDurationMillis(long)` |
+| Credential selection | Key `azure_credential`, handled by `AzureTokenProviderFactory`. It sets `AZURE_TOKEN_CREDENTIALS` (`ManagedIdentityCredential`, `WorkloadIdentityCredential` or `EnvironmentCredential`) in the configuration it passes to `DefaultAzureCredentialBuilder.configuration(...)`, never in the process environment. That needs `azure-identity` 1.18.1 or later. `AzureTokenSource` learns the mode from the factory; for a credential an application passes in itself, a `DefaultAzureCredential` counts as a discovery chain and any other credential as deterministic. |
 
 **Python notes:**
 
@@ -551,7 +566,7 @@ These changes would let clients refresh only when a new token can help, and trea
 
 Other server-side follow-ups, including security hardening, are tracked privately with the QuestDB Enterprise team (see `SECURITY.md`).
 
-## Appendix D. Precedents for D1 and D2 (informative)
+## Appendix D. Precedents for D1, D2 and D10 (informative)
 
 | Source | Behaviour | Bearing on this spec |
 |---|---|---|
@@ -562,6 +577,10 @@ Other server-side follow-ups, including security hardening, are tracked privatel
 | Azure SDK, `BearerTokenAuthenticationPolicy` | Retries only on a `401` that carries a Continuous Access Evaluation claims challenge. A plain `401` goes back to the caller. | A stricter variant of D2. |
 | Kafka: KIP-152 and KAFKA-6516 | Authentication failures are non-retriable at the API. The client is not closed, though, and keeps reconnecting in the background; a request to stop that was closed Won't Fix. | D1. |
 | Kafka: KAFKA-10840 (open) | When credentials expire, a consumer keeps failing authentication in the background and the application cannot see it. A proposed fix notes that Kafka Connect tasks report RUNNING meanwhile. | Why §8.4 exists. |
+| Azure Identity: credential chains and the managed-identity retry strategy | `DefaultAzureCredential` runs managed identity in a "fail fast" mode, meant for the development inner loop: one IMDS probe with a short timeout and no retries. A "resilient" mode skips the probe and retries with exponential backoff; `AZURE_TOKEN_CREDENTIALS=ManagedIdentityCredential`, or the managed-identity credential used directly, enables it. Microsoft recommends a deterministic credential in production. | D10: a discovery chain's "no credential" is no evidence of misconfiguration; `azure_credential` selects the resilient mode. |
+| MongoDB driver auth spec (MONGODB-OIDC) | The application names its environment (`ENVIRONMENT:azure`, `gcp` or `k8s`), and the driver calls that metadata endpoint directly, with no discovery. | D10: deterministic selection. |
+| Google auth library, `ComputeEngineCredentials` | Detection pings the metadata server three times with a short timeout, "for developer desktop scenarios", then checks the SMBIOS product name, which needs no network. So a slow metadata server on a real VM is not taken for "not on GCE". A `503` from the metadata server is retryable. | D10: a probe that gets no answer is not proof; the local check is not adopted (§12). |
+| AWS SDK for Java v2, issue #3939; Apache Druid | On EC2, the default chain sometimes reports "Unable to load credentials from any of the providers in the chain", which AWS attributes to IMDS latency. Druid now treats that error as recoverable within its retry budget. | D10: "nothing found" in a chain is retryable. |
 
 Links:
 
@@ -573,3 +592,11 @@ Links:
 - KIP-152: https://cwiki.apache.org/confluence/display/KAFKA/KIP-152+-+Improve+diagnostics+for+SASL+authentication+failures
 - KAFKA-6516: https://issues.apache.org/jira/browse/KAFKA-6516
 - KAFKA-10840: https://issues.apache.org/jira/browse/KAFKA-10840 (proposed fix: https://github.com/apache/kafka/pull/16418)
+- Azure Identity best practices (deterministic credentials, the managed-identity retry strategy): https://learn.microsoft.com/en-us/dotnet/azure/sdk/authentication/best-practices
+- Azure Identity for Java, credential chains and `AZURE_TOKEN_CREDENTIALS`: https://learn.microsoft.com/en-us/azure/developer/java/sdk/authentication/credential-chains
+- Azure SDK design note on IMDS probing: https://gist.github.com/ahsonkhan/d6c4d3a9780bb058a729b76844923ef1
+- Azure SDK release, October 2025 (resilient managed identity in C++, Go, Java, JavaScript and Python): https://devblogs.microsoft.com/azure-sdk/azure-sdk-release-october-2025/
+- Identify an Azure VM from the guest (SMBIOS asset tag, public cloud only): https://learn.microsoft.com/en-us/azure/virtual-machines/identify-azure-vm-from-guest
+- Google `ComputeEngineCredentials`: https://github.com/googleapis/google-auth-library-java/blob/main/oauth2_http/java/com/google/auth/oauth2/ComputeEngineCredentials.java
+- AWS SDK for Java v2, issue #3939: https://github.com/aws/aws-sdk-java-v2/issues/3939
+- Apache Druid, retry transient AWS credential resolution failures (#19558): https://www.mail-archive.com/commits@druid.apache.org/msg115181.html
