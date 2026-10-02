@@ -239,13 +239,14 @@ public class QwpWebSocketSenderJvmErrorCleanupTest {
      * needed. The connect walk dereferences only the fields wired below plus
      * primitives whose zero-defaults are valid here (field initializers do
      * not run under {@code Unsafe.allocateInstance}), plus the connect-walk
-     * lock, which buildAndConnect acquires unconditionally and is therefore
-     * wired here.
+     * lock and the connection-health tracker, which buildAndConnect uses
+     * unconditionally on a foreground walk and are therefore wired here.
      */
     private static QwpWebSocketSender newBareSender() throws Exception {
         QwpWebSocketSender sender = (QwpWebSocketSender) Unsafe.getUnsafe()
                 .allocateInstance(QwpWebSocketSender.class);
         setField(sender, "connectWalkLock", new java.util.concurrent.locks.ReentrantLock());
+        setField(sender, "healthTracker", new io.questdb.client.cutlass.qwp.client.QwpConnectionHealthTracker());
         return sender;
     }
 

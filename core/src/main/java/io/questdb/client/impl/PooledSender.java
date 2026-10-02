@@ -24,6 +24,7 @@
 
 package io.questdb.client.impl;
 
+import io.questdb.client.ConnectionHealth;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
@@ -274,6 +275,11 @@ public final class PooledSender implements Sender {
     @Override
     public long getAckedFsn() {
         return slot.live(generation).getAckedFsn();
+    }
+
+    @Override
+    public ConnectionHealth health() {
+        return slot.live(generation).health();
     }
 
     @Override

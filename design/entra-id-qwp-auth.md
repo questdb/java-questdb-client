@@ -1,6 +1,6 @@
 # Entra ID app-only auth over QWP: findings and proposed design
 
-Status: **draft for review**. No production code has been written. This file is not committed.
+Status: **implemented** on `feat/qwp-entra-token-provider` - all four steps of the Java plan (§10). §11 maps each step to the code and to the conformance tests, and lists where the code departs from this document's earlier design.
 
 **Read these first:**
 
@@ -552,5 +552,53 @@ Build in this order. Each step is one PR and must pass the conformance tests lis
 
 **Separate tickets, outside this feature:**
 
-- **Dead pooled egress worker** (§3). Start with a test that reproduces it.
+- **Dead pooled egress worker** (§3). Start with a test that reproduces it. *Done after all - the spec makes recovery a MUST (§8.3, "Egress recovery"); see §11.*
 - **Treat a 503 at the upgrade as transient in every phase** (§3, spec Appendix C). This must land before any server change to return 503.
+
+## 11. Implementation status
+
+Every step of §10 is implemented. Line references in §1-§7 predate it.
+
+**Step 1 - token cache** (spec §3-§5, Appendix B). `io.questdb.client.cutlass.auth`:
+
+- `ExpiringToken`, `TokenSource`, `TokenUnavailableException`, and `RefreshingTokenProvider` with its builder (every §5.1 parameter, plus clock, scheduler and jitter seams for tests).
+- `CredentialRedaction`: the §9 token rendering (length + 8-hex SHA-256 prefix) and the sanitizing of library text (display-unsafe characters stripped, 256-character cap).
+- The warm path of `getToken()` is a volatile read with no lock and no I/O. A refresh whose wall-clock time has passed but whose monotonic schedule has not (a host that slept) starts in the background.
+- A cold caller starts one fetch and then waits; it does not start another each time a fetch completes. A source that keeps returning a token inside the hand-out floor is therefore not fetched in a tight loop. While waiting, the "fail immediately" rule of §5.3 is re-evaluated after each failed fetch.
+- Tests: `RefreshingTokenProviderTest` (C1-C8, the cache half of C20).
+
+**Step 2 - client integration** (spec §6, §8.1-§8.3).
+
+- `HttpTokenProvider.onTokenRejected` (default no-op).
+- `QwpWebSocketSender.tokenProviderAuthHeader` is the named dynamic credential that replaced the lambda in `Sender.buildWebSocketAuthHeader`.
+- The one retry after a refreshable 401 is in `QwpWebSocketSender.connectWalk` (shared by the foreground and the orphan drainers) and in `QwpQueryClient.connect` and `reconnectViaTracker`. It records no health penalty and fires no event.
+- `WWW-Authenticate` is captured by `WebSocketClient` and parsed by `cutlass.http.BearerChallenge`. `QwpAuthFailedException.isTokenRefreshable()` applies the §8.2 challenge rule; its message now starts with `auth-rejected`.
+- SYNC startup (`CursorWebSocketSendLoop.connectWithRetry`) retries a credential failure only when `QwpCredentialUnavailableException.isRetryable()` (D6/D8) and the thread is not interrupted.
+- Egress errors name the failure class. A provider failure on `connect()` is a `QwpCredentialUnavailableException` with a `credential-unavailable:` message.
+- Egress recovery: after a failover reconnect fails, the next `execute()` reconnects instead of throwing "not connected". `QwpQueryClientDynamicCredentialTest.testPooledQueryClientRecoversAfterAFailedFailover` reproduced the §3 dead-pooled-worker bug before the fix (it failed with exactly that message).
+- Tests: `WebSocketDynamicCredentialTest` (C9-C16, C23), `QwpQueryClientDynamicCredentialTest`, `BearerChallengeTest`. `TestWebSocketServer` gained an authorization validator, a `WWW-Authenticate` challenge, `dropAllConnections()`, and a TLS mode. The TLS mode uses a self-signed identity generated per JVM with `keytool` (`TestTls`), because `token_provider` is `wss::`-only.
+
+**Step 3 - connect string, registry, Azure module** (spec §7).
+
+- `ConfigSchema` registers `token_provider`, `azure_resource` and `azure_client_id` (COMMON).
+- `TokenProviderSpec.parse` enforces §7.2 on both clients and resolves the factory without fetching anything. It strips `/.default`, checks and lower-cases the client-ID GUID, and builds the registry key.
+- `TokenProviderFactory` is the `ServiceLoader` SPI (`uses` in `module-info.java`). `TokenProviderRegistry` hands out ref-counted leases, with a 60 s linger, a daemon timer that exits when idle, and a test seam that replaces discovery.
+- The non-QWP `Sender` schemas reject the keys (D9). The builders and `QuestDBBuilder` reject mixing them with an application-supplied provider.
+- Leases: `Sender.build()` acquires one and hands it to `QwpWebSocketSender.setCredentialLease` (released on close, or released by `build()` if it fails). `QwpQueryClient` acquires one on its first `connect()` and releases it on close.
+- New reactor module `azure/`, artifact `org.questdb:questdb-client-azure` (not `io.questdb`: the core artifact is `org.questdb:questdb-client`):
+  - `AzureTokenProviderFactory` uses `DefaultAzureCredential`; `azure_client_id` sets both the managed-identity and workload-identity client ID.
+  - `AzureTokenSource` bounds each request at 30 s and classifies per §7.5: `CredentialUnavailableException`, HTTP 400/401 and known AADSTS configuration codes are permanent; everything else is retryable, with `Retry-After` honoured.
+  - It never attaches a library exception: its response references the raw request.
+  - Java 8 bytecode. It has no `module-info`; `Automatic-Module-Name: io.questdb.client.azure`, and an automatic module provides its `META-INF/services`.
+  - Its release profiles mirror core's.
+- Tests: `TokenProviderConfigTest` (C18, C19), `TokenProviderSharingTest` (C17, over TLS), `azure/AzureTokenSourceTest` (fake `TokenCredential`, no network).
+
+**Step 4 - health and deadline** (spec §8.4, §8.5).
+
+- `io.questdb.client.ConnectionHealth` (with `State`, `FailureClass`, `Failure`, `Aggregate`) and `QwpConnectionHealthTracker`, which publishes immutable snapshots through a volatile field.
+- The ingest walk reports rounds and upgrades; the I/O loop reports connection loss and terminal failure. Drainers never report.
+- Accessors: `Sender.health()` (default throws `UnsupportedOperationException`), `QwpQueryClient.health()`, `QuestDB.health()` (aggregate of every pooled connection).
+- `auth_failure_max_duration_millis` (INGRESS key) and `Sender.LineSenderBuilder.authFailureMaxDurationMillis(long)`. The clock lives in `CursorWebSocketSendLoop`, applies to FOREGROUND loops only, and is tracked even before the deadline is armed. The builder arms it right after connecting, so an `async` start is measured from its first failure.
+- Tests: `ConnectionHealthTest` (C21, C22).
+
+**Not done:** the spec documents (`qwp-ingress-websocket.md`, `qwp-egress-websocket.md`, the connect-string reference) live in the documentation repository. The Rust core and Python parity is tracked there too.

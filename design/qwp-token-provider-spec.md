@@ -520,10 +520,10 @@ New types live in `io.questdb.client.cutlass.auth` unless noted.
 | Refreshing provider | `RefreshingTokenProvider implements HttpTokenProvider, QuietCloseable`, created with `RefreshingTokenProvider.builder(TokenSource)`. Methods: `getToken()`, `onTokenRejected(CharSequence, int)`, `awaitReady(long)`, `close()`. The builder exposes the §5.1 parameters, plus clock and scheduler seams for tests. |
 | token-unavailable error | `TokenUnavailableException extends LineSenderException`, with `isRetryable()` and `getRetryAfterMillis()` (-1 means none) |
 | `on_rejected` | `onTokenRejected(CharSequence token, int httpStatus)`, a default no-op method on the existing `io.questdb.client.HttpTokenProvider` |
-| Provider factory | `TokenProviderFactory`, an SPI found through `ServiceLoader` (a `uses` clause in `module-info.java`) |
-| Registry | `TokenProviderRegistry`: process-wide, hands out ref-counted leases |
-| `azure` provider | The new reactor module `azure/`, artifact `io.questdb:questdb-client-azure`, package `io.questdb.client.azure`, class `AzureTokenProviderFactory`. It depends on `azure-identity` through `azure-sdk-bom`, keeps the Java 8 floor, and is released together with the client. |
-| Connection health | `io.questdb.client.ConnectionHealth`, an immutable snapshot. Returned by `Sender.health()` (a default method; non-QWP senders throw `UnsupportedOperationException`), by `QwpQueryClient.health()`, and as an aggregate by `QuestDB.health()`. |
+| Provider factory | `TokenProviderFactory`, an SPI found through `ServiceLoader` (a `uses` clause in `module-info.java`). `TokenProviderSpec.parse` applies the §7.2 rules to a connect string and resolves the factory without fetching a token. |
+| Registry | `TokenProviderRegistry`: process-wide (`global()`), hands out ref-counted `Lease`s, closes a provider `registry_linger` after its last lease |
+| `azure` provider | The new reactor module `azure/`, artifact `org.questdb:questdb-client-azure` (the core client is `org.questdb:questdb-client`), package `io.questdb.client.azure`, classes `AzureTokenProviderFactory` and `AzureTokenSource`. It depends on `azure-identity` through `azure-sdk-bom`, keeps the Java 8 floor, and is released together with the client. |
+| Connection health | `io.questdb.client.ConnectionHealth`, an immutable snapshot. Returned by `Sender.health()` (a default method; non-QWP senders throw `UnsupportedOperationException`), by `QwpQueryClient.health()`, and as a `ConnectionHealth.Aggregate` by `QuestDB.health()`. |
 | Authentication-outage deadline | Key `auth_failure_max_duration_millis`; builder method `authFailureMaxDurationMillis(long)` |
 
 **Python notes:**

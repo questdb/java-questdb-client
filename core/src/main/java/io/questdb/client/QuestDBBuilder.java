@@ -192,6 +192,10 @@ public final class QuestDBBuilder {
             throw new IllegalArgumentException(
                     "httpTokenProvider cannot be combined with token, username, or password in the configuration");
         }
+        if (httpTokenProvider != null && view.has("token_provider")) {
+            throw new IllegalArgumentException(
+                    "httpTokenProvider cannot be combined with token_provider in the configuration");
+        }
         // Validate the single cluster config exactly as both pools will, but
         // without connecting: the full Sender parse plus validateParameters
         // (ingress value keys are registry-STRING, so only the real parse
