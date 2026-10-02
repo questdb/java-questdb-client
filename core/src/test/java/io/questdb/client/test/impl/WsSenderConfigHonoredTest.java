@@ -26,6 +26,7 @@ package io.questdb.client.test.impl;
 
 import io.questdb.client.Sender;
 import io.questdb.client.impl.ConfigSchema;
+import io.questdb.client.test.cutlass.auth.TestTokenProviderFactory;
 import io.questdb.client.impl.Side;
 import org.junit.Assert;
 import org.junit.Test;
@@ -82,6 +83,7 @@ public class WsSenderConfigHonoredTest {
         assertHonored("connection_listener_inbox_capacity=64", "connection_listener_inbox_capacity", 64);
         assertHonored("token=ey.abc", "token", "ey.abc");
         assertHonored("auth_timeout_ms=4321", "auth_timeout_ms", 4321L);
+        assertHonored("auth_failure_max_duration_millis=600000", "auth_failure_max_duration_millis", 600000L);
         assertHonored("connect_timeout=7000", "connect_timeout", 7000);
 
         // username/password together (both-or-neither), and the user/pass aliases.
@@ -103,6 +105,19 @@ public class WsSenderConfigHonoredTest {
         Assert.assertEquals("/ca.p12", tls.get("tls_roots"));
         Assert.assertEquals("pw", tls.get("tls_roots_password"));
         markHonored("tls_roots", "tls_roots_password");
+
+        // token_provider and its azure keys (wss only; the factory is resolved at parse time, so install one).
+        TestTokenProviderFactory.install(new TestTokenProviderFactory("azure"));
+        try {
+            Map<String, Object> tp = snapshot("wss::addr=h:9000;token_provider=azure;azure_resource=api://app/.default;"
+                    + "azure_client_id=AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE;");
+            Assert.assertEquals("azure", tp.get("token_provider"));
+            Assert.assertEquals("api://app", tp.get("azure_resource"));
+            Assert.assertEquals("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", tp.get("azure_client_id"));
+        } finally {
+            TestTokenProviderFactory.uninstall();
+        }
+        markHonored("token_provider", "azure_resource", "azure_client_id");
 
         // Drift guard: every ingress-applied registry key must have an assertion
         // above. The honored set is populated by the assertions themselves, so

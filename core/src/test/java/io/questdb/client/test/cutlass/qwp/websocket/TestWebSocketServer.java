@@ -49,6 +49,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.ToIntFunction;
 
 /**
  * A simple WebSocket server for client integration testing.
@@ -57,6 +58,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class TestWebSocketServer implements Closeable {
     private static final Logger LOG = LoggerFactory.getLogger(TestWebSocketServer.class);
     private static final String WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    // Number of upgrades the authorization validator rejected, over the server's lifetime.
+    private final AtomicInteger authRejectCount = new AtomicInteger();
+    // Number of well-formed upgrade requests received, accepted or rejected, over the server's lifetime.
+    private final AtomicInteger upgradeRequestCount = new AtomicInteger();
     // Authorization header value captured from each well-formed upgrade request ("" when absent), in
     // arrival order. Tests poll this to assert the token a provider supplied at each (re)handshake.
     private final BlockingQueue<String> capturedAuthHeaders = new LinkedBlockingQueue<>();
@@ -84,6 +89,12 @@ public class TestWebSocketServer implements Closeable {
     // connected even after they have all disconnected.
     private final AtomicInteger totalHandshakes = new AtomicInteger();
     private Thread acceptThread;
+    // When non-null, decides every upgrade from its Authorization header value ("" when absent): a positive
+    // return is the HTTP status to reject with (e.g. 401, 403), zero or less accepts. Lets a test model a
+    // server that validates tokens - expired, revoked or rotated - rather than one that rejects blindly.
+    private volatile ToIntFunction<String> authorizationValidator;
+    // WWW-Authenticate value sent with a 401 reject (validator or setRejectWithStatus), or null for none.
+    private volatile String rejectWwwAuthenticate;
     // X-QuestDB-Role value to emit on handshake responses. null = omit the
     // header (legacy behavior for tests written before role-aware failover).
     // The server emits the header on both the 101 success path and (when
@@ -168,6 +179,12 @@ public class TestWebSocketServer implements Closeable {
     public TestWebSocketServer(WebSocketServerHandler handler,
                                boolean emitDurableAckHeader, String advertisedRole,
                                int requestedPort) throws IOException {
+        this(handler, emitDurableAckHeader, advertisedRole, requestedPort, false);
+    }
+
+    private TestWebSocketServer(WebSocketServerHandler handler,
+                                boolean emitDurableAckHeader, String advertisedRole,
+                                int requestedPort, boolean tls) throws IOException {
         this.handler = handler;
         this.emitDurableAckHeader = emitDurableAckHeader;
         this.advertisedRole = advertisedRole;
@@ -177,9 +194,19 @@ public class TestWebSocketServer implements Closeable {
         // which another process could grab a pre-selected port before start()
         // binds it. Pinning to loopback keeps client "localhost" connections
         // routed here rather than to a wildcard listener on the same port.
-        serverSocket = new ServerSocket(requestedPort, 50, java.net.InetAddress.getLoopbackAddress());
+        serverSocket = tls
+                ? TestTls.serverSocketFactory().createServerSocket(requestedPort, 50, java.net.InetAddress.getLoopbackAddress())
+                : new ServerSocket(requestedPort, 50, java.net.InetAddress.getLoopbackAddress());
         serverSocket.setSoTimeout(100);
         this.port = serverSocket.getLocalPort();
+    }
+
+    /**
+     * A server that speaks WebSocket over TLS with a self-signed certificate (see {@link TestTls}). Connect
+     * with {@code wss::...;tls_verify=unsafe_off;}.
+     */
+    public static TestWebSocketServer tls(WebSocketServerHandler handler) throws IOException {
+        return new TestWebSocketServer(handler, false, null, 0, true);
     }
 
     public boolean awaitRoleReject(long timeout, TimeUnit unit) throws InterruptedException {
@@ -232,6 +259,46 @@ public class TestWebSocketServer implements Closeable {
      */
     public int handshakeCount() {
         return totalHandshakes.get();
+    }
+
+    /**
+     * Number of upgrades the authorization validator rejected over the server's lifetime.
+     */
+    public int authRejectCount() {
+        return authRejectCount.get();
+    }
+
+    /**
+     * Closes every live client connection while the listener keeps accepting, so connected clients see a
+     * dropped connection and reconnect.
+     */
+    public void dropAllConnections() {
+        for (ClientHandler client : clients) {
+            client.close();
+        }
+    }
+
+    /**
+     * Number of well-formed upgrade requests received over the server's lifetime, whatever the answer.
+     */
+    public int upgradeRequestCount() {
+        return upgradeRequestCount.get();
+    }
+
+    /**
+     * Installs a validator that decides every upgrade from its {@code Authorization} header value ({@code ""}
+     * when absent): a positive return is the HTTP status to reject with, zero or less accepts. Pass null to
+     * remove it. Runs before the role and status rejects.
+     */
+    public void setAuthorizationValidator(ToIntFunction<String> validator) {
+        this.authorizationValidator = validator;
+    }
+
+    /**
+     * {@code WWW-Authenticate} value to send with a {@code 401} reject, or null for none.
+     */
+    public void setRejectWwwAuthenticate(String value) {
+        this.rejectWwwAuthenticate = value;
     }
 
     /**
@@ -603,6 +670,7 @@ public class TestWebSocketServer implements Closeable {
             if (key == null) {
                 return false;
             }
+            upgradeRequestCount.incrementAndGet();
             capturedAuthHeaders.add(authorization);
 
             // Read-path reject: drop the egress upgrade before the 101 so the
@@ -612,18 +680,23 @@ public class TestWebSocketServer implements Closeable {
                 return false;
             }
 
+            // Token-validating reject path: the validator inspects the presented credential.
+            ToIntFunction<String> validator = authorizationValidator;
+            if (validator != null) {
+                int status = validator.applyAsInt(authorization);
+                if (status > 0) {
+                    writeStatusReject(status, status == 401 ? "Unauthorized" : status == 403 ? "Forbidden" : "Rejected");
+                    authRejectCount.incrementAndGet();
+                    return false;
+                }
+            }
+
             // Arbitrary-status reject path: tests use setRejectWithStatus
             // to drive the failover loop's terminal-vs-transient
             // classification (failover.md §6).
             int customStatus = rejectingStatusCode;
             if (customStatus > 0) {
-                String reason = rejectingStatusReason != null ? rejectingStatusReason : "";
-                String sb = "HTTP/1.1 " + customStatus + ' ' + reason + "\r\n" +
-                        "Connection: close\r\n" +
-                        "Content-Length: 0\r\n" +
-                        "\r\n";
-                out.write(sb.getBytes(StandardCharsets.US_ASCII));
-                out.flush();
+                writeStatusReject(customStatus, rejectingStatusReason != null ? rejectingStatusReason : "");
                 statusRejectCount.incrementAndGet();
                 return false;
             }
@@ -672,6 +745,20 @@ public class TestWebSocketServer implements Closeable {
             return true;
         }
 
+        private void writeStatusReject(int status, String reason) throws IOException {
+            StringBuilder sb = new StringBuilder()
+                    .append("HTTP/1.1 ").append(status).append(' ').append(reason).append("\r\n")
+                    .append("Connection: close\r\n")
+                    .append("Content-Length: 0\r\n");
+            String challenge = rejectWwwAuthenticate;
+            if (status == 401 && challenge != null) {
+                sb.append("WWW-Authenticate: ").append(challenge).append("\r\n");
+            }
+            sb.append("\r\n");
+            out.write(sb.toString().getBytes(StandardCharsets.US_ASCII));
+            out.flush();
+        }
+
         private synchronized void writeFrame(int opcode, byte[] payload, int length) throws IOException {
             // first byte: FIN + opcode
             out.write(0x80 | (opcode & 0x0F));
@@ -702,6 +789,12 @@ public class TestWebSocketServer implements Closeable {
 
             readThread = new Thread(() -> {
                 try {
+                    if (socket instanceof javax.net.ssl.SSLSocket) {
+                        // finish the TLS handshake under a generous timeout before the short polling
+                        // timeout below applies to every read
+                        socket.setSoTimeout(10_000);
+                        ((javax.net.ssl.SSLSocket) socket).startHandshake();
+                    }
                     socket.setSoTimeout(100);
 
                     in = socket.getInputStream();
