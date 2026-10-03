@@ -581,10 +581,12 @@ public class QwpWebSocketSender implements Sender {
     // Released by releaseRecycleSlotLock() on commit, on the breach latch and
     // in close().
     private SlotLock recycleSlotLock;
-    // Latched by recycle step 0 when the slot's logical lock cannot be taken
-    // for a reason a retry will not fix: the slot path has no parent to
-    // anchor it in, or the parent cannot hold .slot-locks. The swap never
-    // runs without that lock, so armIfEligible stops arming this sender.
+    // Latched by recycle step 0 when taking the slot's logical lock fails for
+    // any reason other than contention -- typically a slot path with no
+    // parent to anchor the lock in, or a parent that cannot hold .slot-locks.
+    // Step 0 cannot tell those from a transient open failure, so the latch is
+    // permanent either way. A disk-mode swap never runs without that lock, so
+    // armIfEligible stops arming this sender.
     private boolean recycleSlotUnlockable;
     // Test seam: recycle step-7 fault injection. When set, runs (and is
     // expected to throw) inside ensureConnected()'s loop-construction try,
@@ -3194,8 +3196,8 @@ public class QwpWebSocketSender implements Sender {
      * sender until one is installed) or running on an engine they do not
      * own -- which never arm. A sender whose slot's logical lock cannot be
      * taken (see {@link #setEngineRebuildFactory(EngineRebuildFactory)})
-     * arms once, finds that out at its next drained row start, and never
-     * arms again.
+     * arms once, finds that out when the recycle first tries to take the
+     * lock, and never arms again.
      */
     @Override
     public void resetSymbolDictionary() {
@@ -3383,10 +3385,12 @@ public class QwpWebSocketSender implements Sender {
      * The recycle keeps the slot owned through the slot's parent-anchored
      * logical lock (see {@link EngineRebuildFactory}), so the slot directory
      * needs a parent directory that can hold {@code .slot-locks}. On a bare
-     * relative slot name, or under a parent the process cannot write, the
-     * first recycle attempt logs one WARN and the sender stops arming: rows
-     * are still accepted and the dictionary keeps growing, as on a sender
-     * with no factory.
+     * relative slot name, or under a parent where {@code .slot-locks} cannot
+     * be created or opened, the first recycle attempt logs one WARN and the
+     * sender stops arming: rows are still accepted and the dictionary keeps
+     * growing, as on a sender with no factory. Any other failure to take the
+     * lock, a transient one included, has the same effect; only a contention
+     * is retried.
      *
      * @throws LineSenderException if the sender is closed
      */
@@ -5368,8 +5372,9 @@ public class QwpWebSocketSender implements Sender {
      * sender does not own ({@code setCursorEngine(engine, false)}'s contract:
      * the caller retains ownership, so closing it out from under them would
      * be a use-after-free from the caller's point of view) -- must never arm.
-     * Neither does one whose slot's logical lock proved untakeable at recycle
-     * step 0 ({@link #recycleSlotUnlockable}): the swap never runs without
+     * Neither does one whose slot's logical lock could not be taken at
+     * recycle step 0 for a reason other than contention
+     * ({@link #recycleSlotUnlockable}): a disk-mode swap never runs without
      * that lock.
      * Since the recycle feature is default-on and {@code
      * resetSymbolDictionary()} is a public advisory API, arming a sender with
@@ -5713,8 +5718,10 @@ public class QwpWebSocketSender implements Sender {
      * <p>
      * Otherwise waits (parked, {@code awaitAckedFsn}-shaped) until either the
      * ring drains -- in which case the recycle runs synchronously before
-     * returning, or stays armed if the I/O loop has begun a reconnect meanwhile
-     * (see {@link #recycleForDictReset()} step 2) -- or {@code resetMaxWaitMillis} elapses from THIS call, in
+     * returning, unless {@link #recycleForDictReset()} step 0 or step 2 backs
+     * out (the slot's logical lock is contended or cannot be taken, or the
+     * I/O loop has begun a reconnect meanwhile) -- or
+     * {@code resetMaxWaitMillis} elapses from THIS call, in
      * which case it gives up, counts the timeout, and leaves
      * {@link #resetArmed} set so a later drained {@link #table(CharSequence)}
      * call can still recycle opportunistically.
@@ -5840,8 +5847,8 @@ public class QwpWebSocketSender implements Sender {
      * {@link #maybeRecycleForDictReset()} has proven the ring is drained.
      * Eight steps, strictly ordered (step 0 takes the slot's logical lock; a
      * contention there leaves the recycle armed for the next drained barrier,
-     * and a lock that cannot be taken at all stops this sender arming --
-     * either way nothing is torn down and the caller's row proceeds):
+     * and any other failure to take it stops this sender arming -- either
+     * way nothing is torn down and the caller's row proceeds):
      * <ol>
      *   <li>Snapshot the outgoing epoch's last published (raw) FSN.</li>
      *   <li>Close and null the cursor I/O loop -- joins the I/O thread and
@@ -5939,12 +5946,13 @@ public class QwpWebSocketSender implements Sender {
         // contention (a sibling's startup orphan drainer holding the logical
         // lock for the microseconds between taking it and finding no segment
         // files) leaves the outgoing stack and the arming intact, and the next
-        // drained barrier retries. Any other failure repeats at every barrier
-        // (the slot path has no parent to anchor the lock in, or the parent
-        // cannot hold .slot-locks); swapping without the lock would let a
-        // colliding build() take the slot between the outgoing close and the
-        // rebuild, so the sender stops arming instead. Already held when a
-        // CLOSE_LOOP abandon re-fires.
+        // drained barrier retries. Any other failure is treated as permanent:
+        // it usually repeats at every barrier (the slot path has no parent to
+        // anchor the lock in, or the parent cannot hold .slot-locks), and
+        // step 0 cannot tell that from a transient open failure. Swapping
+        // without the lock would let a colliding build() take the slot between
+        // the outgoing close and the rebuild, so the sender stops arming
+        // instead. Already held when a CLOSE_LOOP abandon re-fires.
         boolean slotLockTakenHere = false;
         if (recycleSlotLock == null) {
             String slotDir = cursorEngine.sfDir();
@@ -5962,9 +5970,10 @@ public class QwpWebSocketSender implements Sender {
                     recycleSlotUnlockable = true;
                     resetArmed = false;
                     LOG.warn("symbol dictionary recycle disabled for this sender: the slot's logical lock "
-                            + "cannot be taken, so the slot cannot stay owned across the swap. Rows are "
-                            + "still accepted and the dictionary keeps growing. Give the slot directory a "
-                            + "parent that can hold .slot-locks [slotDir={}]", slotDir, t);
+                            + "could not be taken, so the slot cannot stay owned across the swap. Rows are "
+                            + "still accepted and the dictionary keeps growing. The slot directory needs a "
+                            + "parent that can hold .slot-locks; if the cause below was transient, a new "
+                            + "sender recycles again [slotDir={}]", slotDir, t);
                     return;
                 }
             }

@@ -259,6 +259,8 @@ public class CursorWebSocketSendLoopConnectGateTest {
                         0, interruptsSeenByWalk.get());
             } finally {
                 releaseWalk.countDown();
+                // Back to the default budget: this close stops a healthy loop.
+                loop.setShutdownAwaitTimeoutMillis(CursorWebSocketSendLoop.DEFAULT_CLOSE_SHUTDOWN_AWAIT_MILLIS);
                 loop.close();
                 engine.close();
                 initialClient.close();
