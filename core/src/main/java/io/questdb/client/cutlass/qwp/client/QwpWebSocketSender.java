@@ -54,6 +54,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderConnectionDispatcher
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderProgressDispatcher;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLockContentionException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.UnreplayableSlotException;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
@@ -580,6 +581,11 @@ public class QwpWebSocketSender implements Sender {
     // Released by releaseRecycleSlotLock() on commit, on the breach latch and
     // in close().
     private SlotLock recycleSlotLock;
+    // Latched by recycle step 0 when the slot's logical lock cannot be taken
+    // for a reason a retry will not fix: the slot path has no parent to
+    // anchor it in, or the parent cannot hold .slot-locks. The swap never
+    // runs without that lock, so armIfEligible stops arming this sender.
+    private boolean recycleSlotUnlockable;
     // Test seam: recycle step-7 fault injection. When set, runs (and is
     // expected to throw) inside ensureConnected()'s loop-construction try,
     // after cursorSendLoop is assigned but before start() -- exercising the
@@ -3185,7 +3191,11 @@ public class QwpWebSocketSender implements Sender {
      * acts on the request, however many times it is made. The request is
      * likewise a permanent no-op on senders that cannot recycle -- ones
      * without an engine rebuild factory (every {@code connect()}-built
-     * sender) or running on an engine they do not own -- which never arm.
+     * sender until one is installed) or running on an engine they do not
+     * own -- which never arm. A sender whose slot's logical lock cannot be
+     * taken (see {@link #setEngineRebuildFactory(EngineRebuildFactory)})
+     * arms once, finds that out at its next drained row start, and never
+     * arms again.
      */
     @Override
     public void resetSymbolDictionary() {
@@ -3359,11 +3369,24 @@ public class QwpWebSocketSender implements Sender {
     /**
      * Installs the factory a symbol-dictionary recycle uses to rebuild its
      * cursor engine on the emptied slot ({@code Sender.build()} installs the
-     * builder's). {@code null} stops future arming ({@link #armIfEligible()}
-     * never arms a sender that cannot rebuild) but does not cancel a recycle
-     * that is already armed or pending, so it must not be cleared while one
-     * is. May be called before or after connect; takes effect at the next
-     * flush-tail arming check.
+     * builder's). May be called before or after connect; takes effect at the
+     * next arming check (a flush tail, or {@link #resetSymbolDictionary()}
+     * with nothing in flight).
+     * <p>
+     * {@code null} stops arming from that next check on
+     * ({@link #armIfEligible()} never arms a sender that cannot rebuild). It
+     * does not reach a recycle that stays armed until then, nor one that is
+     * pending, and either would find no factory at its rebuild, so it must
+     * not be cleared while {@link #isResetArmed()} is true or a recycle is
+     * pending.
+     * <p>
+     * The recycle keeps the slot owned through the slot's parent-anchored
+     * logical lock (see {@link EngineRebuildFactory}), so the slot directory
+     * needs a parent directory that can hold {@code .slot-locks}. On a bare
+     * relative slot name, or under a parent the process cannot write, the
+     * first recycle attempt logs one WARN and the sender stops arming: rows
+     * are still accepted and the dictionary keeps growing, as on a sender
+     * with no factory.
      *
      * @throws LineSenderException if the sender is closed
      */
@@ -5345,6 +5368,9 @@ public class QwpWebSocketSender implements Sender {
      * sender does not own ({@code setCursorEngine(engine, false)}'s contract:
      * the caller retains ownership, so closing it out from under them would
      * be a use-after-free from the caller's point of view) -- must never arm.
+     * Neither does one whose slot's logical lock proved untakeable at recycle
+     * step 0 ({@link #recycleSlotUnlockable}): the swap never runs without
+     * that lock.
      * Since the recycle feature is default-on and {@code
      * resetSymbolDictionary()} is a public advisory API, arming a sender with
      * no way to ever act on the request would leave {@code isResetArmed()}
@@ -5372,6 +5398,7 @@ public class QwpWebSocketSender implements Sender {
         boolean shouldArm = resetEnabled
                 && engineRebuildFactory != null
                 && ownsCursorEngine
+                && !recycleSlotUnlockable
                 && (globalSymbolDictionary.size() >= Math.max(resetThresholdSymbols, resetFloorSymbols)
                         || manualResetRequested);
         if (shouldArm && !resetArmed) {
@@ -5781,8 +5808,8 @@ public class QwpWebSocketSender implements Sender {
      * next send retries; there is deliberately no in-place retry loop. A
      * sibling sender's startup orphan drainer (drain_orphans=on, same sf_dir)
      * can hold this slot's logical lock for the microseconds between taking it
-     * and finding no segment files: that collision now lands at step 0, before
-     * any teardown, where it costs one refused row and nothing else.
+     * and finding no segment files: that collision lands at step 0, before
+     * any teardown, where it defers the recycle to the next drained barrier.
      */
     private CursorSendEngine rebuildEngineOrAbandon(String message) {
         try {
@@ -5812,8 +5839,9 @@ public class QwpWebSocketSender implements Sender {
      * thread from the {@link #table(CharSequence)} barrier, once
      * {@link #maybeRecycleForDictReset()} has proven the ring is drained.
      * Eight steps, strictly ordered (step 0 takes the slot's logical lock; a
-     * contention there refuses the caller's row and re-fires later, nothing
-     * torn down):
+     * contention there leaves the recycle armed for the next drained barrier,
+     * and a lock that cannot be taken at all stops this sender arming --
+     * either way nothing is torn down and the caller's row proceeds):
      * <ol>
      *   <li>Snapshot the outgoing epoch's last published (raw) FSN.</li>
      *   <li>Close and null the cursor I/O loop -- joins the I/O thread and
@@ -5907,11 +5935,16 @@ public class QwpWebSocketSender implements Sender {
         // lock is taken from the live engine's slot directory (null in memory
         // mode: nothing to lock) and held until the rebuilt engine owns the
         // slot's directory flock -- across an abandon too. Nothing is torn
-        // down yet, so a contention here (a sibling's startup orphan drainer
-        // holding the logical lock for the microseconds between taking it and
-        // finding no segment files) costs the caller one refused row, leaves
-        // the outgoing stack and the arming intact, and the next drained
-        // barrier retries. Already held when a CLOSE_LOOP abandon re-fires.
+        // down yet, so a failure here never costs the caller a row. A
+        // contention (a sibling's startup orphan drainer holding the logical
+        // lock for the microseconds between taking it and finding no segment
+        // files) leaves the outgoing stack and the arming intact, and the next
+        // drained barrier retries. Any other failure repeats at every barrier
+        // (the slot path has no parent to anchor the lock in, or the parent
+        // cannot hold .slot-locks); swapping without the lock would let a
+        // colliding build() take the slot between the outgoing close and the
+        // rebuild, so the sender stops arming instead. Already held when a
+        // CLOSE_LOOP abandon re-fires.
         boolean slotLockTakenHere = false;
         if (recycleSlotLock == null) {
             String slotDir = cursorEngine.sfDir();
@@ -5919,11 +5952,20 @@ public class QwpWebSocketSender implements Sender {
                 try {
                     recycleSlotLock = SlotLock.acquireLogical(slotDir);
                     slotLockTakenHere = true;
+                } catch (SlotLockContentionException e) {
+                    LOG.debug("symbol dictionary recycle deferred: the slot's logical lock is contended; "
+                            + "retried at the next drained row start [epoch={}]", symbolDictEpoch);
+                    return;
                 } catch (Error e) {
                     throw e;
                 } catch (Throwable t) {
-                    throw new LineSenderException(t).put("symbol dictionary recycle deferred: "
-                            + "could not take the slot's logical lock; retried at a later row start");
+                    recycleSlotUnlockable = true;
+                    resetArmed = false;
+                    LOG.warn("symbol dictionary recycle disabled for this sender: the slot's logical lock "
+                            + "cannot be taken, so the slot cannot stay owned across the swap. Rows are "
+                            + "still accepted and the dictionary keeps growing. Give the slot directory a "
+                            + "parent that can hold .slot-locks [slotDir={}]", slotDir, t);
+                    return;
                 }
             }
         }

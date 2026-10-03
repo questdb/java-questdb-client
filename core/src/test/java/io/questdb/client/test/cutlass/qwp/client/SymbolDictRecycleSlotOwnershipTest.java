@@ -33,15 +33,21 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLockContentionException;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
+import org.junit.Assume;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
+import java.io.File;
 import java.io.IOException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.Comparator;
 import java.util.IdentityHashMap;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Stream;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
@@ -56,6 +62,7 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  */
 public class SymbolDictRecycleSlotOwnershipTest {
 
+    private static final long SEGMENT_BYTES = 1024L * 1024L;
     @Rule
     public final TemporaryFolder temporaryFolder = TemporaryFolder.builder().assureDeletion().build();
 
@@ -239,11 +246,11 @@ public class SymbolDictRecycleSlotOwnershipTest {
 
     /**
      * A contention on the step-0 lock acquisition (a sibling's orphan drainer
-     * holding the logical lock for microseconds) refuses the caller's row and
-     * nothing else: the outgoing engine stays attached, the arming stays, and
-     * the next drained barrier takes the lock and recycles. Distinguishes
-     * "refused before teardown" from "torn down, then resumed": a resume would
-     * leave the engine null.
+     * holding the logical lock for microseconds) costs the producer nothing:
+     * rows keep flowing, the outgoing engine stays attached, the arming stays,
+     * and the first drained barrier after the lock frees takes it and
+     * recycles. Distinguishes "deferred before teardown" from "torn down,
+     * then resumed": a resume would leave the engine null.
      */
     @Test(timeout = 60_000L)
     public void testLockContentionBeforeTeardownDefersTheRecycleWithNothingTornDown() throws Exception {
@@ -263,12 +270,11 @@ public class SymbolDictRecycleSlotOwnershipTest {
                     // second descriptor in the same process as another holder.
                     try (SlotLock heldElsewhere = SlotLock.acquireLogical(slotDir)) {
                         Assert.assertNotNull(heldElsewhere);
-                        try {
-                            sender.table("t");
-                            Assert.fail("a contended step-0 acquisition must refuse the row");
-                        } catch (LineSenderException expected) {
-                            Assert.assertTrue(expected.getMessage(),
-                                    expected.getMessage().contains("symbol dictionary recycle deferred"));
+                        for (int i = 0; i < 3; i++) {
+                            // Each row start is a drained barrier that finds the lock contended.
+                            sender.table("t").symbol("s", "c" + i).longColumn("v", i).atNow();
+                            Assert.assertTrue("a contended step-0 acquisition must not cost a row",
+                                    sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
                         }
                         Assert.assertEquals("nothing swapped", 0L, ws.getSymbolDictEpoch());
                         Assert.assertTrue("still armed", ws.isResetArmed());
@@ -283,6 +289,67 @@ public class SymbolDictRecycleSlotOwnershipTest {
                 }
             }
         });
+    }
+
+    /**
+     * A {@code connect()}-built sender whose slot is a bare relative name has
+     * no parent directory to anchor the logical lock in, so its recycle can
+     * never own the slot across the swap. It must not refuse rows over that:
+     * the swap is skipped, the sender stops arming, and ingestion continues.
+     */
+    @Test(timeout = 60_000L)
+    public void testBareRelativeSlotStopsArmingAndKeepsIngesting() throws Exception {
+        // Resolved against the forked test JVM's working directory.
+        String slot = "sf-unlockable-bare-" + System.nanoTime();
+        try {
+            assertMemoryLeak(() -> {
+                try (TestWebSocketServer server = ackingServer()) {
+                    assertUnlockableSlotKeepsIngesting(server, slot);
+                }
+            });
+        } finally {
+            deleteRecursively(Paths.get(slot));
+        }
+    }
+
+    /**
+     * The same for a slot whose lock directory cannot exist: a regular file
+     * already sits where {@code .slot-locks} would go. Portable stand-in for
+     * a parent the process cannot write.
+     */
+    @Test(timeout = 60_000L)
+    public void testSlotWhoseLockDirCannotExistStopsArmingAndKeepsIngesting() throws Exception {
+        assertMemoryLeak(() -> {
+            File parent = temporaryFolder.newFolder("blocked-parent");
+            Assert.assertTrue(new File(parent, ".slot-locks").createNewFile());
+            try (TestWebSocketServer server = ackingServer()) {
+                assertUnlockableSlotKeepsIngesting(server, new File(parent, "slot").getAbsolutePath());
+            }
+        });
+    }
+
+    /**
+     * The same for a slot under a parent the process cannot write, with no
+     * {@code .slot-locks} directory in it yet. Skipped where directory
+     * permissions are not enforced (Windows, or running as root).
+     */
+    @Test(timeout = 60_000L)
+    public void testSlotUnderReadOnlyParentStopsArmingAndKeepsIngesting() throws Exception {
+        File parent = temporaryFolder.newFolder("ro-parent");
+        File slot = new File(parent, "slot");
+        Assert.assertTrue(slot.mkdir());
+        parent.setWritable(false, false);
+        try {
+            Assume.assumeFalse("directory permissions are not enforced here",
+                    new File(parent, "probe").mkdir());
+            assertMemoryLeak(() -> {
+                try (TestWebSocketServer server = ackingServer()) {
+                    assertUnlockableSlotKeepsIngesting(server, slot.getAbsolutePath());
+                }
+            });
+        } finally {
+            parent.setWritable(true, false); // the TemporaryFolder rule must be able to delete the tree
+        }
     }
 
     private static Throwable attemptCollidingBuild(String cfg) {
@@ -306,6 +373,47 @@ public class SymbolDictRecycleSlotOwnershipTest {
             }
         }
         throw new AssertionError("a colliding build " + when + " must fail with slot contention, got: " + t, t);
+    }
+
+    private static void assertUnlockableSlotKeepsIngesting(TestWebSocketServer server, String slot) throws Exception {
+        CursorSendEngine engine = new CursorSendEngine(slot, SEGMENT_BYTES);
+        try (QwpWebSocketSender sender = QwpWebSocketSender.connect(
+                "localhost", server.getPort(), null, 0, 0, 0L, null, false, engine)) {
+            sender.setEngineRebuildFactory(() -> new CursorSendEngine(slot, SEGMENT_BYTES));
+            sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
+            Assert.assertTrue(sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+
+            sender.resetSymbolDictionary();
+            Assert.assertTrue("precondition: an owned engine plus a rebuild factory arms on request",
+                    sender.isResetArmed());
+            sender.table("t"); // drained barrier on a live link: step 0 runs and cannot take the lock
+            Assert.assertFalse("the barrier itself must disarm a sender that cannot lock its slot",
+                    sender.isResetArmed());
+            Assert.assertEquals("no swap without the slot's logical lock", 0L, sender.getSymbolDictEpoch());
+            Assert.assertSame("nothing torn down", engine, sender.getCursorEngineForTesting());
+
+            for (int i = 0; i < 20; i++) {
+                sender.table("t").symbol("s", "b" + i).longColumn("v", i).atNow();
+                Assert.assertTrue("row " + i + " must be accepted and acked",
+                        sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+            }
+            Assert.assertEquals(0L, sender.getSymbolDictEpoch());
+            Assert.assertFalse(sender.isResetArmed());
+
+            sender.resetSymbolDictionary();
+            Assert.assertFalse("a later request must not re-arm it", sender.isResetArmed());
+            sender.table("t").symbol("s", "z").longColumn("v", 99L).atNow();
+            Assert.assertTrue(sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+        }
+    }
+
+    private static void deleteRecursively(Path root) throws IOException {
+        if (!java.nio.file.Files.exists(root)) {
+            return;
+        }
+        try (Stream<Path> paths = java.nio.file.Files.walk(root)) {
+            paths.sorted(Comparator.reverseOrder()).forEach(p -> p.toFile().delete());
+        }
     }
 
     private static TestWebSocketServer ackingServer() throws Exception {
