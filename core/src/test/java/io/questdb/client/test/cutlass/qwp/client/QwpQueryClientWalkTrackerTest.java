@@ -441,10 +441,15 @@ public class QwpQueryClientWalkTrackerTest {
         // First port has no server (TCP refused); second is reachable.
         // WalkTracker must classify the first as TransportError and bind
         // the second on the same walk (no fall-through reset needed yet).
-        int portDead = TestPorts.findUnusedPort();
         try (TestWebSocketServer ok = new TestWebSocketServer(NOOP_HANDLER)) {
             ok.setSendServerInfo(true);
             int portOk = ok.getPort();
+            // Probe the dead port only while ok's listener holds portOk: the
+            // kernel never hands out a port a live listener owns, so portDead
+            // cannot collide with portOk. Probing first lets the server's own
+            // bind(0) receive the just-released probe port, and the duplicate
+            // addr entry then fails config validation.
+            int portDead = TestPorts.findUnusedPort();
             ok.start();
             Assert.assertTrue(ok.awaitStart(5, TimeUnit.SECONDS));
 
