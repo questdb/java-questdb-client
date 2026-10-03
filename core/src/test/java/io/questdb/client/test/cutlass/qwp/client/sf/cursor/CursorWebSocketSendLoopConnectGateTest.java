@@ -40,6 +40,7 @@ import org.junit.Test;
 import java.lang.reflect.Field;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
@@ -193,6 +194,82 @@ public class CursorWebSocketSendLoopConnectGateTest {
         });
     }
 
+    /**
+     * The window {@code isLinkUp()} cannot close on its own: the link check
+     * reads the gate open, and the I/O thread starts its connect walk before
+     * the stop's claim. {@code closeIfLinkUp()} must lose the gate to that
+     * walk and refuse; stopping instead would wait out the shutdown budget on
+     * a pull that ignores interrupts.
+     */
+    @Test(timeout = 30_000L)
+    public void testCloseIfLinkUpRefusesWhenTheWalkStartsBehindItsLinkCheck() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final IdleLinkClient initialClient = new IdleLinkClient();
+            final AtomicReference<IdleLinkClient> reconnectedClient = new AtomicReference<>();
+            final CountDownLatch walkEntered = new CountDownLatch(1);
+            final CountDownLatch releaseWalk = new CountDownLatch(1);
+            final AtomicInteger interruptsSeenByWalk = new AtomicInteger();
+            final CursorWebSocketSendLoop.ReconnectFactory factory = () -> {
+                walkEntered.countDown();
+                while (releaseWalk.getCount() != 0L) {
+                    try {
+                        releaseWalk.await();
+                    } catch (InterruptedException e) {
+                        interruptsSeenByWalk.incrementAndGet();
+                    }
+                }
+                IdleLinkClient live = new IdleLinkClient();
+                reconnectedClient.set(live);
+                return live;
+            };
+            final CursorSendEngine engine = new CursorSendEngine(null, 64 * 1024);
+            final CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
+                    initialClient,
+                    engine,
+                    0L,
+                    CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                    factory,
+                    /* reconnectInitialBackoffMillis */ 1_000L,
+                    /* reconnectMaxBackoffMillis */ 5_000L,
+                    false
+            );
+            // A stop that wrongly goes ahead waits on the blocked walk; keep that wait short.
+            loop.setShutdownAwaitTimeoutMillis(1_000L);
+            try {
+                loop.start();
+                Assert.assertTrue("precondition: the loop holds a live link", loop.isLinkUp());
+
+                final AtomicBoolean walkStartedInsideLinkCheck = new AtomicBoolean();
+                initialClient.onNextLinkCheckBy(Thread.currentThread(), () -> {
+                    initialClient.drop();
+                    try {
+                        walkStartedInsideLinkCheck.set(walkEntered.await(5, TimeUnit.SECONDS));
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                });
+
+                boolean stopped = loop.closeIfLinkUp();
+                Assert.assertTrue("the walk must have started inside the stop's own link check",
+                        walkStartedInsideLinkCheck.get());
+                Assert.assertFalse("the stop must lose the gate to a walk that started behind its link check",
+                        stopped);
+                Assert.assertTrue("a refused stop must leave the loop running", loop.isRunning());
+                Assert.assertEquals("a refused stop must not cancel or interrupt the walk",
+                        0, interruptsSeenByWalk.get());
+            } finally {
+                releaseWalk.countDown();
+                loop.close();
+                engine.close();
+                initialClient.close();
+                IdleLinkClient live = reconnectedClient.get();
+                if (live != null) {
+                    live.close();
+                }
+            }
+        });
+    }
+
     private static int getStaticInt(String name) throws Exception {
         Field f = CursorWebSocketSendLoop.class.getDeclaredField(name);
         f.setAccessible(true);
@@ -213,6 +290,8 @@ public class CursorWebSocketSendLoopConnectGateTest {
     private static final class IdleLinkClient extends WebSocketClient {
         private volatile boolean closed;
         private volatile boolean dropped;
+        private volatile Runnable linkCheckHook;
+        private volatile Thread linkCheckHookThread;
 
         private IdleLinkClient() {
             super(DefaultHttpClientConfiguration.INSTANCE, PlainSocketFactory.INSTANCE);
@@ -231,6 +310,13 @@ public class CursorWebSocketSendLoopConnectGateTest {
 
         @Override
         public boolean isConnected() {
+            Runnable hook = linkCheckHook;
+            if (hook != null && Thread.currentThread() == linkCheckHookThread) {
+                linkCheckHook = null;
+                hook.run();
+                // What a link check reads when the drop lands just behind it.
+                return true;
+            }
             return !closed;
         }
 
@@ -244,6 +330,12 @@ public class CursorWebSocketSendLoopConnectGateTest {
 
         void drop() {
             dropped = true;
+        }
+
+        /** Runs {@code hook} inside the next {@code isConnected()} call {@code caller} makes; that call answers connected. */
+        void onNextLinkCheckBy(Thread caller, Runnable hook) {
+            linkCheckHookThread = caller;
+            linkCheckHook = hook;
         }
 
         @Override
