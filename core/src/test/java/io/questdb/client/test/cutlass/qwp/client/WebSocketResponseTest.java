@@ -39,7 +39,7 @@ public class WebSocketResponseTest {
     @Test
     public void testDurableAckFactory() throws Exception {
         assertMemoryLeak(() -> {
-            WebSocketResponse response = WebSocketResponse.durableAck("trades", 42L);
+            WebSocketResponse response = WebSocketResponse.durableAck("trades", "trades-dir", 42L);
             Assert.assertTrue(response.isDurableAck());
             Assert.assertFalse(response.isSuccess());
             Assert.assertEquals(1, response.getTableEntryCount());
@@ -54,7 +54,7 @@ public class WebSocketResponseTest {
     @Test
     public void testDurableAckIsStructurallyValid() throws Exception {
         assertMemoryLeak(() -> {
-            WebSocketResponse response = WebSocketResponse.durableAck("t", 7L);
+            WebSocketResponse response = WebSocketResponse.durableAck("t", "t-dir", 7L);
             int size = response.serializedSize();
 
             long ptr = Unsafe.malloc(size + 1, MemoryTag.NATIVE_DEFAULT);
@@ -72,7 +72,7 @@ public class WebSocketResponseTest {
     @Test
     public void testDurableAckRoundTripThroughNativeMemory() throws Exception {
         assertMemoryLeak(() -> {
-            WebSocketResponse original = WebSocketResponse.durableAck("orders", 12345L);
+            WebSocketResponse original = WebSocketResponse.durableAck("orders", "orders-dir", 12345L);
             int size = original.serializedSize();
             long ptr = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
             try {
@@ -95,7 +95,7 @@ public class WebSocketResponseTest {
     @Test
     public void testDurableAckDoesNotCarryErrorMessage() throws Exception {
         assertMemoryLeak(() -> {
-            WebSocketResponse response = WebSocketResponse.durableAck("t", 99L);
+            WebSocketResponse response = WebSocketResponse.durableAck("t", "t-dir", 99L);
             int size = response.serializedSize();
             long ptr = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
             try {

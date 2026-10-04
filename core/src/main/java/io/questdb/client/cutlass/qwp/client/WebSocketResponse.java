@@ -101,6 +101,7 @@ public class WebSocketResponse {
     // subsequent sight is allocation-free.
     private final Utf8SequenceObjHashMap<String> tableNameCache = new Utf8SequenceObjHashMap<>();
     private final ObjList<String> tableNames = new ObjList<>();
+    private final ObjList<String> tableDirNames = new ObjList<>();
     private final LongList tableSeqTxns = new LongList();
     private String errorMessage;
     private int errorMessageUtf8Length;
@@ -118,11 +119,12 @@ public class WebSocketResponse {
      * Creates a durable-upload ACK response with a single table entry.
      */
     @TestOnly
-    public static WebSocketResponse durableAck(String tableName, long seqTxn) {
+    public static WebSocketResponse durableAck(String tableName, String tableDirName, long seqTxn) {
         WebSocketResponse response = new WebSocketResponse();
         response.status = STATUS_DURABLE_ACK;
         response.sequence = -1;
         response.tableNames.add(tableName);
+        response.tableDirNames.add(tableDirName);
         response.tableSeqTxns.add(seqTxn);
         return response;
     }
@@ -164,7 +166,7 @@ public class WebSocketResponse {
             if (length < MIN_DURABLE_ACK_SIZE) {
                 return false;
             }
-            return validateTableEntries(ptr + 1, length - 1);
+            return validateDurableAckEntries(ptr + 1, length - 1);
         }
 
         // Error response
@@ -245,6 +247,20 @@ public class WebSocketResponse {
         return tableNames.getQuick(index);
     }
 
+    /**
+     * Returns the server-side table directory name that accompanied the
+     * durable-ack entry at {@code index}. Used by the sender loop as an
+     * incarnation discriminator: when the dir name for a table name changes,
+     * the table was dropped and re-created on the server, so per-table
+     * durable-upload watermarks must be reset rather than max-merged.
+     *
+     * @param index entry index
+     * @return the table dir name, or {@code null} for non-durable-ack frames
+     */
+    public String getTableDirName(int index) {
+        return tableDirNames.size() > index ? tableDirNames.getQuick(index) : null;
+    }
+
     public long getTableSeqTxn(int index) {
         return tableSeqTxns.getQuick(index);
     }
@@ -272,6 +288,7 @@ public class WebSocketResponse {
      */
     public boolean readFrom(long ptr, int length) {
         tableNames.clear();
+        tableDirNames.clear();
         tableSeqTxns.clear();
 
         if (length < 1) {
@@ -297,7 +314,9 @@ public class WebSocketResponse {
             sequence = -1;
             errorMessage = null;
             errorMessageUtf8Length = -1;
-            return readTableEntries(ptr + 1, length - 1);
+            // Durable ack entries carry the table dir name as an incarnation
+            // discriminator: [nameLen(2) + name(N) + dirLen(2) + dir(M) + seqTxn(8)]
+            return readDurableAckEntries(ptr + 1, length - 1);
         }
 
         // Error response
@@ -334,7 +353,7 @@ public class WebSocketResponse {
             return MIN_OK_RESPONSE_SIZE + tableEntriesSize();
         }
         if (status == STATUS_DURABLE_ACK) {
-            return MIN_DURABLE_ACK_SIZE + tableEntriesSize();
+            return MIN_DURABLE_ACK_SIZE + durableAckEntriesSize();
         }
         return MIN_ERROR_RESPONSE_SIZE + getErrorMessageUtf8Length();
     }
@@ -369,7 +388,7 @@ public class WebSocketResponse {
             offset += 8;
             offset += writeTableEntries(ptr + offset);
         } else if (status == STATUS_DURABLE_ACK) {
-            offset += writeTableEntries(ptr + offset);
+            offset += writeDurableAckEntries(ptr + offset);
         } else {
             Unsafe.getUnsafe().putLong(ptr + offset, sequence);
             offset += 8;
@@ -420,6 +439,53 @@ public class WebSocketResponse {
         return remaining == offset;
     }
 
+    /**
+     * Reads durable-ack table entries that carry the table dir name as an
+     * incarnation discriminator.
+     * <p>
+     * Format: [nameLen(2) + nameUtf8(N) + dirLen(2) + dirUtf8(M) + seqTxn(8)] * count
+     */
+    private boolean readDurableAckEntries(long ptr, int remaining) {
+        if (remaining < 2) {
+            return false;
+        }
+        int tableCount = Unsafe.getUnsafe().getShort(ptr) & 0xFFFF;
+        int offset = 2;
+        for (int i = 0; i < tableCount; i++) {
+            // Table name
+            if (remaining < offset + 2) {
+                return false;
+            }
+            int nameLen = Unsafe.getUnsafe().getShort(ptr + offset) & 0xFFFF;
+            offset += 2;
+            if (nameLen == 0 || remaining < offset + nameLen + 2) {
+                return false;
+            }
+            long nameLo = ptr + offset;
+            long nameHi = nameLo + nameLen;
+            offset += nameLen;
+            // Dir name (incarnation discriminator)
+            if (remaining < offset + 2) {
+                return false;
+            }
+            int dirLen = Unsafe.getUnsafe().getShort(ptr + offset) & 0xFFFF;
+            offset += 2;
+            if (dirLen == 0 || remaining < offset + dirLen + 8) {
+                return false;
+            }
+            long dirLo = ptr + offset;
+            long dirHi = dirLo + dirLen;
+            offset += dirLen;
+            // SeqTxn
+            long seqTxn = Unsafe.getUnsafe().getLong(ptr + offset);
+            offset += 8;
+            tableNames.add(internTableName(nameLo, nameHi));
+            tableDirNames.add(Utf8s.stringFromUtf8Bytes(dirLo, dirHi));
+            tableSeqTxns.add(seqTxn);
+        }
+        return remaining == offset;
+    }
+
     private String internTableName(long lo, long hi) {
         lookupKey.of(lo, hi);
         int keyIndex = tableNameCache.keyIndex(lookupKey);
@@ -462,6 +528,36 @@ public class WebSocketResponse {
         return remaining == offset;
     }
 
+    private static boolean validateDurableAckEntries(long ptr, int remaining) {
+        if (remaining < 2) {
+            return false;
+        }
+        int tableCount = Unsafe.getUnsafe().getShort(ptr) & 0xFFFF;
+        int offset = 2;
+        for (int i = 0; i < tableCount; i++) {
+            if (remaining < offset + 2) {
+                return false;
+            }
+            int nameLen = Unsafe.getUnsafe().getShort(ptr + offset) & 0xFFFF;
+            offset += 2;
+            if (nameLen == 0 || remaining < offset + nameLen + 2) {
+                return false;
+            }
+            offset += nameLen;
+            // Dir name
+            if (remaining < offset + 2) {
+                return false;
+            }
+            int dirLen = Unsafe.getUnsafe().getShort(ptr + offset) & 0xFFFF;
+            offset += 2;
+            if (dirLen == 0 || remaining < offset + dirLen + 8) {
+                return false;
+            }
+            offset += dirLen + 8;
+        }
+        return remaining == offset;
+    }
+
     private int writeTableEntries(long ptr) {
         int offset = 0;
         int count = tableNames.size();
@@ -479,6 +575,45 @@ public class WebSocketResponse {
             offset += 8;
         }
         return offset;
+    }
+
+    private int writeDurableAckEntries(long ptr) {
+        int offset = 0;
+        int count = tableNames.size();
+        Unsafe.getUnsafe().putShort(ptr + offset, (short) count);
+        offset += 2;
+        for (int i = 0; i < count; i++) {
+            // Table name
+            byte[] nameBytes = tableNames.getQuick(i).getBytes(StandardCharsets.UTF_8);
+            Unsafe.getUnsafe().putShort(ptr + offset, (short) nameBytes.length);
+            offset += 2;
+            for (int j = 0; j < nameBytes.length; j++) {
+                Unsafe.getUnsafe().putByte(ptr + offset + j, nameBytes[j]);
+            }
+            offset += nameBytes.length;
+            // Dir name (incarnation discriminator)
+            byte[] dirBytes = tableDirNames.getQuick(i).getBytes(StandardCharsets.UTF_8);
+            Unsafe.getUnsafe().putShort(ptr + offset, (short) dirBytes.length);
+            offset += 2;
+            for (int j = 0; j < dirBytes.length; j++) {
+                Unsafe.getUnsafe().putByte(ptr + offset + j, dirBytes[j]);
+            }
+            offset += dirBytes.length;
+            // SeqTxn
+            Unsafe.getUnsafe().putLong(ptr + offset, tableSeqTxns.getQuick(i));
+            offset += 8;
+        }
+        return offset;
+    }
+
+    private int durableAckEntriesSize() {
+        int size = 0;
+        for (int i = 0, n = tableNames.size(); i < n; i++) {
+            size += 2 + tableNames.getQuick(i).getBytes(StandardCharsets.UTF_8).length
+                    + 2 + tableDirNames.getQuick(i).getBytes(StandardCharsets.UTF_8).length
+                    + 8;
+        }
+        return size;
     }
 
     private int getErrorMessageUtf8Length() {
