@@ -33,6 +33,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.UnreplayableSlotException;
 import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegmentException;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentBudget;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
 import io.questdb.client.std.Files;
@@ -994,12 +995,13 @@ public class CursorSendEngineTest {
     private static Throwable invokeOwnedPrivateConstructorExpectingFailure(
             String sfDir, long segmentSizeBytes, SegmentManager manager) throws Exception {
         Constructor<CursorSendEngine> ctor = CursorSendEngine.class.getDeclaredConstructor(
-                String.class, long.class, SegmentManager.class, boolean.class, long.class,
+                String.class, long.class, SegmentManager.class, boolean.class, SegmentBudget.class,
                 long.class, long.class, FilesFacade.class);
         ctor.setAccessible(true);
         try {
-            ctor.newInstance(sfDir, segmentSizeBytes, manager, true,
-                    SegmentManager.UNLIMITED_TOTAL_BYTES,
+            // The budget is only consulted when the engine builds its own manager;
+            // here the (owned) manager is supplied, so none is needed.
+            ctor.newInstance(sfDir, segmentSizeBytes, manager, true, null,
                     CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, 0L, FilesFacade.INSTANCE);
             fail("expected constructor failure");
             return null;

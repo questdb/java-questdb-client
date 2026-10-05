@@ -88,6 +88,21 @@ import java.util.concurrent.locks.LockSupport;
 public final class CursorWebSocketSendLoop implements QuietCloseable {
 
     /**
+     * How long {@link #close()} lets a live I/O thread stop on its own before
+     * it breaks the connection's traffic path. After {@code running} goes false
+     * an idle or briefly busy I/O thread exits within microseconds, and its
+     * exit path closes the client in order -- a WebSocket CLOSE frame and, over
+     * TLS, a close_notify -- so the server sees an orderly close. Breaking
+     * traffic first (shutdown(SHUT_RDWR)) sent both into a dead socket, and the
+     * server logged every sender close as a dropped connection. Only an I/O
+     * thread stuck in a native send or receive outlives this window; close()
+     * then breaks its traffic exactly as before, so the window caps the extra
+     * close() latency of that stuck case. A connect walk blocked on a published
+     * in-flight client or credential pull skips the window: nothing is
+     * established to close, and only cancellation unblocks it.
+     */
+    public static final long DEFAULT_CLOSE_GRACEFUL_STOP_MILLIS = 100L;
+    /**
      * Bounded-await backstop for {@link #close()}: the maximum time close()
      * waits for the I/O thread to stop (count down {@code shutdownLatch})
      * before it loud-fails and delegates final teardown to the I/O thread's
@@ -416,6 +431,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // it is engine.ackedFsn() + 1, so the first replayed frame on the new
     // connection is wireSeq=0 and server-side cumulative ACKs still line up.
     private long fsnAtZero;
+    // Graceful-stop window for close() (see DEFAULT_CLOSE_GRACEFUL_STOP_MILLIS).
+    // Overridable via setGracefulStopMillis so tests can pin either outcome
+    // deterministically; production always uses the default. Read only on the
+    // owner thread inside close().
+    private long gracefulStopMillis = DEFAULT_CLOSE_GRACEFUL_STOP_MILLIS;
     // Bounded-await backstop budget for close() (see
     // DEFAULT_CLOSE_SHUTDOWN_AWAIT_MILLIS). Overridable via
     // setShutdownAwaitTimeoutMillis so tests can exercise the timeout branch
@@ -1274,7 +1294,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             // finally{shutdownLatch.countDown()} never fired — awaiting here
             // would block forever. isAlive()==false also covers the normal
             // post-exit case where the latch is already counted down.
-            if (t.isAlive()) {
+            // awaitGracefulStop() lets a thread that is not stuck stop on its
+            // own first, so its exit path ends the connection cleanly and
+            // there is no traffic left to break.
+            if (t.isAlive() && !awaitGracefulStop()) {
                 // Break a native send/receive before joining. Full client close
                 // must remain after the worker exit because it frees buffers the
                 // worker may still access.
@@ -1560,6 +1583,17 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * Test seam: resize the {@link #close()} graceful-stop window (default
+     * {@link #DEFAULT_CLOSE_GRACEFUL_STOP_MILLIS}). {@code 0} disables it, so
+     * close() breaks traffic up front. Production never calls this. Set
+     * before {@link #close()}.
+     */
+    @TestOnly
+    public void setGracefulStopMillis(long millis) {
+        this.gracefulStopMillis = millis;
+    }
+
+    /**
      * Plug an async-delivery sink for ack-watermark advances. Same lifecycle
      * contract as {@link #setErrorDispatcher} — set once before
      * {@link #start()}.
@@ -1694,6 +1728,30 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         connectLoop(new LineSenderException(
                         "async initial connect deferred to I/O thread"),
                 "initial connect", 0L);
+    }
+
+    /**
+     * Gives a live I/O thread {@link #gracefulStopMillis} to stop on its own
+     * after close() cleared {@code running}. ioLoop's exit path closes the
+     * client -- WebSocket CLOSE frame, then the TLS close_notify -- before it
+     * counts the shutdown latch down, so {@code true} means the connection
+     * already ended cleanly and close() has no traffic to break. Returns
+     * {@code false} at once while the connect walk is blocked on cancellable
+     * work, which only {@link ConnectCancellation#cancel()} unblocks. An
+     * interrupt ends the wait early and stays set, so the backstop await
+     * takes its usual failed-stop branch after traffic has been broken.
+     * Owner thread only.
+     */
+    private boolean awaitGracefulStop() {
+        if (gracefulStopMillis <= 0L || connectCancellation.isConnectInFlight()) {
+            return false;
+        }
+        try {
+            return shutdownLatch.await(gracefulStopMillis, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return shutdownLatch.getCount() == 0L;
+        }
     }
 
     private void clearDurableAckTracking() {
@@ -3785,6 +3843,16 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             if (t != null) {
                 t.interrupt();
             }
+        }
+
+        /**
+         * Owner-thread probe from {@link #close()}: true while the connect walk
+         * is blocked on work only {@link #cancel()} can break -- a published
+         * in-flight client or a credential pull. There is no established
+         * connection to close gracefully then, so close() cancels at once.
+         */
+        boolean isConnectInFlight() {
+            return inFlight != null || credentialPullThread != null;
         }
     }
 
