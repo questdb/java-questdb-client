@@ -500,11 +500,12 @@ public class QwpWebSocketSender implements Sender {
     // Anti-thrash floor for the automatic reset. 0 until the
     // first swap; the effective re-arm bar is max(resetThresholdSymbols,
     // resetFloorSymbols). Each swap raises it to twice the dictionary size
-    // at that swap, so a live symbol set larger than the threshold stops
-    // re-arming after at most ~log2(liveSet/threshold) swaps, while a
-    // genuinely unbounded-cardinality producer keeps recycling: the floor is
-    // capped at half the protocol cap so it can never double into the hard
-    // stop. Never lowered -- a shrunken working set simply stops arming, and a
+    // at that swap, capped at half the protocol cap (1,000,000) so it can
+    // never double into the hard stop. A static live set below that cap
+    // stops re-arming after about log2(liveSet/threshold) swaps. A live set
+    // at or above it re-arms every time the fresh dictionary refills to the
+    // capped bar, exactly as a genuinely unbounded-cardinality producer
+    // does. Never lowered -- a shrunken working set simply stops arming, and a
     // manual resetSymbolDictionary() swap bypasses the floor for its own swap
     // without lowering it (max() at the commit).
     private int resetFloorSymbols;

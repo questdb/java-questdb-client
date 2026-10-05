@@ -157,9 +157,10 @@ public class GlobalSymbolDictionary {
                             + "buffered backlog drains first). For unbounded-cardinality data use varchar "
                             + "columns instead of symbol. The automatic dictionary reset "
                             + "(symbol_dict_reset, symbol_dict_reset_threshold) and "
-                            + "Sender.resetSymbolDictionary() avoid this cap, but both act only "
-                            + "on senders created via Sender.build()/fromConfig(), and the reset "
-                            + "itself runs at a table() call once the backlog is acknowledged.");
+                            + "Sender.resetSymbolDictionary() avoid this cap. Both act on senders "
+                            + "created via Sender.build()/fromConfig(), and on connect() senders "
+                            + "given a rebuild factory (setEngineRebuildFactory); the reset itself "
+                            + "runs at a table() call once the backlog is acknowledged.");
         }
 
         // Assign new ID — toString() only for new symbols that must be stored

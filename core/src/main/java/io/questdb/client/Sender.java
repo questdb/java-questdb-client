@@ -1967,9 +1967,22 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * Number of distinct symbols the sender's dictionary may accumulate before
          * {@link #symbolDictReset(boolean)} triggers a recycle. Each recycle raises
          * the effective bar to {@code max(threshold, 2 x dictionary size at the swap)},
-         * capped at half of {@link QwpConstants#MAX_SYMBOL_DICTIONARY_SIZE}, so a
-         * bounded live set larger than the threshold recycles once and settles
-         * instead of recycling on every refill. The bar never drops, a manual
+         * capped at half of {@link QwpConstants#MAX_SYMBOL_DICTIONARY_SIZE} (1,000,000).
+         * How often the sender recycles therefore depends on its live symbol set:
+         * <ul>
+         *   <li>a static set below 1,000,000 stops recycling after about
+         *       {@code log2(set size / threshold)} recycles: four for 900,000 symbols
+         *       at the default threshold;</li>
+         *   <li>a set of 1,000,000 or more refills the fresh dictionary to the capped
+         *       bar every time, so the sender recycles again at each 1,000,000 symbols
+         *       it registers, for as long as it lives. Each recycle re-sends the symbol
+         *       strings on a new connection. Against QuestDB 10.0.0 or later, a set that
+         *       stays below {@link QwpConstants#MAX_SYMBOL_DICTIONARY_SIZE} avoids this
+         *       with {@code symbolDictReset(false)};</li>
+         *   <li>a set whose values keep changing registers new symbols without bound:
+         *       the bar climbs to the cap and the sender then recycles the same way.</li>
+         * </ul>
+         * The bar never drops, a manual
          * {@link Sender#resetSymbolDictionary()} swap included. Must be greater than
          * {@code 0} and no larger than half of {@link QwpConstants#MAX_SYMBOL_DICTIONARY_SIZE}
          * (the re-arm floor's own cap): arming happens at a flush tail and the swap at the
