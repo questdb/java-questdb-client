@@ -5881,7 +5881,10 @@ public class QwpWebSocketSender implements Sender {
      *       closes the WebSocket client -- but only while its link is still up
      *       ({@link CursorWebSocketSendLoop#closeIfLinkUp()}); once the I/O
      *       thread has begun a reconnect, the recycle gives back a step-0 lock
-     *       it took and returns still armed, nothing torn down.
+     *       it took and returns still armed, nothing torn down. A loop that
+     *       latched a terminal error while it was stopping is kept and its
+     *       error thrown instead ({@link #retireStoppedLoop()}), again after
+     *       giving back a step-0 lock this call took.
      *       {@code hasLoopEverConnected} is read
      *       only AFTER {@code close()} returns: the join makes even an
      *       ASYNC-initial sender's connect (observed only by the I/O thread,
@@ -6013,48 +6016,47 @@ public class QwpWebSocketSender implements Sender {
             lastRecycleDurableFsn = fsnEpochBase + lastPublishedFsn;
         }
         // step 2: close the loop - joins the I/O thread, closes the client.
-        try {
-            if (cursorSendLoop != null) {
-                if (!closeLoopIfLinkUpInterruptNeutral(cursorSendLoop)) {
-                    // The I/O thread began a reconnect after the barrier's
-                    // link check -- typically a server close right behind the
-                    // ack that drained the ring. Stopping it now could hold
-                    // this caller for the whole join budget in a credential
-                    // pull or hostname resolve. Nothing is torn down: give
-                    // back a lock this call took and stay armed, exactly as
-                    // the barrier does for a loop it already sees reconnecting.
-                    if (slotLockTakenHere) {
-                        releaseRecycleSlotLock();
-                    }
-                    LOG.info("symbol dictionary recycle deferred: the I/O loop began a reconnect; "
-                            + "retried at the first drained row start after it [epoch={}]", symbolDictEpoch);
-                    return;
-                }
-                // Read the sticky AFTER close(): close joins the I/O thread,
-                // so a connect that landed mid-window is final here. This and
-                // the CLOSE_LOOP resume's re-close are the only places an
-                // ASYNC-initial sender's connect (observed only by the I/O
-                // thread) reaches hasLoopEverConnected.
-                hasLoopEverConnected |= cursorSendLoop.hasEverConnected();
-                cursorSendLoop = null;
+        if (cursorSendLoop != null) {
+            final boolean stopped;
+            try {
+                stopped = closeLoopIfLinkUpInterruptNeutral(cursorSendLoop);
+            } catch (Error e) {
+                throw e;
+            } catch (Throwable t) {
+                // close() set the loop's stop flag before throwing, so the loop
+                // is irreversibly dying but its I/O thread may still own the
+                // engine. Neither proceed with the swap nor claim connectivity;
+                // abandon, and let resumeRecycleIfPending() finish the close
+                // (a repeated close() converges once the I/O thread exits).
+                connected = false;
+                recycleResume = RecycleResume.CLOSE_LOOP;
+                LOG.warn("symbol dictionary recycle abandoned: closing the outgoing I/O loop "
+                        + "failed; the close is finished on the next send [epoch={}]",
+                        symbolDictEpoch, t);
+                throw rethrowRecycleAbandoned(t, "symbol dictionary recycle abandoned while closing "
+                        + "the outgoing I/O loop; retried on the next send");
             }
-            client = null;
-        } catch (Error e) {
-            throw e;
-        } catch (Throwable t) {
-            // close() set the loop's stop flag before throwing, so the loop
-            // is irreversibly dying but its I/O thread may still own the
-            // engine. Neither proceed with the swap nor claim connectivity;
-            // abandon, and let resumeRecycleIfPending() finish the close
-            // (a repeated close() converges once the I/O thread exits).
-            connected = false;
-            recycleResume = RecycleResume.CLOSE_LOOP;
-            LOG.warn("symbol dictionary recycle abandoned: closing the outgoing I/O loop "
-                    + "failed; the close is finished on the next send [epoch={}]",
-                    symbolDictEpoch, t);
-            throw rethrowRecycleAbandoned(t, "symbol dictionary recycle abandoned while closing "
-                    + "the outgoing I/O loop; retried on the next send");
+            if (!stopped) {
+                // The I/O thread began a reconnect after the barrier's
+                // link check -- typically a server close right behind the
+                // ack that drained the ring. Stopping it now could hold
+                // this caller for the whole join budget in a credential
+                // pull or hostname resolve. Nothing is torn down: give
+                // back a lock this call took and stay armed, exactly as
+                // the barrier does for a loop it already sees reconnecting.
+                if (slotLockTakenHere) {
+                    releaseRecycleSlotLock();
+                }
+                LOG.info("symbol dictionary recycle deferred: the I/O loop began a reconnect; "
+                        + "retried at the first drained row start after it [epoch={}]", symbolDictEpoch);
+                return;
+            }
+            if (slotLockTakenHere && cursorSendLoop.getTerminalError() != null) {
+                releaseRecycleSlotLock();
+            }
+            retireStoppedLoop();
         }
+        client = null;
         // step 3: fully-drained close of the engine - empties the slot. The
         // parent-anchored logical lock is NOT reclaimed: this sender holds it
         // (step 0) and CursorSendEngine.close(boolean)'s contract says a holder
@@ -6115,8 +6117,7 @@ public class QwpWebSocketSender implements Sender {
                 throw rethrowRecycleAbandoned(t, "the outgoing I/O loop is still stopping; "
                         + "retried on the next send");
             }
-            hasLoopEverConnected |= cursorSendLoop.hasEverConnected();
-            cursorSendLoop = null;
+            retireStoppedLoop();
             client = null;
             // The dead loop took its catch-up mirror with it, but the ring can
             // carry what the mirror had: re-register [0..sentMaxSymbolId] as
@@ -6215,6 +6216,22 @@ public class QwpWebSocketSender implements Sender {
             throw (LineSenderException) t;
         }
         throw new LineSenderException(t).put(message);
+    }
+
+    /**
+     * Drops the outgoing loop once its close() has returned and carries its
+     * ever-connected sticky over: close joins the I/O thread, so a connect
+     * that landed mid-window is final here, and this is the only place an
+     * ASYNC-initial sender's connect (observed only by the I/O thread)
+     * reaches {@code hasLoopEverConnected}. A loop that latched a terminal
+     * error while it was stopping is kept instead and its error thrown, so
+     * {@link #checkConnectionError()} throws it from every later call, as on
+     * a sender that never recycled.
+     */
+    private void retireStoppedLoop() {
+        cursorSendLoop.checkError();
+        hasLoopEverConnected |= cursorSendLoop.hasEverConnected();
+        cursorSendLoop = null;
     }
 
     /**
