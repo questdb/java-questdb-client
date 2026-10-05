@@ -580,7 +580,9 @@ public class QwpWebSocketSender implements Sender {
     // flock -- across an abandoned CLOSE_LOOP or REBUILD too, so a colliding
     // build() keeps failing fast for the whole swap. Null in memory mode.
     // Released by releaseRecycleSlotLock() on commit, on the breach latch and
-    // in close().
+    // in close(); step 2 also gives back a lock its own call took when it
+    // does not go on to the swap (the loop began a reconnect, or it latched
+    // a terminal error while stopping).
     private SlotLock recycleSlotLock;
     // Latched by recycle step 0 when taking the slot's logical lock fails for
     // any reason other than contention -- typically a slot path with no

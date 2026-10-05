@@ -131,6 +131,8 @@ public class SymbolDictRecycleLoopTerminalTest {
                 }
                 Assert.assertNull("precondition: no terminal yet", loop.getTerminalError());
 
+                // Back to the default budget: the resume's stop must succeed.
+                loop.setShutdownAwaitTimeoutMillis(CursorWebSocketSendLoop.DEFAULT_CLOSE_SHUTDOWN_AWAIT_MILLIS);
                 // The resume's close() breaks traffic again; this time the receive returns with the rejection.
                 final AtomicBoolean latchedInsideTheStop = new AtomicBoolean();
                 client.onNextCloseTraffic(() -> {

@@ -83,7 +83,8 @@ public class SymbolDictRecycleArmingTest {
      * The widest {@code connect(...)} overload takes the recycle settings
      * directly, past the builder's checks, so it applies the same ranges
      * itself and before it builds anything: a threshold of 0 with a rebuild
-     * factory would otherwise recycle and reconnect on every flush. The
+     * factory would otherwise recycle and reconnect on every flush. As in
+     * the builder, the ranges apply with the recycle switched off too. The
      * in-range calls get past the checks and fail on the missing engine.
      */
     @Test
@@ -92,17 +93,21 @@ public class SymbolDictRecycleArmingTest {
             final int maxThreshold = QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE / 2;
             final long maxWaitMillis = Long.MAX_VALUE / 1_000_000L;
             assertConnectRejects("symbol_dict_reset_threshold must be > 0 and <= " + maxThreshold + ": 0",
-                    0, 2_000L);
+                    true, 0, 2_000L);
+            assertConnectRejects("symbol_dict_reset_threshold must be > 0 and <= " + maxThreshold + ": 0",
+                    false, 0, 2_000L);
             assertConnectRejects("symbol_dict_reset_threshold must be > 0 and <= " + maxThreshold + ": -1",
-                    -1, 2_000L);
+                    true, -1, 2_000L);
             assertConnectRejects("symbol_dict_reset_threshold must be > 0 and <= " + maxThreshold + ": "
-                    + (maxThreshold + 1), maxThreshold + 1, 2_000L);
+                    + (maxThreshold + 1), true, maxThreshold + 1, 2_000L);
             assertConnectRejects("symbol_dict_reset_max_wait_millis must be >= 0: -1",
-                    100_000, -1L);
+                    true, 100_000, -1L);
+            assertConnectRejects("symbol_dict_reset_max_wait_millis must be >= 0: -1",
+                    false, 100_000, -1L);
             assertConnectRejects("symbol_dict_reset_max_wait_millis is out of range: " + (maxWaitMillis + 1),
-                    100_000, maxWaitMillis + 1);
-            assertConnectRejects("cursor engine must be attached before connect", 1, 0L);
-            assertConnectRejects("cursor engine must be attached before connect", maxThreshold, maxWaitMillis);
+                    true, 100_000, maxWaitMillis + 1);
+            assertConnectRejects("cursor engine must be attached before connect", true, 1, 0L);
+            assertConnectRejects("cursor engine must be attached before connect", true, maxThreshold, maxWaitMillis);
         });
     }
 
@@ -367,7 +372,12 @@ public class SymbolDictRecycleArmingTest {
         return server;
     }
 
-    private static void assertConnectRejects(String expectedMessage, int thresholdSymbols, long maxWaitMillis) {
+    private static void assertConnectRejects(
+            String expectedMessage,
+            boolean resetEnabled,
+            int thresholdSymbols,
+            long maxWaitMillis
+    ) {
         try {
             QwpWebSocketSender.connect(
                     Collections.singletonList(new QwpWebSocketSender.Endpoint("localhost", 1)),
@@ -391,7 +401,7 @@ public class SymbolDictRecycleArmingTest {
                     CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
                     CursorWebSocketSendLoop.DEFAULT_POISON_MIN_ESCALATION_WINDOW_MILLIS,
                     CursorWebSocketSendLoop.DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS,
-                    true, // symbolDictResetEnabled
+                    resetEnabled, // symbolDictResetEnabled
                     thresholdSymbols,
                     maxWaitMillis).close();
             Assert.fail("expected the connect to throw: " + expectedMessage);
