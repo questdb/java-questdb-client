@@ -33,6 +33,7 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentBudget;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLockContentionException;
@@ -167,6 +168,16 @@ public class SenderPoolSfTest {
                 }
             }
         });
+    }
+
+    @Test
+    public void testRecycledPooledSenderKeepsChargingThePoolBudget() throws Exception {
+        assertRecycledPooledSenderKeepsChargingThePoolBudget(";sf_dir=" + sfDir + ";");
+    }
+
+    @Test
+    public void testRecycledPooledSenderKeepsChargingThePoolBudgetInMemoryMode() throws Exception {
+        assertRecycledPooledSenderKeepsChargingThePoolBudget(";");
     }
 
     @Test
@@ -4507,6 +4518,52 @@ public class SenderPoolSfTest {
                             throw new AssertionError("unexpected recovery sender call: " + method.getName());
                     }
                 });
+    }
+
+    private static void assertRecycledPooledSenderKeepsChargingThePoolBudget(String configTail) throws Exception {
+        // A symbol-dictionary recycle replaces the sender's cursor engine. The
+        // replacement must charge the pool's shared sf_max_total_bytes budget
+        // like the engine it replaces; on a private budget the recycled sender
+        // would buffer up to the whole cap on its own again.
+        TestUtils.assertMemoryLeak(() -> {
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                String config = "ws::addr=localhost:" + port + configTail;
+                SegmentBudget budget;
+                try (SenderPool pool = new SenderPool(config, 1, 1, 5_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    budget = pool.getSegmentBudgetForTesting();
+                    PooledSender lease = pool.borrow();
+                    try {
+                        QwpWebSocketSender delegate = (QwpWebSocketSender) getDelegate(lease);
+                        lease.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
+                        Assert.assertTrue("setup: batch must be acked before the recycle",
+                                delegate.awaitAckedFsn(delegate.flushAndGetSequence(), 5_000));
+                        CursorSendEngine before = delegate.getCursorEngineForTesting();
+                        Assert.assertTrue("setup: the first engine must charge the pool budget",
+                                budget.getSegmentBytes() > 0);
+
+                        lease.resetSymbolDictionary();
+                        lease.table("t").symbol("s", "b").longColumn("v", 2L).atNow();
+                        Assert.assertEquals("setup: the recycle must have run", 1, delegate.getSymbolDictEpoch());
+                        Assert.assertNotSame("setup: the recycle must have replaced the engine",
+                                before, delegate.getCursorEngineForTesting());
+                        // The outgoing engine released its charge when it closed, so
+                        // anything charged now belongs to the replacement.
+                        Assert.assertTrue("the rebuilt engine must charge the pool budget",
+                                budget.getSegmentBytes() > 0);
+                        Assert.assertTrue("the rebuilt engine must still deliver",
+                                delegate.awaitAckedFsn(delegate.flushAndGetSequence(), 5_000));
+                    } finally {
+                        lease.close();
+                    }
+                }
+                Assert.assertEquals("closing the pool must release every charge", 0, budget.getSegmentBytes());
+            }
+        });
     }
 
     private void assertPreallocatedExitHandoffCleansStartupRecoverer(
