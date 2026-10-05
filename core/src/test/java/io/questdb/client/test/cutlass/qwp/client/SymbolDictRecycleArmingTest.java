@@ -31,6 +31,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderConnectionDispatcher;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher;
+import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.DelegatingFilesFacade;
 import io.questdb.client.test.tools.TestUtils;
@@ -75,6 +76,33 @@ public class SymbolDictRecycleArmingTest {
                     Assert.assertTrue(ws.isResetArmed());
                 }
             }
+        });
+    }
+
+    /**
+     * The widest {@code connect(...)} overload takes the recycle settings
+     * directly, past the builder's checks, so it applies the same ranges
+     * itself and before it builds anything: a threshold of 0 with a rebuild
+     * factory would otherwise recycle and reconnect on every flush. The
+     * in-range calls get past the checks and fail on the missing engine.
+     */
+    @Test
+    public void testConnectOverloadRejectsOutOfRangeRecycleSettings() throws Exception {
+        assertMemoryLeak(() -> {
+            final int maxThreshold = QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE / 2;
+            final long maxWaitMillis = Long.MAX_VALUE / 1_000_000L;
+            assertConnectRejects("symbol_dict_reset_threshold must be > 0 and <= " + maxThreshold + ": 0",
+                    0, 2_000L);
+            assertConnectRejects("symbol_dict_reset_threshold must be > 0 and <= " + maxThreshold + ": -1",
+                    -1, 2_000L);
+            assertConnectRejects("symbol_dict_reset_threshold must be > 0 and <= " + maxThreshold + ": "
+                    + (maxThreshold + 1), maxThreshold + 1, 2_000L);
+            assertConnectRejects("symbol_dict_reset_max_wait_millis must be >= 0: -1",
+                    100_000, -1L);
+            assertConnectRejects("symbol_dict_reset_max_wait_millis is out of range: " + (maxWaitMillis + 1),
+                    100_000, maxWaitMillis + 1);
+            assertConnectRejects("cursor engine must be attached before connect", 1, 0L);
+            assertConnectRejects("cursor engine must be attached before connect", maxThreshold, maxWaitMillis);
         });
     }
 
@@ -337,6 +365,39 @@ public class SymbolDictRecycleArmingTest {
         server.start();
         Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
         return server;
+    }
+
+    private static void assertConnectRejects(String expectedMessage, int thresholdSymbols, long maxWaitMillis) {
+        try {
+            QwpWebSocketSender.connect(
+                    Collections.singletonList(new QwpWebSocketSender.Endpoint("localhost", 1)),
+                    null, // tlsConfig
+                    0, 0, 0L, // autoFlushRows, autoFlushBytes, autoFlushIntervalNanos
+                    null, // authorizationHeader
+                    false, // requestDurableAck
+                    null, // cursorEngine
+                    5_000L, // closeFlushTimeoutMillis
+                    CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_DURATION_MILLIS,
+                    CursorWebSocketSendLoop.DEFAULT_RECONNECT_INITIAL_BACKOFF_MILLIS,
+                    CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_BACKOFF_MILLIS,
+                    Sender.InitialConnectMode.OFF,
+                    null, // errorHandler
+                    SenderErrorDispatcher.DEFAULT_CAPACITY,
+                    CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
+                    QwpWebSocketSender.DEFAULT_AUTH_TIMEOUT_MS,
+                    0, // connectTimeoutMs
+                    null, // connectionListener
+                    SenderConnectionDispatcher.DEFAULT_CAPACITY,
+                    CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
+                    CursorWebSocketSendLoop.DEFAULT_POISON_MIN_ESCALATION_WINDOW_MILLIS,
+                    CursorWebSocketSendLoop.DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS,
+                    true, // symbolDictResetEnabled
+                    thresholdSymbols,
+                    maxWaitMillis).close();
+            Assert.fail("expected the connect to throw: " + expectedMessage);
+        } catch (LineSenderException e) {
+            TestUtils.assertContains(e.getMessage(), expectedMessage);
+        }
     }
 
     private static String cfg(TestWebSocketServer server) {

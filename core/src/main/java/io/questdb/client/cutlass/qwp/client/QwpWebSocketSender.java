@@ -1117,6 +1117,12 @@ public class QwpWebSocketSender implements Sender {
      * {@link #setEngineRebuildFactory(EngineRebuildFactory)};
      * {@link io.questdb.client.Sender.LineSenderBuilder#build() Sender.LineSenderBuilder.build()}
      * installs one automatically for WebSocket senders.
+     * <p>
+     * {@code symbolDictResetThresholdSymbols} must be between {@code 1} and half of
+     * {@link QwpConstants#MAX_SYMBOL_DICTIONARY_SIZE}, and {@code symbolDictResetMaxWaitMillis} between
+     * {@code 0} (never wait) and {@code Long.MAX_VALUE / 1_000_000}: the ranges the builder enforces.
+     *
+     * @throws LineSenderException if either recycle setting is out of range
      */
     public static QwpWebSocketSender connect(
             List<Endpoint> endpoints,
@@ -1230,6 +1236,12 @@ public class QwpWebSocketSender implements Sender {
      * {@link #setEngineRebuildFactory(EngineRebuildFactory)};
      * {@link io.questdb.client.Sender.LineSenderBuilder#build() Sender.LineSenderBuilder.build()}
      * installs one automatically for WebSocket senders.
+     * <p>
+     * {@code symbolDictResetThresholdSymbols} must be between {@code 1} and half of
+     * {@link QwpConstants#MAX_SYMBOL_DICTIONARY_SIZE}, and {@code symbolDictResetMaxWaitMillis} between
+     * {@code 0} (never wait) and {@code Long.MAX_VALUE / 1_000_000}: the ranges the builder enforces.
+     *
+     * @throws LineSenderException if either recycle setting is out of range
      */
     public static QwpWebSocketSender connectWithCredentialSupplier(
             List<Endpoint> endpoints,
@@ -1259,6 +1271,19 @@ public class QwpWebSocketSender implements Sender {
             int symbolDictResetThresholdSymbols,
             long symbolDictResetMaxWaitMillis
     ) {
+        if (symbolDictResetThresholdSymbols <= 0
+                || symbolDictResetThresholdSymbols > QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE / 2) {
+            throw new LineSenderException("symbol_dict_reset_threshold must be > 0 and <= ")
+                    .put(QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE / 2).put(": ").put(symbolDictResetThresholdSymbols);
+        }
+        if (symbolDictResetMaxWaitMillis < 0) {
+            throw new LineSenderException("symbol_dict_reset_max_wait_millis must be >= 0: ")
+                    .put(symbolDictResetMaxWaitMillis);
+        }
+        if (symbolDictResetMaxWaitMillis > Long.MAX_VALUE / 1_000_000L) {
+            throw new LineSenderException("symbol_dict_reset_max_wait_millis is out of range: ")
+                    .put(symbolDictResetMaxWaitMillis);
+        }
         QwpWebSocketSender sender = new QwpWebSocketSender(
                 endpoints, tlsConfig,
                 autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
