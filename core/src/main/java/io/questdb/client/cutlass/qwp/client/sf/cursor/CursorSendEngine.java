@@ -286,7 +286,7 @@ public final class CursorSendEngine implements QuietCloseable {
     @TestOnly
     public CursorSendEngine(String sfDir, long segmentSizeBytes,
                             long maxTotalBytes, long appendDeadlineNanos, FilesFacade dictFf) {
-        this(sfDir, segmentSizeBytes, null, true, maxTotalBytes,
+        this(sfDir, segmentSizeBytes, null, true, new SegmentBudget(maxTotalBytes),
                 appendDeadlineNanos, 0L, dictFf);
     }
 
@@ -297,8 +297,23 @@ public final class CursorSendEngine implements QuietCloseable {
     public CursorSendEngine(String sfDir, long segmentSizeBytes,
                             long maxTotalBytes, long appendDeadlineNanos,
                             long syncIntervalNanos) {
-        this(sfDir, segmentSizeBytes, null, true, maxTotalBytes,
-                appendDeadlineNanos, syncIntervalNanos);
+        this(sfDir, segmentSizeBytes, null, true, new SegmentBudget(maxTotalBytes),
+                appendDeadlineNanos, syncIntervalNanos, FilesFacade.INSTANCE);
+    }
+
+    /**
+     * As {@link #CursorSendEngine(String, long, long, long, long)}, but the
+     * engine's private {@link SegmentManager} charges its segments to
+     * {@code budget} instead of to a budget of its own. Engines built on one
+     * budget share its capacity: together they never hold more than it, apart
+     * from the minimum working set (the active segment plus one spare) each
+     * ring is always granted. A sender pool builds every sender this way, so
+     * {@code sf_max_total_bytes} caps the pool rather than each pooled sender.
+     */
+    public CursorSendEngine(String sfDir, long segmentSizeBytes, SegmentBudget budget,
+                            long appendDeadlineNanos, long syncIntervalNanos) {
+        this(sfDir, segmentSizeBytes, null, true, budget,
+                appendDeadlineNanos, syncIntervalNanos, FilesFacade.INSTANCE);
     }
 
     /**
@@ -324,19 +339,16 @@ public final class CursorSendEngine implements QuietCloseable {
     private CursorSendEngine(String sfDir, long segmentSizeBytes, SegmentManager manager,
                              boolean ownsManager, long appendDeadlineNanos,
                              long syncIntervalNanos) {
-        this(sfDir, segmentSizeBytes, manager, ownsManager,
-                SegmentManager.UNLIMITED_TOTAL_BYTES, appendDeadlineNanos, syncIntervalNanos);
-    }
-
-    private CursorSendEngine(String sfDir, long segmentSizeBytes, SegmentManager manager,
-                             boolean ownsManager, long maxTotalBytes, long appendDeadlineNanos,
-                             long syncIntervalNanos) {
-        this(sfDir, segmentSizeBytes, manager, ownsManager, maxTotalBytes,
+        // A caller-supplied manager already charges its own budget.
+        this(sfDir, segmentSizeBytes, manager, ownsManager, null,
                 appendDeadlineNanos, syncIntervalNanos, FilesFacade.INSTANCE);
     }
 
+    // budget is what an owned manager (ownsManager && manager == null) charges
+    // its segments to; unused, and may be null, when the caller supplies the
+    // manager.
     private CursorSendEngine(String sfDir, long segmentSizeBytes, SegmentManager manager,
-                             boolean ownsManager, long maxTotalBytes, long appendDeadlineNanos,
+                             boolean ownsManager, SegmentBudget budget, long appendDeadlineNanos,
                              long syncIntervalNanos, FilesFacade dictFf) {
         this.dictFf = dictFf;
         // Allocate the bound callback before constructing an owned manager.
@@ -360,7 +372,7 @@ public final class CursorSendEngine implements QuietCloseable {
         }
         if (ownsManager && manager == null) {
             manager = new SegmentManager(
-                    segmentSizeBytes, SegmentManager.DEFAULT_POLL_NANOS, maxTotalBytes);
+                    segmentSizeBytes, SegmentManager.DEFAULT_POLL_NANOS, budget);
         }
         SlotLock acquiredLock = null;
         if (!memoryMode) {
