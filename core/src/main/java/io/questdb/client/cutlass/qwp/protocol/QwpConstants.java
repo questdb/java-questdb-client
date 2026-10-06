@@ -113,6 +113,16 @@ public final class QwpConstants {
      */
     public static final byte STATUS_LIMIT_EXCEEDED = 0x0B;
     /**
+     * Status byte on a {@code QUERY_ERROR} frame: the query ran past its
+     * per-query timeout. Sent by a server that enforces the timeout carried on
+     * {@code QUERY_REQUEST} (see {@code QwpEgressMsgKind#CAP_QUERY_TIMEOUT}), and
+     * synthesized by the client when its own deadline for the query expires.
+     * The connection stays usable for the next query. Egress extension of the
+     * ingress {@code STATUS_*} namespace; the next free value after
+     * {@code STATUS_DICTIONARY_GAP} (0x0D).
+     */
+    public static final byte STATUS_QUERY_TIMEOUT = 0x0E;
+    /**
      * Column type: BINARY (length-prefixed opaque bytes).
      * Wire format: identical to VARCHAR — (N+1) x uint32 offsets + concatenated bytes.
      */

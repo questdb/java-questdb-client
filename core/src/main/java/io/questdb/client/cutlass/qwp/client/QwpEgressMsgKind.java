@@ -46,6 +46,18 @@ public final class QwpEgressMsgKind {
      */
     public static final int CAP_QUERY_FLAGS = 0x00000002;
     /**
+     * {@code SERVER_INFO.capabilities} bit: the server enforces a per-query
+     * timeout carried on {@code QUERY_REQUEST}. When set (together with
+     * {@link #CAP_QUERY_FLAGS}), a client that wants a timeout sets
+     * {@link #QUERY_FLAG_TIMEOUT} and appends {@code timeout_ms:varint} after the
+     * {@code query_flags} trailer; the server then ends an over-budget query with
+     * a {@code QUERY_ERROR} carrying
+     * {@link io.questdb.client.cutlass.qwp.protocol.QwpConstants#STATUS_QUERY_TIMEOUT},
+     * leaving the connection open. Mirrors the server-side constant
+     * {@code io.questdb.cutlass.qwp.codec.QwpEgressMsgKind#CAP_QUERY_TIMEOUT}.
+     */
+    public static final int CAP_QUERY_TIMEOUT = 0x00000008;
+    /**
      * {@code SERVER_INFO.capabilities} bit advertising that the frame ends with
      * an additional {@code zone_id:u16_len+utf8} field after {@code node_id}.
      * Mirrors the server-side constant in
@@ -67,6 +79,13 @@ public final class QwpEgressMsgKind {
      * advertised {@link #CAP_QUERY_FLAGS}.
      */
     public static final int QUERY_FLAG_RESET_DICT = 0x01;
+    /**
+     * {@code QUERY_REQUEST.query_flags} bit: a {@code timeout_ms:varint} field
+     * follows the {@code query_flags} varint. The server runs the query under
+     * that timeout instead of its default {@code query.timeout}. Sent only when
+     * the server advertised {@link #CAP_QUERY_TIMEOUT}.
+     */
+    public static final int QUERY_FLAG_TIMEOUT = 0x02;
     public static final byte QUERY_REQUEST = 0x10;
     /**
      * Reset mask bit: clear the connection-scoped SYMBOL dict.

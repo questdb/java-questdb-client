@@ -72,9 +72,22 @@ final class QueryImpl {
     private final QueryWorker worker;
     private final QwpBindSetter wireBinds = this::applyBinds;
     private final WrappingHandler wrappingHandler = new WrappingHandler();
+    // Set when this lease cancels its current submission; cleared by submit().
+    // applyBinds() re-applies it from inside execute(), so a cancel issued while
+    // the submission still waits for the worker is not lost. See requestCancel().
+    private volatile boolean cancelRequested;
     private volatile boolean done = true;
     private volatile String resultMessage;
     private volatile byte resultStatus;
+    // Stamped by submit() for the worker thread: when the query was submitted and
+    // the timeout it runs under (0 = none), so runOn() can hand the client only
+    // the part of the budget that is left. Published by worker.dispatch().
+    private long submitNanos;
+    private long submitTimeoutMillis;
+    // Query timeout set on this handle, in milliseconds: -1 = the pooled client's
+    // default (query_timeout_ms), 0 = none. Kept across submits like the other
+    // builder state; resetForBorrow() restores -1.
+    private long timeoutMillis = -1;
     private volatile Throwable unexpectedError;
     private QwpBindSetter userBinds;
     private QwpColumnBatchHandler userHandler;
@@ -168,12 +181,30 @@ final class QueryImpl {
         // is now uncertain -- a late RESULT_* for the abandoned query could
         // corrupt the next borrower's stream -- so it is discarded rather than
         // returned. The pool grows a fresh worker on the next borrow.
+        final long budgetMillis = worker.closeQueryTimeoutMillis();
+        final long startNanos = System.nanoTime();
         if (!done) {
             worker.cancelInFlight(gen);
-            if (!awaitDone(worker.closeQueryTimeoutMillis())) {
+            if (!awaitDone(budgetMillis)) {
                 worker.discardFromPool(gen);
                 return;
             }
+        }
+        // done means the caller has its outcome, not that the worker is idle:
+        // after a query timeout the worker may still be draining the aborted
+        // query so that its connection stays reusable. It must not reach another
+        // borrower before that finishes, so wait for it within what is left of
+        // the same budget; one that does not finish is discarded as above.
+        final long remainingMillis = budgetMillis - (System.nanoTime() - startNanos) / 1_000_000L;
+        if (!worker.awaitIdle(remainingMillis)) {
+            worker.discardFromPool(gen);
+            return;
+        }
+        // A connection the client gave up on -- it stopped responding after a
+        // query timeout, or the server closed it -- must not go back to the pool.
+        if (worker.client().hasTerminalFailure()) {
+            worker.discardFromPool(gen);
+            return;
         }
         worker.releaseToPool(gen);
     }
@@ -213,6 +244,29 @@ final class QueryImpl {
         sqlBuffer.put(sql);
     }
 
+    /**
+     * Records that the current submission was cancelled. Called by
+     * {@link QueryWorker#cancelInFlight()} under the pool lock, after the lease
+     * generation was validated, so a stale handle cannot mark a later borrower's
+     * query. Needed because {@code execute()} starts by clearing the client's
+     * cancel latch: a cancel that lands while the submission still waits for the
+     * worker -- for instance behind a timed-out query the worker is draining --
+     * would otherwise be dropped.
+     */
+    void requestCancel() {
+        cancelRequested = true;
+    }
+
+    void setTimeout(long gen, long timeout, TimeUnit unit) {
+        checkLive(gen);
+        if (timeout < 0) {
+            throw new IllegalArgumentException("timeout must be >= 0");
+        }
+        long millis = unit.toMillis(timeout);
+        // A positive timeout below one millisecond must not round down to "none".
+        this.timeoutMillis = millis == 0 && timeout > 0 ? 1 : millis;
+    }
+
     void submit(long gen) {
         checkLive(gen);
         if (sqlBuffer.length() == 0) {
@@ -224,6 +278,11 @@ final class QueryImpl {
         if (!done) {
             throw new IllegalStateException("a previous submit() is still in flight; await the Completion first");
         }
+        // The timeout runs from here, so a dispatch that has to wait for the
+        // worker (still draining a previously timed-out query) counts against it.
+        submitTimeoutMillis = timeoutMillis >= 0 ? timeoutMillis : worker.client().getQueryTimeoutMs();
+        submitNanos = System.nanoTime();
+        cancelRequested = false;
         // Reset terminal state under the lock so a stale signal from a prior
         // run can't be observed by the upcoming await().
         doneLock.lock();
@@ -239,6 +298,13 @@ final class QueryImpl {
     }
 
     private void applyBinds(QwpBindValues binds) {
+        // Runs inside execute() after it cleared the client's cancel latch for
+        // this query, and before the request is sent: set the latch again if the
+        // lease cancelled the submission meanwhile, so the query goes out with
+        // its CANCEL right behind it.
+        if (cancelRequested) {
+            worker.client().cancel();
+        }
         QwpBindSetter setter = userBinds;
         if (setter != null) {
             setter.apply(binds);
@@ -333,6 +399,8 @@ final class QueryImpl {
         userBinds = null;
         userHandler = null;
         sqlBuffer.clear();
+        timeoutMillis = -1;
+        cancelRequested = false;
         resultStatus = 0;
         resultMessage = null;
         unexpectedError = null;
@@ -340,12 +408,23 @@ final class QueryImpl {
     }
 
     void runOn(QwpQueryClient client) {
+        long timeoutArg = 0;
+        if (submitTimeoutMillis > 0) {
+            // Only what is left of the budget since submit(); at least 1ms so the
+            // query still runs under a timeout rather than without one.
+            long elapsedMillis = (System.nanoTime() - submitNanos) / 1_000_000L;
+            timeoutArg = Math.max(1L, submitTimeoutMillis - elapsedMillis);
+        }
+        // The grace period after an expired timeout is query_close_timeout_ms,
+        // read per query: the pool learns it only after prewarming its clients.
+        client.withQueryTimeoutGrace(worker.closeQueryTimeoutMillis());
         // Pass the StringSink directly as a CharSequence -- the wire encoder
         // reads chars and writes UTF-8 bytes straight into the send buffer.
-        // sqlBuffer is stable for the duration of execute(): the calling
-        // worker thread is blocked here until a terminal event arrives, and
-        // sql(...) cannot be invoked again until done==true.
-        client.execute(sqlBuffer, wireBinds, wrappingHandler);
+        // sqlBuffer must stay stable until the request is encoded: the caller
+        // can call sql(...) again only once done==true, which execute() signals
+        // either at the terminal event or, after a query timeout, once the I/O
+        // thread has encoded the request (see QwpQueryClient.executeOnce).
+        client.execute(sqlBuffer, wireBinds, wrappingHandler, false, timeoutArg);
     }
 
     /**

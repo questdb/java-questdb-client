@@ -24,6 +24,8 @@
 
 package io.questdb.client;
 
+import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
+
 /**
  * Thrown from {@link Completion#await()} / {@link Completion#await(long, java.util.concurrent.TimeUnit)}
  * when the server reported an error for the corresponding {@link Query},
@@ -32,7 +34,9 @@ package io.questdb.client;
  * <p>
  * The original wire-level status byte is exposed via {@link #getStatus()} so
  * callers can distinguish cancellation from schema errors etc. without
- * string-matching the message.
+ * string-matching the message. A query that ran past its timeout (see
+ * {@link Query#timeout(long, java.util.concurrent.TimeUnit)}) reports
+ * {@link QwpConstants#STATUS_QUERY_TIMEOUT}; {@link #isTimeout()} tests for it.
  */
 public class QueryException extends RuntimeException {
 
@@ -55,5 +59,14 @@ public class QueryException extends RuntimeException {
      */
     public byte getStatus() {
         return status;
+    }
+
+    /**
+     * Returns {@code true} when the query ran past its timeout, whether the
+     * server or the client detected it. The connection that ran it stays
+     * usable.
+     */
+    public boolean isTimeout() {
+        return status == QwpConstants.STATUS_QUERY_TIMEOUT;
     }
 }

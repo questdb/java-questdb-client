@@ -114,6 +114,12 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     private boolean creditEnabled;
     private boolean currentQueryDone;
     private long currentRequestId = -1L;
+    // requestId of the last QUERY_REQUEST fully encoded into sendScratch. Once a
+    // request's id is published here the I/O thread no longer reads the caller's
+    // SQL text or bind scratch for it, so the caller may reuse them even while the
+    // query itself is still running. -1 until the first request. Written by the
+    // I/O thread only; volatile so the executing thread observes it.
+    private volatile long encodedRequestId = -1L;
     private volatile boolean shutdown;
 
     public QwpEgressIoThread(WebSocketClient wsClient, int bufferPoolSize, TerminalFailureListener terminalFailureListener) {
@@ -357,6 +363,15 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     }
 
     /**
+     * Returns {@code true} once the {@code QUERY_REQUEST} for {@code requestId}
+     * has been encoded, after which the I/O thread no longer reads the SQL text or
+     * bind payload that {@link #submitQuery} handed it.
+     */
+    public boolean isRequestEncoded(long requestId) {
+        return encodedRequestId == requestId;
+    }
+
+    /**
      * Signals shutdown. Does not join the thread -- caller handles that.
      */
     public void shutdown() {
@@ -377,6 +392,10 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
      * during {@link #sendQueryRequest} and does not retain a reference after
      * the send completes. {@code bindCount} is the number of binds the
      * payload contains; zero when the user supplied no binds.
+     * <p>
+     * {@code timeoutMs} is written as the {@code timeout_ms} field only when
+     * {@code queryFlags} carries {@link QwpEgressMsgKind#QUERY_FLAG_TIMEOUT};
+     * otherwise it is ignored.
      */
     public void submitQuery(
             CharSequence sql,
@@ -385,7 +404,8 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
             int bindCount,
             long bindPayloadPtr,
             long bindPayloadLen,
-            long queryFlags
+            long queryFlags,
+            long timeoutMs
     ) throws InterruptedException {
         pendingRequest.sql = sql;
         pendingRequest.requestId = requestId;
@@ -394,6 +414,7 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         pendingRequest.bindPayloadPtr = bindPayloadPtr;
         pendingRequest.bindPayloadLen = bindPayloadLen;
         pendingRequest.queryFlags = queryFlags;
+        pendingRequest.timeoutMs = timeoutMs;
         requests.put(pendingRequest);
     }
 
@@ -402,6 +423,16 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
      */
     public QueryEvent takeEvent() throws InterruptedException {
         return events.take();
+    }
+
+    /**
+     * Pops the next event, waiting at most until the absolute
+     * {@link System#nanoTime()} {@code deadlineNanos}. Returns {@code null} when
+     * the deadline passes with no event available. Called by the user thread
+     * during {@code execute()} when the query has a timeout.
+     */
+    public QueryEvent takeEvent(long deadlineNanos) throws InterruptedException {
+        return events.take(deadlineNanos);
     }
 
     /**
@@ -721,7 +752,13 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         // stays byte-identical and the server defaults the flags to 0.
         if (req.queryFlags != 0) {
             sendScratch.putVarint(req.queryFlags);
+            // Flag-gated fields follow the flags in flag-bit order.
+            if ((req.queryFlags & QwpEgressMsgKind.QUERY_FLAG_TIMEOUT) != 0) {
+                sendScratch.putVarint(req.timeoutMs);
+            }
         }
+        // The request no longer references the caller's SQL text or bind scratch.
+        encodedRequestId = req.requestId;
         wsClient.sendBinary(sendScratch.getBufferPtr(), sendScratch.getPosition());
         sendScratch.reset();
     }
@@ -783,5 +820,6 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         long queryFlags;
         long requestId;
         CharSequence sql;
+        long timeoutMs;
     }
 }
