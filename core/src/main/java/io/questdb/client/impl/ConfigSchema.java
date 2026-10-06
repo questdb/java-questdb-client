@@ -63,6 +63,7 @@ public final class ConfigSchema {
         str("token_provider", Side.COMMON);
         str("azure_resource", Side.COMMON);
         str("azure_client_id", Side.COMMON);
+        enumKey("azure_credential", Side.COMMON, "default", "managed_identity", "workload_identity", "environment");
 
         // INGRESS -- the WebSocket Sender applies. STRING in the registry; the
         // Sender parses suffix/mode values (off/on, 64k, durability) with its

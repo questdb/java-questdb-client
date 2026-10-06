@@ -505,18 +505,25 @@ query clients keep reconnecting with a valid token.
 
 ```java
 try (QuestDB db = QuestDB.connect(
-        "wss::addr=qdb1:9000,qdb2:9000;token_provider=azure;azure_resource=api://<questdb-app-id>;")) {
+        "wss::addr=qdb1:9000,qdb2:9000;token_provider=azure;azure_resource=api://<questdb-app-id>;"
+                + "azure_credential=managed_identity;")) {
     // ... use db ...
 }
 ```
 
 - `azure_resource` (required) is the application ID URI (`api://<app-id>`) or the client ID of the QuestDB app
   registration; the client requests the scope `<azure_resource>/.default`.
-- `azure_client_id` (optional) selects a user-assigned managed identity or a workload identity.
-- The credential comes from Azure Identity's `DefaultAzureCredential`: an environment service principal
-  (`AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` or a certificate), a workload identity, a managed
-  identity, or developer tools. No secret ever goes into the connect string, so it stays safe to log and to put in
-  `QDB_CLIENT_CONF`.
+- `azure_credential` (optional) selects the credential. In production, name it: `managed_identity`,
+  `workload_identity` or `environment` (a service principal from `AZURE_TENANT_ID`, `AZURE_CLIENT_ID` and
+  `AZURE_CLIENT_SECRET` or a certificate). A managed identity selected this way retries an unreachable endpoint, and
+  fails fast when the identity is not assigned to the host.
+- `default`, the default, is Azure Identity's `DefaultAzureCredential`, a discovery chain meant for development: an
+  environment service principal, a workload identity, a managed identity, or developer tools. It checks the
+  managed-identity endpoint once without retrying, so an outage of that endpoint fails a startup as if the host had
+  no credential; the client logs a warning saying so.
+- `azure_client_id` (optional) selects a user-assigned managed identity or a workload identity. It cannot be combined
+  with `azure_credential=environment`.
+- No secret ever goes into the connect string, so it stays safe to log and to put in `QDB_CLIENT_CONF`.
 - `token_provider` requires `wss::`, and cannot be combined with `token`, `username`/`password` or an
   application-supplied provider.
 - Every sender, query client and pooled connection built from equivalent connect strings shares one provider per
@@ -627,6 +634,7 @@ schema::key1=value1;key2=value2;
 | `token_provider`     |              | Refreshing bearer-token provider, `wss` only: `azure` (needs `questdb-client-azure`) |
 | `azure_resource`     |              | `token_provider=azure`: application ID URI or client ID of the QuestDB app registration |
 | `azure_client_id`    |              | `token_provider=azure`: client ID of a user-assigned managed identity or workload identity |
+| `azure_credential`   | `default`    | `token_provider=azure`: `default`, `managed_identity`, `workload_identity` or `environment` |
 | `auth_failure_max_duration_millis` | _(none)_ | Ingest: fail the sender once a credential outage or `401`/`403` lasts this long |
 
 ### Pool keys (facade only)

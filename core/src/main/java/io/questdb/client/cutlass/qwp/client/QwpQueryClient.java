@@ -1058,6 +1058,8 @@ public class QwpQueryClient implements QuietCloseable {
                 : tokenProviderSpec.params().get(TokenProviderSpec.KEY_AZURE_RESOURCE));
         m.put("azure_client_id", tokenProviderSpec == null ? null
                 : tokenProviderSpec.params().get(TokenProviderSpec.KEY_AZURE_CLIENT_ID));
+        m.put("azure_credential", tokenProviderSpec == null ? null
+                : tokenProviderSpec.params().get(TokenProviderSpec.KEY_AZURE_CREDENTIAL));
         return m;
     }
 

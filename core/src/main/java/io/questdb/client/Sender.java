@@ -4063,7 +4063,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     throw new LineSenderException("auth_failure_max_duration_millis is only supported for WebSocket transport");
                 } else if (Chars.equals("token_provider", sink)
                         || Chars.equals("azure_resource", sink)
-                        || Chars.equals("azure_client_id", sink)) {
+                        || Chars.equals("azure_client_id", sink)
+                        || Chars.equals("azure_credential", sink)) {
                     // Dynamic bearer credentials are defined for QWP over wss:: only (decision D9).
                     throw new LineSenderException(Chars.toString(sink)
                             + " is only supported with the wss:: schema (QWP over WebSocket)");
@@ -4448,6 +4449,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     : tokenProviderSpec.params().get(TokenProviderSpec.KEY_AZURE_RESOURCE));
             m.put("azure_client_id", tokenProviderSpec == null ? null
                     : tokenProviderSpec.params().get(TokenProviderSpec.KEY_AZURE_CLIENT_ID));
+            m.put("azure_credential", tokenProviderSpec == null ? null
+                    : tokenProviderSpec.params().get(TokenProviderSpec.KEY_AZURE_CREDENTIAL));
             return m;
         }
 

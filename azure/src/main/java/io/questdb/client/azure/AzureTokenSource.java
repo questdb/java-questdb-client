@@ -29,11 +29,15 @@ import com.azure.core.credential.TokenCredential;
 import com.azure.core.credential.TokenRequestContext;
 import com.azure.core.exception.HttpResponseException;
 import com.azure.core.http.HttpResponse;
+import com.azure.identity.ChainedTokenCredential;
 import com.azure.identity.CredentialUnavailableException;
 import io.questdb.client.cutlass.auth.ExpiringToken;
 import io.questdb.client.cutlass.auth.TokenSource;
 import io.questdb.client.cutlass.auth.TokenUnavailableException;
 
+import java.net.SocketException;
+import java.net.SocketTimeoutException;
+import java.net.UnknownHostException;
 import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.util.concurrent.TimeUnit;
@@ -50,16 +54,20 @@ import java.util.concurrent.TimeUnit;
  * RefreshingTokenProvider tokens = RefreshingTokenProvider.builder(
  *         new AzureTokenSource(credential, "api://<questdb-app-id>")).build();
  * }</pre>
- * or let a connect string select {@code token_provider=azure}, which uses {@code DefaultAzureCredential}.
+ * or let a connect string select {@code token_provider=azure}, whose {@code azure_credential} key picks the
+ * credential (see {@link AzureTokenProviderFactory}).
  * <p>
  * Expiry and the refresh hint come from the library's {@link AccessToken}. Failures are classified as section
- * 7.5 prescribes:
+ * 7.5 prescribes, the same way whichever credential is used:
  * <ul>
- *   <li>permanent - "no credential available in the chain" ({@link CredentialUnavailableException}), and
+ *   <li>permanent - no credential available ({@link CredentialUnavailableException}): a credential chain that
+ *   found nothing, or a credential whose configuration is missing; a managed identity that is not assigned to
+ *   this host, which a managed-identity credential used alone reports only in a nested cause; and
  *   authentication failures Entra reports: an HTTP 400 or 401 from the token endpoint, or a known AADSTS
  *   configuration error such as an invalid client or an application that does not exist;</li>
  *   <li>retryable - network errors, timeouts, throttling, 5xx responses, and anything else. A
- *   {@code Retry-After} in seconds is passed on.</li>
+ *   {@code Retry-After} in seconds is passed on, and the error names the socket-level cause of a network
+ *   failure, such as a refused connection, which a managed identity otherwise hides behind a generic message.</li>
  * </ul>
  * Each attempt is bounded (30 s by default). Library exceptions never travel as a cause - their response
  * objects reference the raw HTTP request, which can carry a client secret - only their sanitized message does.
@@ -70,6 +78,12 @@ public final class AzureTokenSource implements TokenSource {
      */
     public static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(30);
     private static final String DEFAULT_SCOPE_SUFFIX = "/.default";
+    // A managed identity that is not assigned to this host, or does not exist: IMDS answers 400 "Identity not
+    // found". Inside a chain that arrives as a CredentialUnavailableException, but a ManagedIdentityCredential used
+    // alone wraps it in a generic ClientAuthenticationException and keeps the reason only in the message of a
+    // nested MSAL exception, which has no status code. Without this rule a configuration error would be retried
+    // for a whole connect budget. Pinned against the real library by AzureManagedIdentityLibraryTest.
+    private static final String IDENTITY_NOT_ASSIGNED = "has not been assigned to this resource";
     private static final int MAX_CAUSE_DEPTH = 16;
     // Entra (AADSTS) errors that a retry cannot fix: the configuration is wrong, an operator must act.
     private static final String[] PERMANENT_AADSTS = {
@@ -85,6 +99,8 @@ public final class AzureTokenSource implements TokenSource {
             "AADSTS7000112", // application disabled
             "AADSTS50049", // unknown or invalid instance
     };
+    // whether the credential is a chain, such as DefaultAzureCredential: only the wording of errors depends on it
+    private final boolean chain;
     private final TokenRequestContext context;
     private final TokenCredential credential;
     private final String scope;
@@ -116,6 +132,7 @@ public final class AzureTokenSource implements TokenSource {
             throw new IllegalArgumentException("timeout must be positive");
         }
         this.credential = credential;
+        this.chain = credential instanceof ChainedTokenCredential;
         this.scope = resource.endsWith(DEFAULT_SCOPE_SUFFIX) ? resource : resource + DEFAULT_SCOPE_SUFFIX;
         this.context = new TokenRequestContext().addScopes(scope);
         this.timeout = timeout;
@@ -124,13 +141,13 @@ public final class AzureTokenSource implements TokenSource {
     /**
      * Classifies a failure from Azure Identity per section 7.5. Never attaches the library exception.
      */
-    static TokenUnavailableException classify(Throwable failure, String scope) {
+    static TokenUnavailableException classify(Throwable failure, String scope, boolean chain) {
         final String description = describe(failure);
         Throwable t = failure;
         for (int depth = 0; t != null && depth < MAX_CAUSE_DEPTH; depth++, t = t.getCause()) {
             if (t instanceof CredentialUnavailableException) {
-                return TokenUnavailableException.permanent(
-                        "no credential available in the Azure Identity chain for " + scope + ": " + description);
+                return TokenUnavailableException.permanent("no credential available "
+                        + (chain ? "in the Azure Identity chain " : "") + "for " + scope + ": " + description);
             }
             if (t instanceof HttpResponseException) {
                 final HttpResponse response = ((HttpResponseException) t).getResponse();
@@ -153,14 +170,33 @@ public final class AzureTokenSource implements TokenSource {
                                 "Entra rejected the token request for " + scope + " (" + code + "): " + description);
                     }
                 }
+                if (message.contains(IDENTITY_NOT_ASSIGNED)) {
+                    // the library's reason, never its message: that also carries the raw response
+                    return TokenUnavailableException.permanent("managed identity unavailable for " + scope
+                            + ": the requested identity has not been assigned to this resource");
+                }
             }
         }
-        return TokenUnavailableException.retryable("the token request for " + scope + " failed: " + description);
+        return TokenUnavailableException.retryable("the token request for " + scope + " failed: "
+                + withNetworkCause(failure, description));
     }
 
     private static String describe(Throwable t) {
         final String message = t.getMessage();
         return message == null ? t.getClass().getName() : t.getClass().getSimpleName() + ": " + message;
+    }
+
+    // The outermost socket-level failure among the causes: a refused or reset connection, an unreachable or
+    // unknown host, a socket timeout. Only these are named: their text is a host, a port and an OS error, while
+    // other library messages (MSAL's, a JSON parser's) can embed a raw response.
+    private static Throwable networkCause(Throwable failure) {
+        Throwable t = failure;
+        for (int depth = 0; t != null && depth < MAX_CAUSE_DEPTH; depth++, t = t.getCause()) {
+            if (t instanceof SocketException || t instanceof UnknownHostException || t instanceof SocketTimeoutException) {
+                return t;
+            }
+        }
+        return null;
     }
 
     private static long retryAfterMillis(HttpResponse response) {
@@ -191,13 +227,27 @@ public final class AzureTokenSource implements TokenSource {
         }
     }
 
+    // Leads with the socket-level cause, unless the description already carries it: error text is capped, and a
+    // library's own message is often generic ("see inner exception").
+    private static String withNetworkCause(Throwable failure, String description) {
+        final Throwable network = networkCause(failure);
+        if (network == null) {
+            return description;
+        }
+        final String reason = network.getMessage();
+        if (reason != null && description.contains(reason)) {
+            return description;
+        }
+        return describe(network) + "; " + description;
+    }
+
     @Override
     public ExpiringToken fetchToken() {
         final AccessToken token;
         try {
             token = credential.getToken(context).block(timeout);
         } catch (RuntimeException e) {
-            throw classify(e, scope);
+            throw classify(e, scope, chain);
         }
         if (token == null) {
             throw TokenUnavailableException.retryable("Azure Identity returned no token for " + scope);

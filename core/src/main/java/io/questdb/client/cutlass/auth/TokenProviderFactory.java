@@ -39,9 +39,9 @@ import java.util.Map;
  * <p>
  * The connect-string vocabulary is fixed - unknown keys are rejected before a factory ever sees them - so a
  * factory receives only the keys the client defines for it, already normalized: for {@code azure}, the
- * {@code azure_resource} (with any trailing {@code /.default} removed) and the optional, lower-cased
- * {@code azure_client_id}. Values in these keys are never secret: secrets come from the platform's standard
- * configuration, never from the connect string.
+ * {@code azure_resource} (with any trailing {@code /.default} removed), the optional, lower-cased
+ * {@code azure_client_id}, and the optional {@code azure_credential} (absent for {@code default}). Values in these
+ * keys are never secret: secrets come from the platform's standard configuration, never from the connect string.
  */
 public interface TokenProviderFactory {
 

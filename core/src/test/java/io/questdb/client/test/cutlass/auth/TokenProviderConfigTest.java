@@ -45,7 +45,8 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
 /**
  * Conformance tests C18 (connect-string validation) and C19 (registry lifecycle) of the dynamic-credential
- * specification (design/qwp-token-provider-spec.md, sections 7.2, 7.4 and 10).
+ * specification (design/qwp-token-provider-spec.md, sections 7.2, 7.4 and 10), and the connect-string half of C24
+ * (credential selection).
  */
 public class TokenProviderConfigTest {
     private static final String WSS = "wss::addr=localhost:9000;";
@@ -62,6 +63,40 @@ public class TokenProviderConfigTest {
     @After
     public void tearDown() {
         TestTokenProviderFactory.uninstall();
+    }
+
+    @Test
+    public void testAzureCredentialSelectsOneCredential() throws Exception {
+        // C24, connect-string half: every value of section 7.1 is accepted by every entry point, reaches the factory,
+        // and keys the registry; "default" is the default and adds nothing.
+        assertMemoryLeak(() -> {
+            for (String value : new String[]{"managed_identity", "workload_identity", "environment"}) {
+                String cfg = WSS + "token_provider=azure;azure_resource=api://qdb-app;azure_credential=" + value + ';';
+                Assert.assertEquals(value, Sender.builder(cfg).wsConfigSnapshotForTest().get("azure_credential"));
+                try (QwpQueryClient client = QwpQueryClient.fromConfig(cfg)) {
+                    Assert.assertEquals(value, client.configSnapshotForTest().get("azure_credential"));
+                }
+                try (QuestDB ignored = QuestDB.connect(cfg + "sender_pool_min=0;query_pool_min=0;")) {
+                    Assert.assertEquals("validation must not start a provider", 0, azure.created.get());
+                }
+                Assert.assertEquals(value, spec("token_provider=azure;azure_resource=api://qdb-app;azure_credential="
+                        + value + ';').params().get(TokenProviderSpec.KEY_AZURE_CREDENTIAL));
+            }
+            String omitted = "token_provider=azure;azure_resource=api://qdb-app;";
+            Assert.assertNull(Sender.builder(WSS + omitted + "azure_credential=default;").wsConfigSnapshotForTest()
+                    .get("azure_credential"));
+            Assert.assertEquals(spec(omitted).registryKey(), spec(omitted + "azure_credential=default;").registryKey());
+            Assert.assertNotEquals(spec(omitted).registryKey(), spec(omitted + "azure_credential=managed_identity;").registryKey());
+
+            TokenProviderRegistry registry = new TokenProviderRegistry(0);
+            try (TokenProviderRegistry.Lease lease = registry.acquire(spec(omitted
+                    + "azure_credential=managed_identity;azure_client_id=AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE;"))) {
+                Assert.assertNotNull(lease.provider());
+                Map<String, String> params = azure.params.get(0);
+                Assert.assertEquals("managed_identity", params.get(TokenProviderSpec.KEY_AZURE_CREDENTIAL));
+                Assert.assertEquals("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", params.get(TokenProviderSpec.KEY_AZURE_CLIENT_ID));
+            }
+        });
     }
 
     @Test
@@ -182,6 +217,18 @@ public class TokenProviderConfigTest {
             assertRejectedOnBoth(WSS + "token_provider=azure;azure_resource=api://x;azure_client_id=not-a-guid;",
                     "invalid azure_client_id");
             assertRejectedOnBoth(WSS + "token_provider=azure;azure_resource=invalid:x;", "rejected by the factory");
+            // azure_credential: a provider key, the values of section 7.1 only (listed in the error), and a client ID
+            // only where the credential takes one
+            assertRejectedOnBoth(WSS + "azure_credential=managed_identity;", "azure_credential requires token_provider=azure");
+            assertRejectedOnBoth(WSS + "token_provider=vault;azure_credential=managed_identity;",
+                    "azure_credential is only valid with token_provider=azure");
+            assertRejectedOnBoth(WSS + "token_provider=azure;azure_resource=api://x;azure_credential=chain;",
+                    "invalid azure_credential: chain (expected default, managed_identity, workload_identity, environment)");
+            assertRejectedOnBoth(WSS + "token_provider=azure;azure_resource=api://x;azure_credential=Managed_Identity;",
+                    "invalid azure_credential: Managed_Identity");
+            assertRejectedOnBoth(WSS + "token_provider=azure;azure_resource=api://x;azure_credential=environment;"
+                            + "azure_client_id=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee;",
+                    "azure_client_id cannot be combined with azure_credential=environment");
             // decision D4: never over plain ws::
             assertRejectedOnBoth("ws::addr=localhost:9000;token_provider=azure;azure_resource=api://x;",
                     "token_provider requires the wss:: schema");
@@ -190,6 +237,8 @@ public class TokenProviderConfigTest {
                     "token_provider is only supported with the wss:: schema");
             assertRejected(() -> Sender.fromConfig("https::addr=localhost:9000;azure_resource=api://x;"),
                     "azure_resource is only supported with the wss:: schema");
+            assertRejected(() -> Sender.fromConfig("http::addr=localhost:9000;azure_credential=managed_identity;"),
+                    "azure_credential is only supported with the wss:: schema");
 
             // an application-supplied provider is exclusive with token_provider
             String cfg = WSS + "token_provider=azure;azure_resource=api://x;";

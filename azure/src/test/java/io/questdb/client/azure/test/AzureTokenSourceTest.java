@@ -32,7 +32,10 @@ import com.azure.core.exception.HttpResponseException;
 import com.azure.core.http.HttpHeaders;
 import com.azure.core.http.HttpResponse;
 import com.azure.identity.AuthenticationRequiredException;
+import com.azure.identity.ChainedTokenCredentialBuilder;
 import com.azure.identity.CredentialUnavailableException;
+import com.microsoft.aad.msal4j.MsalClientException;
+import com.microsoft.aad.msal4j.MsalServiceException;
 import io.questdb.client.azure.AzureTokenProviderFactory;
 import io.questdb.client.azure.AzureTokenSource;
 import io.questdb.client.cutlass.auth.ExpiringToken;
@@ -49,6 +52,10 @@ import org.junit.Test;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.net.ConnectException;
+import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
 import java.nio.charset.Charset;
 import java.time.Duration;
@@ -117,6 +124,20 @@ public class AzureTokenSourceTest {
     }
 
     @Test
+    public void testCredentialUnavailableNamesTheChainOnlyForAChain() {
+        // DefaultAzureCredential is a chain: its wording is unchanged. A credential used alone is not one.
+        TokenCredential unavailable = ctx -> Mono.error(new CredentialUnavailableException("nothing configured"));
+        TokenUnavailableException e = expectFailure(new AzureTokenSource(
+                new ChainedTokenCredentialBuilder().addLast(unavailable).build(), "api://qdb"));
+        Assert.assertFalse(e.isRetryable());
+        Assert.assertTrue(e.getMessage(), e.getMessage().startsWith(
+                "no credential available in the Azure Identity chain for api://qdb/.default: "));
+        e = expectFailure(new AzureTokenSource(unavailable, "api://qdb"));
+        Assert.assertFalse(e.isRetryable());
+        Assert.assertTrue(e.getMessage(), e.getMessage().startsWith("no credential available for api://qdb/.default: "));
+    }
+
+    @Test
     public void testExpiryAndRefreshHintAreMapped() {
         AzureTokenSource source = new AzureTokenSource(
                 ctx -> Mono.just(new AccessToken("eyJ.token", EXPIRES, REFRESH)), "api://qdb");
@@ -153,6 +174,41 @@ public class AzureTokenSourceTest {
         // a library exception's response references the raw HTTP request, which can carry a client secret
         TokenUnavailableException e = fetchFailure(new HttpResponseException("throttled", new FakeResponse(429, "3")));
         Assert.assertNull(e.getCause());
+    }
+
+    @Test
+    public void testNetworkCauseLeadsTheMessage() {
+        // A managed identity used alone reports an unreachable endpoint as "authentication failed, see inner
+        // exception" - the cause chain the real library produces for a refused connection. The socket-level cause
+        // comes first, so it survives the 256-character cap on error text.
+        TokenUnavailableException e = fetchFailure(new ClientAuthenticationException(
+                "Managed Identity authentication failed, see inner exception for more information.", null,
+                new MsalClientException(new UncheckedIOException(
+                        new ConnectException("finishConnect(..) failed with error(-111): Connection refused")))));
+        Assert.assertTrue(e.isRetryable());
+        Assert.assertTrue(e.getMessage(), e.getMessage().startsWith("the token request for api://qdb/.default failed: "
+                + "ConnectException: finishConnect(..) failed with error(-111): Connection refused; "
+                + "ClientAuthenticationException: Managed Identity authentication failed"));
+
+        e = fetchFailure(new RuntimeException("wrapped", new UnknownHostException("login.microsoftonline.com")));
+        Assert.assertTrue(e.isRetryable());
+        Assert.assertTrue(e.getMessage(), e.getMessage().contains("UnknownHostException: login.microsoftonline.com"));
+
+        // a wrapper whose own message already carries the cause - as Reactor's wrapper of a checked exception does -
+        // names it once
+        e = fetchFailure(new UncheckedIOException(new ConnectException("Connection refused")));
+        Assert.assertEquals("the token request for api://qdb/.default failed: UncheckedIOException: "
+                + "java.net.ConnectException: Connection refused", e.getMessage());
+    }
+
+    @Test
+    public void testOnlySocketLevelCausesAreNamed() {
+        // Other nested messages - MSAL's, a JSON parser's - can embed a raw response, which may carry a token.
+        TokenUnavailableException e = fetchFailure(new ClientAuthenticationException("authentication failed", null,
+                new IOException("Unexpected character at [Source: {\"access_token\":\"eyJsecret\"}]")));
+        Assert.assertTrue(e.isRetryable());
+        Assert.assertFalse("a nested non-socket message must not be echoed: " + e.getMessage(),
+                e.getMessage().contains("eyJsecret"));
     }
 
     @Test
@@ -198,6 +254,24 @@ public class AzureTokenSourceTest {
         TokenUnavailableException e = expectFailure(source);
         Assert.assertTrue(e.isRetryable());
         Assert.assertTrue("the attempt must be bounded", System.nanoTime() - start < 10_000_000_000L);
+    }
+
+    @Test
+    public void testUnassignedManagedIdentityIsPermanent() {
+        // A managed identity used alone (azure_credential=managed_identity) reports IMDS's 400 "Identity not found"
+        // only in the message of a nested MSAL exception, with no status code: the cause chain the real library
+        // produces (pinned by AzureManagedIdentityLibraryTest). Left retryable, a sync startup would retry a
+        // configuration error for its whole connect budget.
+        TokenUnavailableException e = fetchFailure(new ClientAuthenticationException(
+                "Managed Identity authentication failed, see inner exception for more information.", null,
+                new MsalServiceException("[Managed Identity] Authentication unavailable. The requested identity has not "
+                        + "been assigned to this resource.Status: 400Content:{\"error\":\"invalid_request\","
+                        + "\"error_description\":\"Identity not found\"}Headers:Connection[close]",
+                        "managed_identity_request_failed")));
+        Assert.assertFalse("expected permanent: " + e.getMessage(), e.isRetryable());
+        Assert.assertEquals("managed identity unavailable for api://qdb/.default: the requested identity has not been "
+                + "assigned to this resource", e.getMessage());
+        Assert.assertNull(e.getCause());
     }
 
     @Test(timeout = 30_000)

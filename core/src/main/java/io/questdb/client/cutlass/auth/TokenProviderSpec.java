@@ -41,6 +41,7 @@ import java.util.TreeMap;
  * {@link TokenProviderRegistry#acquire(TokenProviderSpec)}.
  * <pre>
  * wss::addr=qdb1:9000,qdb2:9000;token_provider=azure;azure_resource=api://&lt;questdb-app-id&gt;;azure_client_id=&lt;uami-client-id&gt;;
+ * wss::addr=qdb1:9000;token_provider=azure;azure_resource=api://&lt;questdb-app-id&gt;;azure_credential=managed_identity;
  * </pre>
  */
 public final class TokenProviderSpec {
@@ -50,13 +51,34 @@ public final class TokenProviderSpec {
      */
     public static final String AZURE = "azure";
     /**
+     * {@code azure_credential=environment}: Azure Identity's {@code EnvironmentCredential} alone.
+     */
+    public static final String AZURE_CREDENTIAL_ENVIRONMENT = "environment";
+    /**
+     * {@code azure_credential=managed_identity}: Azure Identity's {@code ManagedIdentityCredential} alone.
+     */
+    public static final String AZURE_CREDENTIAL_MANAGED_IDENTITY = "managed_identity";
+    /**
+     * {@code azure_credential=workload_identity}: Azure Identity's {@code WorkloadIdentityCredential} alone.
+     */
+    public static final String AZURE_CREDENTIAL_WORKLOAD_IDENTITY = "workload_identity";
+    /**
      * Reserved for a zero-dependency Azure IMDS provider (decision D5); not implemented.
      */
     public static final String AZURE_IMDS = "azure_imds";
     public static final String AZURE_MODULE = "org.questdb:questdb-client-azure";
     public static final String KEY_AZURE_CLIENT_ID = "azure_client_id";
+    /**
+     * Which Azure credential {@code token_provider=azure} uses (section 7.1). Absent, or {@code default}, is Azure
+     * Identity's {@code DefaultAzureCredential}; {@code default} is normalized away, so it never reaches the
+     * factory and shares a provider with a string that omits the key. The other values select that one
+     * credential: {@link #AZURE_CREDENTIAL_MANAGED_IDENTITY}, {@link #AZURE_CREDENTIAL_WORKLOAD_IDENTITY} or
+     * {@link #AZURE_CREDENTIAL_ENVIRONMENT}.
+     */
+    public static final String KEY_AZURE_CREDENTIAL = "azure_credential";
     public static final String KEY_AZURE_RESOURCE = "azure_resource";
     public static final String KEY_TOKEN_PROVIDER = "token_provider";
+    private static final String AZURE_CREDENTIAL_DEFAULT = "default";
     private static final String AZURE_DEFAULT_SCOPE_SUFFIX = "/.default";
     private static final String[] STATIC_CREDENTIAL_KEYS = {"token", "username", "password"};
     private final TokenProviderFactory factory;
@@ -84,6 +106,8 @@ public final class TokenProviderSpec {
      *   <li>a provider-specific key the selected provider does not accept, such as {@code azure_resource}
      *   without {@code token_provider=azure};</li>
      *   <li>a missing required provider key;</li>
+     *   <li>an {@code azure_credential} value that section 7.1 does not list, listing the supported values, and
+     *   {@code azure_client_id} combined with {@code azure_credential=environment};</li>
      *   <li>{@code token_provider} on {@code ws::}: the bearer token would cross the network in cleartext
      *   (decision D4).</li>
      * </ul>
@@ -98,12 +122,16 @@ public final class TokenProviderSpec {
         final String name = view.getStr(KEY_TOKEN_PROVIDER);
         final String resource = view.getStr(KEY_AZURE_RESOURCE);
         final String clientId = view.getStr(KEY_AZURE_CLIENT_ID);
+        final String credential = view.getStr(KEY_AZURE_CREDENTIAL);
         if (name == null) {
             if (resource != null) {
                 throw new IllegalArgumentException(KEY_AZURE_RESOURCE + " requires " + KEY_TOKEN_PROVIDER + '=' + AZURE);
             }
             if (clientId != null) {
                 throw new IllegalArgumentException(KEY_AZURE_CLIENT_ID + " requires " + KEY_TOKEN_PROVIDER + '=' + AZURE);
+            }
+            if (credential != null) {
+                throw new IllegalArgumentException(KEY_AZURE_CREDENTIAL + " requires " + KEY_TOKEN_PROVIDER + '=' + AZURE);
             }
             return null;
         }
@@ -139,6 +167,9 @@ public final class TokenProviderSpec {
             if (clientId != null) {
                 throw new IllegalArgumentException(KEY_AZURE_CLIENT_ID + " is only valid with " + KEY_TOKEN_PROVIDER + '=' + AZURE);
             }
+            if (credential != null) {
+                throw new IllegalArgumentException(KEY_AZURE_CREDENTIAL + " is only valid with " + KEY_TOKEN_PROVIDER + '=' + AZURE);
+            }
         }
         final Map<String, String> params = new TreeMap<>();
         if (AZURE.equals(name)) {
@@ -146,7 +177,17 @@ public final class TokenProviderSpec {
                 throw new IllegalArgumentException(KEY_TOKEN_PROVIDER + '=' + AZURE + " requires " + KEY_AZURE_RESOURCE);
             }
             params.put(KEY_AZURE_RESOURCE, normalizeAzureResource(resource));
+            // checked against the values of section 7.1, and the error lists them; "default" adds no parameter
+            final String mode = view.getEnum(KEY_AZURE_CREDENTIAL);
+            if (mode != null && !AZURE_CREDENTIAL_DEFAULT.equals(mode)) {
+                params.put(KEY_AZURE_CREDENTIAL, mode);
+            }
             if (clientId != null) {
+                if (AZURE_CREDENTIAL_ENVIRONMENT.equals(mode)) {
+                    throw new IllegalArgumentException(KEY_AZURE_CLIENT_ID + " cannot be combined with "
+                            + KEY_AZURE_CREDENTIAL + '=' + AZURE_CREDENTIAL_ENVIRONMENT
+                            + ": that credential takes its client ID from the platform's configuration (AZURE_CLIENT_ID)");
+                }
                 params.put(KEY_AZURE_CLIENT_ID, normalizeGuid(clientId));
             }
         }

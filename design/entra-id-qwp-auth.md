@@ -4,7 +4,7 @@ Status: **implemented** on `feat/qwp-entra-token-provider` - all four steps of t
 
 **Read these first:**
 
-- **The spec wins.** The normative, language-neutral contract is now `design/qwp-token-provider-spec.md` (v0.3, all decisions resolved). Where the two documents differ, follow the spec. That includes the refresh-schedule clamps, backoff jitter, registry linger, and the Java names in its Appendix B, which supersede §7.2 here.
+- **The spec wins.** The normative, language-neutral contract is now `design/qwp-token-provider-spec.md` (v0.4, all decisions resolved). Where the two documents differ, follow the spec. That includes the refresh-schedule clamps, backoff jitter, registry linger, and the Java names in its Appendix B, which supersede §7.2 here.
 - **Java plan:** §10.
 - **Line references** are as of `c9968f24` and may drift.
 
@@ -580,18 +580,18 @@ Every step of §10 is implemented. Line references in §1-§7 predate it.
 
 **Step 3 - connect string, registry, Azure module** (spec §7).
 
-- `ConfigSchema` registers `token_provider`, `azure_resource` and `azure_client_id` (COMMON).
+- `ConfigSchema` registers `token_provider`, `azure_resource`, `azure_client_id` and the enum `azure_credential` (COMMON). `TokenProviderSpec` normalizes `azure_credential=default` away, so it shares a provider with a string that omits the key, and rejects `azure_client_id` with `azure_credential=environment`.
 - `TokenProviderSpec.parse` enforces §7.2 on both clients and resolves the factory without fetching anything. It strips `/.default`, checks and lower-cases the client-ID GUID, and builds the registry key.
 - `TokenProviderFactory` is the `ServiceLoader` SPI (`uses` in `module-info.java`). `TokenProviderRegistry` hands out ref-counted leases, with a 60 s linger, a daemon timer that exits when idle, and a test seam that replaces discovery.
 - The non-QWP `Sender` schemas reject the keys (D9). The builders and `QuestDBBuilder` reject mixing them with an application-supplied provider.
 - Leases: `Sender.build()` acquires one and hands it to `QwpWebSocketSender.setCredentialLease` (released on close, or released by `build()` if it fails). `QwpQueryClient` acquires one on its first `connect()` and releases it on close.
 - New reactor module `azure/`, artifact `org.questdb:questdb-client-azure` (not `io.questdb`: the core artifact is `org.questdb:questdb-client`):
-  - `AzureTokenProviderFactory` uses `DefaultAzureCredential`; `azure_client_id` sets both the managed-identity and workload-identity client ID.
-  - `AzureTokenSource` bounds each request at 30 s and classifies per §7.5: `CredentialUnavailableException`, HTTP 400/401 and known AADSTS configuration codes are permanent; everything else is retryable, with `Retry-After` honoured.
+  - `AzureTokenProviderFactory` uses `DefaultAzureCredential` for `azure_credential=default`, where `azure_client_id` sets both the managed-identity and workload-identity client ID, and warns once when that chain starts. The other values build `ManagedIdentityCredential`, `WorkloadIdentityCredential` or `EnvironmentCredential` directly (spec Appendix B); a credential that cannot be built for lack of configuration fails every fetch as permanent instead of failing a client's `build()`.
+  - `AzureTokenSource` bounds each request at 30 s and classifies per §7.5: `CredentialUnavailableException`, a managed identity that is not assigned (reported only in a nested cause when that credential is used alone), HTTP 400/401 and known AADSTS configuration codes are permanent; everything else is retryable, with `Retry-After` honoured, and names the socket-level cause of a network failure.
   - It never attaches a library exception: its response references the raw request.
   - Java 8 bytecode. It has no `module-info`; `Automatic-Module-Name: io.questdb.client.azure`, and an automatic module provides its `META-INF/services`.
   - Its release profiles mirror core's.
-- Tests: `TokenProviderConfigTest` (C18, C19), `TokenProviderSharingTest` (C17, over TLS), `azure/AzureTokenSourceTest` (fake `TokenCredential`, no network).
+- Tests: `TokenProviderConfigTest` (C18, C19, the connect-string half of C24), `TokenProviderSharingTest` (C17, over TLS), `azure/AzureTokenSourceTest` (fake `TokenCredential`, no network), `azure/AzureCredentialSelectionTest` (the real factory, no network) and `azure/AzureManagedIdentityLibraryTest` (C24: the real library in a child JVM, against a local IMDS stub).
 
 **Step 4 - health and deadline** (spec §8.4, §8.5).
 
