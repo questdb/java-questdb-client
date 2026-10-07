@@ -27,7 +27,10 @@ package io.questdb.client.impl;
 import io.questdb.client.Query;
 import io.questdb.client.QueryException;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -49,7 +52,16 @@ import java.util.concurrent.locks.ReentrantLock;
 public final class QueryWorker {
 
     static final long SHUTDOWN_JOIN_MILLIS = 5_000;
+    // clientCloseOwner states, see shutdown()
+    private static final int CLOSE_BY_DISPATCH_THREAD = 1;
+    private static final int CLOSE_UNDECIDED = 0;
+    private static final int DISPATCH_THREAD_EXITED = 2;
+    private static final Logger LOG = LoggerFactory.getLogger(QueryWorker.class);
     private final QwpQueryClient client;
+    // Decides which of shutdown() and the dispatch thread closes the client: exactly one of them, and never
+    // while the dispatch thread can still be inside execute(). Both sides settle it with a CAS from
+    // CLOSE_UNDECIDED, so the two cannot both close, and neither can skip the close.
+    private final AtomicInteger clientCloseOwner = new AtomicInteger(CLOSE_UNDECIDED);
     private final long createdAtMillis;
     private final QueryClientPool pool;
     private final QueryImpl query;
@@ -85,7 +97,7 @@ public final class QueryWorker {
         this.pool = pool;
         this.query = new QueryImpl(this);
         this.signalCondition = signalLock.newCondition();
-        this.thread = new Thread(this::runLoop, "questdb-query-worker-" + slotIndex);
+        this.thread = new Thread(this::dispatchThreadMain, "questdb-query-worker-" + slotIndex);
         this.thread.setDaemon(true);
         this.createdAtMillis = System.currentTimeMillis();
         this.idleSinceMillis = this.createdAtMillis;
@@ -251,14 +263,25 @@ public final class QueryWorker {
                 callerWasInterrupted = true;
             }
         } finally {
-            // close() must run even if cancel()/join() threw, otherwise the
-            // client's native buffer pool and socket leak for the lifetime of
-            // the process. Catch Throwable so shutdown() itself never propagates
-            // a teardown Error to its callers.
-            try {
-                client.close();
-            } catch (Throwable ignored) {
+            // The client must be closed even if cancel()/join() threw, otherwise its native buffer pool and
+            // socket leak for the lifetime of the process -- but not while the dispatch thread can still be
+            // inside execute(). close() frees what a running execute() uses: its bind buffer and the connection
+            // a reconnect walk is building. A walk parked in a native connect or WebSocket upgrade does not see
+            // the interrupt above, so an expired join does not mean the thread is idle. Closing anyway let the
+            // walk go on to a healthy endpoint, write the binds into the freed buffer (SIGSEGV), or publish an
+            // I/O thread and connection on the closed client (leak). In that case the dispatch thread closes
+            // the client itself on its way out of runLoop(); see dispatchThreadMain().
+            if (!thread.isAlive()) {
+                // exited, or never started: nothing can race the close
+                closeClient();
+            } else if (clientCloseOwner.compareAndSet(CLOSE_UNDECIDED, CLOSE_BY_DISPATCH_THREAD)) {
+                LOG.warn("{} still busy {} ms after shutdown; its query client is closed when the in-flight "
+                        + "execute() returns", thread.getName(), SHUTDOWN_JOIN_MILLIS);
+            } else if (clientCloseOwner.get() == DISPATCH_THREAD_EXITED) {
+                // the dispatch thread left runLoop() between the isAlive() check and the CAS
+                closeClient();
             }
+            // else: an earlier shutdown() already handed the close to the dispatch thread
             if (callerWasInterrupted) {
                 Thread.currentThread().interrupt();
             }
@@ -289,6 +312,26 @@ public final class QueryWorker {
             signalCondition.signal();
         } finally {
             signalLock.unlock();
+        }
+    }
+
+    private void closeClient() {
+        try {
+            client.close();
+        } catch (Throwable ignored) {
+            // Best-effort: neither shutdown() nor the exiting dispatch thread may propagate a teardown Error.
+        }
+    }
+
+    private void dispatchThreadMain() {
+        try {
+            runLoop();
+        } finally {
+            // From here on this thread never touches the client again. If shutdown() stopped waiting for it
+            // while it was still inside a job, the close was left to this thread; run it now.
+            if (!clientCloseOwner.compareAndSet(CLOSE_UNDECIDED, DISPATCH_THREAD_EXITED)) {
+                closeClient();
+            }
         }
     }
 
