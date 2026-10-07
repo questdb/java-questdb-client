@@ -48,7 +48,8 @@ final class QwpUpgradeFailures {
         }
         int status = client.getUpgradeStatusCode();
         if (status == 401 || status == 403) {
-            QwpAuthFailedException ae = new QwpAuthFailedException(status, host, port);
+            QwpAuthFailedException ae = new QwpAuthFailedException(
+                    status, host, port, client.getUpgradeRejectWwwAuthenticate());
             ae.initCause(ex);
             return ae;
         }

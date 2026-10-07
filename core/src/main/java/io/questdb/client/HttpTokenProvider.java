@@ -47,6 +47,18 @@ import io.questdb.client.std.Chars;
  * resolution to the OS. A provider that builds its own HTTP client should bound its connect and TLS
  * handshake likewise, or a black-holed token endpoint stalls a flush for the OS connect timeout. An exception from {@link #getToken()} fails the
  * in-flight flush (HTTP) or the connection attempt (WebSocket).
+ * <p>
+ * Failure classification (WebSocket). A {@link io.questdb.client.cutlass.auth.TokenUnavailableException} marked
+ * retryable is a transient credential outage: a {@code Sender} whose initial connect retries
+ * ({@code initial_connect_retry=on}) keeps retrying it within {@code reconnect_max_duration_millis}. Any other
+ * exception counts as a permanent credential failure, so startup fails fast, as it does for an OIDC device-flow
+ * provider that is not signed in yet. Once a sender has connected, every credential failure is retried while
+ * store-and-forward keeps the rows.
+ * <p>
+ * For a token that rotates on a schedule - a Microsoft Entra ID managed identity or service principal, an OAuth
+ * client-credentials grant - wrap a {@link io.questdb.client.cutlass.auth.TokenSource} in a
+ * {@link io.questdb.client.cutlass.auth.RefreshingTokenProvider}, which caches the token and refreshes it in the
+ * background before it expires.
  *
  * @see QuestDB#connect(CharSequence, HttpTokenProvider)
  * @see QuestDBBuilder#httpTokenProvider(HttpTokenProvider)
@@ -106,4 +118,23 @@ public interface HttpTokenProvider {
      * @return the current HTTP authentication token
      */
     CharSequence getToken();
+
+    /**
+     * Tells the provider that a server rejected a token it handed out, so that a caching provider can refresh
+     * early. WebSocket ingest and query clients call this when an upgrade that presented {@code token} is
+     * answered with {@code 401} - and, when the server sent a {@code WWW-Authenticate: Bearer} challenge that
+     * carries an {@code error}, only when that error is {@code invalid_token}. They then call {@link #getToken()}
+     * again and, if the token changed, retry the same endpoint once. A {@code 403} is never reported: it is an
+     * authorization decision that a new token does not change.
+     * <p>
+     * The call may block briefly while the provider refreshes - a {@code RefreshingTokenProvider} waits up to its
+     * {@code forced_wait}, 5 s by default - and must honour an interrupt by returning promptly with the
+     * interrupt flag still set. It should not throw; the clients ignore anything it throws. The default does
+     * nothing, which suits a provider that always returns its freshest token anyway.
+     *
+     * @param token      the rejected token, without the {@code "Bearer "} prefix
+     * @param httpStatus the HTTP status of the rejection
+     */
+    default void onTokenRejected(CharSequence token, int httpStatus) {
+    }
 }

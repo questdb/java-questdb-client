@@ -25,6 +25,8 @@
 package io.questdb.client;
 
 import io.questdb.client.cutlass.auth.AuthUtils;
+import io.questdb.client.cutlass.auth.TokenProviderRegistry;
+import io.questdb.client.cutlass.auth.TokenProviderSpec;
 import io.questdb.client.cutlass.line.AbstractLineTcpSender;
 import io.questdb.client.cutlass.line.LineChannel;
 import io.questdb.client.cutlass.line.LineSenderException;
@@ -78,6 +80,7 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 
 /**
@@ -625,6 +628,22 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     }
 
     /**
+     * A snapshot of this sender's connection health: whether it is connected, since when it has been without a
+     * connection, how many connect rounds have failed since, and the most recent failure with its class
+     * (design/qwp-token-provider-spec.md, section 8.4). A store-and-forward sender retries an outage - a revoked
+     * credential, an unreachable cluster - indefinitely while the application keeps writing; this is how to see
+     * that it has not reached the server. Cheap and safe to call from any thread: it never waits on I/O or on the
+     * sender's I/O thread, so it can back a health endpoint. It never contains a credential.
+     *
+     * @return the current health
+     * @throws UnsupportedOperationException for transports that do not track connection health: only the
+     *                                       WebSocket (QWP) sender does
+     */
+    default ConnectionHealth health() {
+        throw new UnsupportedOperationException("connection health is only available for WebSocket (QWP) senders");
+    }
+
+    /**
      * Add a column with a 32-bit signed integer value.
      *
      * @param name  name of the column
@@ -948,6 +967,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      */
     final class LineSenderBuilder {
         private static final int AUTO_FLUSH_DISABLED = 0;
+        // Warn once per process when an application-supplied token provider is used over ws:: (spec section 9).
+        private static final AtomicBoolean CLEARTEXT_PROVIDER_WARNED = new AtomicBoolean();
         private static final String TLS_ROOTS_INSECURE_CONFIG_ERROR = "tls_roots cannot be combined with tls_verify=unsafe_off; remove tls_verify to use custom roots, or remove tls_roots to disable certificate validation";
         // close() drain timeout. Default applied at build() time. 0 or -1
         // means "fast close" (skip the drain entirely); any positive value
@@ -1042,6 +1063,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 OrphanScanner.QUARANTINE_SLOT_INFIX;
         private final ObjList<String> hosts = new ObjList<>();
         private final IntList ports = new IntList();
+        // Optional authentication-outage deadline (spec section 8.5); 0 = not set, the default.
+        private long authFailureMaxDurationMillis;
         private long authTimeoutMillis = QwpWebSocketSender.DEFAULT_AUTH_TIMEOUT_MS;
         private int autoFlushBytes = PARAMETER_NOT_SET_EXPLICITLY;
         private int autoFlushIntervalMillis = PARAMETER_NOT_SET_EXPLICITLY;
@@ -1094,6 +1117,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private int httpTimeout = PARAMETER_NOT_SET_EXPLICITLY;
         private String httpToken;
         private HttpTokenProvider httpTokenProvider;
+        // A token_provider selected by the connect string (wss:: only). Resolved through the process-wide
+        // TokenProviderRegistry when build() connects - never at parse time, so validating a configuration
+        // fetches no token - and released when the sender closes.
+        private TokenProviderSpec tokenProviderSpec;
         // Drives the initial-connect strategy. null means "not set
         // explicitly", which build() resolves to SYNC when any reconnect_*
         // knob was tuned by the user, otherwise OFF. SYNC retries on the
@@ -1279,6 +1306,34 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
+         * Optional authentication-outage deadline (design/qwp-token-provider-spec.md, section 8.5): the sender
+         * becomes terminal when a connect round fails with an authentication-class failure - the token provider
+         * could not supply a credential, or an endpoint answered {@code 401}/{@code 403} - once that outage has
+         * lasted this long. Not set by default: such outages are retried indefinitely while store-and-forward
+         * keeps the rows. The clock starts at the first authentication-class failure of an outage and only a
+         * successful upgrade resets it; failures of other classes neither reset nor fire it. Applies while the
+         * sender is established and during an {@code async} initial connect; orphan drains are unaffected. When
+         * it fires, the error names the failure class and the elapsed time, goes to the error handler as
+         * terminal, and is thrown from later producer calls. With {@code sf_dir} set, unacknowledged rows stay
+         * in on-disk store-and-forward for a later sender or an orphan drain; in memory-only mode (no
+         * {@code sf_dir}) they are lost when the sender closes. WebSocket transport only. Connect-string key:
+         * {@code auth_failure_max_duration_millis}.
+         *
+         * @param millis the deadline, {@code > 0}
+         * @return this instance for method chaining
+         */
+        public LineSenderBuilder authFailureMaxDurationMillis(long millis) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("auth_failure_max_duration_millis is only supported for WebSocket transport");
+            }
+            if (millis <= 0) {
+                throw new LineSenderException("auth_failure_max_duration_millis must be > 0: ").put(millis);
+            }
+            this.authFailureMaxDurationMillis = millis;
+            return this;
+        }
+
+        /**
          * Per-endpoint timeout on the WebSocket upgrade response read. Default
          * {@value QwpWebSocketSender#DEFAULT_AUTH_TIMEOUT_MS} ms.
          */
@@ -1459,345 +1514,21 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             }
 
             if (protocol == PROTOCOL_WEBSOCKET) {
-                if (hosts.size() < 1) {
-                    throw new LineSenderException("WebSocket transport requires at least one host:port pair");
+                if (tokenProviderSpec == null) {
+                    return buildWebSocket(httpTokenProvider);
                 }
-
-                int actualAutoFlushRows = autoFlushRows == PARAMETER_NOT_SET_EXPLICITLY ? DEFAULT_WS_AUTO_FLUSH_ROWS : autoFlushRows;
-                int actualAutoFlushBytes = autoFlushBytes == PARAMETER_NOT_SET_EXPLICITLY ? DEFAULT_WS_AUTO_FLUSH_BYTES : autoFlushBytes;
-                long actualAutoFlushIntervalNanos = autoFlushIntervalMillis == PARAMETER_NOT_SET_EXPLICITLY
-                        ? DEFAULT_WS_AUTO_FLUSH_INTERVAL_NANOS
-                        : TimeUnit.MILLISECONDS.toNanos(autoFlushIntervalMillis);
-
-                Supplier<String> wsAuthHeader = buildWebSocketAuthHeader();
-
-                ClientTlsConfiguration wsTlsConfig = null;
-                if (tlsEnabled) {
-                    assert trustStorePassword == null || trustStorePath != null;
-                    wsTlsConfig = new ClientTlsConfiguration(
-                            trustStorePath,
-                            trustStorePassword,
-                            tlsValidationMode == TlsValidationMode.DEFAULT
-                                    ? ClientTlsConfiguration.TLS_VALIDATION_MODE_FULL
-                                    : ClientTlsConfiguration.TLS_VALIDATION_MODE_NONE
-                    );
-                }
-
-                // Setting sfDir enables store-and-forward (mmap'd, recoverable
-                // across sender restarts); omitting it gives memory-only mode
-                // (same lock-free architecture, no disk involvement).
-                // Durability-combination validation lives in validateParameters
-                // so build() and no-connect validation apply the same rules.
-                long actualSfMaxSegmentBytes = resolveSfMaxSegmentBytes();
-                long actualSfMaxTotalBytes = resolveSfMaxTotalBytes();
-                long actualCloseFlushTimeoutMillis = closeFlushTimeoutMillis == CLOSE_FLUSH_TIMEOUT_NOT_SET
-                        ? DEFAULT_CLOSE_FLUSH_TIMEOUT_MILLIS
-                        : closeFlushTimeoutMillis;
-                long actualReconnectMaxDurationMillis =
-                        reconnectMaxDurationMillis == PARAMETER_NOT_SET_EXPLICITLY
-                                ? CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_DURATION_MILLIS
-                                : reconnectMaxDurationMillis;
-                long actualReconnectInitialBackoffMillis =
-                        reconnectInitialBackoffMillis == PARAMETER_NOT_SET_EXPLICITLY
-                                ? CursorWebSocketSendLoop.DEFAULT_RECONNECT_INITIAL_BACKOFF_MILLIS
-                                : reconnectInitialBackoffMillis;
-                long actualReconnectMaxBackoffMillis =
-                        reconnectMaxBackoffMillis == PARAMETER_NOT_SET_EXPLICITLY
-                                ? CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_BACKOFF_MILLIS
-                                : reconnectMaxBackoffMillis;
-                // Resolve the initial-connect mode. An explicit user choice
-                // (via initialConnectMode/initialConnectRetry, or the
-                // initial_connect_retry conf key) wins unconditionally --
-                // including initial_connect_retry=off paired with a tuned
-                // reconnect budget. When the user left it unset and tuned
-                // any reconnect_* knob, promote to SYNC so the budget they
-                // wrote actually applies to the first connect: the knob
-                // name reads as a generic retry budget but the underlying
-                // path only governs reconnects from an established
-                // connection, and silently ignoring the budget on the
-                // initial connect is the canonical footgun this implicit
-                // upgrade removes.
-                InitialConnectMode actualInitialConnectMode;
-                if (initialConnectMode != null) {
-                    actualInitialConnectMode = initialConnectMode;
-                } else if (reconnectMaxDurationMillis != PARAMETER_NOT_SET_EXPLICITLY
-                        || reconnectInitialBackoffMillis != PARAMETER_NOT_SET_EXPLICITLY
-                        || reconnectMaxBackoffMillis != PARAMETER_NOT_SET_EXPLICITLY) {
-                    actualInitialConnectMode = InitialConnectMode.SYNC;
-                } else {
-                    actualInitialConnectMode = InitialConnectMode.OFF;
-                }
-                long actualDurableAckKeepaliveIntervalMillis =
-                        durableAckKeepaliveIntervalMillis == DURABLE_ACK_KEEPALIVE_NOT_SET
-                                ? CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS
-                                : durableAckKeepaliveIntervalMillis;
-                int actualMaxFrameRejections = maxFrameRejections != PARAMETER_NOT_SET_EXPLICITLY
-                        ? maxFrameRejections
-                        : CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS;
-                long actualPoisonMinEscalationWindowMillis = poisonMinEscalationWindowMillis != PARAMETER_NOT_SET_EXPLICITLY
-                        ? poisonMinEscalationWindowMillis
-                        : CursorWebSocketSendLoop.DEFAULT_POISON_MIN_ESCALATION_WINDOW_MILLIS;
-                long actualCatchUpCapGapMinEscalationWindowMillis =
-                        catchUpCapGapMinEscalationWindowMillis != PARAMETER_NOT_SET_EXPLICITLY
-                                ? catchUpCapGapMinEscalationWindowMillis
-                                : CursorWebSocketSendLoop.DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS;
-
-                // sfDir is the parent (group root); the actual slot lives
-                // under sfDir/senderId. This is what the engine sees — the
-                // slot lock and segment files all live one level deeper than
-                // the user-supplied path. Memory mode skips this composition
-                // (slotPath stays null).
-                //
-                // The slot ctor inside CursorSendEngine creates the slot
-                // directory itself, but Files.mkdir is non-recursive — so we
-                // must ensure the parent group root exists first.
-                String slotPath;
-                if (sfDir == null) {
-                    slotPath = null;
-                } else {
-                    if (!Files.exists(sfDir)) {
-                        int rc = Files.mkdir(sfDir, Files.DIR_MODE_DEFAULT);
-                        // mkdir is non-zero on failure, but "already exists"
-                        // is one such failure. Multiple SF senders sharing one
-                        // sf_dir can be built concurrently (the pool calls
-                        // build() outside its lock), so two threads can both
-                        // pass the exists() check and race into mkdir; the
-                        // loser gets EEXIST. Treat a benign creation race --
-                        // the dir now exists -- as success and only fail when
-                        // the directory is genuinely absent afterwards.
-                        if (rc != 0 && !Files.exists(sfDir)) {
-                            throw new LineSenderException(
-                                    "could not create sf_dir: " + sfDir + " rc=" + rc);
-                        }
-                    }
-                    if (sfDurability == SfDurability.PERIODIC
-                            && Files.fsyncParentDir(sfDir) != 0) {
-                        throw new LineSenderException(
-                                "could not sync parent directory for sf_dir: " + sfDir);
-                    }
-                    slotPath = sfDir + "/" + senderId;
-                }
-                long actualSfAppendDeadlineNanos =
-                        sfAppendDeadlineMillis == PARAMETER_NOT_SET_EXPLICITLY
-                                ? CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS
-                                : sfAppendDeadlineMillis * 1_000_000L;
-                long actualSfSyncIntervalNanos = sfDurability == SfDurability.PERIODIC
-                        ? (sfSyncIntervalMillis == PARAMETER_NOT_SET_EXPLICITLY
-                        ? DEFAULT_SF_SYNC_INTERVAL_MILLIS : sfSyncIntervalMillis) * 1_000_000L
-                        : 0L;
-                QwpWebSocketSender connected = null;
-                // The parent-anchored logical lock is stable across a slot rename. Keep it
-                // from before the directory-local lock is acquired until connect() has either
-                // adopted that engine or quarantine has closed, renamed and recreated it.
-                // This closes the inode-swap window in which an already-queued orphan drainer
-                // could otherwise acquire the renamed directory's old .lock and later operate
-                // on the fresh slot through the original pathname.
-                try (SlotLock logicalSlotLock = slotPath == null
-                        ? null
-                        : SlotLock.acquireLogical(slotPath)) {
-                    // The constructor's own recovery seed can also fail terminally, and
-                    // not only as UnreplayableSlotException: when SegmentRing.openExisting
-                    // had to skip an unreadable segment it throws SfRecoveryException (it
-                    // constructs UnreplayableSlotException nowhere), and where it cannot
-                    // even prove the chain's identity -- no manifest -- it quarantines the
-                    // corrupt files and returns an EMPTY recovery rather than refusing.
-                    // Either way the frame range cannot be shown already-acked, so recovery
-                    // sets the slot aside rather than risk seeding the ack cursor past
-                    // frames that were never delivered. All three types below are load
-                    // bearing; narrowing this catch to UnreplayableSlotException would
-                    // restore the permanent build() brick for the segment-skip case. That verdict gets
-                    // the exact same quarantine-and-continue treatment as the connect()-time
-                    // verdict below -- constructing cursorEngine is not inside the loop below,
-                    // so a throw here would otherwise escape build() entirely, uncaught.
-                    // quarantineTornSlot(null, ...) renames the WHOLE slot directory aside
-                    // (not just the unreadable segment file) before building the replacement
-                    // at the original slotPath, so the replacement starts on a genuinely empty
-                    // directory with nothing left to skip -- it cannot throw the same way
-                    // twice, which is what makes looping unnecessary here.
-                    boolean quarantined = false;
-                    CursorSendEngine cursorEngine;
-                    try {
-                        try {
-                            cursorEngine = newCursorEngine(
-                                    slotPath, actualSfMaxSegmentBytes,
-                                    actualSfMaxTotalBytes, sfSharedBudget, actualSfAppendDeadlineNanos,
-                                    actualSfSyncIntervalNanos);
-                        } catch (SfSanitizedResidueException first) {
-                            // NOT terminal, and it must be intercepted ahead of its
-                            // SfRecoveryException parent below. Recovery durably zeroed
-                            // proven-dead sealed residue BEFORE failing closed, so the
-                            // chain on disk is already healed: quarantining here would
-                            // set aside a slot whose backlog replays perfectly. Retry
-                            // once over the healed chain; a repeat is genuine and takes
-                            // the terminal arm.
-                            LOG.info("sf slot {}: sealed residue sanitized during recovery ({}); "
-                                            + "retrying over the healed chain",
-                                    slotPath, first.getMessage());
-                            cursorEngine = newCursorEngine(
-                                    slotPath, actualSfMaxSegmentBytes,
-                                    actualSfMaxTotalBytes, sfSharedBudget, actualSfAppendDeadlineNanos,
-                                    actualSfSyncIntervalNanos);
-                        }
-                    } catch (UnreplayableSlotException | SfRecoveryException
-                             | MmapSegmentCorruptionException e) {
-                        // The terminal recovery verdicts, and the only ones build()
-                        // sets a slot aside for. UnreplayableSlotException says the
-                        // symbol dictionary cannot be rebuilt from any source;
-                        // SfRecoveryException and MmapSegmentCorruptionException say
-                        // the durable chain itself is proven corrupt or incomplete.
-                        // None of the three clears on a retry, and senderId is stable
-                        // with a not-fully-drained slot retained on close -- so
-                        // without this arm every restart re-recovers the same slot and
-                        // throws again, and the application cannot construct a Sender
-                        // at all, not even to BUFFER new rows.
-                        //
-                        // Deliberately NOT catching plain MmapSegmentException or
-                        // SfOperationalException: those are operational (EMFILE,
-                        // ENOMEM, an unreadable-but-possibly-intact file). Aborting
-                        // startup on them is correct; quarantining on them would
-                        // convert a transient into the permanent loss of a healthy
-                        // slot's durable frames.
-                        if (slotPath == null) {
-                            throw e;
-                        }
-                        quarantined = true;
-                        cursorEngine = quarantineTornSlot(
-                                null, e, sfDir, senderId, slotPath, actualSfMaxSegmentBytes,
-                                actualSfMaxTotalBytes, sfSharedBudget, actualSfAppendDeadlineNanos,
-                                actualSfSyncIntervalNanos, errorHandler);
-                    }
-                    int actualErrorInboxCapacity = errorInboxCapacity != PARAMETER_NOT_SET_EXPLICITLY
-                            ? errorInboxCapacity
-                            : io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher.DEFAULT_CAPACITY;
-                    int actualConnectionListenerInboxCapacity = connectionListenerInboxCapacity != PARAMETER_NOT_SET_EXPLICITLY
-                            ? connectionListenerInboxCapacity
-                            : io.questdb.client.cutlass.qwp.client.sf.cursor.SenderConnectionDispatcher.DEFAULT_CAPACITY;
-                    List<QwpWebSocketSender.Endpoint> wsEndpoints =
-                            new ArrayList<>(hosts.size());
-                    for (int i = 0, n = hosts.size(); i < n; i++) {
-                        wsEndpoints.add(new QwpWebSocketSender.Endpoint(hosts.getQuick(i), ports.getQuick(i)));
-                    }
-                    // The recovery seed inside connect() is the authority on whether a recovered
-                    // slot can be replayed: it rebuilds the dictionary from its intact prefix and
-                    // then from the surviving frames' own delta sections, and throws
-                    // UnreplayableSlotException only once neither source holds the missing ids.
-                    // Quarantining on anything weaker would set aside slots that recovery can
-                    // still rescue, so build() waits for that verdict rather than pre-judging it.
-                    while (connected == null) {
-                        try {
-                            connected = QwpWebSocketSender.connectWithCredentialSupplier(
-                                    wsEndpoints,
-                                    wsTlsConfig,
-                                    actualAutoFlushRows,
-                                    actualAutoFlushBytes,
-                                    actualAutoFlushIntervalNanos,
-                                    wsAuthHeader,
-                                    requestDurableAck,
-                                    cursorEngine,
-                                    actualCloseFlushTimeoutMillis,
-                                    actualReconnectMaxDurationMillis,
-                                    actualReconnectInitialBackoffMillis,
-                                    actualReconnectMaxBackoffMillis,
-                                    actualInitialConnectMode,
-                                    errorHandler,
-                                    actualErrorInboxCapacity,
-                                    actualDurableAckKeepaliveIntervalMillis,
-                                    authTimeoutMillis,
-                                    connectTimeoutMillis == PARAMETER_NOT_SET_EXPLICITLY ? 0 : connectTimeoutMillis,
-                                    connectionListener,
-                                    actualConnectionListenerInboxCapacity,
-                                    actualMaxFrameRejections,
-                                    actualPoisonMinEscalationWindowMillis,
-                                    actualCatchUpCapGapMinEscalationWindowMillis
-                            );
-                        } catch (UnreplayableSlotException e) {
-                            // The one failure build() recovers from. The slot's frames reference ids
-                            // that nothing still holds, so they can never go on the wire -- but that is
-                            // no reason to take the producer down with them. Before this, the throw
-                            // escaped build() and, because senderId is stable and a not-fully-drained
-                            // slot is retained on close, every retry re-recovered the same slot and
-                            // threw again: the application could not construct a Sender at all, so it
-                            // could not even BUFFER new rows. An already-lost batch became an unbounded
-                            // outage of everything after it.
-                            //
-                            // Set the slot aside instead, keep its bytes for forensics and resend, and
-                            // start the producer on a clean one. Once only: a second such failure would
-                            // mean the FRESH slot is unreplayable, which cannot happen, so let it out
-                            // rather than loop.
-                            if (quarantined || slotPath == null) {
-                                try {
-                                    // close(false): we still hold the logical slot lock.
-                                    cursorEngine.close(false);
-                                } catch (Throwable ignored) {
-                                    // best-effort
-                                }
-                                throw e;
-                            }
-                            quarantined = true;
-                            cursorEngine = quarantineTornSlot(
-                                    cursorEngine, e, sfDir, senderId, slotPath, actualSfMaxSegmentBytes,
-                                    actualSfMaxTotalBytes, sfSharedBudget, actualSfAppendDeadlineNanos,
-                                    actualSfSyncIntervalNanos, errorHandler);
-                        } catch (Throwable t) {
-                            // connect() failed before ownership of cursorEngine
-                            // transferred — close it ourselves. close(false)
-                            // because logicalSlotLock is still held here: a fresh
-                            // slot is fully drained, so the default close would
-                            // unlink the very lock file this scope holds.
-                            try {
-                                cursorEngine.close(false);
-                            } catch (Throwable ignored) {
-                                // best-effort
-                            }
-                            throw t;
-                        }
-                    }
-                }
-                // connect() succeeded — `connected` now owns cursorEngine
-                // via setCursorEngine(engine, true). From here on, ANY
-                // failure must close `connected` (which closes the engine
-                // through ownsCursorEngine), not cursorEngine directly:
-                // closing the engine alone would leak the I/O thread,
-                // dispatcher daemon, drainer pool, microbatch buffers and
-                // WebSocketClient inside the abandoned `connected`.
-                connected.setTransactional(transactional);
+                // token_provider: share the process-wide provider for this configuration. The lease is the
+                // sender's from here on: released when the sender closes, or right here if build() fails.
+                TokenProviderRegistry.Lease lease = TokenProviderRegistry.global().acquire(tokenProviderSpec);
                 try {
-                    // Install the drainer listener BEFORE startOrphanDrainers
-                    // below: drainers must see the listener at submit time so
-                    // no early drainer event is lost to a late installation.
-                    if (drainerListener != null) {
-                        connected.setDrainerListener(drainerListener);
+                    QwpWebSocketSender sender = buildWebSocket(lease.provider());
+                    sender.setCredentialLease(lease);
+                    lease = null;
+                    return sender;
+                } finally {
+                    if (lease != null) {
+                        lease.close();
                     }
-                    // Once the foreground sender is up, dispatch drainers
-                    // for any sibling orphan slots. Scan AFTER we acquire
-                    // our own slot lock so we never accidentally try to
-                    // adopt our own data; the OrphanScanner.scan filter
-                    // also excludes our sender_id.
-                    if (drainOrphans && sfDir != null) {
-                        io.questdb.client.std.ObjList<String> orphans =
-                                io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner
-                                        .scan(sfDir, senderId, orphanDrainBase, orphanDrainSlotCount);
-                        if (orphans.size() > 0) {
-                            org.slf4j.LoggerFactory.getLogger(LineSenderBuilder.class)
-                                    .info("dispatching drainers for {} orphan slot(s) under {} "
-                                                    + "(max_background_drainers={})",
-                                            orphans.size(), sfDir, maxBackgroundDrainers);
-                            connected.startOrphanDrainers(
-                                    orphans,
-                                    maxBackgroundDrainers,
-                                    actualSfMaxSegmentBytes,
-                                    actualSfMaxTotalBytes,
-                                    actualSfSyncIntervalNanos);
-                        }
-                    }
-                    return connected;
-                } catch (Throwable t) {
-                    try {
-                        connected.close();
-                    } catch (Throwable ignored) {
-                        // best-effort
-                    }
-                    throw t;
                 }
             }
 
@@ -2276,6 +2007,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * @return this instance for method chaining
          */
         public LineSenderBuilder httpToken(String token) {
+            if (this.tokenProviderSpec != null) {
+                throw new LineSenderException("token cannot be combined with token_provider");
+            }
             if (this.username != null) {
                 throw new LineSenderException("authentication username was already configured ")
                         .put("[username=").put(this.username).put("]");
@@ -2335,6 +2069,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * @return this instance for method chaining
          */
         public LineSenderBuilder httpTokenProvider(HttpTokenProvider httpTokenProvider) {
+            if (this.tokenProviderSpec != null) {
+                throw new LineSenderException("an application-supplied token provider cannot be combined with "
+                        + "token_provider in the configuration");
+            }
             if (this.username != null) {
                 throw new LineSenderException("authentication username was already configured ")
                         .put("[username=").put(this.username).put("]");
@@ -2364,6 +2102,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * @see #httpToken(String)
          */
         public LineSenderBuilder httpUsernamePassword(String username, String password) {
+            if (this.tokenProviderSpec != null) {
+                throw new LineSenderException("username/password cannot be combined with token_provider");
+            }
             if (this.username != null) {
                 throw new LineSenderException("authentication username was already configured ")
                         .put("[username=").put(this.username).put("]");
@@ -3479,7 +3220,361 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             ports.add(port);
         }
 
-        private Supplier<String> buildWebSocketAuthHeader() {
+        private QwpWebSocketSender buildWebSocket(HttpTokenProvider tokenProvider) {
+            if (hosts.size() < 1) {
+                throw new LineSenderException("WebSocket transport requires at least one host:port pair");
+            }
+            if (tokenProvider != null && !tlsEnabled && CLEARTEXT_PROVIDER_WARNED.compareAndSet(false, true)) {
+                // design/qwp-token-provider-spec.md, section 9: a configured token_provider is rejected on ws::,
+                // but an application-supplied provider is the application's call - warn once instead.
+                LOG.warn("a token provider is used over ws:: (no TLS): bearer tokens cross the network in "
+                        + "cleartext; use wss:: in production");
+            }
+
+            int actualAutoFlushRows = autoFlushRows == PARAMETER_NOT_SET_EXPLICITLY ? DEFAULT_WS_AUTO_FLUSH_ROWS : autoFlushRows;
+            int actualAutoFlushBytes = autoFlushBytes == PARAMETER_NOT_SET_EXPLICITLY ? DEFAULT_WS_AUTO_FLUSH_BYTES : autoFlushBytes;
+            long actualAutoFlushIntervalNanos = autoFlushIntervalMillis == PARAMETER_NOT_SET_EXPLICITLY
+                    ? DEFAULT_WS_AUTO_FLUSH_INTERVAL_NANOS
+                    : TimeUnit.MILLISECONDS.toNanos(autoFlushIntervalMillis);
+
+            Supplier<String> wsAuthHeader = buildWebSocketAuthHeader(tokenProvider);
+
+            ClientTlsConfiguration wsTlsConfig = null;
+            if (tlsEnabled) {
+                assert trustStorePassword == null || trustStorePath != null;
+                wsTlsConfig = new ClientTlsConfiguration(
+                        trustStorePath,
+                        trustStorePassword,
+                        tlsValidationMode == TlsValidationMode.DEFAULT
+                                ? ClientTlsConfiguration.TLS_VALIDATION_MODE_FULL
+                                : ClientTlsConfiguration.TLS_VALIDATION_MODE_NONE
+                );
+            }
+
+            // Setting sfDir enables store-and-forward (mmap'd, recoverable
+            // across sender restarts); omitting it gives memory-only mode
+            // (same lock-free architecture, no disk involvement).
+            // Durability-combination validation lives in validateParameters
+            // so build() and no-connect validation apply the same rules.
+            long actualSfMaxSegmentBytes = resolveSfMaxSegmentBytes();
+            long actualSfMaxTotalBytes = resolveSfMaxTotalBytes();
+            long actualCloseFlushTimeoutMillis = closeFlushTimeoutMillis == CLOSE_FLUSH_TIMEOUT_NOT_SET
+                    ? DEFAULT_CLOSE_FLUSH_TIMEOUT_MILLIS
+                    : closeFlushTimeoutMillis;
+            long actualReconnectMaxDurationMillis =
+                    reconnectMaxDurationMillis == PARAMETER_NOT_SET_EXPLICITLY
+                            ? CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_DURATION_MILLIS
+                            : reconnectMaxDurationMillis;
+            long actualReconnectInitialBackoffMillis =
+                    reconnectInitialBackoffMillis == PARAMETER_NOT_SET_EXPLICITLY
+                            ? CursorWebSocketSendLoop.DEFAULT_RECONNECT_INITIAL_BACKOFF_MILLIS
+                            : reconnectInitialBackoffMillis;
+            long actualReconnectMaxBackoffMillis =
+                    reconnectMaxBackoffMillis == PARAMETER_NOT_SET_EXPLICITLY
+                            ? CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_BACKOFF_MILLIS
+                            : reconnectMaxBackoffMillis;
+            // Resolve the initial-connect mode. An explicit user choice
+            // (via initialConnectMode/initialConnectRetry, or the
+            // initial_connect_retry conf key) wins unconditionally --
+            // including initial_connect_retry=off paired with a tuned
+            // reconnect budget. When the user left it unset and tuned
+            // any reconnect_* knob, promote to SYNC so the budget they
+            // wrote actually applies to the first connect: the knob
+            // name reads as a generic retry budget but the underlying
+            // path only governs reconnects from an established
+            // connection, and silently ignoring the budget on the
+            // initial connect is the canonical footgun this implicit
+            // upgrade removes.
+            InitialConnectMode actualInitialConnectMode;
+            if (initialConnectMode != null) {
+                actualInitialConnectMode = initialConnectMode;
+            } else if (reconnectMaxDurationMillis != PARAMETER_NOT_SET_EXPLICITLY
+                    || reconnectInitialBackoffMillis != PARAMETER_NOT_SET_EXPLICITLY
+                    || reconnectMaxBackoffMillis != PARAMETER_NOT_SET_EXPLICITLY) {
+                actualInitialConnectMode = InitialConnectMode.SYNC;
+            } else {
+                actualInitialConnectMode = InitialConnectMode.OFF;
+            }
+            long actualDurableAckKeepaliveIntervalMillis =
+                    durableAckKeepaliveIntervalMillis == DURABLE_ACK_KEEPALIVE_NOT_SET
+                            ? CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS
+                            : durableAckKeepaliveIntervalMillis;
+            int actualMaxFrameRejections = maxFrameRejections != PARAMETER_NOT_SET_EXPLICITLY
+                    ? maxFrameRejections
+                    : CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS;
+            long actualPoisonMinEscalationWindowMillis = poisonMinEscalationWindowMillis != PARAMETER_NOT_SET_EXPLICITLY
+                    ? poisonMinEscalationWindowMillis
+                    : CursorWebSocketSendLoop.DEFAULT_POISON_MIN_ESCALATION_WINDOW_MILLIS;
+            long actualCatchUpCapGapMinEscalationWindowMillis =
+                    catchUpCapGapMinEscalationWindowMillis != PARAMETER_NOT_SET_EXPLICITLY
+                            ? catchUpCapGapMinEscalationWindowMillis
+                            : CursorWebSocketSendLoop.DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS;
+
+            // sfDir is the parent (group root); the actual slot lives
+            // under sfDir/senderId. This is what the engine sees — the
+            // slot lock and segment files all live one level deeper than
+            // the user-supplied path. Memory mode skips this composition
+            // (slotPath stays null).
+            //
+            // The slot ctor inside CursorSendEngine creates the slot
+            // directory itself, but Files.mkdir is non-recursive — so we
+            // must ensure the parent group root exists first.
+            String slotPath;
+            if (sfDir == null) {
+                slotPath = null;
+            } else {
+                if (!Files.exists(sfDir)) {
+                    int rc = Files.mkdir(sfDir, Files.DIR_MODE_DEFAULT);
+                    // mkdir is non-zero on failure, but "already exists"
+                    // is one such failure. Multiple SF senders sharing one
+                    // sf_dir can be built concurrently (the pool calls
+                    // build() outside its lock), so two threads can both
+                    // pass the exists() check and race into mkdir; the
+                    // loser gets EEXIST. Treat a benign creation race --
+                    // the dir now exists -- as success and only fail when
+                    // the directory is genuinely absent afterwards.
+                    if (rc != 0 && !Files.exists(sfDir)) {
+                        throw new LineSenderException(
+                                "could not create sf_dir: " + sfDir + " rc=" + rc);
+                    }
+                }
+                if (sfDurability == SfDurability.PERIODIC
+                        && Files.fsyncParentDir(sfDir) != 0) {
+                    throw new LineSenderException(
+                            "could not sync parent directory for sf_dir: " + sfDir);
+                }
+                slotPath = sfDir + "/" + senderId;
+            }
+            long actualSfAppendDeadlineNanos =
+                    sfAppendDeadlineMillis == PARAMETER_NOT_SET_EXPLICITLY
+                            ? CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS
+                            : sfAppendDeadlineMillis * 1_000_000L;
+            long actualSfSyncIntervalNanos = sfDurability == SfDurability.PERIODIC
+                    ? (sfSyncIntervalMillis == PARAMETER_NOT_SET_EXPLICITLY
+                    ? DEFAULT_SF_SYNC_INTERVAL_MILLIS : sfSyncIntervalMillis) * 1_000_000L
+                    : 0L;
+            QwpWebSocketSender connected = null;
+            // The parent-anchored logical lock is stable across a slot rename. Keep it
+            // from before the directory-local lock is acquired until connect() has either
+            // adopted that engine or quarantine has closed, renamed and recreated it.
+            // This closes the inode-swap window in which an already-queued orphan drainer
+            // could otherwise acquire the renamed directory's old .lock and later operate
+            // on the fresh slot through the original pathname.
+            try (SlotLock logicalSlotLock = slotPath == null
+                    ? null
+                    : SlotLock.acquireLogical(slotPath)) {
+                // The constructor's own recovery seed can also fail terminally, and
+                // not only as UnreplayableSlotException: when SegmentRing.openExisting
+                // had to skip an unreadable segment it throws SfRecoveryException (it
+                // constructs UnreplayableSlotException nowhere), and where it cannot
+                // even prove the chain's identity -- no manifest -- it quarantines the
+                // corrupt files and returns an EMPTY recovery rather than refusing.
+                // Either way the frame range cannot be shown already-acked, so recovery
+                // sets the slot aside rather than risk seeding the ack cursor past
+                // frames that were never delivered. All three types below are load
+                // bearing; narrowing this catch to UnreplayableSlotException would
+                // restore the permanent build() brick for the segment-skip case. That verdict gets
+                // the exact same quarantine-and-continue treatment as the connect()-time
+                // verdict below -- constructing cursorEngine is not inside the loop below,
+                // so a throw here would otherwise escape build() entirely, uncaught.
+                // quarantineTornSlot(null, ...) renames the WHOLE slot directory aside
+                // (not just the unreadable segment file) before building the replacement
+                // at the original slotPath, so the replacement starts on a genuinely empty
+                // directory with nothing left to skip -- it cannot throw the same way
+                // twice, which is what makes looping unnecessary here.
+                boolean quarantined = false;
+                CursorSendEngine cursorEngine;
+                try {
+                    try {
+                        cursorEngine = newCursorEngine(
+                                slotPath, actualSfMaxSegmentBytes,
+                                actualSfMaxTotalBytes, sfSharedBudget, actualSfAppendDeadlineNanos,
+                                actualSfSyncIntervalNanos);
+                    } catch (SfSanitizedResidueException first) {
+                        // NOT terminal, and it must be intercepted ahead of its
+                        // SfRecoveryException parent below. Recovery durably zeroed
+                        // proven-dead sealed residue BEFORE failing closed, so the
+                        // chain on disk is already healed: quarantining here would
+                        // set aside a slot whose backlog replays perfectly. Retry
+                        // once over the healed chain; a repeat is genuine and takes
+                        // the terminal arm.
+                        LOG.info("sf slot {}: sealed residue sanitized during recovery ({}); "
+                                        + "retrying over the healed chain",
+                                slotPath, first.getMessage());
+                        cursorEngine = newCursorEngine(
+                                slotPath, actualSfMaxSegmentBytes,
+                                actualSfMaxTotalBytes, sfSharedBudget, actualSfAppendDeadlineNanos,
+                                actualSfSyncIntervalNanos);
+                    }
+                } catch (UnreplayableSlotException | SfRecoveryException
+                         | MmapSegmentCorruptionException e) {
+                    // The terminal recovery verdicts, and the only ones build()
+                    // sets a slot aside for. UnreplayableSlotException says the
+                    // symbol dictionary cannot be rebuilt from any source;
+                    // SfRecoveryException and MmapSegmentCorruptionException say
+                    // the durable chain itself is proven corrupt or incomplete.
+                    // None of the three clears on a retry, and senderId is stable
+                    // with a not-fully-drained slot retained on close -- so
+                    // without this arm every restart re-recovers the same slot and
+                    // throws again, and the application cannot construct a Sender
+                    // at all, not even to BUFFER new rows.
+                    //
+                    // Deliberately NOT catching plain MmapSegmentException or
+                    // SfOperationalException: those are operational (EMFILE,
+                    // ENOMEM, an unreadable-but-possibly-intact file). Aborting
+                    // startup on them is correct; quarantining on them would
+                    // convert a transient into the permanent loss of a healthy
+                    // slot's durable frames.
+                    if (slotPath == null) {
+                        throw e;
+                    }
+                    quarantined = true;
+                    cursorEngine = quarantineTornSlot(
+                            null, e, sfDir, senderId, slotPath, actualSfMaxSegmentBytes,
+                            actualSfMaxTotalBytes, sfSharedBudget, actualSfAppendDeadlineNanos,
+                            actualSfSyncIntervalNanos, errorHandler);
+                }
+                int actualErrorInboxCapacity = errorInboxCapacity != PARAMETER_NOT_SET_EXPLICITLY
+                        ? errorInboxCapacity
+                        : io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher.DEFAULT_CAPACITY;
+                int actualConnectionListenerInboxCapacity = connectionListenerInboxCapacity != PARAMETER_NOT_SET_EXPLICITLY
+                        ? connectionListenerInboxCapacity
+                        : io.questdb.client.cutlass.qwp.client.sf.cursor.SenderConnectionDispatcher.DEFAULT_CAPACITY;
+                List<QwpWebSocketSender.Endpoint> wsEndpoints =
+                        new ArrayList<>(hosts.size());
+                for (int i = 0, n = hosts.size(); i < n; i++) {
+                    wsEndpoints.add(new QwpWebSocketSender.Endpoint(hosts.getQuick(i), ports.getQuick(i)));
+                }
+                // The recovery seed inside connect() is the authority on whether a recovered
+                // slot can be replayed: it rebuilds the dictionary from its intact prefix and
+                // then from the surviving frames' own delta sections, and throws
+                // UnreplayableSlotException only once neither source holds the missing ids.
+                // Quarantining on anything weaker would set aside slots that recovery can
+                // still rescue, so build() waits for that verdict rather than pre-judging it.
+                while (connected == null) {
+                    try {
+                        connected = QwpWebSocketSender.connectWithCredentialSupplier(
+                                wsEndpoints,
+                                wsTlsConfig,
+                                actualAutoFlushRows,
+                                actualAutoFlushBytes,
+                                actualAutoFlushIntervalNanos,
+                                wsAuthHeader,
+                                requestDurableAck,
+                                cursorEngine,
+                                actualCloseFlushTimeoutMillis,
+                                actualReconnectMaxDurationMillis,
+                                actualReconnectInitialBackoffMillis,
+                                actualReconnectMaxBackoffMillis,
+                                actualInitialConnectMode,
+                                errorHandler,
+                                actualErrorInboxCapacity,
+                                actualDurableAckKeepaliveIntervalMillis,
+                                authTimeoutMillis,
+                                connectTimeoutMillis == PARAMETER_NOT_SET_EXPLICITLY ? 0 : connectTimeoutMillis,
+                                connectionListener,
+                                actualConnectionListenerInboxCapacity,
+                                actualMaxFrameRejections,
+                                actualPoisonMinEscalationWindowMillis,
+                                actualCatchUpCapGapMinEscalationWindowMillis
+                        );
+                    } catch (UnreplayableSlotException e) {
+                        // The one failure build() recovers from. The slot's frames reference ids
+                        // that nothing still holds, so they can never go on the wire -- but that is
+                        // no reason to take the producer down with them. Before this, the throw
+                        // escaped build() and, because senderId is stable and a not-fully-drained
+                        // slot is retained on close, every retry re-recovered the same slot and
+                        // threw again: the application could not construct a Sender at all, so it
+                        // could not even BUFFER new rows. An already-lost batch became an unbounded
+                        // outage of everything after it.
+                        //
+                        // Set the slot aside instead, keep its bytes for forensics and resend, and
+                        // start the producer on a clean one. Once only: a second such failure would
+                        // mean the FRESH slot is unreplayable, which cannot happen, so let it out
+                        // rather than loop.
+                        if (quarantined || slotPath == null) {
+                            try {
+                                // close(false): we still hold the logical slot lock.
+                                cursorEngine.close(false);
+                            } catch (Throwable ignored) {
+                                // best-effort
+                            }
+                            throw e;
+                        }
+                        quarantined = true;
+                        cursorEngine = quarantineTornSlot(
+                                cursorEngine, e, sfDir, senderId, slotPath, actualSfMaxSegmentBytes,
+                                actualSfMaxTotalBytes, sfSharedBudget, actualSfAppendDeadlineNanos,
+                                actualSfSyncIntervalNanos, errorHandler);
+                    } catch (Throwable t) {
+                        // connect() failed before ownership of cursorEngine
+                        // transferred — close it ourselves. close(false)
+                        // because logicalSlotLock is still held here: a fresh
+                        // slot is fully drained, so the default close would
+                        // unlink the very lock file this scope holds.
+                        try {
+                            cursorEngine.close(false);
+                        } catch (Throwable ignored) {
+                            // best-effort
+                        }
+                        throw t;
+                    }
+                }
+            }
+            // connect() succeeded — `connected` now owns cursorEngine
+            // via setCursorEngine(engine, true). From here on, ANY
+            // failure must close `connected` (which closes the engine
+            // through ownsCursorEngine), not cursorEngine directly:
+            // closing the engine alone would leak the I/O thread,
+            // dispatcher daemon, drainer pool, microbatch buffers and
+            // WebSocketClient inside the abandoned `connected`.
+            connected.setTransactional(transactional);
+            if (authFailureMaxDurationMillis > 0) {
+                // The I/O loop may already be running (async initial connect), but it tracks the outage clock
+                // from the first authentication-class failure regardless; this only arms the deadline.
+                connected.setAuthFailureMaxDurationMillis(authFailureMaxDurationMillis);
+            }
+            try {
+                // Install the drainer listener BEFORE startOrphanDrainers
+                // below: drainers must see the listener at submit time so
+                // no early drainer event is lost to a late installation.
+                if (drainerListener != null) {
+                    connected.setDrainerListener(drainerListener);
+                }
+                // Once the foreground sender is up, dispatch drainers
+                // for any sibling orphan slots. Scan AFTER we acquire
+                // our own slot lock so we never accidentally try to
+                // adopt our own data; the OrphanScanner.scan filter
+                // also excludes our sender_id.
+                if (drainOrphans && sfDir != null) {
+                    io.questdb.client.std.ObjList<String> orphans =
+                            io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner
+                                    .scan(sfDir, senderId, orphanDrainBase, orphanDrainSlotCount);
+                    if (orphans.size() > 0) {
+                        org.slf4j.LoggerFactory.getLogger(LineSenderBuilder.class)
+                                .info("dispatching drainers for {} orphan slot(s) under {} "
+                                                + "(max_background_drainers={})",
+                                        orphans.size(), sfDir, maxBackgroundDrainers);
+                        connected.startOrphanDrainers(
+                                orphans,
+                                maxBackgroundDrainers,
+                                actualSfMaxSegmentBytes,
+                                actualSfMaxTotalBytes,
+                                actualSfSyncIntervalNanos);
+                    }
+                }
+                return connected;
+            } catch (Throwable t) {
+                try {
+                    connected.close();
+                } catch (Throwable ignored) {
+                    // best-effort
+                }
+                throw t;
+            }
+        }
+
+        private Supplier<String> buildWebSocketAuthHeader(HttpTokenProvider provider) {
             // A constant credential goes through fixedAuthHeader, not a bare lambda: the tag is what lets
             // the store-and-forward drainer tell a permanently-wrong password from a rotating token that a
             // fresh pull can repair, and so decide whether a 401 may quarantine an orphan slot for good.
@@ -3492,21 +3587,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 String header = "Bearer " + httpToken;
                 return QwpWebSocketSender.fixedAuthHeader(header);
             }
-            if (httpTokenProvider != null) {
-                // pull a fresh token at each (re)handshake so a long-lived WebSocket follows token
-                // refreshes; validateToken rejects a null/empty/blank return, or a token carrying a
-                // control or non-ASCII char (both forbidden by the HttpTokenProvider contract), rather
-                // than send a malformed or CR/LF-injected "Bearer " header
-                final HttpTokenProvider provider = httpTokenProvider;
-                return () -> {
-                    // snapshot before validating: the concatenation below re-reads the sequence, and a
-                    // provider is free to reuse a mutable buffer, so validating the live sequence checks
-                    // bytes the header need not carry. See HttpTokenProvider.validateToken.
-                    CharSequence pulled = provider.getToken();
-                    CharSequence token = pulled == null ? null : pulled.toString();
-                    HttpTokenProvider.validateToken(token);
-                    return "Bearer " + token;
-                };
+            if (provider != null) {
+                // Pull a fresh token at each (re)handshake so a long-lived WebSocket follows token refreshes.
+                // The supplier snapshots and validates every pull (validateToken rejects a null/empty/blank
+                // return, or a token carrying a control or non-ASCII char, rather than send a malformed or
+                // CR/LF-injected "Bearer " header), and it carries the provider's onTokenRejected back-channel
+                // that the connect walk uses for its one retry after a 401.
+                return QwpWebSocketSender.tokenProviderAuthHeader(provider);
             }
             return null;
         }
@@ -4028,6 +4115,15 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     // genuine value-parse error names the offending key.
                     String reservedKey = Chars.toString(sink);
                     pos = getValue(configurationString, pos, sink, reservedKey);
+                } else if (Chars.equals("auth_failure_max_duration_millis", sink)) {
+                    throw new LineSenderException("auth_failure_max_duration_millis is only supported for WebSocket transport");
+                } else if (Chars.equals("token_provider", sink)
+                        || Chars.equals("azure_resource", sink)
+                        || Chars.equals("azure_client_id", sink)
+                        || Chars.equals("azure_credential", sink)) {
+                    // Dynamic bearer credentials are defined for QWP over wss:: only (decision D9).
+                    throw new LineSenderException(Chars.toString(sink)
+                            + " is only supported with the wss:: schema (QWP over WebSocket)");
                 } else {
                     // sf-client.md §4.6: parser must reject unknown keys.
                     // Forward-compat is via the spec, not silent ignore — silent
@@ -4075,6 +4171,16 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 ConfigString cs = ConfigString.parse(configurationString);
                 ConfigView view = new ConfigView(cs);
                 validateWsConfig(view, tlsEnabled);
+                // Validates token_provider and its keys (wss:: only, exclusive with static credentials, a
+                // supported provider) without fetching anything; build() acquires the provider.
+                TokenProviderSpec spec = TokenProviderSpec.parse(view, tlsEnabled);
+                if (spec != null) {
+                    if (httpTokenProvider != null) {
+                        throw new LineSenderException("token_provider cannot be combined with an "
+                                + "application-supplied token provider");
+                    }
+                    tokenProviderSpec = spec;
+                }
 
                 view.getHostPorts("addr", DEFAULT_WEBSOCKET_PORT, this::appendAddress);
 
@@ -4109,6 +4215,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     // getInt (not getLong + cast): connectTimeoutMillis takes an
                     // int, and an over-int value must reject, not wrap.
                     connectTimeoutMillis(view.getInt("connect_timeout", 0));
+                }
+                if (view.has("auth_failure_max_duration_millis")) {
+                    authFailureMaxDurationMillis(view.getLong("auth_failure_max_duration_millis", 0));
                 }
 
                 s = view.getStr("auto_flush_rows");
@@ -4390,6 +4499,14 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             m.put("tls_verify", tlsValidationMode == null ? null : tlsValidationMode.name());
             m.put("tls_roots", trustStorePath);
             m.put("tls_roots_password", trustStorePassword == null ? null : new String(trustStorePassword));
+            m.put("auth_failure_max_duration_millis", authFailureMaxDurationMillis);
+            m.put("token_provider", tokenProviderSpec == null ? null : tokenProviderSpec.name());
+            m.put("azure_resource", tokenProviderSpec == null ? null
+                    : tokenProviderSpec.params().get(TokenProviderSpec.KEY_AZURE_RESOURCE));
+            m.put("azure_client_id", tokenProviderSpec == null ? null
+                    : tokenProviderSpec.params().get(TokenProviderSpec.KEY_AZURE_CLIENT_ID));
+            m.put("azure_credential", tokenProviderSpec == null ? null
+                    : tokenProviderSpec.params().get(TokenProviderSpec.KEY_AZURE_CREDENTIAL));
             return m;
         }
 

@@ -485,6 +485,108 @@ The token is stored as **plaintext JSON protected by file permissions** — `060
 
 `FileTokenStore` is safe to share between processes that sign in as the same identity: each update is written atomically (so a concurrent reader never sees a half-written credential), and when the identity provider rotates the refresh token on each refresh, the read-refresh-write is serialized across processes with a lock file so they do not race each other into an unnecessary re-prompt. The lock file's staleness is judged by its modification time, so this coordination assumes the processes share a clock — a single machine, or machines with synchronized clocks; under significant clock skew (for example a store directory on NFS shared across hosts) a live lock can be mis-judged stale or a dead one never expire. `clearCache()` removes the persisted entry under the same lock, but across processes it is best-effort: a peer that still holds a live in-memory token may legitimately re-persist afterwards (it always forces a fresh sign-in for the calling process).
 
+### Rotating Bearer Tokens (Microsoft Entra ID and Other Identity Platforms)
+
+Service identities - an Azure managed identity, a service principal, an AKS workload identity - authenticate with
+bearer tokens that expire every hour or every day. Select a **token provider** and the client fetches tokens itself,
+keeps them in a shared cache, and refreshes them in the background well before they expire, so long-lived senders and
+query clients keep reconnecting with a valid token.
+
+**Microsoft Entra ID from a connect string.** Add the optional `questdb-client-azure` artifact (same version as
+`questdb-client`); it brings Azure Identity and registers `token_provider=azure`:
+
+```xml
+<dependency>
+    <groupId>org.questdb</groupId>
+    <artifactId>questdb-client-azure</artifactId>
+    <version>1.0.0</version>
+</dependency>
+```
+
+```java
+try (QuestDB db = QuestDB.connect(
+        "wss::addr=qdb1:9000,qdb2:9000;token_provider=azure;azure_resource=api://<questdb-app-id>;"
+                + "azure_credential=managed_identity;")) {
+    // ... use db ...
+}
+```
+
+- `azure_resource` (required) is the application ID URI (`api://<app-id>`) or the client ID of the QuestDB app
+  registration; the client requests the scope `<azure_resource>/.default`.
+- `azure_credential` (optional) selects the credential. In production, name it: `managed_identity`,
+  `workload_identity` or `environment` (a service principal from `AZURE_TENANT_ID`, `AZURE_CLIENT_ID` and
+  `AZURE_CLIENT_SECRET` or a certificate). A managed identity selected this way retries an unreachable endpoint, and
+  fails fast when the identity is not assigned to the host.
+- `default`, the default, is Azure Identity's `DefaultAzureCredential`, a discovery chain meant for development: an
+  environment service principal, a workload identity, a managed identity, or developer tools. It checks the
+  managed-identity endpoint once without retrying, so an outage of that endpoint fails a startup as if the host had
+  no credential; the client logs a warning saying so.
+- `azure_client_id` (optional) selects a user-assigned managed identity or a workload identity. It cannot be combined
+  with `azure_credential=environment`.
+- No secret ever goes into the connect string, so it stays safe to log and to put in `QDB_CLIENT_CONF`.
+- `token_provider` requires `wss::`, and cannot be combined with `token`, `username`/`password` or an
+  application-supplied provider.
+- Every sender, query client and pooled connection built from equivalent connect strings shares one provider per
+  process: one refresher thread, one call to Entra at a time.
+
+On the server, validate tokens locally (`acl.oidc.groups.encoded.in.token=true`, `acl.oidc.groups.claim=roles`,
+`acl.oidc.sub.claim=oid`), set the QuestDB app registration to issue v2 tokens, and map its app roles to groups with
+`CREATE GROUP ... WITH EXTERNAL ALIAS '<role>'`.
+
+**Any other identity platform.** Wrap a `TokenSource` in a `RefreshingTokenProvider` and pass the provider to
+`QuestDB.connect(config, provider)`, `httpTokenProvider(...)` or `withBearerTokenProvider(...)`. The application owns
+the provider: close it after the clients that use it.
+
+```java
+import io.questdb.client.cutlass.auth.ExpiringToken;
+import io.questdb.client.cutlass.auth.RefreshingTokenProvider;
+import io.questdb.client.cutlass.auth.TokenUnavailableException;
+
+RefreshingTokenProvider tokens = RefreshingTokenProvider.builder(() -> {
+    MyToken t = myIdentityPlatform.requestToken(); // runs on the provider's own thread
+    return new ExpiringToken(t.value(), t.expiresAtEpochMillis());
+}).build();
+try (QuestDB db = QuestDB.connect("wss::addr=qdb1:9000;", tokens)) {
+    // ... use db ...
+} finally {
+    tokens.close();
+}
+```
+
+A source reports a failure by throwing `TokenUnavailableException.retryable(...)` (network trouble, throttling,
+5xx) or `TokenUnavailableException.permanent(...)` (missing or wrong configuration); anything else counts as
+retryable. Never put a token or a raw response body in the message. The provider keeps retrying with backoff and
+keeps serving the current token while it is still valid.
+
+How failures are handled:
+
+- A token is refreshed at about half its lifetime, so an idle client always holds a valid one.
+- When the server rejects a token with `401`, the client asks the provider for a new one and retries the same server
+  once, immediately.
+- At startup, `initial_connect_retry=off` (the default) fails if no token can be obtained; `on` keeps retrying a
+  retryable provider failure within `reconnect_max_duration_millis`; `async` retries in the background.
+- Once connected, a store-and-forward sender rides out credential outages and `401`/`403` indefinitely, buffering
+  rows and reporting each failure to the error handler. Set `auth_failure_max_duration_millis` to make the sender
+  fail instead once such an outage lasts that long (unacknowledged rows stay on disk).
+
+### Connection Health
+
+A sender that rides out an outage keeps accepting rows, so check its connection health to see that it is not
+reaching the server. Reading health never blocks and never contains a credential, so it can back a health endpoint.
+
+```java
+ConnectionHealth.Aggregate health = db.health(); // every pooled sender and query client
+if (health.count(ConnectionHealth.State.RECONNECTING) > 0) {
+    long since = health.getOldestOutageSinceEpochMillis();
+    ConnectionHealth.Failure failure = health.getLastFailure(); // e.g. AUTH_REJECTED 401, CREDENTIAL_UNAVAILABLE
+    // ...
+}
+```
+
+`Sender.health()` and `QwpQueryClient.health()` return the same information for a single client: its state
+(`CONNECTING`, `CONNECTED`, `RECONNECTING`, `FAILED`, `CLOSED`), the last successful connect, the start of the current
+outage, the number of failed connect rounds since, and the last failure with its class.
+
 ### Explicit Timestamps
 
 ```java
@@ -529,6 +631,11 @@ schema::key1=value1;key2=value2;
 | `tls_roots_password` |              | Optional JKS/PKCS#12 password; omit when `tls_roots` is PEM          |
 | `connect_timeout`    | _(OS)_       | TCP connect + TLS handshake timeout, in milliseconds                |
 | `auth_timeout_ms`    | `15000`      | Authentication/upgrade request timeout, in milliseconds             |
+| `token_provider`     |              | Refreshing bearer-token provider, `wss` only: `azure` (needs `questdb-client-azure`) |
+| `azure_resource`     |              | `token_provider=azure`: application ID URI or client ID of the QuestDB app registration |
+| `azure_client_id`    |              | `token_provider=azure`: client ID of a user-assigned managed identity or workload identity |
+| `azure_credential`   | `default`    | `token_provider=azure`: `default`, `managed_identity`, `workload_identity` or `environment` |
+| `auth_failure_max_duration_millis` | _(none)_ | Ingest: fail the sender once a credential outage or `401`/`403` lasts this long |
 
 ### Pool keys (facade only)
 

@@ -24,6 +24,7 @@
 
 package io.questdb.client.impl;
 
+import io.questdb.client.ConnectionHealth;
 import io.questdb.client.HttpTokenProvider;
 import io.questdb.client.Sender;
 import io.questdb.client.SenderConnectionListener;
@@ -1937,6 +1938,25 @@ public final class SenderPool implements AutoCloseable {
         lock.lock();
         try {
             return available.size();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Adds the connection health of every live pooled sender to {@code into}. Reading a sender's health never
+     * waits on its I/O, so this is safe under the pool lock.
+     */
+    public void collectHealth(java.util.List<ConnectionHealth> into) {
+        lock.lock();
+        try {
+            for (int i = 0, n = all.size(); i < n; i++) {
+                try {
+                    into.add(all.get(i).delegate().health());
+                } catch (UnsupportedOperationException ignored) {
+                    // a test double without connection health
+                }
+            }
         } finally {
             lock.unlock();
         }
