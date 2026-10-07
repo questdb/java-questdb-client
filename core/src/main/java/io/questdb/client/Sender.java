@@ -42,6 +42,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentBudget;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegmentCorruptionException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SfRecoveryException;
@@ -1189,6 +1190,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private SfDurability sfDurability = SfDurability.MEMORY;
         private long sfMaxSegmentBytes = PARAMETER_NOT_SET_EXPLICITLY;
         private long sfMaxTotalBytes = PARAMETER_NOT_SET_EXPLICITLY;
+        // Budget shared with other senders (a sender pool's), or null for a
+        // private budget of sfMaxTotalBytes. See storeAndForwardSharedBudget.
+        private SegmentBudget sfSharedBudget;
         private long sfSyncIntervalMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private boolean shouldDestroyPrivKey;
         private boolean tlsEnabled;
@@ -2630,6 +2634,19 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
+         * The {@code sf_max_total_bytes} cap {@link #build()} applies: the
+         * configured value, or the default for the configured backing (128 MiB
+         * in memory, 10 GiB with {@code sf_dir}, and never less than two
+         * segments). Introspection hook for the connection pool, which sizes
+         * the one budget all of its senders share from this value. Returns
+         * {@code -1} for transports other than WebSocket, which have no
+         * segment ring to cap.
+         */
+        public long getResolvedSfMaxTotalBytes() {
+            return protocol == PROTOCOL_WEBSOCKET ? resolveSfMaxTotalBytes() : -1L;
+        }
+
+        /**
          * Excludes the connection pool's <em>live</em> slot set from
          * {@link #drainOrphans(boolean)} scanning: a sibling slot under
          * {@code sf_dir} named {@code <base>-<index>} with
@@ -2765,13 +2782,19 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
-         * Hard cap on cursor-allocated bytes (active + spare + sealed
-         * segments). When the cap is reached, the producer's
-         * {@code Sender.flush()} blocks until ACK-driven trim frees space;
-         * if the cap is exhausted past the configured deadline (default 30 s),
-         * {@code flush()} throws. Default: {@code 128 MiB}, which applies to
-         * both memory-mode and SF-mode rings — for SF deployments with
-         * cheap disk, raise this knob explicitly. WebSocket transport only.
+         * Hard cap on cursor-allocated bytes: active + spare + sealed
+         * segments, plus the symbol-dictionary side-file with {@code sf_dir}.
+         * When the cap is reached, the producer's {@code Sender.flush()}
+         * blocks until ACK-driven trim frees space; if the cap is exhausted
+         * past the configured deadline (default 30 s), {@code flush()} throws.
+         * Default: {@code 128 MiB} of native memory without {@code sf_dir},
+         * {@code 10 GiB} of disk with it. WebSocket transport only.
+         * <p>
+         * The cap belongs to this sender alone unless it is built with
+         * {@link #storeAndForwardSharedBudget(SegmentBudget)}. The connection
+         * pool behind {@link QuestDB} does that for every sender it builds,
+         * so in a pool the cap bounds all pooled senders together, not each
+         * of them.
          */
         public LineSenderBuilder storeAndForwardMaxTotalBytes(long maxTotalBytes) {
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
@@ -2781,6 +2804,29 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 throw new LineSenderException("sf_max_total_bytes must be positive: ").put(maxTotalBytes);
             }
             this.sfMaxTotalBytes = maxTotalBytes;
+            return this;
+        }
+
+        /**
+         * Charges this sender's cursor segments to {@code budget}, shared with
+         * every other sender built on it, instead of to a private budget of
+         * {@code sf_max_total_bytes}. Together those senders never hold more
+         * than the budget's capacity, except that each is always granted its
+         * minimum working set: the active segment plus one spare. This
+         * sender's own {@code sf_max_total_bytes} then caps only the
+         * background orphan drainers it starts. The connection pool behind
+         * {@link QuestDB} builds every sender this way. WebSocket transport
+         * only.
+         *
+         * @param budget the shared budget, or {@code null} for a private one
+         *               (the default)
+         * @return this instance for method chaining
+         */
+        public LineSenderBuilder storeAndForwardSharedBudget(SegmentBudget budget) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("store_and_forward is only supported for WebSocket transport");
+            }
+            this.sfSharedBudget = budget;
             return this;
         }
 
@@ -2818,6 +2864,25 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 throw new LineSenderException("invalid ").put(name).put(" [error=").put(sink).put("]");
             }
             return pos;
+        }
+
+        // Every cursor engine build() creates -- including the fresh slot that
+        // replaces a quarantined one -- charges the shared budget when the sender
+        // was given one, and a private budget of sfMaxTotalBytes otherwise.
+        private static CursorSendEngine newCursorEngine(
+                String slotPath,
+                long sfMaxSegmentBytes,
+                long sfMaxTotalBytes,
+                SegmentBudget sfSharedBudget,
+                long sfAppendDeadlineNanos,
+                long sfSyncIntervalNanos
+        ) {
+            if (sfSharedBudget != null) {
+                return new CursorSendEngine(slotPath, sfMaxSegmentBytes, sfSharedBudget,
+                        sfAppendDeadlineNanos, sfSyncIntervalNanos);
+            }
+            return new CursorSendEngine(slotPath, sfMaxSegmentBytes, sfMaxTotalBytes,
+                    sfAppendDeadlineNanos, sfSyncIntervalNanos);
         }
 
         private static SfDurability parseDurabilityValue(@NotNull StringSink value) {
@@ -2976,8 +3041,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private static CursorSendEngine quarantineTornSlot(
                 CursorSendEngine torn, RuntimeException cause, String sfDir,
                 String senderId, String slotPath,
-                long sfMaxSegmentBytes, long sfMaxTotalBytes, long sfAppendDeadlineNanos,
-                long sfSyncIntervalNanos,
+                long sfMaxSegmentBytes, long sfMaxTotalBytes, SegmentBudget sfSharedBudget,
+                long sfAppendDeadlineNanos, long sfSyncIntervalNanos,
                 io.questdb.client.SenderErrorHandler errorHandler
         ) {
             // The verdict, and the reason, come from the recovery seed -- the only code that
@@ -3052,7 +3117,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             String.valueOf(handlerFailure));
                 }
             }
-            return new CursorSendEngine(slotPath, sfMaxSegmentBytes, sfMaxTotalBytes,
+            return newCursorEngine(slotPath, sfMaxSegmentBytes, sfMaxTotalBytes, sfSharedBudget,
                     sfAppendDeadlineNanos, sfSyncIntervalNanos);
         }
 
@@ -3190,18 +3255,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             // (same lock-free architecture, no disk involvement).
             // Durability-combination validation lives in validateParameters
             // so build() and no-connect validation apply the same rules.
-            long actualSfMaxSegmentBytes = sfMaxSegmentBytes == PARAMETER_NOT_SET_EXPLICITLY
-                    ? DEFAULT_SEGMENT_BYTES
-                    : sfMaxSegmentBytes;
-            // Default cap depends on backing: RAM (memory mode) is tight
-            // by default; disk (SF mode) is cheap so the default is
-            // generous enough that normal traffic never hits it.
-            long defaultMaxTotal = sfDir == null
-                    ? DEFAULT_MAX_BYTES_MEMORY
-                    : DEFAULT_MAX_BYTES_SF;
-            long actualSfMaxTotalBytes = sfMaxTotalBytes == PARAMETER_NOT_SET_EXPLICITLY
-                    ? Math.max(defaultMaxTotal, actualSfMaxSegmentBytes * 2)
-                    : sfMaxTotalBytes;
+            long actualSfMaxSegmentBytes = resolveSfMaxSegmentBytes();
+            long actualSfMaxTotalBytes = resolveSfMaxTotalBytes();
             long actualCloseFlushTimeoutMillis = closeFlushTimeoutMillis == CLOSE_FLUSH_TIMEOUT_NOT_SET
                     ? DEFAULT_CLOSE_FLUSH_TIMEOUT_MILLIS
                     : closeFlushTimeoutMillis;
@@ -3330,9 +3385,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 CursorSendEngine cursorEngine;
                 try {
                     try {
-                        cursorEngine = new CursorSendEngine(
+                        cursorEngine = newCursorEngine(
                                 slotPath, actualSfMaxSegmentBytes,
-                                actualSfMaxTotalBytes, actualSfAppendDeadlineNanos,
+                                actualSfMaxTotalBytes, sfSharedBudget, actualSfAppendDeadlineNanos,
                                 actualSfSyncIntervalNanos);
                     } catch (SfSanitizedResidueException first) {
                         // NOT terminal, and it must be intercepted ahead of its
@@ -3345,9 +3400,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         LOG.info("sf slot {}: sealed residue sanitized during recovery ({}); "
                                         + "retrying over the healed chain",
                                 slotPath, first.getMessage());
-                        cursorEngine = new CursorSendEngine(
+                        cursorEngine = newCursorEngine(
                                 slotPath, actualSfMaxSegmentBytes,
-                                actualSfMaxTotalBytes, actualSfAppendDeadlineNanos,
+                                actualSfMaxTotalBytes, sfSharedBudget, actualSfAppendDeadlineNanos,
                                 actualSfSyncIntervalNanos);
                     }
                 } catch (UnreplayableSlotException | SfRecoveryException
@@ -3375,7 +3430,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     quarantined = true;
                     cursorEngine = quarantineTornSlot(
                             null, e, sfDir, senderId, slotPath, actualSfMaxSegmentBytes,
-                            actualSfMaxTotalBytes, actualSfAppendDeadlineNanos,
+                            actualSfMaxTotalBytes, sfSharedBudget, actualSfAppendDeadlineNanos,
                             actualSfSyncIntervalNanos, errorHandler);
                 }
                 int actualErrorInboxCapacity = errorInboxCapacity != PARAMETER_NOT_SET_EXPLICITLY
@@ -3448,7 +3503,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         quarantined = true;
                         cursorEngine = quarantineTornSlot(
                                 cursorEngine, e, sfDir, senderId, slotPath, actualSfMaxSegmentBytes,
-                                actualSfMaxTotalBytes, actualSfAppendDeadlineNanos,
+                                actualSfMaxTotalBytes, sfSharedBudget, actualSfAppendDeadlineNanos,
                                 actualSfSyncIntervalNanos, errorHandler);
                     } catch (Throwable t) {
                         // connect() failed before ownership of cursorEngine
@@ -4465,6 +4520,21 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         .put("[protocol=").put(protocol).put("]");
             }
             protocol = PROTOCOL_HTTP;
+        }
+
+        private long resolveSfMaxSegmentBytes() {
+            return sfMaxSegmentBytes == PARAMETER_NOT_SET_EXPLICITLY ? DEFAULT_SEGMENT_BYTES : sfMaxSegmentBytes;
+        }
+
+        // The default cap depends on the backing: RAM (memory mode) is tight by
+        // default; disk (SF mode) is cheap, so its default is generous enough
+        // that normal traffic never hits it.
+        private long resolveSfMaxTotalBytes() {
+            if (sfMaxTotalBytes != PARAMETER_NOT_SET_EXPLICITLY) {
+                return sfMaxTotalBytes;
+            }
+            long defaultMaxTotal = sfDir == null ? DEFAULT_MAX_BYTES_MEMORY : DEFAULT_MAX_BYTES_SF;
+            return Math.max(defaultMaxTotal, resolveSfMaxSegmentBytes() * 2);
         }
 
         private void tcp() {

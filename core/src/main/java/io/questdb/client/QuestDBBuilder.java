@@ -404,6 +404,11 @@ public final class QuestDBBuilder {
 
     /**
      * Maximum sender-pool size. Defaults to 4.
+     * <p>
+     * The pooled senders share one {@code sf_max_total_bytes} budget for data
+     * the server has not acknowledged yet, so a larger pool adds connections,
+     * not buffer memory -- apart from the minimum working set of two segments
+     * every live sender keeps.
      */
     public QuestDBBuilder senderPoolMax(int max) {
         if (max < 1) {
