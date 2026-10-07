@@ -42,6 +42,7 @@ import org.junit.Test;
 import java.nio.file.Paths;
 import java.util.Arrays;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.assertArrayEquals;
@@ -1162,6 +1163,133 @@ public class SegmentRingTest {
                 }
             } finally {
                 Unsafe.free(buf, 32, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    /**
+     * The I/O thread sends a frame as soon as its bytes lie below
+     * {@link MmapSegment#publishedOffset()}, and the server can ACK it before
+     * {@code appendOrFsn} returns. Because {@code acknowledge} clamps at
+     * {@code publishedFsn}, the ring must publish a frame's FSN no later than its bytes:
+     * an ACK clamped below a frame the I/O thread could already send is consumed and
+     * lost, and the server's cumulative ACKs never re-deliver it once the producer goes
+     * quiet. Losing the final frame's ACK this way would stall close() and drain()
+     * until their timeout.
+     * <p>
+     * The high-water manager wakeup runs inside {@code appendOrFsn} once the appended
+     * frame's bytes are visible, so it observes the ring exactly where an I/O-thread
+     * ACK can race the publication: the wakeup plays the I/O thread and ACKs the
+     * newest frame visible to it.
+     */
+    @Test
+    public void testAckOfFrameVisibleDuringAppendIsNotClampedAway() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final int payloadLen = 32;
+            final long frameSize = MmapSegment.FRAME_HEADER_SIZE + payloadLen;
+            final long segSize = 64 * 1024;
+            long buf = Unsafe.malloc(payloadLen, MemoryTag.NATIVE_DEFAULT);
+            try {
+                fillPattern(buf, payloadLen, 0);
+                try (SegmentRing ring = new SegmentRing(MmapSegment.createInMemory(0L, segSize), segSize)) {
+                    final long[] newestVisibleAtWakeup = {-1L};
+                    final long[] ackedAtWakeup = {-1L};
+                    final int[] wakeups = {0};
+                    ring.setManagerWakeup(() -> {
+                        MmapSegment active = ring.getActive();
+                        long newestVisible = active.baseSeq()
+                                + (active.publishedOffset() - MmapSegment.HEADER_SIZE) / frameSize - 1L;
+                        ring.acknowledge(newestVisible);
+                        newestVisibleAtWakeup[0] = newestVisible;
+                        ackedAtWakeup[0] = ring.ackedFsn();
+                        wakeups[0]++;
+                    });
+                    long fsn;
+                    do {
+                        fsn = ring.appendOrFsn(buf, payloadLen);
+                        assertTrue("setup: append must succeed, got " + fsn, fsn >= 0);
+                    } while (wakeups[0] == 0);
+
+                    assertEquals("setup: the high-water wakeup fires once per active", 1, wakeups[0]);
+                    assertEquals("setup: the frame appended by the waking call is visible to the I/O thread",
+                            fsn, newestVisibleAtWakeup[0]);
+                    assertEquals("an ACK for a frame the I/O thread could already send must not be clamped away",
+                            fsn, ackedAtWakeup[0]);
+                    assertEquals(fsn, ring.ackedFsn());
+                }
+            } finally {
+                Unsafe.free(buf, payloadLen, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    /**
+     * Concurrent form of {@link #testAckOfFrameVisibleDuringAppendIsNotClampedAway}: an
+     * observer thread plays the I/O thread against a producer that appends across many
+     * rotations, ACKing each frame the moment its bytes become visible below
+     * {@link MmapSegment#publishedOffset()}. Every such ACK must land; none may be
+     * clamped below the frame the observer could already have sent.
+     */
+    @Test(timeout = 60_000L)
+    public void testAckOfFrameVisibleToConsumerLandsUnderConcurrentAppends() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final int payloadLen = 16;
+            final long frameSize = MmapSegment.FRAME_HEADER_SIZE + payloadLen;
+            final long segSize = MmapSegment.HEADER_SIZE + frameSize * 64;
+            final long frameCount = 200_000L;
+            long buf = Unsafe.malloc(payloadLen, MemoryTag.NATIVE_DEFAULT);
+            try {
+                fillPattern(buf, payloadLen, 0);
+                try (SegmentRing ring = new SegmentRing(MmapSegment.createInMemory(0L, segSize), segSize)) {
+                    final AtomicBoolean producerDone = new AtomicBoolean();
+                    final AtomicReference<Throwable> failure = new AtomicReference<>();
+                    Thread observer = new Thread(() -> {
+                        try {
+                            long lastAcked = -1L;
+                            while (lastAcked < frameCount - 1L && failure.get() == null) {
+                                // Read before the snapshot: once the producer is done, its
+                                // every append happened-before this read, so the snapshot
+                                // below sees all frames and a caught-up observer can stop.
+                                boolean isProducerDone = producerDone.get();
+                                MmapSegment active = ring.getActive();
+                                long newestVisible = active.baseSeq()
+                                        + (active.publishedOffset() - MmapSegment.HEADER_SIZE) / frameSize - 1L;
+                                if (newestVisible > lastAcked) {
+                                    ring.acknowledge(newestVisible);
+                                    long acked = ring.ackedFsn();
+                                    if (acked < newestVisible) {
+                                        throw new AssertionError("ACK of visible FSN " + newestVisible
+                                                + " was clamped to " + acked);
+                                    }
+                                    lastAcked = newestVisible;
+                                } else if (isProducerDone) {
+                                    break;
+                                }
+                            }
+                        } catch (Throwable t) {
+                            failure.compareAndSet(null, t);
+                        }
+                    }, "ack-observer");
+                    observer.start();
+                    try {
+                        for (long i = 0; i < frameCount && failure.get() == null; i++) {
+                            long fsn;
+                            while ((fsn = ring.appendOrFsn(buf, payloadLen)) == SegmentRing.BACKPRESSURE_NO_SPARE) {
+                                ring.installHotSpare(MmapSegment.createInMemory(ring.nextSeqHint(), segSize));
+                            }
+                            assertEquals(i, fsn);
+                        }
+                    } catch (Throwable t) {
+                        failure.compareAndSet(null, t);
+                    } finally {
+                        producerDone.set(true);
+                        observer.join();
+                    }
+                    assertNull("visible frame ACK lost: " + failure.get(), failure.get());
+                    assertEquals(frameCount - 1L, ring.ackedFsn());
+                }
+            } finally {
+                Unsafe.free(buf, payloadLen, MemoryTag.NATIVE_DEFAULT);
             }
         });
     }
