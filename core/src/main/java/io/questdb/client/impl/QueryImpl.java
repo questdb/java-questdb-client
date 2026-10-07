@@ -79,6 +79,10 @@ final class QueryImpl {
     private volatile boolean done = true;
     private volatile String resultMessage;
     private volatile byte resultStatus;
+    // Counts submit() calls. Written under doneLock; volatile so runOn() can read
+    // it without the lock. Lets runOn() tell its own submission from a later one,
+    // see signalUnexpected(long, Throwable).
+    private volatile long submissionSeq;
     // Stamped by submit() for the worker thread: when the query was submitted and
     // the timeout it runs under (0 = none), so runOn() can hand the client only
     // the part of the budget that is left. Published by worker.dispatch().
@@ -288,6 +292,7 @@ final class QueryImpl {
         doneLock.lock();
         try {
             done = false;
+            submissionSeq++;
             resultStatus = 0;
             resultMessage = null;
             unexpectedError = null;
@@ -295,6 +300,11 @@ final class QueryImpl {
             doneLock.unlock();
         }
         worker.dispatch(this);
+    }
+
+    private static String describe(Throwable t) {
+        String message = t.getMessage();
+        return message != null ? message : t.getClass().getSimpleName();
     }
 
     private void applyBinds(QwpBindValues binds) {
@@ -377,6 +387,29 @@ final class QueryImpl {
         }
     }
 
+    /**
+     * Signals an error that escaped the run of {@code submission}, unless a later
+     * {@link #submit} has taken that submission's place. A run can end with an
+     * exception after it signalled its outcome: when a handler throws on a query
+     * timeout, the client rethrows the exception only once the aborted query has
+     * drained, and the caller, already released, may have submitted again
+     * meanwhile. That exception must not become the newer submission's outcome.
+     * The check and the signal share {@code doneLock}, which {@code submit()}
+     * takes to start a submission.
+     */
+    private void signalUnexpected(long submission, Throwable t) {
+        // getMessage() may be user code: run it before taking the lock submit() needs.
+        final String message = describe(t);
+        doneLock.lock();
+        try {
+            if (submission == submissionSeq) {
+                signalDone((byte) 0, message, t);
+            }
+        } finally {
+            doneLock.unlock();
+        }
+    }
+
     private void throwIfFailed() {
         Throwable unexpected = unexpectedError;
         if (unexpected != null) {
@@ -408,6 +441,9 @@ final class QueryImpl {
     }
 
     void runOn(QwpQueryClient client) {
+        // The submission this run executes. No later submit() can happen before
+        // the run signals this one's outcome, so the value is stable until then.
+        final long submission = submissionSeq;
         long timeoutArg = 0;
         if (submitTimeoutMillis > 0) {
             // Only what is left of the budget since submit(); at least 1ms so the
@@ -424,7 +460,11 @@ final class QueryImpl {
         // can call sql(...) again only once done==true, which execute() signals
         // either at the terminal event or, after a query timeout, once the I/O
         // thread has encoded the request (see QwpQueryClient.executeOnce).
-        client.execute(sqlBuffer, wireBinds, wrappingHandler, false, timeoutArg);
+        try {
+            client.execute(sqlBuffer, wireBinds, wrappingHandler, false, timeoutArg);
+        } catch (Throwable t) {
+            signalUnexpected(submission, t);
+        }
     }
 
     /**
@@ -432,7 +472,7 @@ final class QueryImpl {
      * exception escaping {@code execute()} before any handler callback).
      */
     void signalUnexpected(Throwable t) {
-        signalDone((byte) 0, t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName(), t);
+        signalDone((byte) 0, describe(t), t);
     }
 
     private final class WrappingHandler implements QwpColumnBatchHandler {

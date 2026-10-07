@@ -49,6 +49,7 @@ import java.util.Random;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.LockSupport;
 
 /**
  * QWP egress (query results) client.
@@ -179,6 +180,9 @@ public class QwpQueryClient implements QuietCloseable {
     // deadline arithmetic (deadline + 2 * grace) on System.nanoTime() values
     // clear of overflow; ~73 years is "no limit" for every practical purpose.
     private static final long MAX_TIMEOUT_NANOS = Long.MAX_VALUE / 8;
+    // How often an interrupted execute() checks whether the I/O thread has
+    // encoded its request (see retractRequest).
+    private static final long REQUEST_ENCODED_POLL_NANOS = TimeUnit.MICROSECONDS.toNanos(100);
     // States of a query running under a timeout (see executeOnce).
     // RUNNING: before the deadline, events are delivered normally.
     private static final int TIMEOUT_PHASE_RUNNING = 0;
@@ -993,10 +997,11 @@ public class QwpQueryClient implements QuietCloseable {
      * ({@link #withQueryTimeoutGrace(long)}) after the deadline, the handler is
      * told about the timeout anyway and this call keeps draining the aborted
      * query for up to one more grace period, so the connection can still be
-     * reused. Only a connection that stays silent through both grace periods is
-     * treated as failed (see {@link #hasTerminalFailure()}). Unless a handler
-     * callback blocks, this call therefore returns about two grace periods after
-     * the timeout at the latest.
+     * reused. That drain happens even if the handler's {@code onError} throws;
+     * the exception then propagates once the drain ends. Only a connection that
+     * stays silent through both grace periods is treated as failed (see
+     * {@link #hasTerminalFailure()}). Unless a handler callback blocks, this call
+     * therefore returns about two grace periods after the timeout at the latest.
      *
      * @param timeoutMs query timeout in milliseconds; {@code 0} runs the query
      *                  without a timeout
@@ -1616,6 +1621,18 @@ public class QwpQueryClient implements QuietCloseable {
         return "questdb-java-egress/1.0.0";
     }
 
+    /**
+     * Hands an event the executing thread does not deliver back to the I/O
+     * thread, with its batch buffer: the I/O thread waits for each published
+     * batch to be released.
+     */
+    private static void discardEvent(QwpEgressIoThread io, QueryEvent ev) {
+        if (ev.kind == QueryEvent.KIND_BATCH && ev.buffer != null) {
+            io.releaseBuffer(ev.buffer);
+        }
+        io.releaseEvent(ev);
+    }
+
     private static boolean isPast(long deadlineNanos) {
         return System.nanoTime() - deadlineNanos >= 0;
     }
@@ -1647,17 +1664,27 @@ public class QwpQueryClient implements QuietCloseable {
         return remainingNanos <= 0L ? 0L : (remainingNanos + 999_999L) / 1_000_000L;
     }
 
+    /**
+     * Throws {@code t} as is, without wrapping it. Callbacks of
+     * {@link QwpColumnBatchHandler} declare no checked exceptions, so this only
+     * matters for a handler that throws one anyway: it reaches the caller of
+     * {@link #execute} unchanged, as it does when it is not held back.
+     */
+    @SuppressWarnings("unchecked")
+    private static <T extends Throwable> void throwUnchecked(Throwable t) throws T {
+        throw (T) t;
+    }
+
     private static long toBoundedNanos(long millis) {
         return Math.min(TimeUnit.MILLISECONDS.toNanos(millis), MAX_TIMEOUT_NANOS);
     }
 
     /**
-     * Gives up on a connection that left a timed-out query unanswered through
-     * both grace periods (hung server, black-holed network), or whose I/O thread
-     * never even sent the query. Latches a terminal failure, so the next
-     * {@link #execute} replaces the connection ({@code failover=on}) or reports
-     * the failure ({@code failover=off}) and a pool discards the client, then
-     * stops the I/O thread.
+     * Gives up on the connection. Latches a terminal failure carrying
+     * {@code failureMessage}, so the next {@link #execute} replaces the
+     * connection ({@code failover=on}) or reports the failure
+     * ({@code failover=off}) and a pool discards the client, then stops the I/O
+     * thread.
      * <p>
      * Runs on the executing thread, the sole consumer of the event queue, and
      * keeps releasing every batch the I/O thread still publishes while it winds
@@ -1665,14 +1692,11 @@ public class QwpQueryClient implements QuietCloseable {
      * released, and would otherwise outlive the joins in {@link #close()} and
      * {@link #cleanupFailedConnect()}.
      */
-    private void abandonUnresponsiveConnection(QwpEgressIoThread io) {
+    private void abandonConnection(QwpEgressIoThread io, String failureMessage) {
         GenerationListener listener = currentGenerationListener;
         if (listener != null) {
-            listener.onTerminalFailure(WebSocketResponse.STATUS_INTERNAL_ERROR,
-                    "connection stopped responding after a query timeout");
+            listener.onTerminalFailure(WebSocketResponse.STATUS_INTERNAL_ERROR, failureMessage);
         }
-        LOG.warn("QwpQueryClient connection did not end a timed-out query within two grace periods of {}ms; "
-                + "closing it", queryTimeoutGraceMs);
         io.shutdown();
         Thread handle = ioThreadHandle;
         if (handle == null) {
@@ -1695,15 +1719,23 @@ public class QwpQueryClient implements QuietCloseable {
                 continue;
             }
             if (ev != null) {
-                if (ev.kind == QueryEvent.KIND_BATCH && ev.buffer != null) {
-                    io.releaseBuffer(ev.buffer);
-                }
-                io.releaseEvent(ev);
+                discardEvent(io, ev);
             }
         }
         if (interrupted) {
             Thread.currentThread().interrupt();
         }
+    }
+
+    /**
+     * Gives up on a connection that left a timed-out query unanswered through
+     * both grace periods (hung server, black-holed network), or whose I/O thread
+     * never even sent the query. See {@link #abandonConnection}.
+     */
+    private void abandonUnresponsiveConnection(QwpEgressIoThread io) {
+        LOG.warn("QwpQueryClient connection did not end a timed-out query within two grace periods of {}ms; "
+                + "closing it", queryTimeoutGraceMs);
+        abandonConnection(io, "connection stopped responding after a query timeout");
     }
 
     /**
@@ -1883,6 +1915,10 @@ public class QwpQueryClient implements QuietCloseable {
             attempt++;
             FailoverProbeHandler probe = new FailoverProbeHandler(handler);
             executeOnce(sql, binds, probe, resetSymbolDict, timeoutMs, deadlineNanos);
+            // A handler failure held back while the attempt drained a timed-out
+            // query propagates now: the query has ended, or the connection was
+            // given up on.
+            probe.rethrowDeferredFailure();
             if (!probe.transportFailureIntercepted) {
                 return;
             }
@@ -2021,6 +2057,15 @@ public class QwpQueryClient implements QuietCloseable {
      * connection, which carries one query at a time, can serve the next query.
      * A connection still silent after that is abandoned. The handler sees
      * exactly one terminal callback in every case.
+     * <p>
+     * An attempt that ends before its query's last frame -- the handler threw
+     * from {@code onBatch}, or the thread was interrupted -- leaves the query
+     * running on the connection, and cancels it. The I/O thread still works
+     * through it before it sends the next query, so the next attempt skips the
+     * leftover events: each event carries the id of its query (see
+     * {@link QueryEvent#requestId}). An interrupt that comes before the I/O
+     * thread has encoded the request takes the request back, or waits for the
+     * encoding, before the caller hears about it (see {@link #retractRequest}).
      */
     private void executeOnce(
             CharSequence sql,
@@ -2101,11 +2146,27 @@ public class QwpQueryClient implements QuietCloseable {
         // STATUS_CANCELLED reply then reports that cancel, not the timeout.
         boolean cancelledByUser = false;
         long waitDeadlineNanos = deadlineNanos;
+        boolean submitted = false;
+        // Set once the attempt has taken its query's last event, or given up on
+        // the connection: the query no longer runs on it.
+        boolean settled = false;
         try {
             io.submitQuery(sql, requestId, initialCreditBytes, bindValues.count(), bindValues.bufferPtr(), bindValues.bufferLen(),
                     queryFlags, wireTimeoutMs);
+            submitted = true;
             while (true) {
                 QueryEvent ev = timed ? io.takeEvent(waitDeadlineNanos) : io.takeEvent();
+                if (ev != null && ev.isForOtherRequest(requestId)) {
+                    // A leftover of an earlier query whose attempt ended before that
+                    // query did. Not this query's; skip it.
+                    discardEvent(io, ev);
+                    if (!timed || !isPast(waitDeadlineNanos)) {
+                        continue;
+                    }
+                    // Leftovers can keep coming past the wait deadline, and the
+                    // queue still returns them then: handle the deadline now.
+                    ev = null;
+                }
                 if (ev == null) {
                     // waitDeadlineNanos passed without an event.
                     if (phase == TIMEOUT_PHASE_RUNNING) {
@@ -2127,18 +2188,24 @@ public class QwpQueryClient implements QuietCloseable {
                         io.requestCancel(requestId);
                         phase = TIMEOUT_PHASE_DRAINING;
                         waitDeadlineNanos = deadlineNanos + 2 * graceNanos;
-                        probe.onError(requestId, QwpConstants.STATUS_QUERY_TIMEOUT, queryTimeoutMessage(timeoutMs)
+                        probe.onErrorWhileDraining(requestId, QwpConstants.STATUS_QUERY_TIMEOUT, queryTimeoutMessage(timeoutMs)
                                 + "; the server did not end the query within the " + queryTimeoutGraceMs
                                 + "ms grace period");
                         continue;
                     }
                     final boolean callerWaiting = phase != TIMEOUT_PHASE_DRAINING;
                     abandonUnresponsiveConnection(io);
+                    settled = true;
                     if (callerWaiting) {
                         probe.onError(requestId, QwpConstants.STATUS_QUERY_TIMEOUT, queryTimeoutMessage(timeoutMs)
                                 + "; the connection did not respond and was closed");
                     }
                     return;
+                }
+                if (ev.kind != QueryEvent.KIND_BATCH) {
+                    // Every other event ends the query on the connection, and the
+                    // attempt returns once the switch below handles it.
+                    settled = true;
                 }
                 try {
                     switch (ev.kind) {
@@ -2221,12 +2288,23 @@ public class QwpQueryClient implements QuietCloseable {
             }
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
+            // Before the caller hears about the interrupt: the I/O thread must be
+            // done with the request (see retractRequest).
+            if (submitted && !io.isRequestEncoded(requestId) && retractRequest(io, requestId)) {
+                settled = true;
+            }
             // Interrupt on the user thread is not a transport failure; surface directly.
             // A draining attempt has already given the handler its terminal callback.
             if (phase != TIMEOUT_PHASE_DRAINING) {
                 probe.deliverFinal(requestId, "interrupted while waiting for server response");
             }
         } finally {
+            if (submitted && !settled) {
+                // The attempt ends while its query still runs: the handler threw,
+                // or the thread was interrupted. Cancel the query, so the leftovers
+                // the next attempt skips stop coming.
+                io.requestCancel(requestId);
+            }
             currentRequestId = -1L;
         }
     }
@@ -2480,6 +2558,54 @@ public class QwpQueryClient implements QuietCloseable {
         return flags;
     }
 
+    /**
+     * Makes sure the I/O thread no longer reads the request {@code requestId},
+     * which an interrupted {@code execute()} stops waiting for before the I/O
+     * thread has encoded it. Until then the I/O thread reads the caller's SQL
+     * text, which the caller may change once it learns about the interrupt, and
+     * this client's request holder and bind buffer, which the next query reuses.
+     * <p>
+     * A request the I/O thread has not picked up yet is withdrawn: it is never
+     * sent. One it has picked up is awaited -- encoding is CPU work, done
+     * microseconds after the pick-up -- without regard to interrupts. An I/O
+     * thread that is still not done after {@link #shutdownJoinMs} is stuck, and
+     * the connection is given up, as on a query timeout.
+     *
+     * @return {@code true} when the query does not run on the connection: it was
+     * withdrawn, or the connection was given up
+     */
+    private boolean retractRequest(QwpEgressIoThread io, long requestId) {
+        if (io.withdrawRequest(requestId)) {
+            return true;
+        }
+        final Thread handle = ioThreadHandle;
+        // parkNanos() returns at once while the interrupt flag is set, so clear it
+        // for the wait, and restore it after.
+        boolean interrupted = Thread.interrupted();
+        try {
+            final long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(shutdownJoinMs);
+            while (!io.isRequestEncoded(requestId)) {
+                if (handle == null || !handle.isAlive()) {
+                    // A stopped I/O thread reads nothing more.
+                    return true;
+                }
+                if (isPast(deadlineNanos)) {
+                    LOG.warn("QwpQueryClient I/O thread did not finish sending an interrupted query within {}ms; "
+                            + "closing the connection", shutdownJoinMs);
+                    abandonConnection(io, "I/O thread stopped responding");
+                    return true;
+                }
+                LockSupport.parkNanos(REQUEST_ENCODED_POLL_NANOS);
+                interrupted |= Thread.interrupted();
+            }
+            return false;
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
     private void runUpgradeWithTimeout(Endpoint ep, String authHeader) {
         // Connect first, OUTSIDE the upgrade try. A connect-phase failure --
         // including a connect_timeout overage flagged via flagAsTimeout() -- must
@@ -2554,6 +2680,9 @@ public class QwpQueryClient implements QuietCloseable {
      */
     private static final class FailoverProbeHandler implements QwpColumnBatchHandler {
         final QwpColumnBatchHandler delegate;
+        // Thrown by the handler while its query was still running; see
+        // onErrorWhileDraining().
+        Throwable deferredFailure;
         String interceptedMessage;
         long interceptedRequestId = -1L;
         byte interceptedStatus;
@@ -2631,6 +2760,36 @@ public class QwpQueryClient implements QuietCloseable {
             interceptedRequestId = requestId;
             interceptedStatus = status;
             interceptedMessage = message;
+        }
+
+        /**
+         * Delivers the error that ends a query for the caller while the query is
+         * still running on the connection: the timeout reported at the end of the
+         * grace period, before the aborted query has drained. The connection
+         * carries one query at a time, so a throw from the handler must not cut
+         * that drain short -- the next query would read this query's remaining
+         * frames as its own. The throw is held instead, and
+         * {@link #rethrowDeferredFailure()} raises it once the attempt is over.
+         */
+        void onErrorWhileDraining(long requestId, byte status, String message) {
+            try {
+                delegate.onError(requestId, status, message);
+            } catch (Throwable t) {
+                deferredFailure = t;
+            }
+        }
+
+        /**
+         * Raises the handler failure held back by {@link #onErrorWhileDraining},
+         * if any. Called once the attempt has drained its query, or given up on
+         * the connection.
+         */
+        void rethrowDeferredFailure() {
+            Throwable t = deferredFailure;
+            if (t != null) {
+                deferredFailure = null;
+                QwpQueryClient.<RuntimeException>throwUnchecked(t);
+            }
         }
     }
 

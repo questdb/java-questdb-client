@@ -38,6 +38,7 @@ import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -55,7 +56,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  * holds, while the pooled, authenticated connection stays open and serves the
  * following queries. A worker still draining a timed-out query is not handed to
  * the next borrower before it is idle, and one whose connection stopped
- * responding is replaced rather than reused.
+ * responding is replaced rather than reused. A handler that throws -- on the
+ * timeout, or mid-result -- fails only its own submission.
  */
 public class QueryTimeoutFacadeTest {
 
@@ -127,6 +129,112 @@ public class QueryTimeoutFacadeTest {
                     assertTimesOut(q);
                 }
                 Assert.assertEquals("all queries must share one connection", 1, server.handshakeCount());
+            } finally {
+                script.close();
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testThrowingBatchHandlerFailsOnlyItsOwnSubmission() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            Script script = new Script();
+            script.onQuery = (s, c, id, n) -> {
+                if (n == 1) {
+                    s.send(c, firstBatch(id));
+                    // The rest of the result arrives after the handler has thrown.
+                    s.sendLater(c, 300, nextBatch(id));
+                    s.sendLater(c, 300, resultEnd(id));
+                } else {
+                    s.send(c, execDone(id));
+                }
+            };
+            try (TestWebSocketServer server = startServer(script, QwpEgressMsgKind.CAP_QUERY_FLAGS | QwpEgressMsgKind.CAP_QUERY_TIMEOUT);
+                 QuestDB db = QuestDB.connect(config(server));
+                 Query q = db.borrowQuery()) {
+                final IllegalStateException failure = new IllegalStateException("handler failed");
+                q.sql("SELECT s FROM t").handler(new QwpColumnBatchHandler() {
+                    @Override
+                    public void onBatch(QwpColumnBatch batch) {
+                        throw failure;
+                    }
+
+                    @Override
+                    public void onEnd(long totalRows) {
+                    }
+
+                    @Override
+                    public void onError(byte status, String message) {
+                    }
+                });
+                try {
+                    q.submit().await();
+                    Assert.fail("the submission whose handler threw must fail");
+                } catch (QueryException e) {
+                    Assert.assertSame("the handler's exception must be its own submission's outcome",
+                            failure, e.getCause());
+                }
+
+                RecordingHandler next = new RecordingHandler();
+                q.sql("INSERT INTO t VALUES (1)").handler(next);
+                assertOwnOutcome(q);
+                Assert.assertTrue("the next submission must get its own reply", next.execDone);
+                Assert.assertEquals("the abandoned query's rows must not reach the next submission",
+                        0, next.batches.get());
+                Assert.assertEquals("the connection must be reused", 1, server.handshakeCount());
+            } finally {
+                script.close();
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testThrowingHandlerLeavesTheNextSubmissionIntact() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final long timeoutMs = 100;
+            final long graceMs = 1_000;
+            Script script = new Script();
+            script.onQuery = (s, c, id, n) -> {
+                if (n == 1) {
+                    // Ends the query halfway through the second grace period: the
+                    // caller is released first, while the worker still drains it.
+                    s.replyOnceLater(c, id, timeoutMs + graceMs + graceMs / 2,
+                            queryError(id, QwpConstants.STATUS_QUERY_TIMEOUT, "timeout, query aborted"));
+                } else {
+                    s.send(c, execDone(id));
+                }
+            };
+            try (TestWebSocketServer server = startServer(script, QwpEgressMsgKind.CAP_QUERY_FLAGS | QwpEgressMsgKind.CAP_QUERY_TIMEOUT);
+                 QuestDB db = QuestDB.connect(config(server) + "query_close_timeout_ms=" + graceMs + ";")) {
+                try (Query q = db.borrowQuery()) {
+                    q.sql("SELECT slow()").handler(new QwpColumnBatchHandler() {
+                        @Override
+                        public void onBatch(QwpColumnBatch batch) {
+                        }
+
+                        @Override
+                        public void onEnd(long totalRows) {
+                        }
+
+                        @Override
+                        public void onError(byte status, String message) {
+                            throw new IllegalStateException("handler failed: " + message);
+                        }
+                    }).timeout(timeoutMs, TimeUnit.MILLISECONDS);
+                    assertTimesOut(q);
+
+                    // Submitted while the worker still drains the timed-out query: it runs
+                    // once the drain ends and must get its own outcome -- neither the
+                    // aborted query's late reply nor the handler's failure.
+                    q.sql("INSERT INTO t VALUES (1)").handler(new NoopHandler()).timeout(0, TimeUnit.MILLISECONDS);
+                    assertOwnOutcome(q);
+                }
+                // The pooled connection is handed to the next borrower in step too.
+                try (Query q = db.borrowQuery()) {
+                    q.sql("INSERT INTO t VALUES (2)").handler(new NoopHandler());
+                    assertOwnOutcome(q);
+                }
+                Assert.assertEquals("the drained connection must be reused", 1, server.handshakeCount());
             } finally {
                 script.close();
             }
@@ -236,6 +344,15 @@ public class QueryTimeoutFacadeTest {
         });
     }
 
+    private static void assertOwnOutcome(Query q) throws InterruptedException {
+        try {
+            q.submit().await();
+        } catch (QueryException e) {
+            Assert.fail("the submission must get its own outcome, got status=" + e.getStatus()
+                    + ", message=" + e.getMessage() + ", cause=" + e.getCause());
+        }
+    }
+
     private static QueryException assertTimesOut(Query q) throws InterruptedException {
         try {
             q.submit().await();
@@ -261,18 +378,69 @@ public class QueryTimeoutFacadeTest {
         return frame(QwpEgressMsgKind.EXEC_DONE, requestId, new byte[]{0, 0}); // op_type, rows_affected
     }
 
+    /**
+     * RESULT_BATCH {@code batch_seq == 0}: the schema (one VARCHAR column) and a
+     * single row.
+     */
+    private static byte[] firstBatch(long requestId) {
+        ByteArrayOutputStream body = new ByteArrayOutputStream();
+        putVarint(body, 0);       // batch_seq
+        putVarint(body, 0);       // table name length
+        putVarint(body, 1);       // row_count
+        putVarint(body, 1);       // column_count
+        putVarint(body, 1);       // column name length
+        body.write('s');
+        body.write(QwpConstants.TYPE_VARCHAR);
+        putVarcharCell(body, "a");
+        return frame(QwpEgressMsgKind.RESULT_BATCH, requestId, 1, body.toByteArray());
+    }
+
     private static byte[] frame(byte msgKind, long requestId, byte[] body) {
+        return frame(msgKind, requestId, 0, body);
+    }
+
+    private static byte[] frame(byte msgKind, long requestId, int tableCount, byte[] body) {
         int payloadLen = 1 + 8 + body.length;
         ByteBuffer bb = ByteBuffer.allocate(QwpConstants.HEADER_SIZE + payloadLen).order(ByteOrder.LITTLE_ENDIAN);
         bb.putInt(QwpConstants.MAGIC_MESSAGE);
         bb.put(QwpConstants.VERSION);
         bb.put((byte) 0);       // flags
-        bb.putShort((short) 0); // table_count
+        bb.putShort((short) tableCount);
         bb.putInt(payloadLen);
         bb.put(msgKind);
         bb.putLong(requestId);
         bb.put(body);
         return bb.array();
+    }
+
+    /**
+     * Continuation RESULT_BATCH ({@code batch_seq == 1}): one row against the
+     * schema of {@link #firstBatch}.
+     */
+    private static byte[] nextBatch(long requestId) {
+        ByteArrayOutputStream body = new ByteArrayOutputStream();
+        putVarint(body, 1);       // batch_seq
+        putVarint(body, 0);       // table name length
+        putVarint(body, 1);       // row_count
+        putVarcharCell(body, "b");
+        return frame(QwpEgressMsgKind.RESULT_BATCH, requestId, 1, body.toByteArray());
+    }
+
+    private static void putVarcharCell(ByteArrayOutputStream body, String value) {
+        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
+        body.write(0);            // null_flag: no nulls
+        ByteBuffer offsets = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN);
+        offsets.putInt(0).putInt(bytes.length);
+        body.write(offsets.array(), 0, 8);
+        body.write(bytes, 0, bytes.length);
+    }
+
+    private static void putVarint(ByteArrayOutputStream out, long value) {
+        while ((value & ~0x7FL) != 0) {
+            out.write((int) ((value & 0x7F) | 0x80));
+            value >>>= 7;
+        }
+        out.write((int) value);
     }
 
     private static byte[] queryError(long requestId, byte status, String message) {
@@ -316,6 +484,29 @@ public class QueryTimeoutFacadeTest {
 
         @Override
         public void onError(byte status, String message) {
+        }
+    }
+
+    private static final class RecordingHandler implements QwpColumnBatchHandler {
+        final AtomicInteger batches = new AtomicInteger();
+        volatile boolean execDone;
+
+        @Override
+        public void onBatch(QwpColumnBatch batch) {
+            batches.incrementAndGet();
+        }
+
+        @Override
+        public void onEnd(long totalRows) {
+        }
+
+        @Override
+        public void onError(byte status, String message) {
+        }
+
+        @Override
+        public void onExecDone(short opType, long rowsAffected) {
+            execDone = true;
         }
     }
 

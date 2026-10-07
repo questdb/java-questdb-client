@@ -89,8 +89,9 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     // reads the fields synchronously in {@link #sendQueryRequest} and does not
     // retain a reference past that call. Reuse avoids a per-submit allocation
     // -- one in-flight query per client makes this safe: the worker that
-    // mutates pendingRequest is blocked on the events queue until the I/O
-    // thread has finished consuming the previous instance.
+    // mutates pendingRequest does not return from execute() before the I/O
+    // thread has encoded the previous instance, or it was withdrawn
+    // (withdrawRequest).
     private final QueryRequest pendingRequest = new QueryRequest();
     // Single-slot request queue (Phase-1 allows one in-flight query).
     private final BlockingQueue<QueryRequest> requests = new ArrayBlockingQueue<>(1);
@@ -113,6 +114,8 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     private volatile boolean closed;
     private boolean creditEnabled;
     private boolean currentQueryDone;
+    // Query being served. Stamped on the events of that query (QueryEvent.requestId);
+    // connection-level events stay at QueryEvent.ANY_REQUEST.
     private long currentRequestId = -1L;
     // requestId of the last QUERY_REQUEST fully encoded into sendScratch. Once a
     // request's id is published here the I/O thread no longer reads the caller's
@@ -299,9 +302,11 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     /**
      * Queues a CANCEL frame for {@code requestId} to be sent by the I/O thread
      * between the next two {@code receiveFrame} iterations (typically within
-     * {@link #POLL_TIMEOUT_MS}). Safe to call from any thread. If a CANCEL for
-     * the same (or another) requestId is already pending, the newer id wins --
-     * multiple concurrent cancels coalesce into one send.
+     * {@link #POLL_TIMEOUT_MS}) once it serves that query. Safe to call from any
+     * thread. If a CANCEL for the same (or another) requestId is already pending,
+     * the newer id wins -- multiple concurrent cancels coalesce into one send.
+     * See {@link #drainPendingCancel()} for a cancel of a query that has not been
+     * sent yet, or has already ended.
      */
     public void requestCancel(long requestId) {
         pendingCancelRequestId.set(requestId);
@@ -436,6 +441,18 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     }
 
     /**
+     * Takes back the request {@code requestId} that {@link #submitQuery} queued,
+     * provided this thread has not picked it up yet. Returns {@code true} when it
+     * was still queued: it is never sent, and the caller may reuse its SQL text
+     * and bind payload at once. Returns {@code false} when this thread has it;
+     * it reads them until {@link #isRequestEncoded} holds. Removal and pick-up
+     * are atomic with respect to each other.
+     */
+    public boolean withdrawRequest(long requestId) {
+        return pendingRequest.requestId == requestId && requests.remove(pendingRequest);
+    }
+
+    /**
      * Takes a pre-allocated {@link QueryEvent} from the pool for the I/O thread
      * to populate before offering to {@link #events}. Falls back to a fresh
      * allocation if the pool is momentarily empty -- under normal flow the pool
@@ -452,8 +469,7 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     }
 
     private void decodeAndEmitError(long payload, int payloadLen) {
-        QueryEvent ev = decodeError(payload, payloadLen);
-        events.offer(ev);
+        events.offer(decodeError(payload, payloadLen).forRequest(currentRequestId));
     }
 
     /**
@@ -492,7 +508,7 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
             emitTerminalTransportError("EXEC_DONE frame truncated mid rows_affected varint");
             return;
         }
-        events.offer(new QueryEvent().asExecDone(opType, rowsAffected));
+        events.offer(new QueryEvent().asExecDone(opType, rowsAffected).forRequest(currentRequestId));
     }
 
     /**
@@ -549,7 +565,7 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
             emitTerminalTransportError("RESULT_END frame truncated mid total_rows varint");
             return;
         }
-        events.offer(new QueryEvent().asEnd(total));
+        events.offer(new QueryEvent().asEnd(total).forRequest(currentRequestId));
     }
 
     /**
@@ -557,10 +573,22 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
      * thread at every loop boundary so a cancel set by a user thread reaches
      * the server regardless of whether the I/O thread was waiting on a frame
      * or on a free buffer.
+     * <p>
+     * Only a cancel of the query being served goes out. One for a later query
+     * stays pending: the user thread can queue that query, and cancel it, while
+     * this thread still works through an earlier query whose {@code execute()}
+     * stopped waiting for it. Sent now, the CANCEL would reach the server before
+     * the query does, and the server drops a cancel of a query it does not know.
+     * One for an earlier query, which has already ended, is dropped. Request ids
+     * only grow, so comparing them tells the three apart.
      */
     private void drainPendingCancel() {
-        long id = pendingCancelRequestId.getAndSet(-1L);
-        if (id >= 0L) {
+        long id = pendingCancelRequestId.get();
+        if (id < 0L || id > currentRequestId) {
+            return;
+        }
+        // The CAS keeps a cancel the user thread set meanwhile, which is newer.
+        if (pendingCancelRequestId.compareAndSet(id, -1L) && id == currentRequestId) {
             sendCancel(id);
         }
     }
@@ -659,7 +687,7 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
             currentQueryDone = true;
             return;
         }
-        events.offer(borrowEvent().asBatch(buf));
+        events.offer(borrowEvent().asBatch(buf).forRequest(currentRequestId));
         // Park on the release latch. Returning sooner would let receiveFrame
         // compact the WebSocket recv buffer, overwriting the bytes that the
         // user-visible column pointers still reference. User thread's
@@ -808,9 +836,10 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     /**
      * Mutable request holder reused across submits. Safe to reuse because at
      * most one query is in flight per client: the worker thread mutates fields
-     * and offers the instance into {@link #requests}, then blocks on the events
-     * queue until the I/O thread has fully consumed the previous instance and
-     * delivered a terminal event.
+     * and offers the instance into {@link #requests}, and does not return from
+     * {@code execute()} before this thread has encoded the instance (see
+     * {@link #isRequestEncoded}) or the worker withdrew it
+     * ({@link #withdrawRequest}).
      */
     private static final class QueryRequest {
         int bindCount;

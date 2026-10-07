@@ -39,6 +39,7 @@ import org.junit.Test;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -47,10 +48,12 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
@@ -64,7 +67,9 @@ import java.util.concurrent.atomic.AtomicInteger;
  * central promise of the feature: a timed-out query ends gracefully -- reported
  * as {@link QwpConstants#STATUS_QUERY_TIMEOUT} -- on a connection that stays
  * open and authenticated for the next query. Only a connection that does not
- * answer at all is replaced.
+ * answer at all is replaced. The same holds for a query its caller abandons --
+ * the handler throws, or the thread is interrupted -- before the query ends: the
+ * next query never sees the abandoned one's leftovers.
  * <p>
  * The server-side enforcement (breaker timeout, status mapping) is covered
  * against a live server in the questdb repository.
@@ -161,6 +166,52 @@ public class QwpQueryClientQueryTimeoutTest {
     }
 
     @Test(timeout = 30_000)
+    public void testCancelOfAQueryQueuedBehindLeftoversIsNotLost() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final Set<Long> received = ConcurrentHashMap.newKeySet();
+            ScriptedServer script = new ScriptedServer();
+            script.onQuery = (s, c, frame, n) -> {
+                long id = requestIdOf(frame);
+                if (n == 1) {
+                    send(c, firstBatch(id, "a"));
+                    // The rest arrives after the handler has thrown.
+                    s.sendLater(c, 300, nextBatch(id, 1, "b"), resultEnd(id, 2));
+                } else {
+                    // Held: only a CANCEL ends it.
+                    received.add(id);
+                }
+            };
+            // Like a real server, ignores a cancel of a query it has not received.
+            script.onCancel = (s, c, frame, n) -> {
+                long id = requestIdOf(frame);
+                if (received.contains(id)) {
+                    s.replyOnce(c, id, 0, queryError(id, QwpConstants.STATUS_CANCELLED, "cancelled by client"));
+                }
+            };
+            try (TestWebSocketServer server = startServer(script, CAPS_WITH_TIMEOUT);
+                 QwpQueryClient client = connect(server, "")) {
+                client.withQueryTimeoutGrace(500);
+                try {
+                    client.execute("SELECT s FROM t", null, failingOnBatch(new IllegalStateException("handler failed")), false, 0);
+                    Assert.fail("the handler's exception must propagate out of execute()");
+                } catch (IllegalStateException expected) {
+                    // the first query is abandoned, its rest still on the way
+                }
+
+                // Cancelled before it is sent: the I/O thread still works through the
+                // abandoned query, and must send the CANCEL only after this query.
+                RecordingHandler next = new RecordingHandler();
+                client.execute("SELECT s FROM t", binds -> client.cancel(), next, false, 2_000);
+                Assert.assertEquals("the cancel must reach the server after its query, got message=" + next.errorMessage,
+                        QwpConstants.STATUS_CANCELLED, next.errorStatus);
+                Assert.assertEquals("the abandoned query's rows must not reach the next query", 0, next.batches.get());
+            } finally {
+                script.close();
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testCompleteResultJustPastTheDeadlineIsASuccess() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             ScriptedServer script = new ScriptedServer();
@@ -213,6 +264,229 @@ public class QwpQueryClientQueryTimeoutTest {
                         firstTimeout > 9_000 && firstTimeout <= 10_000);
                 Assert.assertTrue("the replay must carry only the remaining budget, not a fresh one: "
                         + replayTimeout, replayTimeout > 0 && replayTimeout <= firstTimeout - 150);
+            } finally {
+                script.close();
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testInterruptReleasesTheCallerOnlyOnceItsRequestIsEncoded() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            ScriptedServer script = new ScriptedServer();
+            script.onQuery = (s, c, frame, n) -> send(c, execDone(requestIdOf(frame)));
+            try (TestWebSocketServer server = startServer(script, CAPS_WITH_TIMEOUT);
+                 QwpQueryClient client = connect(server, "")) {
+                // The I/O thread picks the request up, and stops inside its SQL text.
+                CountDownLatch reading = new CountDownLatch(1);
+                CountDownLatch release = new CountDownLatch(1);
+                CharSequence sql = new BlockingSql("INSERT INTO t VALUES (1)", reading, release);
+                RecordingHandler interrupted = new RecordingHandler();
+                Thread caller = new Thread(() -> client.execute(sql, null, interrupted, false, 0));
+                caller.start();
+                try {
+                    Assert.assertTrue("the I/O thread must start encoding the request", reading.await(5, TimeUnit.SECONDS));
+                    caller.interrupt();
+                    // The caller may change the SQL text once released, and the next
+                    // query reuses the bind buffer: not before the I/O thread is done.
+                    caller.join(300);
+                    Assert.assertTrue("execute() must wait for the I/O thread to finish reading the request",
+                            caller.isAlive());
+                } finally {
+                    release.countDown();
+                }
+                caller.join(5_000);
+                Assert.assertFalse("execute() must return once the request is encoded", caller.isAlive());
+                Assert.assertEquals(WebSocketResponse.STATUS_INTERNAL_ERROR, interrupted.errorStatus);
+
+                RecordingHandler next = new RecordingHandler();
+                client.execute("INSERT INTO t VALUES (2)", null, next, false, 0);
+                Assert.assertTrue("the next statement must get its own reply", next.execDone);
+                Assert.assertEquals("the connection must be reused, not replaced", 1, server.handshakeCount());
+            } finally {
+                script.close();
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testInterruptWithAStuckIoThreadGivesUpTheConnection() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            ScriptedServer script = new ScriptedServer();
+            script.onQuery = (s, c, frame, n) -> send(c, execDone(requestIdOf(frame)));
+            try (TestWebSocketServer server = startServer(script, CAPS_WITH_TIMEOUT);
+                 QwpQueryClient client = connect(server, "")) {
+                final long shutdownJoinMs = 300;
+                setShutdownJoinMs(client, shutdownJoinMs);
+                // The I/O thread picks the request up, and stays inside its SQL text
+                // until it is interrupted: stuck.
+                CountDownLatch reading = new CountDownLatch(1);
+                CountDownLatch release = new CountDownLatch(1);
+                CharSequence sql = new BlockingSql("INSERT INTO t VALUES (1)", reading, release);
+                RecordingHandler interrupted = new RecordingHandler();
+                Thread caller = new Thread(() -> client.execute(sql, null, interrupted, false, 0));
+                caller.start();
+                long elapsed;
+                try {
+                    Assert.assertTrue("the I/O thread must start encoding the request", reading.await(5, TimeUnit.SECONDS));
+                    long start = System.nanoTime();
+                    caller.interrupt();
+                    caller.join(10_000);
+                    elapsed = elapsedMs(start);
+                } finally {
+                    release.countDown();
+                }
+                Assert.assertFalse("execute() must return", caller.isAlive());
+                Assert.assertEquals(WebSocketResponse.STATUS_INTERNAL_ERROR, interrupted.errorStatus);
+                Assert.assertTrue("execute() must first wait for the I/O thread, returned after " + elapsed + "ms",
+                        elapsed >= shutdownJoinMs);
+                Assert.assertTrue("a connection whose I/O thread is stuck must be given up", client.hasTerminalFailure());
+
+                // failover=on (the default) replaces the connection for the next query.
+                RecordingHandler next = new RecordingHandler();
+                client.execute("INSERT INTO t VALUES (2)", null, next, false, 0);
+                Assert.assertTrue("the next statement must get its own reply", next.execDone);
+                Assert.assertEquals("a replacement connection must have been opened", 2, server.handshakeCount());
+            } finally {
+                script.close();
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testInterruptedQueryDoesNotAnswerTheNextQuery() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            ScriptedServer script = new ScriptedServer();
+            script.onQuery = (s, c, frame, n) -> {
+                long id = requestIdOf(frame);
+                if (n == 1) {
+                    // Answers only after its caller has stopped waiting.
+                    s.sendLater(c, 500, firstBatch(id, "late"), resultEnd(id, 1));
+                } else {
+                    send(c, execDone(id));
+                }
+            };
+            try (TestWebSocketServer server = startServer(script, CAPS_WITH_TIMEOUT);
+                 QwpQueryClient client = connect(server, "")) {
+                RecordingHandler first = new RecordingHandler();
+                Thread caller = new Thread(() -> client.execute("SELECT s FROM t", null, first, false, 0));
+                caller.start();
+                long firstId = requestIdOf(script.queries.take());
+                caller.interrupt();
+                caller.join(5_000);
+                Assert.assertFalse("execute() must return when its thread is interrupted", caller.isAlive());
+                Assert.assertEquals(WebSocketResponse.STATUS_INTERNAL_ERROR, first.errorStatus);
+                byte[] cancel = script.cancels.poll(5, TimeUnit.SECONDS);
+                Assert.assertNotNull("the abandoned query must be cancelled", cancel);
+                Assert.assertEquals(firstId, requestIdOf(cancel));
+
+                RecordingHandler next = new RecordingHandler();
+                client.execute("INSERT INTO t VALUES (1)", null, next, false, 0);
+                Assert.assertTrue("the next statement must get its own reply, got status=" + next.errorStatus
+                        + ", message=" + next.errorMessage, next.execDone);
+                Assert.assertEquals("the abandoned query's rows must not reach the next statement", 0, next.batches.get());
+                Assert.assertEquals("the connection must be reused, not replaced", 1, server.handshakeCount());
+            } finally {
+                script.close();
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testInterruptedQueryNotYetSentIsWithdrawn() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            ScriptedServer script = new ScriptedServer();
+            script.onQuery = (s, c, frame, n) -> {
+                long id = requestIdOf(frame);
+                if (n == 1) {
+                    send(c, firstBatch(id, "a"));
+                    // The rest arrives late; until then the I/O thread does not pick up
+                    // the next request.
+                    s.sendLater(c, 500, nextBatch(id, 1, "b"), resultEnd(id, 2));
+                } else {
+                    send(c, execDone(id));
+                }
+            };
+            try (TestWebSocketServer server = startServer(script, CAPS_WITH_TIMEOUT);
+                 QwpQueryClient client = connect(server, "")) {
+                try {
+                    client.execute("SELECT s FROM t", null, failingOnBatch(new IllegalStateException("handler failed")), false, 0);
+                    Assert.fail("the handler's exception must propagate out of execute()");
+                } catch (IllegalStateException expected) {
+                    // the first query is abandoned, its rest still on the way
+                }
+
+                // Queued behind the abandoned query's leftovers, and interrupted there.
+                RecordingHandler interrupted = new RecordingHandler();
+                Thread caller = new Thread(() -> client.execute("INSERT INTO t VALUES (2)", null, interrupted, false, 0));
+                caller.start();
+                awaitParked(caller);
+                caller.interrupt();
+                caller.join(5_000);
+                Assert.assertFalse("execute() must return when its thread is interrupted", caller.isAlive());
+                Assert.assertEquals(WebSocketResponse.STATUS_INTERNAL_ERROR, interrupted.errorStatus);
+
+                RecordingHandler next = new RecordingHandler();
+                client.execute("INSERT INTO t VALUES (3)", null, next, false, 0);
+                Assert.assertTrue("the next statement must get its own reply", next.execDone);
+                RecordingHandler last = new RecordingHandler();
+                client.execute("INSERT INTO t VALUES (4)", null, last, false, 0);
+                Assert.assertTrue("the last statement must get its own reply", last.execDone);
+
+                // The interrupted statement, withdrawn before it was sent, never reaches
+                // the server; every other statement reaches it exactly once.
+                List<String> received = new ArrayList<>();
+                for (byte[] frame : script.queries) {
+                    received.add(sqlOf(frame));
+                }
+                Assert.assertEquals(Arrays.asList("SELECT s FROM t", "INSERT INTO t VALUES (3)", "INSERT INTO t VALUES (4)"),
+                        received);
+            } finally {
+                script.close();
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testLeftoversOfAnAbandonedQueryDoNotPostponeTheNextTimeout() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final long timeoutMs = 100;
+            final long graceMs = 200;
+            ScriptedServer script = new ScriptedServer();
+            script.onQuery = (s, c, frame, n) -> {
+                long id = requestIdOf(frame);
+                if (n == 1) {
+                    send(c, firstBatch(id, "a"));
+                    // Streams on, ignoring the CANCEL, for 3 seconds: far past the
+                    // next query's deadline and grace period.
+                    for (int i = 1; i <= 150; i++) {
+                        s.sendLater(c, 20L * i, nextBatch(id, i, "b"));
+                    }
+                } else {
+                    send(c, execDone(id));
+                }
+            };
+            try (TestWebSocketServer server = startServer(script, CAPS_WITH_TIMEOUT);
+                 QwpQueryClient client = connect(server, "")) {
+                client.withQueryTimeoutGrace(graceMs);
+                try {
+                    client.execute("SELECT s FROM t", null, failingOnBatch(new IllegalStateException("handler failed")), false, 0);
+                    Assert.fail("the handler's exception must propagate out of execute()");
+                } catch (IllegalStateException expected) {
+                    // the first query is abandoned and keeps streaming
+                }
+
+                RecordingHandler next = new RecordingHandler();
+                long start = System.nanoTime();
+                client.execute("INSERT INTO t VALUES (1)", null, next, false, timeoutMs);
+                long elapsed = elapsedMs(start);
+
+                next.assertTimedOut();
+                Assert.assertEquals("the abandoned query's rows must not reach the next statement", 0, next.batches.get());
+                Assert.assertTrue("the leftovers must not postpone the timeout, took " + elapsed + "ms",
+                        elapsed < 1_500);
+                Assert.assertTrue("a connection still busy with the abandoned query is given up",
+                        client.hasTerminalFailure());
             } finally {
                 script.close();
             }
@@ -357,6 +631,159 @@ public class QwpQueryClientQueryTimeoutTest {
                 client.execute("INSERT INTO t VALUES (1)", null, next, false, 0);
                 Assert.assertTrue(next.execDone);
                 Assert.assertEquals("the authenticated connection must be reused", 1, server.handshakeCount());
+            } finally {
+                script.close();
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testThrowingBatchHandlerDoesNotLeakRowsIntoTheNextQuery() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            ScriptedServer script = new ScriptedServer();
+            script.onQuery = (s, c, frame, n) -> {
+                long id = requestIdOf(frame);
+                if (n == 1) {
+                    send(c, firstBatch(id, "a"));
+                    // The rest of the result arrives after the handler has thrown.
+                    s.sendLater(c, 300, nextBatch(id, 1, "b"), resultEnd(id, 2));
+                } else {
+                    send(c, execDone(id));
+                }
+            };
+            try (TestWebSocketServer server = startServer(script, CAPS_WITH_TIMEOUT);
+                 QwpQueryClient client = connect(server, "")) {
+                final IllegalStateException failure = new IllegalStateException("handler failed");
+                try {
+                    client.execute("SELECT s FROM t", null, failingOnBatch(failure), false, 0);
+                    Assert.fail("the handler's exception must propagate out of execute()");
+                } catch (IllegalStateException e) {
+                    Assert.assertSame(failure, e);
+                }
+                long firstId = requestIdOf(script.queries.take());
+                byte[] cancel = script.cancels.poll(5, TimeUnit.SECONDS);
+                Assert.assertNotNull("the abandoned query must be cancelled", cancel);
+                Assert.assertEquals(firstId, requestIdOf(cancel));
+
+                RecordingHandler next = new RecordingHandler();
+                client.execute("INSERT INTO t VALUES (1)", null, next, false, 0);
+                Assert.assertEquals("the abandoned query's rows must not reach the next statement", 0, next.batches.get());
+                Assert.assertTrue("the next statement must get its own reply, got status=" + next.errorStatus
+                        + ", message=" + next.errorMessage, next.execDone);
+                Assert.assertFalse(next.ended);
+                Assert.assertEquals("the connection must be reused, not replaced", 1, server.handshakeCount());
+            } finally {
+                script.close();
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testThrowingHandlerIsRethrownWhenTheConnectionIsGivenUp() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final long timeoutMs = 100;
+            final long graceMs = 200;
+            ScriptedServer script = new ScriptedServer();
+            script.onQuery = (s, c, frame, n) -> {
+                if (n > 1) {
+                    send(c, execDone(requestIdOf(frame)));
+                }
+                // n == 1: never answered, not even after a CANCEL.
+            };
+            try (TestWebSocketServer server = startServer(script, CAPS_WITH_TIMEOUT);
+                 QwpQueryClient client = connect(server, "")) {
+                client.withQueryTimeoutGrace(graceMs);
+                // An Error, not an exception: the handler's throwable must come back as is.
+                final Error failure = new Error("handler failed");
+                QwpColumnBatchHandler throwing = new QwpColumnBatchHandler() {
+                    @Override
+                    public void onBatch(QwpColumnBatch batch) {
+                    }
+
+                    @Override
+                    public void onEnd(long totalRows) {
+                    }
+
+                    @Override
+                    public void onError(byte status, String message) {
+                        throw failure;
+                    }
+                };
+                Throwable thrown = null;
+                long start = System.nanoTime();
+                try {
+                    client.execute("SELECT slow()", null, throwing, false, timeoutMs);
+                } catch (Throwable t) {
+                    thrown = t;
+                }
+                long elapsed = elapsedMs(start);
+
+                Assert.assertSame("the handler's throwable must propagate unwrapped", failure, thrown);
+                Assert.assertTrue("execute() must give up on the connection before rethrowing, took " + elapsed + "ms",
+                        elapsed >= timeoutMs + 2 * graceMs);
+                Assert.assertTrue("a silent connection must be marked failed", client.hasTerminalFailure());
+
+                RecordingHandler next = new RecordingHandler();
+                client.execute("INSERT INTO t VALUES (1)", null, next, false, 0);
+                Assert.assertTrue(next.execDone);
+                Assert.assertEquals("a replacement connection must have been opened", 2, server.handshakeCount());
+            } finally {
+                script.close();
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testThrowingHandlerStillDrainsTheTimedOutQuery() throws Exception {
+        // The handler contract lets any callback throw and keeps the connection
+        // usable. At the end of the grace period onError fires while the aborted
+        // query is still running, so a throw there must not skip the drain:
+        // otherwise the aborted query's late reply answers the next query.
+        TestUtils.assertMemoryLeak(() -> {
+            final long timeoutMs = 100;
+            final long graceMs = 1_000;
+            ScriptedServer script = new ScriptedServer();
+            script.onQuery = (s, c, frame, n) -> {
+                long id = requestIdOf(frame);
+                if (n == 1) {
+                    // Ends the query halfway through the second grace period: after the
+                    // handler is told about the timeout, before the connection is given up.
+                    s.sendLater(c, timeoutMs + graceMs + graceMs / 2,
+                            queryError(id, QwpConstants.STATUS_QUERY_TIMEOUT, "timeout, query aborted"));
+                } else {
+                    send(c, execDone(id));
+                }
+            };
+            try (TestWebSocketServer server = startServer(script, CAPS_WITH_TIMEOUT);
+                 QwpQueryClient client = connect(server, "")) {
+                client.withQueryTimeoutGrace(graceMs);
+                QwpColumnBatchHandler throwing = new QwpColumnBatchHandler() {
+                    @Override
+                    public void onBatch(QwpColumnBatch batch) {
+                    }
+
+                    @Override
+                    public void onEnd(long totalRows) {
+                    }
+
+                    @Override
+                    public void onError(byte status, String message) {
+                        throw new IllegalStateException(message);
+                    }
+                };
+                try {
+                    client.execute("SELECT slow()", null, throwing, false, timeoutMs);
+                    Assert.fail("the handler's exception must propagate out of execute()");
+                } catch (IllegalStateException e) {
+                    Assert.assertTrue("the handler must throw at the end of the grace period, while the query "
+                            + "is still running: " + e.getMessage(), e.getMessage().contains("grace period"));
+                }
+
+                RecordingHandler next = new RecordingHandler();
+                client.execute("INSERT INTO t VALUES (1)", null, next, false, 0);
+                Assert.assertTrue("the next statement must get its own reply, not the aborted query's: status="
+                        + next.errorStatus + ", message=" + next.errorMessage, next.execDone);
+                Assert.assertEquals("the drained connection must be reused", 1, server.handshakeCount());
             } finally {
                 script.close();
             }
@@ -512,6 +939,18 @@ public class QwpQueryClientQueryTimeoutTest {
         });
     }
 
+    /**
+     * Waits until {@code thread} blocks, here: parked waiting for its query's
+     * events, with the request queued.
+     */
+    private static void awaitParked(Thread thread) throws InterruptedException {
+        final long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (thread.getState() != Thread.State.WAITING && thread.getState() != Thread.State.TIMED_WAITING) {
+            Assert.assertTrue("the thread must block", System.nanoTime() - deadlineNanos < 0);
+            Thread.sleep(1);
+        }
+    }
+
     private static byte[] closeFrame() {
         // Marker understood by ScriptedServer's send(): close the connection.
         return new byte[0];
@@ -535,6 +974,23 @@ public class QwpQueryClientQueryTimeoutTest {
 
     private static byte[] execDone(long requestId) {
         return serverFrame(QwpEgressMsgKind.EXEC_DONE, requestId, 0, new byte[]{0, 0}); // op_type, rows_affected
+    }
+
+    private static QwpColumnBatchHandler failingOnBatch(RuntimeException failure) {
+        return new QwpColumnBatchHandler() {
+            @Override
+            public void onBatch(QwpColumnBatch batch) {
+                throw failure;
+            }
+
+            @Override
+            public void onEnd(long totalRows) {
+            }
+
+            @Override
+            public void onError(byte status, String message) {
+            }
+        };
     }
 
     /**
@@ -641,6 +1097,21 @@ public class QwpQueryClientQueryTimeoutTest {
         return bb.array();
     }
 
+    private static void setShutdownJoinMs(QwpQueryClient client, long millis) throws Exception {
+        Field field = QwpQueryClient.class.getDeclaredField("shutdownJoinMs");
+        field.setAccessible(true);
+        field.setLong(client, millis);
+    }
+
+    /**
+     * The SQL text of a captured {@code QUERY_REQUEST}.
+     */
+    private static String sqlOf(byte[] queryRequest) {
+        int[] p = {1 + 8};
+        int len = (int) readVarint(queryRequest, p);
+        return new String(queryRequest, p[0], len, StandardCharsets.UTF_8);
+    }
+
     private static TestWebSocketServer startServer(ScriptedServer script, int capabilities) throws Exception {
         TestWebSocketServer server = new TestWebSocketServer(script);
         server.setSendServerInfo(true);
@@ -723,6 +1194,51 @@ public class QwpQueryClientQueryTimeoutTest {
 
         int port() {
             return socket.getLocalPort();
+        }
+    }
+
+    /**
+     * SQL text that holds up whoever reads its first character -- the I/O
+     * thread, which reads it while encoding the request -- until released or
+     * interrupted.
+     */
+    private static final class BlockingSql implements CharSequence {
+        private final CountDownLatch reading;
+        private final CountDownLatch release;
+        private final String text;
+
+        BlockingSql(String text, CountDownLatch reading, CountDownLatch release) {
+            this.text = text;
+            this.reading = reading;
+            this.release = release;
+        }
+
+        @Override
+        public char charAt(int index) {
+            if (index == 0) {
+                reading.countDown();
+                try {
+                    release.await(10, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            return text.charAt(index);
+        }
+
+        @Override
+        public int length() {
+            return text.length();
+        }
+
+        @Override
+        public CharSequence subSequence(int start, int end) {
+            return text.subSequence(start, end);
+        }
+
+        @Override
+        public String toString() {
+            return text;
         }
     }
 
