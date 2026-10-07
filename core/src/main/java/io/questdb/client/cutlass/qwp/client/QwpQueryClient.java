@@ -1719,6 +1719,13 @@ public class QwpQueryClient implements QuietCloseable {
                 return;
             }
             if (attempt >= failoverMaxAttempts || System.nanoTime() - failoverDeadlineNanos >= 0) {
+                // The connection is dead: its generation latched the transport failure, so no later query runs on
+                // it. Record the loss, as the exits below do. With a single attempt per execute(), every later
+                // execute() ends here on that same latch and never reconnects: terminal, as with failover off.
+                healthTracker.connectionLost();
+                if (failoverMaxAttempts <= 1) {
+                    healthTracker.failed();
+                }
                 int failovers = Math.max(0, attempt - 1);
                 handler.onError(probe.interceptedRequestId, probe.interceptedStatus,
                         "transport failure after " + attempt + " execute attempt"
