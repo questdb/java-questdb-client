@@ -1314,8 +1314,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * successful upgrade resets it; failures of other classes neither reset nor fire it. Applies while the
          * sender is established and during an {@code async} initial connect; orphan drains are unaffected. When
          * it fires, the error names the failure class and the elapsed time, goes to the error handler as
-         * terminal, and is thrown from later producer calls; unacknowledged rows stay in on-disk
-         * store-and-forward for a later sender or an orphan drain. WebSocket transport only. Connect-string key:
+         * terminal, and is thrown from later producer calls. With {@code sf_dir} set, unacknowledged rows stay
+         * in on-disk store-and-forward for a later sender or an orphan drain; in memory-only mode (no
+         * {@code sf_dir}) they are lost when the sender closes. WebSocket transport only. Connect-string key:
          * {@code auth_failure_max_duration_millis}.
          *
          * @param millis the deadline, {@code > 0}

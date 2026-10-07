@@ -2174,8 +2174,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * when a connect round of a FOREGROUND loop fails with an authentication-class failure ({@code failure} is a
      * credential-unavailable or a 401/403 rejection). Starts the outage clock on the first such failure; when a
      * deadline is armed and the clock has reached it, latches a terminal that names the failure class and the
-     * elapsed time, reports it to the error handler, and returns true. Unacknowledged rows stay in
-     * store-and-forward.
+     * elapsed time, reports it to the error handler, and returns true. Unacknowledged rows stay in on-disk
+     * store-and-forward when the engine has an sf_dir; in memory mode they are lost when the sender closes.
      */
     private boolean authOutageDeadlineFired(Throwable failure) {
         if (reconnectPolicy != ReconnectPolicy.FOREGROUND) {
@@ -2196,7 +2196,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         final String message = "authentication outage deadline exceeded: " + failureClass + " persisted for "
                 + elapsedMillis + "ms (auth_failure_max_duration_millis="
                 + TimeUnit.NANOSECONDS.toMillis(deadline) + "); last failure: " + failure.getMessage();
-        LOG.error("{} -- the sender stops; unacknowledged rows stay in store-and-forward", message);
+        // Name the rows' fate per backing (spec section 8.5): only an sf_dir slot outlives this sender; memory-mode
+        // segments are malloc'd and freed when the sender closes.
+        LOG.error("{} -- the sender stops; {}", message, engine.sfDir() != null
+                ? "unacknowledged rows stay in on-disk store-and-forward for a later sender or an orphan drain"
+                : "unacknowledged rows are lost when the sender closes (memory-only mode, no sf_dir)");
         long fromFsn = engine.ackedFsn() + 1L;
         long toFsn = Math.max(fromFsn, engine.publishedFsn());
         SenderError err = new SenderError(
