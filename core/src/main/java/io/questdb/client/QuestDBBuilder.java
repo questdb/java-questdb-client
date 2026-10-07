@@ -105,6 +105,12 @@ public final class QuestDBBuilder {
      * letting the pool grow a fresh one. Bounds the close of a handle whose
      * {@code submit()} is still running -- e.g. when the caller's own
      * {@code await(timeout)} expired and they gave up. Defaults to 5000ms.
+     * <p>
+     * Also the grace period of the query timeout ({@code query_timeout_ms},
+     * {@link Query#timeout(long, java.util.concurrent.TimeUnit)}): how long a
+     * timed-out query may take to end before the caller is released with the
+     * timeout anyway, and how long its connection may then take to drain the
+     * aborted query before it is closed instead of reused.
      */
     public QuestDBBuilder queryCloseTimeoutMillis(long millis) {
         if (millis < 0) {

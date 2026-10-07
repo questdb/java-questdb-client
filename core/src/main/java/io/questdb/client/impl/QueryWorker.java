@@ -28,6 +28,7 @@ import io.questdb.client.Query;
 import io.questdb.client.QueryException;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -51,6 +52,9 @@ public final class QueryWorker {
     static final long SHUTDOWN_JOIN_MILLIS = 5_000;
     private final QwpQueryClient client;
     private final long createdAtMillis;
+    // Signalled, under signalLock, whenever the worker becomes idle: a job's
+    // runOn() returned, or shutdown stranded the pending job. See awaitIdle().
+    private final Condition idleCondition;
     private final QueryClientPool pool;
     private final QueryImpl query;
     private final Condition signalCondition;
@@ -78,6 +82,10 @@ public final class QueryWorker {
     // thread observes the latest value without taking the pool lock.
     private volatile long generation;
     private volatile long idleSinceMillis;
+    // True while the dispatch thread runs a job's runOn(). Guarded by signalLock.
+    // Outlives the job's terminal callback: after a query timeout the caller is
+    // released while runOn() still drains the aborted query.
+    private boolean running;
     private volatile boolean shuttingDown;
 
     public QueryWorker(QwpQueryClient client, QueryClientPool pool, int slotIndex) {
@@ -85,10 +93,41 @@ public final class QueryWorker {
         this.pool = pool;
         this.query = new QueryImpl(this);
         this.signalCondition = signalLock.newCondition();
+        this.idleCondition = signalLock.newCondition();
         this.thread = new Thread(this::runLoop, "questdb-query-worker-" + slotIndex);
         this.thread.setDaemon(true);
         this.createdAtMillis = System.currentTimeMillis();
         this.idleSinceMillis = this.createdAtMillis;
+    }
+
+    /**
+     * Waits up to {@code timeoutMillis} for this worker to become idle: no job
+     * running and none pending. Used by {@link QueryImpl#close(long)} before
+     * returning the worker to the pool, because a job's terminal callback can
+     * precede the end of its {@code runOn()} -- after a query timeout the
+     * client keeps draining the aborted query so its connection stays
+     * reusable. Returns {@code false} on timeout or interrupt; an interrupt
+     * re-raises the caller's flag, like {@link QueryImpl}'s close drain.
+     */
+    boolean awaitIdle(long timeoutMillis) {
+        long remainingNanos = TimeUnit.MILLISECONDS.toNanos(Math.max(0L, timeoutMillis));
+        signalLock.lock();
+        try {
+            while (running || current != null) {
+                if (remainingNanos <= 0L) {
+                    return false;
+                }
+                try {
+                    remainingNanos = idleCondition.awaitNanos(remainingNanos);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+            }
+            return true;
+        } finally {
+            signalLock.unlock();
+        }
     }
 
     long createdAtMillis() {
@@ -139,6 +178,9 @@ public final class QueryWorker {
      * generation first. Lease code must use {@link #cancelInFlight(long)}.
      */
     void cancelInFlight() {
+        // Remembered on the lease too: a submission still waiting for this worker
+        // (behind a timed-out query being drained) has not reached the client yet.
+        query.requestCancel();
         try {
             client.cancel();
         } catch (RuntimeException ignored) {
@@ -317,6 +359,7 @@ public final class QueryWorker {
                     // caller so its Completion.await() does not hang.
                     QueryImpl stranded = current;
                     current = null;
+                    idleCondition.signalAll();
                     if (stranded != null) {
                         stranded.signalUnexpected(
                                 new QueryException((byte) 0, "QuestDB handle is closed"));
@@ -335,6 +378,7 @@ public final class QueryWorker {
                 // already-consumed signal, and park the worker forever while
                 // the user thread waits on a Completion that never fires.
                 current = null;
+                running = true;
             } finally {
                 signalLock.unlock();
             }
@@ -342,6 +386,13 @@ public final class QueryWorker {
                 q.runOn(client);
             } catch (Throwable t) {
                 q.signalUnexpected(t);
+            }
+            signalLock.lock();
+            try {
+                running = false;
+                idleCondition.signalAll();
+            } finally {
+                signalLock.unlock();
             }
             // Test-only barrier: deterministically reproduce the busy-worker
             // shutdown-drop race (df6f7ca) at its exact site. Null in production.

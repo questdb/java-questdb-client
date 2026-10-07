@@ -27,8 +27,10 @@ package io.questdb.client;
 import io.questdb.client.cutlass.qwp.client.QwpBindSetter;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
 import io.questdb.client.cutlass.qwp.client.QwpServerInfo;
+import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 
 import java.io.Closeable;
+import java.util.concurrent.TimeUnit;
 
 /**
  * A query handle leased from the {@link QuestDB} pool via
@@ -43,9 +45,9 @@ import java.io.Closeable;
  * creates one small lease handle per borrow (often scalar-replaced by the JIT
  * when used with try-with-resources).
  * <p>
- * Lifecycle: configure with {@link #sql}, optional {@link #binds}, and
- * {@link #handler}, then call {@link #submit()} to obtain a {@link Completion}
- * and {@code await()} it before the next {@link #submit()}.
+ * Lifecycle: configure with {@link #sql}, optional {@link #binds} and
+ * {@link #timeout}, and {@link #handler}, then call {@link #submit()} to obtain
+ * a {@link Completion} and {@code await()} it before the next {@link #submit()}.
  * <p>
  * Thread safety: not thread-safe and single-flight -- one in-flight query per
  * handle. To run queries concurrently, borrow one handle per concurrent query.
@@ -132,4 +134,40 @@ public interface Query extends Closeable {
      * before the first successful bind
      */
     QwpServerInfo serverInfo();
+
+    /**
+     * Sets the query timeout for subsequent {@link #submit()} calls on this
+     * handle, overriding the {@code query_timeout_ms} default from the
+     * connection string; {@code 0} runs queries without a timeout. It stays in
+     * effect until changed, and every borrow starts from the configured
+     * default.
+     * <p>
+     * The timeout is measured from {@code submit()} and bounds the whole query:
+     * server execution, any failover, and the time the handler spends in its
+     * callbacks (it is checked between result batches, so a handler blocked
+     * inside {@code onBatch} is not interrupted). When it expires, the query is
+     * stopped -- by the server when it supports per-query timeouts, otherwise by
+     * a client-side cancel -- no further result batch reaches the handler, the
+     * handler's {@code onError} receives
+     * {@link QwpConstants#STATUS_QUERY_TIMEOUT}, and {@link Completion#await()}
+     * throws a {@link QueryException} whose {@link QueryException#isTimeout()}
+     * is {@code true}. The pooled connection stays open and authenticated, and
+     * serves the next query.
+     * <p>
+     * Should the server not end the query within {@code query_close_timeout_ms}
+     * (see {@link QuestDBBuilder#queryCloseTimeoutMillis(long)}) of the timeout,
+     * the caller is released with the timeout anyway while the connection
+     * finishes draining the aborted query; only a connection that stays silent
+     * for that long once more is closed and replaced.
+     * <p>
+     * Unlike {@link Completion#await(long, TimeUnit)}, which only bounds how
+     * long the caller waits, the query timeout stops the query.
+     *
+     * @param timeout the timeout, {@code 0} for none; a positive value below
+     *                one millisecond counts as one millisecond
+     * @param unit    the unit of {@code timeout}
+     * @return this handle
+     * @throws IllegalArgumentException when {@code timeout} is negative
+     */
+    Query timeout(long timeout, TimeUnit unit);
 }

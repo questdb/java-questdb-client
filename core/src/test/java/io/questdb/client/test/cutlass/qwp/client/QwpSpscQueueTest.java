@@ -210,6 +210,75 @@ public class QwpSpscQueueTest {
     }
 
     @Test
+    public void testTimedTakeReturnsNullAtTheDeadline() throws InterruptedException {
+        QwpSpscQueue<String> q = new QwpSpscQueue<>(4);
+        long start = System.nanoTime();
+        Assert.assertNull("an empty queue must yield null once the deadline passes",
+                q.take(start + TimeUnit.MILLISECONDS.toNanos(100)));
+        long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+        Assert.assertTrue("timed take must wait until the deadline, waited " + elapsedMs + " ms", elapsedMs >= 100);
+        // The queue stays fully usable afterwards.
+        Assert.assertTrue(q.offer("after"));
+        Assert.assertEquals("after", q.take(System.nanoTime() + TimeUnit.SECONDS.toNanos(5)));
+    }
+
+    @Test
+    public void testTimedTakeWithPastDeadlineStillReturnsAvailableValue() throws InterruptedException {
+        QwpSpscQueue<String> q = new QwpSpscQueue<>(4);
+        long past = System.nanoTime() - TimeUnit.SECONDS.toNanos(1);
+        Assert.assertNull("a past deadline on an empty queue must not block", q.take(past));
+        Assert.assertTrue(q.offer("ready"));
+        Assert.assertEquals("a value already available is returned even past the deadline", "ready", q.take(past));
+    }
+
+    @Test
+    public void testTimedTakeWakesOnOfferBeforeTheDeadline() throws Exception {
+        QwpSpscQueue<String> q = new QwpSpscQueue<>(4);
+        AtomicReference<String> taken = new AtomicReference<>();
+        CountDownLatch done = new CountDownLatch(1);
+        Thread consumer = new Thread(() -> {
+            try {
+                taken.set(q.take(System.nanoTime() + TimeUnit.SECONDS.toNanos(30)));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } finally {
+                done.countDown();
+            }
+        }, "spsc-timed-consumer");
+        consumer.start();
+        // Past the spin window, so the consumer is parked in parkNanos.
+        Thread.sleep(100);
+        Assert.assertTrue(q.offer("delivered"));
+        Assert.assertTrue("the producer's offer must unpark a timed take", done.await(5, TimeUnit.SECONDS));
+        Assert.assertEquals("delivered", taken.get());
+        consumer.join(1_000);
+    }
+
+    @Test
+    public void testTimedTakeInterruptedThrows() throws Exception {
+        QwpSpscQueue<String> q = new QwpSpscQueue<>(4);
+        AtomicReference<Throwable> caught = new AtomicReference<>();
+        CountDownLatch done = new CountDownLatch(1);
+        Thread consumer = new Thread(() -> {
+            try {
+                q.take(System.nanoTime() + TimeUnit.SECONDS.toNanos(30));
+                caught.set(new AssertionError("expected InterruptedException"));
+            } catch (Throwable t) {
+                caught.set(t);
+            } finally {
+                done.countDown();
+            }
+        }, "spsc-timed-interrupt");
+        consumer.start();
+        Thread.sleep(100);
+        consumer.interrupt();
+        Assert.assertTrue(done.await(5, TimeUnit.SECONDS));
+        Assert.assertTrue("expected InterruptedException, got " + caught.get(),
+                caught.get() instanceof InterruptedException);
+        consumer.join(1_000);
+    }
+
+    @Test
     public void testCapacityOneIsRoundedToOne() {
         // Edge case: requesting capacity 1 still yields a power-of-two ring (1).
         QwpSpscQueue<String> q = new QwpSpscQueue<>(1);

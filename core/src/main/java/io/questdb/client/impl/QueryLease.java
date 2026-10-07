@@ -113,4 +113,10 @@ final class QueryLease implements Query, Completion {
     public QwpServerInfo serverInfo() {
         return impl.serverInfo(generation);
     }
+
+    @Override
+    public Query timeout(long timeout, TimeUnit unit) {
+        impl.setTimeout(generation, timeout, unit);
+        return this;
+    }
 }

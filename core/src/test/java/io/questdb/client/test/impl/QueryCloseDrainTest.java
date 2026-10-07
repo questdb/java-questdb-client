@@ -34,6 +34,8 @@ import org.junit.Test;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 
 /**
@@ -127,6 +129,65 @@ public class QueryCloseDrainTest {
         });
     }
 
+    @Test(timeout = 30_000)
+    public void testCloseDiscardsWorkerThatStaysBusy() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (QueryClientPool pool = new QueryClientPool(
+                    CFG, 0, 2, 1_000L, Long.MAX_VALUE, Long.MAX_VALUE, NO_CONNECT)) {
+                setCloseQueryTimeout(pool, 150L);
+                QueryWorker w = pool.acquire();
+                long gen = generation(w);
+                // done stays true (the caller has its outcome), but the worker never
+                // finishes the job -- a drain that outlives the close budget.
+                setRunning(w, true);
+
+                long startNanos = System.nanoTime();
+                closeQuery(w, gen);
+                long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000;
+
+                Assert.assertTrue("close() must wait about the close budget, elapsed=" + elapsedMs, elapsedMs >= 120);
+                Assert.assertFalse("a worker that is still busy must be discarded, not returned to the pool",
+                        allWorkers(pool).contains(w));
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testCloseWaitsForBusyWorkerToFinishBeforeReturningIt() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (QueryClientPool pool = new QueryClientPool(
+                    CFG, 0, 2, 1_000L, Long.MAX_VALUE, Long.MAX_VALUE, NO_CONNECT)) {
+                setCloseQueryTimeout(pool, 5_000L);
+                QueryWorker w = pool.acquire();
+                long gen = generation(w);
+                // done stays true, but the worker is still inside the job's runOn() --
+                // as after a query timeout, when it drains the aborted query after
+                // the caller has been released.
+                setRunning(w, true);
+                Thread finisher = new Thread(() -> {
+                    try {
+                        Thread.sleep(200);
+                        setRunning(w, false);
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                });
+                finisher.start();
+
+                long startNanos = System.nanoTime();
+                closeQuery(w, gen);
+                long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000;
+                finisher.join();
+
+                Assert.assertTrue("close() must wait for the job to finish, elapsed=" + elapsedMs, elapsedMs >= 150);
+                Assert.assertTrue("a worker that finished in time must be returned to the pool",
+                        allWorkers(pool).contains(w));
+                QueryWorker again = pool.acquire();
+                Assert.assertSame("the returned worker must be handed out again", w, again);
+            }
+        });
+    }
+
     @SuppressWarnings("unchecked")
     private static ArrayList<QueryWorker> allWorkers(QueryClientPool pool) throws Exception {
         Field f = QueryClientPool.class.getDeclaredField("all");
@@ -163,6 +224,25 @@ public class QueryCloseDrainTest {
         Field f = QueryClientPool.class.getDeclaredField("closeQueryTimeoutMillis");
         f.setAccessible(true);
         f.setLong(pool, millis);
+    }
+
+    // Sets the worker's running flag under its signalLock and wakes idle waiters,
+    // exactly as its run loop does around a job's runOn().
+    private static void setRunning(QueryWorker w, boolean running) throws Exception {
+        Field lockF = QueryWorker.class.getDeclaredField("signalLock");
+        Field runningF = QueryWorker.class.getDeclaredField("running");
+        Field idleF = QueryWorker.class.getDeclaredField("idleCondition");
+        lockF.setAccessible(true);
+        runningF.setAccessible(true);
+        idleF.setAccessible(true);
+        ReentrantLock lock = (ReentrantLock) lockF.get(w);
+        lock.lock();
+        try {
+            runningF.setBoolean(w, running);
+            ((Condition) idleF.get(w)).signalAll();
+        } finally {
+            lock.unlock();
+        }
     }
 
     private static void setDone(QueryWorker w, boolean done) throws Exception {

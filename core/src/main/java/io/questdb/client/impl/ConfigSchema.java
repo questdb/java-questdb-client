@@ -102,6 +102,7 @@ public final class ConfigSchema {
         longRange("failover_max_duration_ms", Side.EGRESS, 0, OPEN_MAX, false, false); // >= 0
         intRange("max_batch_rows", Side.EGRESS, 1, 1_048_576, false, false); // [1, 1048576]
         longRange("initial_credit", Side.EGRESS, 0, OPEN_MAX, false, false); // >= 0
+        longRange("query_timeout_ms", Side.EGRESS, 0, OPEN_MAX, false, false); // >= 0; 0 = no timeout
         intRange("buffer_pool_size", Side.EGRESS, 1, OPEN_MAX, false, false); // >= 1
         enumKey("compression", Side.EGRESS, "zstd", "raw", "auto");
         intRange("compression_level", Side.EGRESS, 1, 22, false, false); // [1, 22]
