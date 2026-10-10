@@ -147,7 +147,7 @@ public final class QwpWireTestUtils {
         throw new IllegalStateException("varint truncated");
     }
 
-    static int tableCount(byte[] frame) {
+    public static int tableCount(byte[] frame) {
         return (frame[6] & 0xFF) | ((frame[7] & 0xFF) << 8);
     }
 
