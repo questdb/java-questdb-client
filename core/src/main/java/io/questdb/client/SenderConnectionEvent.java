@@ -193,7 +193,9 @@ public final class SenderConnectionEvent {
 
         /**
          * The active wire connection dropped and the reconnect loop is about
-         * to start. Fired once per outage, before any retry attempts.
+         * to start. Fired once per outage, before any retry attempts. Not
+         * fired for the deliberate reconnect a symbol-dictionary recycle
+         * performs.
          */
         DISCONNECTED,
 
@@ -201,7 +203,9 @@ public final class SenderConnectionEvent {
          * A reconnect attempt succeeded against the same endpoint that was
          * previously active. Fired once per successful reconnect to the same
          * endpoint; {@link Kind#FAILED_OVER} is fired instead when the new
-         * endpoint differs.
+         * endpoint differs. Also fired — without a preceding
+         * {@link #DISCONNECTED} — for the reconnect that follows a
+         * symbol-dictionary recycle, which is deliberate, not an outage.
          */
         RECONNECTED,
 
