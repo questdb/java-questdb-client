@@ -976,7 +976,9 @@ public final class SegmentRing implements QuietCloseable {
      * server NACK with a bogus wireSeq cannot move {@code ackedFsn} past what
      * the producer has actually written. If we didn't clamp, the segment
      * manager could trim segments the I/O thread is still iterating and SEGV
-     * the JVM on the next {@code Unsafe.getInt} of an unmapped region.
+     * the JVM on the next {@code Unsafe.getInt} of an unmapped region. The
+     * clamp never drops a legitimate ACK: {@link #appendOrFsn} publishes a
+     * frame's FSN before the I/O thread can see, and send, the frame.
      *
      * @return {@code true} if the watermark advanced, {@code false} on
      *         no-op (idempotent re-ack or clamped). Callers wishing to fire
@@ -1009,8 +1011,9 @@ public final class SegmentRing implements QuietCloseable {
      */
     public long appendOrFsn(long payloadAddr, int payloadLen) {
         checkDurability();
-        long offset = active.tryAppend(payloadAddr, payloadLen);
-        if (offset == -1L) {
+        MmapSegment target = active;
+        boolean rotated = false;
+        if (target.tryWrite(payloadAddr, payloadLen) == -1L) {
             // Active is full. Try to rotate.
             MmapSegment spare = hotSpare;
             if (spare == null) {
@@ -1020,7 +1023,7 @@ public final class SegmentRing implements QuietCloseable {
             // range durable before the manifest can name its successor. The
             // manager performs the barrier; the producer uses the existing
             // backpressure path while it waits.
-            MmapSegment previous = active;
+            MmapSegment previous = target;
             if (requestSyncBeforeRotation(previous)) {
                 wakeManager();
                 return BACKPRESSURE_NO_SPARE;
@@ -1083,25 +1086,38 @@ public final class SegmentRing implements QuietCloseable {
             if (wakeup != null) {
                 wakeup.run();
             }
-            offset = active.tryAppend(payloadAddr, payloadLen);
-            if (offset == -1L) {
+            target = spare;
+            if (target.tryWrite(payloadAddr, payloadLen) == -1L) {
                 // Doesn't fit even in a fresh segment -- payload is genuinely too big.
                 return PAYLOAD_TOO_LARGE;
             }
-        } else if (!wakeupRequestedForActive
+            rotated = true;
+        }
+        long fsn = nextSeq++;
+        // The frame is fully written but not yet visible to the I/O thread.
+        // Publish its FSN first and its bytes second. The I/O thread sends a
+        // frame the moment it lies below publishedOffset(), and the server can
+        // ACK it before this method returns; acknowledge() clamps at
+        // publishedFsn, so an FSN published after the bytes could clamp that
+        // ACK away. Server ACKs are cumulative and nothing re-delivers a lost
+        // one, so losing the last frame's ACK would stall close() and drain()
+        // until their timeouts. publishedFsn may run one frame ahead of
+        // publishedOffset() for an instant, but never behind it.
+        publishedFsn = fsn;
+        target.publishWritten();
+        if (!rotated
+                && !wakeupRequestedForActive
                 && hotSpare == null
                 && managerWakeup != null
-                && active.publishedOffset() >= signalAtBytes) {
+                && target.publishedOffset() >= signalAtBytes) {
             // Backup signal: we're past the high-water mark and still don't
             // have a spare (manager hasn't caught up yet, or this is the very
             // first active and rotation hasn't fired the on-rotation wakeup).
-            // Fire once per active segment.
+            // Fire once per active segment, after the frame is fully published
+            // so the wakeup never delays its send.
             wakeupRequestedForActive = true;
             managerWakeup.run();
         }
-        long fsn = nextSeq++;
-        // publishedFsn last so the I/O thread never observes a half-written frame.
-        publishedFsn = fsn;
         return fsn;
     }
 
@@ -1470,9 +1486,12 @@ public final class SegmentRing implements QuietCloseable {
     }
 
     /**
-     * Highest FSN whose frame is fully written and visible to consumers (the
-     * I/O thread). Returns -1 when nothing has been appended yet. Volatile
-     * read; safe to call from any thread.
+     * Highest FSN whose frame is fully written. {@link #appendOrFsn} publishes it
+     * before the frame's bytes become visible below
+     * {@link MmapSegment#publishedOffset()}, so it covers every frame the I/O
+     * thread can send: it may run one frame ahead of the visible bytes for an
+     * instant, never behind them. Returns -1 when nothing has been appended yet.
+     * Volatile read; safe to call from any thread.
      */
     public long publishedFsn() {
         return publishedFsn;
