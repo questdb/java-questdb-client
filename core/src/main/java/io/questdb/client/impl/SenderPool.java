@@ -33,6 +33,7 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerListener;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentBudget;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLockContentionException;
@@ -70,6 +71,13 @@ import java.util.function.IntFunction;
  * pool tracks in-flight creations via {@code inFlightCreations} so the cap
  * check ({@code allSize + inFlightCreations + closingSlots + leakedSlots <
  * maxSize}) stays correct under concurrent borrows.
+ * <p>
+ * <b>Shared buffer budget.</b> Every WebSocket sender the pool builds charges
+ * its cursor segments -- unacknowledged data, in memory or under
+ * {@code sf_dir} -- to one {@link SegmentBudget} sized from the configured
+ * {@code sf_max_total_bytes}. That key therefore caps the pool as a whole:
+ * growing the pool adds connections, not buffer memory. The only overshoot is
+ * the minimum working set (two segments) each live sender is always granted.
  * <p>
  * <b>Store-and-forward slots.</b> When the configuration enables SF
  * ({@code sf_dir} set), every sender owns an exclusive on-disk slot
@@ -193,6 +201,10 @@ public final class SenderPool implements AutoCloseable {
     // enabled; null otherwise. Each pooled sender's slot id is
     // {@code slotBaseId + "-" + slotIndex}.
     private final String slotBaseId;
+    // The sf_max_total_bytes budget shared by every sender this pool builds,
+    // live and recovery delegates alike; null for non-WebSocket transports,
+    // which have no cursor ring.
+    private final SegmentBudget segmentBudget;
     // SF group root (sf_dir) when SF is enabled; null otherwise. Used to
     // locate this pool's own managed slot dirs <sfDir>/<slotBaseId>-<index>
     // for startup recovery of unacked data left by a previous run.
@@ -543,6 +555,8 @@ public final class SenderPool implements AutoCloseable {
             probe.httpTokenProvider(tokenProvider);
         }
         this.storeAndForward = probe.isStoreAndForwardEnabled();
+        long budgetBytes = probe.getResolvedSfMaxTotalBytes();
+        this.segmentBudget = budgetBytes > 0 ? new SegmentBudget(budgetBytes) : null;
         this.slotBaseId = this.storeAndForward ? probe.getConfiguredSenderId() : null;
         this.sfDir = this.storeAndForward ? probe.getConfiguredSfDir() : null;
         this.slotInUse = this.storeAndForward ? new boolean[maxSize] : null;
@@ -1389,6 +1403,11 @@ public final class SenderPool implements AutoCloseable {
     }
 
     @TestOnly
+    public SegmentBudget getSegmentBudgetForTesting() {
+        return segmentBudget;
+    }
+
+    @TestOnly
     public Thread getStartupRecoveryThreadForTesting() {
         return startupRecoveryThread;
     }
@@ -2043,6 +2062,10 @@ public final class SenderPool implements AutoCloseable {
         return builder;
     }
 
+    private Sender.LineSenderBuilder applySegmentBudget(Sender.LineSenderBuilder builder) {
+        return segmentBudget == null ? builder : builder.storeAndForwardSharedBudget(segmentBudget);
+    }
+
     private Sender.LineSenderBuilder applyTokenProvider(Sender.LineSenderBuilder builder) {
         if (tokenProvider != null) {
             builder.httpTokenProvider(tokenProvider);
@@ -2078,7 +2101,7 @@ public final class SenderPool implements AutoCloseable {
 
     private Sender buildManagedSlotSender(int slotIndex, boolean forRecovery) {
         if (!storeAndForward) {
-            return applyUserCallbacks(applyTokenProvider(Sender.builder(configurationString))).build();
+            return applyUserCallbacks(applyTokenProvider(applySegmentBudget(Sender.builder(configurationString)))).build();
         }
         // Give this pooled sender its own slot dir <sf_dir>/<base>-<index>
         // so concurrent SF senders sharing one sf_dir never collide on
@@ -2101,7 +2124,7 @@ public final class SenderPool implements AutoCloseable {
         // per-sender drainer is an additional path that only runs when
         // drain_orphans=on; foreign leftovers under other names are drained
         // only by that path.
-        Sender.LineSenderBuilder builder = Sender.builder(configurationString)
+        Sender.LineSenderBuilder builder = applySegmentBudget(Sender.builder(configurationString))
                 .senderId(slotBaseId + "-" + slotIndex)
                 .orphanDrainExcludeManagedSlots(slotBaseId, maxSize);
         if (forRecovery) {

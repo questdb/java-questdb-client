@@ -29,6 +29,7 @@ import io.questdb.client.cutlass.qwp.websocket.WebSocketOpcode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.InputStream;
@@ -366,6 +367,24 @@ public class TestWebSocketServer implements Closeable {
         return bb.array();
     }
 
+    private static void appendUnmaskedFrame(ByteArrayOutputStream frames, int opcode, byte[] payload) {
+        frames.write(0x80 | (opcode & 0x0F));
+        int length = payload.length;
+        if (length <= 125) {
+            frames.write(length);
+        } else if (length <= 65_535) {
+            frames.write(126);
+            frames.write((length >> 8) & 0xFF);
+            frames.write(length & 0xFF);
+        } else {
+            frames.write(127);
+            for (int shift = 56; shift >= 0; shift -= 8) {
+                frames.write((int) (((long) length >>> shift) & 0xFF));
+            }
+        }
+        frames.write(payload, 0, length);
+    }
+
     private static boolean isReadPath(String path) {
         return path != null && path.startsWith("/read");
     }
@@ -461,6 +480,25 @@ public class TestWebSocketServer implements Closeable {
 
         public synchronized void sendBinary(byte[] data) throws IOException {
             writeFrame(WebSocketOpcode.BINARY, data, data.length);
+        }
+
+        /**
+         * Writes a binary frame and then a close frame with one socket write,
+         * so the client reads the close right behind the binary frame -- the
+         * way a server answering its last frame on the way out flushes both.
+         */
+        public synchronized void sendBinaryThenClose(byte[] data, int code, String reason) throws IOException {
+            byte[] reasonBytes = (reason != null && !reason.isEmpty())
+                    ? reason.getBytes(StandardCharsets.UTF_8) : new byte[0];
+            byte[] closePayload = new byte[2 + reasonBytes.length];
+            closePayload[0] = (byte) ((code >> 8) & 0xFF);
+            closePayload[1] = (byte) (code & 0xFF);
+            System.arraycopy(reasonBytes, 0, closePayload, 2, reasonBytes.length);
+            ByteArrayOutputStream frames = new ByteArrayOutputStream(data.length + closePayload.length + 20);
+            appendUnmaskedFrame(frames, WebSocketOpcode.BINARY, data);
+            appendUnmaskedFrame(frames, WebSocketOpcode.CLOSE, closePayload);
+            out.write(frames.toByteArray());
+            out.flush();
         }
 
         public synchronized void sendClose(int code, String reason) throws IOException {

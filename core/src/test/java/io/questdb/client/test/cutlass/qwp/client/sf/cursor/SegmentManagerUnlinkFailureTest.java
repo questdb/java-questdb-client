@@ -39,7 +39,6 @@ import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
 
-import java.lang.reflect.Field;
 import java.nio.file.Paths;
 import java.util.Arrays;
 import java.util.concurrent.CountDownLatch;
@@ -136,7 +135,7 @@ public class SegmentManagerUnlinkFailureTest {
                     Assert.assertTrue("manager never retried the injected unlink",
                             facade.removeRetried.await(5, TimeUnit.SECONDS));
                     Assert.assertEquals("failed unlink must retain conservative registered bytes",
-                            ring.totalSegmentBytes(), readTotalBytes(manager));
+                            ring.totalSegmentBytes(), manager.getTotalBytesForTesting());
                 }
 
                 Assert.assertTrue("failed unlink path must remain observable", Files.exists(failedPath));
@@ -208,17 +207,6 @@ public class SegmentManagerUnlinkFailureTest {
     private static void fill(long address, int len, byte value) {
         for (int i = 0; i < len; i++) {
             Unsafe.getUnsafe().putByte(address + i, value);
-        }
-    }
-
-    private static long readTotalBytes(SegmentManager manager) throws Exception {
-        Field field = SegmentManager.class.getDeclaredField("totalBytes");
-        field.setAccessible(true);
-        Field lockField = SegmentManager.class.getDeclaredField("lock");
-        lockField.setAccessible(true);
-        Object lock = lockField.get(manager);
-        synchronized (lock) {
-            return field.getLong(manager);
         }
     }
 
