@@ -55,6 +55,9 @@ import java.util.concurrent.atomic.AtomicInteger;
  * Uses plain Java heap buffers - no native memory.
  */
 public class TestWebSocketServer implements Closeable {
+    // Upper bound on how long a connection a handler dropped keeps draining the client, waiting for it to hang
+    // up, before its read thread closes the socket anyway. See ClientHandler.lingerThenClose().
+    private static final long HANDLER_DROP_LINGER_MILLIS = 5_000;
     private static final Logger LOG = LoggerFactory.getLogger(TestWebSocketServer.class);
     private static final String WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     // Authorization header value captured from each well-formed upgrade request ("" when absent), in
@@ -428,6 +431,9 @@ public class TestWebSocketServer implements Closeable {
         private final ByteBuffer recvBuffer = ByteBuffer.allocate(65_536).order(ByteOrder.BIG_ENDIAN);
         private final AtomicBoolean running = new AtomicBoolean(false);
         private final Socket socket;
+        // Set by close() when a handler drops this connection from inside one of its own callbacks, i.e. on the
+        // read thread. Read only by that thread, which then lingers and closes the socket itself.
+        private boolean droppedByHandler;
         private InputStream in;
         private boolean isClosed;
         private OutputStream out;
@@ -442,9 +448,33 @@ public class TestWebSocketServer implements Closeable {
             recvBuffer.flip(); // start with nothing readable
         }
 
+        /**
+         * Closes this connection. Called from a handler callback -- the scripted mid-stream wire drop -- it
+         * delivers every frame the handler already wrote and then ends the stream with an orderly FIN; called
+         * from any other thread (server teardown) it closes the socket immediately and joins the read thread.
+         */
         @Override
         public void close() {
             running.set(false);
+            if (Thread.currentThread() == readThread) {
+                // A handler is dropping the connection from one of its own callbacks: "ack, then drop the
+                // wire". A plain socket.close() here aborts the connection with an RST whenever the client has
+                // frames in flight that this thread has not read yet - the normal case mid-stream, as clients
+                // pipeline - and the kernel then also discards everything it has not transmitted yet, i.e. the
+                // frames this handler wrote a moment ago. The client sees "connection reset" instead of its
+                // acks, so the script silently degrades to "drop". Half-close instead: the FIN queues behind
+                // every frame already written. The read loop stops once the callback returns, and
+                // lingerThenClose() drains the client until it hangs up before closing the socket. No join
+                // either: it would wait on this very thread for its whole timeout, while the caller may hold a
+                // lock (a synchronized handler) that every other connection's callbacks need.
+                droppedByHandler = true;
+                try {
+                    socket.shutdownOutput();
+                } catch (IOException e) {
+                    // already shut down, or the client is gone; lingerThenClose() still closes the socket
+                }
+                return;
+            }
             try {
                 socket.close();
             } catch (IOException e) {
@@ -562,6 +592,35 @@ public class TestWebSocketServer implements Closeable {
 
             recvBuffer.compact();
             recvBuffer.flip();
+        }
+
+        // Runs on the read thread once a handler has dropped the connection (see close()). The FIN is already
+        // queued behind the frames the handler wrote; keep reading - and discarding - whatever the client still
+        // sends until it closes its side, so the final close() never finds unread input, the condition that turns
+        // it into an RST and throws away frames still on their way out. Bounded, so a client that never hangs up
+        // cannot pin the thread; the server's close() cuts it short by closing the socket under the read.
+        private void lingerThenClose() {
+            final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(HANDLER_DROP_LINGER_MILLIS);
+            final byte[] discard = new byte[8192];
+            try {
+                while (System.nanoTime() < deadline) {
+                    try {
+                        if (in.read(discard) < 0) {
+                            break;
+                        }
+                    } catch (SocketTimeoutException e) {
+                        // the SO_TIMEOUT tick; keep waiting for the client's FIN
+                    }
+                }
+            } catch (IOException e) {
+                // reset by the client, or closed by the server's close(): nothing left to deliver
+            } finally {
+                try {
+                    socket.close();
+                } catch (IOException e) {
+                    // ignore
+                }
+            }
         }
 
         private boolean performHandshake() throws IOException {
@@ -754,6 +813,10 @@ public class TestWebSocketServer implements Closeable {
                 } catch (IOException e) {
                     if (running.get()) {
                         LOG.error("Client error", e);
+                    }
+                } finally {
+                    if (droppedByHandler) {
+                        lingerThenClose();
                     }
                 }
             }, "WebSocket-Client-" + socket.getPort());
