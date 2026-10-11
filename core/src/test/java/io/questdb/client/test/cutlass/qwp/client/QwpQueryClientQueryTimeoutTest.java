@@ -59,6 +59,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.LockSupport;
 
 /**
  * Per-query timeout of {@link QwpQueryClient}, against a scripted mock server.
@@ -232,6 +233,80 @@ public class QwpQueryClientQueryTimeoutTest {
                 client.execute("INSERT INTO t VALUES (1)", null, insert, false, 100);
                 Assert.assertTrue("a statement that completed past the deadline took effect", insert.execDone);
                 Assert.assertEquals(0, insert.errorStatus);
+            } finally {
+                script.close();
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testConnectionFailingPastTheDeadlineIsReportedAsTimeout() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            ScriptedServer script = new ScriptedServer();
+            script.onQuery = (s, c, frame, n) -> {
+                if (n > 1) {
+                    send(c, execDone(requestIdOf(frame)));
+                }
+                // n == 1: held
+            };
+            // An older server is sent its CANCEL only past the deadline, so the
+            // connection fails while the caller still waits for the outcome.
+            script.onCancel = (s, c, frame, n) -> send(c, closeFrame());
+            try (TestWebSocketServer server = startServer(script, CAPS_FLAGS_ONLY);
+                 QwpQueryClient client = connect(server, "")) {
+                RecordingHandler h = new RecordingHandler();
+                client.execute("SELECT slow()", null, h, false, 100);
+
+                h.assertTimedOut();
+                Assert.assertTrue("the message must report the failure: " + h.errorMessage,
+                        h.errorMessage.contains("the connection then failed"));
+                Assert.assertEquals("one terminal callback per query", 1, h.terminals.get());
+
+                RecordingHandler next = new RecordingHandler();
+                client.execute("INSERT INTO t VALUES (1)", null, next, false, 0);
+                Assert.assertTrue(next.execDone);
+                Assert.assertEquals("the failed connection must be replaced", 2, server.handshakeCount());
+            } finally {
+                script.close();
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testCutShortResultIsATimeoutEvenThoughTheServerEndedIt() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final long timeoutMs = 150;
+            ScriptedServer script = new ScriptedServer();
+            script.onQuery = (s, c, frame, n) -> {
+                long id = requestIdOf(frame);
+                if (n == 1) {
+                    // The whole result at once, well within the budget the server enforces.
+                    send(c, firstBatch(id, "a"));
+                    send(c, nextBatch(id, 1, "b"));
+                    send(c, resultEnd(id, 2));
+                } else {
+                    send(c, execDone(id));
+                }
+            };
+            try (TestWebSocketServer server = startServer(script, CAPS_WITH_TIMEOUT);
+                 QwpQueryClient client = connect(server, "")) {
+                // Still on the first batch when the deadline passes.
+                RecordingHandler h = new RecordingHandler(timeoutMs);
+                client.execute("SELECT s FROM t", null, h, false, timeoutMs);
+
+                // The handler did not get the whole result, so the server's end of
+                // it must not be reported as the query's end.
+                h.assertTimedOut();
+                Assert.assertEquals("one terminal callback per query", 1, h.terminals.get());
+                Assert.assertTrue("no batch may reach the handler past the deadline, got " + h.batches.get(),
+                        h.batches.get() <= 1);
+                Assert.assertTrue("the client must leave a server-enforced timeout to the server",
+                        script.cancels.isEmpty());
+
+                RecordingHandler next = new RecordingHandler();
+                client.execute("INSERT INTO t VALUES (1)", null, next, false, 0);
+                Assert.assertTrue(next.execDone);
+                Assert.assertEquals("the connection must be reused, not replaced", 1, server.handshakeCount());
             } finally {
                 script.close();
             }
@@ -553,6 +628,64 @@ public class QwpQueryClientQueryTimeoutTest {
                 client.execute("INSERT INTO t VALUES (1)", null, next, false, 0);
                 Assert.assertTrue(next.execDone);
                 Assert.assertEquals("the connection must be reused, not replaced", 1, server.handshakeCount());
+            } finally {
+                script.close();
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testQueryEndingWhileTheConnectionDrainsIsNotReportedAgain() throws Exception {
+        // The caller is told about the timeout when the grace period ends. Whatever
+        // then ends the drained query must not reach the handler too: on the pool, a
+        // second outcome would complete the submission queued behind the drain.
+        TestUtils.assertMemoryLeak(() -> {
+            final long timeoutMs = 100;
+            final long graceMs = 500;
+            final ConcurrentHashMap<Long, byte[]> endOnCancel = new ConcurrentHashMap<>();
+            ScriptedServer script = new ScriptedServer();
+            script.onQuery = (s, c, frame, n) -> {
+                long id = requestIdOf(frame);
+                if (n == 1) {
+                    endOnCancel.put(id, resultEnd(id, 0));
+                } else if (n == 2) {
+                    endOnCancel.put(id, execDone(id));
+                } else if (n == 3) {
+                    endOnCancel.put(id, closeFrame());
+                } else {
+                    send(c, execDone(id));
+                }
+            };
+            // A server that enforces the timeout is sent its first CANCEL when the
+            // grace period ends, so this end always reaches a draining connection.
+            script.onCancel = (s, c, frame, n) -> {
+                byte[] end = endOnCancel.remove(requestIdOf(frame));
+                if (end != null) {
+                    send(c, end);
+                }
+            };
+            try (TestWebSocketServer server = startServer(script, CAPS_WITH_TIMEOUT);
+                 QwpQueryClient client = connect(server, "")) {
+                client.withQueryTimeoutGrace(graceMs);
+                RecordingHandler select = new RecordingHandler();
+                client.execute("SELECT slow()", null, select, false, timeoutMs);
+                select.assertReleasedOnlyByTheGracePeriod();
+                Assert.assertFalse("the RESULT_END must have ended the drain", client.hasTerminalFailure());
+
+                RecordingHandler insert = new RecordingHandler();
+                client.execute("INSERT INTO t SELECT slow()", null, insert, false, timeoutMs);
+                insert.assertReleasedOnlyByTheGracePeriod();
+                Assert.assertFalse("the EXEC_DONE must have ended the drain", client.hasTerminalFailure());
+
+                RecordingHandler failed = new RecordingHandler();
+                client.execute("SELECT slow()", null, failed, false, timeoutMs);
+                failed.assertReleasedOnlyByTheGracePeriod();
+                Assert.assertTrue("the connection failure must have ended the drain", client.hasTerminalFailure());
+
+                RecordingHandler next = new RecordingHandler();
+                client.execute("INSERT INTO t VALUES (1)", null, next, false, 0);
+                Assert.assertTrue(next.execDone);
+                Assert.assertEquals("only the failed connection may be replaced", 2, server.handshakeCount());
             } finally {
                 script.close();
             }
@@ -1251,10 +1384,31 @@ public class QwpQueryClientQueryTimeoutTest {
         volatile byte errorStatus;
         volatile boolean execDone;
         volatile long terminalNanos;
+        private final long firstBatchHoldNanos;
+
+        RecordingHandler() {
+            this(0);
+        }
+
+        /**
+         * A handler that falls behind: its first {@code onBatch} holds the
+         * caller's thread for {@code firstBatchHoldMs}.
+         */
+        RecordingHandler(long firstBatchHoldMs) {
+            this.firstBatchHoldNanos = TimeUnit.MILLISECONDS.toNanos(firstBatchHoldMs);
+        }
 
         @Override
         public void onBatch(QwpColumnBatch batch) {
-            batches.incrementAndGet();
+            if (batches.incrementAndGet() == 1 && firstBatchHoldNanos > 0) {
+                // execute() sets its deadline on entry, before this call, so a hold
+                // as long as the timeout always ends past the deadline.
+                final long holdEndNanos = System.nanoTime() + firstBatchHoldNanos;
+                long left;
+                while ((left = holdEndNanos - System.nanoTime()) > 0) {
+                    LockSupport.parkNanos(left);
+                }
+            }
         }
 
         @Override
@@ -1279,6 +1433,14 @@ public class QwpQueryClientQueryTimeoutTest {
         @Override
         public void onFailoverReset(QwpServerInfo newNode) {
             failoverResets.incrementAndGet();
+        }
+
+        void assertReleasedOnlyByTheGracePeriod() {
+            Assert.assertEquals("the query's end, drained after the caller was released, must not be reported",
+                    1, terminals.get());
+            assertTimedOut();
+            Assert.assertTrue("the caller must be released at the end of the grace period: " + errorMessage,
+                    errorMessage.contains("grace period"));
         }
 
         void assertTimedOut() {
