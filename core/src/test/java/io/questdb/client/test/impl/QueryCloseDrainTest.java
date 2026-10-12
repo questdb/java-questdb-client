@@ -139,6 +139,7 @@ public class QueryCloseDrainTest {
                 long gen = generation(w);
                 // done stays true (the caller has its outcome), but the worker never
                 // finishes the job -- a drain that outlives the close budget.
+                setDraining(w, true);
                 setRunning(w, true);
 
                 long startNanos = System.nanoTime();
@@ -163,10 +164,13 @@ public class QueryCloseDrainTest {
                 // done stays true, but the worker is still inside the job's runOn() --
                 // as after a query timeout, when it drains the aborted query after
                 // the caller has been released.
+                setDraining(w, true);
                 setRunning(w, true);
                 Thread finisher = new Thread(() -> {
                     try {
                         Thread.sleep(200);
+                        // The drain ends before the job does, as in executeOnce().
+                        setDraining(w, false);
                         setRunning(w, false);
                     } catch (Exception e) {
                         throw new RuntimeException(e);
@@ -184,6 +188,84 @@ public class QueryCloseDrainTest {
                         allWorkers(pool).contains(w));
                 QueryWorker again = pool.acquire();
                 Assert.assertSame("the returned worker must be handed out again", w, again);
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testInterruptedCloseDiscardsWorkerStillDraining() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (QueryClientPool pool = new QueryClientPool(
+                    CFG, 0, 2, 1_000L, Long.MAX_VALUE, Long.MAX_VALUE, NO_CONNECT)) {
+                // A long budget: the only way close() can return promptly is by
+                // honoring the caller's interrupt.
+                setCloseQueryTimeout(pool, 60_000L);
+                QueryWorker w = pool.acquire();
+                long gen = generation(w);
+                // done stays true, but the client still drains a timed-out query.
+                setDraining(w, true);
+                setRunning(w, true);
+
+                Thread.currentThread().interrupt();
+                long startNanos = System.nanoTime();
+                closeQuery(w, gen);
+                long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000;
+
+                Assert.assertTrue("close() must preserve the caller's interrupt flag", Thread.interrupted());
+                Assert.assertTrue("interrupt must abort the wait for the drain promptly, elapsed=" + elapsedMs,
+                        elapsedMs < 5_000);
+                Assert.assertFalse("an interrupted close() must discard a worker that is still draining",
+                        allWorkers(pool).contains(w));
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testInterruptedCloseReturnsWorkerFinishingACompletedJob() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (QueryClientPool pool = new QueryClientPool(
+                    CFG, 0, 2, 1_000L, Long.MAX_VALUE, Long.MAX_VALUE, NO_CONNECT)) {
+                setCloseQueryTimeout(pool, 60_000L);
+                QueryWorker w = pool.acquire();
+                long gen = generation(w);
+                // The window right after every completed query: done is true and the
+                // client drains nothing, but the worker thread is still returning
+                // from the job's runOn().
+                setRunning(w, true);
+                try {
+                    Thread.currentThread().interrupt();
+                    closeQuery(w, gen);
+                    Assert.assertTrue("close() must preserve the caller's interrupt flag", Thread.interrupted());
+                    Assert.assertTrue("an interrupted close() must return a healthy worker, not discard it",
+                            allWorkers(pool).contains(w));
+                    Assert.assertSame("the returned worker must be handed out again", w, pool.acquire());
+                } finally {
+                    Thread.interrupted();
+                    setRunning(w, false);
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testZeroBudgetCloseReturnsWorkerFinishingACompletedJob() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (QueryClientPool pool = new QueryClientPool(
+                    CFG, 0, 2, 1_000L, Long.MAX_VALUE, Long.MAX_VALUE, NO_CONNECT)) {
+                setCloseQueryTimeout(pool, 0L);
+                QueryWorker w = pool.acquire();
+                long gen = generation(w);
+                // As above: a completed job whose worker thread is still returning
+                // from runOn(). No budget is needed to return it.
+                setRunning(w, true);
+                try {
+                    closeQuery(w, gen);
+                    Assert.assertTrue("a zero-budget close() must return a healthy worker, not discard it",
+                            allWorkers(pool).contains(w));
+                    Assert.assertSame("the returned worker must be handed out again", w, pool.acquire());
+                } finally {
+                    setRunning(w, false);
+                }
             }
         });
     }
@@ -224,6 +306,14 @@ public class QueryCloseDrainTest {
         Field f = QueryClientPool.class.getDeclaredField("closeQueryTimeoutMillis");
         f.setAccessible(true);
         f.setLong(pool, millis);
+    }
+
+    // Marks the worker's client as draining a timed-out query, the state
+    // QwpQueryClient.executeOnce() sets before it releases the caller.
+    private static void setDraining(QueryWorker w, boolean draining) throws Exception {
+        Field f = QwpQueryClient.class.getDeclaredField("drainingTimedOutQuery");
+        f.setAccessible(true);
+        f.setBoolean(w.client(), draining);
     }
 
     // Sets the worker's running flag under its signalLock and wakes idle waiters,

@@ -56,7 +56,9 @@ import java.util.concurrent.atomic.AtomicInteger;
  * holds, while the pooled, authenticated connection stays open and serves the
  * following queries. A worker still draining a timed-out query is not handed to
  * the next borrower before it is idle, and one whose connection stopped
- * responding is replaced rather than reused. A handler that throws -- on the
+ * responding is replaced rather than reused, while one whose query has ended goes
+ * back to the pool at once -- even when close() has no budget or the caller's
+ * interrupt flag is set. A handler that throws -- on the
  * timeout, or mid-result -- fails only its own submission.
  */
 public class QueryTimeoutFacadeTest {
@@ -102,6 +104,11 @@ public class QueryTimeoutFacadeTest {
     }
 
     @Test(timeout = 30_000)
+    public void testCloseWithoutBudgetKeepsTheConnectionOfCompletedQueries() throws Exception {
+        assertCloseKeepsTheConnectionOfCompletedQueries("query_close_timeout_ms=0;", false);
+    }
+
+    @Test(timeout = 30_000)
     public void testConfiguredDefaultAppliesAndHandleCanOverrideIt() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             Script script = new Script();
@@ -133,6 +140,11 @@ public class QueryTimeoutFacadeTest {
                 script.close();
             }
         });
+    }
+
+    @Test(timeout = 30_000)
+    public void testInterruptedCloseKeepsTheConnectionOfCompletedQueries() throws Exception {
+        assertCloseKeepsTheConnectionOfCompletedQueries("", true);
     }
 
     @Test(timeout = 30_000)
@@ -338,6 +350,43 @@ public class QueryTimeoutFacadeTest {
                     q.sql("INSERT INTO t VALUES (1)").handler(new NoopHandler()).submit().await();
                 }
                 Assert.assertEquals("the silent connection must be replaced by a new one", 2, server.handshakeCount());
+            } finally {
+                script.close();
+            }
+        });
+    }
+
+    /**
+     * The terminal callback releases the caller while the worker thread is still
+     * returning from the job, so close() regularly lands in that window. It must
+     * return the worker there rather than give up on it: each discard would show
+     * as one more connection. Hitting the window is a matter of timing; the
+     * zero-budget and interrupted-close cases of QueryCloseDrainTest pin it
+     * deterministically.
+     */
+    private static void assertCloseKeepsTheConnectionOfCompletedQueries(
+            String extraConfig,
+            boolean interruptBeforeClose
+    ) throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            Script script = new Script();
+            script.onQuery = (s, c, id, n) -> s.send(c, resultEnd(id));
+            try (TestWebSocketServer server = startServer(script, QwpEgressMsgKind.CAP_QUERY_FLAGS | QwpEgressMsgKind.CAP_QUERY_TIMEOUT);
+                 QuestDB db = QuestDB.connect(config(server) + extraConfig)) {
+                NoopHandler handler = new NoopHandler();
+                for (int i = 0; i < 2_000; i++) {
+                    try (Query q = db.borrowQuery()) {
+                        q.sql("SELECT 1").handler(handler).submit().await();
+                        if (interruptBeforeClose) {
+                            Thread.currentThread().interrupt();
+                        }
+                    }
+                    if (interruptBeforeClose) {
+                        Assert.assertTrue("close() must preserve the caller's interrupt flag", Thread.interrupted());
+                    }
+                }
+                Assert.assertEquals("closing a handle whose query has ended must keep its connection",
+                        1, server.handshakeCount());
             } finally {
                 script.close();
             }

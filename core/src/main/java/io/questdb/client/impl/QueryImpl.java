@@ -186,21 +186,27 @@ final class QueryImpl {
         // corrupt the next borrower's stream -- so it is discarded rather than
         // returned. The pool grows a fresh worker on the next borrow.
         final long budgetMillis = worker.closeQueryTimeoutMillis();
-        final long startNanos = System.nanoTime();
+        long remainingMillis = budgetMillis;
         if (!done) {
+            final long startNanos = System.nanoTime();
             worker.cancelInFlight(gen);
             if (!awaitDone(budgetMillis)) {
                 worker.discardFromPool(gen);
                 return;
             }
+            remainingMillis -= (System.nanoTime() - startNanos) / 1_000_000L;
         }
-        // done means the caller has its outcome, not that the worker is idle:
-        // after a query timeout the worker may still be draining the aborted
-        // query so that its connection stays reusable. It must not reach another
-        // borrower before that finishes, so wait for it within what is left of
-        // the same budget; one that does not finish is discarded as above.
-        final long remainingMillis = budgetMillis - (System.nanoTime() - startNanos) / 1_000_000L;
-        if (!worker.awaitIdle(remainingMillis)) {
+        // done means the caller has its outcome, not always that the connection
+        // is free: after a query timeout the worker may still be draining the
+        // aborted query so that its connection stays reusable. It must not reach
+        // another borrower before that finishes, so wait for it within what is
+        // left of the same budget; one that does not finish is discarded as above.
+        // Only a drain is waited for. Any other job is past its terminal callback
+        // and merely returning from runOn(), which the run loop already tolerates
+        // (a job dispatched meanwhile runs next), so the worker goes back at once:
+        // waiting for that return would discard a healthy worker whenever the
+        // budget is 0 or the caller's interrupt flag is set.
+        if (worker.client().isDrainingTimedOutQuery() && !worker.awaitIdle(remainingMillis)) {
             worker.discardFromPool(gen);
             return;
         }
@@ -425,8 +431,11 @@ final class QueryImpl {
      * {@link QueryWorker#lease()} when {@link QuestDBImpl#borrowQuery()} hands a
      * freshly stamped {@link QueryLease} out, so each borrow starts from the
      * documented "reset to empty" contract on {@link io.questdb.client.Query}.
-     * The leased worker is idle at this point (just acquired from the pool), so
-     * the reset is unconditional.
+     * The reset is unconditional: the worker was just acquired from the pool, so
+     * its previous job, if any, is past its terminal callback and can no longer
+     * change this state -- even while the worker thread is still returning from
+     * that job's {@code runOn()}. {@link #close(long)} pools no worker that is
+     * still draining a timed-out query.
      */
     void resetForBorrow() {
         userBinds = null;

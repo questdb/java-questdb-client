@@ -261,6 +261,11 @@ public class QwpQueryClient implements QuietCloseable {
     // user thread's write is visible to a concurrent cancel caller; 64-bit writes
     // are atomic under {@code volatile long}.
     private volatile long currentRequestId = -1L;
+    // True while execute() drains a timed-out query whose handler already had its
+    // terminal callback (TIMEOUT_PHASE_DRAINING). Written on the user thread only
+    // when a drain starts and ends, never on the per-query path; read from any
+    // thread through isDrainingTimedOutQuery().
+    private volatile boolean drainingTimedOutQuery;
     // True by default: on transport failure during execute(), reconnect to
     // another endpoint and replay the query. Callers that prefer to see the
     // error themselves opt out via {@code failover=off} in the connection
@@ -1185,6 +1190,21 @@ public class QwpQueryClient implements QuietCloseable {
 
     public boolean isConnected() {
         return connected;
+    }
+
+    /**
+     * Returns {@code true} while {@link #execute} drains a timed-out query whose
+     * handler has already had its terminal callback: the server did not end the
+     * query within the grace period, so the caller was released with the timeout
+     * while this client keeps waiting, up to one more grace period, for the
+     * query's last frame. The connection carries one query at a time, so it is
+     * not free for the next query until this returns {@code false}. Set before
+     * that callback runs: a thread that has seen the callback sees the drain too.
+     * When the drain ends with the connection given up on,
+     * {@link #hasTerminalFailure()} already holds once this returns {@code false}.
+     */
+    public boolean isDrainingTimedOutQuery() {
+        return drainingTimedOutQuery;
     }
 
     /**
@@ -2187,6 +2207,9 @@ public class QwpQueryClient implements QuietCloseable {
                         // query so the connection can serve the next one.
                         io.requestCancel(requestId);
                         phase = TIMEOUT_PHASE_DRAINING;
+                        // Before the callback that releases the caller, so whoever
+                        // has seen that callback also sees the drain.
+                        drainingTimedOutQuery = true;
                         waitDeadlineNanos = deadlineNanos + 2 * graceNanos;
                         probe.onErrorWhileDraining(requestId, QwpConstants.STATUS_QUERY_TIMEOUT, queryTimeoutMessage(timeoutMs)
                                 + "; the server did not end the query within the " + queryTimeoutGraceMs
@@ -2306,6 +2329,11 @@ public class QwpQueryClient implements QuietCloseable {
                 io.requestCancel(requestId);
             }
             currentRequestId = -1L;
+            if (phase == TIMEOUT_PHASE_DRAINING) {
+                // The drain is over: the query ended, or the connection was given
+                // up on, which has already latched its terminal failure.
+                drainingTimedOutQuery = false;
+            }
         }
     }
 

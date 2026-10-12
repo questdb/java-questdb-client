@@ -102,12 +102,15 @@ public final class QueryWorker {
 
     /**
      * Waits up to {@code timeoutMillis} for this worker to become idle: no job
-     * running and none pending. Used by {@link QueryImpl#close(long)} before
-     * returning the worker to the pool, because a job's terminal callback can
-     * precede the end of its {@code runOn()} -- after a query timeout the
-     * client keeps draining the aborted query so its connection stays
-     * reusable. Returns {@code false} on timeout or interrupt; an interrupt
-     * re-raises the caller's flag, like {@link QueryImpl}'s close drain.
+     * running and none pending. Used by {@link QueryImpl#close(long)} while the
+     * client drains a timed-out query
+     * ({@link QwpQueryClient#isDrainingTimedOutQuery()}): the job's terminal
+     * callback has released the caller, but its {@code runOn()} keeps draining
+     * the aborted query so the connection stays reusable. A job past its
+     * terminal callback for any other reason is not waited for: it is merely
+     * returning from {@code runOn()}, which the run loop tolerates. Returns
+     * {@code false} on timeout or interrupt; an interrupt re-raises the caller's
+     * flag, like {@link QueryImpl}'s close drain.
      */
     boolean awaitIdle(long timeoutMillis) {
         long remainingNanos = TimeUnit.MILLISECONDS.toNanos(Math.max(0L, timeoutMillis));

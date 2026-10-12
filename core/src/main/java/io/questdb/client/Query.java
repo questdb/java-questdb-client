@@ -82,6 +82,14 @@ public interface Query extends Closeable {
      * therefore never blocks the caller unbounded, even when the server is slow
      * to honor the cancel.
      * <p>
+     * After a query timeout the server did not honor within the grace period
+     * (see {@link #timeout}), the client may still be draining the aborted query
+     * when {@code close()} runs. {@code close()} then waits for that drain in the
+     * same way: within the same budget, interruptibly, and discarding the client
+     * if the drain does not finish. A client whose connection failed is discarded
+     * as well. Any other client whose query has ended is returned to the pool at
+     * once.
+     * <p>
      * Must NOT be called from a result handler: handlers run on the worker
      * thread, so {@code close()} would block waiting for a terminal event that
      * only that thread can deliver. Calling it there throws
