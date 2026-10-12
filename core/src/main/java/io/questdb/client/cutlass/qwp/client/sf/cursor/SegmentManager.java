@@ -82,6 +82,11 @@ public final class SegmentManager implements QuietCloseable {
     private static final int TRIM_RETRY_UNLINK = 2;
     private static final long WORKER_JOIN_TIMEOUT_MILLIS = 5_000L;
 
+    // Every segment the registered rings own, plus their live side-file bytes,
+    // is charged here. Private to this manager unless the caller hands the same
+    // budget to several managers -- a sender pool does, so sf_max_total_bytes
+    // caps all of its senders together.
+    private final SegmentBudget budget;
     private final AtomicLong fileGeneration = new AtomicLong();
     private final FilesFacade filesFacade;
     // Per-ring segment bytes below which the cap check never refuses to
@@ -96,9 +101,11 @@ public final class SegmentManager implements QuietCloseable {
     // ordinary backpressure: the ring cycles between one and two segments as
     // acks arrive, ingestion continues, and the cap degrades to best-effort by
     // exactly the dictionary's overshoot rather than stopping the pipeline.
+    // A budget shared with other managers needs the floor for the same reason:
+    // a sibling ring whose connection is down can hold the whole budget, and
+    // only the floor keeps this ring cycling through its own two segments.
     private final long livenessFloorBytes;
     private final Object lock = new Object();
-    private final long maxTotalBytes;
     // Reused by the manager worker thread to build spare-segment paths
     // directly into native memory. Each rotation writes the path bytes plus
     // a trailing NUL terminator into the same buffer, and passes the
@@ -133,8 +140,8 @@ public final class SegmentManager implements QuietCloseable {
     // never as the exact false return meaning the worker loop has exited.
     private volatile Runnable beforeExitCleanupRegistrationHook;
     // Test seam: runs on the worker thread just before the install path's
-    // synchronized(lock) entry (the one that performs installHotSpare + the
-    // totalBytes += segmentSize commit). Null in production; tests use it to
+    // synchronized(lock) entry (the one that performs installHotSpare and
+    // keeps the spare's budget charge). Null in production; tests use it to
     // pause after the worker has snapshotted a RingEntry and created a spare,
     // but before ownership/accounting commit. Callers may inject a deregister
     // or hold this stale worker snapshot while caller-side cleanup runs.
@@ -148,7 +155,7 @@ public final class SegmentManager implements QuietCloseable {
     // SegmentManagerTrimDeregisterRaceTest installs it, to deterministically
     // inject a deregister(ring) call into the exact race window that the
     // entry-state check inside the trim block closes for watermark writes and
-    // totalBytes accounting.
+    // budget accounting.
     private volatile Runnable beforeTrimSyncHook;
     // Test seam invoked exactly when a retry transition/recovery is logged.
     // Null in production; persistent-failure tests use it to prove log bounds
@@ -188,12 +195,6 @@ public final class SegmentManager implements QuietCloseable {
     private boolean scratchHandedToWorker;
     private volatile long shortestSyncIntervalNanos = Long.MAX_VALUE;
     private boolean workerLoopExited;
-    // Total bytes currently allocated across every segment owned by every
-    // registered ring (active + sealed + hot-spare). Mutated by the manager
-    // thread on provision/trim and by register/deregister callers under
-    // {@link #lock}; the lock covers both paths so the counter stays
-    // consistent across registration boundaries.
-    private long totalBytes;
     // volatile: read by awaitRingQuiescence() from arbitrary caller threads
     // while the @TestOnly setter may run on another.
     private volatile long workerJoinTimeoutMillis = WORKER_JOIN_TIMEOUT_MILLIS;
@@ -203,11 +204,11 @@ public final class SegmentManager implements QuietCloseable {
     private volatile Thread workerThread;
 
     public SegmentManager(long segmentSizeBytes) {
-        this(segmentSizeBytes, DEFAULT_POLL_NANOS, UNLIMITED_TOTAL_BYTES, FilesFacade.INSTANCE, System::nanoTime);
+        this(segmentSizeBytes, DEFAULT_POLL_NANOS, UNLIMITED_TOTAL_BYTES);
     }
 
     public SegmentManager(long segmentSizeBytes, long pollNanos) {
-        this(segmentSizeBytes, pollNanos, UNLIMITED_TOTAL_BYTES, FilesFacade.INSTANCE, System::nanoTime);
+        this(segmentSizeBytes, pollNanos, UNLIMITED_TOTAL_BYTES);
     }
 
     /**
@@ -233,12 +234,22 @@ public final class SegmentManager implements QuietCloseable {
      *                         hold an initial active plus one hot spare.
      */
     public SegmentManager(long segmentSizeBytes, long pollNanos, long maxTotalBytes) {
-        this(segmentSizeBytes, pollNanos, maxTotalBytes, FilesFacade.INSTANCE, System::nanoTime);
+        this(segmentSizeBytes, pollNanos, new SegmentBudget(maxTotalBytes), FilesFacade.INSTANCE, System::nanoTime);
+    }
+
+    /**
+     * As {@link #SegmentManager(long, long, long)}, but charging
+     * {@code budget}, which other managers may share: its capacity then caps
+     * the rings of all of them together. The capacity must allow at least one
+     * {@code segmentSizeBytes}.
+     */
+    public SegmentManager(long segmentSizeBytes, long pollNanos, SegmentBudget budget) {
+        this(segmentSizeBytes, pollNanos, budget, FilesFacade.INSTANCE, System::nanoTime);
     }
 
     @TestOnly
     public SegmentManager(long segmentSizeBytes, long pollNanos, long maxTotalBytes, FilesFacade filesFacade) {
-        this(segmentSizeBytes, pollNanos, maxTotalBytes, filesFacade, System::nanoTime);
+        this(segmentSizeBytes, pollNanos, new SegmentBudget(maxTotalBytes), filesFacade, System::nanoTime);
     }
 
     @TestOnly
@@ -246,6 +257,17 @@ public final class SegmentManager implements QuietCloseable {
             long segmentSizeBytes,
             long pollNanos,
             long maxTotalBytes,
+            FilesFacade filesFacade,
+            LongSupplier ticks
+    ) {
+        this(segmentSizeBytes, pollNanos, new SegmentBudget(maxTotalBytes), filesFacade, ticks);
+    }
+
+    @TestOnly
+    public SegmentManager(
+            long segmentSizeBytes,
+            long pollNanos,
+            SegmentBudget budget,
             FilesFacade filesFacade,
             LongSupplier ticks
     ) {
@@ -257,16 +279,20 @@ public final class SegmentManager implements QuietCloseable {
             pathScratch.close();
             throw new IllegalArgumentException("segmentSizeBytes too small: " + segmentSizeBytes);
         }
-        if (maxTotalBytes < segmentSizeBytes) {
+        if (budget == null) {
+            pathScratch.close();
+            throw new IllegalArgumentException("budget must not be null");
+        }
+        if (budget.getCapacityBytes() < segmentSizeBytes) {
             pathScratch.close();
             throw new IllegalArgumentException(
-                    "maxTotalBytes (" + maxTotalBytes + ") must allow at least one segment of "
+                    "maxTotalBytes (" + budget.getCapacityBytes() + ") must allow at least one segment of "
                             + segmentSizeBytes + " bytes");
         }
+        this.budget = budget;
         this.filesFacade = filesFacade;
         this.segmentSizeBytes = segmentSizeBytes;
         this.pollNanos = pollNanos;
-        this.maxTotalBytes = maxTotalBytes;
         // Clamp rather than multiply blind: segmentSizeBytes is user-supplied
         // and only bounded below, so a pathological value would wrap the
         // product negative and make the floor test trivially false -- silently
@@ -576,7 +602,7 @@ public final class SegmentManager implements QuietCloseable {
             for (int i = 0, n = rings.size(); i < n; i++) {
                 RingEntry e = rings.get(i);
                 if (e.ring == ring) {
-                    // Reverse the ring's contribution to totalBytes —
+                    // Reverse the ring's charge to the budget —
                     // mirrors the seed in register(). Any spares the
                     // manager provisioned during the ring's lifetime
                     // are also part of totalSegmentBytes() now, so a
@@ -584,7 +610,10 @@ public final class SegmentManager implements QuietCloseable {
                     // and the net manager activity (provisions minus
                     // trims) for this ring.
                     e.deregister();
-                    totalBytes -= ring.totalSegmentBytes();
+                    budget.release(ring.totalSegmentBytes());
+                    if (e.sideFileBytes != null) {
+                        budget.removeSideFileGauge(e.sideFileBytes);
+                    }
                     rings.remove(i);
                     return;
                 }
@@ -636,10 +665,10 @@ public final class SegmentManager implements QuietCloseable {
      * {@code .sfa} segments; a {@code null} gauge contributes zero (memory
      * mode, degraded full-dict sessions).
      * <p>
-     * The gauge is invoked with the manager's internal lock held, so it must
-     * be wait-free and must not throw: a throwing gauge terminates the
-     * manager worker for every registered ring, and a blocking gauge stalls
-     * register/deregister for all slots.
+     * The gauge is invoked under the {@link SegmentBudget}'s monitor, so it
+     * must be wait-free and must not throw: a throwing gauge terminates the
+     * worker of every manager charging that budget, and a blocking gauge
+     * stalls register/deregister and provisioning for all of their slots.
      */
     public void register(SegmentRing ring, String dir, AckWatermark watermark, long syncIntervalNanos, LongSupplier sideFileBytes) {
         if (syncIntervalNanos < 0L) {
@@ -650,7 +679,7 @@ public final class SegmentManager implements QuietCloseable {
         }
         // Account for bytes the ring already owns when it joins. A recovered
         // ring (post-restart, orphan adoption) can come up at-or-above the cap;
-        // without this seed, totalBytes stays at 0 and the per-tick cap check
+        // without this seed, the budget stays at 0 and the per-tick cap check
         // at serviceRing would let the manager keep provisioning new spares on
         // top of the recovered set, effectively doubling the documented cap.
         long ringBytes = ring.totalSegmentBytes();
@@ -663,13 +692,25 @@ public final class SegmentManager implements QuietCloseable {
         Runnable managerWakeup = this::wakeWorker;
         RingEntry e = new RingEntry(ring, dir, watermark, sideFileBytes, syncIntervalNanos, ticks.getAsLong());
         // ObjList.add either throws before storing e or makes the entry visible.
-        // Once visible, only non-throwing state commits may remain.
+        // Once visible, only non-throwing state commits may remain, so the gauge
+        // (whose list can also throw on growth) is added first and withdrawn if
+        // the entry cannot be published.
         synchronized (lock) {
             if (dir != null) {
                 advanceFileGeneration(minNextGeneration);
             }
-            rings.add(e);
-            totalBytes += ringBytes;
+            if (sideFileBytes != null) {
+                budget.addSideFileGauge(sideFileBytes);
+            }
+            try {
+                rings.add(e);
+            } catch (Throwable t) {
+                if (sideFileBytes != null) {
+                    budget.removeSideFileGauge(sideFileBytes);
+                }
+                throw t;
+            }
+            budget.charge(ringBytes);
             if (syncIntervalNanos > 0L) {
                 ring.enablePeriodicSync();
                 if (syncIntervalNanos < shortestSyncIntervalNanos) {
@@ -697,40 +738,14 @@ public final class SegmentManager implements QuietCloseable {
         return entry == null ? null : entry.ring;
     }
 
-    // Callers must hold `lock` (the rings list is mutated under it). The
-    // side-file bytes are read live from each slot's gauge instead of being
-    // folded into the incremental totalBytes counter: the dictionary grows
-    // out-of-band on producer threads, so an incremental mirror would
-    // drift, while a live read cannot. Each gauge is WAIT-FREE and takes no
-    // lock at all -- PersistedSymbolDict.occupiedDiskBytes() is a pair of
-    // volatile reads -- and it must stay that way. This runs with `lock` held,
-    // on the worker that drives provisioning and trim for every registered ring,
-    // while a producer can hold that dictionary's monitor across ff.allocate
-    // and mmap. A gauge that took the monitor would park the whole manager
-    // behind one producer's append I/O.
-    private long sideFileBytesLocked() {
-        long total = 0L;
-        for (int i = 0, n = rings.size(); i < n; i++) {
-            LongSupplier gauge = rings.get(i).sideFileBytes;
-            if (gauge != null) {
-                total += gauge.getAsLong();
-            }
-        }
-        return total;
-    }
-
     @TestOnly
     public long getCapAccountedBytesForTesting() {
-        synchronized (lock) {
-            return totalBytes + sideFileBytesLocked();
-        }
+        return budget.getAccountedBytes();
     }
 
     @TestOnly
     public long getTotalBytesForTesting() {
-        synchronized (lock) {
-            return totalBytes;
-        }
+        return budget.getSegmentBytes();
     }
 
     @TestOnly
@@ -958,55 +973,59 @@ public final class SegmentManager implements QuietCloseable {
         //    DISK_FULL_LOG_THROTTLE_NANOS so a sustained-disk-full state
         //    doesn't drown the log.
         if (e.ring.needsHotSpare()) {
-            // Snapshot totalBytes under lock -- register/deregister can mutate
-            // it from caller threads -- and add the live side-file bytes of
-            // every registered slot, so .symbol-dict growth counts against the
-            // cap. Heavy provisioning I/O happens outside the lock; the
-            // post-install commit re-acquires it.
-            long observedTotal;
-            long observedSideFileBytes;
-            synchronized (lock) {
-                observedSideFileBytes = sideFileBytesLocked();
-                observedTotal = totalBytes + observedSideFileBytes;
-            }
-            boolean withinCap = observedTotal + segmentSizeBytes <= maxTotalBytes;
+            // Charge the spare BEFORE provisioning it, as one atomic check-and-
+            // charge against everything else on the budget, live side-file bytes
+            // included. A snapshot-then-commit check would let two managers that
+            // share the budget both see room for its last segment and both take
+            // it. Installing the spare keeps the charge; every other outcome
+            // below releases it.
+            boolean withinCap = budget.tryCharge(segmentSizeBytes);
             // Liveness floor. Refusing on segment bytes is productive -- an ack
             // trims a sealed segment and the shortfall clears. Refusing on
             // side-file bytes is not: the dictionary never shrinks, so a ring
             // held below its minimum working set by them would never rotate
-            // again, on this run or any later one. Provision anyway while this
-            // ring is under the floor, and account it honestly below.
+            // again, on this run or any later one. Nor is refusing on the
+            // segments of OTHER rings that share the budget: their acks may
+            // never come (a sibling whose connection is down). Provision anyway
+            // while this ring is under the floor, and charge it honestly.
             long ringSegmentBytes = withinCap ? 0L : e.ring.totalSegmentBytes();
             boolean belowLivenessFloor = !withinCap && ringSegmentBytes < livenessFloorBytes;
+            if (belowLivenessFloor) {
+                budget.charge(segmentSizeBytes);
+            }
             if (!withinCap && !belowLivenessFloor) {
                 long now = System.nanoTime();
                 if (now - lastDiskFullLogNs >= DISK_FULL_LOG_THROTTLE_NANOS) {
+                    long sideFileBytes = budget.getSideFileBytes();
                     LOG.warn("SF {}: cannot provision spare in {} "
                                     + "(totalBytes={}, sideFileBytes={}, cap={}, segmentSize={}). "
                                     + "Producer is backpressured until ACK-driven trim frees segment "
                                     + "space; side-file bytes are not reclaimed by trim.",
                             memoryMode ? "memory cap reached" : "disk-full",
-                            memoryMode ? "<memory>" : e.dir, observedTotal, observedSideFileBytes,
-                            maxTotalBytes, segmentSizeBytes);
+                            memoryMode ? "<memory>" : e.dir, budget.getSegmentBytes() + sideFileBytes,
+                            sideFileBytes, budget.getCapacityBytes(), segmentSizeBytes);
                     lastDiskFullLogNs = now;
                 }
             } else {
                 if (belowLivenessFloor) {
                     // Exceeding a configured cap is worth saying out loud, and
                     // saying WHY: the operator's remedy is to raise
-                    // sf_max_total_bytes or shrink the symbol dictionary, never
-                    // to wait for a trim.
+                    // sf_max_total_bytes, or shrink the symbol dictionary or the
+                    // number of senders sharing the budget, never to wait for a
+                    // trim.
                     long now = System.nanoTime();
                     if (now - lastDiskFullLogNs >= DISK_FULL_LOG_THROTTLE_NANOS) {
+                        long sideFileBytes = budget.getSideFileBytes();
                         LOG.warn("SF {}: provisioning past sf_max_total_bytes to keep the slot "
                                         + "usable (totalBytes={}, sideFileBytes={}, cap={}, "
                                         + "segmentSize={}, ringSegmentBytes={}, minWorkingSet={}). "
-                                        + "The symbol dictionary alone leaves no room for the "
-                                        + "active segment plus one spare, and trim cannot reclaim "
-                                        + "it; raise sf_max_total_bytes or reduce symbol "
-                                        + "cardinality.",
-                                memoryMode ? "<memory>" : e.dir, observedTotal,
-                                observedSideFileBytes, maxTotalBytes, segmentSizeBytes,
+                                        + "The rest of the budget -- symbol dictionaries, which trim "
+                                        + "cannot reclaim, and the segments of other senders sharing "
+                                        + "it -- leaves no room for this slot's active segment plus "
+                                        + "one spare; raise sf_max_total_bytes, or reduce symbol "
+                                        + "cardinality or the number of pooled senders.",
+                                memoryMode ? "<memory>" : e.dir, budget.getSegmentBytes() + sideFileBytes,
+                                sideFileBytes, budget.getCapacityBytes(), segmentSizeBytes,
                                 ringSegmentBytes, livenessFloorBytes);
                         lastDiskFullLogNs = now;
                     }
@@ -1051,22 +1070,21 @@ public final class SegmentManager implements QuietCloseable {
                                         "could not sync hot-spare directory " + e.dir);
                             }
                         }
-                        // Install + commit atomically under the manager lock.
-                        // If `e.ring` was deregistered between the snapshot
-                        // above and now, abandoning the spare here is the only
-                        // way to keep totalBytes consistent: deregister already
-                        // subtracted ring.totalSegmentBytes() (without the
-                        // spare, since it wasn't installed yet) so a commit at
-                        // this point would inflate totalBytes by one segment
-                        // with no future subtractor. By holding `lock` across
-                        // installHotSpare AND the += commit AND the registration
-                        // check, deregister is forced to either
-                        // observe the spare in the ring (and subtract it) or
-                        // run before installation (so no install happens).
+                        // Install under the manager lock, gated on the entry
+                        // still being registered. If `e.ring` was deregistered
+                        // since the charge above, abandoning the spare here is
+                        // the only way to keep the budget consistent:
+                        // deregister already released ring.totalSegmentBytes()
+                        // (without the spare, since it wasn't installed yet), so
+                        // installing now would keep the spare's charge with no
+                        // future releaser. By holding `lock` across the
+                        // registration check AND installHotSpare, deregister is
+                        // forced to either observe the spare in the ring (and
+                        // release it) or run before installation (so no install
+                        // happens and the !installed path releases the charge).
                         synchronized (lock) {
                             if (e.isRegistered()) {
                                 e.ring.installHotSpare(spare);
-                                totalBytes += segmentSizeBytes;
                                 installed = true;
                             }
                         }
@@ -1076,6 +1094,7 @@ public final class SegmentManager implements QuietCloseable {
                             memoryMode ? "<memory>" : e.dir, t);
                 }
                 if (!installed) {
+                    budget.release(segmentSizeBytes);
                     if (spare != null) {
                         try {
                             spare.close();
@@ -1144,7 +1163,7 @@ public final class SegmentManager implements QuietCloseable {
                 synchronized (lock) {
                     long removedBytes = e.ring.commitPendingTrims(trimBatch, closed);
                     if (e.isRegistered()) {
-                        totalBytes -= removedBytes;
+                        budget.release(removedBytes);
                     }
                 }
             }
@@ -1259,7 +1278,7 @@ public final class SegmentManager implements QuietCloseable {
                 synchronized (lock) {
                     long removedBytes = e.ring.commitPendingTrims(trimBatch, unlinked);
                     if (e.isRegistered()) {
-                        totalBytes -= removedBytes;
+                        budget.release(removedBytes);
                     }
                 }
             } catch (Throwable t) {
@@ -1445,8 +1464,8 @@ public final class SegmentManager implements QuietCloseable {
         final SegmentRing ring;
         // Live gauge of the slot's .symbol-dict side-file bytes, or null when
         // the slot has no dictionary (memory mode, degraded full-dict
-        // sessions). Read at the provisioning cap check only -- never folded
-        // into totalBytes, which stays a segments-only counter.
+        // sessions). Lent to the budget for its cap checks between register
+        // and deregister -- never folded into its segments-only counter.
         final LongSupplier sideFileBytes;
         final long syncIntervalNanos;
         // Engine-owned ack watermark for this slot, or null in memory

@@ -24,8 +24,10 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.LineSenderServerException;
 import io.questdb.client.Sender;
 import io.questdb.client.SenderError;
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
@@ -106,6 +108,58 @@ public class InitialConnectAsyncTest {
                                 + err.getServerMessage(),
                         err.getServerMessage().contains("ws-upgrade-failed"));
                 Assert.assertFalse("no upgrade has succeeded yet", wss.wasEverConnected());
+            } finally {
+                closeQuietly(sender);
+            }
+        }
+    }
+
+    @Test
+    public void testAsyncAuthFailureLeavesRebuildFactorySetterUsable() throws Exception {
+        // Sender.build() installs the rebuild factory after connect(), and in
+        // async mode the I/O thread can latch a 401 terminal in between. A
+        // latched terminal leaves the sender OPEN with the error armed (the
+        // next producer call throws it; close() still runs), so the setter must
+        // refuse only a CLOSED sender: refusing a latched one made build()
+        // throw and leak whenever that race landed. Same latched-but-open
+        // state, reached deterministically, then a direct setter call.
+        try (Always401Fixture fixture = new Always401Fixture()) {
+            fixture.start();
+            int port = fixture.getPort();
+            ErrorInbox inbox = new ErrorInbox();
+            String cfg = "ws::addr=localhost:" + port
+                    + sfDirOpt() + ";initial_connect_retry=async"
+                    + ";reconnect_max_duration_millis=200"
+                    + ";reconnect_initial_backoff_millis=10"
+                    + ";reconnect_max_backoff_millis=50"
+                    + ";close_flush_timeout_millis=0;";
+            Sender sender = Sender.builder(cfg)
+                    .errorHandler(inbox)
+                    .build();
+            try {
+                QwpWebSocketSender wss = (QwpWebSocketSender) sender;
+                Assert.assertTrue("an async 401 must surface a terminal to the errorHandler",
+                        inbox.await(5, TimeUnit.SECONDS));
+                Assert.assertEquals(SenderError.Policy.TERMINAL, inbox.get().getAppliedPolicy());
+
+                LineSenderServerException latched = null;
+                try {
+                    sender.table("foo").longColumn("v", 1L).atNow();
+                    sender.flush();
+                } catch (LineSenderServerException e) {
+                    latched = e;
+                }
+                Assert.assertNotNull("the latched terminal must surface on the next producer call; "
+                        + "that is what makes this sender latched rather than closed", latched);
+
+                try {
+                    wss.setEngineRebuildFactory(() -> {
+                        throw new AssertionError("the factory is installed, never invoked, here");
+                    });
+                } catch (LineSenderException e) {
+                    throw new AssertionError("setEngineRebuildFactory must refuse only a closed sender, "
+                            + "not one whose I/O thread latched a terminal", e);
+                }
             } finally {
                 closeQuietly(sender);
             }

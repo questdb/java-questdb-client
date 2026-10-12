@@ -76,6 +76,7 @@ public abstract class AbstractLineHttpSender implements Sender {
     private final DirectByteSlice bufferView = new DirectByteSlice();
     private final long flushIntervalNanos;
     private final ObjList<String> hosts;
+    private final HttpTokenProvider httpTokenProvider;
     private final boolean isTls;
     private final int maxBackoffMillis;
     private final int maxNameLength;
@@ -94,7 +95,6 @@ public abstract class AbstractLineHttpSender implements Sender {
     private boolean closed;
     private int currentAddressIndex;
     private long flushAfterNanos = Long.MAX_VALUE;
-    private HttpTokenProvider httpTokenProvider;
     private boolean isTokenPending;
     private JsonErrorParser jsonErrorParser;
     private boolean lastFlushFailed;
@@ -159,7 +159,8 @@ public abstract class AbstractLineHttpSender implements Sender {
         this(new ObjList<>(host), IntList.createWithValues(port), path, clientConfiguration, tlsConfig, client, autoFlushRows, authToken, username, password, maxNameLength, maxRetriesNanos, maxBackoffMillis, minRequestThroughput,
                 flushIntervalNanos,
                 0,
-                rnd
+                rnd,
+                null
         );
     }
 
@@ -181,7 +182,8 @@ public abstract class AbstractLineHttpSender implements Sender {
             long minRequestThroughput,
             long flushIntervalNanos,
             int currentAddressIndex,
-            Rnd rnd
+            Rnd rnd,
+            HttpTokenProvider httpTokenProvider
     ) {
         assert authToken == null || (username == null && password == null);
         this.maxRetriesNanos = maxRetriesNanos;
@@ -192,6 +194,7 @@ public abstract class AbstractLineHttpSender implements Sender {
         this.path = path != null ? path : PATH;
         this.autoFlushRows = autoFlushRows;
         this.authToken = authToken;
+        this.httpTokenProvider = httpTokenProvider;
         this.username = username;
         this.password = password;
         this.minRequestThroughput = minRequestThroughput;
@@ -200,18 +203,25 @@ public abstract class AbstractLineHttpSender implements Sender {
 
         this.isTls = tlsConfig != null;
 
-        if (client != null) {
-            this.client = client;
-        } else {
-            this.client = isTls ?
-                    HttpClientFactory.newTlsInstance(clientConfiguration, tlsConfig)
-                    : HttpClientFactory.newPlainTextInstance(clientConfiguration);
+        // Close the supplied or newly created client if sender initialization fails.
+        try {
+            if (client != null) {
+                this.client = client;
+            } else {
+                this.client = isTls ?
+                        HttpClientFactory.newTlsInstance(clientConfiguration, tlsConfig)
+                        : HttpClientFactory.newPlainTextInstance(clientConfiguration);
+            }
+            this.questDBVersion = new BuildInformationHolder().getSwVersion();
+            // Precompute the User-Agent header value once: newRequest() runs on every flush, so
+            // concatenating it there would allocate a String each time.
+            this.userAgent = "QuestDB/java/" + questDBVersion;
+            this.request = newRequest();
+        } catch (Throwable th) {
+            Misc.freeSuppressing(this.client, th);
+            this.client = null;
+            throw th;
         }
-        this.questDBVersion = new BuildInformationHolder().getSwVersion();
-        // precompute the User-Agent header value once: newRequest() runs on every flush, so concatenating it
-        // there would allocate a String each time
-        this.userAgent = "QuestDB/java/" + questDBVersion;
-        this.request = newRequest();
         this.maxNameLength = maxNameLength;
         this.rnd = rnd;
     }
@@ -406,7 +416,8 @@ public abstract class AbstractLineHttpSender implements Sender {
                         minRequestThroughput,
                         flushIntervalNanos,
                         currentAddressIndex,
-                        rnd
+                        rnd,
+                        httpTokenProvider
                 );
                 break;
             case PROTOCOL_VERSION_V2:
@@ -427,7 +438,8 @@ public abstract class AbstractLineHttpSender implements Sender {
                         minRequestThroughput,
                         flushIntervalNanos,
                         currentAddressIndex,
-                        rnd
+                        rnd,
+                        httpTokenProvider
                 );
                 break;
             case PROTOCOL_VERSION_V3:
@@ -448,22 +460,12 @@ public abstract class AbstractLineHttpSender implements Sender {
                         minRequestThroughput,
                         flushIntervalNanos,
                         currentAddressIndex,
-                        rnd
+                        rnd,
+                        httpTokenProvider
                 );
                 break;
             default:
                 throw new LineSenderException("Unsupported protocol version: " + protocolVersion);
-        }
-        if (httpTokenProvider != null) {
-            // The constructor built the initial request before the provider was wired (httpTokenProvider was
-            // still null, so it took the no-auth path with withContent). Rebuild it via the deferred path now
-            // that the provider is set: this leaves the request at the header stage with the token pending,
-            // matching the reset() path, so the first row's stampTokenIfPending() finishes it (appends the auth
-            // header + withContent()) without a second client.newRequest(). Deferring the first getToken() off
-            // the build path also lets a lazily-signing-in provider (e.g. OidcDeviceAuth::getToken) be wired
-            // before sign-in completes, keeping the token pull on the use/flush path the provider documents.
-            sender.httpTokenProvider = httpTokenProvider;
-            sender.request = sender.newRequest();
         }
         return sender;
     }

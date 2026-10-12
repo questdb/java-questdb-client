@@ -85,26 +85,44 @@ jobs:
             !core/target/*-sources.jar
           if-no-files-found: error
 
-  # The 1.3.5-1.3.7 releases shipped a JDK 8-built jar whose FdBig class links
-  # sun.misc.FDBigInteger (gone since Java 9) and whose module name degraded to
-  # the filename-derived "questdb.client". Both are only observable in the
-  # PACKAGED jar on a modern JDK, so take the jar built by build-jdk8 and prove
-  # on JDK 25 that (a) the automatic module name is io.questdb.client and
-  # (b) slow-path double formatting resolves the META-INF/versions/11 bridge.
-  mrjar-smoke-jdk25:
-    name: MRJAR smoke (JDK 8 jar on JDK 25)
+  # Takes the JDK 8-built jar (the shipped artifact) from build-jdk8 and runs it
+  # on every newer JDK the client must work on, asserting (a) the automatic
+  # module name is io.questdb.client and (b) slow-path double formatting
+  # resolves the META-INF/versions/11 bridge. These are only observable in the
+  # PACKAGED jar on a modern JDK, and each regression here was invisible to the
+  # other jobs until the jar was EXECUTED on the right JDK/flags:
+  #   * 1.3.5-1.3.7: FdBig linked sun.misc.FDBigInteger (gone since Java 9) and
+  #     the module name degraded to the filename-derived "questdb.client".
+  #   * issue #96: JDK 26 made FDBigInteger package-private (passed 8/11/25).
+  #   * JDK 27 compact object headers (JEP 450, default-on) shifted the
+  #     AccessibleObject.override offset the bridge relies on -- guarded by the
+  #     per-layout runs in the smoke step below, blocking on the 25/26 legs.
+  # The 27-ea entry is a forward canary: it should be green, and does not fail
+  # the workflow because EA is a moving target -- a red run means the next JDK
+  # needs attention.
+  mrjar-smoke:
+    name: MRJAR smoke (JDK 8 jar on JDK ${{ matrix.java }})
     needs: build-jdk8
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ["25", "26"]
+        experimental: [false]
+        include:
+          - java: "27-ea"
+            experimental: true
     steps:
       - name: Check out
         uses: actions/checkout@v4
 
-      - name: Set up JDK 25
+      - name: Set up JDK ${{ matrix.java }}
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "25"
+          java-version: ${{ matrix.java }}
 
       - name: Download JDK 8-built client jar
         uses: actions/download-artifact@v4
@@ -120,26 +138,46 @@ jobs:
           grep -q '^io\.questdb\.client@' module.txt
           javac -cp "$jar_file" -d smoke-classes \
             core/src/test/java/io/questdb/client/test/std/DoubleFormatSmoke.java
-          java -cp "$jar_file:smoke-classes" io.questdb.client.test.std.DoubleFormatSmoke
+          # The FdBig double formatter reaches jdk.internal.math.FDBigInteger by
+          # setting AccessibleObject.override at an offset Unsafe derives from the
+          # object header size. Run the smoke under each object-header layout so a
+          # regression to a hard-coded offset fails a BLOCKING leg (25, 26), not
+          # only the non-blocking 27-ea canary. Compact object headers (JEP 450)
+          # are a product flag on JDK 25/26 and default-on from 27; the
+          # +IgnoreUnrecognizedVMOptions guard keeps the flags harmless on any JDK.
+          run_smoke() { # <label> <jvm flags...>
+            local label="$1"; shift
+            echo "::group::DoubleFormatSmoke [$label]"
+            java "$@" -cp "$jar_file:smoke-classes" io.questdb.client.test.std.DoubleFormatSmoke
+            echo "::endgroup::"
+          }
+          run_smoke "default"           -XX:+IgnoreUnrecognizedVMOptions
+          run_smoke "compact-headers"   -XX:+IgnoreUnrecognizedVMOptions -XX:+UseCompactObjectHeaders
+          run_smoke "uncompressed-oops" -XX:+IgnoreUnrecognizedVMOptions -XX:-UseCompressedOops -XX:-UseCompressedClassPointers
 
   # The client is also consumed as a submodule of the main questdb repo, which
-  # builds on JDK 25. Guard against JDK 25 compile breakage (main + test
-  # sources, both modules) and confirm the javadoc jar builds on JDK 25 too
+  # builds on JDK 25, and contributors build on the newest GA JDK (issue #96
+  # was "does not compile on JDK 26"). Guard against compile breakage on both
+  # (main + test sources, both modules) and confirm the javadoc jar builds too
   # (-P javadoc attaches it at the package phase). Do NOT run the tests -- the
   # parent repo runs them against a real server.
-  compile-jdk25:
-    name: Compile & javadoc smoke (JDK 25)
+  compile-modern-jdk:
+    name: Compile & javadoc smoke (JDK ${{ matrix.java }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ["25", "26"]
     steps:
       - name: Check out
         uses: actions/checkout@v4
 
-      - name: Set up JDK 25
+      - name: Set up JDK ${{ matrix.java }}
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "25"
+          java-version: ${{ matrix.java }}
           cache: maven
 
       - name: Compile (main + test) and build javadoc (no tests run)

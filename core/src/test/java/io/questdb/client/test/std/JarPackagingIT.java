@@ -69,6 +69,19 @@ public class JarPackagingIT {
             Assert.assertNotNull("JAVA11_HOME (or -Djava11.home) must point at a JDK 11+", bridgeJdkHome);
             runSmokeAgainstJar(bridgeJdkHome);
         }
+        // Optional extra runtimes for local cross-JDK checks, e.g.
+        //   QUESTDB_SMOKE_JDKS=$HOME/.sdkman/candidates/java/17.0.14-amzn:$HOME/.sdkman/candidates/java/26.0.2-amzn
+        // CI covers the JDK 8 jar on newer JDKs in the mrjar-smoke matrix; this
+        // gives a developer with several JDKs installed the same check from
+        // `mvn install`. Absent or empty means no extra runs.
+        String extraJdks = System.getenv("QUESTDB_SMOKE_JDKS");
+        if (extraJdks != null && !extraJdks.trim().isEmpty()) {
+            for (String jdkHome : extraJdks.split(File.pathSeparator)) {
+                if (!jdkHome.trim().isEmpty()) {
+                    runSmokeAgainstJar(jdkHome.trim());
+                }
+            }
+        }
     }
 
     private static void runSmokeAgainstJar(String jdkHome) throws Exception {
@@ -96,9 +109,12 @@ public class JarPackagingIT {
                         "root FdBig of a JDK 8 build must use sun.misc.FDBigInteger",
                         classReferences(jar, FD_BIG_ENTRY, "sun/misc/FDBigInteger")
                 );
+                // the java11 bridge never names the class (JDK 26 made it package-private);
+                // it loads it by dotted name and binds method handles, so the
+                // constant-pool witness is the dotted string literal
                 Assert.assertTrue(
-                        "META-INF/versions/11 FdBig must use jdk.internal.math.FDBigInteger",
-                        classReferences(jar, VERSIONED_FD_BIG_ENTRY, "jdk/internal/math/FDBigInteger")
+                        "META-INF/versions/11 FdBig must bind jdk.internal.math.FDBigInteger",
+                        classReferences(jar, VERSIONED_FD_BIG_ENTRY, "jdk.internal.math.FDBigInteger")
                 );
                 Assert.assertNotNull(
                         "META-INF/versions/11 must carry the java11 Compat shim",
@@ -117,8 +133,8 @@ public class JarPackagingIT {
                 // JDK 11+ build: dev/smoke only, never shipped. Root classes are the
                 // java11 variants and the real module descriptor is present.
                 Assert.assertTrue(
-                        "root FdBig of a JDK 11+ build must use jdk.internal.math.FDBigInteger",
-                        classReferences(jar, FD_BIG_ENTRY, "jdk/internal/math/FDBigInteger")
+                        "root FdBig of a JDK 11+ build must bind jdk.internal.math.FDBigInteger",
+                        classReferences(jar, FD_BIG_ENTRY, "jdk.internal.math.FDBigInteger")
                 );
                 Assert.assertNotNull("module-info.class missing", jar.getEntry("module-info.class"));
             }
@@ -148,6 +164,7 @@ public class JarPackagingIT {
             classBytes = readAll(in);
         }
         // the referenced class name appears verbatim as a constant-pool UTF-8 entry
+        // (slash form for a class constant, dotted form for a Class.forName literal)
         byte[] needle = constant.getBytes("UTF-8");
         for (int i = 0; i <= classBytes.length - needle.length; i++) {
             int j = 0;

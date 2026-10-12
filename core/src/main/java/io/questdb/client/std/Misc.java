@@ -64,6 +64,23 @@ public final class Misc {
         return null;
     }
 
+    // Close during rollback, attaching cleanup failures without replacing the original failure.
+    public static void freeSuppressing(Closeable object, Throwable failure) {
+        if (object != null) {
+            try {
+                object.close();
+            } catch (Throwable closeFailure) {
+                if (closeFailure != failure) {
+                    try {
+                        failure.addSuppressed(closeFailure);
+                    } catch (Throwable ignored) {
+                        // Recording the suppressed failure can itself run out of memory.
+                    }
+                }
+            }
+        }
+    }
+
     public static Decimal128 getThreadLocalDecimal128() {
         return tlDecimal128.get();
     }

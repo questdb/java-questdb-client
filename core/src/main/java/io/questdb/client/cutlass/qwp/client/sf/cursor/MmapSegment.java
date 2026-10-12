@@ -695,6 +695,33 @@ public final class MmapSegment implements QuietCloseable {
      * just a CRC pass and a memcpy into the mapped region.
      */
     public long tryAppend(long payloadAddr, int payloadLen) {
+        long offset = tryWrite(payloadAddr, payloadLen);
+        if (offset != -1L) {
+            publishWritten();
+        }
+        return offset;
+    }
+
+    /**
+     * Makes every frame written by {@link #tryWrite} visible to the consumer: the
+     * I/O thread may read, and send, any frame below {@link #publishedOffset()}.
+     * Producer thread only.
+     */
+    void publishWritten() {
+        // Until this volatile write retires, the consumer cannot see any of the
+        // bytes tryWrite wrote, and once it does, every one of them is complete.
+        publishedCursor = appendCursor;
+    }
+
+    /**
+     * First half of {@link #tryAppend}: writes the frame and advances the append
+     * cursor and the frame count, but leaves {@link #publishedOffset()} where it
+     * was, so the consumer cannot see the frame until {@link #publishWritten}.
+     * {@link SegmentRing} publishes the frame's FSN in between, so the FSN is
+     * never behind a frame the I/O thread can send. Returns the frame's offset,
+     * or -1 with nothing written if it does not fit. Producer thread only.
+     */
+    long tryWrite(long payloadAddr, int payloadLen) {
         if (payloadLen < 0) {
             throw new IllegalArgumentException("negative payloadLen: " + payloadLen);
         }
@@ -720,11 +747,10 @@ public final class MmapSegment implements QuietCloseable {
         // Plain read + write of the volatile field. `frameCount++` would
         // trip the "non-atomic increment of volatile" inspection, but
         // single-writer invariant (only the producer thread mutates) makes
-        // the RMW race-free by design.
+        // the RMW race-free by design. It precedes the publishedCursor store
+        // in publishWritten, so a consumer that sees the frame's bytes also
+        // sees the frame count that makes its FSN discoverable.
         frameCount = frameCount + 1;
-        // Publish last. Until this volatile write retires, the consumer
-        // cannot see any of the bytes we just wrote.
-        publishedCursor = appendCursor;
         return offset;
     }
 

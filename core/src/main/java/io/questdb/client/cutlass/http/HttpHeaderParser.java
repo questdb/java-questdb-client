@@ -26,6 +26,7 @@ package io.questdb.client.cutlass.http;
 
 import io.questdb.client.std.LowerCaseUtf8SequenceObjHashMap;
 import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.Misc;
 import io.questdb.client.std.Mutable;
 import io.questdb.client.std.Numbers;
 import io.questdb.client.std.NumericException;
@@ -46,7 +47,8 @@ import static io.questdb.client.cutlass.http.HttpConstants.HEADER_CONTENT_TYPE;
 public class HttpHeaderParser implements Mutable, QuietCloseable, HttpRequestHeader {
     private final ObjectPool<DirectUtf8String> csPool;
     private final LowerCaseUtf8SequenceObjHashMap<DirectUtf8String> headers = new LowerCaseUtf8SequenceObjHashMap<>();
-    private final DirectUtf8Sink sink = new DirectUtf8Sink(0);
+    // Allocate inside the constructor's try so later initialization failures release the sink.
+    private final DirectUtf8Sink sink;
     private final DirectUtf8String temp = new DirectUtf8String();
     private final Utf8SequenceObjHashMap<DirectUtf8String> urlParams = new Utf8SequenceObjHashMap<>();
     protected boolean incomplete;
@@ -73,10 +75,17 @@ public class HttpHeaderParser implements Mutable, QuietCloseable, HttpRequestHea
     private DirectUtf8String statusCode;
 
     public HttpHeaderParser(int bufferSize, ObjectPool<DirectUtf8String> csPool) {
-        this.headerPtr = this._wptr = Unsafe.malloc(bufferSize, MemoryTag.NATIVE_HTTP_CONN);
-        this.hi = headerPtr + bufferSize;
-        this.csPool = csPool;
-        clear();
+        try {
+            this.sink = new DirectUtf8Sink(0);
+            this.csPool = csPool;
+            this.headerPtr = this._wptr = Unsafe.malloc(bufferSize, MemoryTag.NATIVE_HTTP_CONN);
+            this.hi = headerPtr + bufferSize;
+            clear();
+        } catch (Throwable th) {
+            // Avoid invoking an overridden close() during construction.
+            freeNative();
+            throw th;
+        }
     }
 
     @Override
@@ -108,10 +117,7 @@ public class HttpHeaderParser implements Mutable, QuietCloseable, HttpRequestHea
     @Override
     public void close() {
         clear();
-        if (headerPtr != 0) {
-            headerPtr = _wptr = hi = Unsafe.free(headerPtr, hi - headerPtr, MemoryTag.NATIVE_HTTP_CONN);
-        }
-        sink.close();
+        freeNative();
         csPool.clear();
     }
 
@@ -202,6 +208,13 @@ public class HttpHeaderParser implements Mutable, QuietCloseable, HttpRequestHea
             }
         }
         return p;
+    }
+
+    private void freeNative() {
+        if (headerPtr != 0) {
+            headerPtr = _wptr = hi = Unsafe.free(headerPtr, hi - headerPtr, MemoryTag.NATIVE_HTTP_CONN);
+        }
+        Misc.free(sink);
     }
 
     private void parseContentLength() {

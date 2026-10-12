@@ -101,7 +101,8 @@ public class CursorWebSocketSendLoopForegroundReconnectPolicyTest {
                         CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
                         0L,
                         0L,
-                        CursorWebSocketSendLoop.ReconnectPolicy.FOREGROUND);
+                        CursorWebSocketSendLoop.ReconnectPolicy.FOREGROUND,
+                        0L);
                 try {
                     seedMirror(loop, "sym0"); // non-empty mirror => swapClient runs the catch-up
                     appendFrame(engine, (byte) 1);
@@ -171,7 +172,8 @@ public class CursorWebSocketSendLoopForegroundReconnectPolicyTest {
                         CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
                         0L,
                         0L,
-                        CursorWebSocketSendLoop.ReconnectPolicy.FOREGROUND);
+                        CursorWebSocketSendLoop.ReconnectPolicy.FOREGROUND,
+                        0L);
                 try {
                     appendFrame(engine, (byte) 1);
                     loop.start();
@@ -228,7 +230,8 @@ public class CursorWebSocketSendLoopForegroundReconnectPolicyTest {
                         CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
                         0L,
                         0L,
-                        CursorWebSocketSendLoop.ReconnectPolicy.FOREGROUND);
+                        CursorWebSocketSendLoop.ReconnectPolicy.FOREGROUND,
+                        0L);
                 // Wire an error sink. Retrying is what the store-and-forward contract
                 // demands, but until dispatchRetriedEndpointPolicyFailure existed the retry
                 // was programmatically INVISIBLE: dispatchError ran only in the terminal

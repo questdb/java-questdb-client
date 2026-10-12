@@ -1178,7 +1178,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                         CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                         CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
                         0L, TimeUnit.HOURS.toMillis(1),
-                        CursorWebSocketSendLoop.ReconnectPolicy.ORPHAN);
+                        CursorWebSocketSendLoop.ReconnectPolicy.ORPHAN, 0L);
                 loopRef[0] = loop;
                 try {
                     seedMirror(loop, TestUtils.repeat("x", 200));
@@ -1332,7 +1332,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                 CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                 CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
                 0L, capGapWindowMillis,
-                CursorWebSocketSendLoop.ReconnectPolicy.ORPHAN);
+                CursorWebSocketSendLoop.ReconnectPolicy.ORPHAN, 0L);
     }
 
     private CursorWebSocketSendLoop newForegroundLoop(
@@ -1438,7 +1438,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                         CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                         CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
                         0L, 0L,
-                        CursorWebSocketSendLoop.ReconnectPolicy.ORPHAN);
+                        CursorWebSocketSendLoop.ReconnectPolicy.ORPHAN, 0L);
                 loopRef[0] = loop;
                 try {
                     seedMirror(loop, TestUtils.repeat("x", 200));
