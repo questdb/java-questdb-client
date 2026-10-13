@@ -130,6 +130,28 @@ public class QwpQueryClientDynamicCredentialTest {
     }
 
     @Test(timeout = 30_000)
+    public void testConnectPersistent401WithAMintingProviderIsRetriedOnlyOnce() throws Exception {
+        // C11 on egress, with a provider that hands out a new token on every pull, so only the one-retry limit
+        // ends the round: the changed-token check alone would retry for as long as the server keeps rejecting.
+        assertMemoryLeak(() -> {
+            AtomicInteger minted = new AtomicInteger();
+            try (TestWebSocketServer server = startServer();
+                 QwpQueryClient client = QwpQueryClient.fromConfig("ws::addr=localhost:" + server.getPort() + ";")
+                         .withBearerTokenProvider(() -> mint(minted))) {
+                server.setAuthorizationValidator(h -> 401);
+                try {
+                    client.connect();
+                    Assert.fail();
+                } catch (QwpAuthFailedException e) {
+                    Assert.assertEquals(401, e.getStatusCode());
+                }
+                Assert.assertEquals(Arrays.asList("Bearer T1", "Bearer T2"), headers(server));
+                Assert.assertEquals(2, minted.get());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testConnectStaleTokenIsRetriedOnceWithTheRefreshedToken() throws Exception {
         // C10 on egress: one 401 for the stale token, then the same endpoint with the refreshed one.
         assertMemoryLeak(() -> {
@@ -187,6 +209,45 @@ public class QwpQueryClientDynamicCredentialTest {
     }
 
     @Test(timeout = 30_000)
+    public void testFailedReconnectOnTheNextExecuteStaysRecoverable() throws Exception {
+        // Egress recovery (section 8.3) across consecutive failures: when the reconnect that the next execute()
+        // makes after a failed failover fails too, that operation reports it, and a later operation still
+        // reconnects instead of throwing "QwpQueryClient not connected" from then on.
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer a = startServer();
+                 TestWebSocketServer b = startServer();
+                 QwpQueryClient client = QwpQueryClient.fromConfig(
+                                 "ws::addr=localhost:" + a.getPort() + ",localhost:" + b.getPort()
+                                         + ";failover_backoff_initial_ms=0;")
+                         .withBearerTokenProvider(() -> "TOKEN")) {
+                client.connect();
+                b.setAuthorizationValidator(h -> 401);
+                a.close();
+                ResultCollector failover = new ResultCollector();
+                client.execute("SELECT 1", failover);
+                Assert.assertNotNull("the failover reconnect must fail", failover.error.get());
+                Assert.assertFalse(client.isConnected());
+
+                // B still rejects: the reconnect this operation makes fails as well, reported to the handler
+                ResultCollector reconnect = new ResultCollector();
+                client.execute("SELECT 1", reconnect);
+                String error = reconnect.error.get();
+                Assert.assertNotNull("the operation must fail", error);
+                Assert.assertTrue(error, error.startsWith("reconnect failed: auth-rejected"));
+                Assert.assertFalse(client.isConnected());
+
+                // B accepts again: the next operation reconnects
+                b.setAuthorizationValidator(null);
+                ResultCollector recovered = new ResultCollector();
+                client.execute("SELECT 1", recovered);
+                Assert.assertNull("execute() must reconnect: " + recovered.error.get(), recovered.error.get());
+                Assert.assertTrue(recovered.done.get() > 0);
+                Assert.assertTrue(client.isConnected());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testFailoverCredentialUnavailableNamesTheClass() throws Exception {
         assertMemoryLeak(() -> {
             AtomicInteger pulls = new AtomicInteger();
@@ -208,6 +269,33 @@ public class QwpQueryClientDynamicCredentialTest {
                 Assert.assertNotNull(failed.error.get());
                 Assert.assertTrue(failed.error.get(), failed.error.get().contains("credential-unavailable: IdP unreachable"));
                 Assert.assertEquals("no endpoint contacted on the failed failover", 0, b.upgradeRequestCount());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testFailoverPersistent401WithAMintingProviderIsRetriedOnlyOnce() throws Exception {
+        // C11 on the egress failover path, with a provider that hands out a new token on every pull: B rejects
+        // every token, and the failover reconnect retries it exactly once before the operation fails.
+        assertMemoryLeak(() -> {
+            AtomicInteger minted = new AtomicInteger();
+            try (TestWebSocketServer a = startServer();
+                 TestWebSocketServer b = startServer();
+                 QwpQueryClient client = QwpQueryClient.fromConfig(
+                                 "ws::addr=localhost:" + a.getPort() + ",localhost:" + b.getPort()
+                                         + ";failover_backoff_initial_ms=0;")
+                         .withBearerTokenProvider(() -> mint(minted))) {
+                b.setAuthorizationValidator(h -> 401);
+                client.connect();
+                Assert.assertEquals("Bearer T1", a.pollAuthorizationHeader(5, TimeUnit.SECONDS));
+                a.close();
+                ResultCollector result = new ResultCollector();
+                client.execute("SELECT 1", result);
+                Assert.assertNotNull("the failover reconnect must fail", result.error.get());
+                Assert.assertTrue(result.error.get(),
+                        result.error.get().contains("auth-rejected during failover reconnect"));
+                Assert.assertEquals(Arrays.asList("Bearer T2", "Bearer T3"), headers(b));
+                Assert.assertEquals(3, minted.get());
             }
         });
     }
@@ -293,6 +381,16 @@ public class QwpQueryClientDynamicCredentialTest {
             headers.add(h);
         }
         return headers;
+    }
+
+    // A provider that hands out a new token on every pull. It gives up after ten, so a client that kept
+    // retrying fails the test's assertions instead of spinning until the timeout.
+    private static String mint(AtomicInteger minted) {
+        int n = minted.incrementAndGet();
+        if (n > 10) {
+            throw TokenUnavailableException.permanent("test provider exhausted");
+        }
+        return "T" + n;
     }
 
     private static TestWebSocketServer startServer() throws IOException, InterruptedException {

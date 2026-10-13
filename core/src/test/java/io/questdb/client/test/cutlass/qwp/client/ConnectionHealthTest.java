@@ -34,6 +34,7 @@ import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
 import io.questdb.client.cutlass.qwp.client.QwpEgressMsgKind;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.test.cutlass.qwp.client.WebSocketDynamicCredentialTest.ErrorCollector;
@@ -217,6 +218,53 @@ public class ConnectionHealthTest {
                             Assert.assertTrue(errors.count("auth-rejected") > 0);
                             rejectWith.set(0);
                         }
+                    }
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 60_000)
+    public void testDeadlineSpanCarriesExternalFsnsAfterASymbolDictRecycle() throws Exception {
+        // C22 after a symbol-dict recycle: the rebuilt I/O loop arms the deadline, and the terminal error's span
+        // is on the sender's own FSN scale - what flushAndGetSequence() returned - not the rebuilt engine's.
+        assertMemoryLeak(() -> {
+            ErrorCollector errors = new ErrorCollector();
+            try (TestWebSocketServer server = startServer(new WebSocketDynamicCredentialTest.AckHandler())) {
+                Sender sender = Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address("localhost:" + server.getPort())
+                        .symbolDictResetThreshold(2)
+                        .reconnectInitialBackoffMillis(10)
+                        .reconnectMaxBackoffMillis(20)
+                        .closeFlushTimeoutMillis(0)
+                        .authFailureMaxDurationMillis(200)
+                        .errorHandler(errors)
+                        .build();
+                try {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    sender.table("t").symbol("s", "a").longColumn("v", 1).atNow();
+                    sender.table("t").symbol("s", "b").longColumn("v", 1).atNow();
+                    long acked = sender.flushAndGetSequence();
+                    Assert.assertTrue(sender.awaitAckedFsn(acked, 10_000));
+                    // every handshake from here on is rejected, the rebuilt loop's first connect included
+                    server.setRejectWithStatus(401, "Unauthorized");
+                    sender.table("t").symbol("s", "c").longColumn("v", 2).atNow(); // the recycle runs here
+                    Assert.assertEquals("setup: the dictionary must have been recycled", 1, ws.getSymbolDictEpoch());
+                    Assert.assertTrue("setup: the recycle must move the FSN epoch", ws.getFsnEpochBaseForTesting() > 0);
+                    long pending = sender.flushAndGetSequence();
+                    await(() -> errors.terminalCount() == 1, 10_000, "the deadline to fire on the rebuilt loop");
+                    SenderError terminal = terminal(errors);
+                    Assert.assertTrue(terminal.getServerMessage(),
+                            terminal.getServerMessage().contains("auth-rejected persisted for"));
+                    Assert.assertEquals("fromFsn must follow the acknowledged FSN the sender reported",
+                            acked + 1, terminal.getFromFsn());
+                    Assert.assertEquals("toFsn must be the last FSN the sender reported", pending, terminal.getToFsn());
+                } finally {
+                    server.setRejectWithStatus(0, null);
+                    try {
+                        sender.close();
+                    } catch (LineSenderException ignored) {
+                        // close() may rethrow the terminal
                     }
                 }
             }

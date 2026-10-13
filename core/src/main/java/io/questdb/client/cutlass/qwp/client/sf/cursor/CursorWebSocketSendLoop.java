@@ -2365,8 +2365,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         LOG.error("{} -- the sender stops; {}", message, engine.sfDir() != null
                 ? "unacknowledged rows stay in on-disk store-and-forward for a later sender or an orphan drain"
                 : "unacknowledged rows are lost when the sender closes (memory-only mode, no sf_dir)");
-        long fromFsn = engine.ackedFsn() + 1L;
-        long toFsn = Math.max(fromFsn, engine.publishedFsn());
+        // External FSNs, like every other SenderError span: after a symbol-dict recycle the engine numbers its
+        // frames from 0 again, and only externalFsnBase + raw matches what flushAndGetSequence() handed out.
+        long fromFsn = externalFsnBase + engine.ackedFsn() + 1L;
+        long toFsn = Math.max(fromFsn, externalFsnBase + engine.publishedFsn());
         SenderError err = new SenderError(
                 SenderError.Category.SECURITY_ERROR,
                 SenderError.Policy.TERMINAL,
