@@ -737,7 +737,10 @@ public class WebSocketDynamicCredentialTest {
                     Sender.builder(Sender.Transport.WEBSOCKET)
                             .address("localhost:" + server.getPort())
                             .initialConnectMode(Sender.InitialConnectMode.SYNC)
-                            .reconnectMaxDurationMillis(300)
+                            // The budget must fit the retries asserted below. Each backoff park is 10-40 ms
+                            // nominally, but macOS timer coalescing on a busy CI host wakes a timed park
+                            // ~100 ms late or more, which left room for only two pulls in a 300 ms budget.
+                            .reconnectMaxDurationMillis(2_000)
                             .reconnectInitialBackoffMillis(10)
                             .reconnectMaxBackoffMillis(20)
                             .httpTokenProvider(() -> {
