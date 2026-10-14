@@ -501,20 +501,14 @@ public final class QuestDBBuilder {
 
     /**
      * The housekeeper's settle cadence: {@code auto_flush_interval} when set,
-     * {@link #DEFAULT_SETTLE_INTERVAL_MILLIS} when unset, and the reap cadence
-     * when the interval is off. (The WebSocket transport rejects
-     * {@code auto_flush=off}, so the interval key is the only switch.)
+     * {@link #DEFAULT_SETTLE_INTERVAL_MILLIS} when unset. The WebSocket
+     * transport rejects both {@code auto_flush=off} and
+     * {@code auto_flush_interval=off}, so the interval is a number or unset.
+     * {@code housekeeperIntervalMillis} is currently unused.
      * Public only for the unit test, which lives in another package.
      */
     @TestOnly
     public static long resolveSettleIntervalMillis(ConfigView view, long housekeeperIntervalMillis) {
-        String interval = view.getStr("auto_flush_interval");
-        if (interval == null) {
-            return DEFAULT_SETTLE_INTERVAL_MILLIS;
-        }
-        if ("off".equalsIgnoreCase(interval)) {
-            return housekeeperIntervalMillis;
-        }
         // getLong uses the connect-string number syntax (underscore separators
         // included), the same one the Sender parse already accepted.
         return Math.max(1L, view.getLong("auto_flush_interval", DEFAULT_SETTLE_INTERVAL_MILLIS));

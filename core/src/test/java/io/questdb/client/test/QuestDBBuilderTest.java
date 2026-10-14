@@ -286,17 +286,13 @@ public class QuestDBBuilderTest {
 
     @Test
     public void testSettleIntervalFollowsAutoFlushInterval() {
-        // The WebSocket transport rejects auto_flush=off, so the interval key
-        // alone decides: unset -> the sender's 100 ms default, a number -> that
-        // number, "off" -> the housekeeper's reap cadence.
+        // The WebSocket transport rejects both auto_flush=off and
+        // auto_flush_interval=off, so the interval is unset (the sender's
+        // 100 ms default) or a number (underscore separators allowed).
         ConfigView dflt = new ConfigView(ConfigString.parse("ws::addr=127.0.0.1:1;"));
         Assert.assertEquals(100L, QuestDBBuilder.resolveSettleIntervalMillis(dflt, 5_000L));
         ConfigView explicit = new ConfigView(ConfigString.parse("ws::addr=127.0.0.1:1;auto_flush_interval=250;"));
         Assert.assertEquals(250L, QuestDBBuilder.resolveSettleIntervalMillis(explicit, 5_000L));
-        ConfigView intervalOff = new ConfigView(ConfigString.parse("ws::addr=127.0.0.1:1;auto_flush_interval=off;"));
-        Assert.assertEquals(5_000L, QuestDBBuilder.resolveSettleIntervalMillis(intervalOff, 5_000L));
-        ConfigView intervalOffUpper = new ConfigView(ConfigString.parse("ws::addr=127.0.0.1:1;auto_flush_interval=OFF;"));
-        Assert.assertEquals(5_000L, QuestDBBuilder.resolveSettleIntervalMillis(intervalOffUpper, 5_000L));
         ConfigView underscored = new ConfigView(ConfigString.parse("ws::addr=127.0.0.1:1;auto_flush_interval=1_000;"));
         Assert.assertEquals(1_000L, QuestDBBuilder.resolveSettleIntervalMillis(underscored, 5_000L));
     }
