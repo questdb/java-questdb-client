@@ -41,8 +41,8 @@ public final class QwpConnectionHealthTracker {
     private static final int MAX_CAUSE_DEPTH = 16;
     private final Object lock = new Object();
     private long failedRounds;
-    private ConnectionHealth.Failure lastFailure;
     private long lastConnectedAt = ConnectionHealth.NONE;
+    private ConnectionHealth.Failure lastFailure;
     private long outageSince;
     private volatile ConnectionHealth snapshot;
     private ConnectionHealth.State state = ConnectionHealth.State.CONNECTING;

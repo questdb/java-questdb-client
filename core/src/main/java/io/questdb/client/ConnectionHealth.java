@@ -42,8 +42,8 @@ public final class ConnectionHealth {
      */
     public static final long NONE = -1L;
     private final long failedRounds;
-    private final Failure lastFailure;
     private final long lastConnectedAtEpochMillis;
+    private final Failure lastFailure;
     private final long outageSinceEpochMillis;
     private final State state;
 
@@ -74,18 +74,18 @@ public final class ConnectionHealth {
     }
 
     /**
+     * Wall-clock time of the most recent successful upgrade, or {@link #NONE}.
+     */
+    public long getLastConnectedAtEpochMillis() {
+        return lastConnectedAtEpochMillis;
+    }
+
+    /**
      * The most recent failed connect round: its class, a sanitized message and its time. Kept after the
      * connection recovers. Null when no round has failed.
      */
     public Failure getLastFailure() {
         return lastFailure;
-    }
-
-    /**
-     * Wall-clock time of the most recent successful upgrade, or {@link #NONE}.
-     */
-    public long getLastConnectedAtEpochMillis() {
-        return lastConnectedAtEpochMillis;
     }
 
     /**
