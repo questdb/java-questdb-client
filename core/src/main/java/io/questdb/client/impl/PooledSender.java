@@ -153,7 +153,10 @@ public final class PooledSender implements Sender {
      * A row left in progress is cancelled, the slot is returned, and then a
      * {@link LineSenderException} is thrown so the mistake is visible. A
      * delegate that has latched a terminal error is retired instead of being
-     * returned, and the error is rethrown here.
+     * returned, and a new {@link LineSenderException} is thrown here whose
+     * cause is the delegate's error. A lease body that already threw the typed
+     * error keeps it as the primary exception, with close's wrapper
+     * suppressed.
      * <p>
      * Idempotent for sequential reuse: a stale generation (the lease was
      * already returned and the slot possibly re-borrowed) is a no-op. Concurrent
@@ -166,7 +169,7 @@ public final class PooledSender implements Sender {
      * instead, which commits the group. Without {@code flush_on_close}, only
      * the release that closes the window ships: it flushes, committing the
      * group. The window's age is measured from the first release that found
-     * work. A failed ship retires the slot and rethrows.
+     * work. A failed ship retires the slot and throws the wrapper described above.
      */
     @Override
     public void close() {
@@ -176,27 +179,39 @@ public final class PooledSender implements Sender {
         SenderPool pool = slot.pool();
         boolean cancelledRow = false;
         boolean recycle = false;
+        RuntimeException failure = null;
         try {
             // live(), not delegate(): re-validate the generation right before
             // touching the delegate, narrowing the duplicate-close race.
             Sender delegate = slot.live(generation);
-            delegate.checkError();
-            if (delegate.hasRowInProgress()) {
-                delegate.cancelRow();
-                cancelledRow = true;
+            try {
+                delegate.checkError();
+                if (delegate.hasRowInProgress()) {
+                    delegate.cancelRow();
+                    cancelledRow = true;
+                }
+                ship(pool, delegate);
+                recycle = true;
+            } catch (RuntimeException e) {
+                // The delegate rethrows its latched instance, which a lease
+                // body may already have thrown: wrap it below, after the
+                // slot is retired.
+                failure = e;
             }
-            ship(pool, delegate);
-            recycle = true;
         } finally {
             if (recycle) {
                 pool.giveBack(this);
             } else {
                 // The probe, the cancel or the ship threw: the delegate has
                 // latched an error, the flush failed, or the generation went
-                // stale. Retire it; the
-                // original throwable propagates once this finally returns.
+                // stale. Retire it; a wrapper around the original propagates
+                // once this finally returns.
                 pool.discardBroken(this);
             }
+        }
+        if (failure != null) {
+            String msg = failure.getMessage();
+            throw new LineSenderException("pooled sender close failed: " + msg, failure);
         }
         if (cancelledRow) {
             throw new LineSenderException("row in progress at close(): the row was cancelled and the sender returned to the pool; "

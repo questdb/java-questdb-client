@@ -55,12 +55,14 @@ public class SenderPoolCloseSemanticsTest {
             // A terminal latched between the probe and the cancel: model it as
             // cancelRow() itself failing. The lease must still come home.
             delegate.rowInProgress = true;
-            delegate.cancelError = new LineSenderException("latched during cancel");
+            LineSenderException original = new LineSenderException("latched during cancel");
+            delegate.cancelError = original;
             try {
                 first.close();
                 Assert.fail("close() must propagate the cancel failure");
             } catch (LineSenderException e) {
-                Assert.assertEquals("latched during cancel", e.getMessage());
+                Assert.assertSame(original, e.getCause());
+                Assert.assertTrue(e.getMessage().contains("latched during cancel"));
             }
             Assert.assertEquals("slot must be retired, not stranded", 0, pool.totalSize());
             Assert.assertEquals(1, delegate.closeCount.get());
@@ -118,12 +120,14 @@ public class SenderPoolCloseSemanticsTest {
         try (SenderPool pool = newPool(1, 1, built)) {
             Sender first = pool.borrow();
             RecordingSender delegate = built.get(0);
-            delegate.latchedError = new LineSenderException("latched terminal");
+            LineSenderException original = new LineSenderException("latched terminal");
+            delegate.latchedError = original;
             try {
                 first.close();
                 Assert.fail("close() must rethrow the latched terminal");
             } catch (LineSenderException e) {
-                Assert.assertEquals("latched terminal", e.getMessage());
+                Assert.assertSame(original, e.getCause());
+                Assert.assertTrue(e.getMessage().contains("latched terminal"));
             }
             Assert.assertEquals("dead slot must be retired", 0, pool.totalSize());
             Assert.assertEquals("retired delegate must be closed", 1, delegate.closeCount.get());

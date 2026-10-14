@@ -4,6 +4,7 @@ import io.questdb.client.LineSenderServerException;
 import io.questdb.client.QuestDB;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
+import io.questdb.client.impl.PooledSender;
 import io.questdb.client.test.QuestDBFlushOnCloseTest.FrameLog;
 import io.questdb.client.test.cutlass.qwp.client.QwpWireTestUtils;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
@@ -60,6 +61,7 @@ public class QuestDBCommitWindowTest {
                 log.awaitDataFrames(2, 5_000);
                 Assert.assertTrue(log.deferFlag(0));
                 Assert.assertFalse(log.deferFlag(1));
+                Assert.assertEquals(0, log.commitFrames());
             }
         }
     }
@@ -70,7 +72,7 @@ public class QuestDBCommitWindowTest {
         try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-            try (QuestDB db = QuestDB.connect(config(server.getPort(), "commit_rows=2;commit_interval_ms=60000;housekeeper_interval_ms=60000;")
+            try (QuestDB db = QuestDB.connect(config(server.getPort(), "commit_rows=2;commit_interval_ms=60000;housekeeper_interval_ms=60000;auto_flush_interval=60000;")
                     + "reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=50;")) {
                 try (Sender s = db.borrowSender()) {
                     s.table("t").longColumn("v", 1L).atNow();
@@ -128,22 +130,16 @@ public class QuestDBCommitWindowTest {
         try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-            try (QuestDB db = QuestDB.connect(config(server.getPort(), "commit_rows=1000;commit_interval_ms=60000;housekeeper_interval_ms=60000;")
+            try (QuestDB db = QuestDB.connect(config(server.getPort(), "commit_rows=1000;commit_interval_ms=60000;housekeeper_interval_ms=60000;auto_flush_interval=60000;")
                     + "reconnect_max_duration_millis=500;reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=50;")) {
-                // No try-with-resources: close() rethrows the instance the body threw, and
-                // the compiler-generated addSuppressed(self) would mask it with an
-                // IllegalArgumentException.
+                Sender retiredDelegate = null;
                 LineSenderServerException seen = null;
                 long deadline = System.currentTimeMillis() + 5_000;
                 for (long v = 1; seen == null && (v <= 2 || System.currentTimeMillis() < deadline); v++) {
-                    Sender s = db.borrowSender();
-                    try {
+                    // try-with-resources: the typed error stays primary, close()'s wrapper is suppressed
+                    try (Sender s = db.borrowSender()) {
+                        retiredDelegate = ((PooledSender) s).getDelegateForTesting();
                         s.table("t").longColumn("v", v).atNow();
-                    } catch (LineSenderServerException e) {
-                        seen = e;
-                    }
-                    try {
-                        s.close();
                     } catch (LineSenderServerException e) {
                         seen = e;
                     }
@@ -152,7 +148,8 @@ public class QuestDBCommitWindowTest {
                 Assert.assertNotNull("the latched terminal must surface on a later call on that slot", seen);
                 Assert.assertEquals("it names the rejected frame", 1L, seen.getServerError().getMessageSequence());
                 try (Sender s = db.borrowSender()) {
-                    Assert.assertNotNull("the pool replaces the retired slot", s);
+                    Assert.assertNotSame("the pool replaces the retired slot", retiredDelegate, ((PooledSender) s).getDelegateForTesting());
+                    s.table("t").longColumn("v", 4L).atNow();
                 }
             }
         }
@@ -170,15 +167,22 @@ public class QuestDBCommitWindowTest {
      * is nothing, shows both frames again.
      */
     private static final class RejectSecondFrameHandler implements TestWebSocketServer.WebSocketServerHandler {
-        private final byte rejectStatus;
         private int connections;
         private TestWebSocketServer.ClientHandler currentClient;
         private TestWebSocketServer.ClientHandler firstClient;
         private long nextSeq;
+        private final byte rejectStatus;
         private int secondConnectionDataFrames;
 
         RejectSecondFrameHandler(byte rejectStatus) {
             this.rejectStatus = rejectStatus;
+        }
+
+        void awaitSecondConnectionFrames(int atLeast, long timeoutMillis) throws InterruptedException {
+            long deadline = System.currentTimeMillis() + timeoutMillis;
+            while (secondConnectionDataFrames() < atLeast && System.currentTimeMillis() < deadline) {
+                Thread.sleep(10);
+            }
         }
 
         @Override
@@ -211,13 +215,6 @@ public class QuestDBCommitWindowTest {
 
         synchronized int secondConnectionDataFrames() {
             return secondConnectionDataFrames;
-        }
-
-        void awaitSecondConnectionFrames(int atLeast, long timeoutMillis) throws InterruptedException {
-            long deadline = System.currentTimeMillis() + timeoutMillis;
-            while (secondConnectionDataFrames() < atLeast && System.currentTimeMillis() < deadline) {
-                Thread.sleep(10);
-            }
         }
     }
 }
