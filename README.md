@@ -32,7 +32,7 @@ try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;")) {
                 .doubleColumn("price", 2615.54)
                 .doubleColumn("amount", 0.00044)
                 .atNow();
-        // close() flushes pending rows and returns the Sender to the pool.
+        // close() returns the Sender to the pool; rows ship by threshold or within auto_flush_interval.
     }
 }
 ```
@@ -98,8 +98,12 @@ snippets below borrow from its pools.
 
 ### Ingest Data
 
-Borrow a `Sender`, write rows, and close it. `close()` flushes pending rows and returns the sender to the pool — the
-underlying connection is only torn down when the `QuestDB` handle itself is closed.
+Borrow a `Sender`, write rows, and close it. Close releases, flush ships, drain waits: `close()` returns the sender to
+the pool and ships nothing by itself; rows go out when an auto-flush threshold trips on a later append or when the
+pool's housekeeper settles the idle slot, at most one `auto_flush_interval` later (100 ms by default). Borrowing per
+message is the intended pattern and batches like a sender held for the whole run. Call `flush()` to ship now and
+`drain()` to wait for the server. The underlying connection is only torn down when the `QuestDB` handle itself is
+closed.
 
 ```java
 import io.questdb.client.Sender;
@@ -110,15 +114,15 @@ try (Sender sender = db.borrowSender()) {
             .doubleColumn("price", 42_500.50)
             .longColumn("size", 100)
             .atNow();
-    // No explicit flush() needed: close() flushes for you.
+    // close() returns the sender; the pool ships the row by threshold or on its next settle.
 }
 ```
 
 ### Sending Batches of Rows
 
 The sender buffers rows and sends them in batches. For high throughput, write many rows on one borrowed sender and
-flush per batch rather than per row: each flush has a fixed cost, so batching raises throughput. `close()` flushes the
-final partial batch.
+flush per batch rather than per row: each flush has a fixed cost, so batching raises throughput. The final partial batch ships on the
+pool's next settle; call `flush()` before `close()` if you need it on the wire now.
 
 ```java
 try (Sender sender = db.borrowSender()) {
@@ -542,6 +546,7 @@ schema::key1=value1;key2=value2;
 | `acquire_timeout_ms`     | `5000`  | How long `borrowSender()`/`borrowQuery()` waits for a free slot                |
 | `idle_timeout_ms`        | `60000` | How long a pooled connection may stay idle before it is reaped                 |
 | `max_lifetime_ms`        | `1800000` | Maximum lifetime of a pooled connection before it is recycled                |
+| `flush_on_close`         | `off`   | `on` makes a pooled `close()` flush before releasing (one frame and one commit per close, the pre-1.4 behaviour). Note: "flush" means published to the store-and-forward ring, not acknowledged |
 
 ### Query routing keys
 

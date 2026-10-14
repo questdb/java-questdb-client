@@ -1410,6 +1410,7 @@ public class SenderPoolSfTest {
                 String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
                 Thread borrower = null;
                 try (SenderPool pool = new SenderPool(config, 1, 1, 60_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    pool.setFlushOnClose(true);
                     PooledSender lease = pool.borrow();
                     QwpWebSocketSender delegate = (QwpWebSocketSender) getDelegate(lease);
                     lease.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
