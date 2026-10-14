@@ -586,13 +586,14 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     }
 
     /**
-     * Ships the pending rows as a frame carrying the defer-commit flag: the
+     * Ships the pending rows as frames carrying the defer-commit flag: the
      * server appends them to its WAL writers and withholds both the commit and
-     * the acknowledgement until a later {@link #flush()} on this sender, which
-     * closes the group. Used by the connection pool's commit window. Only the
-     * WebSocket QWP transport supports deferred commits.
+     * the acknowledgement until the group is closed. A later {@link #flush()},
+     * {@link #close()}, or (outside transactional mode) an auto-flush that
+     * ships an unflagged frame closes the group. Used by the connection pool's
+     * commit window. Only the WebSocket QWP transport supports deferred commits.
      *
-     * @return the published frame sequence number, or {@code -1} if nothing was pending
+     * @return the highest FSN published by this call, or {@code -1} if nothing was pending
      * @throws UnsupportedOperationException on transports without deferred commits
      * @throws LineSenderException           if the transport has latched a terminal error
      */

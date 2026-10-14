@@ -461,6 +461,7 @@ public class QwpWebSocketSender implements Sender {
     // while no engine is retained.
     private volatile CursorSendEngine retainedEngine;
     private int pendingRowCount;
+    // Monotonic for the sender's life; reset() does not clear it. Counts rows whether or not they shipped.
     private long rowsAppended;
     private SenderProgressDispatcher progressDispatcher;
     // Async-delivery sink for ack-watermark advances. Default no-op; a
@@ -3253,11 +3254,6 @@ public class QwpWebSocketSender implements Sender {
         cachedTimestampNanosColumn = null;
     }
 
-    @Override
-    public long rowsAppended() {
-        return rowsAppended;
-    }
-
     /**
      * Advisory request to start a fresh symbol-dictionary epoch. Sets
      * {@link #manualResetRequested}; if no flush is in flight
@@ -3287,6 +3283,11 @@ public class QwpWebSocketSender implements Sender {
         if (pendingRowCount == 0) {
             armIfEligible();
         }
+    }
+
+    @Override
+    public long rowsAppended() {
+        return rowsAppended;
     }
 
     /**

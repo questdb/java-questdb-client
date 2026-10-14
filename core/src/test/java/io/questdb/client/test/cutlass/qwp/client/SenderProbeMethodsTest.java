@@ -41,6 +41,7 @@ public class SenderProbeMethodsTest {
                 Assert.assertEquals(2L, sender.rowsAppended());
 
                 log.awaitDataFrames(2, 5_000);
+                Assert.assertEquals("no separate commit message: the committing frame carries the rows", 0, log.commitFrames());
                 Assert.assertTrue("first frame carries FLAG_DEFER_COMMIT", log.deferFlag(0));
                 Assert.assertFalse("committing frame is unflagged", log.deferFlag(1));
             }
@@ -106,6 +107,13 @@ public class SenderProbeMethodsTest {
             sender.checkError();                            // default: no-op
             Assert.assertFalse(sender.hasRowInProgress());  // default: false
             Assert.assertEquals(0, sender.pendingRowCount()); // default: 0
+            Assert.assertEquals(0L, sender.rowsAppended());
+            Assert.assertFalse(sender.hasDeferredFrames());
+            try {
+                sender.flushDeferred();
+                Assert.fail("expected UnsupportedOperationException");
+            } catch (UnsupportedOperationException expected) {
+            }
         }
     }
 

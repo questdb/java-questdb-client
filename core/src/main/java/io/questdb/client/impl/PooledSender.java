@@ -368,13 +368,13 @@ public final class PooledSender implements Sender {
     }
 
     @Override
-    public long rowsAppended() {
-        return slot.live(generation).rowsAppended();
+    public void resetSymbolDictionary() {
+        slot.live(generation).resetSymbolDictionary();
     }
 
     @Override
-    public void resetSymbolDictionary() {
-        slot.live(generation).resetSymbolDictionary();
+    public long rowsAppended() {
+        return slot.live(generation).rowsAppended();
     }
 
     @Override
