@@ -25,6 +25,7 @@
 package io.questdb.client.impl;
 
 import io.questdb.client.Sender;
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
 import io.questdb.client.std.Decimal128;
@@ -44,9 +45,11 @@ import java.time.temporal.ChronoUnit;
  * {@link Sender} call to the reused {@link SenderSlot}'s delegate, validating
  * that generation first via {@link SenderSlot#live(long)}.
  * <p>
- * Behaviour difference from a raw Sender: {@link #close()} flushes the buffer
- * and returns the slot to the pool. The underlying Sender is only truly closed
- * when {@link io.questdb.client.QuestDB#close()} shuts the pool down.
+ * Behaviour difference from a raw Sender: {@link #close()} returns the slot to
+ * the pool and, by default, ships nothing; rows ship by threshold or by the
+ * pool's housekeeper. With {@code flush_on_close=on} close flushes first. The
+ * underlying Sender is only truly closed when
+ * {@link io.questdb.client.QuestDB#close()} shuts the pool down.
  * <p>
  * Because the slot is reused across borrows, this wrapper -- not the slot --
  * carries the lease identity. A stale handle (held after {@link #close()}, with
@@ -137,55 +140,57 @@ public final class PooledSender implements Sender {
     }
 
     /**
-     * Flushes pending rows and returns this lease's slot to the pool. Does not
-     * actually close the underlying {@link Sender}; that only happens when the
-     * owning {@code QuestDB} is closed. If the pool is already shutting down
-     * when this lease comes home, the underlying Sender is torn down here, on
-     * the calling thread (see {@link SenderPool#close()}).
+     * Returns this lease's slot to the pool. By default nothing is shipped:
+     * the rows stay in the slot's buffer and go out when an auto-flush
+     * threshold trips on a later append or when the pool's housekeeper settles
+     * the idle slot. With {@code flush_on_close=on} the rows are flushed first,
+     * as before 1.4. Does not close the underlying {@link Sender}; that only
+     * happens when the owning {@code QuestDB} is closed. If the pool is already
+     * shutting down when this lease comes home, the underlying Sender is torn
+     * down here, on the calling thread, which ships whatever it still buffers.
+     * <p>
+     * A row left in progress is cancelled, the slot is returned, and then a
+     * {@link LineSenderException} is thrown so the mistake is visible. A
+     * delegate that has latched a terminal error is retired instead of being
+     * returned, and the error is rethrown here.
      * <p>
      * Idempotent for sequential reuse: a stale generation (the lease was
-     * already returned and the slot possibly re-borrowed) is a no-op, and the
-     * pool re-checks the generation under its lock, so a duplicate close can
-     * never re-enqueue a slot a different borrower now owns. Concurrent
-     * double-close of ONE lease from two threads is outside the Sender
-     * threading contract; the flush below revalidates the lease via
-     * {@link SenderSlot#live(long)} so a racing duplicate typically fails with
-     * {@code IllegalStateException} rather than flushing into a re-borrowed
-     * slot, but two threads racing inside a single lease are not fully
-     * protected.
+     * already returned and the slot possibly re-borrowed) is a no-op.
      */
     @Override
     public void close() {
         if (generation != slot.generation()) {
             return;
         }
-        // Track normal completion rather than catching a specific throwable
-        // type. flush() can exit abnormally with an Error (AssertionError
-        // under -ea, OutOfMemoryError, ...) as well as a RuntimeException;
-        // keying the recycle decision off normal completion treats every
-        // abnormal exit as unrecyclable, which is the fail-safe default.
-        boolean flushed = false;
+        if (slot.pool().isFlushOnClose()) {
+            closeFlushing();
+            return;
+        }
+        boolean cancelledRow = false;
+        boolean recycle = false;
         try {
-            // live(), not delegate(): re-validating the generation right
-            // before the flush narrows the duplicate-close race documented
-            // above. A stale duplicate throws here, and the finally routes it
-            // to discardBroken, which drops it on the same stale-generation
-            // check under the pool lock.
-            slot.live(generation).flush();
-            flushed = true;
+            // live(), not delegate(): re-validate the generation right before
+            // touching the delegate, narrowing the duplicate-close race.
+            Sender delegate = slot.live(generation);
+            delegate.checkError();
+            if (delegate.hasRowInProgress()) {
+                delegate.cancelRow();
+                cancelledRow = true;
+            }
+            recycle = true;
         } finally {
-            if (flushed) {
+            if (recycle) {
                 slot.pool().giveBack(this);
             } else {
-                // flush() did not complete normally. Sender does not clear its
-                // buffer on flush failure (see Sender Javadoc), and WebSocket
-                // transport latches the failure for good. Either way the slot
-                // is unsafe to recycle: the next borrower would inherit the
-                // failed rows or a dead connection. The original throwable
-                // propagates naturally once this finally returns -- no explicit
-                // rethrow needed.
+                // The probe or the cancel threw: the delegate has latched an
+                // error (or the generation went stale). Retire it; the
+                // original throwable propagates once this finally returns.
                 slot.pool().discardBroken(this);
             }
+        }
+        if (cancelledRow) {
+            throw new LineSenderException("row in progress at close(): the row was cancelled and the sender returned to the pool; "
+                    + "finish rows with at(), atNow() or cancelRow() before close()");
         }
     }
 
@@ -418,5 +423,23 @@ public final class PooledSender implements Sender {
 
     SenderSlot slot() {
         return slot;
+    }
+
+    /**
+     * The {@code flush_on_close=on} path: today's close. Ships the buffer, then
+     * returns the slot; any abnormal exit of the flush retires the slot.
+     */
+    private void closeFlushing() {
+        boolean flushed = false;
+        try {
+            slot.live(generation).flush();
+            flushed = true;
+        } finally {
+            if (flushed) {
+                slot.pool().giveBack(this);
+            } else {
+                slot.pool().discardBroken(this);
+            }
+        }
     }
 }

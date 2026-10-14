@@ -137,8 +137,15 @@ public interface QuestDB extends Closeable {
     /**
      * Borrows a {@link Sender} from the pool. The caller MUST call
      * {@link Sender#close()} on the returned instance to release it back to
-     * the pool. {@code close()} on a pooled Sender flushes pending rows
-     * before returning to the pool; a real disconnect only happens at
+     * the pool. Close releases, flush ships, drain waits: {@code close()} on a
+     * pooled Sender returns the slot and by default ships nothing, the rows go
+     * out when an auto-flush threshold trips on a later append or when the
+     * housekeeper settles the idle slot (at most one {@code auto_flush_interval}
+     * later). Call {@link Sender#flush()} to ship now and
+     * {@link Sender#drain(long)} to wait for the server. Set
+     * {@code flush_on_close=on} to have {@code close()} flush, as before 1.4.
+     * Note that in this client "flush" means published to the store-and-forward
+     * ring, not acknowledged by the server. A real disconnect only happens at
      * {@link #close()} on this {@code QuestDB} handle.
      * <p>
      * Allocation: zero at steady state -- the returned instance is a

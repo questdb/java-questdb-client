@@ -251,6 +251,7 @@ public final class SenderPool implements AutoCloseable {
     // production; lifecycle tests use it to acknowledge distinct retries
     // without inspecting transient Condition queue membership.
     private volatile Runnable creationWaitRetryHook;
+    private volatile boolean flushOnClose;
     // Slots removed from `all` whose delegate is still releasing its flock.
     // They keep reserving capacity (and their slotInUse mark) until the
     // flock drops, so the cap check and the slot allocator stay consistent
@@ -1238,7 +1239,10 @@ public final class SenderPool implements AutoCloseable {
                     throw new LineSenderException("QuestDB handle is closed");
                 }
                 if (!available.isEmpty()) {
-                    SenderSlot s = available.pollFirst();
+                    // LIFO: the most recently returned slot is the warmest and
+                    // its buffer is the fullest; cold slots sink to the head
+                    // where reapIdle() visits them first.
+                    SenderSlot s = available.pollLast();
                     // Stamp a fresh lease id under the lock so the PooledSender
                     // wrapper handed out can be told apart from any prior,
                     // now-stale borrow of the same slot.
@@ -1953,6 +1957,16 @@ public final class SenderPool implements AutoCloseable {
     }
 
     /**
+     * Whether a pooled {@code close()} ships the lease's rows before releasing
+     * the slot (the pre-1.4 behaviour) or only releases it. Off by default:
+     * rows then ship when an auto-flush threshold trips on a later append, or
+     * when the housekeeper settles the idle slot.
+     */
+    public boolean isFlushOnClose() {
+        return flushOnClose;
+    }
+
+    /**
      * Snapshot of the number of SF slots currently retired because a
      * delegate {@code close()} returned with the slot flock still held after
      * an I/O or manager worker did not stop. Each leaked slot lowers the
@@ -1970,6 +1984,10 @@ public final class SenderPool implements AutoCloseable {
         } finally {
             lock.unlock();
         }
+    }
+
+    public void setFlushOnClose(boolean flushOnClose) {
+        this.flushOnClose = flushOnClose;
     }
 
     private SenderSlot createSlot(IntFunction<Sender> factory, int slotIndex) {
