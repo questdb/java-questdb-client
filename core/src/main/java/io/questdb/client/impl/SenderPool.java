@@ -251,6 +251,8 @@ public final class SenderPool implements AutoCloseable {
     // production; lifecycle tests use it to acknowledge distinct retries
     // without inspecting transient Condition queue membership.
     private volatile Runnable creationWaitRetryHook;
+    private volatile long commitIntervalNanos;
+    private volatile int commitRows;
     private volatile boolean flushOnClose;
     // Slots removed from `all` whose delegate is still releasing its flock.
     // They keep reserving capacity (and their slotInUse mark) until the
@@ -1764,6 +1766,7 @@ public final class SenderPool implements AutoCloseable {
             Throwable fatal = null;
             try {
                 lease.flush();
+                lease.slot().markCommitted(lease.slot().delegate().rowsAppended());
                 flushed = true;
             } catch (Exception ignored) {
                 // Transient (ring full, recycle in flight) or terminal: the
@@ -1861,10 +1864,10 @@ public final class SenderPool implements AutoCloseable {
 
     /**
      * What {@link #settleIdle()} looks for in an idle slot. Phase A: buffered
-     * rows. Phase B adds deferred frames awaiting their commit.
+     * rows and deferred frames awaiting their commit.
      */
     private static boolean hasUnshippedWork(Sender delegate) {
-        return delegate.pendingRowCount() > 0;
+        return delegate.pendingRowCount() > 0 || delegate.hasDeferredFrames();
     }
 
     /**
@@ -2093,6 +2096,21 @@ public final class SenderPool implements AutoCloseable {
         }
     }
 
+    /** Age per commit window in nanoseconds, or 0 when no window is configured. */
+    public long commitIntervalNanos() {
+        return commitIntervalNanos;
+    }
+
+    /** Rows per commit window, or 0 when no window is configured. */
+    public int commitRows() {
+        return commitRows;
+    }
+
+    /** Whether a commit window is configured: pooled closes ship deferred frames and commit per window. */
+    public boolean hasCommitWindow() {
+        return commitRows > 0;
+    }
+
     /**
      * Whether a pooled {@code close()} ships the lease's rows before releasing
      * the slot (the pre-1.4 behaviour) or only releases it. Off by default:
@@ -2121,6 +2139,21 @@ public final class SenderPool implements AutoCloseable {
         } finally {
             lock.unlock();
         }
+    }
+
+    /**
+     * Configures the commit window. Both values positive enable it; {@code 0, 0}
+     * disables it. Must be set before the first borrow; the pool's delegates
+     * must have been built with {@code transaction=on} so that auto-flush
+     * inside a lease ships deferred frames too (QuestDBBuilder injects it).
+     */
+    public void setCommitWindow(int commitRows, long commitIntervalMillis) {
+        if ((commitRows > 0) != (commitIntervalMillis > 0)) {
+            throw new IllegalArgumentException("commit window needs both rows and interval, or neither: rows="
+                    + commitRows + ", intervalMillis=" + commitIntervalMillis);
+        }
+        this.commitRows = commitRows;
+        this.commitIntervalNanos = TimeUnit.MILLISECONDS.toNanos(commitIntervalMillis);
     }
 
     public void setFlushOnClose(boolean flushOnClose) {

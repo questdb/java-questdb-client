@@ -48,6 +48,11 @@ final class SenderSlot {
     private final Sender delegate;
     private final SenderPool pool;
     private final int slotIndex;
+    // Commit-window state, guarded by the lease: only the thread holding the
+    // slot's current lease (a borrower or the settle step) reads or writes it.
+    // 0 = no group open since the last commit.
+    private long groupOpenedAtNanos;
+    private long rowsAppendedAtLastCommit;
     // Index in SenderPool.retiredSlots, or -1 while this slot is not retired.
     // Guarded by the pool lock. The pool maintains this index across swap
     // removals so the delegate's release callback can recover this exact slot
@@ -109,6 +114,15 @@ final class SenderSlot {
         return delegate;
     }
 
+    /**
+     * Records that everything appended so far is committed. Called after a
+     * committing {@code flush()} on the delegate, by a release or by the settle.
+     */
+    void markCommitted(long rowsAppended) {
+        rowsAppendedAtLastCommit = rowsAppended;
+        groupOpenedAtNanos = 0L;
+    }
+
     void markIdleAt(long nowMillis) {
         idleSinceMillis = nowMillis;
     }
@@ -127,5 +141,22 @@ final class SenderSlot {
 
     int slotIndex() {
         return slotIndex;
+    }
+
+    /**
+     * Whether the commit window should close at this release. Rows in the
+     * window are counted from appends, so the answer does not depend on
+     * whether rows shipped at close or by auto-flush. The first release that
+     * finds work after a commit opens the group's clock.
+     */
+    boolean windowCloses(long rowsAppended, boolean deferredOpen, long nowNanos, int commitRows, long commitIntervalNanos) {
+        long inWindow = rowsAppended - rowsAppendedAtLastCommit;
+        if (inWindow <= 0 && !deferredOpen) {
+            return false;
+        }
+        if (groupOpenedAtNanos == 0L) {
+            groupOpenedAtNanos = nowNanos;
+        }
+        return inWindow >= commitRows || nowNanos - groupOpenedAtNanos >= commitIntervalNanos;
     }
 }

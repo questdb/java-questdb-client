@@ -158,16 +158,19 @@ public final class PooledSender implements Sender {
      * already returned and the slot possibly re-borrowed) is a no-op. Concurrent
      * double-close of ONE lease from two threads is outside the Sender
      * threading contract.
+     * <p>
+     * With a commit window ({@link SenderPool#setCommitWindow}) and
+     * {@code flush_on_close=on}, each close ships a deferred frame; the close
+     * that fills the window (rows appended or age of the open group) flushes
+     * instead, which commits the group. Without {@code flush_on_close} the
+     * window still closes on that release, but nothing is shipped otherwise.
      */
     @Override
     public void close() {
         if (generation != slot.generation()) {
             return;
         }
-        if (slot.pool().isFlushOnClose()) {
-            closeFlushing();
-            return;
-        }
+        SenderPool pool = slot.pool();
         boolean cancelledRow = false;
         boolean recycle = false;
         try {
@@ -179,15 +182,16 @@ public final class PooledSender implements Sender {
                 delegate.cancelRow();
                 cancelledRow = true;
             }
+            ship(pool, delegate);
             recycle = true;
         } finally {
             if (recycle) {
-                slot.pool().giveBack(this);
+                pool.giveBack(this);
             } else {
                 // The probe or the cancel threw: the delegate has latched an
                 // error (or the generation went stale). Retire it; the
                 // original throwable propagates once this finally returns.
-                slot.pool().discardBroken(this);
+                pool.discardBroken(this);
             }
         }
         if (cancelledRow) {
@@ -263,12 +267,17 @@ public final class PooledSender implements Sender {
 
     @Override
     public void flush() {
-        slot.live(generation).flush();
+        Sender delegate = slot.live(generation);
+        delegate.flush();
+        slot.markCommitted(delegate.rowsAppended());
     }
 
     @Override
     public long flushAndGetSequence() {
-        return slot.live(generation).flushAndGetSequence();
+        Sender delegate = slot.live(generation);
+        long sequence = delegate.flushAndGetSequence();
+        slot.markCommitted(delegate.rowsAppended());
+        return sequence;
     }
 
     @Override
@@ -443,20 +452,31 @@ public final class PooledSender implements Sender {
     }
 
     /**
-     * The {@code flush_on_close=on} path: today's close. Ships the buffer, then
-     * returns the slot; any abnormal exit of the flush retires the slot.
+     * What a release ships, per the pool's settings:
+     * <ul>
+     *   <li>commit window set and closing now: {@code flush()}, which ships
+     *       pending rows unflagged and commits the group;</li>
+     *   <li>otherwise {@code flush_on_close=on}: {@code flushDeferred()} with a
+     *       window, {@code flush()} without one;</li>
+     *   <li>otherwise nothing: rows wait for a threshold or the settle.</li>
+     * </ul>
      */
-    private void closeFlushing() {
-        boolean flushed = false;
-        try {
-            slot.live(generation).flush();
-            flushed = true;
-        } finally {
-            if (flushed) {
-                slot.pool().giveBack(this);
-            } else {
-                slot.pool().discardBroken(this);
+    private void ship(SenderPool pool, Sender delegate) {
+        if (pool.hasCommitWindow()) {
+            boolean closes = slot.windowCloses(delegate.rowsAppended(), delegate.hasDeferredFrames(),
+                    System.nanoTime(), pool.commitRows(), pool.commitIntervalNanos());
+            if (closes) {
+                delegate.flush();
+                slot.markCommitted(delegate.rowsAppended());
+                return;
             }
+            if (pool.isFlushOnClose()) {
+                delegate.flushDeferred();
+            }
+            return;
+        }
+        if (pool.isFlushOnClose()) {
+            delegate.flush();
         }
     }
 }
