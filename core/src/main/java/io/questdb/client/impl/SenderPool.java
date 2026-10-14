@@ -1709,6 +1709,71 @@ public final class SenderPool implements AutoCloseable {
         this.afterStartupRecoveryJoinHook = afterJoinHook;
     }
 
+    /**
+     * Ships rows left behind in idle slots. A pooled {@code close()} does not
+     * flush by default, and auto-flush thresholds are only evaluated on append,
+     * so a slot nobody borrows again would keep its last rows until the pool
+     * closes. The housekeeper calls this on its settle cadence.
+     * <p>
+     * Each candidate slot is taken off the free list under the pool lock and
+     * stamped with a fresh generation, which makes it an internal lease: a
+     * borrower arriving meanwhile takes another slot or waits, and
+     * {@link #close()} waits for it like any outstanding lease. The flush runs
+     * outside the lock. A delegate whose flush failed is probed with
+     * {@link Sender#checkError()}: a latched error retires the slot, anything
+     * else keeps the rows for the next settle. The slot's idle clock is not
+     * touched, so reaping is unaffected.
+     *
+     * @return the number of slots whose flush completed
+     */
+    public int settleIdle() {
+        if (closed) {
+            return 0;
+        }
+        ArrayList<PooledSender> leases = null;
+        lock.lock();
+        try {
+            if (closed) {
+                return 0;
+            }
+            Iterator<SenderSlot> it = available.iterator();
+            while (it.hasNext()) {
+                SenderSlot s = it.next();
+                if (hasUnshippedWork(s.delegate())) {
+                    it.remove();
+                    s.bumpGeneration();
+                    if (leases == null) {
+                        leases = new ArrayList<>();
+                    }
+                    leases.add(new PooledSender(s, s.generation()));
+                }
+            }
+        } finally {
+            lock.unlock();
+        }
+        if (leases == null) {
+            return 0;
+        }
+        int settled = 0;
+        for (int i = 0, n = leases.size(); i < n; i++) {
+            PooledSender lease = leases.get(i);
+            boolean flushed = false;
+            try {
+                lease.flush();
+                flushed = true;
+            } catch (Throwable ignored) {
+                // Transient (ring full, recycle in flight) or terminal: the
+                // requeue below tells them apart with the probe.
+            } finally {
+                requeueSettled(lease);
+            }
+            if (flushed) {
+                settled++;
+            }
+        }
+        return settled;
+    }
+
     private void stopFailedStartupRecoveryDriver(Thread recoveryThread) {
         if (recoveryThread == null || recoveryThread == Thread.currentThread()) {
             return;
@@ -1776,6 +1841,53 @@ public final class SenderPool implements AutoCloseable {
                     this,
                     TimeUnit.MILLISECONDS.toNanos(RECOVERY_RETRY_INTERVAL_MILLIS));
         }
+    }
+
+    /**
+     * What {@link #settleIdle()} looks for in an idle slot. Phase A: buffered
+     * rows. Phase B adds deferred frames awaiting their commit.
+     */
+    private static boolean hasUnshippedWork(Sender delegate) {
+        return delegate.pendingRowCount() > 0;
+    }
+
+    /**
+     * Returns a slot held by {@link #settleIdle()} to the free list without
+     * resetting its idle clock, or retires it when the delegate has latched an
+     * error or the pool is shutting down. Mirrors {@link #giveBack} for the
+     * internal lease.
+     */
+    private void requeueSettled(PooledSender lease) {
+        SenderSlot s = lease.slot();
+        boolean healthy = false;
+        try {
+            s.delegate().checkError();
+            healthy = true;
+        } catch (Throwable ignored) {
+            // latched: retire below
+        }
+        if (!healthy) {
+            retireLease(lease, " during settle");
+            return;
+        }
+        lock.lock();
+        try {
+            if (!closed) {
+                if (s.generation() != lease.generation()) {
+                    return;
+                }
+                s.bumpGeneration();
+                assert !available.contains(s) : "slot already present in available deque on requeueSettled";
+                available.addLast(s);
+                slotReleased.signal();
+                return;
+            }
+        } finally {
+            lock.unlock();
+        }
+        // Pool is shutting down: tear the delegate down here, on the settle
+        // thread, exactly as giveBack does for a borrower's lease.
+        retireLease(lease, " during settle after pool close");
     }
 
     /**
