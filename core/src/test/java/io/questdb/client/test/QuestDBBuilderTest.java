@@ -334,7 +334,14 @@ public class QuestDBBuilderTest {
         QuestDBBuilder b = QuestDB.builder()
                 .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=on;commit_rows=10;");
         try (QuestDB ignored = b.build()) {
-            Assert.assertTrue(b.ingestConfigForTest().contains("transaction=on;"));
+            Assert.assertTrue(b.ingestConfigForTest().startsWith("ws::transaction=on;"));
+        }
+        QuestDBBuilder explicitOn = QuestDB.builder()
+                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=on;commit_rows=10;transaction=on;");
+        try (QuestDB ignored = explicitOn.build()) {
+            String resolved = explicitOn.ingestConfigForTest();
+            Assert.assertEquals(resolved, resolved.indexOf("transaction=on;"), resolved.lastIndexOf("transaction=on;"));
+            Assert.assertTrue(resolved.contains("transaction=on;"));
         }
         QuestDBBuilder none = QuestDB.builder()
                 .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;");
@@ -358,6 +365,29 @@ public class QuestDBBuilderTest {
         assertBuildRejected(
                 "ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=off;commit_interval_ms=10;",
                 "flush_on_close");
+    }
+
+    @Test
+    public void testBuildTwiceWithoutWindowStaysWindowless() {
+        QuestDBBuilder b = QuestDB.builder()
+                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;");
+        for (int i = 0; i < 2; i++) {
+            try (QuestDB ignored = b.build()) {
+                Assert.assertEquals(0, b.poolConfigSnapshotForTest().get("commit_rows"));
+                Assert.assertEquals(0L, b.poolConfigSnapshotForTest().get("commit_interval_ms"));
+                Assert.assertFalse(b.ingestConfigForTest().contains("transaction="));
+            }
+        }
+    }
+
+    @Test
+    public void testCommitWindowStringKeysBelowOneAreRejected() {
+        assertBuildRejected(
+                "ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=on;commit_rows=0;",
+                "commit_rows");
+        assertBuildRejected(
+                "ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=on;commit_interval_ms=-5;",
+                "commit_interval_ms");
     }
 
     @Test

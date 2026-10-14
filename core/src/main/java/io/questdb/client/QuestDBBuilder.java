@@ -73,10 +73,10 @@ public final class QuestDBBuilder {
     private static final int UNSET = -1;
 
     private long acquireTimeoutMillis = UNSET;
-    // Optional ingest-side async callbacks. Null -> each pooled Sender uses its
-    // loud-not-silent default. Applied to every Sender the pool builds.
     private long commitIntervalMillis = UNSET;
     private int commitRows = UNSET;
+    // Optional ingest-side async callbacks. Null -> each pooled Sender uses its
+    // loud-not-silent default. Applied to every Sender the pool builds.
     private SenderConnectionListener connectionListener;
     private BackgroundDrainerListener drainerListener;
     private SenderErrorHandler errorHandler;
@@ -90,6 +90,8 @@ public final class QuestDBBuilder {
     private long queryCloseTimeoutMillis = UNSET;
     private int queryPoolMax = UNSET;
     private int queryPoolMin = UNSET;
+    private int resolvedCommitRows;
+    private long resolvedCommitIntervalMillis;
     private String resolvedIngestConfig;
     private int senderPoolMax = UNSET;
     private int senderPoolMin = UNSET;
@@ -280,15 +282,26 @@ public final class QuestDBBuilder {
         if (flushOnClose == null) {
             flushOnClose = view.getBool("flush_on_close", false);
         }
-        resolvePoolInt(commitRows, "commit_rows", view, UNSET, this::setCommitRowsResolved);
-        resolvePoolLong(commitIntervalMillis, "commit_interval_ms", view, UNSET, this::setCommitIntervalResolved);
-        boolean windowSet = commitRows != UNSET || commitIntervalMillis != UNSET;
-        if (windowSet) {
-            if (commitRows == UNSET) {
-                commitRows = DEFAULT_COMMIT_ROWS;
+        int windowRows = commitRows;
+        if (windowRows == UNSET && view.has("commit_rows")) {
+            windowRows = view.getInt("commit_rows", UNSET);
+            if (windowRows < 1) {
+                throw new IllegalArgumentException("commit_rows must be >= 1, got " + windowRows);
             }
-            if (commitIntervalMillis == UNSET) {
-                commitIntervalMillis = DEFAULT_COMMIT_INTERVAL_MILLIS;
+        }
+        long windowIntervalMillis = commitIntervalMillis;
+        if (windowIntervalMillis == UNSET && view.has("commit_interval_ms")) {
+            windowIntervalMillis = view.getLong("commit_interval_ms", UNSET);
+            if (windowIntervalMillis < 1) {
+                throw new IllegalArgumentException("commit_interval_ms must be >= 1, got " + windowIntervalMillis);
+            }
+        }
+        if (windowRows != UNSET || windowIntervalMillis != UNSET) {
+            if (windowRows == UNSET) {
+                windowRows = DEFAULT_COMMIT_ROWS;
+            }
+            if (windowIntervalMillis == UNSET) {
+                windowIntervalMillis = DEFAULT_COMMIT_INTERVAL_MILLIS;
             }
             if (!flushOnClose) {
                 throw new IllegalArgumentException(
@@ -306,11 +319,13 @@ public final class QuestDBBuilder {
                 ingestConfig = injectAfterSchema(ingestConfig, "transaction=on;");
             }
         } else {
-            commitRows = 0;
-            commitIntervalMillis = 0;
+            windowRows = 0;
+            windowIntervalMillis = 0;
         }
+        resolvedCommitRows = windowRows;
+        resolvedCommitIntervalMillis = windowIntervalMillis;
         resolvedIngestConfig = ingestConfig;
-        long settleIntervalMillis = resolveSettleIntervalMillis(view, housekeeperIntervalMillis, commitIntervalMillis);
+        long settleIntervalMillis = resolveSettleIntervalMillis(view, housekeeperIntervalMillis, windowIntervalMillis);
 
         return new QuestDBImpl(
                 ingestConfig,
@@ -330,8 +345,8 @@ public final class QuestDBBuilder {
                 drainerListener,
                 flushOnClose,
                 settleIntervalMillis,
-                commitRows,
-                commitIntervalMillis
+                windowRows,
+                windowIntervalMillis
         );
     }
 
@@ -533,6 +548,11 @@ public final class QuestDBBuilder {
         return this;
     }
 
+    @TestOnly
+    public String ingestConfigForTest() {
+        return resolvedIngestConfig;
+    }
+
     /**
      * Snapshot of the resolved pool config, keyed by connect-string key name.
      * Valid after {@link #build()} has run pool-key resolution. Drives the
@@ -551,21 +571,11 @@ public final class QuestDBBuilder {
         m.put("max_lifetime_ms", maxLifetimeMillis);
         m.put("housekeeper_interval_ms", housekeeperIntervalMillis);
         m.put("flush_on_close", flushOnClose);
-        m.put("commit_rows", commitRows);
-        m.put("commit_interval_ms", commitIntervalMillis);
+        m.put("commit_rows", resolvedCommitRows);
+        m.put("commit_interval_ms", resolvedCommitIntervalMillis);
         return m;
     }
 
-    @TestOnly
-    public String ingestConfigForTest() {
-        return resolvedIngestConfig;
-    }
-
-    // Inject a non-blocking async initial connect right after the schema
-    // separator so lazy_connect's build never blocks or fail-fast on a down
-    // server. Only used when the user set no initial_connect_retry of their own
-    // (resolveLazyConnect rejects an explicit blocking mode rather than silently
-    // overriding it), so placement is immaterial -- there is no competing value.
     // Inserts a key right after the "ws::" / "wss::" schema separator so the
     // sender parse sees it as part of the ingest config.
     private static String injectAfterSchema(String config, String keyValue) {
@@ -573,10 +583,14 @@ public final class QuestDBBuilder {
         return config.substring(0, sep) + keyValue + config.substring(sep);
     }
 
+    // Inject a non-blocking async initial connect right after the schema
+    // separator so lazy_connect's build never blocks or fail-fast on a down
+    // server. Only used when the user set no initial_connect_retry of their own
+    // (resolveLazyConnect rejects an explicit blocking mode rather than silently
+    // overriding it), so placement is immaterial -- there is no competing value.
     private static String withDefaultAsyncConnect(String config) {
-        int sep = config.indexOf("::");
-        // sep >= 0: fromConfig() validated a ws/wss schema, so "::" is present.
-        return config.substring(0, sep + 2) + "initial_connect_retry=async;" + config.substring(sep + 2);
+        // fromConfig() validated a ws/wss schema, so "::" is present.
+        return injectAfterSchema(config, "initial_connect_retry=async;");
     }
 
     /**
@@ -616,13 +630,5 @@ public final class QuestDBBuilder {
             return; // explicit builder call wins
         }
         setter.accept(view.has(key) ? view.getLong(key, UNSET) : dflt);
-    }
-
-    private void setCommitIntervalResolved(long millis) {
-        this.commitIntervalMillis = millis;
-    }
-
-    private void setCommitRowsResolved(int rows) {
-        this.commitRows = rows;
     }
 }
