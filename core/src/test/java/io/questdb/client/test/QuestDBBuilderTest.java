@@ -29,6 +29,8 @@ import io.questdb.client.QuestDB;
 import io.questdb.client.QuestDBBuilder;
 import io.questdb.client.Query;
 import io.questdb.client.Sender;
+import io.questdb.client.impl.ConfigString;
+import io.questdb.client.impl.ConfigView;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
 import org.junit.Test;
@@ -239,6 +241,50 @@ public class QuestDBBuilderTest {
                 "wss::addr=127.0.0.1:1;tls_roots=/ca.pem;tls_verify=unsafe_off;sender_pool_min=0;query_pool_min=0;",
                 "tls_roots cannot be combined with tls_verify=unsafe_off"
         );
+    }
+
+    @Test
+    public void testFlushOnCloseBuilderCallOverridesString() {
+        QuestDBBuilder b = QuestDB.builder()
+                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=off;")
+                .flushOnClose(true);
+        try (QuestDB ignored = b.build()) {
+            Assert.assertEquals(Boolean.TRUE, b.poolConfigSnapshotForTest().get("flush_on_close"));
+        }
+    }
+
+    @Test
+    public void testFlushOnCloseKeyParsedAndSnapshotted() {
+        QuestDBBuilder on = QuestDB.builder()
+                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=on;");
+        try (QuestDB ignored = on.build()) {
+            Assert.assertEquals(Boolean.TRUE, on.poolConfigSnapshotForTest().get("flush_on_close"));
+        }
+        QuestDBBuilder dflt = QuestDB.builder()
+                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;");
+        try (QuestDB ignored = dflt.build()) {
+            Assert.assertEquals("default is off", Boolean.FALSE, dflt.poolConfigSnapshotForTest().get("flush_on_close"));
+        }
+    }
+
+    @Test
+    public void testFlushOnCloseRejectsInvalidValue() {
+        assertBuildRejected(
+                "ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=maybe;",
+                "flush_on_close");
+    }
+
+    @Test
+    public void testSettleIntervalFollowsAutoFlushInterval() {
+        // The WebSocket transport rejects auto_flush=off, so the interval key
+        // alone decides: unset -> the sender's 100 ms default, a number -> that
+        // number, "off" -> the housekeeper's reap cadence.
+        ConfigView dflt = new ConfigView(ConfigString.parse("ws::addr=127.0.0.1:1;"));
+        Assert.assertEquals(100L, QuestDBBuilder.resolveSettleIntervalMillis(dflt, 5_000L));
+        ConfigView explicit = new ConfigView(ConfigString.parse("ws::addr=127.0.0.1:1;auto_flush_interval=250;"));
+        Assert.assertEquals(250L, QuestDBBuilder.resolveSettleIntervalMillis(explicit, 5_000L));
+        ConfigView intervalOff = new ConfigView(ConfigString.parse("ws::addr=127.0.0.1:1;auto_flush_interval=off;"));
+        Assert.assertEquals(5_000L, QuestDBBuilder.resolveSettleIntervalMillis(intervalOff, 5_000L));
     }
 
     @Test

@@ -60,6 +60,10 @@ public final class QuestDBBuilder {
     static final int DEFAULT_POOL_MAX = 4;
     static final int DEFAULT_POOL_MIN = 1;
     static final long DEFAULT_QUERY_CLOSE_TIMEOUT_MILLIS = 5_000;
+    // Settle cadence when auto_flush_interval is not set: the WebSocket
+    // sender's own default auto-flush interval, so rows left in an idle slot
+    // wait no longer than rows in a busy one.
+    static final long DEFAULT_SETTLE_INTERVAL_MILLIS = 100;
 
     // Every valid pool value is >= 0, so -1 unambiguously marks "not set
     // explicitly". The public pool setters are the only writers of these
@@ -72,6 +76,8 @@ public final class QuestDBBuilder {
     private SenderConnectionListener connectionListener;
     private BackgroundDrainerListener drainerListener;
     private SenderErrorHandler errorHandler;
+    // null = not set explicitly; the string key or the default applies.
+    private Boolean flushOnClose;
     private long housekeeperIntervalMillis = UNSET;
     private HttpTokenProvider httpTokenProvider;
     private String config;
@@ -167,6 +173,21 @@ public final class QuestDBBuilder {
     }
 
     /**
+     * Whether {@code close()} on a borrowed sender flushes its rows before
+     * returning the slot. Off by default: close releases, flush ships, drain
+     * waits, and rows left in a slot ship within one auto-flush interval. On
+     * restores the pre-1.4 behaviour, one frame and one WAL commit per close,
+     * which is the slow path for applications that borrow per message. In this
+     * client "flush" means published to the store-and-forward ring, not
+     * acknowledged by the server; use {@link Sender#drain(long)} for that.
+     * Overrides {@code flush_on_close} in the config string.
+     */
+    public QuestDBBuilder flushOnClose(boolean flushOnClose) {
+        this.flushOnClose = flushOnClose;
+        return this;
+    }
+
+    /**
      * Builds the {@link QuestDB} handle. Validates both connect strings up
      * front -- so a malformed config fails here even when both pools have
      * {@code min == 0} and nothing connects -- then eagerly creates {@code min}
@@ -222,6 +243,10 @@ public final class QuestDBBuilder {
         resolvePoolLong(idleTimeoutMillis, "idle_timeout_ms", view, DEFAULT_IDLE_TIMEOUT_MILLIS, this::idleTimeoutMillis);
         resolvePoolLong(maxLifetimeMillis, "max_lifetime_ms", view, DEFAULT_MAX_LIFETIME_MILLIS, this::maxLifetimeMillis);
         resolvePoolLong(housekeeperIntervalMillis, "housekeeper_interval_ms", view, DEFAULT_HOUSEKEEPER_INTERVAL_MILLIS, this::housekeeperIntervalMillis);
+        if (flushOnClose == null) {
+            flushOnClose = view.getBool("flush_on_close", false);
+        }
+        long settleIntervalMillis = resolveSettleIntervalMillis(view, housekeeperIntervalMillis);
 
         return new QuestDBImpl(
                 ingestConfig,
@@ -239,8 +264,8 @@ public final class QuestDBBuilder {
                 errorHandler,
                 connectionListener,
                 drainerListener,
-                false,
-                housekeeperIntervalMillis
+                flushOnClose,
+                settleIntervalMillis
         );
     }
 
@@ -459,6 +484,7 @@ public final class QuestDBBuilder {
         m.put("idle_timeout_ms", idleTimeoutMillis);
         m.put("max_lifetime_ms", maxLifetimeMillis);
         m.put("housekeeper_interval_ms", housekeeperIntervalMillis);
+        m.put("flush_on_close", flushOnClose);
         return m;
     }
 
@@ -471,6 +497,27 @@ public final class QuestDBBuilder {
         int sep = config.indexOf("::");
         // sep >= 0: fromConfig() validated a ws/wss schema, so "::" is present.
         return config.substring(0, sep + 2) + "initial_connect_retry=async;" + config.substring(sep + 2);
+    }
+
+    /**
+     * The housekeeper's settle cadence: {@code auto_flush_interval} when set,
+     * {@link #DEFAULT_SETTLE_INTERVAL_MILLIS} when unset, and the reap cadence
+     * when the interval is off. (The WebSocket transport rejects
+     * {@code auto_flush=off}, so the interval key is the only switch.)
+     * Public only for the unit test, which lives in another package.
+     */
+    @TestOnly
+    public static long resolveSettleIntervalMillis(ConfigView view, long housekeeperIntervalMillis) {
+        String interval = view.getStr("auto_flush_interval");
+        if (interval == null) {
+            return DEFAULT_SETTLE_INTERVAL_MILLIS;
+        }
+        if ("off".equalsIgnoreCase(interval)) {
+            return housekeeperIntervalMillis;
+        }
+        // The Sender parse ran on the same string before this point and already
+        // rejected a non-positive or non-numeric value.
+        return Math.max(1L, Long.parseLong(interval.trim()));
     }
 
     private static void requireWebSocketSchema(CharSequence config, String role) {

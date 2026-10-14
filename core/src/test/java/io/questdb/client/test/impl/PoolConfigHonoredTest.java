@@ -60,6 +60,7 @@ public class PoolConfigHonoredTest {
             expected.put("idle_timeout_ms", 4321L);
             expected.put("max_lifetime_ms", 98765L);
             expected.put("housekeeper_interval_ms", 222L);
+            expected.put("flush_on_close", Boolean.TRUE);
 
             StringBuilder cfg = new StringBuilder("ws::addr=127.0.0.1:1;");
             for (Map.Entry<String, Object> e : expected.entrySet()) {
