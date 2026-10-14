@@ -515,9 +515,9 @@ public final class QuestDBBuilder {
         if ("off".equalsIgnoreCase(interval)) {
             return housekeeperIntervalMillis;
         }
-        // The Sender parse ran on the same string before this point and already
-        // rejected a non-positive or non-numeric value.
-        return Math.max(1L, Long.parseLong(interval.trim()));
+        // getLong uses the connect-string number syntax (underscore separators
+        // included), the same one the Sender parse already accepted.
+        return Math.max(1L, view.getLong("auto_flush_interval", DEFAULT_SETTLE_INTERVAL_MILLIS));
     }
 
     private static void requireWebSocketSchema(CharSequence config, String role) {

@@ -265,6 +265,16 @@ public class QuestDBBuilderTest {
         try (QuestDB ignored = dflt.build()) {
             Assert.assertEquals("default is off", Boolean.FALSE, dflt.poolConfigSnapshotForTest().get("flush_on_close"));
         }
+        QuestDBBuilder t = QuestDB.builder()
+                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=true;");
+        try (QuestDB ignored = t.build()) {
+            Assert.assertEquals(Boolean.TRUE, t.poolConfigSnapshotForTest().get("flush_on_close"));
+        }
+        QuestDBBuilder f = QuestDB.builder()
+                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=false;");
+        try (QuestDB ignored = f.build()) {
+            Assert.assertEquals(Boolean.FALSE, f.poolConfigSnapshotForTest().get("flush_on_close"));
+        }
     }
 
     @Test
@@ -285,6 +295,10 @@ public class QuestDBBuilderTest {
         Assert.assertEquals(250L, QuestDBBuilder.resolveSettleIntervalMillis(explicit, 5_000L));
         ConfigView intervalOff = new ConfigView(ConfigString.parse("ws::addr=127.0.0.1:1;auto_flush_interval=off;"));
         Assert.assertEquals(5_000L, QuestDBBuilder.resolveSettleIntervalMillis(intervalOff, 5_000L));
+        ConfigView intervalOffUpper = new ConfigView(ConfigString.parse("ws::addr=127.0.0.1:1;auto_flush_interval=OFF;"));
+        Assert.assertEquals(5_000L, QuestDBBuilder.resolveSettleIntervalMillis(intervalOffUpper, 5_000L));
+        ConfigView underscored = new ConfigView(ConfigString.parse("ws::addr=127.0.0.1:1;auto_flush_interval=1_000;"));
+        Assert.assertEquals(1_000L, QuestDBBuilder.resolveSettleIntervalMillis(underscored, 5_000L));
     }
 
     @Test
