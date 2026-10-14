@@ -238,7 +238,9 @@ public final class QuestDBBuilder {
                 httpTokenProvider,
                 errorHandler,
                 connectionListener,
-                drainerListener
+                drainerListener,
+                false,
+                housekeeperIntervalMillis
         );
     }
 
