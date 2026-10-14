@@ -295,8 +295,7 @@ public class RefreshingTokenProviderTest {
 
             // 401 for the current token: a fetch starts now and the caller waits for it
             Thread rejecter = start(() -> provider.onTokenRejected("T1", 401));
-            await(() -> scheduler.peek() != null && scheduler.peek().delayNanos == 0, 5_000,
-                    "the forced fetch to be scheduled");
+            await(scheduler::isNextImmediate, 5_000, "the forced fetch to be scheduled");
             scheduler.runNext();
             rejecter.join(5_000);
             Assert.assertFalse("onTokenRejected must return once the forced fetch completes", rejecter.isAlive());
@@ -318,8 +317,7 @@ public class RefreshingTokenProviderTest {
 
             // a forced fetch that returns the same token is a normal success
             rejecter = start(() -> provider.onTokenRejected("T2", 401));
-            await(() -> scheduler.peek() != null && scheduler.peek().delayNanos == 0, 5_000,
-                    "the second forced fetch to be scheduled");
+            await(scheduler::isNextImmediate, 5_000, "the second forced fetch to be scheduled");
             scheduler.runNext();
             rejecter.join(5_000);
             Assert.assertFalse(rejecter.isAlive());
@@ -349,8 +347,7 @@ public class RefreshingTokenProviderTest {
             // exactly at expires_at - handout_floor the token is unusable: the caller must get a new one
             AtomicReference<Object> got = new AtomicReference<>();
             Thread caller = start(() -> got.set(provider.getToken().toString()));
-            await(() -> scheduler.peek() != null && scheduler.peek().delayNanos == 0, 5_000,
-                    "the cold caller to start a fetch");
+            await(scheduler::isNextImmediate, 5_000, "the cold caller to start a fetch");
             Assert.assertNull("nothing may be handed out before the fetch", got.get());
             scheduler.runNext();
             caller.join(5_000);
@@ -378,8 +375,7 @@ public class RefreshingTokenProviderTest {
                     got.set(e);
                 }
             });
-            await(() -> scheduler.peek() != null && scheduler.peek().delayNanos == 0, 5_000,
-                    "the cold caller to start a fetch");
+            await(scheduler::isNextImmediate, 5_000, "the cold caller to start a fetch");
             scheduler.runNext(); // the source returns T1 again, still inside the floor
             Assert.assertNull("an unusable token must not be handed out", got.get());
             clock.advanceMillis(1_001); // cold_wait elapses

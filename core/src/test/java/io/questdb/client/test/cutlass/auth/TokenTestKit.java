@@ -126,6 +126,15 @@ public final class TokenTestKit {
             return t;
         }
 
+        /**
+         * Whether the earliest live task was scheduled with no delay. Reads the task list once: the provider cancels
+         * a task before it schedules its replacement, so a second {@link #peek()} can find no task at all.
+         */
+        public boolean isNextImmediate() {
+            Task next = peek();
+            return next != null && next.delayNanos == 0;
+        }
+
         public boolean isShutdown() {
             return shutdown;
         }
