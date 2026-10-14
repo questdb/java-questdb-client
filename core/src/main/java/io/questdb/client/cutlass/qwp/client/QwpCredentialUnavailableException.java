@@ -40,10 +40,8 @@ import io.questdb.client.cutlass.line.LineSenderException;
  * the RUNNING store-and-forward drainer retries it indefinitely with capped backoff under
  * Invariant B -- the IdP becomes reachable again, or the user completes an interactive
  * sign-in -- holding the un-acked rows in SF meanwhile, and NEVER bounds it by
- * {@code reconnectMaxDurationMillis} (that would drop a producer store-and-forward promised
- * to keep alive). Only the optional authentication-outage deadline
- * ({@code auth_failure_max_duration_millis}, off by default) latches a terminal once such an
- * outage has lasted that long. During initialization the classification
+ * {@code reconnectMaxDurationMillis} nor latches a terminal (either would drop a producer
+ * store-and-forward promised to keep alive). During initialization the classification
  * decides: {@link #isRetryable()} is true only when the provider threw a
  * {@link TokenUnavailableException} marked retryable, which a SYNC initial connect keeps
  * retrying within its budget; any other provider failure is permanent and fails startup

@@ -570,9 +570,8 @@ How failures are handled:
 - At startup, `initial_connect_retry=off` (the default) fails if no token can be obtained; `on` keeps retrying a
   retryable provider failure within `reconnect_max_duration_millis`; `async` retries in the background.
 - Once connected, a store-and-forward sender rides out credential outages and `401`/`403` indefinitely, buffering
-  rows and reporting each failure to the error handler. Set `auth_failure_max_duration_millis` to make the sender
-  fail instead once such an outage lasts that long. With `sf_dir`, unacknowledged rows then stay on disk for a
-  later sender or an orphan drain; without it, they are lost when the sender closes.
+  rows and reporting each failure to the error handler and in its connection health. It never fails on its own: an
+  application that prefers a hard failure watches the health or the error handler, and closes the sender itself.
 
 ### Connection Health
 
@@ -640,7 +639,6 @@ schema::key1=value1;key2=value2;
 | `azure_resource`     |              | `token_provider=azure`: application ID URI or client ID of the QuestDB app registration |
 | `azure_client_id`    |              | `token_provider=azure`: client ID of a user-assigned managed identity or workload identity |
 | `azure_credential`   | `default`    | `token_provider=azure`: `default`, `managed_identity`, `workload_identity` or `environment` |
-| `auth_failure_max_duration_millis` | _(none)_ | Ingest: fail the sender once a credential outage or `401`/`403` lasts this long |
 
 ### Pool keys (facade only)
 

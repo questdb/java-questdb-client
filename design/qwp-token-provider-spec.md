@@ -1,9 +1,10 @@
 # QWP dynamic bearer credentials: cross-language specification
 
-**Status:** v0.5, ready for implementation. All decisions are resolved (§12).
+**Status:** v0.6, ready for implementation. All decisions are resolved (§12).
 
 **Changes:**
 
+- **v0.6:** the optional authentication-outage deadline (§8.5, D7) is withdrawn. It made an established sender terminal on a transient outage, which store-and-forward forbids, and the role-reject and transport rounds of a failover counted toward it. An application that prefers a hard failure closes the sender itself, guided by the error channel and the connection health (§8.5).
 - **v0.5:** a result whose token expires within `handout_floor` of its receipt is a retryable failed fetch whose message names `handout_floor` (§4, C2, C6). Before, it counted as a success that could never be handed out, so every caller waited out `cold_wait` for an error that named no cause.
 - **v0.4:** `azure_credential` selects one Azure credential deterministically (§7.1), so the library itself reports an unreachable managed-identity endpoint (retryable) apart from a misconfigured credential (permanent) (§7.5, D10). A discovery chain's "no credential available" stays permanent, so a host without a credential still fails fast, and the client warns once that the chain does not ride out an endpoint outage. This resolves the conflict between §4 and §7.5 over an unreachable managed-identity endpoint.
 - **v0.3:** decisions resolved, with D8 (§8.1) and D9 (§7.2) added; Java binding decided (Appendix B).
@@ -350,7 +351,7 @@ Further rules:
 
 **Retry indefinitely**
 
-- **Meaning:** retry with capped exponential backoff for as long as the client is open, unless the optional deadline in §8.5 is configured. Store-and-forward MUST NOT drop a live producer.
+- **Meaning:** retry with capped exponential backoff for as long as the client is open. Store-and-forward MUST NOT drop a live producer, so no setting bounds these retries (§8.5).
 - **Reporting:** each retried failure MUST be reported to the application's error channel, not only to logs. The report is a retriable, security-category error that names the failure class. The failure SHOULD also be visible in the connection health (§8.4).
 
 **Ride out, then quarantine**
@@ -388,24 +389,13 @@ Rules:
 - **Pools and facades** SHOULD expose an aggregate: the number of connections in each `state`, the oldest `outage_since`, and the most recent `last_failure`.
 - **Query clients** use the same fields. They connect on demand, so for them `reconnecting` means the last connect or failover reconnect failed and the next operation will try again.
 
-### 8.5 Optional authentication-outage deadline [D7]
+### 8.5 No authentication-outage deadline [D7]
 
-Some applications prefer a hard failure to an authentication outage that lasts indefinitely, much as Kafka's `delivery.timeout.ms` bounds how long a record may wait. A client MAY offer this. If it does, it MUST use this key and these semantics.
+A client MUST NOT offer a setting that makes an established ingress sender terminal once an authentication-class failure has lasted some time.
 
-| Key | Values | Default |
-|---|---|---|
-| `auth_failure_max_duration_millis` | a positive duration in milliseconds | not set (no deadline) |
-
-- **Which failures count.** Only *authentication-class* failures: credential-unavailable, and auth-rejected (`401` or `403`).
-- **Where it applies.** Ingress senders, in the phases where §8.3 retries an authentication-class failure indefinitely: `async` initialization and established. It does not apply to orphan drains, which have their own rule, or to egress, which already fails the operation.
-- **The clock.** It starts at the first authentication-class failure of the current outage. Only a successful upgrade resets it.
-- **When it fires.** The sender becomes terminal when a connect round fails with an authentication-class failure and the clock has reached the configured duration.
-  - Rounds that fail for other reasons neither reset the clock nor fire the deadline.
-  - So a network outage that follows a single `401` does not fire it.
-  - And a cluster that alternates between `401` and network errors cannot postpone it forever.
-- **What happens then.**
-  - The error names the failure class and the elapsed time. It is reported as terminal through the error handler and raised from later producer calls.
-  - Unacknowledged data stays in on-disk store-and-forward storage, for a later sender or an orphan drain. In memory-only mode it is lost when the sender closes.
+- **Why.** Such a deadline latches a terminal on a transient outage, which store-and-forward forbids. An unreachable identity provider, a throttling token endpoint, or a failover window around a rejected token all recover, and the rows wait in store-and-forward meanwhile. A clock that keeps running through the role-reject and transport rounds of a failover would also end a producer that never had a lasting authentication problem.
+- **What applications use instead.** Every failed round is reported to the error channel as a retriable, security-category error that names its class (§8.3), and the connection health (§8.4) shows how long the sender has been failing (`outage_since`) and why (`last_failure`). An application that prefers a hard failure closes the sender itself.
+- **The rows.** With on-disk store-and-forward, closing the sender leaves the unacknowledged rows for a later sender or an orphan drain. In memory-only mode they are lost when the sender closes.
 
 ## 9. Security
 
@@ -448,7 +438,7 @@ Every client that implements this specification SHOULD pass these scenarios. The
 | C19 | Registry lifecycle | Lease release, linger, and re-acquiring a lease during the linger period. |
 | C20 | Redaction | A sentinel token never appears in logs, errors, events, string representations or health snapshots, across C4, C10, C11 and a malformed source response. |
 | C21 | Connection health | The snapshot moves through `connecting`, `connected`, `reconnecting` (with `401` and credential-unavailable failures) and back to `connected`. `outage_since` and `failed_rounds` reset on recovery; `last_failure` is kept. No credential appears in it. |
-| C22 | Authentication-outage deadline | Unset: retries continue indefinitely. Set: the sender becomes terminal only on an authentication-class round once the duration has passed. Other failures in between neither reset nor fire it. A successful upgrade resets it. Orphan drains are unaffected, and on-disk data remains. |
+| C22 | No authentication-outage deadline | An established sender rides out credential-unavailable and `401` rounds, with role rejects in between, without becoming terminal, and delivers the buffered rows once the credential is back. |
 | C23 | `WWW-Authenticate` challenge | A plain `401`, and a `401` with `Bearer error="invalid_token"`, both trigger the retry in §8.2. A `401` whose Bearer challenge carries another error does not. |
 | C24 | Azure credential selection | With `azure_credential=managed_identity`, an unreachable managed-identity endpoint is retryable, so `sync` initialization retries it within its budget; an identity that is not assigned is permanent, so initialization fails fast. With `default`, a chain that finds nothing is permanent, and the warning in §7.5 is logged once, unless the platform's selector names one credential. |
 
@@ -457,7 +447,7 @@ Every client that implements this specification SHOULD pass these scenarios. The
 - **QWP ingress and egress specs** (`qwp-ingress-websocket.md`, `qwp-egress-websocket.md`):
   - their statement that "authentication errors are terminal at any host" is replaced by §8 **[D1]**;
   - their authentication sections should point to §6.
-- **Connect-string reference:** it should reserve the keys in §7.1, and `auth_failure_max_duration_millis` (§8.5).
+- **Connect-string reference:** it should reserve the keys in §7.1.
 - **OIDC device-flow token store** (`design/oidc-token-persistence.md`): unaffected. An `OidcDeviceAuth` instance remains a valid provider supplied by the application.
 
 ## 12. Decisions
@@ -472,7 +462,7 @@ All decisions below are resolved. Changing one after the Java implementation mer
 | D4 | Whether to reject `token_provider` on `ws::` | Yes. |
 | D5 | A zero-dependency `azure_imds` provider | The name is reserved; it is implemented only on demand. |
 | D6 | Whether SYNC initialization retries retryable provider failures | Yes. |
-| D7 | Whether to offer the authentication-outage deadline, and its key | Yes, as an optional setting that is off by default: `auth_failure_max_duration_millis`. |
+| D7 | Whether to offer an authentication-outage deadline | No. It would make an established sender terminal on a transient outage, which store-and-forward forbids (§8.5). Applications watch the error channel and the connection health instead. Versions 0.2 to 0.5 offered it as `auth_failure_max_duration_millis`. |
 | D8 | How to classify an exception from an application-supplied provider that is not a token-unavailable error | Permanent (§8.1). |
 | D9 | Whether `token_provider` applies to non-QWP schemas | No; `wss::` only (§7.2). |
 | D10 | How the `azure` provider classifies "no credential available", and how to make it resilient | `azure_credential` selects one credential, so the library itself reports an unreachable endpoint (retryable) apart from a misconfigured credential (permanent). In a discovery chain, "no credential available" stays permanent. An IMDS outage looks the same (§7.5), but only `sync` initialization depends on the difference (§8.3), and making it retryable would make every host without a credential wait out `reconnect_max_duration_millis` (5 minutes by default, plus up to one `cold_wait`) before failing. Resilience is therefore opt-in through deterministic mode, which Azure Identity recommends in production anyway, and a chain warns once when it starts. This follows Azure Identity's split between fail-fast discovery and a resilient single credential (Appendix D). A local host check, as Google's library makes, was not adopted: Azure's SMBIOS asset tag identifies only the public cloud, not sovereign clouds or Azure Local. |
@@ -540,7 +530,6 @@ New types live in `io.questdb.client.cutlass.auth` unless noted.
 | Registry | `TokenProviderRegistry`: process-wide (`global()`), hands out ref-counted `Lease`s, closes a provider `registry_linger` after its last lease |
 | `azure` provider | The new reactor module `azure/`, artifact `org.questdb:questdb-client-azure` (the core client is `org.questdb:questdb-client`), package `io.questdb.client.azure`, classes `AzureTokenProviderFactory` and `AzureTokenSource`. It depends on `azure-identity` through `azure-sdk-bom`, keeps the Java 8 floor, and is released together with the client. |
 | Connection health | `io.questdb.client.ConnectionHealth`, an immutable snapshot. Returned by `Sender.health()` (a default method; non-QWP senders throw `UnsupportedOperationException`), by `QwpQueryClient.health()`, and as a `ConnectionHealth.Aggregate` by `QuestDB.health()`. |
-| Authentication-outage deadline | Key `auth_failure_max_duration_millis`; builder method `authFailureMaxDurationMillis(long)` |
 | Credential selection | Key `azure_credential`, validated by `TokenProviderSpec` and handled by `AzureTokenProviderFactory`. `default` builds `DefaultAzureCredential`; the other values build `ManagedIdentityCredential`, `WorkloadIdentityCredential` or `EnvironmentCredential` directly, never touching the process environment. Setting `AZURE_TOKEN_CREDENTIALS` in the configuration passed to `DefaultAzureCredentialBuilder.configuration(...)` is not enough: in `azure-identity` 1.18 it selects the credential but keeps the chain's endpoint check, because each credential re-reads the selector from the process-wide configuration. A credential that cannot be built for lack of configuration fails every fetch as permanent. `AzureTokenSource` classifies the same way whatever the credential: it finds a managed identity's "not assigned" reason in a nested cause, and names the socket-level cause of a network failure, but never echoes another nested message (§9). |
 
 **Python notes:**

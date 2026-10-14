@@ -1115,8 +1115,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 OrphanScanner.QUARANTINE_SLOT_INFIX;
         private final ObjList<String> hosts = new ObjList<>();
         private final IntList ports = new IntList();
-        // Optional authentication-outage deadline (spec section 8.5); 0 = not set, the default.
-        private long authFailureMaxDurationMillis;
         private long authTimeoutMillis = QwpWebSocketSender.DEFAULT_AUTH_TIMEOUT_MS;
         private int autoFlushBytes = PARAMETER_NOT_SET_EXPLICITLY;
         private int autoFlushIntervalMillis = PARAMETER_NOT_SET_EXPLICITLY;
@@ -1357,34 +1355,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 throw new LineSenderException("connect_timeout must be > 0: ").put(millis);
             }
             this.connectTimeoutMillis = millis;
-            return this;
-        }
-
-        /**
-         * Optional authentication-outage deadline (design/qwp-token-provider-spec.md, section 8.5): the sender
-         * becomes terminal when a connect round fails with an authentication-class failure - the token provider
-         * could not supply a credential, or an endpoint answered {@code 401}/{@code 403} - once that outage has
-         * lasted this long. Not set by default: such outages are retried indefinitely while store-and-forward
-         * keeps the rows. The clock starts at the first authentication-class failure of an outage and only a
-         * successful upgrade resets it; failures of other classes neither reset nor fire it. Applies while the
-         * sender is established and during an {@code async} initial connect; orphan drains are unaffected. When
-         * it fires, the error names the failure class and the elapsed time, goes to the error handler as
-         * terminal, and is thrown from later producer calls. With {@code sf_dir} set, unacknowledged rows stay
-         * in on-disk store-and-forward for a later sender or an orphan drain; in memory-only mode (no
-         * {@code sf_dir}) they are lost when the sender closes. WebSocket transport only. Connect-string key:
-         * {@code auth_failure_max_duration_millis}.
-         *
-         * @param millis the deadline, {@code > 0}
-         * @return this instance for method chaining
-         */
-        public LineSenderBuilder authFailureMaxDurationMillis(long millis) {
-            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
-                throw new LineSenderException("auth_failure_max_duration_millis is only supported for WebSocket transport");
-            }
-            if (millis <= 0) {
-                throw new LineSenderException("auth_failure_max_duration_millis must be > 0: ").put(millis);
-            }
-            this.authFailureMaxDurationMillis = millis;
             return this;
         }
 
@@ -2234,8 +2204,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * {@code reconnect_max_duration_millis} - after which a pull that keeps failing on later reconnects is
          * retried indefinitely, with the buffered rows held in store-and-forward, until a token is available
          * again. A token outage does not terminate a running WebSocket sender, just as a persistent transport
-         * reconnect failure does not (store-and-forward Invariant B), unless
-         * {@link #authFailureMaxDurationMillis(long)} is set.
+         * reconnect failure does not (store-and-forward Invariant B): an application that prefers a hard failure
+         * watches {@link Sender#health()} or its error handler, and closes the sender itself.
          * <br>
          * Over HTTP the token is pulled once per request and written into the request buffer ahead of the
          * buffered rows, so a token refresh is picked up on the next new batch after a successful flush. A
@@ -3777,11 +3747,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             // dispatcher daemon, drainer pool, microbatch buffers and
             // WebSocketClient inside the abandoned `connected`.
             connected.setTransactional(transactional);
-            if (authFailureMaxDurationMillis > 0) {
-                // The I/O loop may already be running (async initial connect), but it tracks the outage clock
-                // from the first authentication-class failure regardless; this only arms the deadline.
-                connected.setAuthFailureMaxDurationMillis(authFailureMaxDurationMillis);
-            }
             try {
                 final String rebuildSfDir = sfDir;
                 final String rebuildSenderId = senderId;
@@ -4411,8 +4376,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     // genuine value-parse error names the offending key.
                     String reservedKey = Chars.toString(sink);
                     pos = getValue(configurationString, pos, sink, reservedKey);
-                } else if (Chars.equals("auth_failure_max_duration_millis", sink)) {
-                    throw new LineSenderException("auth_failure_max_duration_millis is only supported for WebSocket transport");
                 } else if (Chars.equals("token_provider", sink)
                         || Chars.equals("azure_resource", sink)
                         || Chars.equals("azure_client_id", sink)
@@ -4511,9 +4474,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     // getInt (not getLong + cast): connectTimeoutMillis takes an
                     // int, and an over-int value must reject, not wrap.
                     connectTimeoutMillis(view.getInt("connect_timeout", 0));
-                }
-                if (view.has("auth_failure_max_duration_millis")) {
-                    authFailureMaxDurationMillis(view.getLong("auth_failure_max_duration_millis", 0));
                 }
 
                 s = view.getStr("auto_flush_rows");
@@ -4814,7 +4774,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             m.put("tls_verify", tlsValidationMode == null ? null : tlsValidationMode.name());
             m.put("tls_roots", trustStorePath);
             m.put("tls_roots_password", trustStorePassword == null ? null : new String(trustStorePassword));
-            m.put("auth_failure_max_duration_millis", authFailureMaxDurationMillis);
             m.put("token_provider", tokenProviderSpec == null ? null : tokenProviderSpec.name());
             m.put("azure_resource", tokenProviderSpec == null ? null
                     : tokenProviderSpec.params().get(TokenProviderSpec.KEY_AZURE_RESOURCE));

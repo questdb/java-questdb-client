@@ -68,9 +68,6 @@ public final class ConfigSchema {
         // INGRESS -- the WebSocket Sender applies. STRING in the registry; the
         // Sender parses suffix/mode values (off/on, 64k, durability) with its
         // own helpers, byte-for-byte.
-        // Optional authentication-outage deadline (design/qwp-token-provider-spec.md, section 8.5). Not set by
-        // default; > 0 when set.
-        longRange("auth_failure_max_duration_millis", Side.INGRESS, 0, OPEN_MAX, true, false);
         str("auto_flush", Side.INGRESS);
         str("auto_flush_bytes", Side.INGRESS);
         str("auto_flush_interval", Side.INGRESS);

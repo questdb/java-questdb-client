@@ -548,7 +548,7 @@ Build in this order. Each step is one PR and must pass the conformance tests lis
    - Add the `uses` clause to `module-info.java`.
    - Release the lease when a sender or query client closes.
    - Add the new `azure/` reactor module.
-4. **Health accessor and deadline.** Implements spec §8.4 and §8.5. Tests C21–C22.
+4. **Health accessor.** Implements spec §8.4, and §8.5, which rules out an authentication-outage deadline. Tests C21–C22.
 
 **Separate tickets, outside this feature:**
 
@@ -593,12 +593,12 @@ Every step of §10 is implemented. Line references in §1-§7 predate it.
   - Its release profiles mirror core's.
 - Tests: `TokenProviderConfigTest` (C18, C19, the connect-string half of C24), `TokenProviderSharingTest` (C17, over TLS), `azure/AzureTokenSourceTest` (fake `TokenCredential`, no network), `azure/AzureCredentialSelectionTest` (the real factory, no network) and `azure/AzureManagedIdentityLibraryTest` (C24: the real library in a child JVM, against a local IMDS stub).
 
-**Step 4 - health and deadline** (spec §8.4, §8.5).
+**Step 4 - health** (spec §8.4, §8.5).
 
 - `io.questdb.client.ConnectionHealth` (with `State`, `FailureClass`, `Failure`, `Aggregate`) and `QwpConnectionHealthTracker`, which publishes immutable snapshots through a volatile field.
 - The ingest walk reports rounds and upgrades; the I/O loop reports connection loss and terminal failure. Drainers never report.
 - Accessors: `Sender.health()` (default throws `UnsupportedOperationException`), `QwpQueryClient.health()`, `QuestDB.health()` (aggregate of every pooled connection).
-- `auth_failure_max_duration_millis` (INGRESS key) and `Sender.LineSenderBuilder.authFailureMaxDurationMillis(long)`. The clock lives in `CursorWebSocketSendLoop`, applies to FOREGROUND loops only, and is tracked even before the deadline is armed. The builder arms it right after connecting, so an `async` start is measured from its first failure.
+- No authentication-outage deadline (spec §8.5): an established sender retries credential-unavailable and `401`/`403` rounds indefinitely, and reports them through the error handler and the health snapshot. The opt-in `auth_failure_max_duration_millis` of spec v0.2 to v0.5 was removed.
 - Tests: `ConnectionHealthTest` (C21, C22).
 
 **Not done:** the spec documents (`qwp-ingress-websocket.md`, `qwp-egress-websocket.md`, the connect-string reference) live in the documentation repository. The Rust core and Python parity is tracked there too.

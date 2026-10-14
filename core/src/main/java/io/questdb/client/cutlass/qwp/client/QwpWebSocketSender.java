@@ -195,8 +195,7 @@ public class QwpWebSocketSender implements Sender {
     // wrapped as QwpCredentialUnavailableException: the OFF initial connect fails fast with the provider's own
     // exception, the SYNC one too unless the failure is retryable (then it retries within the reconnect
     // budget), while the running background drainer treats it as a transient outage and retries it
-    // indefinitely (never bounded by the reconnect budget, terminal only through the opt-in
-    // auth_failure_max_duration_millis deadline) per store-and-forward Invariant B.
+    // indefinitely (never bounded by the reconnect budget, never terminal) per store-and-forward Invariant B.
     private final Supplier<String> authorizationHeaderSupplier;
     private final int autoFlushBytes;
     private final long autoFlushIntervalNanos;
@@ -280,8 +279,6 @@ public class QwpWebSocketSender implements Sender {
     // Test-only lifecycle witness. close() invokes and clears it strictly after
     // publishing closed=true and before starting any drain or teardown work.
     private volatile Runnable closeStartedHook;
-    // Optional authentication-outage deadline (spec section 8.5) handed to the I/O loop; 0 = none.
-    private volatile long authFailureMaxDurationMillis;
     private boolean connected;
     private SenderConnectionDispatcher connectionDispatcher;
     // A connect-string token_provider's registry lease (TokenProviderRegistry), released when this sender
@@ -1969,19 +1966,6 @@ public class QwpWebSocketSender implements Sender {
     @Override
     public ConnectionHealth health() {
         return healthTracker.snapshot();
-    }
-
-    /**
-     * Arms the optional authentication-outage deadline (design/qwp-token-provider-spec.md, section 8.5); see
-     * {@code Sender.LineSenderBuilder.authFailureMaxDurationMillis(long)}. {@code <= 0} disarms it. May be called
-     * while the I/O loop runs.
-     */
-    public void setAuthFailureMaxDurationMillis(long millis) {
-        this.authFailureMaxDurationMillis = millis;
-        CursorWebSocketSendLoop loop = cursorSendLoop;
-        if (loop != null) {
-            loop.setAuthFailureMaxDurationMillis(millis);
-        }
     }
 
     /**
@@ -4191,9 +4175,8 @@ public class QwpWebSocketSender implements Sender {
         // connect unwraps it and fails fast with the provider's own exception, and so does the SYNC one unless
         // the provider classified the failure retryable, in which case SYNC retries it within its budget. The
         // running background drainer treats it as a transient outage and retries it indefinitely with capped
-        // backoff (never bounded by the reconnect budget; terminal only once the opt-in
-        // auth_failure_max_duration_millis deadline expires), so a persistent credential outage keeps the
-        // buffered rows in store-and-forward rather than terminating the sender (Invariant B).
+        // backoff (never bounded by the reconnect budget, never terminal), so even a persistent credential
+        // outage keeps the buffered rows in store-and-forward rather than terminating the sender (Invariant B).
         // Mirrors QwpQueryClient, which likewise resolves the credential once before its endpoint walk.
         // Publish this thread as being inside the pull BEFORE making it, then re-check cancellation, exactly
         // as the per-endpoint connect below does with the WebSocketClient. The pull is the one blocking call
@@ -4216,9 +4199,8 @@ public class QwpWebSocketSender implements Sender {
             // provider's own exception, so build() surfaces the provider's error directly rather than an internal
             // wrapper; a SYNC connect retries a retryable one within its budget first. The running background
             // drainer, by contrast, treats it as a transient outage and retries it indefinitely under Invariant B
-            // -- never bounding it by the reconnect budget, and latching a terminal only when the opt-in
-            // auth_failure_max_duration_millis deadline expires -- so a recoverable credential outage never drops
-            // a producer store-and-forward promised to keep alive.
+            // -- never bounding it by the reconnect budget, never latching a terminal -- so a recoverable
+            // credential outage never drops a producer store-and-forward promised to keep alive.
             throw new QwpCredentialUnavailableException(e);
         } finally {
             // Drop the marker as soon as the pull returns, so a later cancel() cannot interrupt this thread
@@ -5073,7 +5055,6 @@ public class QwpWebSocketSender implements Sender {
             // retries indefinitely.)
             cursorSendLoop.setConnectionDispatcher(connectionDispatcher);
             cursorSendLoop.setConnectionHealthTracker(healthTracker);
-            cursorSendLoop.setAuthFailureMaxDurationMillis(authFailureMaxDurationMillis);
             // Seed the fresh loop's own hasEverConnected before it can observe
             // any endpoint-policy failure: without this, a symbol-dict
             // recycle's rebuilt loop starts believing it has never connected

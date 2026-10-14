@@ -86,7 +86,6 @@ public class WsSenderConfigHonoredTest {
         assertHonored("connection_listener_inbox_capacity=64", "connection_listener_inbox_capacity", 64);
         assertHonored("token=ey.abc", "token", "ey.abc");
         assertHonored("auth_timeout_ms=4321", "auth_timeout_ms", 4321L);
-        assertHonored("auth_failure_max_duration_millis=600000", "auth_failure_max_duration_millis", 600_000L);
         assertHonored("connect_timeout=7000", "connect_timeout", 7000);
 
         // username/password together (both-or-neither), and the user/pass aliases.
