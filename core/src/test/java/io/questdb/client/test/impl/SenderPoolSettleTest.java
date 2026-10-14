@@ -8,10 +8,11 @@ import org.junit.Test;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -31,7 +32,7 @@ public class SenderPoolSettleTest {
             RecordingSender delegate = built.get(0);
             long idleSince = idleSinceOf(pool);
             Assert.assertEquals(0, delegate.flushCount.get());
-            Thread.sleep(5);
+            Thread.sleep(20);
             Assert.assertEquals(1, pool.settleIdle());
             Assert.assertEquals(1, delegate.flushCount.get());
             Assert.assertEquals(0, delegate.pendingRowCount());
@@ -98,20 +99,23 @@ public class SenderPoolSettleTest {
             delegate.flushGate = gate;
             Thread settler = new Thread(pool::settleIdle, "settler");
             settler.start();
-            // wait until the settle holds the slot (free list empty)
-            long deadline = System.currentTimeMillis() + 2_000;
-            while (pool.availableSize() != 0 && System.currentTimeMillis() < deadline) {
-                Thread.sleep(5);
-            }
-            Assert.assertEquals("settle must hold the slot as an internal lease", 0, pool.availableSize());
-            // a borrower arriving now must wait (max=1), not get the slot being flushed
             try {
-                pool.borrow();
-                Assert.fail("borrow must time out while the only slot is being settled");
-            } catch (LineSenderException expected) {
-                // acquire timeout (150 ms in newPool)
+                // wait until the settle holds the slot (free list empty)
+                long deadline = System.currentTimeMillis() + 2_000;
+                while (pool.availableSize() != 0 && System.currentTimeMillis() < deadline) {
+                    Thread.sleep(5);
+                }
+                Assert.assertEquals("settle must hold the slot as an internal lease", 0, pool.availableSize());
+                // a borrower arriving now must wait (max=1), not get the slot being flushed
+                try {
+                    pool.borrow();
+                    Assert.fail("borrow must time out while the only slot is being settled");
+                } catch (LineSenderException expected) {
+                    // acquire timeout (150 ms in newPool)
+                }
+            } finally {
+                gate.countDown();
             }
-            gate.countDown();
             settler.join(2_000);
             Assert.assertFalse(settler.isAlive());
             Assert.assertEquals(1, delegate.flushCount.get());
@@ -130,44 +134,83 @@ public class SenderPoolSettleTest {
                     built.add(rs);
                     return rs;
                 });
-        try (Sender s = pool.borrow()) {
-            s.table("t").longColumn("v", 1L).atNow();
-        }
-        RecordingSender delegate = built.get(0);
-        CountDownLatch gate = new CountDownLatch(1);
-        delegate.flushGate = gate;
-        AtomicReference<Throwable> settleFailure = new AtomicReference<>();
-        Thread settler = new Thread(() -> {
-            try {
-                pool.settleIdle();
-            } catch (Throwable t) {
-                settleFailure.set(t);
+        try {
+            try (Sender s = pool.borrow()) {
+                s.table("t").longColumn("v", 1L).atNow();
             }
-        }, "settler");
-        settler.start();
-        long deadline = System.currentTimeMillis() + 2_000;
-        while (pool.availableSize() != 0 && System.currentTimeMillis() < deadline) {
-            Thread.sleep(5);
+            RecordingSender delegate = built.get(0);
+            CountDownLatch gate = new CountDownLatch(1);
+            delegate.flushGate = gate;
+            AtomicReference<Throwable> settleFailure = new AtomicReference<>();
+            AtomicInteger settleResult = new AtomicInteger(-1);
+            Thread settler = new Thread(() -> {
+                try {
+                    settleResult.set(pool.settleIdle());
+                } catch (Throwable t) {
+                    settleFailure.set(t);
+                }
+            }, "settler");
+            Thread closer = new Thread(pool::close, "closer");
+            settler.start();
+            try {
+                long deadline = System.currentTimeMillis() + 2_000;
+                while (pool.availableSize() != 0 && System.currentTimeMillis() < deadline) {
+                    Thread.sleep(5);
+                }
+                Assert.assertEquals(0, pool.availableSize());
+                closer.start();
+                // close() parks in its timed wait for the internal lease
+                deadline = System.currentTimeMillis() + 2_000;
+                while (closer.getState() != Thread.State.TIMED_WAITING && System.currentTimeMillis() < deadline) {
+                    Thread.sleep(5);
+                }
+                Assert.assertEquals("close() must be waiting for the internal lease",
+                        Thread.State.TIMED_WAITING, closer.getState());
+                Assert.assertTrue("close() must be waiting for the internal lease", closer.isAlive());
+            } finally {
+                gate.countDown();
+            }
+            settler.join(2_000);
+            closer.join(2_000);
+            Assert.assertFalse(settler.isAlive());
+            Assert.assertFalse(closer.isAlive());
+            Assert.assertNull(settleFailure.get());
+            Assert.assertEquals(1, settleResult.get());
+            Assert.assertEquals("the settle thread must retire the slot once the pool is closing", 0, pool.totalSize());
+            Assert.assertEquals(1, delegate.closeCount.get());
+        } finally {
+            pool.close();
         }
-        Assert.assertEquals(0, pool.availableSize());
-        Thread closer = new Thread(pool::close, "closer");
-        closer.start();
-        Thread.sleep(50);                      // close() is now waiting for the internal lease
-        gate.countDown();
-        settler.join(2_000);
-        closer.join(2_000);
-        Assert.assertFalse(settler.isAlive());
-        Assert.assertFalse(closer.isAlive());
-        Assert.assertNull(settleFailure.get());
-        Assert.assertEquals("the settle thread must retire the slot once the pool is closing", 0, pool.totalSize());
-        Assert.assertEquals(1, delegate.closeCount.get());
+    }
+
+    @Test
+    public void testSettleHandlesSeveralCandidatesIndependently() {
+        List<RecordingSender> built = new ArrayList<>();
+        try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(2, 2, built)) {
+            Sender a = pool.borrow();
+            Sender b = pool.borrow();
+            a.table("t").longColumn("v", 1L).atNow();
+            b.table("t").longColumn("v", 2L).atNow();
+            a.close();
+            b.close();
+            RecordingSender dead = built.get(0);
+            RecordingSender healthy = built.get(1);
+            dead.flushError = new LineSenderException("wire is dead");
+            dead.latchedError = new LineSenderException("latched terminal");
+            Assert.assertEquals(1, pool.settleIdle());
+            Assert.assertEquals(1, healthy.flushCount.get());
+            Assert.assertEquals(1, pool.availableSize());
+            Assert.assertEquals(1, pool.totalSize());
+            Assert.assertEquals(1, dead.closeCount.get());
+            Assert.assertEquals(0, healthy.closeCount.get());
+        }
     }
 
     @SuppressWarnings("unchecked")
     private static long idleSinceOf(SenderPool pool) throws Exception {
         Field availableF = SenderPool.class.getDeclaredField("available");
         availableF.setAccessible(true);
-        Object slot = ((java.util.ArrayDeque<Object>) availableF.get(pool)).peekLast();
+        Object slot = ((ArrayDeque<Object>) availableF.get(pool)).peekLast();
         Method m = slot.getClass().getDeclaredMethod("idleSinceMillis");
         m.setAccessible(true);
         return (long) m.invoke(slot);

@@ -33,6 +33,7 @@ import io.questdb.client.std.bytes.DirectByteSlice;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -242,7 +243,9 @@ class RecordingSender implements Sender {
         CountDownLatch gate = flushGate;
         if (gate != null) {
             try {
-                gate.await();
+                if (!gate.await(10, TimeUnit.SECONDS)) {
+                    throw new AssertionError("flushGate was never released");
+                }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }

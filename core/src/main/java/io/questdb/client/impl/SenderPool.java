@@ -1590,7 +1590,8 @@ public final class SenderPool implements AutoCloseable {
                         inFlightCreations, creationWaitMillis);
             }
             // Bounded graceful wait for outstanding leases. A slot is borrowed
-            // iff it is in `all` but not in `available`; retireLease's
+            // iff it is in `all` but not in `available`, which includes the
+            // internal leases settleIdle() holds while it flushes; retireLease's
             // delegate-close section (running outside the lock on a returning
             // borrower's thread) is tracked by pendingLeaseTeardowns so this
             // method does not return while a teardown is still in flight.
@@ -1719,9 +1720,11 @@ public final class SenderPool implements AutoCloseable {
      * stamped with a fresh generation, which makes it an internal lease: a
      * borrower arriving meanwhile takes another slot or waits, and
      * {@link #close()} waits for it like any outstanding lease. The flush runs
-     * outside the lock. A delegate whose flush failed is probed with
-     * {@link Sender#checkError()}: a latched error retires the slot, anything
-     * else keeps the rows for the next settle. The slot's idle clock is not
+     * outside the lock. After the flush, whether it succeeded or not, the
+     * delegate is probed with {@link Sender#checkError()}: a latched error
+     * retires the slot, anything else returns it to the free list, and rows a
+     * failed flush left behind wait for the next settle. An {@link Error}
+     * thrown by the flush is not transient and retires the slot. The slot's idle clock is not
      * touched, so reaping is unaffected.
      *
      * @return the number of slots whose flush completed
@@ -1758,14 +1761,27 @@ public final class SenderPool implements AutoCloseable {
         for (int i = 0, n = leases.size(); i < n; i++) {
             PooledSender lease = leases.get(i);
             boolean flushed = false;
+            Throwable fatal = null;
             try {
                 lease.flush();
                 flushed = true;
-            } catch (Throwable ignored) {
+            } catch (Exception ignored) {
                 // Transient (ring full, recycle in flight) or terminal: the
                 // requeue below tells them apart with the probe.
-            } finally {
-                requeueSettled(lease);
+            } catch (Throwable t) {
+                // An Error (AssertionError, OutOfMemoryError) is not transient.
+                fatal = t;
+            }
+            try {
+                if (fatal != null) {
+                    LOG.warn("settleIdle: flush threw an Error, retiring slot {}", lease.slot().slotIndex(), fatal);
+                    retireLease(lease, " during settle");
+                } else {
+                    requeueSettled(lease);
+                }
+            } catch (Throwable t) {
+                // Keep going: the remaining leases must not stay out of `available`.
+                LOG.warn("settleIdle: could not requeue or retire slot {}", lease.slot().slotIndex(), t);
             }
             if (flushed) {
                 settled++;
@@ -1867,6 +1883,14 @@ public final class SenderPool implements AutoCloseable {
             // latched: retire below
         }
         if (!healthy) {
+            long pendingRows = 0;
+            try {
+                pendingRows = s.delegate().pendingRowCount();
+            } catch (Throwable ignored) {
+                // best effort: the count is only for the log line
+            }
+            LOG.warn("settleIdle: delegate of slot {} latched an error, retiring it with {} pending row(s)",
+                    s.slotIndex(), pendingRows);
             retireLease(lease, " during settle");
             return;
         }
@@ -1894,7 +1918,8 @@ public final class SenderPool implements AutoCloseable {
      * Retires one lease on the calling (borrower's) thread: validates the
      * lease generation under the lock, removes the slot from {@code all},
      * closes the delegate OUTSIDE the lock, and reclaims the SF slot index.
-     * Shared by {@link #discardBroken} (broken delegate) and by
+     * Shared by {@link #discardBroken} (broken delegate), by
+     * {@link #requeueSettled} (settle lease with a dead delegate) and by
      * {@link #giveBack} when the pool is shutting down (delegated teardown --
      * see {@link #close()}).
      * <p>
