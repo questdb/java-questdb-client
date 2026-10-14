@@ -27,6 +27,7 @@ package io.questdb.client.test;
 import io.questdb.client.QuestDB;
 import io.questdb.client.Sender;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
+import org.junit.Ignore;
 import org.junit.Test;
 
 import java.util.concurrent.TimeUnit;
@@ -37,7 +38,7 @@ import java.util.concurrent.TimeUnit;
  * Target: the default is within noise of a single held lease; the window
  * numbers answer whether frames or commits dominate.
  */
-//@Ignore("manual benchmark")
+@Ignore("manual benchmark")
 public class PoolBorrowPerRowBenchmark {
     private static final int ROWS = 1_000_000;
 
