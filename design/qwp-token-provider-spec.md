@@ -1,9 +1,10 @@
 # QWP dynamic bearer credentials: cross-language specification
 
-**Status:** v0.4, ready for implementation. All decisions are resolved (§12).
+**Status:** v0.5, ready for implementation. All decisions are resolved (§12).
 
 **Changes:**
 
+- **v0.5:** a result whose token expires within `handout_floor` of its receipt is a retryable failed fetch whose message names `handout_floor` (§4, C2, C6). Before, it counted as a success that could never be handed out, so every caller waited out `cold_wait` for an error that named no cause.
 - **v0.4:** `azure_credential` selects one Azure credential deterministically (§7.1), so the library itself reports an unreachable managed-identity endpoint (retryable) apart from a misconfigured credential (permanent) (§7.5, D10). A discovery chain's "no credential available" stays permanent, so a host without a credential still fails fast, and the client warns once that the chain does not ride out an endpoint outage. This resolves the conflict between §4 and §7.5 over an unreachable managed-identity endpoint.
 - **v0.3:** decisions resolved, with D8 (§8.1) and D9 (§7.2) added; Java binding decided (Appendix B).
 - **v0.2:** connection health (§8.4), the optional authentication-outage deadline (§8.5), `WWW-Authenticate` handling (§8.2), and Appendices C and D.
@@ -97,9 +98,10 @@ Classification:
 - **No concurrency:** a provider never calls `fetch()` concurrently with itself.
 - **Where it runs:** implementations SHOULD run `fetch()` on a background context owned by the provider, never on a connection thread.
 - **Blocking:** `fetch()` MAY block, but it SHOULD bound its own network operations. 30 s per attempt is RECOMMENDED.
-- **Bad results:** the provider MUST treat a result as a retryable error in either of these cases:
+- **Bad results:** the provider MUST treat a result as a retryable error in any of these cases:
   - the token fails the checks in §3;
-  - `expires_at` is not later than the time the result was received.
+  - `expires_at` is not later than the time the result was received;
+  - the token is not usable (§5.1) at the time the result was received: `expires_at` is no more than `handout_floor` after it. Such a token could never be handed out (§5.3). The error message MUST name `handout_floor`, so that a platform issuing tokens this short-lived is diagnosed rather than waited on.
 
 ## 5. Refreshing provider
 
@@ -426,11 +428,11 @@ Every client that implements this specification SHOULD pass these scenarios. The
 | ID | Scenario | Expected result |
 |---|---|---|
 | C1 | Refresh schedule | Refresh times follow §5.2 for `L` = 24 h, 60 min and 5 min, with and without `refresh_at`. |
-| C2 | Same token returned | Fetches converge as described in §5.2, and the token stays usable. |
+| C2 | Same token returned | Fetches converge as described in §5.2, and the token stays usable until it enters `handout_floor`. The fetch that returns it inside the floor is a retryable failure (§4). |
 | C3 | Cold burst | 64 concurrent callers with no usable token cause exactly one fetch. |
 | C4 | Cold failure | A retryable error is raised within `cold_wait`. A permanent classification is passed through. |
 | C5 | Backoff | Delays follow §5.4. `retry_after` is honoured and capped. |
-| C6 | Hand-out floor | A token inside `handout_floor` is never handed out. |
+| C6 | Hand-out floor | A token inside `handout_floor` is never handed out. A result whose token is already inside it on arrival is a retryable failure whose message names `handout_floor` (§4); one millisecond more is usable. |
 | C7 | Cancellation | A cancelled wait returns promptly, and the cancellation signal is preserved. |
 | C8 | Forced refresh | Rate limited. A stale token is ignored. A same-token result is accepted. |
 | C9 | Reconnect after expiry | The reconnect carries the refreshed token, and no `401` is observed. |

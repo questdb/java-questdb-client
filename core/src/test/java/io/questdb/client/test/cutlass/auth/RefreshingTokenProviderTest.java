@@ -303,16 +303,20 @@ public class RefreshingTokenProviderTest {
             Assert.assertEquals("T2", provider.getToken().toString());
             Assert.assertEquals(2, source.calls());
 
-            // a stale token - it has already rotated - is ignored
-            assertReturnsPromptly(() -> provider.onTokenRejected("T1", 401));
             // rate limited: a second forced refresh within forced_min_interval is ignored
             clock.advanceMillis(30_000 - 1);
             assertReturnsPromptly(() -> provider.onTokenRejected("T2", 401));
             Assert.assertNotEquals("no forced fetch may be scheduled", 0, scheduler.peek().delayNanos);
             Assert.assertEquals(2, source.calls());
 
-            // once the interval has passed, a forced fetch that returns the same token is a normal success
+            // a stale token - it has already rotated - is ignored. The interval has now passed, so the rate limit
+            // no longer applies and only the stale-token check keeps this from forcing a fetch.
             clock.advanceMillis(1);
+            assertReturnsPromptly(() -> provider.onTokenRejected("T1", 401));
+            Assert.assertNotEquals("a stale token must not schedule a fetch", 0, scheduler.peek().delayNanos);
+            Assert.assertEquals(2, source.calls());
+
+            // a forced fetch that returns the same token is a normal success
             rejecter = start(() -> provider.onTokenRejected("T2", 401));
             await(() -> scheduler.peek() != null && scheduler.peek().delayNanos == 0, 5_000,
                     "the second forced fetch to be scheduled");
@@ -357,7 +361,7 @@ public class RefreshingTokenProviderTest {
     @Test(timeout = 30_000)
     public void testHandoutFloorTokenIsNotHandedOutEvenWhenTheSourceRepeatsIt() throws Exception {
         // C6, second shape: the source keeps returning the token that sits inside the floor. The caller waits
-        // out cold_wait and fails rather than receive it.
+        // out cold_wait and fails rather than receive it, and its error names the cause (section 4).
         FakeClock clock = new FakeClock(T0);
         ManualScheduler scheduler = new ManualScheduler(clock);
         ScriptedSource source = new ScriptedSource().thenToken("T1", T0 + 10 * MIN);
@@ -382,9 +386,49 @@ public class RefreshingTokenProviderTest {
             caller.join(5_000);
             Assert.assertTrue("expected a token-unavailable error, got " + got.get(),
                     got.get() instanceof TokenUnavailableException);
-            Assert.assertTrue("no fetch failed, so the error is retryable",
-                    ((TokenUnavailableException) got.get()).isRetryable());
+            TokenUnavailableException error = (TokenUnavailableException) got.get();
+            Assert.assertTrue("the repeated token is a retryable failed fetch", error.isRetryable());
+            Assert.assertTrue(error.getMessage(), error.getMessage().contains("within handout_floor (60000 ms)"));
+            Assert.assertEquals(1, provider.getConsecutiveFailures());
             Assert.assertEquals("the caller started one fetch, not one per completed fetch", 2, source.calls());
+        }
+    }
+
+    @Test
+    public void testHandoutFloorTokenOnArrivalIsARetryableFailure() {
+        // C6, section 4: a token that expires within handout_floor of its receipt could never be handed out, so
+        // its fetch fails - retryable, named in the failure record and in a caller's error - rather than count as
+        // a success that leaves every caller to wait out cold_wait for an error with no cause.
+        FakeClock clock = new FakeClock(T0);
+        ManualScheduler scheduler = new ManualScheduler(clock);
+        final long floor = RefreshingTokenProvider.DEFAULT_HANDOUT_FLOOR_MILLIS;
+        ScriptedSource source = new ScriptedSource()
+                .then(() -> new ExpiringToken("SHORT", clock.wallClockMillis() + floor))
+                .then(() -> new ExpiringToken("EDGE", clock.wallClockMillis() + floor + 1));
+        try (RefreshingTokenProvider provider = provider(source, clock, scheduler, 0.0)
+                .coldWaitMillis(0)
+                .build()) {
+            scheduler.runNext();
+            Assert.assertEquals(1, provider.getConsecutiveFailures());
+            RefreshingTokenProvider.FetchFailure failure = provider.getLastFailure();
+            Assert.assertNotNull("a token that is unusable on arrival is a failed fetch", failure);
+            Assert.assertTrue(failure.isRetryable());
+            Assert.assertTrue(failure.getMessage(), failure.getMessage().contains("within handout_floor (60000 ms)"));
+            Assert.assertEquals("an unusable token is never held", RefreshingTokenProvider.NONE,
+                    provider.getTokenExpiresAtEpochMillis());
+            try {
+                provider.getToken();
+                Assert.fail("expected a token-unavailable error");
+            } catch (TokenUnavailableException e) {
+                Assert.assertTrue(e.isRetryable());
+                Assert.assertTrue("the caller's error must name the cause: " + e.getMessage(),
+                        e.getMessage().contains("within handout_floor (60000 ms)"));
+            }
+
+            // retried after backoff, not dropped: one millisecond beyond the floor is usable
+            scheduler.advanceAndRunNext();
+            Assert.assertEquals("EDGE", provider.getToken().toString());
+            Assert.assertEquals(0, provider.getConsecutiveFailures());
         }
     }
 
@@ -515,7 +559,10 @@ public class RefreshingTokenProviderTest {
             }
             // 24 h halves to below the 60 s floor in 11 steps (86400 s -> ... -> 84.4 s)
             Assert.assertEquals(11, fetchesWhileUsable);
-            Assert.assertEquals(0, provider.getConsecutiveFailures());
+            // the fetch that returned the token inside the floor is a failed fetch (section 4)
+            Assert.assertEquals(1, provider.getConsecutiveFailures());
+            Assert.assertTrue(provider.getLastFailure().getMessage(),
+                    provider.getLastFailure().getMessage().contains("within handout_floor"));
         }
     }
 

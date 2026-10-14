@@ -4,7 +4,7 @@ Status: **implemented** on `feat/qwp-entra-token-provider` - all four steps of t
 
 **Read these first:**
 
-- **The spec wins.** The normative, language-neutral contract is now `design/qwp-token-provider-spec.md` (v0.4, all decisions resolved). Where the two documents differ, follow the spec. That includes the refresh-schedule clamps, backoff jitter, registry linger, and the Java names in its Appendix B, which supersede §7.2 here.
+- **The spec wins.** The normative, language-neutral contract is now `design/qwp-token-provider-spec.md` (v0.5, all decisions resolved). Where the two documents differ, follow the spec. That includes the refresh-schedule clamps, backoff jitter, registry linger, and the Java names in its Appendix B, which supersede §7.2 here.
 - **Java plan:** §10.
 - **Line references** are as of `c9968f24` and may drift.
 

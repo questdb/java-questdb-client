@@ -558,6 +558,10 @@ A source reports a failure by throwing `TokenUnavailableException.retryable(...)
 retryable. Never put a token or a raw response body in the message. The provider keeps retrying with backoff and
 keeps serving the current token while it is still valid.
 
+The provider hands a token out only while it has more than 60 s left (`handoutFloorMillis`, the hand-out floor). A
+source whose token arrives with 60 s or less left gets a failed fetch whose error names `handout_floor`; if your
+platform issues tokens that short, lower the floor with `handoutFloorMillis(...)`.
+
 How failures are handled:
 
 - A token is refreshed at about half its lifetime, so an idle client always holds a valid one.
@@ -567,7 +571,8 @@ How failures are handled:
   retryable provider failure within `reconnect_max_duration_millis`; `async` retries in the background.
 - Once connected, a store-and-forward sender rides out credential outages and `401`/`403` indefinitely, buffering
   rows and reporting each failure to the error handler. Set `auth_failure_max_duration_millis` to make the sender
-  fail instead once such an outage lasts that long (unacknowledged rows stay on disk).
+  fail instead once such an outage lasts that long. With `sf_dir`, unacknowledged rows then stay on disk for a
+  later sender or an orphan drain; without it, they are lost when the sender closes.
 
 ### Connection Health
 

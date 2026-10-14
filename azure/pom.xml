@@ -68,6 +68,11 @@
         <!-- Azure SDK BOM: pins azure-identity and its azure-core stack to versions released together -->
         <azure-sdk-bom.version>1.3.8</azure-sdk-bom.version>
         <logback.version>1.5.25</logback.version>
+        <!-- Test selection, as in core: a build that includes this module - the questdb server's local-client
+             profile pulls in the whole client reactor - narrows its tests with -Dtest.include / -Dtest.exclude.
+             The defaults run every test. -->
+        <test.exclude>None</test.exclude>
+        <test.include>**/*Test.java</test.include>
     </properties>
 
     <dependencyManagement>
@@ -126,6 +131,12 @@
                 <configuration>
                     <!-- the module ships no module-info: test it the way most applications load it -->
                     <useModulePath>false</useModulePath>
+                    <includes>
+                        <include>${test.include}</include>
+                    </includes>
+                    <excludes>
+                        <exclude>${test.exclude}</exclude>
+                    </excludes>
                 </configuration>
             </plugin>
             <plugin>

@@ -74,7 +74,9 @@ import java.util.function.DoubleSupplier;
  *   (unless one is running or the provider is backing off after failures) and waits up to {@code cold_wait},
  *   then throws a {@link TokenUnavailableException} carrying the classification of the most recent failed
  *   fetch, or a retryable one when no fetch failed. It never hands out an unusable token. Any number of
- *   concurrent callers cause at most one fetch.</li>
+ *   concurrent callers cause at most one fetch. A fetch whose token is unusable on arrival - it expires within
+ *   {@code handout_floor} of its receipt - is a retryable failed fetch whose message names {@code handout_floor}:
+ *   a source whose tokens are that short-lived needs a lower floor.</li>
  *   <li><b>Failures.</b> A failed fetch is retried with jittered exponential backoff, from
  *   {@code backoff_initial} up to {@code backoff_max}, honouring the source's {@code retry_after} up to
  *   {@code retry_after_max}. Retries continue whatever the classification for as long as the provider is open,
@@ -517,6 +519,15 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
                             + ", not after it was received at " + instant(receivedAt),
                     receivedAt);
         }
+        if (!usable(result.getExpiresAtEpochMillis(), receivedAt)) {
+            // Not usable even on arrival, so it could never be handed out (section 4). Recorded as a success, it
+            // would leave every caller to wait out cold_wait for an error that names no cause.
+            return new FetchFailure(true, TokenUnavailableException.NO_RETRY_AFTER,
+                    "token source returned a token that expires " + (result.getExpiresAtEpochMillis() - receivedAt)
+                            + " ms after it was received, within handout_floor (" + handoutFloorMillis
+                            + " ms): it can never be handed out; issue longer-lived tokens or lower handout_floor",
+                    receivedAt);
+        }
         return null;
     }
 
@@ -682,7 +693,11 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
     }
 
     private boolean usable(Held h, long wallNow) {
-        return h != null && wallNow < h.expiresAtEpochMillis - handoutFloorMillis;
+        return h != null && usable(h.expiresAtEpochMillis, wallNow);
+    }
+
+    private boolean usable(long expiresAtEpochMillis, long wallNow) {
+        return wallNow < expiresAtEpochMillis - handoutFloorMillis;
     }
 
     /**
@@ -829,7 +844,9 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
         }
 
         /**
-         * A token is usable only while {@code now < expires_at - handout_floor}. Default 60 s.
+         * A token is usable only while {@code now < expires_at - handout_floor}. Default 60 s. A fetched token that
+         * is not usable on arrival counts as a failed fetch, so a source whose tokens live no longer than this needs
+         * a lower value.
          */
         public Builder handoutFloorMillis(long millis) {
             this.handoutFloorMillis = nonNegative("handout_floor", millis);
