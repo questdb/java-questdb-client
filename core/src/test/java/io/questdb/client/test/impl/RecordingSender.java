@@ -47,6 +47,7 @@ class RecordingSender implements Sender {
     final AtomicInteger deferredFlushCount = new AtomicInteger();
     final AtomicInteger flushCount = new AtomicInteger();
     volatile RuntimeException cancelError;     // thrown by cancelRow() when set
+    volatile RuntimeException deferredFlushError; // thrown by flushDeferred() when set
     volatile boolean deferredFramesOpen;
     volatile RuntimeException flushError;      // thrown by flush() when set
     volatile CountDownLatch flushGate;         // flush() blocks on it when set
@@ -131,6 +132,12 @@ class RecordingSender implements Sender {
     }
 
     @Override
+    public boolean drain(long timeoutMillis) {
+        flush();
+        return true;
+    }
+
+    @Override
     public void flush() {
         awaitGate();
         RuntimeException e = flushError;
@@ -149,6 +156,10 @@ class RecordingSender implements Sender {
     @Override
     public long flushDeferred() {
         awaitGate();
+        RuntimeException deferredError = deferredFlushError;
+        if (deferredError != null) {
+            throw deferredError;
+        }
         boolean hadRows = pendingRows > 0;
         if (!hadRows) {
             return -1L;                       // nothing pending: the real sender publishes nothing

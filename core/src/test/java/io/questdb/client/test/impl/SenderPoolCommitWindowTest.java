@@ -60,6 +60,29 @@ public class SenderPoolCommitWindowTest {
     }
 
     @Test
+    public void testDrainResetsTheWindow() {
+        List<RecordingSender> built = new ArrayList<>();
+        try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(1, 1, built)) {
+            pool.setFlushOnClose(true);
+            pool.setCommitWindow(2, 60_000L);
+            try (Sender s = pool.borrow()) {
+                s.table("t").longColumn("v", 1L).atNow();
+            }
+            try (Sender s = pool.borrow()) {
+                s.table("t").longColumn("v", 2L).atNow();
+                Assert.assertTrue(s.drain(0));      // app commits explicitly: 2 rows, window would close here
+            }
+            RecordingSender d = built.get(0);
+            Assert.assertEquals(1, d.flushCount.get());
+            try (Sender s = pool.borrow()) {
+                s.table("t").longColumn("v", 3L).atNow();
+            }
+            Assert.assertEquals(2, d.deferredFlushCount.get());
+            Assert.assertEquals(1, d.flushCount.get());
+        }
+    }
+
+    @Test
     public void testLeaseFlushResetsTheWindow() {
         List<RecordingSender> built = new ArrayList<>();
         try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(1, 1, built)) {

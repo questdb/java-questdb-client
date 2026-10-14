@@ -24,6 +24,7 @@
 
 package io.questdb.client.impl;
 
+import io.questdb.client.LineSenderServerException;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
@@ -170,6 +171,11 @@ public final class PooledSender implements Sender {
      * the release that closes the window ships: it flushes, committing the
      * group. The window's age is measured from the first release that found
      * work. A failed ship retires the slot and throws the wrapper described above.
+     * <p>
+     * Close-time errors are wrapped: the delegate's error is the cause. A latched
+     * {@link LineSenderServerException} is rethrown as a new one carrying the same
+     * {@code SenderError}. While the pool is shutting down, the rows are flushed here
+     * so a ship failure propagates to the caller.
      */
     @Override
     public void close() {
@@ -190,7 +196,12 @@ public final class PooledSender implements Sender {
                     delegate.cancelRow();
                     cancelledRow = true;
                 }
-                ship(pool, delegate);
+                if (pool.isClosed()) {
+                    // Pool shutting down: ship here so a failure reaches the caller.
+                    delegate.flush();
+                } else {
+                    ship(pool, delegate);
+                }
                 recycle = true;
             } catch (RuntimeException e) {
                 // The delegate rethrows its latched instance, which a lease
@@ -210,6 +221,11 @@ public final class PooledSender implements Sender {
             }
         }
         if (failure != null) {
+            if (failure instanceof LineSenderServerException) {
+                LineSenderServerException typed = new LineSenderServerException(((LineSenderServerException) failure).getServerError());
+                typed.initCause(failure);
+                throw typed;
+            }
             String msg = failure.getMessage();
             boolean retryable = failure instanceof LineSenderException && ((LineSenderException) failure).isRetryable();
             LineSenderException wrapper = new LineSenderException("pooled sender close failed: " + msg, retryable);
@@ -278,7 +294,10 @@ public final class PooledSender implements Sender {
 
     @Override
     public boolean drain(long timeoutMillis) {
-        return slot.live(generation).drain(timeoutMillis);
+        Sender delegate = slot.live(generation);
+        boolean drained = delegate.drain(timeoutMillis);
+        slot.markCommitted(delegate.rowsAppended());
+        return drained;
     }
 
     @Override

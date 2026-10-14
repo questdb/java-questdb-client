@@ -161,7 +161,7 @@ final class PoolHousekeeper {
     }
 
     private void runLoop() {
-        long nextSettleAt = System.currentTimeMillis() + settleIntervalMillis;
+        long nextSettleAt = System.currentTimeMillis() + this.settleIntervalMillis;
         long nextReapAt = System.currentTimeMillis() + intervalMillis;
         while (!stop) {
             // Per-slot startup SF recovery, driven on THIS (the reap-loop)

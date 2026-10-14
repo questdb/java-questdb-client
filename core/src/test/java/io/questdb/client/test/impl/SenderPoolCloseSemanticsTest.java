@@ -25,7 +25,9 @@
 
 package io.questdb.client.test.impl;
 
+import io.questdb.client.LineSenderServerException;
 import io.questdb.client.Sender;
+import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.impl.PooledSender;
 import io.questdb.client.impl.SenderPool;
@@ -149,7 +151,7 @@ public class SenderPoolCloseSemanticsTest {
         s.close();
         RecordingSender delegate = built.get(0);
         Assert.assertEquals("returning lease must close its delegate", 1, delegate.closeCount.get());
-        Assert.assertEquals("the pooled close itself must not flush", 0, delegate.flushCount.get());
+        Assert.assertEquals("a lease closing into a shutting-down pool flushes so ship failures propagate", 1, delegate.flushCount.get());
         Assert.assertEquals(0, pool.totalSize());
     }
 
@@ -171,6 +173,49 @@ public class SenderPoolCloseSemanticsTest {
             try (Sender second = pool.borrow()) {
                 Assert.assertSame("same slot is reused", delegate, ((PooledSender) second).getDelegateForTesting());
             }
+        }
+    }
+
+    @Test
+    public void testFlushDeferredThrowingAtCloseRetiresSlot() {
+        List<RecordingSender> built = new ArrayList<>();
+        try (SenderPool pool = newPool(1, 1, built)) {
+            pool.setFlushOnClose(true);
+            pool.setCommitWindow(1000, 60_000L);
+            Sender first = pool.borrow();
+            RecordingSender delegate = built.get(0);
+            LineSenderException original = new LineSenderException("deferred ship failed");
+            delegate.deferredFlushError = original;
+            first.table("t").longColumn("v", 1L).atNow();
+            try {
+                first.close();
+                Assert.fail("close() must propagate the deferred ship failure");
+            } catch (LineSenderException e) {
+                Assert.assertSame(original, e.getCause());
+            }
+            Assert.assertEquals("slot must be retired, not stranded", 0, pool.totalSize());
+            Assert.assertEquals(1, delegate.closeCount.get());
+        }
+    }
+
+    @Test
+    public void testLatchedServerErrorAtCloseKeepsItsType() {
+        List<RecordingSender> built = new ArrayList<>();
+        try (SenderPool pool = newPool(1, 1, built)) {
+            Sender first = pool.borrow();
+            RecordingSender delegate = built.get(0);
+            SenderError error = SenderError.dataLoss("rejected", "/tmp/q");
+            LineSenderServerException original = new LineSenderServerException(error);
+            delegate.latchedError = original;
+            try {
+                first.close();
+                Assert.fail("close() must propagate the latched error");
+            } catch (LineSenderServerException e) {
+                Assert.assertNotSame(original, e);
+                Assert.assertSame(error, e.getServerError());
+                Assert.assertSame(original, e.getCause());
+            }
+            Assert.assertEquals(0, pool.totalSize());
         }
     }
 

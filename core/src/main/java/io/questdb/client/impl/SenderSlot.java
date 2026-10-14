@@ -50,8 +50,8 @@ final class SenderSlot {
     private final int slotIndex;
     // Commit-window state, guarded by the lease: only the thread holding the
     // slot's current lease (a borrower or the settle step) reads or writes it.
-    // 0 = no group open since the last commit.
-    private long groupOpenedAtNanos;
+    // Long.MIN_VALUE = no group open since the last commit.
+    private long groupOpenedAtNanos = Long.MIN_VALUE;
     // Index in SenderPool.retiredSlots, or -1 while this slot is not retired.
     // Guarded by the pool lock. The pool maintains this index across swap
     // removals so the delegate's release callback can recover this exact slot
@@ -59,6 +59,7 @@ final class SenderSlot {
     private int retiredIndex = -1;
     // Commit-window state, guarded by the lease (see groupOpenedAtNanos).
     private long rowsAppendedAtLastCommit;
+    private boolean settleFailureLogged;
     // Monotonic lease id. Mutated only under the SenderPool lock (bumped in
     // borrow() when the slot is handed out and in giveBack()/discardBroken()
     // when it is returned). A PooledSender wrapper captures it live for its
@@ -121,7 +122,7 @@ final class SenderSlot {
      */
     void markCommitted(long rowsAppended) {
         rowsAppendedAtLastCommit = rowsAppended;
-        groupOpenedAtNanos = 0L;
+        groupOpenedAtNanos = Long.MIN_VALUE;
     }
 
     void markIdleAt(long nowMillis) {
@@ -140,6 +141,14 @@ final class SenderSlot {
         this.retiredIndex = retiredIndex;
     }
 
+    void settleFailureLogged(boolean logged) {
+        this.settleFailureLogged = logged;
+    }
+
+    boolean settleFailureLogged() {
+        return settleFailureLogged;
+    }
+
     int slotIndex() {
         return slotIndex;
     }
@@ -155,7 +164,7 @@ final class SenderSlot {
         if (inWindow <= 0 && !deferredOpen) {
             return false;
         }
-        if (groupOpenedAtNanos == 0L) {
+        if (groupOpenedAtNanos == Long.MIN_VALUE) {
             groupOpenedAtNanos = nowNanos;
         }
         return inWindow >= commitRows || nowNanos - groupOpenedAtNanos >= commitIntervalNanos;

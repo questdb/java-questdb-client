@@ -1765,12 +1765,14 @@ public final class SenderPool implements AutoCloseable {
             boolean flushed = false;
             Throwable fatal = null;
             try {
+                // PooledSender.flush() already marks the commit on the slot.
                 lease.flush();
-                lease.slot().markCommitted(lease.slot().delegate().rowsAppended());
+                lease.slot().settleFailureLogged(false);
                 flushed = true;
-            } catch (Exception ignored) {
+            } catch (Exception e) {
                 // Transient (ring full, recycle in flight) or terminal: the
                 // requeue below tells them apart with the probe.
+                logSettleFailure(lease.slot(), e);
             } catch (Throwable t) {
                 // An Error (AssertionError, OutOfMemoryError) is not transient.
                 fatal = t;
@@ -1791,6 +1793,23 @@ public final class SenderPool implements AutoCloseable {
             }
         }
         return settled;
+    }
+
+    private void logSettleFailure(SenderSlot slot, Exception e) {
+        int idx = slot.slotIndex();
+        int pending = 0;
+        try {
+            pending = slot.delegate().pendingRowCount();
+        } catch (Throwable ignored) {
+            // best effort: the count is only for the log line
+        }
+        String error = e.toString();
+        if (!slot.settleFailureLogged()) {
+            slot.settleFailureLogged(true);
+            LOG.warn("SenderPool: settle flush failed for slot {} with {} pending row(s), will retry: {}", idx, pending, error);
+        } else {
+            LOG.debug("SenderPool: settle flush failed for slot {} with {} pending row(s), will retry: {}", idx, pending, error);
+        }
     }
 
     private void stopFailedStartupRecoveryDriver(Thread recoveryThread) {
@@ -1970,9 +1989,20 @@ public final class SenderPool implements AutoCloseable {
         // Close the delegate outside the lock (releases the SF flock). Always
         // attempt it so native resources are freed even on the defensive path
         // where the wrapper had already left `all`.
+        int pendingAtRetire = 0;
+        try {
+            pendingAtRetire = s.delegate().pendingRowCount();
+        } catch (Throwable ignored) {
+            // best effort: the count is only for the log line
+        }
         try {
             s.delegate().close();
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            if (pendingAtRetire > 0) {
+                String error = t.toString();
+                LOG.warn("SenderPool: slot {} retired with {} unshipped row(s); delegate close failed: {}",
+                        s.slotIndex(), pendingAtRetire, error);
+            }
             // Best-effort teardown: a delegate close() can throw an Error
             // (e.g. an -ea AssertionError) as well as a RuntimeException.
             // Either way the accounting in the finally below MUST run,
@@ -2109,6 +2139,11 @@ public final class SenderPool implements AutoCloseable {
     /** Whether a commit window is configured: pooled closes ship deferred frames and commit per window. */
     public boolean hasCommitWindow() {
         return commitRows > 0;
+    }
+
+    /** Whether {@code close()} has started; a lease returning now is torn down instead of recycled. */
+    boolean isClosed() {
+        return closed;
     }
 
     /**

@@ -100,7 +100,7 @@ snippets below borrow from its pools.
 
 Borrow a `Sender`, write rows, and close it. Close releases, flush ships, drain waits: `close()` returns the sender to
 the pool and ships nothing by itself; rows go out when an auto-flush threshold trips on a later append or when the
-pool's housekeeper settles the idle slot, at most one `auto_flush_interval` later (100 ms by default). Borrowing per
+pool's housekeeper settles the idle slot, typically within one `auto_flush_interval` (100 ms by default). Borrowing per
 message is the intended pattern and batches like a sender held for the whole run. Call `flush()` to ship now and
 `drain()` to wait for the server. The underlying connection is only torn down when the `QuestDB` handle itself is
 closed.
@@ -551,9 +551,9 @@ schema::key1=value1;key2=value2;
 | `acquire_timeout_ms`     | `5000`  | How long `borrowSender()`/`borrowQuery()` waits for a free slot                |
 | `idle_timeout_ms`        | `60000` | How long a pooled connection may stay idle before it is reaped                 |
 | `max_lifetime_ms`        | `1800000` | Maximum lifetime of a pooled connection before it is recycled                |
-| `flush_on_close`         | `off`   | `on` makes a pooled `close()` flush before releasing (one frame and one commit per close, the pre-1.4 behaviour). Note: "flush" means published to the store-and-forward ring, not acknowledged |
+| `flush_on_close`         | `off`   | `on` makes a pooled `close()` flush before releasing (one frame and one commit per close, the pre-1.4 behaviour). Note: "flush" means published to the store-and-forward ring, not acknowledged. Close-time errors are wrapped; the delegate's error is the cause |
 | `commit_rows`            | _(unset)_ | Commit window: with `flush_on_close=on`, closes ship frames flagged defer-commit and the server commits once per window of this many rows. Acks arrive at the commit; `drain()` after `flush()` |
-| `commit_interval_ms`     | _(unset)_ | Commit window age in milliseconds; setting either window key enables the window, the other defaults to 1000 rows / 100 ms |
+| `commit_interval_ms`     | _(unset)_ | Commit window age in milliseconds; setting either window key enables the window, the other defaults to 1000 rows / 100 ms. An idle slot's open group is committed at the settle cadence, so the interval only bounds groups on busy slots |
 
 ### Query routing keys
 

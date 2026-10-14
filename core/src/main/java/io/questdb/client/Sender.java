@@ -682,8 +682,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     }
 
     /**
-     * Whether a row has been started with {@link #table(CharSequence)} and not
-     * yet finished with {@link #at}, {@link #atNow()} or {@link #cancelRow()}.
+     * Whether a row is in progress: at least one column value has been set for
+     * the current row (just {@link #table(CharSequence)} does not count) and the
+     * row is not yet finished with {@link #at}, {@link #atNow()} or {@link #cancelRow()}.
      * Only the WebSocket QWP transport tracks this; other transports return
      * {@code false}.
      *
