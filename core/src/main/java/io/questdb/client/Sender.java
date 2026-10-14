@@ -416,6 +416,21 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     }
 
     /**
+     * Throws the error this sender has latched, if any: the terminal error of
+     * the WebSocket I/O loop (server rejection, exhausted reconnect budget,
+     * authentication failure) or a connection error. Publishes nothing and
+     * never blocks. Used by the connection pool to decide whether a returned
+     * sender may be handed to the next borrower.
+     * <br>
+     * Only the WebSocket QWP transport latches errors; on other transports this
+     * is a no-op.
+     *
+     * @throws LineSenderException if a terminal or connection error is latched
+     */
+    default void checkError() {
+    }
+
+    /**
      * Close this Sender.
      * <br>
      * This must be called before dereferencing Sender, otherwise resources might leak.
@@ -640,6 +655,18 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     }
 
     /**
+     * Whether a row has been started with {@link #table(CharSequence)} and not
+     * yet finished with {@link #at}, {@link #atNow()} or {@link #cancelRow()}.
+     * Only the WebSocket QWP transport tracks this; other transports return
+     * {@code false}.
+     *
+     * @return {@code true} while a row is in progress
+     */
+    default boolean hasRowInProgress() {
+        return false;
+    }
+
+    /**
      * Add a column with a 32-bit signed integer value.
      *
      * @param name  name of the column
@@ -704,6 +731,17 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      */
     Sender longColumn(CharSequence name, long value);
 
+
+    /**
+     * Number of rows appended with {@link #at}/{@link #atNow()} that have not
+     * been shipped to the server yet. Only the WebSocket QWP transport counts
+     * pending rows; other transports return {@code 0}.
+     *
+     * @return rows buffered and not yet flushed
+     */
+    default int pendingRowCount() {
+        return 0;
+    }
 
     /**
      * Advisory request to start a fresh symbol-dictionary epoch. The reset

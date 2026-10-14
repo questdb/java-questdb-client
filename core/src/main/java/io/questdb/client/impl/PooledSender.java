@@ -131,6 +131,11 @@ public final class PooledSender implements Sender {
         return this;
     }
 
+    @Override
+    public void checkError() {
+        slot.live(generation).checkError();
+    }
+
     /**
      * Flushes pending rows and returns this lease's slot to the pool. Does not
      * actually close the underlying {@link Sender}; that only happens when the
@@ -277,6 +282,11 @@ public final class PooledSender implements Sender {
     }
 
     @Override
+    public boolean hasRowInProgress() {
+        return slot.live(generation).hasRowInProgress();
+    }
+
+    @Override
     public Sender intColumn(CharSequence name, int value) {
         slot.live(generation).intColumn(name, value);
         return this;
@@ -328,6 +338,11 @@ public final class PooledSender implements Sender {
     public Sender longColumn(CharSequence name, long value) {
         slot.live(generation).longColumn(name, value);
         return this;
+    }
+
+    @Override
+    public int pendingRowCount() {
+        return slot.live(generation).pendingRowCount();
     }
 
     @Override

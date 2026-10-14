@@ -1656,6 +1656,11 @@ public class QwpWebSocketSender implements Sender {
         return this;
     }
 
+    @Override
+    public void checkError() {
+        checkNotClosed();
+    }
+
     /**
      * Closes the sender: flushes user-thread state into the engine, drains
      * acked data within {@code close_flush_timeout}, stops the I/O loop,
@@ -2899,6 +2904,11 @@ public class QwpWebSocketSender implements Sender {
         return counters.serverErrors.get();
     }
 
+    @Override
+    public boolean hasRowInProgress() {
+        return currentTableBuffer != null && currentTableBuffer.hasInProgressRow();
+    }
+
     /**
      * Adds an INT column value to the current row.
      *
@@ -3131,6 +3141,11 @@ public class QwpWebSocketSender implements Sender {
             java.util.function.BooleanSupplier stopFlag
     ) {
         return new ReconnectSupplier(stopFlag, "drainer stop requested during connect");
+    }
+
+    @Override
+    public int pendingRowCount() {
+        return pendingRowCount;
     }
 
     /**
