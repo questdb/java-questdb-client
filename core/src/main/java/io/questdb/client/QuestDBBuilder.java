@@ -54,6 +54,8 @@ import java.util.function.LongConsumer;
 public final class QuestDBBuilder {
 
     static final long DEFAULT_ACQUIRE_TIMEOUT_MILLIS = 5_000;
+    static final long DEFAULT_COMMIT_INTERVAL_MILLIS = 100;
+    static final int DEFAULT_COMMIT_ROWS = 1000;
     static final long DEFAULT_HOUSEKEEPER_INTERVAL_MILLIS = 5_000;
     static final long DEFAULT_IDLE_TIMEOUT_MILLIS = 60_000;
     static final long DEFAULT_MAX_LIFETIME_MILLIS = 30 * 60_000L;
@@ -73,6 +75,8 @@ public final class QuestDBBuilder {
     private long acquireTimeoutMillis = UNSET;
     // Optional ingest-side async callbacks. Null -> each pooled Sender uses its
     // loud-not-silent default. Applied to every Sender the pool builds.
+    private long commitIntervalMillis = UNSET;
+    private int commitRows = UNSET;
     private SenderConnectionListener connectionListener;
     private BackgroundDrainerListener drainerListener;
     private SenderErrorHandler errorHandler;
@@ -86,6 +90,7 @@ public final class QuestDBBuilder {
     private long queryCloseTimeoutMillis = UNSET;
     private int queryPoolMax = UNSET;
     private int queryPoolMin = UNSET;
+    private String resolvedIngestConfig;
     private int senderPoolMax = UNSET;
     private int senderPoolMin = UNSET;
 
@@ -117,6 +122,35 @@ public final class QuestDBBuilder {
             throw new IllegalArgumentException("queryCloseTimeoutMillis must be >= 0");
         }
         this.queryCloseTimeoutMillis = millis;
+        return this;
+    }
+
+    /**
+     * Age of a commit window in milliseconds. Setting a commit window makes
+     * pooled closes ship frames flagged defer-commit: the server appends them
+     * and commits once per window, when either {@link #commitRows(int)} rows
+     * or this many milliseconds have accumulated since the last commit. Acks
+     * then arrive at the commit, so a {@link Sender#drain(long)} should follow
+     * a {@link Sender#flush()}. Requires {@code flush_on_close=on}. When only
+     * one of the two window settings is given, the other takes the auto-flush
+     * default (1000 rows, 100 ms).
+     */
+    public QuestDBBuilder commitIntervalMillis(long millis) {
+        if (millis < 1) {
+            throw new IllegalArgumentException("commitIntervalMillis must be >= 1");
+        }
+        this.commitIntervalMillis = millis;
+        return this;
+    }
+
+    /**
+     * Rows per commit window. See {@link #commitIntervalMillis(long)}.
+     */
+    public QuestDBBuilder commitRows(int rows) {
+        if (rows < 1) {
+            throw new IllegalArgumentException("commitRows must be >= 1");
+        }
+        this.commitRows = rows;
         return this;
     }
 
@@ -246,7 +280,37 @@ public final class QuestDBBuilder {
         if (flushOnClose == null) {
             flushOnClose = view.getBool("flush_on_close", false);
         }
-        long settleIntervalMillis = resolveSettleIntervalMillis(view, housekeeperIntervalMillis);
+        resolvePoolInt(commitRows, "commit_rows", view, UNSET, this::setCommitRowsResolved);
+        resolvePoolLong(commitIntervalMillis, "commit_interval_ms", view, UNSET, this::setCommitIntervalResolved);
+        boolean windowSet = commitRows != UNSET || commitIntervalMillis != UNSET;
+        if (windowSet) {
+            if (commitRows == UNSET) {
+                commitRows = DEFAULT_COMMIT_ROWS;
+            }
+            if (commitIntervalMillis == UNSET) {
+                commitIntervalMillis = DEFAULT_COMMIT_INTERVAL_MILLIS;
+            }
+            if (!flushOnClose) {
+                throw new IllegalArgumentException(
+                        "conflicting configuration: commit_rows/commit_interval_ms need flush_on_close=on in this version. "
+                                + "The buffered variant (flush_on_close=off with a commit window) is not available yet; "
+                                + "set flush_on_close=on or remove the commit window keys.");
+            }
+            String transaction = view.getStr("transaction");
+            if (transaction != null && !"on".equalsIgnoreCase(transaction)) {
+                throw new IllegalArgumentException(
+                        "conflicting configuration: a commit window needs transaction=on on the pooled senders, but "
+                                + "transaction=" + transaction + " was set. Remove transaction= (the pool sets it) or set it to on.");
+            }
+            if (transaction == null) {
+                ingestConfig = injectAfterSchema(ingestConfig, "transaction=on;");
+            }
+        } else {
+            commitRows = 0;
+            commitIntervalMillis = 0;
+        }
+        resolvedIngestConfig = ingestConfig;
+        long settleIntervalMillis = resolveSettleIntervalMillis(view, housekeeperIntervalMillis, commitIntervalMillis);
 
         return new QuestDBImpl(
                 ingestConfig,
@@ -265,7 +329,9 @@ public final class QuestDBBuilder {
                 connectionListener,
                 drainerListener,
                 flushOnClose,
-                settleIntervalMillis
+                settleIntervalMillis,
+                commitRows,
+                commitIntervalMillis
         );
     }
 
@@ -485,7 +551,14 @@ public final class QuestDBBuilder {
         m.put("max_lifetime_ms", maxLifetimeMillis);
         m.put("housekeeper_interval_ms", housekeeperIntervalMillis);
         m.put("flush_on_close", flushOnClose);
+        m.put("commit_rows", commitRows);
+        m.put("commit_interval_ms", commitIntervalMillis);
         return m;
+    }
+
+    @TestOnly
+    public String ingestConfigForTest() {
+        return resolvedIngestConfig;
     }
 
     // Inject a non-blocking async initial connect right after the schema
@@ -493,6 +566,13 @@ public final class QuestDBBuilder {
     // server. Only used when the user set no initial_connect_retry of their own
     // (resolveLazyConnect rejects an explicit blocking mode rather than silently
     // overriding it), so placement is immaterial -- there is no competing value.
+    // Inserts a key right after the "ws::" / "wss::" schema separator so the
+    // sender parse sees it as part of the ingest config.
+    private static String injectAfterSchema(String config, String keyValue) {
+        int sep = config.indexOf("::") + 2;
+        return config.substring(0, sep) + keyValue + config.substring(sep);
+    }
+
     private static String withDefaultAsyncConnect(String config) {
         int sep = config.indexOf("::");
         // sep >= 0: fromConfig() validated a ws/wss schema, so "::" is present.
@@ -504,14 +584,16 @@ public final class QuestDBBuilder {
      * {@link #DEFAULT_SETTLE_INTERVAL_MILLIS} when unset. The WebSocket
      * transport rejects both {@code auto_flush=off} and
      * {@code auto_flush_interval=off}, so the interval is a number or unset.
-     * {@code housekeeperIntervalMillis} is currently unused.
+     * With a commit window, the shorter of that and {@code commitIntervalMillis}
+     * (0 = no window). {@code housekeeperIntervalMillis} is currently unused.
      * Public only for the unit test, which lives in another package.
      */
     @TestOnly
-    public static long resolveSettleIntervalMillis(ConfigView view, long housekeeperIntervalMillis) {
+    public static long resolveSettleIntervalMillis(ConfigView view, long housekeeperIntervalMillis, long commitIntervalMillis) {
         // getLong uses the connect-string number syntax (underscore separators
         // included), the same one the Sender parse already accepted.
-        return Math.max(1L, view.getLong("auto_flush_interval", DEFAULT_SETTLE_INTERVAL_MILLIS));
+        long fromAutoFlush = Math.max(1L, view.getLong("auto_flush_interval", DEFAULT_SETTLE_INTERVAL_MILLIS));
+        return commitIntervalMillis > 0 ? Math.min(fromAutoFlush, commitIntervalMillis) : fromAutoFlush;
     }
 
     private static void requireWebSocketSchema(CharSequence config, String role) {
@@ -534,5 +616,13 @@ public final class QuestDBBuilder {
             return; // explicit builder call wins
         }
         setter.accept(view.has(key) ? view.getLong(key, UNSET) : dflt);
+    }
+
+    private void setCommitIntervalResolved(long millis) {
+        this.commitIntervalMillis = millis;
+    }
+
+    private void setCommitRowsResolved(int rows) {
+        this.commitRows = rows;
     }
 }
