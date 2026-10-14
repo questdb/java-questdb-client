@@ -156,7 +156,7 @@ public final class PooledSender implements Sender {
      * returned, and a new {@link LineSenderException} is thrown here whose
      * cause is the delegate's error. A lease body that already threw the typed
      * error keeps it as the primary exception, with close's wrapper
-     * suppressed.
+     * suppressed. The typed error and its classification live on the cause.
      * <p>
      * Idempotent for sequential reuse: a stale generation (the lease was
      * already returned and the slot possibly re-borrowed) is a no-op. Concurrent
@@ -211,7 +211,10 @@ public final class PooledSender implements Sender {
         }
         if (failure != null) {
             String msg = failure.getMessage();
-            throw new LineSenderException("pooled sender close failed: " + msg, failure);
+            boolean retryable = failure instanceof LineSenderException && ((LineSenderException) failure).isRetryable();
+            LineSenderException wrapper = new LineSenderException("pooled sender close failed: " + msg, retryable);
+            wrapper.initCause(failure);
+            throw wrapper;
         }
         if (cancelledRow) {
             throw new LineSenderException("row in progress at close(): the row was cancelled and the sender returned to the pool; "

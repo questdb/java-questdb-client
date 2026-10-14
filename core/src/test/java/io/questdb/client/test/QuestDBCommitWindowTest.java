@@ -3,6 +3,7 @@ package io.questdb.client.test;
 import io.questdb.client.LineSenderServerException;
 import io.questdb.client.QuestDB;
 import io.questdb.client.Sender;
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.impl.PooledSender;
 import io.questdb.client.test.QuestDBFlushOnCloseTest.FrameLog;
@@ -142,6 +143,12 @@ public class QuestDBCommitWindowTest {
                         s.table("t").longColumn("v", v).atNow();
                     } catch (LineSenderServerException e) {
                         seen = e;
+                    } catch (LineSenderException e) {
+                        // the terminal latched after the last row call: close() wraps it
+                        if (!(e.getCause() instanceof LineSenderServerException)) {
+                            throw e;
+                        }
+                        seen = (LineSenderServerException) e.getCause();
                     }
                     Thread.sleep(20);
                 }
@@ -167,22 +174,15 @@ public class QuestDBCommitWindowTest {
      * is nothing, shows both frames again.
      */
     private static final class RejectSecondFrameHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private final byte rejectStatus;
         private int connections;
         private TestWebSocketServer.ClientHandler currentClient;
         private TestWebSocketServer.ClientHandler firstClient;
         private long nextSeq;
-        private final byte rejectStatus;
         private int secondConnectionDataFrames;
 
         RejectSecondFrameHandler(byte rejectStatus) {
             this.rejectStatus = rejectStatus;
-        }
-
-        void awaitSecondConnectionFrames(int atLeast, long timeoutMillis) throws InterruptedException {
-            long deadline = System.currentTimeMillis() + timeoutMillis;
-            while (secondConnectionDataFrames() < atLeast && System.currentTimeMillis() < deadline) {
-                Thread.sleep(10);
-            }
         }
 
         @Override
@@ -210,6 +210,13 @@ public class QuestDBCommitWindowTest {
                 }
             } catch (IOException e) {
                 throw new RuntimeException(e);
+            }
+        }
+
+        void awaitSecondConnectionFrames(int atLeast, long timeoutMillis) throws InterruptedException {
+            long deadline = System.currentTimeMillis() + timeoutMillis;
+            while (secondConnectionDataFrames() < atLeast && System.currentTimeMillis() < deadline) {
+                Thread.sleep(10);
             }
         }
 
