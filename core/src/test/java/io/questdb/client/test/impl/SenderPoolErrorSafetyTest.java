@@ -171,8 +171,8 @@ public class SenderPoolErrorSafetyTest {
             IntFunction<Sender> factory = slotIndex -> flushThrowingSender();
 
             try (SenderPool pool = newPool(CFG, 1, 1, 1_000, factory)) {
-                Sender first = pool.borrow();
                 pool.setFlushOnClose(true); // this test is about the flushing close path
+                Sender first = pool.borrow();
                 // Capture the underlying slot before close(): borrow() always hands
                 // out a FRESH PooledSender wrapper, so assertNotSame(first, second)
                 // on the wrappers is vacuously true and proves nothing -- it stays

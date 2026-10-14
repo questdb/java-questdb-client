@@ -155,7 +155,9 @@ public final class PooledSender implements Sender {
      * returned, and the error is rethrown here.
      * <p>
      * Idempotent for sequential reuse: a stale generation (the lease was
-     * already returned and the slot possibly re-borrowed) is a no-op.
+     * already returned and the slot possibly re-borrowed) is a no-op. Concurrent
+     * double-close of ONE lease from two threads is outside the Sender
+     * threading contract.
      */
     @Override
     public void close() {

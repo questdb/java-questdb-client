@@ -38,14 +38,14 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * In-memory {@link Sender} double for pool tests. Records calls, models the
  * buffer state the pool asks about, and can be told to fail or to block.
- * Never touches the network. Not final: one test subclasses it to make a
- * single method throw.
+ * Never touches the network. Not final, so a test can override a single method.
  */
 class RecordingSender implements Sender {
     final AtomicInteger cancelCount = new AtomicInteger();
     final AtomicInteger closeCount = new AtomicInteger();
     final AtomicInteger deferredFlushCount = new AtomicInteger();
     final AtomicInteger flushCount = new AtomicInteger();
+    volatile RuntimeException cancelError;     // thrown by cancelRow() when set
     volatile boolean deferredFramesOpen;
     volatile RuntimeException flushError;      // thrown by flush() when set
     volatile CountDownLatch flushGate;         // flush() blocks on it when set
@@ -84,6 +84,10 @@ class RecordingSender implements Sender {
     @Override
     public void cancelRow() {
         cancelCount.incrementAndGet();
+        RuntimeException e = cancelError;
+        if (e != null) {
+            throw e;
+        }
         rowInProgress = false;
     }
 

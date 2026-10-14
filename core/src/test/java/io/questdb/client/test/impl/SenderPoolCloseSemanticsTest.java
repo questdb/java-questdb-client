@@ -47,6 +47,27 @@ public class SenderPoolCloseSemanticsTest {
     private static final String CONFIG = "http::addr=127.0.0.1:1;protocol_version=2;auto_flush=off;";
 
     @Test
+    public void testCancelRowThrowingAtCloseRetiresSlot() {
+        List<RecordingSender> built = new ArrayList<>();
+        try (SenderPool pool = newPool(1, 1, built)) {
+            Sender first = pool.borrow();
+            RecordingSender delegate = built.get(0);
+            // A terminal latched between the probe and the cancel: model it as
+            // cancelRow() itself failing. The lease must still come home.
+            delegate.rowInProgress = true;
+            delegate.cancelError = new LineSenderException("latched during cancel");
+            try {
+                first.close();
+                Assert.fail("close() must propagate the cancel failure");
+            } catch (LineSenderException e) {
+                Assert.assertEquals("latched during cancel", e.getMessage());
+            }
+            Assert.assertEquals("slot must be retired, not stranded", 0, pool.totalSize());
+            Assert.assertEquals(1, delegate.closeCount.get());
+        }
+    }
+
+    @Test
     public void testCloseDoesNotFlushByDefault() {
         List<RecordingSender> built = new ArrayList<>();
         try (SenderPool pool = newPool(1, 1, built)) {
@@ -77,6 +98,21 @@ public class SenderPoolCloseSemanticsTest {
     }
 
     @Test
+    public void testFreeListIsLifo() {
+        List<RecordingSender> built = new ArrayList<>();
+        try (SenderPool pool = newPool(2, 2, built)) {
+            Sender a = pool.borrow();
+            Sender b = pool.borrow();
+            Object slotB = slotOf(b);
+            a.close();
+            b.close();
+            try (Sender next = pool.borrow()) {
+                Assert.assertSame("most recently returned slot is borrowed first", slotB, slotOf(next));
+            }
+        }
+    }
+
+    @Test
     public void testLatchedErrorAtCloseRetiresSlotAndThrows() {
         List<RecordingSender> built = new ArrayList<>();
         try (SenderPool pool = newPool(1, 1, built)) {
@@ -96,6 +132,21 @@ public class SenderPoolCloseSemanticsTest {
                 Assert.assertNotSame(delegate, ((PooledSender) second).getDelegateForTesting());
             }
         }
+    }
+
+    @Test
+    public void testLeaseReturnedAfterPoolCloseClosesDelegate() {
+        List<RecordingSender> built = new ArrayList<>();
+        SenderPool pool = newPool(1, 1, built);
+        Sender s = pool.borrow();
+        s.table("t").longColumn("v", 1L).atNow();
+        pool.close();                                        // bounded wait, lease outstanding
+        Assert.assertEquals("borrowed slot is left for the returning lease", 1, pool.totalSize());
+        s.close();
+        RecordingSender delegate = built.get(0);
+        Assert.assertEquals("returning lease must close its delegate", 1, delegate.closeCount.get());
+        Assert.assertEquals("the pooled close itself must not flush", 0, delegate.flushCount.get());
+        Assert.assertEquals(0, pool.totalSize());
     }
 
     @Test
@@ -120,36 +171,6 @@ public class SenderPoolCloseSemanticsTest {
     }
 
     @Test
-    public void testCancelRowThrowingAtCloseRetiresSlot() {
-        List<RecordingSender> built = new ArrayList<>();
-        try (SenderPool pool = newPool(1, 1, built)) {
-            Sender first = pool.borrow();
-            RecordingSender delegate = built.get(0);
-            first.table("t");
-            // A terminal latched between the probe and the cancel: model it as
-            // cancelRow() itself failing. The lease must still come home.
-            RecordingSender throwingOnCancel = new RecordingSender() {
-                @Override
-                public void cancelRow() {
-                    throw new LineSenderException("latched during cancel");
-                }
-            };
-            // swap the delegate the slot holds, white-box
-            setDelegate(first, throwingOnCancel);
-            throwingOnCancel.rowInProgress = true;
-            try {
-                first.close();
-                Assert.fail("close() must propagate the cancel failure");
-            } catch (LineSenderException e) {
-                Assert.assertEquals("latched during cancel", e.getMessage());
-            }
-            Assert.assertEquals("slot must be retired, not stranded", 0, pool.totalSize());
-            Assert.assertEquals(1, throwingOnCancel.closeCount.get());
-            Assert.assertEquals(0, delegate.closeCount.get());
-        }
-    }
-
-    @Test
     public void testStaleCloseDoesNotTouchReborrowedSlot() {
         List<RecordingSender> built = new ArrayList<>();
         try (SenderPool pool = newPool(1, 1, built)) {
@@ -157,43 +178,17 @@ public class SenderPoolCloseSemanticsTest {
             first.close();
             Sender second = pool.borrow();
             second.table("t").longColumn("v", 1L);          // second's row in progress
-            first.close();                                   // stale: must be a no-op
             RecordingSender delegate = built.get(0);
+            delegate.latchedError = new LineSenderException("must not be probed by a stale close");
+            first.close();                                   // stale: must be a no-op, must not probe
+            Assert.assertEquals("stale close must not retire the live slot", 1, pool.totalSize());
+            delegate.latchedError = null;
             Assert.assertEquals("stale close must not cancel the live borrower's row", 0, delegate.cancelCount.get());
             Assert.assertTrue(delegate.hasRowInProgress());
             Assert.assertEquals("stale close must not re-enqueue the slot", 0, pool.availableSize());
             second.atNow();
             second.close();
             Assert.assertEquals(1, pool.availableSize());
-        }
-    }
-
-    @Test
-    public void testLeaseReturnedAfterPoolCloseClosesDelegate() {
-        List<RecordingSender> built = new ArrayList<>();
-        SenderPool pool = newPool(1, 1, built);
-        Sender s = pool.borrow();
-        s.table("t").longColumn("v", 1L).atNow();
-        pool.close();                                        // bounded wait, lease outstanding
-        Assert.assertEquals("borrowed slot is left for the returning lease", 1, pool.totalSize());
-        s.close();
-        RecordingSender delegate = built.get(0);
-        Assert.assertEquals("returning lease must close its delegate, which ships the rows", 1, delegate.closeCount.get());
-        Assert.assertEquals(0, pool.totalSize());
-    }
-
-    @Test
-    public void testFreeListIsLifo() {
-        List<RecordingSender> built = new ArrayList<>();
-        try (SenderPool pool = newPool(2, 2, built)) {
-            Sender a = pool.borrow();
-            Sender b = pool.borrow();
-            Object slotB = slotOf(b);
-            a.close();
-            b.close();
-            try (Sender next = pool.borrow()) {
-                Assert.assertSame("most recently returned slot is borrowed first", slotB, slotOf(next));
-            }
         }
     }
 
@@ -210,17 +205,6 @@ public class SenderPoolCloseSemanticsTest {
             Field f = PooledSender.class.getDeclaredField("slot");
             f.setAccessible(true);
             return f.get(pooledWrapper);
-        } catch (ReflectiveOperationException e) {
-            throw new AssertionError(e);
-        }
-    }
-
-    private static void setDelegate(Sender pooledWrapper, Sender delegate) {
-        try {
-            Object slot = slotOf(pooledWrapper);
-            Field f = slot.getClass().getDeclaredField("delegate");
-            f.setAccessible(true);
-            f.set(slot, delegate);
         } catch (ReflectiveOperationException e) {
             throw new AssertionError(e);
         }
