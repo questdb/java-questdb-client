@@ -124,6 +124,11 @@ The sender buffers rows and sends them in batches. For high throughput, write ma
 flush per batch rather than per row: each flush has a fixed cost, so batching raises throughput. The final partial batch ships on the
 pool's next settle; call `flush()` before `close()` if you need it on the wire now.
 
+If you borrow per message and want each message in the store-and-forward ring the moment `close()` returns, set
+`flush_on_close=on` together with a commit window (`commit_rows`, `commit_interval_ms`): every close ships one frame
+flagged defer-commit, the server appends it, and the pool commits once per window instead of once per close. A
+rejected frame rolls the open window back on the server and the client replays the healthy frames from the ring.
+
 ```java
 try (Sender sender = db.borrowSender()) {
     for (int i = 0; i < trades.size(); i++) {
@@ -547,6 +552,8 @@ schema::key1=value1;key2=value2;
 | `idle_timeout_ms`        | `60000` | How long a pooled connection may stay idle before it is reaped                 |
 | `max_lifetime_ms`        | `1800000` | Maximum lifetime of a pooled connection before it is recycled                |
 | `flush_on_close`         | `off`   | `on` makes a pooled `close()` flush before releasing (one frame and one commit per close, the pre-1.4 behaviour). Note: "flush" means published to the store-and-forward ring, not acknowledged |
+| `commit_rows`            | _(unset)_ | Commit window: with `flush_on_close=on`, closes ship frames flagged defer-commit and the server commits once per window of this many rows. Acks arrive at the commit; `drain()` after `flush()` |
+| `commit_interval_ms`     | _(unset)_ | Commit window age in milliseconds; setting either window key enables the window, the other defaults to 1000 rows / 100 ms |
 
 ### Query routing keys
 
