@@ -26,8 +26,8 @@ package io.questdb.client.test.impl;
 
 import io.questdb.client.Sender;
 import io.questdb.client.impl.ConfigSchema;
-import io.questdb.client.test.cutlass.auth.TestTokenProviderFactory;
 import io.questdb.client.impl.Side;
+import io.questdb.client.test.cutlass.auth.TestTokenProviderFactory;
 import org.junit.Assert;
 import org.junit.Test;
 

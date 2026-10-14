@@ -29,6 +29,7 @@ import io.questdb.client.Sender;
 import io.questdb.client.cutlass.auth.ExpiringToken;
 import io.questdb.client.cutlass.auth.TokenProviderRegistry;
 import io.questdb.client.cutlass.auth.TokenProviderSpec;
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 import io.questdb.client.impl.ConfigString;
 import io.questdb.client.impl.ConfigView;
@@ -78,6 +79,28 @@ public class TokenProviderSharingTest {
                         0, TokenProviderRegistry.global().leaseCount(spec));
                 Assert.assertTrue("the provider lingers for the next client", TokenProviderRegistry.global().isActive(spec));
             }
+        });
+    }
+
+    @Test(timeout = 60_000)
+    public void testSenderBuildFailureReleasesTheLease() throws Exception {
+        assertMemoryLeak(() -> {
+            TestTokenProviderFactory azure = new TestTokenProviderFactory("azure");
+            TestTokenProviderFactory.install(azure);
+            // nothing listens on the port: build() takes the lease, then fails to connect
+            String cfg = "wss::addr=localhost:" + TestPorts.findUnusedPort() + ";tls_verify=unsafe_off;"
+                    + "token_provider=azure;azure_resource=api://c17-failed-build-" + System.nanoTime() + ';';
+            TokenProviderSpec spec = spec(cfg);
+            try (Sender ignored = Sender.fromConfig(cfg)) {
+                Assert.fail("build() must fail: nothing listens on " + cfg);
+            } catch (LineSenderException expected) {
+                // the connect failure
+            }
+            Assert.assertEquals("build() took the lease: it created the provider", 1, azure.created.get());
+            Assert.assertEquals("a failed build releases its lease",
+                    0, TokenProviderRegistry.global().leaseCount(spec));
+            Assert.assertTrue("the provider lingers for the next attempt",
+                    TokenProviderRegistry.global().isActive(spec));
         });
     }
 
