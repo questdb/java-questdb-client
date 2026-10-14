@@ -586,6 +586,21 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     }
 
     /**
+     * Ships the pending rows as a frame carrying the defer-commit flag: the
+     * server appends them to its WAL writers and withholds both the commit and
+     * the acknowledgement until a later {@link #flush()} on this sender, which
+     * closes the group. Used by the connection pool's commit window. Only the
+     * WebSocket QWP transport supports deferred commits.
+     *
+     * @return the published frame sequence number, or {@code -1} if nothing was pending
+     * @throws UnsupportedOperationException on transports without deferred commits
+     * @throws LineSenderException           if the transport has latched a terminal error
+     */
+    default long flushDeferred() {
+        throw new UnsupportedOperationException("deferred flush requires the WebSocket transport");
+    }
+
+    /**
      * Add a GEOHASH column value from pre-packed bits and an explicit bit precision.
      * <p>
      * The {@code bits} long carries the geohash in its low {@code precisionBits} bits;
@@ -652,6 +667,17 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      */
     default long getAckedFsn() {
         return -1L;
+    }
+
+    /**
+     * Whether frames shipped with {@link #flushDeferred()}, or by auto-flush in
+     * {@code transaction=on} mode, are still waiting for the commit that a
+     * {@link #flush()} sends. Only the WebSocket QWP transport tracks this.
+     *
+     * @return {@code true} while a deferred group is open
+     */
+    default boolean hasDeferredFrames() {
+        return false;
     }
 
     /**
@@ -797,6 +823,18 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * @see #flush()
      */
     void reset();
+
+    /**
+     * Monotonic count of rows finished with {@link #at}/{@link #atNow()} over
+     * this sender's life, whether or not they have shipped. The connection
+     * pool measures its commit window on deltas of this value. Only the
+     * WebSocket QWP transport counts; other transports return {@code 0}.
+     *
+     * @return rows appended so far
+     */
+    default long rowsAppended() {
+        return 0L;
+    }
 
     /**
      * Add a column with a 16-bit signed integer value.

@@ -272,6 +272,11 @@ public final class PooledSender implements Sender {
     }
 
     @Override
+    public long flushDeferred() {
+        return slot.live(generation).flushDeferred();
+    }
+
+    @Override
     public Sender geoHashColumn(CharSequence name, long bits, int precisionBits) {
         slot.live(generation).geoHashColumn(name, bits, precisionBits);
         return this;
@@ -286,6 +291,11 @@ public final class PooledSender implements Sender {
     @Override
     public long getAckedFsn() {
         return slot.live(generation).getAckedFsn();
+    }
+
+    @Override
+    public boolean hasDeferredFrames() {
+        return slot.live(generation).hasDeferredFrames();
     }
 
     @Override
@@ -355,6 +365,11 @@ public final class PooledSender implements Sender {
     @Override
     public void reset() {
         slot.live(generation).reset();
+    }
+
+    @Override
+    public long rowsAppended() {
+        return slot.live(generation).rowsAppended();
     }
 
     @Override

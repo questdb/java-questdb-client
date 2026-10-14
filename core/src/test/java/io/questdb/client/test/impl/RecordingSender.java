@@ -146,9 +146,6 @@ class RecordingSender implements Sender {
         deferredFramesOpen = false;
     }
 
-    /* Phase B (Task 9): re-enable these three overrides once Sender gains
-       flushDeferred(), hasDeferredFrames() and rowsAppended().
-
     @Override
     public long flushDeferred() {
         awaitGate();
@@ -165,12 +162,6 @@ class RecordingSender implements Sender {
     public boolean hasDeferredFrames() {
         return deferredFramesOpen;
     }
-
-    @Override
-    public long rowsAppended() {
-        return rowsAppended;
-    }
-    */
 
     @Override
     public boolean hasRowInProgress() {
@@ -211,6 +202,11 @@ class RecordingSender implements Sender {
     public void reset() {
         pendingRows = 0;
         rowInProgress = false;
+    }
+
+    @Override
+    public long rowsAppended() {
+        return rowsAppended;
     }
 
     @Override

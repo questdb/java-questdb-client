@@ -2,6 +2,7 @@ package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.test.QuestDBFlushOnCloseTest;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
 import org.junit.Test;
@@ -16,6 +17,35 @@ import java.util.concurrent.TimeUnit;
  * frame.
  */
 public class SenderProbeMethodsTest {
+
+    @Test
+    public void testDeferredFlushShipsFlaggedFrameAndFlushCommits() throws Exception {
+        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+        try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            try (Sender sender = Sender.fromConfig(config(server.getPort()))) {
+                Assert.assertEquals(0L, sender.rowsAppended());
+                Assert.assertFalse(sender.hasDeferredFrames());
+                Assert.assertEquals(-1L, sender.flushDeferred());          // nothing pending
+
+                sender.table("t").longColumn("v", 1L).atNow();
+                Assert.assertEquals(1L, sender.rowsAppended());
+                Assert.assertTrue(sender.flushDeferred() >= 0L);
+                Assert.assertTrue("a deferred frame is open", sender.hasDeferredFrames());
+                Assert.assertEquals(0, sender.pendingRowCount());
+
+                sender.table("t").longColumn("v", 2L).atNow();
+                sender.flush();                                            // closes the group
+                Assert.assertFalse(sender.hasDeferredFrames());
+                Assert.assertEquals(2L, sender.rowsAppended());
+
+                log.awaitDataFrames(2, 5_000);
+                Assert.assertTrue("first frame carries FLAG_DEFER_COMMIT", log.deferFlag(0));
+                Assert.assertFalse("committing frame is unflagged", log.deferFlag(1));
+            }
+        }
+    }
 
     @Test
     public void testHealthySenderReportsBufferState() throws Exception {
