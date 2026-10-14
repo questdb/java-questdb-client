@@ -1,3 +1,27 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
 package io.questdb.client.test.impl;
 
 import io.questdb.client.Sender;
@@ -105,11 +129,29 @@ public class SenderPoolCommitWindowTest {
     }
 
     @Test
+    public void testSetCommitWindowRejectsNegativeOrMixedValues() {
+        List<RecordingSender> built = new ArrayList<>();
+        try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(1, 1, built)) {
+            int[][] bad = {{-1, -1}, {0, -5}, {5, 0}, {0, 5}};
+            for (int[] b : bad) {
+                try {
+                    pool.setCommitWindow(b[0], b[1]);
+                    Assert.fail("expected IllegalArgumentException for " + b[0] + ", " + b[1]);
+                } catch (IllegalArgumentException expected) {
+                    Assert.assertFalse(pool.hasCommitWindow());
+                }
+            }
+            pool.setCommitWindow(0, 0);
+            Assert.assertFalse(pool.hasCommitWindow());
+        }
+    }
+
+    @Test
     public void testSettleCommitsIdleOpenGroup() {
         List<RecordingSender> built = new ArrayList<>();
         try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(1, 1, built)) {
             pool.setFlushOnClose(true);
-            pool.setCommitWindow(1_000, 60_000L);
+            pool.setCommitWindow(2, 60_000L);
             try (Sender s = pool.borrow()) {
                 s.table("t").longColumn("v", 1L).atNow();
             }
@@ -120,7 +162,9 @@ public class SenderPoolCommitWindowTest {
             Assert.assertEquals(1, d.flushCount.get());
             Assert.assertFalse(d.hasDeferredFrames());
             Assert.assertEquals("window restarted by the settle", 0, pool.settleIdle());
-            // the next close after a settle commit is deferred again, not committing
+            // the settle marked the commit at 1 row, so the next close (2 rows
+            // appended in total, 1 in the window) defers; had the mark been
+            // missed, the window would count 2 rows and this close would commit
             try (Sender s = pool.borrow()) {
                 s.table("t").longColumn("v", 2L).atNow();
             }

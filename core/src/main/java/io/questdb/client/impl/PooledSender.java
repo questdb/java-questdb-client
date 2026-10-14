@@ -140,7 +140,8 @@ public final class PooledSender implements Sender {
     }
 
     /**
-     * Returns this lease's slot to the pool. By default nothing is shipped:
+     * Returns this lease's slot to the pool. By default nothing is shipped
+     * (see the commit-window note below):
      * the rows stay in the slot's buffer and go out when an auto-flush
      * threshold trips on a later append or when the pool's housekeeper settles
      * the idle slot. With {@code flush_on_close=on} the rows are flushed first,
@@ -162,8 +163,10 @@ public final class PooledSender implements Sender {
      * With a commit window ({@link SenderPool#setCommitWindow}) and
      * {@code flush_on_close=on}, each close ships a deferred frame; the close
      * that fills the window (rows appended or age of the open group) flushes
-     * instead, which commits the group. Without {@code flush_on_close} the
-     * window still closes on that release, but nothing is shipped otherwise.
+     * instead, which commits the group. Without {@code flush_on_close}, only
+     * the release that closes the window ships: it flushes, committing the
+     * group. The window's age is measured from the first release that found
+     * work. A failed ship retires the slot and rethrows.
      */
     @Override
     public void close() {
@@ -188,8 +191,9 @@ public final class PooledSender implements Sender {
             if (recycle) {
                 pool.giveBack(this);
             } else {
-                // The probe or the cancel threw: the delegate has latched an
-                // error (or the generation went stale). Retire it; the
+                // The probe, the cancel or the ship threw: the delegate has
+                // latched an error, the flush failed, or the generation went
+                // stale. Retire it; the
                 // original throwable propagates once this finally returns.
                 pool.discardBroken(this);
             }

@@ -246,13 +246,13 @@ public final class SenderPool implements AutoCloseable {
     // production; regression tests release a retired slot here to prove that
     // the terminal pass re-probes returned capacity before throwing.
     private volatile Runnable borrowWaitExpiredHook;
+    private volatile long commitIntervalNanos;
+    private volatile int commitRows;
     // Test seam invoked after close() handles an interrupt and confirms the
     // original creation-wait deadline still permits another wait. Null in
     // production; lifecycle tests use it to acknowledge distinct retries
     // without inspecting transient Condition queue membership.
     private volatile Runnable creationWaitRetryHook;
-    private volatile long commitIntervalNanos;
-    private volatile int commitRows;
     private volatile boolean flushOnClose;
     // Slots removed from `all` whose delegate is still releasing its flock.
     // They keep reserving capacity (and their slotInUse mark) until the
@@ -2143,12 +2143,12 @@ public final class SenderPool implements AutoCloseable {
 
     /**
      * Configures the commit window. Both values positive enable it; {@code 0, 0}
-     * disables it. Must be set before the first borrow; the pool's delegates
+     * disables it; negative values are rejected. Must be set before the first borrow; the pool's delegates
      * must have been built with {@code transaction=on} so that auto-flush
      * inside a lease ships deferred frames too (QuestDBBuilder injects it).
      */
     public void setCommitWindow(int commitRows, long commitIntervalMillis) {
-        if ((commitRows > 0) != (commitIntervalMillis > 0)) {
+        if (commitRows < 0 || commitIntervalMillis < 0 || (commitRows > 0) != (commitIntervalMillis > 0)) {
             throw new IllegalArgumentException("commit window needs both rows and interval, or neither: rows="
                     + commitRows + ", intervalMillis=" + commitIntervalMillis);
         }

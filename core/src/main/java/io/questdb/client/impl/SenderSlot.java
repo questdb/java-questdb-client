@@ -52,12 +52,13 @@ final class SenderSlot {
     // slot's current lease (a borrower or the settle step) reads or writes it.
     // 0 = no group open since the last commit.
     private long groupOpenedAtNanos;
-    private long rowsAppendedAtLastCommit;
     // Index in SenderPool.retiredSlots, or -1 while this slot is not retired.
     // Guarded by the pool lock. The pool maintains this index across swap
     // removals so the delegate's release callback can recover this exact slot
     // without scanning every other retired slot.
     private int retiredIndex = -1;
+    // Commit-window state, guarded by the lease (see groupOpenedAtNanos).
+    private long rowsAppendedAtLastCommit;
     // Monotonic lease id. Mutated only under the SenderPool lock (bumped in
     // borrow() when the slot is handed out and in giveBack()/discardBroken()
     // when it is returned). A PooledSender wrapper captures it live for its
