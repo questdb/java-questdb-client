@@ -120,12 +120,17 @@ public final class QwpConnectionHealthTracker {
     }
 
     /**
-     * The client will not connect again. Sticky; keeps the last connect-round failure.
+     * The client will not connect again. Sticky; keeps the last connect-round failure. A client that fails while
+     * connected starts its outage here, since it will not reach the server again; a client already without a
+     * connection keeps the start of the outage it is in.
      */
     public void failed() {
         synchronized (lock) {
             if (state != ConnectionHealth.State.CLOSED) {
                 state = ConnectionHealth.State.FAILED;
+                if (outageSince == ConnectionHealth.NONE) {
+                    outageSince = System.currentTimeMillis();
+                }
                 publish();
             }
         }

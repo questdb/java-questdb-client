@@ -32,6 +32,7 @@ import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
 import io.questdb.client.cutlass.qwp.client.QwpEgressMsgKind;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
+import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.test.cutlass.qwp.client.WebSocketDynamicCredentialTest.ErrorCollector;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
@@ -43,6 +44,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static io.questdb.client.test.cutlass.auth.TokenTestKit.await;
@@ -191,37 +193,18 @@ public class ConnectionHealthTest {
     }
 
     @Test(timeout = 60_000)
+    public void testQueryClientHealthIsFailedWhenFailoverIsOffAndItLosesItsConnection() throws Exception {
+        // C21 for egress: with failover off a query that loses its connection fails, and the failure stays latched,
+        // so every later query fails on it without reconnecting - the client is done.
+        assertMemoryLeak(() -> assertQueryClientFailsForGood("failover=off;", null));
+    }
+
+    @Test(timeout = 60_000)
     public void testQueryClientHealthIsFailedWhenItsOnlyAttemptLosesItsConnection() throws Exception {
         // C21 for egress: with failover_max_attempts=1 a query that loses its connection fails, and every later
         // query fails on the same latched failure without reconnecting - the client is done, as with failover off.
-        assertMemoryLeak(() -> {
-            DropQueryHandler handler = new DropQueryHandler();
-            try (TestWebSocketServer server = startServer(handler)) {
-                server.setSendServerInfo(true);
-                try (QwpQueryClient client = QwpQueryClient.fromConfig("ws::addr=localhost:" + server.getPort()
-                        + ";failover_max_attempts=1;")) {
-                    client.connect();
-                    handler.drop.set(true);
-                    RecordingHandler failed = new RecordingHandler();
-                    client.execute("SELECT 1", failed);
-                    Assert.assertNotNull("the query must fail", failed.error);
-                    Assert.assertTrue(failed.error, failed.error.startsWith("transport failure after 1 execute attempt"));
-                    ConnectionHealth h = client.health();
-                    Assert.assertEquals(h.toString(), ConnectionHealth.State.FAILED, h.getState());
-                    Assert.assertNotEquals(ConnectionHealth.NONE, h.getOutageSinceEpochMillis());
-
-                    // FAILED must hold: the server answers again, yet the next query fails without reconnecting
-                    handler.drop.set(false);
-                    int upgrades = server.upgradeRequestCount();
-                    RecordingHandler next = new RecordingHandler();
-                    client.execute("SELECT 1", next);
-                    Assert.assertNotNull("the next query must fail", next.error);
-                    Assert.assertTrue(next.error, next.error.startsWith("transport failure after 1 execute attempt"));
-                    Assert.assertEquals("no reconnect", upgrades, server.upgradeRequestCount());
-                    Assert.assertEquals(ConnectionHealth.State.FAILED, client.health().getState());
-                }
-            }
-        });
+        assertMemoryLeak(() -> assertQueryClientFailsForGood("failover_max_attempts=1;",
+                "transport failure after 1 execute attempt"));
     }
 
     @Test(timeout = 60_000)
@@ -256,6 +239,34 @@ public class ConnectionHealthTest {
                     Assert.assertEquals(h.toString(), ConnectionHealth.State.CONNECTED, h.getState());
                     Assert.assertEquals(ConnectionHealth.NONE, h.getOutageSinceEpochMillis());
                 }
+            }
+        });
+    }
+
+    @Test(timeout = 60_000)
+    public void testSenderHealthIsFailedWithAnOutageAfterATerminalRejection() throws Exception {
+        // C21: a sender that becomes terminal while connected - the server rejects a batch with a TERMINAL category -
+        // reports FAILED, and its outage starts there, since it will never reach the server again.
+        assertMemoryLeak(() -> {
+            ErrorCollector errors = new ErrorCollector();
+            try (TestWebSocketServer server = startServer(new RejectingHandler());
+                 Sender sender = Sender.builder(Sender.Transport.WEBSOCKET)
+                         .address("localhost:" + server.getPort())
+                         .errorHandler(errors)
+                         .build()) {
+                ConnectionHealth h = sender.health();
+                Assert.assertEquals(ConnectionHealth.State.CONNECTED, h.getState());
+                Assert.assertEquals(ConnectionHealth.NONE, h.getOutageSinceEpochMillis());
+
+                sender.table("t").longColumn("v", 1).atNow();
+                sender.flush();
+                // the I/O thread latches FAILED before it hands the terminal error to the handler
+                await(() -> errors.terminalCount() >= 1, 10_000, "the terminal rejection");
+                h = sender.health();
+                Assert.assertEquals(h.toString(), ConnectionHealth.State.FAILED, h.getState());
+                Assert.assertNotEquals("a failed sender is without a connection: " + h,
+                        ConnectionHealth.NONE, h.getOutageSinceEpochMillis());
+                Assert.assertTrue(h.toString(), h.getOutageSinceEpochMillis() >= h.getLastConnectedAtEpochMillis());
             }
         });
     }
@@ -340,6 +351,38 @@ public class ConnectionHealthTest {
                 Assert.assertEquals(ConnectionHealth.State.CLOSED, sender.health().getState());
             }
         });
+    }
+
+    // A query client loses its connection in the middle of a query, and its configuration lets it never reconnect:
+    // the query fails, and the health is FAILED with an outage. FAILED holds when a later query fails on the same
+    // latched failure without contacting the server. errorPrefix, when not null, starts both errors.
+    private static void assertQueryClientFailsForGood(String configKeys, String errorPrefix) throws Exception {
+        DropQueryHandler handler = new DropQueryHandler();
+        try (TestWebSocketServer server = startServer(handler)) {
+            server.setSendServerInfo(true);
+            try (QwpQueryClient client = QwpQueryClient.fromConfig("ws::addr=localhost:" + server.getPort() + ';'
+                    + configKeys)) {
+                client.connect();
+                handler.drop.set(true);
+                RecordingHandler failed = new RecordingHandler();
+                client.execute("SELECT 1", failed);
+                Assert.assertNotNull("the query must fail", failed.error);
+                Assert.assertTrue(failed.error, errorPrefix == null || failed.error.startsWith(errorPrefix));
+                ConnectionHealth h = client.health();
+                Assert.assertEquals(h.toString(), ConnectionHealth.State.FAILED, h.getState());
+                Assert.assertNotEquals(ConnectionHealth.NONE, h.getOutageSinceEpochMillis());
+
+                // FAILED must hold: the server answers again, yet the next query fails without reconnecting
+                handler.drop.set(false);
+                int upgrades = server.upgradeRequestCount();
+                RecordingHandler next = new RecordingHandler();
+                client.execute("SELECT 1", next);
+                Assert.assertNotNull("the next query must fail", next.error);
+                Assert.assertTrue(next.error, errorPrefix == null || next.error.startsWith(errorPrefix));
+                Assert.assertEquals("no reconnect", upgrades, server.upgradeRequestCount());
+                Assert.assertEquals(ConnectionHealth.State.FAILED, client.health().getState());
+            }
+        }
     }
 
     private static TestWebSocketServer startServer(TestWebSocketServer.WebSocketServerHandler handler)
@@ -427,6 +470,20 @@ public class ConnectionHealthTest {
         @Override
         public void onExecDone(short opType, long rowsAffected) {
             execDone++;
+        }
+    }
+
+    // Rejects every batch with PARSE_ERROR, a TERMINAL category: replaying the same bytes cannot succeed.
+    private static final class RejectingHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private final AtomicLong sequence = new AtomicLong();
+
+        @Override
+        public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            try {
+                client.sendBinary(QwpWireTestUtils.buildNack(sequence.getAndIncrement(), WebSocketResponse.STATUS_PARSE_ERROR));
+            } catch (IOException ignored) {
+                // surfaces to the client as a transport error
+            }
         }
     }
 }
