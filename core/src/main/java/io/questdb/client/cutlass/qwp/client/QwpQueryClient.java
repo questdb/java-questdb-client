@@ -774,9 +774,12 @@ public class QwpQueryClient implements QuietCloseable {
      * endpoints unreachable" (the latter surfaces as a plain
      * {@link HttpClientException}).
      * <p>
-     * A configured token provider is queried once here, before the walk. A
-     * provider failure (not signed in, a failed silent refresh, a rejected
-     * token) is cluster-wide, so it fails fast with the provider's own error
+     * A configured token provider is queried once here, before the walk, and once
+     * more if an endpoint rejects its token with {@code 401}. A provider failure
+     * (not signed in, a failed silent refresh, a rejected token) is cluster-wide,
+     * so it fails fast, without contacting any endpoint, as a
+     * {@link QwpCredentialUnavailableException} whose message starts with
+     * {@code credential-unavailable} and whose cause is the provider's own error,
      * rather than being retried across endpoints as a transport failure.
      */
     public synchronized void connect() {
@@ -828,9 +831,9 @@ public class QwpQueryClient implements QuietCloseable {
         Throwable lastTransportError = null;
         // Resolve the bearer credential once, before the endpoint walk: a token is cluster-wide, so a
         // token-provider failure (not signed in, a failed silent refresh, a rejected token) is not a
-        // per-endpoint transport fault. Resolving here lets it propagate as the provider's own error
-        // instead of being folded into "all endpoints unreachable", and avoids re-querying the provider
-        // once per endpoint.
+        // per-endpoint transport fault. Resolving here lets it propagate as a credential-unavailable failure
+        // that carries the provider's own error, instead of being folded into "all endpoints unreachable",
+        // and avoids re-querying the provider once per endpoint.
         String authHeader = resolveAuthorizationHeader();
         // One same-endpoint retry after a refreshable 401 per connect, for a token provider only
         // (design/qwp-token-provider-spec.md, section 8.2). The retried attempt records no health penalty.

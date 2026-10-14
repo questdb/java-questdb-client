@@ -50,6 +50,8 @@ import java.nio.ByteOrder;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static io.questdb.client.test.cutlass.auth.TokenTestKit.await;
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
@@ -59,6 +61,8 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  * 8.5) of the dynamic-credential specification (design/qwp-token-provider-spec.md).
  */
 public class ConnectionHealthTest {
+    // The elapsed time a deadline terminal reports: "... persisted for <millis>ms ...".
+    private static final Pattern PERSISTED_FOR = Pattern.compile("persisted for (\\d+)ms");
     private static final String SENTINEL = "SENTINEL-TOKEN-7f3a91";
 
     @Rule
@@ -103,11 +107,20 @@ public class ConnectionHealthTest {
                 Assert.assertEquals("role rejects and transport failures must not fire the deadline",
                         0, errors.terminalCount());
                 // the credential outage returns: the clock was never reset, so the first such round fires
+                long failAt = System.nanoTime();
                 mode.set("fail");
                 await(() -> errors.terminalCount() == 1, 10_000, "the deadline to fire");
                 SenderError terminal = terminal(errors);
                 Assert.assertTrue(terminal.getServerMessage(),
                         terminal.getServerMessage().contains("credential-unavailable persisted for"));
+                // The clock started before authOutageStart was taken and the terminal fired after failAt, so the
+                // reported outage spans the role-reject and transport rounds. A clock those rounds had reset
+                // would report only the time since the credential outage returned.
+                Matcher persisted = PERSISTED_FOR.matcher(terminal.getServerMessage());
+                Assert.assertTrue(terminal.getServerMessage(), persisted.find());
+                Assert.assertTrue("role rejects and transport failures must not reset the clock: "
+                                + terminal.getServerMessage(),
+                        Long.parseLong(persisted.group(1)) >= TimeUnit.NANOSECONDS.toMillis(failAt - authOutageStart));
                 Assert.assertEquals(ConnectionHealth.State.FAILED, sender.health().getState());
             } catch (LineSenderException expected) {
                 // close() rethrows the latched terminal

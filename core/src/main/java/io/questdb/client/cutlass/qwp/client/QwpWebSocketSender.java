@@ -191,10 +191,12 @@ public class QwpWebSocketSender implements Sender {
     // fixed token or Basic credential; for an httpTokenProvider it pulls a freshly refreshed token,
     // so the initial connect and every reconnect re-handshake carry the current token. May be null
     // when no auth is configured. Evaluated once per (re)connect round in buildAndConnect, before the
-    // endpoint walk (not once per endpoint); a throwing provider is wrapped as
-    // QwpCredentialUnavailableException: the foreground/SYNC initial connect fails fast with the provider's
-    // own exception, while the running background drainer treats it as a transient outage and retries it
-    // indefinitely (never bounded by the reconnect budget, never terminal) per store-and-forward Invariant B.
+    // endpoint walk (not once per endpoint), and once more after a refreshable 401; a throwing provider is
+    // wrapped as QwpCredentialUnavailableException: the OFF initial connect fails fast with the provider's own
+    // exception, the SYNC one too unless the failure is retryable (then it retries within the reconnect
+    // budget), while the running background drainer treats it as a transient outage and retries it
+    // indefinitely (never bounded by the reconnect budget, terminal only through the opt-in
+    // auth_failure_max_duration_millis deadline) per store-and-forward Invariant B.
     private final Supplier<String> authorizationHeaderSupplier;
     private final int autoFlushBytes;
     private final long autoFlushIntervalNanos;
@@ -4185,11 +4187,13 @@ public class QwpWebSocketSender implements Sender {
         // javadoc documents - NOT once per endpoint: a token-provider failure is cluster-wide (a failed silent
         // refresh, or not signed in), not a per-endpoint transport fault, so re-querying it per endpoint would
         // hammer the token endpoint with the same dead credential and mislabel the failure as "all endpoints
-        // unreachable". A throw here is wrapped as QwpCredentialUnavailableException (below): the
-        // foreground/SYNC initial connect unwraps it and fails fast with the provider's own message, while the
+        // unreachable". A throw here is wrapped as QwpCredentialUnavailableException (below): the OFF initial
+        // connect unwraps it and fails fast with the provider's own exception, and so does the SYNC one unless
+        // the provider classified the failure retryable, in which case SYNC retries it within its budget. The
         // running background drainer treats it as a transient outage and retries it indefinitely with capped
-        // backoff (never bounded by the reconnect budget, never terminal), so even a persistent credential
-        // outage keeps the buffered rows in store-and-forward rather than terminating the sender (Invariant B).
+        // backoff (never bounded by the reconnect budget; terminal only once the opt-in
+        // auth_failure_max_duration_millis deadline expires), so a persistent credential outage keeps the
+        // buffered rows in store-and-forward rather than terminating the sender (Invariant B).
         // Mirrors QwpQueryClient, which likewise resolves the credential once before its endpoint walk.
         // Publish this thread as being inside the pull BEFORE making it, then re-check cancellation, exactly
         // as the per-endpoint connect below does with the WebSocketClient. The pull is the one blocking call
@@ -4208,12 +4212,13 @@ public class QwpWebSocketSender implements Sender {
             authHeader = authorizationHeaderSupplier == null ? null : authorizationHeaderSupplier.get();
         } catch (RuntimeException e) {
             // Tag the failure CLASS so each context applies the right policy: a credential we cannot acquire is
-            // not a transport outage. A foreground/SYNC connect unwraps this and rethrows the provider's own
-            // exception, so build() surfaces the provider's error directly rather than an internal wrapper. The
-            // running background drainer, by contrast, treats it as a transient outage and retries it
-            // indefinitely under Invariant B -- never bounding it by the reconnect budget, never latching a
-            // terminal -- so a recoverable credential outage never drops a producer store-and-forward promised
-            // to keep alive.
+            // not a transport outage. A foreground connect that fails startup on it unwraps this and rethrows the
+            // provider's own exception, so build() surfaces the provider's error directly rather than an internal
+            // wrapper; a SYNC connect retries a retryable one within its budget first. The running background
+            // drainer, by contrast, treats it as a transient outage and retries it indefinitely under Invariant B
+            // -- never bounding it by the reconnect budget, and latching a terminal only when the opt-in
+            // auth_failure_max_duration_millis deadline expires -- so a recoverable credential outage never drops
+            // a producer store-and-forward promised to keep alive.
             throw new QwpCredentialUnavailableException(e);
         } finally {
             // Drop the marker as soon as the pull returns, so a later cancel() cannot interrupt this thread

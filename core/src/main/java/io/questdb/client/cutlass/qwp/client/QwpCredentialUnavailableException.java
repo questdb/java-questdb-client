@@ -40,8 +40,10 @@ import io.questdb.client.cutlass.line.LineSenderException;
  * the RUNNING store-and-forward drainer retries it indefinitely with capped backoff under
  * Invariant B -- the IdP becomes reachable again, or the user completes an interactive
  * sign-in -- holding the un-acked rows in SF meanwhile, and NEVER bounds it by
- * {@code reconnectMaxDurationMillis} nor latches a terminal (either would drop a producer
- * store-and-forward promised to keep alive). During initialization the classification
+ * {@code reconnectMaxDurationMillis} (that would drop a producer store-and-forward promised
+ * to keep alive). Only the optional authentication-outage deadline
+ * ({@code auth_failure_max_duration_millis}, off by default) latches a terminal once such an
+ * outage has lasted that long. During initialization the classification
  * decides: {@link #isRetryable()} is true only when the provider threw a
  * {@link TokenUnavailableException} marked retryable, which a SYNC initial connect keeps
  * retrying within its budget; any other provider failure is permanent and fails startup
@@ -55,11 +57,14 @@ import io.questdb.client.cutlass.line.LineSenderException;
  * {@code build()}, {@code flush()} or any row call delivers this type. The foreground
  * connects - SYNC in {@code CursorWebSocketSendLoop.connectWithRetry}, and the OFF-mode
  * connect in {@code QwpWebSocketSender} - both catch it and rethrow
- * {@link #providerFailure()}, so a token-provider failure reaches the caller as the
- * provider's own exception; the running background drainer catches it and retries under
- * the invariant above. The query client ({@code QwpQueryClient}) does throw it from
- * {@code connect()}, with a message that starts with {@code credential-unavailable}. It is
- * public because both of those packages handle it, and
+ * {@link #providerFailure()} for a failure that fails startup fast, so that failure reaches
+ * the caller as the provider's own exception. A retryable failure that exhausts the SYNC
+ * budget instead surfaces as a {@code LineSenderException} whose message names the
+ * {@code credential-unavailable} class and whose cause is this exception. The running
+ * background drainer catches it and retries under the invariant above. The query client
+ * ({@code QwpQueryClient}) does throw it from {@code connect()}, with a message that starts
+ * with {@code credential-unavailable}. It is public because both of those packages handle
+ * it, and
  * because {@code QwpWebSocketSender.newReconnectFactory()} is public: a caller that
  * drives {@code ReconnectFactory.reconnect()} itself runs the endpoint walk directly and
  * so can receive this type unwrapped. Such a caller should treat it as the provider

@@ -749,8 +749,10 @@ public class TestWebSocketServer implements Closeable {
             if (validator != null) {
                 int status = validator.applyAsInt(authorization);
                 if (status > 0) {
-                    writeStatusReject(status, status == 401 ? "Unauthorized" : status == 403 ? "Forbidden" : "Rejected");
+                    // Count before the client can observe the reject: a test reads authRejectCount() as soon as the
+                    // client has handled the response, and counting after the flush races that read.
                     authRejectCount.incrementAndGet();
+                    writeStatusReject(status, status == 401 ? "Unauthorized" : status == 403 ? "Forbidden" : "Rejected");
                     return false;
                 }
             }

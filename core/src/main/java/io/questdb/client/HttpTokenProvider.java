@@ -53,7 +53,8 @@ import io.questdb.client.std.Chars;
  * ({@code initial_connect_retry=on}) keeps retrying it within {@code reconnect_max_duration_millis}. Any other
  * exception counts as a permanent credential failure, so startup fails fast, as it does for an OIDC device-flow
  * provider that is not signed in yet. Once a sender has connected, every credential failure is retried while
- * store-and-forward keeps the rows.
+ * store-and-forward keeps the rows, unless {@code auth_failure_max_duration_millis} is set: the sender then fails
+ * once such an outage has lasted that long.
  * <p>
  * For a token that rotates on a schedule - a Microsoft Entra ID managed identity or service principal, an OAuth
  * client-credentials grant - wrap a {@link io.questdb.client.cutlass.auth.TokenSource} in a

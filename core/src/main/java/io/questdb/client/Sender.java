@@ -2218,7 +2218,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * Over HTTP the provider is not called at build time: the first call happens when the first row is
          * started, then once per flush. Over WebSocket it depends on whether the initial connect is eager.
          * With an EAGER initial connect (the default, and any {@code initial_connect_retry} other than
-         * {@code async}) the handshake runs during {@code build()} and queries the provider once for it;
+         * {@code async}) the handshake runs during {@code build()} and queries the provider for it: once per
+         * connect attempt, plus once more when an endpoint rejects the token with {@code 401} (see
+         * {@link HttpTokenProvider#onTokenRejected(CharSequence, int)});
          * under {@code lazy_connect=true} - or {@code initial_connect_retry=async} - the ingest side connects
          * asynchronously, so {@code build()} pulls nothing and a provider failure surfaces through the error
          * inbox rather than from {@code build()}. Either way the provider is queried again once per reconnect
@@ -2226,10 +2228,14 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * already-established WebSocket is not re-authenticated mid-stream. The two transports differ in
          * mechanism but both keep the producer alive across a sustained token outage: over HTTP a failed pull
          * leaves the request token-pending and is retried on the next row; over WebSocket an EAGER initial
-         * handshake fails fast when no token can be obtained, after which a pull that keeps failing on later
-         * reconnects is retried indefinitely, with the buffered rows held in store-and-forward, until a token
-         * is available again. A token outage does not terminate a running WebSocket sender, just as a
-         * persistent transport reconnect failure does not (store-and-forward Invariant B).
+         * handshake fails {@code build()} when no token can be obtained - at once in
+         * {@link InitialConnectMode#OFF} mode, and in {@link InitialConnectMode#SYNC} mode only after retrying a
+         * retryable {@link io.questdb.client.cutlass.auth.TokenUnavailableException} within
+         * {@code reconnect_max_duration_millis} - after which a pull that keeps failing on later reconnects is
+         * retried indefinitely, with the buffered rows held in store-and-forward, until a token is available
+         * again. A token outage does not terminate a running WebSocket sender, just as a persistent transport
+         * reconnect failure does not (store-and-forward Invariant B), unless
+         * {@link #authFailureMaxDurationMillis(long)} is set.
          * <br>
          * Over HTTP the token is pulled once per request and written into the request buffer ahead of the
          * buffered rows, so a token refresh is picked up on the next new batch after a successful flush. A
@@ -3658,30 +3664,19 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             try (SlotLock logicalSlotLock = slotPath == null
                     ? null
                     : SlotLock.acquireLogical(slotPath)) {
-                // The constructor's own recovery seed can also fail terminally, and
-                // not only as UnreplayableSlotException: when SegmentRing.openExisting
-                // had to skip an unreadable segment it throws SfRecoveryException (it
-                // constructs UnreplayableSlotException nowhere), and where it cannot
-                // even prove the chain's identity -- no manifest -- it quarantines the
-                // corrupt files and returns an EMPTY recovery rather than refusing.
-                // Either way the frame range cannot be shown already-acked, so recovery
-                // sets the slot aside rather than risk seeding the ack cursor past
-                // frames that were never delivered. All three types below are load
-                // bearing; narrowing this catch to UnreplayableSlotException would
-                // restore the permanent build() brick for the segment-skip case. That verdict gets
-                // the exact same quarantine-and-continue treatment as the connect()-time
-                // verdict below -- constructing cursorEngine is not inside the loop below,
-                // so a throw here would otherwise escape build() entirely, uncaught.
-                // quarantineTornSlot(null, ...) renames the WHOLE slot directory aside
-                // (not just the unreadable segment file) before building the replacement
-                // at the original slotPath, so the replacement starts on a genuinely empty
-                // directory with nothing left to skip -- it cannot throw the same way
-                // twice, which is what makes looping unnecessary here.
+                // Recovery-verdict handling lives in constructEngineOnSlotLocked.
                 ConstructedEngine constructed = constructEngineOnSlotLocked(
                         sfDir, senderId, slotPath,
                         actualSfMaxSegmentBytes, actualSfMaxTotalBytes, sfSharedBudget,
                         actualSfAppendDeadlineNanos, actualSfSyncIntervalNanos,
                         errorHandler);
+                // Seeded from constructEngineOnSlotLocked's own verdict, not
+                // hardcoded false: if construction already quarantined this
+                // slot, the connect loop below must count that as the one
+                // quarantine build() allows per attempt (see its "quarantined
+                // || slotPath == null" guard) rather than starting blind and
+                // risking a second quarantineTornSlot pass on what should be
+                // an immediate close-and-rethrow.
                 boolean quarantined = constructed.quarantined;
                 CursorSendEngine cursorEngine = constructed.engine;
                 int actualErrorInboxCapacity = errorInboxCapacity != PARAMETER_NOT_SET_EXPLICITLY
@@ -3791,9 +3786,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 final String rebuildSfDir = sfDir;
                 final String rebuildSenderId = senderId;
                 final SenderErrorHandler buildTimeHandler = errorHandler;
+                // A rebuilt engine charges the same budget as the one it replaces,
+                // so a pooled sender stays under the pool's cap across a recycle.
                 final SegmentBudget rebuildSharedBudget = sfSharedBudget;
-                // The recycle holds the slot's logical lock across its swap, so
-                // the rebuild must construct under that lock without retaking it.
+                // The recycle holds the slot's logical lock across its whole swap
+                // (QwpWebSocketSender.recycleForDictReset step 0), so the rebuild
+                // constructs under that lock and must not take it again.
                 connected.setEngineRebuildFactory(new QwpWebSocketSender.EngineRebuildFactory() {
                     @Override
                     public CursorSendEngine rebuild() {

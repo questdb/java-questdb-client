@@ -2040,7 +2040,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // blocking (non-lazy) initial connect hands it to connectWithRetry (see
         // QwpWebSocketSender.ensureConnected, the SYNC branch), and
         // BackgroundDrainer converts it into the durable-ack capability-gap
-        // budget. Neither bounds this loop's steady-state reconnect.
+        // budget. Neither bounds this loop's steady-state reconnect. The one
+        // exception is opt-in: a FOREGROUND loop with
+        // auth_failure_max_duration_millis set latches a terminal once an
+        // authentication-class outage outlasts it (authOutageDeadlineFired).
         long backoffMillis = reconnectInitialBackoffMillis;
         if (paceFirstAttemptMillis > 0 && running) {
             // NACK-initiated recycle against a reachable server: pace the
@@ -2213,11 +2216,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // background drainer this is a TRANSIENT outage like any other under Invariant B: the provider
                 // hands over a token again once the IdP is reachable or the user finishes signing in, and the
                 // un-acked rows stay safe in on-disk SF meanwhile. So retry indefinitely with capped backoff --
-                // NEVER bound by a wall-clock budget and NEVER latch a terminal, which would drop a producer
-                // that store-and-forward promised to keep alive on a recoverable fault. The foreground/SYNC
-                // initial connect still fails fast with the provider's own exception (connectWithRetry, and the
-                // OFF-mode connect in QwpWebSocketSender), because a connectivity error is only the caller's to
-                // see DURING initialization, not after the drainer is running.
+                // NEVER bound by the reconnect budget and never latch a terminal of our own, which would drop a
+                // producer that store-and-forward promised to keep alive on a recoverable fault. The only
+                // terminal here is the one the user opted into: authOutageDeadlineFired() below, when
+                // auth_failure_max_duration_millis is set. The initial connect handles it in connectWithRetry
+                // (SYNC: a retryable failure is retried within the budget, anything else fails fast with the
+                // provider's own exception) and in the OFF-mode connect in QwpWebSocketSender (fails fast),
+                // because a connectivity error is only the caller's to see DURING initialization, not after the
+                // drainer is running.
                 //
                 // Ends any open cap-gap episode like every other unrelated reconnect state: we never reached a
                 // node to observe its batch cap, so this outage's wall clock must not accrue toward the orphan
@@ -2444,7 +2450,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * Once a FOREGROUND sender has reached the server even once, initialization is
      * over and store-and-forward owns the buffered data: every endpoint-policy
      * failure is then a transient the drainer must ride out, never a producer-fatal
-     * terminal (Invariant B).
+     * terminal (Invariant B). The opt-in authentication-outage deadline is separate
+     * from this gate: see {@code authOutageDeadlineFired}.
      */
     private boolean endpointPolicyFailureIsTerminal() {
         return reconnectPolicy == ReconnectPolicy.ORPHAN || !hasEverConnected;
