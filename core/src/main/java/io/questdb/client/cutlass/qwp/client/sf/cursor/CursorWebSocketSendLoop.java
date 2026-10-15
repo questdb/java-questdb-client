@@ -2868,10 +2868,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         }
         lastFrameOrPingNanos = now;
         try {
-            // 1 s, not the 600 s data-frame timeout: a socket that cannot take a
-            // 6-byte PING after an idle interval belongs to a wedged server, and
-            // reconnect + replay beats blocking the I/O thread for minutes.
-            client.sendPing(1000);
+            // A timeout here reconnects and replays unacked frames, so it must be as
+            // tolerant as a data send: a slow-draining server or a GC pause is not a dead peer.
+            client.sendPing();
         } catch (Throwable t) {
             fail(t);
         }
