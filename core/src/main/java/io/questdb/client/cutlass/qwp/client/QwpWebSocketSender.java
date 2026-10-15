@@ -1049,7 +1049,8 @@ public class QwpWebSocketSender implements Sender {
                 CursorWebSocketSendLoop.DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS,
                 DEFAULT_SYMBOL_DICT_RESET_ENABLED,
                 DEFAULT_SYMBOL_DICT_RESET_THRESHOLD_SYMBOLS,
-                DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS);
+                DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS,
+                CursorWebSocketSendLoop.DEFAULT_KEEPALIVE_INTERVAL_MILLIS);
     }
 
     /**
@@ -1107,7 +1108,8 @@ public class QwpWebSocketSender implements Sender {
                 catchUpCapGapMinEscalationWindowMillis,
                 DEFAULT_SYMBOL_DICT_RESET_ENABLED,
                 DEFAULT_SYMBOL_DICT_RESET_THRESHOLD_SYMBOLS,
-                DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS);
+                DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS,
+                CursorWebSocketSendLoop.DEFAULT_KEEPALIVE_INTERVAL_MILLIS);
     }
 
     /**
@@ -1168,7 +1170,7 @@ public class QwpWebSocketSender implements Sender {
                 maxFrameRejections, poisonMinEscalationWindowMillis,
                 catchUpCapGapMinEscalationWindowMillis,
                 symbolDictResetEnabled, symbolDictResetThresholdSymbols,
-                symbolDictResetMaxWaitMillis);
+                symbolDictResetMaxWaitMillis, CursorWebSocketSendLoop.DEFAULT_KEEPALIVE_INTERVAL_MILLIS);
     }
 
     /**
@@ -1178,7 +1180,7 @@ public class QwpWebSocketSender implements Sender {
      * long, long, long, long, Sender.InitialConnectMode, SenderErrorHandler, int, long, long, int,
      * SenderConnectionListener, int, int, long, long)}. Kept as its own overload, delegating to the master
      * below with the symbol-dictionary recycle knobs defaulted, so a caller compiled before those knobs'
-     * arity moved into the master keeps linking; {@code ExportedApiCompatibilityTest} pins it.
+     * arity moved into the master keeps linking.
      * <p>
      * Recycling requires a non-null engine rebuild factory installed via
      * {@link #setEngineRebuildFactory(EngineRebuildFactory)};
@@ -1221,16 +1223,18 @@ public class QwpWebSocketSender implements Sender {
                 catchUpCapGapMinEscalationWindowMillis,
                 DEFAULT_SYMBOL_DICT_RESET_ENABLED,
                 DEFAULT_SYMBOL_DICT_RESET_THRESHOLD_SYMBOLS,
-                DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS);
+                DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS,
+                CursorWebSocketSendLoop.DEFAULT_KEEPALIVE_INTERVAL_MILLIS);
     }
 
     /**
-     * Connect entry point that also accepts the poison-frame detector
+     * Master connect entry point — also accepts the poison-frame detector
      * threshold ({@code max_frame_rejections}) and the symbol-dictionary
      * recycle knobs ({@code symbol_dict_reset}, {@code symbol_dict_reset_threshold},
      * {@code symbol_dict_reset_max_wait_millis}): consecutive server-active
      * rejections of the same head-of-line frame, with no ack progress in
-     * between, before the loop escalates to a typed terminal.
+     * between, before the loop escalates to a typed terminal. Also takes the
+     * idle keepalive PING cadence ({@code keepalive_interval_millis}).
      * <p>
      * Named apart from {@code connect} for the reason given on
      * {@link #connectWithCredentialSupplier(List, ClientTlsConfiguration, int, int, long, Supplier,
@@ -1247,52 +1251,6 @@ public class QwpWebSocketSender implements Sender {
      * {@code 0} (never wait) and {@code Long.MAX_VALUE / 1_000_000}: the ranges the builder enforces.
      *
      * @throws LineSenderException if either recycle setting is out of range
-     */
-    public static QwpWebSocketSender connectWithCredentialSupplier(
-            List<Endpoint> endpoints,
-            ClientTlsConfiguration tlsConfig,
-            int autoFlushRows,
-            int autoFlushBytes,
-            long autoFlushIntervalNanos,
-            Supplier<String> authorizationHeaderSupplier,
-            boolean requestDurableAck,
-            CursorSendEngine cursorEngine,
-            long closeFlushTimeoutMillis,
-            long reconnectMaxDurationMillis,
-            long reconnectInitialBackoffMillis,
-            long reconnectMaxBackoffMillis,
-            Sender.InitialConnectMode initialConnectMode,
-            SenderErrorHandler errorHandler,
-            int errorInboxCapacity,
-            long durableAckKeepaliveIntervalMillis,
-            long authTimeoutMs,
-            int connectTimeoutMs,
-            SenderConnectionListener connectionListener,
-            int connectionListenerInboxCapacity,
-            int maxFrameRejections,
-            long poisonMinEscalationWindowMillis,
-            long catchUpCapGapMinEscalationWindowMillis,
-            boolean symbolDictResetEnabled,
-            int symbolDictResetThresholdSymbols,
-            long symbolDictResetMaxWaitMillis
-    ) {
-        return connectWithCredentialSupplier(endpoints, tlsConfig, autoFlushRows, autoFlushBytes,
-                autoFlushIntervalNanos, authorizationHeaderSupplier, requestDurableAck,
-                cursorEngine, closeFlushTimeoutMillis, reconnectMaxDurationMillis,
-                reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
-                initialConnectMode, errorHandler, errorInboxCapacity,
-                durableAckKeepaliveIntervalMillis, authTimeoutMs, connectTimeoutMs,
-                connectionListener, connectionListenerInboxCapacity,
-                maxFrameRejections, poisonMinEscalationWindowMillis,
-                catchUpCapGapMinEscalationWindowMillis,
-                symbolDictResetEnabled, symbolDictResetThresholdSymbols, symbolDictResetMaxWaitMillis,
-                CursorWebSocketSendLoop.DEFAULT_KEEPALIVE_INTERVAL_MILLIS);
-    }
-
-    /**
-     * Master connect entry point: the overload above plus the idle keepalive
-     * PING cadence ({@code keepalive_interval_millis}; {@code 0} or negative
-     * disables it).
      */
     public static QwpWebSocketSender connectWithCredentialSupplier(
             List<Endpoint> endpoints,

@@ -983,7 +983,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * The policy-aware constructor as released in 1.3.x: equivalent to the overload
      * below with {@code externalFsnBase = 0L}, the value every caller outside a
      * symbol-dictionary recycle passes. Kept so callers compiled against a released
-     * jar keep linking; {@code ExportedApiCompatibilityTest} pins it.
+     * jar keep linking.
      */
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
                                    long fsnAtZero, long parkNanos,
