@@ -29,6 +29,7 @@ import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
+import io.questdb.client.cutlass.qwp.client.BatchTooLargeForCapException;
 import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.Decimal256;
 import io.questdb.client.std.Decimal64;
@@ -162,6 +163,16 @@ public final class PooledSender implements Sender {
      * error keeps it as the primary exception, with close's wrapper
      * suppressed. The typed error and its classification live on the cause.
      * <p>
+     * A server batch cap rejection ({@link BatchTooLargeForCapException}, retained
+     * by an auto-flush or thrown by close's own flush) does not retire the slot at
+     * once. The byte trigger fires after the crossing row is committed, so the
+     * rejected batch can hold mostly rows earlier leases left. The lease is rolled
+     * back to its borrow mark, which drops only this lease's rows, and the flush is
+     * retried: when the rows left by earlier leases ship, the slot is returned and a
+     * {@link LineSenderException} whose cause is the rejection names the number of
+     * this lease's rows dropped. Only an inherited batch the cap still rejects
+     * retires the slot, with the wrapper described above.
+     * <p>
      * Idempotent for sequential reuse: a stale generation (the lease was
      * already returned and the slot possibly re-borrowed) is a no-op. Concurrent
      * double-close of ONE lease from two threads is outside the Sender
@@ -189,6 +200,8 @@ public final class PooledSender implements Sender {
         boolean cancelledRow = false;
         boolean recycle = false;
         RuntimeException failure = null;
+        BatchTooLargeForCapException capRejection = null;
+        int droppedLeaseRows = 0;
         int pendingRowsAtRetire = 0;
         try {
             // live(), not delegate(): re-validate the generation right before
@@ -213,6 +226,25 @@ public final class PooledSender implements Sender {
                 // slot is retired.
                 failure = e;
             }
+            if (failure instanceof BatchTooLargeForCapException) {
+                // The byte trigger fires after the crossing row is committed, so
+                // the rejected batch can hold mostly rows earlier leases left.
+                // Drop only this lease's rows and retry: the slot stays in service
+                // when the rest ships, and an inherited batch the cap still
+                // rejects falls through to the retirement below.
+                try {
+                    int pendingBeforeRollback = delegate.pendingRowCount();
+                    delegate.resetToSavepoint();
+                    droppedLeaseRows = pendingBeforeRollback - delegate.pendingRowCount();
+                    delegate.flush();
+                    slot.markCommitted(delegate.rowsAppended());
+                    capRejection = (BatchTooLargeForCapException) failure;
+                    failure = null;
+                    recycle = true;
+                } catch (RuntimeException e) {
+                    failure = e;
+                }
+            }
         } finally {
             if (recycle) {
                 pool.giveBack(this);
@@ -220,9 +252,10 @@ public final class PooledSender implements Sender {
                 // The probe, the cancel or the ship threw: the delegate has
                 // latched an error, the flush failed, or the generation went
                 // stale. Retire it; a wrapper around the original propagates
-                // once this finally returns.
+                // once this finally returns. Rows a rollback above dropped are
+                // lost with the slot as well.
                 try {
-                    pendingRowsAtRetire = slot.delegate().pendingRowCount();
+                    pendingRowsAtRetire = droppedLeaseRows + slot.delegate().pendingRowCount();
                 } catch (Throwable ignored) {
                     // best effort: the count is only for the message
                 }
@@ -240,6 +273,13 @@ public final class PooledSender implements Sender {
             LineSenderException wrapper = new LineSenderException("pooled sender close failed, slot retired with "
                     + pendingRowsAtRetire + " unshipped row(s): " + msg, retryable);
             wrapper.initCause(failure);
+            throw wrapper;
+        }
+        if (capRejection != null) {
+            LineSenderException wrapper = new LineSenderException("pooled sender close dropped " + droppedLeaseRows
+                    + " row(s) of this lease after the server batch cap rejected the batch; rows left by earlier leases shipped",
+                    capRejection.isRetryable());
+            wrapper.initCause(capRejection);
             throw wrapper;
         }
         if (cancelledRow) {

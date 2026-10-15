@@ -69,6 +69,54 @@ public class QuestDBFlushOnCloseTest {
     }
 
     @Test
+    public void testCrossingRowOverTheMarginDropsOnlyThatLeasesRowsAndShipsTheRest() throws Exception {
+        FrameLog log = new FrameLog();
+        try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+            server.setAdvertisedMaxBatchSize(4 * 1024);
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            // auto_flush_bytes unset: the byte trigger sits at 90 percent of the 4 KiB cap (3686 bytes)
+            try (QuestDB db = QuestDB.connect(config(server.getPort(), "auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
+                // warm-up lease: proves the connection and the advertised cap are in place
+                // (initial_connect_retry=async learns the cap on the I/O thread)
+                try (Sender s = db.borrowSender()) {
+                    s.table("w").longColumn("v", 1L).atNow();
+                    s.flush();
+                }
+                log.awaitDataFrames(1, 5_000);
+                String wide = wideValue(1000);
+                for (int i = 0; i < 3; i++) {
+                    try (Sender s = db.borrowSender()) {
+                        s.table("t").stringColumn("s", wide).atNow();    // 3 KB in all, below the trigger
+                    }
+                }
+                Sender delegate = null;
+                boolean hasCloseThrown = false;
+                try (Sender s = db.borrowSender()) {
+                    delegate = ((PooledSender) s).getDelegateForTesting();
+                    try {
+                        s.table("t").stringColumn("s", wideValue(1500)).atNow();
+                        Assert.fail("the crossing row makes the auto-flushed batch 4.5 KB, over the 4 KiB cap");
+                    } catch (BatchTooLargeForCapException expected) {
+                        // the row stays committed and the rejection is retained
+                    }
+                } catch (LineSenderException e) {
+                    hasCloseThrown = true;
+                    Assert.assertTrue("close() wraps the rejection", e.getCause() instanceof BatchTooLargeForCapException);
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("dropped 1 row(s) of this lease"));
+                }
+                Assert.assertTrue("close() must report the dropped row", hasCloseThrown);
+                log.awaitDataFrames(2, 5_000);
+                Assert.assertEquals("the three earlier rows ship as one frame with table t", 1, log.tableCount(1));
+                try (Sender s = db.borrowSender()) {
+                    Assert.assertSame("the slot stayed in service", delegate, ((PooledSender) s).getDelegateForTesting());
+                    Assert.assertEquals("only the crossing row was dropped, the rest shipped", 0, s.pendingRowCount());
+                }
+            }
+        }
+    }
+
+    @Test
     public void testFlushOnCloseShipsOneFramePerClose() throws Exception {
         FrameLog log = new FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
