@@ -882,6 +882,40 @@ public class RefreshingTokenProviderTest {
     }
 
     @Test
+    public void testSupersededScheduledCallbackDoesNotFetchOrReplaceTheForcedRefresh() {
+        FakeClock clock = new FakeClock(T0);
+        ManualScheduler scheduler = new ManualScheduler(clock);
+        ScriptedSource source = new ScriptedSource()
+                .thenToken("T1", T0 + HOUR)
+                .thenToken("T2", T0 + 2 * HOUR);
+        try (RefreshingTokenProvider provider = provider(source, clock, scheduler, 0.5)
+                .forcedWaitMillis(0)
+                .build()) {
+            scheduler.runNext();
+            ManualScheduler.Task superseded = scheduler.peek();
+            Assert.assertNotNull(superseded);
+
+            provider.onTokenRejected("T1", 401);
+            ManualScheduler.Task forcedRefresh = scheduler.peek();
+            Assert.assertNotNull(forcedRefresh);
+            Assert.assertNotSame(superseded, forcedRefresh);
+            Assert.assertTrue(superseded.cancelled);
+            Assert.assertEquals(0, forcedRefresh.delayNanos);
+
+            // Replay a callback that started before cancellation and resumed after its replacement.
+            superseded.runnable.run();
+            Assert.assertEquals("a superseded callback must not fetch", 1, source.calls());
+            Assert.assertSame("the superseded callback must preserve its replacement",
+                    forcedRefresh, scheduler.peek());
+            Assert.assertEquals("T1", provider.getToken().toString());
+
+            scheduler.runNext();
+            Assert.assertEquals("the forced refresh must fetch exactly once", 2, source.calls());
+            Assert.assertEquals("T2", provider.getToken().toString());
+        }
+    }
+
+    @Test
     public void testTokenHandedOutTooBrieflyToRefreshAheadIsReportedOnce() {
         // section 5.2: a 75 s token is handed out for 15 s, less than min_refresh_interval, so it cannot be refreshed
         // while it is still handed out. The refresh keeps its 30 s spacing - no fetch storm - and the provider says
