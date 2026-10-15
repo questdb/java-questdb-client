@@ -217,6 +217,8 @@ public class AzureTokenSourceTest {
         assertRetryable(new HttpResponseException("unavailable", new FakeResponse(503, null)), "HTTP 503", -1);
         assertRetryable(new HttpResponseException("gone", new FakeResponse(410, "Wed, 21 Oct 2015 07:28:00 GMT")), "HTTP 410", -1);
         assertRetryable(new IllegalStateException("connection reset"), "connection reset", -1);
+        assertRetryable(new MsalServiceException("temporarily unavailable", "temporarily_unavailable"),
+                "temporarily unavailable", -1);
         assertRetryable(new ClientAuthenticationException("ManagedIdentityCredential: IMDS endpoint timed out", null,
                 (Object) null), "timed out", -1);
     }

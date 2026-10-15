@@ -31,6 +31,7 @@ import com.azure.core.exception.HttpResponseException;
 import com.azure.core.http.HttpResponse;
 import com.azure.identity.ChainedTokenCredential;
 import com.azure.identity.CredentialUnavailableException;
+import com.microsoft.aad.msal4j.MsalServiceException;
 import io.questdb.client.cutlass.auth.ExpiringToken;
 import io.questdb.client.cutlass.auth.TokenSource;
 import io.questdb.client.cutlass.auth.TokenUnavailableException;
@@ -40,6 +41,8 @@ import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
 import java.time.Duration;
 import java.time.OffsetDateTime;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -143,6 +146,7 @@ public final class AzureTokenSource implements TokenSource {
      */
     static TokenUnavailableException classify(Throwable failure, String scope, boolean chain) {
         final String description = describe(failure);
+        long retryAfterMillis = TokenUnavailableException.NO_RETRY_AFTER;
         Throwable t = failure;
         for (int depth = 0; t != null && depth < MAX_CAUSE_DEPTH; depth++, t = t.getCause()) {
             if (t instanceof CredentialUnavailableException) {
@@ -162,6 +166,10 @@ public final class AzureTokenSource implements TokenSource {
                             retryAfterMillis(response));
                 }
             }
+            if (t instanceof MsalServiceException && retryAfterMillis == TokenUnavailableException.NO_RETRY_AFTER) {
+                // Service-principal credentials expose response headers through MSAL, not HttpResponseException.
+                retryAfterMillis = retryAfterMillis(((MsalServiceException) t).headers());
+            }
             final String message = t.getMessage();
             if (message != null) {
                 for (String code : PERMANENT_AADSTS) {
@@ -178,7 +186,7 @@ public final class AzureTokenSource implements TokenSource {
             }
         }
         return TokenUnavailableException.retryable("the token request for " + scope + " failed: "
-                + withNetworkCause(failure, description));
+                + withNetworkCause(failure, description), retryAfterMillis);
     }
 
     private static String describe(Throwable t) {
@@ -199,13 +207,7 @@ public final class AzureTokenSource implements TokenSource {
         return null;
     }
 
-    private static long retryAfterMillis(HttpResponse response) {
-        final String value;
-        try {
-            value = response.getHeaderValue("Retry-After");
-        } catch (RuntimeException e) {
-            return TokenUnavailableException.NO_RETRY_AFTER;
-        }
+    private static long parseRetryAfterMillis(String value) {
         if (value == null) {
             return TokenUnavailableException.NO_RETRY_AFTER;
         }
@@ -225,6 +227,28 @@ public final class AzureTokenSource implements TokenSource {
             // an azure-core older than the refresh hint
             return ExpiringToken.NO_REFRESH_AT;
         }
+    }
+
+    private static long retryAfterMillis(HttpResponse response) {
+        try {
+            return parseRetryAfterMillis(response.getHeaderValue("Retry-After"));
+        } catch (RuntimeException e) {
+            return TokenUnavailableException.NO_RETRY_AFTER;
+        }
+    }
+
+    private static long retryAfterMillis(Map<String, List<String>> headers) {
+        if (headers != null) {
+            for (Map.Entry<String, List<String>> header : headers.entrySet()) {
+                if ("Retry-After".equalsIgnoreCase(header.getKey())) {
+                    final List<String> values = header.getValue();
+                    return values == null || values.isEmpty()
+                            ? TokenUnavailableException.NO_RETRY_AFTER
+                            : parseRetryAfterMillis(values.get(0));
+                }
+            }
+        }
+        return TokenUnavailableException.NO_RETRY_AFTER;
     }
 
     // Leads with the socket-level cause, unless the description already carries it: error text is capped, and a
