@@ -759,6 +759,17 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      */
     Sender longColumn(CharSequence name, long value);
 
+    /**
+     * Marks the current buffer state as the point {@link #resetToSavepoint()}
+     * rolls back to: rows appended after this call are discarded by that
+     * method, rows appended before it are kept. Any flush that ships the
+     * pending rows empties the savepoint, so a later {@code resetToSavepoint()}
+     * behaves like {@link #reset()}. The pool marks a savepoint when it hands a
+     * slot to a borrower. Pure bookkeeping: it runs no error check. Default
+     * no-op.
+     */
+    default void markSavepoint() {
+    }
 
     /**
      * Number of rows appended with {@link #at}/{@link #atNow()} that have not
@@ -819,12 +830,25 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * data format) and want to continue sending new data without retrying the problematic data.
      * After calling this method, you can start building a new row by calling {@link #table(CharSequence)}.
      * <br>
-     * Note: This method is only available for HTTP transport. TCP transport doesn't support
-     * this operation.
+     * Supported by the HTTP and WebSocket transports; TCP does not support it. On a pooled
+     * sender this discards only the rows appended through the current lease, see
+     * {@link #resetToSavepoint()}.
      *
      * @see #flush()
      */
     void reset();
+
+    /**
+     * Discards the rows appended since the last {@link #markSavepoint()} and
+     * keeps the rows buffered before it. Without a savepoint, or after a flush
+     * emptied it, this is {@link #reset()}. A pooled sender's {@code reset()}
+     * calls this, so a borrower can drop its own bad batch without discarding
+     * rows earlier borrowers left in the shared slot buffer. Default calls
+     * {@code reset()}.
+     */
+    default void resetToSavepoint() {
+        reset();
+    }
 
     /**
      * Monotonic count of rows finished with {@link #at}/{@link #atNow()} over

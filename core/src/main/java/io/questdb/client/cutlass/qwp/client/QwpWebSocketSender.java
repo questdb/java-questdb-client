@@ -462,6 +462,11 @@ public class QwpWebSocketSender implements Sender {
     // Optional owning-pool notification, relayed after the engine confirms the
     // flock release and slotLockReleased is visible to pool re-probes.
     private volatile Runnable slotLockReleaseListener;
+    // Pre-flight batch-cap rejection of the last flush attempt, kept until reset(),
+    // resetToSavepoint() or a successful flush clears it. Not a terminal: the
+    // standalone contract lets the caller reset() and carry on. checkError()
+    // reports it so a pool can retire a slot whose batch no flush will ship.
+    private BatchTooLargeForCapException retainedBatchRejection;
     // Engine whose close() could not complete during sender close() — its
     // cleanup is pending on a worker/I/O-thread exit path. isSlotLockReleased()
     // re-probes it so a late flock release becomes visible to the owning pool.
@@ -471,6 +476,11 @@ public class QwpWebSocketSender implements Sender {
     private int pendingRowCount;
     // Monotonic for the sender's life; reset() does not clear it. Counts rows whether or not they shipped.
     private long rowsAppended;
+    // Pending counters at the last markSavepoint(); zero once a flush ships the
+    // pending rows, at which point resetToSavepoint() is reset().
+    private long savepointFirstPendingRowTimeNanos;
+    private long savepointPendingBytes;
+    private int savepointPendingRowCount;
     private SenderProgressDispatcher progressDispatcher;
     // Async-delivery sink for ack-watermark advances. Default no-op; a
     // setProgressHandler call before connect() swaps in a real handler.
@@ -1670,6 +1680,10 @@ public class QwpWebSocketSender implements Sender {
     @Override
     public void checkError() {
         checkNotClosed();
+        BatchTooLargeForCapException rejected = retainedBatchRejection;
+        if (rejected != null) {
+            throw rejected;
+        }
     }
 
     /**
@@ -3163,6 +3177,20 @@ public class QwpWebSocketSender implements Sender {
         return this;
     }
 
+    @Override
+    public void markSavepoint() {
+        ObjList<CharSequence> keys = tableBuffers.keys();
+        for (int i = 0, n = keys.size(); i < n; i++) {
+            QwpTableBuffer buf = tableBuffers.get(keys.getQuick(i));
+            if (buf != null) {
+                buf.markSavepoint();
+            }
+        }
+        savepointPendingRowCount = pendingRowCount;
+        savepointPendingBytes = pendingBytes;
+        savepointFirstPendingRowTimeNanos = firstPendingRowTimeNanos;
+    }
+
     /**
      * Returns a {@link CursorWebSocketSendLoop.ReconnectFactory} that, on each
      * call, performs the multi-endpoint walk and returns a freshly connected
@@ -3258,11 +3286,46 @@ public class QwpWebSocketSender implements Sender {
         pendingBytes = 0;
         pendingRowCount = 0;
         firstPendingRowTimeNanos = 0;
+        savepointPendingRowCount = 0;
+        savepointPendingBytes = 0;
+        savepointFirstPendingRowTimeNanos = 0;
+        retainedBatchRejection = null;
         currentTableBuffer = null;
         currentTableBufferSnapshotBytes = 0;
         currentTableName = null;
         cachedTimestampColumn = null;
         cachedTimestampNanosColumn = null;
+    }
+
+    @Override
+    public void resetToSavepoint() {
+        checkNotClosed();
+        if (savepointPendingRowCount == 0) {
+            // No rows before the mark, or a flush since emptied it: every pending
+            // row is the caller's own and the full reset applies, watermark included.
+            reset();
+            return;
+        }
+        ObjList<CharSequence> keys = tableBuffers.keys();
+        for (int i = 0, n = keys.size(); i < n; i++) {
+            QwpTableBuffer buf = tableBuffers.get(keys.getQuick(i));
+            if (buf != null) {
+                buf.rollbackToSavepoint();
+            }
+        }
+        // The batch symbol watermark stays: ids the dropped rows registered ride
+        // along unused in the next delta section, which the server tolerates,
+        // whereas lowering it below an id a retained row references would ship
+        // rows pointing at symbols the server never received.
+        pendingRowCount = savepointPendingRowCount;
+        pendingBytes = savepointPendingBytes;
+        firstPendingRowTimeNanos = savepointFirstPendingRowTimeNanos;
+        currentTableBuffer = null;
+        currentTableBufferSnapshotBytes = 0;
+        currentTableName = null;
+        cachedTimestampColumn = null;
+        cachedTimestampNanosColumn = null;
+        retainedBatchRejection = null;
     }
 
     /**
@@ -5100,6 +5163,10 @@ public class QwpWebSocketSender implements Sender {
                     ? 0 : currentTableBuffer.getBufferedBytes();
             pendingRowCount = 0;
             firstPendingRowTimeNanos = 0;
+            savepointPendingRowCount = 0;
+            savepointPendingBytes = 0;
+            savepointFirstPendingRowTimeNanos = 0;
+            retainedBatchRejection = null;
             return;
         }
 
@@ -5163,7 +5230,13 @@ public class QwpWebSocketSender implements Sender {
                 && !deltaDictEnabled && currentBatchMaxSymbolId > deltaBaseline
                 && !splitFramesFit(cap, deltaBaseline)
                 && splitFramesFit(cap, currentBatchMaxSymbolId)) {
-            publishDictionaryChunks(cap, deltaBaseline + 1, currentBatchMaxSymbolId);
+            try {
+                publishDictionaryChunks(cap, deltaBaseline + 1, currentBatchMaxSymbolId);
+            } catch (BatchTooLargeForCapException e) {
+                // Thrown before the try block below, which would latch it.
+                retainedBatchRejection = e;
+                throw e;
+            }
             dictionaryChunksAwaitCommit = true;
             deltaBaseline = currentBatchMaxSymbolId;
             combinedBodyStart = encodeCombinedFrame(tableCount, deferCommit, deltaBaseline);
@@ -5199,6 +5272,9 @@ public class QwpWebSocketSender implements Sender {
 
             resetTableBuffersAfterFlush();
         } catch (Throwable t) {
+            if (t instanceof BatchTooLargeForCapException) {
+                retainedBatchRejection = (BatchTooLargeForCapException) t;
+            }
             if (dictionaryChunksAwaitCommit) {
                 commitOrphanedDictionaryChunks(t);
             }
@@ -5448,6 +5524,10 @@ public class QwpWebSocketSender implements Sender {
         currentTableBufferSnapshotBytes = 0;
         pendingRowCount = 0;
         firstPendingRowTimeNanos = 0;
+        savepointPendingRowCount = 0;
+        savepointPendingBytes = 0;
+        savepointFirstPendingRowTimeNanos = 0;
+        retainedBatchRejection = null;
         armIfEligible();
     }
 

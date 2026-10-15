@@ -287,5 +287,18 @@ public class QuestDBFlushOnCloseTest {
                 throw new RuntimeException(e);
             }
         }
+
+        /**
+         * Table count of the i-th data frame (frames with a table count above zero).
+         */
+        public synchronized int tableCount(int dataFrameIndex) {
+            int seen = -1;
+            for (int i = 0, size = tableCounts.size(); i < size; i++) {
+                if (tableCounts.get(i) > 0 && ++seen == dataFrameIndex) {
+                    return tableCounts.get(i);
+                }
+            }
+            throw new AssertionError("no data frame at index " + dataFrameIndex);
+        }
     }
 }
