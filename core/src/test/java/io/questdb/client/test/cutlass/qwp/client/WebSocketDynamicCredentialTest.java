@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.HttpTokenProvider;
 import io.questdb.client.Sender;
 import io.questdb.client.SenderConnectionEvent;
 import io.questdb.client.SenderError;
@@ -53,7 +54,10 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -152,6 +156,16 @@ public class WebSocketDynamicCredentialTest {
     public void testChallengePlain401Retries() throws Exception {
         // C23: a plain 401, with no challenge at all, triggers the retry.
         assertChallengeRetries(null);
+    }
+
+    @Test(timeout = 30_000)
+    public void testCloseInterruptsThePost401CredentialPull() throws Exception {
+        assertCloseInterruptsPost401Wait(false);
+    }
+
+    @Test(timeout = 30_000)
+    public void testCloseInterruptsThePost401RejectionCallback() throws Exception {
+        assertCloseInterruptsPost401Wait(true);
     }
 
     @Test(timeout = 60_000)
@@ -875,6 +889,72 @@ public class WebSocketDynamicCredentialTest {
                 }
                 Assert.assertEquals("challenge=" + challenge, Arrays.asList("Bearer T1", "Bearer T2"), drainHeaders(server));
                 Assert.assertEquals(1, server.authRejectCount());
+            }
+        });
+    }
+
+    private void assertCloseInterruptsPost401Wait(boolean isBlockingCallback) throws Exception {
+        assertMemoryLeak(() -> {
+            CountDownLatch waitEntered = new CountDownLatch(1);
+            CountDownLatch waitInterrupted = new CountDownLatch(1);
+            CountDownLatch releaseWait = new CountDownLatch(1);
+            AtomicBoolean hasRejected = new AtomicBoolean();
+            Runnable waitForInterrupt = () -> {
+                waitEntered.countDown();
+                try {
+                    releaseWait.await(45, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    waitInterrupted.countDown();
+                }
+            };
+            HttpTokenProvider provider = new HttpTokenProvider() {
+                @Override
+                public CharSequence getToken() {
+                    if (hasRejected.get() && !isBlockingCallback) {
+                        waitForInterrupt.run();
+                    }
+                    return "T1";
+                }
+
+                @Override
+                public void onTokenRejected(CharSequence token, int httpStatus) {
+                    hasRejected.set(true);
+                    if (isBlockingCallback) {
+                        waitForInterrupt.run();
+                    }
+                }
+            };
+            try (TestWebSocketServer server = startServer(new AckHandler());
+                 Sender sender = Sender.builder(Sender.Transport.WEBSOCKET)
+                         .address("localhost:" + server.getPort())
+                         .closeFlushTimeoutMillis(0)
+                         .httpTokenProvider(provider)
+                         .build()) {
+                FutureTask<Void> close = new FutureTask<>(() -> {
+                    sender.close();
+                    return null;
+                });
+                Thread closer = new Thread(close, "post-401-sender-close");
+                try {
+                    Assert.assertEquals("Bearer T1", server.pollAuthorizationHeader(5, TimeUnit.SECONDS));
+                    server.setAuthorizationValidator(h -> 401);
+                    server.dropAllConnections();
+                    Assert.assertTrue("the post-401 wait must start", waitEntered.await(5, TimeUnit.SECONDS));
+                    Assert.assertEquals("the reconnect must reach the server before blocking", 1, server.authRejectCount());
+                    Assert.assertEquals("Bearer T1", server.pollAuthorizationHeader(5, TimeUnit.SECONDS));
+
+                    closer.start();
+                    Assert.assertTrue("close must interrupt the " + (isBlockingCallback ? "rejection callback" : "second pull"),
+                            waitInterrupted.await(5, TimeUnit.SECONDS));
+                    close.get(5, TimeUnit.SECONDS);
+                } finally {
+                    releaseWait.countDown();
+                    if (closer.getState() != Thread.State.NEW) {
+                        closer.join(10_000);
+                        Assert.assertFalse("the close thread must exit", closer.isAlive());
+                    }
+                }
             }
         });
     }

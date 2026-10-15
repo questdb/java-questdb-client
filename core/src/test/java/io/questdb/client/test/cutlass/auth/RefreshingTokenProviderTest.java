@@ -38,10 +38,12 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
 
 import static io.questdb.client.test.cutlass.auth.TokenTestKit.await;
 
@@ -151,6 +153,60 @@ public class RefreshingTokenProviderTest {
         }
         Assert.assertFalse(provider.awaitReady(10));
         provider.onTokenRejected("TOKEN", 401); // no-op, no throw
+    }
+
+    @Test(timeout = 30_000)
+    public void testCloseWakesEveryColdCallerBeforeTheFetchCompletes() throws Exception {
+        ReentrantLock fetchGate = new ReentrantLock();
+        CountDownLatch fetchEntered = new CountDownLatch(1);
+        CountDownLatch fetchCompleted = new CountDownLatch(1);
+        AtomicReference<Thread> fetchThread = new AtomicReference<>();
+        List<Thread> callers = new ArrayList<>();
+        List<FutureTask<CharSequence>> results = new ArrayList<>();
+        fetchGate.lock();
+        try (RefreshingTokenProvider provider = RefreshingTokenProvider.builder(() -> {
+            fetchThread.set(Thread.currentThread());
+            fetchEntered.countDown();
+            // Keep this finite source phase non-interruptible so shutdown cannot release callers through fetch completion.
+            fetchGate.lock();
+            try {
+                return new ExpiringToken("TOKEN", System.currentTimeMillis() + HOUR);
+            } finally {
+                fetchGate.unlock();
+                fetchCompleted.countDown();
+            }
+        }).coldWaitMillis(60_000).build()) {
+            Assert.assertTrue("the prefetch must start", fetchEntered.await(5, TimeUnit.SECONDS));
+            for (int i = 0; i < 2; i++) {
+                FutureTask<CharSequence> result = new FutureTask<>(provider::getToken);
+                results.add(result);
+                callers.add(start(result));
+            }
+            await(() -> allParked(callers), 5_000, "both cold callers to wait");
+
+            provider.close();
+            for (FutureTask<CharSequence> result : results) {
+                ExecutionException error = Assert.assertThrows(ExecutionException.class,
+                        () -> result.get(5, TimeUnit.SECONDS));
+                Assert.assertTrue(error.getCause() instanceof TokenUnavailableException);
+                TokenUnavailableException unavailable = (TokenUnavailableException) error.getCause();
+                Assert.assertFalse("close must report a permanent failure", unavailable.isRetryable());
+                Assert.assertTrue(unavailable.getMessage(), unavailable.getMessage().contains("is closed"));
+            }
+            Assert.assertEquals("close must wake every caller before the source completes", 1, fetchCompleted.getCount());
+        } finally {
+            fetchGate.unlock();
+            for (Thread caller : callers) {
+                caller.interrupt();
+                caller.join(5_000);
+                Assert.assertFalse("the cold caller must exit", caller.isAlive());
+            }
+            Thread refresher = fetchThread.get();
+            if (refresher != null) {
+                refresher.join(5_000);
+                Assert.assertFalse("the refresher must exit after releasing the source", refresher.isAlive());
+            }
+        }
     }
 
     @Test(timeout = 30_000)
