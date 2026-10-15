@@ -26,6 +26,9 @@ package io.questdb.client.test;
 
 import io.questdb.client.QuestDB;
 import io.questdb.client.Sender;
+import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.BatchTooLargeForCapException;
+import io.questdb.client.impl.PooledSender;
 import io.questdb.client.test.cutlass.qwp.client.QwpWireTestUtils;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
@@ -115,6 +118,91 @@ public class QuestDBFlushOnCloseTest {
                 log.awaitDataFrames(1, 5_000);
                 Assert.assertEquals("one frame, one table: t1 only", 1, log.tableCount(0));
                 Assert.assertEquals(1, log.dataFrames());
+            }
+        }
+    }
+
+    @Test
+    public void testOverCapBatchRetiresTheSlotInsteadOfPoisoningIt() throws Exception {
+        FrameLog log = new FrameLog();
+        try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+            server.setAdvertisedMaxBatchSize(4 * 1024);
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            // auto_flush_bytes=off on purpose: defeat the cap-bound byte trigger so the batch outgrows the cap
+            try (QuestDB db = QuestDB.connect(config(server.getPort(),
+                    "auto_flush_bytes=off;auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
+            // warm-up lease: proves the connection and the advertised cap are in place
+            // (initial_connect_retry=async learns the cap on the I/O thread)
+            try (Sender s = db.borrowSender()) {
+                s.table("w").longColumn("v", 1L).atNow();
+                s.flush();
+            }
+            log.awaitDataFrames(1, 5_000);
+                String wide = wideValue(1000);
+                for (int i = 0; i < 6; i++) {
+                    try (Sender s = db.borrowSender()) {
+                        s.table("t").stringColumn("s", wide).atNow();
+                    }
+                }
+                Sender poisoned = null;
+                boolean closeThrew = false;
+                try (Sender s = db.borrowSender()) {
+                    poisoned = ((PooledSender) s).getDelegateForTesting();
+                    try {
+                        s.flush();
+                        Assert.fail("six 1 KB rows do not fit a 4 KiB cap");
+                    } catch (BatchTooLargeForCapException expected) {
+                        // the retained batch belongs to nobody: close() must retire the slot
+                    }
+                } catch (LineSenderException e) {
+                    closeThrew = true;
+                    Assert.assertTrue("close() wraps the retained rejection", e.getCause() instanceof BatchTooLargeForCapException);
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("6 pending row(s) dropped"));
+                }
+                Assert.assertTrue("close() must report the retirement", closeThrew);
+                try (Sender s = db.borrowSender()) {
+                    Assert.assertNotSame("the retired slot is replaced", poisoned, ((PooledSender) s).getDelegateForTesting());
+                    s.table("t").stringColumn("s", wide).atNow();
+                    s.flush();
+                }
+                log.awaitDataFrames(2, 5_000);
+            }
+        }
+    }
+
+    @Test
+    public void testRowOverTheCapFailsOnlyThatRowAndKeepsTheSlot() throws Exception {
+        FrameLog log = new FrameLog();
+        try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+            server.setAdvertisedMaxBatchSize(4 * 1024);
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            try (QuestDB db = QuestDB.connect(config(server.getPort(), "auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
+            // warm-up lease: proves the connection and the advertised cap are in place
+            // (initial_connect_retry=async learns the cap on the I/O thread)
+            try (Sender s = db.borrowSender()) {
+                s.table("w").longColumn("v", 1L).atNow();
+                s.flush();
+            }
+            log.awaitDataFrames(1, 5_000);
+                Sender delegate;
+                try (Sender s = db.borrowSender()) {
+                    delegate = ((PooledSender) s).getDelegateForTesting();
+                    try {
+                        s.table("t").stringColumn("s", wideValue(5000)).atNow();
+                        Assert.fail("a 5 KB row cannot fit a 4 KiB cap");
+                    } catch (LineSenderException expected) {
+                        Assert.assertTrue(expected.getMessage(), expected.getMessage().contains("row too large"));
+                    }
+                    s.table("t").longColumn("v", 1L).atNow();           // the lease carries on
+                }
+                try (Sender s = db.borrowSender()) {
+                    Assert.assertSame("the slot stayed in service", delegate, ((PooledSender) s).getDelegateForTesting());
+                    Assert.assertEquals(1, s.pendingRowCount());
+                    s.flush();
+                }
+                log.awaitDataFrames(2, 5_000);
             }
         }
     }

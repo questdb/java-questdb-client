@@ -156,7 +156,8 @@ public final class PooledSender implements Sender {
      * {@link LineSenderException} is thrown so the mistake is visible. A
      * delegate that has latched a terminal error is retired instead of being
      * returned, and a new {@link LineSenderException} is thrown here whose
-     * cause is the delegate's error. A lease body that already threw the typed
+     * cause is the delegate's error and whose message carries the number of pending rows the
+     * retirement dropped. A lease body that already threw the typed
      * error keeps it as the primary exception, with close's wrapper
      * suppressed. The typed error and its classification live on the cause.
      * <p>
@@ -187,6 +188,7 @@ public final class PooledSender implements Sender {
         boolean cancelledRow = false;
         boolean recycle = false;
         RuntimeException failure = null;
+        int pendingRowsAtRetire = 0;
         try {
             // live(), not delegate(): re-validate the generation right before
             // touching the delegate, narrowing the duplicate-close race.
@@ -218,6 +220,11 @@ public final class PooledSender implements Sender {
                 // latched an error, the flush failed, or the generation went
                 // stale. Retire it; a wrapper around the original propagates
                 // once this finally returns.
+                try {
+                    pendingRowsAtRetire = slot.delegate().pendingRowCount();
+                } catch (Throwable ignored) {
+                    // best effort: the count is only for the message
+                }
                 pool.discardBroken(this);
             }
         }
@@ -229,7 +236,8 @@ public final class PooledSender implements Sender {
             }
             String msg = failure.getMessage();
             boolean retryable = failure instanceof LineSenderException && ((LineSenderException) failure).isRetryable();
-            LineSenderException wrapper = new LineSenderException("pooled sender close failed: " + msg, retryable);
+            LineSenderException wrapper = new LineSenderException("pooled sender close failed, slot retired with "
+                    + pendingRowsAtRetire + " pending row(s) dropped: " + msg, retryable);
             wrapper.initCause(failure);
             throw wrapper;
         }

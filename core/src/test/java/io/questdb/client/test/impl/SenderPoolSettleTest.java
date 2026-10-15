@@ -26,6 +26,8 @@ package io.questdb.client.test.impl;
 
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.BatchTooLargeForCapException;
+import io.questdb.client.impl.PooledSender;
 import io.questdb.client.impl.SenderPool;
 import org.junit.Assert;
 import org.junit.Test;
@@ -45,6 +47,25 @@ import java.util.concurrent.atomic.AtomicReference;
  * concurrent borrower.
  */
 public class SenderPoolSettleTest {
+
+    @Test
+    public void testSettleRetiresSlotHoldingAnOverCapBatch() {
+        List<RecordingSender> built = new ArrayList<>();
+        try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(1, 1, built)) {
+            try (Sender s = pool.borrow()) {
+                s.table("t").longColumn("v", 1L).atNow();
+            }
+            RecordingSender delegate = built.get(0);
+            delegate.flushError = new BatchTooLargeForCapException("single table batch too large for server batch cap");
+            Assert.assertEquals(0, pool.settleIdle());
+            Assert.assertEquals("a batch the cap rejects never ships: the slot is retired", 0, pool.totalSize());
+            Assert.assertEquals(1, delegate.closeCount.get());
+            try (Sender next = pool.borrow()) {
+                Assert.assertEquals("the next borrow builds a fresh delegate", 2, built.size());
+                Assert.assertNotSame(delegate, ((PooledSender) next).getDelegateForTesting());
+            }
+        }
+    }
 
     @Test
     public void testSettleShipsRowsLeftInIdleSlot() throws Exception {

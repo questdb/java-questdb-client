@@ -30,6 +30,7 @@ import io.questdb.client.SenderConnectionListener;
 import io.questdb.client.SenderError;
 import io.questdb.client.SenderErrorHandler;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.BatchTooLargeForCapException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerListener;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
@@ -1323,6 +1324,8 @@ public final class SenderPool implements AutoCloseable {
                     created.bumpGeneration();
                     inFlightCreations--;
                     creationFinished.signalAll();
+                    // Every lease handed to a caller starts at a mark.
+                    created.delegate().markSavepoint();
                     return new PooledSender(created, created.generation());
                 }
                 // Capacity-starved: re-probe retired slots BEFORE the terminal
@@ -1730,8 +1733,10 @@ public final class SenderPool implements AutoCloseable {
      * delegate is probed with {@link Sender#checkError()}: a latched error
      * retires the slot, anything else returns it to the free list, and rows a
      * failed flush left behind wait for the next settle. An {@link Error}
-     * thrown by the flush is not transient and retires the slot. The slot's idle clock is not
-     * touched, so reaping is unaffected.
+     * thrown by the flush is not transient and retires the slot, and so does a
+     * {@code BatchTooLargeForCapException}: that batch belongs to no lease and no retry can
+     * ship it, so the slot is retired and the dropped row count logged. The slot's idle clock
+     * is not touched, so reaping is unaffected.
      *
      * @return the number of slots whose flush completed
      */
@@ -1768,11 +1773,16 @@ public final class SenderPool implements AutoCloseable {
             PooledSender lease = leases.get(i);
             boolean flushed = false;
             Throwable fatal = null;
+            BatchTooLargeForCapException overCap = null;
             try {
                 // PooledSender.flush() already marks the commit on the slot.
                 lease.flush();
                 lease.slot().settleFailureLogged(false);
                 flushed = true;
+            } catch (BatchTooLargeForCapException e) {
+                // Deterministic and not latched: no retry ships this batch and no
+                // lease owns it any more. Retire the slot below.
+                overCap = e;
             } catch (Exception e) {
                 // Transient (ring full, recycle in flight) or terminal: the
                 // requeue below tells them apart with the probe.
@@ -1784,6 +1794,10 @@ public final class SenderPool implements AutoCloseable {
             try {
                 if (fatal != null) {
                     LOG.warn("settleIdle: flush threw an Error, retiring slot {}", lease.slot().slotIndex(), fatal);
+                    retireLease(lease, " during settle");
+                } else if (overCap != null) {
+                    LOG.warn("settleIdle: slot {} holds a batch the server cap rejects, retiring it and dropping {} pending row(s): {}",
+                            lease.slot().slotIndex(), pendingRowsOf(lease.slot()), overCap.toString());
                     retireLease(lease, " during settle");
                 } else {
                     requeueSettled(lease);
@@ -1801,12 +1815,7 @@ public final class SenderPool implements AutoCloseable {
 
     private void logSettleFailure(SenderSlot slot, Exception e) {
         int idx = slot.slotIndex();
-        int pending = 0;
-        try {
-            pending = slot.delegate().pendingRowCount();
-        } catch (Throwable ignored) {
-            // best effort: the count is only for the log line
-        }
+        int pending = pendingRowsOf(slot);
         String error = e.toString();
         if (!slot.settleFailureLogged()) {
             slot.settleFailureLogged(true);
@@ -1889,6 +1898,15 @@ public final class SenderPool implements AutoCloseable {
      * What {@link #settleIdle()} looks for in an idle slot. Phase A: buffered
      * rows and deferred frames awaiting their commit.
      */
+    /** Best-effort pending row count of a slot's delegate, for log lines only. */
+    private static int pendingRowsOf(SenderSlot slot) {
+        try {
+            return slot.delegate().pendingRowCount();
+        } catch (Throwable ignored) {
+            return 0;
+        }
+    }
+
     private static boolean hasUnshippedWork(Sender delegate) {
         return delegate.pendingRowCount() > 0 || delegate.hasDeferredFrames();
     }
@@ -1909,12 +1927,7 @@ public final class SenderPool implements AutoCloseable {
             // latched: retire below
         }
         if (!healthy) {
-            long pendingRows = 0;
-            try {
-                pendingRows = s.delegate().pendingRowCount();
-            } catch (Throwable ignored) {
-                // best effort: the count is only for the log line
-            }
+            int pendingRows = pendingRowsOf(s);
             LOG.warn("settleIdle: delegate of slot {} latched an error, retiring it with {} pending row(s)",
                     s.slotIndex(), pendingRows);
             retireLease(lease, " during settle");
