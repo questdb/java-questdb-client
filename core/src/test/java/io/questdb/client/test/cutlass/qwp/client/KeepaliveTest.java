@@ -36,16 +36,24 @@ public class KeepaliveTest {
 
     @Test
     public void testIdleConnectionSendsPings() throws Exception {
+        final long intervalMillis = 100;
         AtomicInteger pings = new AtomicInteger();
+        long startNanos = System.nanoTime();
         try (TestWebSocketServer server = startServer(pings);
-             Sender ignored = Sender.fromConfig(config(server, 100))) {
+             Sender ignored = Sender.fromConfig(config(server, intervalMillis))) {
             // generous: exits as soon as 3 pings land, and Windows CI can stall for seconds
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
             while (pings.get() < 3 && System.nanoTime() < deadline) {
                 Thread.sleep(10);
             }
+            // a PING must not cost a reconnect
+            Assert.assertEquals(1, server.handshakeCount());
         }
-        Assert.assertTrue("expected periodic pings on an idle connection, saw " + pings.get(), pings.get() >= 3);
+        long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+        int seen = pings.get();
+        Assert.assertTrue("expected periodic pings on an idle connection, saw " + seen, seen >= 3);
+        // the gate spaces PINGs at least one interval apart, so this holds however slow the box is
+        Assert.assertTrue("ping flood: " + seen + " in " + elapsedMillis + " ms", seen <= elapsedMillis / intervalMillis + 1);
     }
 
     @Test
