@@ -841,7 +841,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     /**
      * Discards the rows appended since the last {@link #markSavepoint()} and
      * keeps the rows buffered before it. Without a savepoint, or after a flush
-     * emptied it, this is {@link #reset()}. A pooled sender's {@code reset()}
+     * emptied it, this discards every pending row like {@link #reset()}, and
+     * also removes the column definitions the server has not seen yet. A pooled sender's {@code reset()}
      * calls this, so a borrower can drop its own bad batch without discarding
      * rows earlier borrowers left in the shared slot buffer. Default calls
      * {@code reset()}.

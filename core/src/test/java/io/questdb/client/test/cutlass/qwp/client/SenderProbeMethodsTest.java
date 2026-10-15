@@ -172,6 +172,41 @@ public class SenderProbeMethodsTest {
     }
 
     @Test
+    public void testResetToSavepointAfterAnOverCapFlushClearsTheProbeAndShipsTheEarlierRows() throws Exception {
+        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+        try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+            server.setAdvertisedMaxBatchSize(4 * 1024);
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            try (Sender sender = Sender.fromConfig(config(server.getPort()))) {
+                sender.table("t").longColumn("v", 1L).atNow();
+                sender.markSavepoint();
+                String wide = QuestDBFlushOnCloseTest.wideValue(1000);
+                for (int i = 0; i < 6; i++) {
+                    sender.table("t").stringColumn("s", wide).atNow();
+                }
+                try {
+                    sender.flush();
+                    Assert.fail("the lease's rows do not fit a 4 KiB cap");
+                } catch (BatchTooLargeForCapException expected) {
+                    // retained for retry
+                }
+                try {
+                    sender.checkError();
+                    Assert.fail("the probe must report the retained batch");
+                } catch (BatchTooLargeForCapException expected) {
+                    // the pool retires a slot on this
+                }
+                sender.resetToSavepoint();
+                sender.checkError();
+                Assert.assertEquals(1, sender.pendingRowCount());
+                sender.flush();
+                log.awaitDataFrames(1, 5_000);
+            }
+        }
+    }
+
+    @Test
     public void testResetToSavepointKeepsRowsBufferedBeforeTheMark() throws Exception {
         QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {

@@ -26,6 +26,7 @@ package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.BatchTooLargeForCapException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
@@ -487,7 +488,7 @@ public class SelfSufficientFramesTest {
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
                 String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
-                        + ";sf_max_segment_bytes=64;";
+                        + ";sf_max_segment_bytes=64;auto_flush_bytes=off;";
                 String pad = TestUtils.repeat("x", 60);
                 Sender sender = Sender.fromConfig(config);
                 try {
@@ -1040,7 +1041,14 @@ public class SelfSufficientFramesTest {
                         Assert.assertTrue(e.getMessage(),
                                 e.getMessage().contains("a single symbol value is too large for the server batch cap"));
                     }
+                    try {
+                        sender.checkError();
+                        Assert.fail("the probe must report the retained batch");
+                    } catch (BatchTooLargeForCapException expected) {
+                        // latched by the dictionary pre-flight
+                    }
                     sender.reset();
+                    sender.checkError();
                 }
 
                 // Nothing may have been published -- not even a dictionary chunk.

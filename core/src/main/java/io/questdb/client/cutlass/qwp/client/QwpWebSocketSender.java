@@ -478,6 +478,7 @@ public class QwpWebSocketSender implements Sender {
     private long rowsAppended;
     // Pending counters at the last markSavepoint(); zero once a flush ships the
     // pending rows, at which point resetToSavepoint() is reset().
+    private int savepointBatchMaxSymbolId;
     private long savepointFirstPendingRowTimeNanos;
     private long savepointPendingBytes;
     private int savepointPendingRowCount;
@@ -3186,6 +3187,7 @@ public class QwpWebSocketSender implements Sender {
                 buf.markSavepoint();
             }
         }
+        savepointBatchMaxSymbolId = currentBatchMaxSymbolId;
         savepointPendingRowCount = pendingRowCount;
         savepointPendingBytes = pendingBytes;
         savepointFirstPendingRowTimeNanos = firstPendingRowTimeNanos;
@@ -3272,60 +3274,7 @@ public class QwpWebSocketSender implements Sender {
                 buf.reset();
             }
         }
-        // Drop the batch's symbol watermark along with the rows that raised it. A
-        // later flush encodes the delta section as
-        // [sentMaxSymbolId+1 .. currentBatchMaxSymbolId], so a watermark left behind
-        // by the discarded batch keeps re-encoding that batch's symbols: a single-row
-        // batch after reset() would still carry the whole abandoned range and hit the
-        // very cap rejection reset() is documented to clear, leaving the sender unable
-        // to flush anything at all. -1 is the same value resetTableBuffersAfterFlush
-        // leaves behind after a successful flush, and sendCommitMessage already reads
-        // it as an empty delta.
-        currentBatchMaxSymbolId = -1;
-        reclaimUnsentSymbolIds();
-        pendingBytes = 0;
-        pendingRowCount = 0;
-        firstPendingRowTimeNanos = 0;
-        savepointPendingRowCount = 0;
-        savepointPendingBytes = 0;
-        savepointFirstPendingRowTimeNanos = 0;
-        retainedBatchRejection = null;
-        currentTableBuffer = null;
-        currentTableBufferSnapshotBytes = 0;
-        currentTableName = null;
-        cachedTimestampColumn = null;
-        cachedTimestampNanosColumn = null;
-    }
-
-    @Override
-    public void resetToSavepoint() {
-        checkNotClosed();
-        if (savepointPendingRowCount == 0) {
-            // No rows before the mark, or a flush since emptied it: every pending
-            // row is the caller's own and the full reset applies, watermark included.
-            reset();
-            return;
-        }
-        ObjList<CharSequence> keys = tableBuffers.keys();
-        for (int i = 0, n = keys.size(); i < n; i++) {
-            QwpTableBuffer buf = tableBuffers.get(keys.getQuick(i));
-            if (buf != null) {
-                buf.rollbackToSavepoint();
-            }
-        }
-        // The batch symbol watermark stays: ids the dropped rows registered ride
-        // along unused in the next delta section, which the server tolerates,
-        // whereas lowering it below an id a retained row references would ship
-        // rows pointing at symbols the server never received.
-        pendingRowCount = savepointPendingRowCount;
-        pendingBytes = savepointPendingBytes;
-        firstPendingRowTimeNanos = savepointFirstPendingRowTimeNanos;
-        currentTableBuffer = null;
-        currentTableBufferSnapshotBytes = 0;
-        currentTableName = null;
-        cachedTimestampColumn = null;
-        cachedTimestampNanosColumn = null;
-        retainedBatchRejection = null;
+        discardPendingBatchState();
     }
 
     /**
@@ -3357,6 +3306,41 @@ public class QwpWebSocketSender implements Sender {
         if (pendingRowCount == 0) {
             armIfEligible();
         }
+    }
+
+    @Override
+    public void resetToSavepoint() {
+        checkNotClosed();
+        // Always roll back, also with an empty savepoint: after a flush each
+        // buffer's mark sits at "no rows, server-known columns", so the rollback
+        // drops the column definitions the lease created that the server has not
+        // seen, which reset() would keep and ship null-padded.
+        ObjList<CharSequence> keys = tableBuffers.keys();
+        for (int i = 0, n = keys.size(); i < n; i++) {
+            QwpTableBuffer buf = tableBuffers.get(keys.getQuick(i));
+            if (buf != null) {
+                buf.rollbackToSavepoint();
+            }
+        }
+        if (savepointPendingRowCount == 0) {
+            // No rows before the mark, or a flush since emptied it: every pending
+            // row is the caller's own and the sender-level clears of reset() apply.
+            discardPendingBatchState();
+            return;
+        }
+        // Rows before the mark reference only symbol ids at or below the
+        // watermark recorded at the mark, and the watermark only grows within a
+        // batch, so restoring it drops the ids the discarded rows registered.
+        currentBatchMaxSymbolId = savepointBatchMaxSymbolId;
+        pendingRowCount = savepointPendingRowCount;
+        pendingBytes = savepointPendingBytes;
+        firstPendingRowTimeNanos = savepointFirstPendingRowTimeNanos;
+        currentTableBuffer = null;
+        currentTableBufferSnapshotBytes = 0;
+        currentTableName = null;
+        cachedTimestampColumn = null;
+        cachedTimestampNanosColumn = null;
+        retainedBatchRejection = null;
     }
 
     @Override
@@ -4583,6 +4567,14 @@ public class QwpWebSocketSender implements Sender {
         }
     }
 
+    private void clearSavepointAndRejection() {
+        savepointBatchMaxSymbolId = 0;
+        savepointPendingRowCount = 0;
+        savepointPendingBytes = 0;
+        savepointFirstPendingRowTimeNanos = 0;
+        retainedBatchRejection = null;
+    }
+
     private synchronized Throwable closeRemainingResources(Throwable terminalError) {
         if (closeCleanupStarted) {
             return terminalError;
@@ -4751,6 +4743,29 @@ public class QwpWebSocketSender implements Sender {
     private Endpoint currentEndpoint() {
         int idx = currentEndpointIdx;
         return idx < 0 ? null : endpoints.get(idx);
+    }
+
+    private void discardPendingBatchState() {
+        // Drop the batch's symbol watermark along with the rows that raised it. A
+        // later flush encodes the delta section as
+        // [sentMaxSymbolId+1 .. currentBatchMaxSymbolId], so a watermark left behind
+        // by the discarded batch keeps re-encoding that batch's symbols: a single-row
+        // batch after reset() would still carry the whole abandoned range and hit the
+        // very cap rejection reset() is documented to clear, leaving the sender unable
+        // to flush anything at all. -1 is the same value resetTableBuffersAfterFlush
+        // leaves behind after a successful flush, and sendCommitMessage already reads
+        // it as an empty delta.
+        currentBatchMaxSymbolId = -1;
+        reclaimUnsentSymbolIds();
+        pendingBytes = 0;
+        pendingRowCount = 0;
+        firstPendingRowTimeNanos = 0;
+        clearSavepointAndRejection();
+        currentTableBuffer = null;
+        currentTableBufferSnapshotBytes = 0;
+        currentTableName = null;
+        cachedTimestampColumn = null;
+        cachedTimestampNanosColumn = null;
     }
 
     /**
@@ -5163,10 +5178,7 @@ public class QwpWebSocketSender implements Sender {
                     ? 0 : currentTableBuffer.getBufferedBytes();
             pendingRowCount = 0;
             firstPendingRowTimeNanos = 0;
-            savepointPendingRowCount = 0;
-            savepointPendingBytes = 0;
-            savepointFirstPendingRowTimeNanos = 0;
-            retainedBatchRejection = null;
+            clearSavepointAndRejection();
             return;
         }
 
@@ -5524,10 +5536,7 @@ public class QwpWebSocketSender implements Sender {
         currentTableBufferSnapshotBytes = 0;
         pendingRowCount = 0;
         firstPendingRowTimeNanos = 0;
-        savepointPendingRowCount = 0;
-        savepointPendingBytes = 0;
-        savepointFirstPendingRowTimeNanos = 0;
-        retainedBatchRejection = null;
+        clearSavepointAndRejection();
         armIfEligible();
     }
 
