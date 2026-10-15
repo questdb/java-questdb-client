@@ -567,8 +567,11 @@ out, and the provider logs a warning once. If your platform issues tokens that s
 
 How failures are handled:
 
-- A token is refreshed at about half its lifetime, and always before it enters the hand-out floor, so an idle client
-  always holds a valid one.
+- The provider refreshes a token proactively, usually at about half its lifetime, and starts earlier for shorter
+  hand-out windows where the minimum refresh interval permits. Uninterrupted availability requires the refresh to
+  finish before the current token enters the hand-out floor. Even a successful fetch can leave callers waiting:
+  with defaults, a 100 s token starts refreshing at +30 s and stops being handed out at +40 s, leaving only 10 s
+  for the refresh to complete.
 - When the server rejects a token with `401`, the client asks the provider for a new one and retries the same server
   once, immediately.
 - At startup, `initial_connect_retry=off` (the default) fails if no token can be obtained; `on` keeps retrying a

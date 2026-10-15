@@ -68,11 +68,11 @@ import java.util.function.DoubleSupplier;
  *   scheduled at a jittered half-life, {@code f + (e - f) * U(0.45, 0.55)}, no later than
  *   {@code e - min(refresh_margin, (e - f) / 2)}, no earlier than {@code f + p}, where
  *   {@code p = min(min_refresh_interval, (e - f) / 2)}, and no later than the platform's refresh hint when it gave
- *   one. It also runs at least {@code p} before the token leaves its hand-out window at {@code e - handout_floor},
- *   unless that is sooner than {@code f + p}. While the source is healthy, even an idle client therefore always
- *   holds a usable token, provided a token is handed out for longer than {@code p}: with the defaults, provided it
- *   lives longer than 90 s. A shorter-lived token cannot be refreshed while it is still handed out, so callers
- *   wait for a fetch whenever one stops being usable, and the provider logs a warning once.</li>
+ *   one. The provider also aims to start at least {@code p} before the token leaves its hand-out window at
+ *   {@code e - handout_floor}, but never sooner than {@code f + p}. Continuous availability requires each refresh
+ *   to complete with a usable token before that cutoff; even a successful fetch can leave callers waiting if it
+ *   takes longer. A token handed out for less than {@code p} cannot be proactively refreshed while it is still
+ *   handed out, so callers wait for a fetch when it stops being usable, and the provider logs a warning once.</li>
  *   <li><b>Hand-out.</b> A token is usable only while {@code now < e - handout_floor}. {@link #getToken()}
  *   returns a usable token at once - a volatile read, no I/O, no lock. With no usable token it starts a fetch
  *   (unless one is running or the provider is backing off after failures) and waits up to {@code cold_wait},
@@ -223,9 +223,9 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
         if (refreshAt > 0) {
             r = Math.min(r, Math.max(refreshAt, f + spacing));
         }
-        // Refresh at least the spacing before the token leaves its hand-out window, so the fetch and its retries run
-        // while the current token is still handed out. A short-lived token's window can close sooner than the spacing
-        // after this fetch; the spacing wins, and such a token is fetched when a caller needs it.
+        // Move the refresh earlier to leave room for fetching before the hand-out cutoff, without breaking the
+        // minimum scheduled spacing. A short window can leave less than the spacing for the fetch to complete,
+        // so callers may still wait even when the source succeeds.
         return Math.min(r, Math.max(e - handoutFloorMillis - spacing, f + spacing));
     }
 
@@ -356,7 +356,7 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
                 // lock, to start that fetch in the background.
                 if (!fetchRunning && consecutiveFailures == 0
                         && (wallNow >= h.refreshAtEpochMillis || clock.monotonicNanos() - h.refreshAtNanos >= 0)) {
-                    startOverdueRefresh();
+                    startOverdueRefresh(h);
                 }
                 return h.token;
             }
@@ -690,10 +690,13 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
         scheduledTask = scheduler.schedule(() -> runFetch(seq), delayNanos);
     }
 
-    private void startOverdueRefresh() {
+    private void startOverdueRefresh(Held observed) {
         lock.lock();
         try {
-            requestFetchNowLocked(clock.monotonicNanos());
+            // A scheduled refresh may have replaced the warm reader's snapshot before it acquired the lock.
+            if (held == observed) {
+                requestFetchNowLocked(clock.monotonicNanos());
+            }
         } finally {
             lock.unlock();
         }

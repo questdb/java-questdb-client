@@ -38,6 +38,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -675,9 +676,8 @@ public class RefreshingTokenProviderTest {
 
     @Test
     public void testShortLivedTokenIsRefreshedWhileItIsStillHandedOut() {
-        // section 5.2: a 100 s token is handed out for 40 s. Its refresh runs 30 s after the fetch, while it is still
-        // handed out, so an idle client always holds a usable token. Scheduled at its half-life alone, the refresh
-        // ran 45-50 s after the fetch, and every caller after the token left its window waited for a fetch.
+        // section 5.2: a 100 s token is handed out for 40 s. An immediately returning refresh at +30 s keeps a
+        // usable token available. Its half-life alone would schedule the refresh at +45-50 s, after the cutoff.
         FakeClock clock = new FakeClock(T0);
         ManualScheduler scheduler = new ManualScheduler(clock);
         ScriptedSource source = new ScriptedSource().then(() -> new ExpiringToken(
@@ -697,6 +697,60 @@ public class RefreshingTokenProviderTest {
                 previousFetch += 30_000L;
             }
             Assert.assertEquals(4, source.calls());
+        }
+    }
+
+    @Test(timeout = 30_000)
+    public void testSlowSuccessfulRefreshCanOutlastTheHandoutWindow() throws Exception {
+        FakeClock clock = new FakeClock(T0);
+        ManualScheduler scheduler = new ManualScheduler(clock);
+        ScriptedSource source = new ScriptedSource()
+                .thenToken("T1", T0 + 100_000L)
+                .then(() -> new ExpiringToken("T2", clock.wallClockMillis() + 100_000L));
+        try (RefreshingTokenProvider provider = provider(source, clock, scheduler, 0.5).build()) {
+            scheduler.runNext();
+            Assert.assertEquals("T1", provider.getToken().toString());
+            Assert.assertEquals(30_000L, scheduler.peek().delayMillis());
+            source.setGate();
+            FutureTask<ManualScheduler.Task> refresh = new FutureTask<>(scheduler::advanceAndRunNext);
+            FutureTask<String> token = new FutureTask<>(() -> provider.getToken().toString());
+            Thread refresher = start(refresh);
+            Thread caller = null;
+            try {
+                await(() -> source.calls() == 2, 5_000, "the scheduled refresh to enter the source");
+                Assert.assertEquals(T0 + 30_000L, clock.wallClockMillis());
+                clock.advanceMillis(9_999);
+                Assert.assertEquals("T1", provider.getToken().toString());
+                clock.advanceMillis(1);
+                Assert.assertFalse("the old token has reached its handout floor", provider.awaitReady(0));
+
+                caller = start(token);
+                Thread waitingCaller = caller;
+                await(() -> waitingCaller.getState() == Thread.State.TIMED_WAITING,
+                        5_000, "the caller to wait for the in-flight refresh");
+                clock.advanceMillis(9_999);
+                Assert.assertFalse(provider.awaitReady(0));
+                Assert.assertFalse("a successful but unfinished fetch cannot supply a token", token.isDone());
+
+                clock.advanceMillis(1);
+                source.openGate();
+                Assert.assertEquals("T2", token.get(5, TimeUnit.SECONDS));
+                refresh.get(5, TimeUnit.SECONDS);
+                Assert.assertEquals(T0 + 50_000L, provider.getLastSuccessEpochMillis());
+                Assert.assertEquals(2, source.calls());
+                Assert.assertEquals(0, provider.getConsecutiveFailures());
+                Assert.assertNull(provider.getLastFailure());
+            } finally {
+                source.openGate();
+                refresher.interrupt();
+                refresher.join(5_000);
+                if (caller != null) {
+                    caller.interrupt();
+                    caller.join(5_000);
+                    Assert.assertFalse("the token wait must finish", caller.isAlive());
+                }
+                Assert.assertFalse("the refresh must finish", refresher.isAlive());
+            }
         }
     }
 
@@ -814,6 +868,65 @@ public class RefreshingTokenProviderTest {
             }
             Assert.assertEquals(1, source.calls());
             Assert.assertSame("a warm read must not touch the schedule", scheduled, scheduler.peek());
+        }
+    }
+
+    @Test(timeout = 30_000)
+    public void testWarmReaderDoesNotRescheduleAfterAConcurrentRefresh() throws Exception {
+        FakeClock clock = new FakeClock(T0);
+        ManualScheduler scheduler = new ManualScheduler(clock);
+        ScriptedSource source = new ScriptedSource()
+                .thenToken("T1", T0 + HOUR)
+                .then(() -> new ExpiringToken("T2", clock.wallClockMillis() + HOUR));
+        CountDownLatch snapshotRead = new CountDownLatch(1);
+        CountDownLatch resumeReader = new CountDownLatch(1);
+        AtomicBoolean isGateArmed = new AtomicBoolean();
+        RefreshingTokenProvider.Clock gatedClock = new RefreshingTokenProvider.Clock() {
+            @Override
+            public long monotonicNanos() {
+                return clock.monotonicNanos();
+            }
+
+            @Override
+            public long wallClockMillis() {
+                if (isGateArmed.compareAndSet(true, false)) {
+                    snapshotRead.countDown();
+                    try {
+                        Assert.assertTrue("the reader must resume", resumeReader.await(5, TimeUnit.SECONDS));
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new AssertionError(e);
+                    }
+                }
+                return clock.wallClockMillis();
+            }
+        };
+        try (RefreshingTokenProvider provider = RefreshingTokenProvider.builder(source)
+                .clock(gatedClock).scheduler(scheduler).random(() -> 0.5).build()) {
+            scheduler.runNext();
+            Assert.assertEquals("T1", provider.getToken().toString());
+            clock.advanceMillis(scheduler.peek().delayMillis());
+            isGateArmed.set(true);
+            FutureTask<String> token = new FutureTask<>(() -> provider.getToken().toString());
+            Thread reader = start(token);
+            try {
+                // Pause after getToken() captures T1, then publish T2 before the reader checks T1's deadline.
+                Assert.assertTrue("the reader must capture the old token", snapshotRead.await(5, TimeUnit.SECONDS));
+                scheduler.runNext();
+                Assert.assertEquals("T2", provider.getToken().toString());
+                ManualScheduler.Task nextRefresh = scheduler.peek();
+                Assert.assertEquals(30 * MIN, nextRefresh.delayMillis());
+                resumeReader.countDown();
+                Assert.assertEquals("T1", token.get(5, TimeUnit.SECONDS));
+                Assert.assertSame("the stale reader must preserve the new refresh schedule",
+                        nextRefresh, scheduler.peek());
+                Assert.assertEquals(2, source.calls());
+            } finally {
+                resumeReader.countDown();
+                reader.interrupt();
+                reader.join(5_000);
+                Assert.assertFalse("the reader must finish", reader.isAlive());
+            }
         }
     }
 
