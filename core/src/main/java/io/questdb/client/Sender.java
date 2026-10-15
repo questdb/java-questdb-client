@@ -2231,10 +2231,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * the server periodically. Effective only when
          * {@link #requestDurableAck(boolean) request_durable_ack=on}.
          * <p>
-         * Pass {@code 0} or negative to disable keepalive PINGs entirely
-         * — the caller then accepts that durable-ack frames may not
-         * arrive on idle connections (e.g. they are sending data
-         * continuously, or have their own ping driver).
+         * Pass {@code 0} or negative to disable it. The idle PING
+         * ({@link #keepaliveIntervalMillis(long)}) is separate.
          * <p>
          * Default
          * {@value io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop#DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS}

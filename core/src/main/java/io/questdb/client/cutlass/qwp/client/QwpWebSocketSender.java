@@ -336,7 +336,7 @@ public class QwpWebSocketSender implements Sender {
     // Keepalive PING cadence used by the I/O loop while
     // request_durable_ack=on AND there are pending durable-ack
     // confirmations. Default mirrors the loop's spec value; 0 or negative
-    // disables keepalive PINGs entirely.
+    // disables this PING (the idle keepalive PING is separate).
     private long durableAckKeepaliveIntervalMillis =
             CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS;
     // Idle keepalive PING cadence for the I/O loop; 0 or negative disables it.
@@ -890,7 +890,7 @@ public class QwpWebSocketSender implements Sender {
     /**
      * Master connect overload — also accepts the keepalive PING cadence
      * the I/O loop uses while waiting on STATUS_DURABLE_ACK frames.
-     * {@code 0} or negative disables the keepalive entirely (caller takes
+     * {@code 0} or negative disables this durable-ack PING (caller takes
      * responsibility for prodding the server).
      */
     public static QwpWebSocketSender connect(

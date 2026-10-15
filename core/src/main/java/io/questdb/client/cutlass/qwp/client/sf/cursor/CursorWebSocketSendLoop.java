@@ -134,7 +134,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * events, so an opted-in idle client has to prod it. {@code 200} ms
      * trades one PING per 200 ms per idle opted-in connection for
      * sub-second confirmation latency once the upload completes
-     * server-side. {@code 0} or negative disables the keepalive entirely.
+     * server-side. {@code 0} or negative disables this PING, not the idle keepalive.
      */
     public static final long DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS = 200L;
     /**
@@ -283,7 +283,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     @TestOnly
     public static volatile boolean forceMirrorSeedFailureForTest;
     // Pre-converted to nanos for the comparison in sendPingIfDue.
-    // Zero or negative disables the keepalive entirely.
+    // Zero or negative disables the durable-ack PING only.
     private final long durableAckKeepaliveIntervalNanos;
     // Idle keepalive PING cadence in nanos; 0 or negative disables. Set before start().
     private long keepaliveIntervalNanos = TimeUnit.MILLISECONDS.toNanos(DEFAULT_KEEPALIVE_INTERVAL_MILLIS);
@@ -677,7 +677,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     /**
      * Master constructor — also accepts the cadence at which the I/O loop
      * sends keepalive PINGs while waiting on STATUS_DURABLE_ACK frames.
-     * Pass {@code 0} or negative to disable keepalive PINGs entirely (the
+     * Pass {@code 0} or negative to disable this durable-ack PING (the
      * caller takes responsibility for prodding the server, e.g. by sending
      * data, or by accepting indefinite waits on idle connections).
      */
