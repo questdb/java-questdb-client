@@ -156,8 +156,9 @@ public final class PooledSender implements Sender {
      * {@link LineSenderException} is thrown so the mistake is visible. A
      * delegate that has latched a terminal error is retired instead of being
      * returned, and a new {@link LineSenderException} is thrown here whose
-     * cause is the delegate's error and whose message carries the number of pending rows the
-     * retirement dropped. A lease body that already threw the typed
+     * cause is the delegate's error and whose message carries the number of unshipped rows at
+     * the retirement. The count lives on the wrapper of a non-server failure; the typed server
+     * branch below carries none. A lease body that already threw the typed
      * error keeps it as the primary exception, with close's wrapper
      * suppressed. The typed error and its classification live on the cause.
      * <p>
@@ -237,7 +238,7 @@ public final class PooledSender implements Sender {
             String msg = failure.getMessage();
             boolean retryable = failure instanceof LineSenderException && ((LineSenderException) failure).isRetryable();
             LineSenderException wrapper = new LineSenderException("pooled sender close failed, slot retired with "
-                    + pendingRowsAtRetire + " pending row(s) dropped: " + msg, retryable);
+                    + pendingRowsAtRetire + " unshipped row(s): " + msg, retryable);
             wrapper.initCause(failure);
             throw wrapper;
         }

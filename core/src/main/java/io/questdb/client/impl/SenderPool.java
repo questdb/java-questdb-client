@@ -1734,8 +1734,8 @@ public final class SenderPool implements AutoCloseable {
      * retires the slot, anything else returns it to the free list, and rows a
      * failed flush left behind wait for the next settle. An {@link Error}
      * thrown by the flush is not transient and retires the slot, and so does a
-     * {@code BatchTooLargeForCapException}: that batch belongs to no lease and no retry can
-     * ship it, so the slot is retired and the dropped row count logged. The slot's idle clock
+     * {@code BatchTooLargeForCapException}: that batch belongs to no lease, a settle retry
+     * cannot ship it, so the slot is retired and the dropped row count logged. The slot's idle clock
      * is not touched, so reaping is unaffected.
      *
      * @return the number of slots whose flush completed
@@ -1780,8 +1780,9 @@ public final class SenderPool implements AutoCloseable {
                 lease.slot().settleFailureLogged(false);
                 flushed = true;
             } catch (BatchTooLargeForCapException e) {
-                // Deterministic and not latched: no retry ships this batch and no
-                // lease owns it any more. Retire the slot below.
+                // Deterministic: the probe would report it too, but no settle retry
+                // can ship this batch and no lease owns it any more. Retire the
+                // slot below.
                 overCap = e;
             } catch (Exception e) {
                 // Transient (ring full, recycle in flight) or terminal: the
@@ -1898,6 +1899,10 @@ public final class SenderPool implements AutoCloseable {
      * What {@link #settleIdle()} looks for in an idle slot. Phase A: buffered
      * rows and deferred frames awaiting their commit.
      */
+    private static boolean hasUnshippedWork(Sender delegate) {
+        return delegate.pendingRowCount() > 0 || delegate.hasDeferredFrames();
+    }
+
     /** Best-effort pending row count of a slot's delegate, for log lines only. */
     private static int pendingRowsOf(SenderSlot slot) {
         try {
@@ -1905,10 +1910,6 @@ public final class SenderPool implements AutoCloseable {
         } catch (Throwable ignored) {
             return 0;
         }
-    }
-
-    private static boolean hasUnshippedWork(Sender delegate) {
-        return delegate.pendingRowCount() > 0 || delegate.hasDeferredFrames();
     }
 
     /**

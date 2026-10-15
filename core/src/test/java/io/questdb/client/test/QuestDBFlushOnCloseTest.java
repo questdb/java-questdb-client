@@ -132,13 +132,13 @@ public class QuestDBFlushOnCloseTest {
             // auto_flush_bytes=off on purpose: defeat the cap-bound byte trigger so the batch outgrows the cap
             try (QuestDB db = QuestDB.connect(config(server.getPort(),
                     "auto_flush_bytes=off;auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
-            // warm-up lease: proves the connection and the advertised cap are in place
-            // (initial_connect_retry=async learns the cap on the I/O thread)
-            try (Sender s = db.borrowSender()) {
-                s.table("w").longColumn("v", 1L).atNow();
-                s.flush();
-            }
-            log.awaitDataFrames(1, 5_000);
+                // warm-up lease: proves the connection and the advertised cap are in place
+                // (initial_connect_retry=async learns the cap on the I/O thread)
+                try (Sender s = db.borrowSender()) {
+                    s.table("w").longColumn("v", 1L).atNow();
+                    s.flush();
+                }
+                log.awaitDataFrames(1, 5_000);
                 String wide = wideValue(1000);
                 for (int i = 0; i < 6; i++) {
                     try (Sender s = db.borrowSender()) {
@@ -146,7 +146,7 @@ public class QuestDBFlushOnCloseTest {
                     }
                 }
                 Sender poisoned = null;
-                boolean closeThrew = false;
+                boolean hasCloseThrown = false;
                 try (Sender s = db.borrowSender()) {
                     poisoned = ((PooledSender) s).getDelegateForTesting();
                     try {
@@ -156,17 +156,18 @@ public class QuestDBFlushOnCloseTest {
                         // the retained batch belongs to nobody: close() must retire the slot
                     }
                 } catch (LineSenderException e) {
-                    closeThrew = true;
+                    hasCloseThrown = true;
                     Assert.assertTrue("close() wraps the retained rejection", e.getCause() instanceof BatchTooLargeForCapException);
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("6 pending row(s) dropped"));
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("6 unshipped row(s)"));
                 }
-                Assert.assertTrue("close() must report the retirement", closeThrew);
+                Assert.assertTrue("close() must report the retirement", hasCloseThrown);
                 try (Sender s = db.borrowSender()) {
                     Assert.assertNotSame("the retired slot is replaced", poisoned, ((PooledSender) s).getDelegateForTesting());
                     s.table("t").stringColumn("s", wide).atNow();
                     s.flush();
                 }
                 log.awaitDataFrames(2, 5_000);
+                Assert.assertEquals("the over-cap batch never ships", 2, log.dataFrames());
             }
         }
     }
@@ -179,13 +180,13 @@ public class QuestDBFlushOnCloseTest {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
             try (QuestDB db = QuestDB.connect(config(server.getPort(), "auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
-            // warm-up lease: proves the connection and the advertised cap are in place
-            // (initial_connect_retry=async learns the cap on the I/O thread)
-            try (Sender s = db.borrowSender()) {
-                s.table("w").longColumn("v", 1L).atNow();
-                s.flush();
-            }
-            log.awaitDataFrames(1, 5_000);
+                // warm-up lease: proves the connection and the advertised cap are in place
+                // (initial_connect_retry=async learns the cap on the I/O thread)
+                try (Sender s = db.borrowSender()) {
+                    s.table("w").longColumn("v", 1L).atNow();
+                    s.flush();
+                }
+                log.awaitDataFrames(1, 5_000);
                 Sender delegate;
                 try (Sender s = db.borrowSender()) {
                     delegate = ((PooledSender) s).getDelegateForTesting();
