@@ -559,12 +559,16 @@ retryable. Never put a token or a raw response body in the message. The provider
 keeps serving the current token while it is still valid.
 
 The provider hands a token out only while it has more than 60 s left (`handoutFloorMillis`, the hand-out floor). A
-source whose token arrives with 60 s or less left gets a failed fetch whose error names `handout_floor`; if your
-platform issues tokens that short, lower the floor with `handoutFloorMillis(...)`.
+source whose token arrives with 60 s or less left gets a failed fetch whose error names `handout_floor`. A token that
+arrives with less than 90 s left is handed out, but it cannot be refreshed before it enters the floor, because
+refreshes are at least 30 s apart (`minRefreshIntervalMillis`): callers wait for a fetch whenever such a token runs
+out, and the provider logs a warning once. If your platform issues tokens that short, lower the floor with
+`handoutFloorMillis(...)`.
 
 How failures are handled:
 
-- A token is refreshed at about half its lifetime, so an idle client always holds a valid one.
+- A token is refreshed at about half its lifetime, and always before it enters the hand-out floor, so an idle client
+  always holds a valid one.
 - When the server rejects a token with `401`, the client asks the provider for a new one and retries the same server
   once, immediately.
 - At startup, `initial_connect_retry=off` (the default) fails if no token can be obtained; `on` keeps retrying a

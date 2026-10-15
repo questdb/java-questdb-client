@@ -66,9 +66,13 @@ import java.util.function.DoubleSupplier;
  *   thread. {@link #awaitReady(long)} lets an application gate startup on it.</li>
  *   <li><b>Proactive refresh.</b> After a fetch received at {@code f} with expiry {@code e}, the next fetch is
  *   scheduled at a jittered half-life, {@code f + (e - f) * U(0.45, 0.55)}, no later than
- *   {@code e - min(refresh_margin, (e - f) / 2)}, no earlier than {@code f + min(min_refresh_interval,
- *   (e - f) / 2)}, and no later than the platform's refresh hint when it gave one. While the source is healthy,
- *   even an idle client therefore always holds a usable token.</li>
+ *   {@code e - min(refresh_margin, (e - f) / 2)}, no earlier than {@code f + p}, where
+ *   {@code p = min(min_refresh_interval, (e - f) / 2)}, and no later than the platform's refresh hint when it gave
+ *   one. It also runs at least {@code p} before the token leaves its hand-out window at {@code e - handout_floor},
+ *   unless that is sooner than {@code f + p}. While the source is healthy, even an idle client therefore always
+ *   holds a usable token, provided a token is handed out for longer than {@code p}: with the defaults, provided it
+ *   lives longer than 90 s. A shorter-lived token cannot be refreshed while it is still handed out, so callers
+ *   wait for a fetch whenever one stops being usable, and the provider logs a warning once.</li>
  *   <li><b>Hand-out.</b> A token is usable only while {@code now < e - handout_floor}. {@link #getToken()}
  *   returns a usable token at once - a volatile read, no I/O, no lock. With no usable token it starts a fetch
  *   (unless one is running or the provider is backing off after failures) and waits up to {@code cold_wait},
@@ -157,6 +161,7 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
     private long scheduledDueNanos;
     private long scheduledSeq;
     private ScheduledTask scheduledTask;
+    private boolean shortWindowWarned;
 
     private RefreshingTokenProvider(Builder b) {
         this.source = b.source;
@@ -191,7 +196,10 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
 
     /**
      * The refresh instant of the specification's section 5.2 for a token received at {@code f} that expires at
-     * {@code e}, given a uniform sample {@code u} in {@code [0, 1)}. Pure; exposed for the conformance tests.
+     * {@code e}, given a uniform sample {@code u} in {@code [0, 1)}: the jittered half-life, clamped by
+     * {@code refresh_margin}, {@code min_refresh_interval} and the refresh hint, and moved to at least the refresh
+     * spacing before the token leaves its hand-out window, unless that is sooner than the spacing after the fetch.
+     * Pure; exposed for the conformance tests.
      */
     @TestOnly
     public static long computeRefreshAtMillis(
@@ -200,20 +208,25 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
             long refreshAt,
             double u,
             long refreshMarginMillis,
-            long minRefreshIntervalMillis
+            long minRefreshIntervalMillis,
+            long handoutFloorMillis
     ) {
         final long life = e - f;
         final long half = life / 2;
         final long margin = Math.min(refreshMarginMillis, half);
-        final long floor = Math.min(minRefreshIntervalMillis, half);
+        // the least time between a fetch and the refresh that follows it: p in section 5.2
+        final long spacing = Math.min(minRefreshIntervalMillis, half);
         final double fraction = 0.45 + 0.10 * Math.max(0.0, Math.min(1.0, u));
         long r = f + (long) (life * fraction);
         r = Math.min(r, e - margin);
-        r = Math.max(r, f + floor);
+        r = Math.max(r, f + spacing);
         if (refreshAt > 0) {
-            r = Math.min(r, Math.max(refreshAt, f + floor));
+            r = Math.min(r, Math.max(refreshAt, f + spacing));
         }
-        return r;
+        // Refresh at least the spacing before the token leaves its hand-out window, so the fetch and its retries run
+        // while the current token is still handed out. A short-lived token's window can close sooner than the spacing
+        // after this fetch; the spacing wins, and such a token is fetched when a caller needs it.
+        return Math.min(r, Math.max(e - handoutFloorMillis - spacing, f + spacing));
     }
 
     private static String instant(long epochMillis) {
@@ -576,7 +589,8 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
                 result.getRefreshAtEpochMillis(),
                 uniform(),
                 refreshMarginMillis,
-                minRefreshIntervalMillis
+                minRefreshIntervalMillis,
+                handoutFloorMillis
         );
         final long delayNanos = millisToNanos(refreshAt - receivedAt);
         final int failures = consecutiveFailures;
@@ -593,6 +607,18 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
             LOG.debug("token provider {}: fetched [token={}, expiresAt={}, refreshAt={}]",
                     name, CredentialRedaction.describeToken(result.getToken()),
                     instant(result.getExpiresAtEpochMillis()), instant(refreshAt));
+        }
+        final long handoutEnd = result.getExpiresAtEpochMillis() - handoutFloorMillis;
+        if (!shortWindowWarned && refreshAt > handoutEnd) {
+            // The token stops being handed out before the next refresh may run, so callers will wait for a fetch.
+            // Say why, once: the cure is configuration.
+            shortWindowWarned = true;
+            LOG.warn("token provider {}: a token from the source is handed out for only {} ms - it expires {} ms "
+                            + "after it arrives and handout_floor is {} ms - but the next refresh cannot run sooner "
+                            + "than {} ms after a fetch, so callers wait for a fetch whenever a token stops being "
+                            + "usable; lower handout_floor or min_refresh_interval, or issue longer-lived tokens",
+                    name, handoutEnd - receivedAt, result.getExpiresAtEpochMillis() - receivedAt, handoutFloorMillis,
+                    refreshAt - receivedAt);
         }
     }
 
@@ -846,7 +872,8 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
         /**
          * A token is usable only while {@code now < expires_at - handout_floor}. Default 60 s. A fetched token that
          * is not usable on arrival counts as a failed fetch, so a source whose tokens live no longer than this needs
-         * a lower value.
+         * a lower value. A token handed out for no longer than {@code min_refresh_interval} cannot be refreshed while
+         * it is still handed out, so a source whose tokens live only that much longer needs a lower value too.
          */
         public Builder handoutFloorMillis(long millis) {
             this.handoutFloorMillis = nonNegative("handout_floor", millis);

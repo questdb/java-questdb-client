@@ -1,9 +1,10 @@
 # QWP dynamic bearer credentials: cross-language specification
 
-**Status:** v0.6, ready for implementation. All decisions are resolved (§12).
+**Status:** v0.7, ready for implementation. All decisions are resolved (§12).
 
 **Changes:**
 
+- **v0.7:** a refresh starts at least `p` before the token leaves its hand-out window (§5.2). Before, a token that lived less than about two minutes was refreshed only after it had stopped being handed out, so in every cycle callers waited for a fetch. A token handed out for less than `p` still cannot be refreshed in time; the provider logs that once (§5.2, C1).
 - **v0.6:** the optional authentication-outage deadline (§8.5, D7) is withdrawn. It made an established sender terminal on a transient outage, which store-and-forward forbids, and the role-reject and transport rounds of a failover counted toward it. An application that prefers a hard failure closes the sender itself, guided by the error channel and the connection health (§8.5).
 - **v0.5:** a result whose token expires within `handout_floor` of its receipt is a retryable failed fetch whose message names `handout_floor` (§4, C2, C6). Before, it counted as a success that could never be handed out, so every caller waited out `cold_wait` for an error that named no cause.
 - **v0.4:** `azure_credential` selects one Azure credential deterministically (§7.1), so the library itself reports an unreachable managed-identity endpoint (retryable) apart from a misconfigured credential (permanent) (§7.5, D10). A discovery chain's "no credential available" stays permanent, so a host without a credential still fails fast, and the client warns once that the chain does not ride out an endpoint outage. This resolves the conflict between §4 and §7.5 over an unreachable managed-identity endpoint.
@@ -134,15 +135,19 @@ r = min(r, e - m)
 r = max(r, f + p)
 if refresh_at is present:
     r = min(r, max(refresh_at, f + p))
+r = min(r, max(e - handout_floor - p, f + p))
 ```
 
 - **Proactive refresh:** the provider MUST start a fetch at `r` without waiting for a caller.
-- **Effect:** while the source is healthy, even an idle client always holds a usable token.
+- **Hand-out window:** a token is handed out until `e - handout_floor` (§5.1). The last step starts the refresh at least `p` before then, so the fetch and its retries run while the current token is still handed out, but never sooner than `p` after the fetch. With the defaults it changes nothing for a token that lives 3 minutes or more.
+- **Effect:** while the source is healthy, even an idle client always holds a usable token, provided a token is handed out for longer than `p`. With the defaults, that is a token that lives longer than 90 s.
+- **Short hand-out window:** a token handed out for less than `p` cannot be refreshed while it is still handed out without breaking `min_refresh_interval`, so callers wait for a fetch whenever it stops being usable. The provider SHOULD log a warning once that names `handout_floor`, so that the configuration can be fixed.
 
 *Informative examples:*
 
 - A 60-minute service-principal token is refreshed at about 27–33 minutes.
 - A 24-hour managed-identity token is refreshed at about 11–13 hours.
+- A 100-second token is handed out for 40 s and refreshed 30 s after its fetch. Without the last step it would be refreshed 45–50 s after its fetch, after it had stopped being handed out.
 - If the platform keeps returning the same token, each refresh happens at about half of the remaining lifetime. So a token is fetched only a handful of times before it expires.
 
 ### 5.3 Handing out a token: `get_token()`
@@ -417,7 +422,7 @@ Every client that implements this specification SHOULD pass these scenarios. The
 
 | ID | Scenario | Expected result |
 |---|---|---|
-| C1 | Refresh schedule | Refresh times follow §5.2 for `L` = 24 h, 60 min and 5 min, with and without `refresh_at`. |
+| C1 | Refresh schedule | Refresh times follow §5.2 for `L` = 24 h, 60 min and 5 min, with and without `refresh_at`. With the default `handout_floor`, `L` = 150 s, 120 s and 100 s are refreshed inside their hand-out window, and `L` = 75 s, which cannot be, keeps the `p` spacing and is logged once. |
 | C2 | Same token returned | Fetches converge as described in §5.2, and the token stays usable until it enters `handout_floor`. The fetch that returns it inside the floor is a retryable failure (§4). |
 | C3 | Cold burst | 64 concurrent callers with no usable token cause exactly one fetch. |
 | C4 | Cold failure | A retryable error is raised within `cold_wait`. A permanent classification is passed through. |

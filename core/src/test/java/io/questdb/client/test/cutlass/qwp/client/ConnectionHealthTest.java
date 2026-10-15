@@ -42,6 +42,11 @@ import org.junit.Test;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -56,6 +61,35 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  */
 public class ConnectionHealthTest {
     private static final String SENTINEL = "SENTINEL-TOKEN-7f3a91";
+
+    @Test
+    public void testAggregateReportsTheOldestOutageAndTheLatestFailure() {
+        // C21 for the facade: QuestDB.health() reports how long the longest outage has lasted and what failed last,
+        // whatever the order of the pooled connections.
+        ConnectionHealth.Failure olderFailure = new ConnectionHealth.Failure(
+                ConnectionHealth.FailureClass.TRANSPORT, 0, "connection refused", 6_000L);
+        ConnectionHealth.Failure newerFailure = new ConnectionHealth.Failure(
+                ConnectionHealth.FailureClass.AUTH_REJECTED, 401, "auth-rejected", 10_000L);
+        List<ConnectionHealth> healths = Arrays.asList(
+                new ConnectionHealth(ConnectionHealth.State.CONNECTED, 1_000L, ConnectionHealth.NONE, 0, null),
+                new ConnectionHealth(ConnectionHealth.State.RECONNECTING, 1_000L, 9_000L, 1, newerFailure),
+                new ConnectionHealth(ConnectionHealth.State.RECONNECTING, 1_000L, 5_000L, 3, olderFailure),
+                new ConnectionHealth(ConnectionHealth.State.CONNECTING, ConnectionHealth.NONE, 7_000L, 0, null)
+        );
+        for (int rotation = 0; rotation < healths.size(); rotation++) {
+            List<ConnectionHealth> ordered = new ArrayList<>(healths);
+            Collections.rotate(ordered, rotation);
+            ConnectionHealth.Aggregate aggregate = ConnectionHealth.Aggregate.of(ordered);
+            Assert.assertEquals(4, aggregate.total());
+            Assert.assertEquals(1, aggregate.count(ConnectionHealth.State.CONNECTED));
+            Assert.assertEquals(2, aggregate.count(ConnectionHealth.State.RECONNECTING));
+            Assert.assertEquals(1, aggregate.count(ConnectionHealth.State.CONNECTING));
+            Assert.assertEquals("the oldest outage [rotation=" + rotation + ']',
+                    5_000L, aggregate.getOldestOutageSinceEpochMillis());
+            Assert.assertSame("the most recent failure [rotation=" + rotation + ']',
+                    newerFailure, aggregate.getLastFailure());
+        }
+    }
 
     @Test(timeout = 60_000)
     public void testAuthenticationOutageNeverMakesTheSenderTerminal() throws Exception {
@@ -267,6 +301,50 @@ public class ConnectionHealthTest {
                 Assert.assertNotEquals("a failed sender is without a connection: " + h,
                         ConnectionHealth.NONE, h.getOutageSinceEpochMillis());
                 Assert.assertTrue(h.toString(), h.getOutageSinceEpochMillis() >= h.getLastConnectedAtEpochMillis());
+            }
+        });
+    }
+
+    @Test(timeout = 60_000)
+    public void testSenderHealthIsReconnectingFromTheMomentItLosesItsConnection() throws Exception {
+        // C21: an established sender that loses its connection reports RECONNECTING, with the outage started, while
+        // its first reconnect round is still running - not only once a round has failed. That round can be slow: a
+        // provider fetching a token, or a connect to a host that does not answer.
+        assertMemoryLeak(() -> {
+            AtomicBoolean holdPulls = new AtomicBoolean();
+            CountDownLatch pullHeld = new CountDownLatch(1);
+            CountDownLatch release = new CountDownLatch(1);
+            try (TestWebSocketServer server = startServer(new WebSocketDynamicCredentialTest.AckHandler());
+                 Sender sender = Sender.builder(Sender.Transport.WEBSOCKET)
+                         .address("localhost:" + server.getPort())
+                         .httpTokenProvider(() -> {
+                             if (holdPulls.get()) {
+                                 pullHeld.countDown();
+                                 try {
+                                     release.await(30, TimeUnit.SECONDS);
+                                 } catch (InterruptedException e) {
+                                     Thread.currentThread().interrupt();
+                                 }
+                             }
+                             return SENTINEL;
+                         })
+                         .build()) {
+                Assert.assertEquals(ConnectionHealth.State.CONNECTED, sender.health().getState());
+                try {
+                    holdPulls.set(true);
+                    server.dropAllConnections();
+                    Assert.assertTrue("the reconnect round pulls a credential", pullHeld.await(10, TimeUnit.SECONDS));
+                    ConnectionHealth h = sender.health();
+                    Assert.assertEquals(h.toString(), ConnectionHealth.State.RECONNECTING, h.getState());
+                    Assert.assertNotEquals("the outage starts when the connection is lost: " + h,
+                            ConnectionHealth.NONE, h.getOutageSinceEpochMillis());
+                    Assert.assertEquals("no round has failed yet", 0, h.getFailedRounds());
+                } finally {
+                    holdPulls.set(false);
+                    release.countDown();
+                }
+                await(() -> sender.health().getState() == ConnectionHealth.State.CONNECTED, 10_000, "reconnected");
+                Assert.assertEquals(ConnectionHealth.NONE, sender.health().getOutageSinceEpochMillis());
             }
         });
     }

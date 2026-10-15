@@ -514,7 +514,33 @@ public class RefreshingTokenProviderTest {
         assertRefreshDelay(50_000L, 0.0, 0, 25_000L);
         // the pure function agrees with the provider
         Assert.assertEquals(T0 + 1_800_000L,
-                RefreshingTokenProvider.computeRefreshAtMillis(T0, T0 + HOUR, 0, 0.5, 5 * MIN, 30_000));
+                RefreshingTokenProvider.computeRefreshAtMillis(T0, T0 + HOUR, 0, 0.5, 5 * MIN, 30_000, 0));
+    }
+
+    @Test
+    public void testRefreshScheduleKeepsTheRefreshInsideTheHandoutWindow() {
+        // C1 with the default 60 s handout_floor: a refresh runs at least min_refresh_interval (30 s) before the token
+        // leaves its hand-out window, unless that is sooner than 30 s after the fetch.
+        final long floor = RefreshingTokenProvider.DEFAULT_HANDOUT_FLOOR_MILLIS;
+        // long-lived tokens keep their schedule
+        assertRefreshDelay(floor, DAY, 0.5, 0, 43_200_000L);
+        assertRefreshDelay(floor, HOUR, 1.0, 0, 1_980_000L);
+        assertRefreshDelay(floor, 5 * MIN, 0.5, 0, 150_000L);
+        assertRefreshDelay(floor, 180_000L, 0.5, 0, 90_000L); // the shortest lifetime the bound leaves alone
+        // a shorter-lived token is refreshed 30 s before its hand-out window closes ...
+        assertRefreshDelay(floor, 150_000L, 0.0, 0, 60_000L); // handed out for 90 s; the half-life is 67.5-75 s
+        assertRefreshDelay(floor, 150_000L, 0.5, 0, 60_000L);
+        assertRefreshDelay(floor, 120_000L, 0.5, 0, 30_000L); // handed out for 60 s; the half-life is 60 s
+        // ... but no sooner than 30 s after the fetch, which is still inside a window longer than 30 s
+        assertRefreshDelay(floor, 100_000L, 0.0, 0, 30_000L); // handed out for 40 s; the half-life is 45-50 s
+        assertRefreshDelay(floor, 100_000L, 1.0, 0, 30_000L);
+        // an earlier refresh hint still wins
+        assertRefreshDelay(floor, 150_000L, 0.5, T0 + 40_000L, 40_000L);
+        // a token handed out for 30 s or less cannot be refreshed inside its window: the 30 s spacing wins
+        assertRefreshDelay(floor, 75_000L, 0.5, 0, 30_000L); // handed out for 15 s
+        // the pure function agrees with the provider
+        Assert.assertEquals(T0 + 30_000L,
+                RefreshingTokenProvider.computeRefreshAtMillis(T0, T0 + 100_000L, 0, 0.5, 5 * MIN, 30_000, floor));
     }
 
     @Test
@@ -542,7 +568,7 @@ public class RefreshingTokenProviderTest {
                 long remaining = expiry - clock.wallClockMillis();
                 ManualScheduler.Task next = scheduler.peek();
                 long expectedDelay = RefreshingTokenProvider.computeRefreshAtMillis(
-                        0, remaining, 0, 0.5, 5 * MIN, 30_000);
+                        0, remaining, 0, 0.5, 5 * MIN, 30_000, RefreshingTokenProvider.DEFAULT_HANDOUT_FLOOR_MILLIS);
                 Assert.assertEquals("refresh at about half the remaining lifetime [remaining=" + remaining + ']',
                         expectedDelay, next.delayMillis());
                 Assert.assertTrue(next.delayMillis() <= remaining / 2 + 1);
@@ -553,7 +579,9 @@ public class RefreshingTokenProviderTest {
                 Assert.assertEquals("SAME", provider.getToken().toString());
                 fetchesWhileUsable++;
             }
-            // 24 h halves to below the 60 s floor in 11 steps (86400 s -> ... -> 84.4 s)
+            // The remaining lifetime halves over the first 10 fetches (86400 s -> ... -> 168.75 s). The 11th runs
+            // 30 s before the token would leave its hand-out window, at 90 s left, and the next one finds it inside
+            // the floor.
             Assert.assertEquals(11, fetchesWhileUsable);
             // the fetch that returned the token inside the floor is a failed fetch (section 4)
             Assert.assertEquals(1, provider.getConsecutiveFailures());
@@ -628,6 +656,33 @@ public class RefreshingTokenProviderTest {
     }
 
     @Test
+    public void testShortLivedTokenIsRefreshedWhileItIsStillHandedOut() {
+        // section 5.2: a 100 s token is handed out for 40 s. Its refresh runs 30 s after the fetch, while it is still
+        // handed out, so an idle client always holds a usable token. Scheduled at its half-life alone, the refresh
+        // ran 45-50 s after the fetch, and every caller after the token left its window waited for a fetch.
+        FakeClock clock = new FakeClock(T0);
+        ManualScheduler scheduler = new ManualScheduler(clock);
+        ScriptedSource source = new ScriptedSource().then(() -> new ExpiringToken(
+                "T" + (clock.wallClockMillis() - T0), clock.wallClockMillis() + 100_000L));
+        try (RefreshingTokenProvider provider = provider(source, clock, scheduler, 0.5).build()) {
+            scheduler.runNext();
+            long previousFetch = T0;
+            for (int refresh = 1; refresh <= 3; refresh++) {
+                Assert.assertEquals("refresh 30 s after the fetch", 30_000L, scheduler.peek().delayMillis());
+                scheduler.advanceAndRunNext();
+                Assert.assertEquals(previousFetch + 30_000L, clock.wallClockMillis());
+                // one second after the previous token left its hand-out window: fetch + 100 s - 60 s floor
+                clock.advanceMillis(previousFetch + 41_000L - clock.wallClockMillis());
+                Assert.assertEquals("an idle client holds a usable token",
+                        "T" + refresh * 30_000L, provider.getToken().toString());
+                Assert.assertFalse("no caller had to start a fetch", scheduler.isNextImmediate());
+                previousFetch += 30_000L;
+            }
+            Assert.assertEquals(4, source.calls());
+        }
+    }
+
+    @Test
     public void testSourceFailureTextIsSanitized() {
         FakeClock clock = new FakeClock(T0);
         ManualScheduler scheduler = new ManualScheduler(clock);
@@ -669,6 +724,45 @@ public class RefreshingTokenProviderTest {
             Assert.assertEquals("the current token keeps being served while usable",
                     "UP", provider.getToken().toString());
         }
+    }
+
+    @Test
+    public void testTokenHandedOutTooBrieflyToRefreshAheadIsReportedOnce() {
+        // section 5.2: a 75 s token is handed out for 15 s, less than min_refresh_interval, so it cannot be refreshed
+        // while it is still handed out. The refresh keeps its 30 s spacing - no fetch storm - and the provider says
+        // once why callers wait for a fetch.
+        ch.qos.logback.classic.Logger logger = (ch.qos.logback.classic.Logger)
+                org.slf4j.LoggerFactory.getLogger(RefreshingTokenProvider.class);
+        ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> appender =
+                new ch.qos.logback.core.read.ListAppender<>();
+        appender.start();
+        ch.qos.logback.classic.Level savedLevel = logger.getLevel();
+        logger.setLevel(ch.qos.logback.classic.Level.ALL);
+        logger.addAppender(appender);
+        FakeClock clock = new FakeClock(T0);
+        ManualScheduler scheduler = new ManualScheduler(clock);
+        ScriptedSource source = new ScriptedSource().then(
+                () -> new ExpiringToken("BRIEF", clock.wallClockMillis() + 75_000L));
+        try (RefreshingTokenProvider provider = provider(source, clock, scheduler, 0.5).build()) {
+            scheduler.runNext();
+            Assert.assertEquals("the refresh keeps its spacing", 30_000L, scheduler.peek().delayMillis());
+            scheduler.advanceAndRunNext();
+            Assert.assertEquals(30_000L, scheduler.peek().delayMillis());
+            Assert.assertEquals(2, source.calls());
+        } finally {
+            logger.detachAppender(appender);
+            logger.setLevel(savedLevel);
+            appender.stop();
+        }
+        List<String> warnings = new ArrayList<>();
+        for (ch.qos.logback.classic.spi.ILoggingEvent event : appender.list) {
+            if (event.getLevel() == ch.qos.logback.classic.Level.WARN) {
+                warnings.add(event.getFormattedMessage());
+            }
+        }
+        Assert.assertEquals("reported once, not once per fetch: " + warnings, 1, warnings.size());
+        Assert.assertTrue(warnings.get(0), warnings.get(0).contains("handed out for only 15000 ms"));
+        Assert.assertTrue(warnings.get(0), warnings.get(0).contains("lower handout_floor"));
     }
 
     @Test(timeout = 30_000)
@@ -751,16 +845,27 @@ public class RefreshingTokenProviderTest {
     }
 
     private static void assertRefreshDelay(long lifetimeMillis, double u, long refreshAt, long expectedDelayMillis) {
+        assertRefreshDelay(0, lifetimeMillis, u, refreshAt, expectedDelayMillis);
+    }
+
+    private static void assertRefreshDelay(
+            long handoutFloorMillis,
+            long lifetimeMillis,
+            double u,
+            long refreshAt,
+            long expectedDelayMillis
+    ) {
         FakeClock clock = new FakeClock(T0);
         ManualScheduler scheduler = new ManualScheduler(clock);
         ScriptedSource source = new ScriptedSource()
                 .then(() -> new ExpiringToken("TOKEN", T0 + lifetimeMillis, refreshAt));
         try (RefreshingTokenProvider provider = provider(source, clock, scheduler, u)
-                .handoutFloorMillis(0)
+                .handoutFloorMillis(handoutFloorMillis)
                 .build()) {
             Assert.assertEquals("the prefetch runs at once", 0, scheduler.peek().delayNanos);
             scheduler.runNext();
-            Assert.assertEquals("refresh delay [L=" + lifetimeMillis + ", u=" + u + ", refreshAt=" + refreshAt + ']',
+            Assert.assertEquals("refresh delay [handoutFloor=" + handoutFloorMillis + ", L=" + lifetimeMillis
+                            + ", u=" + u + ", refreshAt=" + refreshAt + ']',
                     expectedDelayMillis, scheduler.peek().delayMillis());
             Assert.assertEquals(T0 + lifetimeMillis, provider.getTokenExpiresAtEpochMillis());
         }

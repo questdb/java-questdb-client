@@ -761,6 +761,45 @@ public class WebSocketDynamicCredentialTest {
         });
     }
 
+    @Test(timeout = 30_000)
+    public void testSyncInitializationStopsRetryingWhenTheThreadIsInterrupted() throws Exception {
+        // C7 for SYNC startup: an interrupt cancels a startup that is retrying a retryable credential failure. The
+        // provider's own error surfaces after the first pull, with the flag kept. Retrying instead would spin through
+        // the whole budget, since every backoff park returns at once while the flag is set.
+        assertMemoryLeak(() -> {
+            AtomicInteger pulls = new AtomicInteger();
+            try (TestWebSocketServer server = startServer(new AckHandler())) {
+                Throwable failure = null;
+                try {
+                    Sender.builder(Sender.Transport.WEBSOCKET)
+                            .address("localhost:" + server.getPort())
+                            .initialConnectMode(Sender.InitialConnectMode.SYNC)
+                            .reconnectMaxDurationMillis(10_000)
+                            .reconnectInitialBackoffMillis(10)
+                            .reconnectMaxBackoffMillis(20)
+                            .httpTokenProvider(() -> {
+                                pulls.incrementAndGet();
+                                // the application cancels startup - Future.cancel(true) - while the IdP is down
+                                Thread.currentThread().interrupt();
+                                throw TokenUnavailableException.retryable("IdP unreachable");
+                            })
+                            .build()
+                            .close();
+                } catch (Throwable t) {
+                    failure = t;
+                }
+                // read and clear the flag before anything else can block on it
+                boolean interruptKept = Thread.interrupted();
+                Assert.assertTrue("expected the provider's own error, got " + failure,
+                        failure instanceof TokenUnavailableException);
+                Assert.assertTrue(failure.getMessage(), failure.getMessage().contains("IdP unreachable"));
+                Assert.assertTrue("the interrupt flag must be kept", interruptKept);
+                Assert.assertEquals("an interrupted startup must not retry", 1, pulls.get());
+                Assert.assertEquals(0, server.upgradeRequestCount());
+            }
+        });
+    }
+
     private static void renderThrowable(Throwable t, List<String> into) {
         for (Throwable c = t; c != null; c = c.getCause()) {
             into.add(c.toString());
