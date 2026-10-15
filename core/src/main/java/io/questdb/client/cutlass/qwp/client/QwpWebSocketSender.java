@@ -6376,6 +6376,7 @@ public class QwpWebSocketSender implements Sender {
      */
     private void retireStoppedLoop() {
         cursorSendLoop.checkError();
+        healthTracker.connectionLost();
         hasLoopEverConnected |= cursorSendLoop.hasEverConnected();
         cursorSendLoop = null;
     }
