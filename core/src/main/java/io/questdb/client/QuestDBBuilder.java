@@ -325,7 +325,7 @@ public final class QuestDBBuilder {
         resolvedCommitRows = windowRows;
         resolvedCommitIntervalMillis = windowIntervalMillis;
         resolvedIngestConfig = ingestConfig;
-        long settleIntervalMillis = resolveSettleIntervalMillis(view, housekeeperIntervalMillis, windowIntervalMillis);
+        long settleIntervalMillis = resolveSettleIntervalMillis(view, windowIntervalMillis);
 
         return new QuestDBImpl(
                 ingestConfig,
@@ -599,11 +599,11 @@ public final class QuestDBBuilder {
      * transport rejects both {@code auto_flush=off} and
      * {@code auto_flush_interval=off}, so the interval is a number or unset.
      * With a commit window, the shorter of that and {@code commitIntervalMillis}
-     * (0 = no window). {@code housekeeperIntervalMillis} is currently unused.
+     * (0 = no window).
      * Public only for the unit test, which lives in another package.
      */
     @TestOnly
-    public static long resolveSettleIntervalMillis(ConfigView view, long housekeeperIntervalMillis, long commitIntervalMillis) {
+    public static long resolveSettleIntervalMillis(ConfigView view, long commitIntervalMillis) {
         // getLong uses the connect-string number syntax (underscore separators
         // included), the same one the Sender parse already accepted.
         long fromAutoFlush = Math.max(1L, view.getLong("auto_flush_interval", DEFAULT_SETTLE_INTERVAL_MILLIS));

@@ -363,6 +363,7 @@ public final class SenderPool implements AutoCloseable {
     private int recoveryFailStreak;
     private int recoveryFailStreakSlot = -1;
     private final IntList recoveryWarnedSlots = new IntList();
+    private volatile int startupRecoveryBuildAttempts;
 
     public SenderPool(
             String configurationString,
@@ -1719,6 +1720,11 @@ public final class SenderPool implements AutoCloseable {
         this.afterStartupRecoveryJoinHook = afterJoinHook;
     }
 
+    @TestOnly
+    public int startupRecoveryBuildAttemptsForTesting() {
+        return startupRecoveryBuildAttempts;
+    }
+
     /**
      * Ships rows left behind in idle slots. A pooled {@code close()} does not
      * flush by default, and auto-flush thresholds are only evaluated on append,
@@ -2250,6 +2256,7 @@ public final class SenderPool implements AutoCloseable {
      * {@link #drainCandidateSlotForRecovery}.
      */
     private SenderSlot createRecoverer(int slotIndex) {
+        startupRecoveryBuildAttempts++;
         return createSlot(recoverySenderFactory, slotIndex);
     }
 

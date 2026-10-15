@@ -46,6 +46,11 @@ final class PoolHousekeeper {
     // no application-level connect timeout); see the residual-window note on
     // SenderPool.recoverOneSlotStep.
     static final long STOP_TIMEOUT_MILLIS = 2_000;
+    // Wait between startup-recovery steps that did not find more work to do at
+    // once: a finished scan, an empty one, or a transient failure such as an
+    // unreachable server. The same cadence SenderPool's private driver uses, and
+    // deliberately not the settle cadence, which can be 50 ms.
+    static final long STARTUP_RECOVERY_RETRY_MILLIS = 1_000L;
 
     private final long intervalMillis;
     private final QueryClientPool queryPool;
@@ -58,9 +63,9 @@ final class PoolHousekeeper {
     /**
      * @param intervalMillis       reap cadence: idle and over-age slots
      * @param settleIntervalMillis settle cadence: ship rows left in idle slots;
-     *                             the shorter of the configured auto-flush and
-     *                             commit intervals, or {@code intervalMillis}
-     *                             when both are off
+     *                             {@code auto_flush_interval} (100 ms when
+     *                             unset), or the commit interval when that is
+     *                             shorter
      */
     PoolHousekeeper(SenderPool senderPool, QueryClientPool queryPool, long intervalMillis, long settleIntervalMillis) {
         this.senderPool = senderPool;
@@ -140,6 +145,16 @@ final class PoolHousekeeper {
      * primitive. Keeping the two stop paths identical matters when an interrupt arrives during the first
      * join: it must be remembered without skipping the target interrupt and second join that follow.
      */
+    /**
+     * {@code nowMillis + intervalMillis}, saturating at {@link Long#MAX_VALUE}
+     * so an interval of {@code Long.MAX_VALUE} ("never") does not wrap negative
+     * and either stall every other deadline or fire at once.
+     */
+    static long deadline(long nowMillis, long intervalMillis) {
+        long d = nowMillis + intervalMillis;
+        return d < nowMillis ? Long.MAX_VALUE : d;
+    }
+
     static boolean joinIgnoringCallerInterrupts(Thread target, long timeoutMillis) {
         final long timeoutNanos = TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
         final long deadlineNanos = System.nanoTime() + timeoutNanos;
@@ -161,8 +176,10 @@ final class PoolHousekeeper {
     }
 
     private void runLoop() {
-        long nextSettleAt = System.currentTimeMillis() + this.settleIntervalMillis;
-        long nextReapAt = System.currentTimeMillis() + intervalMillis;
+        long startMillis = System.currentTimeMillis();
+        long nextSettleAt = deadline(startMillis, settleIntervalMillis);
+        long nextReapAt = deadline(startMillis, intervalMillis);
+        long nextRecoveryAt = startMillis;
         while (!stop) {
             // Per-slot startup SF recovery, driven on THIS (the reap-loop)
             // thread, one stranded slot per iteration. Doing it here rather than
@@ -182,18 +199,27 @@ final class PoolHousekeeper {
             // No-op once recovery completes or the pool is closing. Best-effort:
             // a recovery failure (including an Error) must never kill this
             // daemon, so swallow Throwable -- exactly as the reap guards below.
-            boolean recovering;
-            try {
-                recovering = senderPool.runStartupRecoveryStep();
-            } catch (Throwable ignored) {
-                recovering = false;
+            boolean recovering = false;
+            if (System.currentTimeMillis() >= nextRecoveryAt) {
+                try {
+                    recovering = senderPool.runStartupRecoveryStep();
+                } catch (Throwable ignored) {
+                    recovering = false;
+                }
+                // A step with more work runs again at once. A step that finished,
+                // found nothing or hit a transient failure is retried on its own
+                // cadence, never on the settle cadence: a stranded slot against an
+                // unreachable server must not become a hot connect loop.
+                long afterStep = System.currentTimeMillis();
+                nextRecoveryAt = recovering ? afterStep : deadline(afterStep, STARTUP_RECOVERY_RETRY_MILLIS);
             }
             synchronized (signalLock) {
                 if (stop) {
                     return;
                 }
                 if (!recovering) {
-                    long waitMillis = Math.min(nextSettleAt, nextReapAt) - System.currentTimeMillis();
+                    long nextAt = Math.min(Math.min(nextSettleAt, nextReapAt), nextRecoveryAt);
+                    long waitMillis = nextAt - System.currentTimeMillis();
                     if (waitMillis > 0) {
                         try {
                             signalLock.wait(waitMillis);
@@ -215,7 +241,7 @@ final class PoolHousekeeper {
                     // Best-effort: settleIdle() already guards per-slot
                     // failures; a Throwable here must never kill the daemon.
                 }
-                nextSettleAt = now + settleIntervalMillis;
+                nextSettleAt = deadline(now, settleIntervalMillis);
             }
             if (now >= nextReapAt) {
                 try {
@@ -236,7 +262,7 @@ final class PoolHousekeeper {
                     // must never propagate, and Throwable (not RuntimeException) so
                     // an Error from query-client teardown cannot kill the daemon.
                 }
-                nextReapAt = now + intervalMillis;
+                nextReapAt = deadline(now, intervalMillis);
             }
         }
     }

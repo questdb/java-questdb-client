@@ -321,12 +321,12 @@ public class QuestDBBuilderTest {
     @Test
     public void testSettleIntervalTakesShorterOfAutoFlushAndCommitIntervals() {
         ConfigView v = new ConfigView(ConfigString.parse("ws::addr=127.0.0.1:1;auto_flush_interval=250;"));
-        Assert.assertEquals(40L, QuestDBBuilder.resolveSettleIntervalMillis(v, 5_000L, 40L));
-        Assert.assertEquals(250L, QuestDBBuilder.resolveSettleIntervalMillis(v, 5_000L, 900L));
-        Assert.assertEquals(250L, QuestDBBuilder.resolveSettleIntervalMillis(v, 5_000L, 0L));
+        Assert.assertEquals(40L, QuestDBBuilder.resolveSettleIntervalMillis(v, 40L));
+        Assert.assertEquals(250L, QuestDBBuilder.resolveSettleIntervalMillis(v, 900L));
+        Assert.assertEquals(250L, QuestDBBuilder.resolveSettleIntervalMillis(v, 0L));
         ConfigView unset = new ConfigView(ConfigString.parse("ws::addr=127.0.0.1:1;"));
-        Assert.assertEquals(40L, QuestDBBuilder.resolveSettleIntervalMillis(unset, 5_000L, 40L));
-        Assert.assertEquals(100L, QuestDBBuilder.resolveSettleIntervalMillis(unset, 5_000L, 900L));
+        Assert.assertEquals(40L, QuestDBBuilder.resolveSettleIntervalMillis(unset, 40L));
+        Assert.assertEquals(100L, QuestDBBuilder.resolveSettleIntervalMillis(unset, 900L));
     }
 
     @Test
@@ -396,11 +396,11 @@ public class QuestDBBuilderTest {
         // auto_flush_interval=off, so the interval is unset (the sender's
         // 100 ms default) or a number (underscore separators allowed).
         ConfigView dflt = new ConfigView(ConfigString.parse("ws::addr=127.0.0.1:1;"));
-        Assert.assertEquals(100L, QuestDBBuilder.resolveSettleIntervalMillis(dflt, 5_000L, 0L));
+        Assert.assertEquals(100L, QuestDBBuilder.resolveSettleIntervalMillis(dflt, 0L));
         ConfigView explicit = new ConfigView(ConfigString.parse("ws::addr=127.0.0.1:1;auto_flush_interval=250;"));
-        Assert.assertEquals(250L, QuestDBBuilder.resolveSettleIntervalMillis(explicit, 5_000L, 0L));
+        Assert.assertEquals(250L, QuestDBBuilder.resolveSettleIntervalMillis(explicit, 0L));
         ConfigView underscored = new ConfigView(ConfigString.parse("ws::addr=127.0.0.1:1;auto_flush_interval=1_000;"));
-        Assert.assertEquals(1_000L, QuestDBBuilder.resolveSettleIntervalMillis(underscored, 5_000L, 0L));
+        Assert.assertEquals(1_000L, QuestDBBuilder.resolveSettleIntervalMillis(underscored, 0L));
     }
 
     @Test
