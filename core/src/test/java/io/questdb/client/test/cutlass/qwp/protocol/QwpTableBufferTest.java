@@ -1389,6 +1389,23 @@ public class QwpTableBufferTest {
     }
 
     @Test
+    public void testResetMovesTheSavepointToTheEmptyBuffer() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false).addLong(1L);
+                table.nextRow();
+                table.markSavepoint();
+                table.reset();
+                table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false).addLong(2L);
+                table.nextRow();
+                table.rollbackToSavepoint();
+                assertEquals("reset() emptied the savepoint", 0, table.getRowCount());
+                assertEquals("columns the server already knows stay", 1, table.getColumnCount());
+            }
+        });
+    }
+
+    @Test
     public void testRetainInProgressRowFastClearsUnstagedNullableColumn() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpTableBuffer table = new QwpTableBuffer("test")) {
@@ -1545,5 +1562,74 @@ public class QwpTableBufferTest {
             }
         }
         return result;
+    }
+
+    @Test
+    public void testRollbackToSavepointDiscardsAnInProgressRow() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                QwpTableBuffer.ColumnBuffer v = table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false);
+                v.addLong(1L);
+                table.nextRow();
+                table.markSavepoint();
+                table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false).addLong(2L);   // row 2 started, not committed
+                assertTrue(table.hasInProgressRow());
+                table.rollbackToSavepoint();
+                assertEquals(1, table.getRowCount());
+                assertFalse(table.hasInProgressRow());
+                assertEquals(1, v.getSize());
+            }
+        });
+    }
+
+    @Test
+    public void testRollbackToSavepointKeepsEarlierRowsAndDropsLaterColumns() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                QwpTableBuffer.ColumnBuffer v = table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false);
+                v.addLong(1L);
+                long bytesAtMark = table.nextRow();
+                table.markSavepoint();
+                assertEquals(1, table.getSavepointRowCount());
+                table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false).addLong(2L);
+                table.getOrCreateColumn("s", QwpConstants.TYPE_VARCHAR, false).addString("later");
+                table.nextRow();
+                assertEquals(2, table.getRowCount());
+                assertEquals(2, table.getColumnCount());
+
+                table.rollbackToSavepoint();
+
+                assertEquals(1, table.getRowCount());
+                assertEquals("the column added after the mark is gone", 1, table.getColumnCount());
+                assertEquals(1, v.getSize());
+                assertEquals(bytesAtMark, table.getBufferedBytes());
+                assertFalse(table.hasInProgressRow());
+                // still usable: the dropped column can come back
+                table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false).addLong(3L);
+                table.getOrCreateColumn("s", QwpConstants.TYPE_VARCHAR, false).addString("again");
+                table.nextRow();
+                assertEquals(2, table.getRowCount());
+                assertEquals(2, table.getColumnCount());
+                assertEquals(2, v.getSize());
+            }
+        });
+    }
+
+    @Test
+    public void testRollbackToSavepointWithoutMarkDropsEveryRowButKeepsColumns() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                QwpTableBuffer.ColumnBuffer v = table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false);
+                v.addLong(1L);
+                table.nextRow();
+                table.reset();
+                table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false).addLong(2L);
+                table.nextRow();
+                table.rollbackToSavepoint();
+                assertEquals(0, table.getRowCount());
+                assertEquals(0, v.getSize());
+                assertEquals("no mark: behaves like reset(), definitions stay", 1, table.getColumnCount());
+            }
+        });
     }
 }

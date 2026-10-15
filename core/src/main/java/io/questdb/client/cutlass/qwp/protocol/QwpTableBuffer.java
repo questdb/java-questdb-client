@@ -72,6 +72,11 @@ public class QwpTableBuffer implements QuietCloseable {
     private ColumnBuffer[] fastColumns; // plain array for O(1) sequential access
     private int inProgressColumnCount;
     private int rowCount;
+    // Savepoint for rollbackToSavepoint(): the row count and column count at the
+    // last markSavepoint(). reset() moves it to "no rows, all current columns",
+    // since a flushed buffer's columns are known to the server; clear() zeroes it.
+    private int savepointColumnCount;
+    private int savepointRowCount;
 
     public QwpTableBuffer(String tableName) {
         this(tableName, null);
@@ -130,6 +135,8 @@ public class QwpTableBuffer implements QuietCloseable {
         committedColumnCount = 0;
         inProgressColumnCount = 0;
         rowCount = 0;
+        savepointRowCount = 0;
+        savepointColumnCount = 0;
         columnDefsCacheValid = false;
         cachedColumnDefs = null;
     }
@@ -257,11 +264,29 @@ public class QwpTableBuffer implements QuietCloseable {
     }
 
     /**
+     * Row count recorded by the last {@link #markSavepoint()}; {@code 0} when
+     * none was taken since the buffer was last reset or cleared.
+     */
+    public int getSavepointRowCount() {
+        return savepointRowCount;
+    }
+
+    /**
      * Returns true if a row is partially built (columns written but not yet committed
      * via {@link #nextRow()}).
      */
     public boolean hasInProgressRow() {
         return inProgressColumnCount > 0;
+    }
+
+    /**
+     * Remembers the current row count and column count. A later
+     * {@link #rollbackToSavepoint()} truncates the buffer back to this point.
+     * Take it between rows, not while a row is in progress.
+     */
+    public void markSavepoint() {
+        savepointRowCount = rowCount;
+        savepointColumnCount = columns.size();
     }
 
     /**
@@ -344,6 +369,8 @@ public class QwpTableBuffer implements QuietCloseable {
         columnAccessCursor = 0;
         committedColumnCount = columns.size();
         inProgressColumnCount = 0;
+        savepointRowCount = 0;
+        savepointColumnCount = columns.size();
         rowCount = 0;
     }
 
@@ -368,6 +395,36 @@ public class QwpTableBuffer implements QuietCloseable {
             }
         }
         rowCount = 0;
+        committedColumnCount = columns.size();
+    }
+
+    /**
+     * Discards the rows and the columns added since {@link #markSavepoint()},
+     * including a row in progress, and keeps everything before the mark.
+     * Columns the mark did not see are closed and removed: the server has not
+     * seen them either, so they must not pad the retained rows. Without a mark
+     * since the last {@link #reset()} this drops every row and keeps the column
+     * definitions, which is what {@code reset()} does.
+     */
+    public void rollbackToSavepoint() {
+        columnAccessCursor = 0;
+        inProgressColumnCount = 0;
+        boolean columnsRemoved = false;
+        for (int i = columns.size() - 1; i >= savepointColumnCount; i--) {
+            ColumnBuffer col = columns.getQuick(i);
+            if (col != null) {
+                col.close();
+            }
+            columns.remove(i);
+            columnsRemoved = true;
+        }
+        if (columnsRemoved) {
+            rebuildColumnAccessStructures();
+        }
+        for (int i = 0, n = columns.size(); i < n; i++) {
+            fastColumns[i].truncateTo(savepointRowCount);
+        }
+        rowCount = savepointRowCount;
         committedColumnCount = columns.size();
     }
 
