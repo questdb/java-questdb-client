@@ -504,7 +504,8 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
         if (retryAfterMillis >= 0) {
             delay = Math.max(delay, Math.min(retryAfterMillis, retryAfterMaxMillis));
         }
-        return delay;
+        // Millisecond rounding must not turn a positive backoff into an immediate retry.
+        return Math.max(1, delay);
     }
 
     private void cancelScheduledLocked() {

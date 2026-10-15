@@ -103,6 +103,33 @@ public class RefreshingTokenProviderTest {
     }
 
     @Test
+    public void testBackoffHasPositiveDelayAtOneMillisecond() {
+        for (double u : new double[]{0.0, 0.5, Math.nextDown(1.0)}) {
+            for (long retryAfterMillis : new long[]{TokenUnavailableException.NO_RETRY_AFTER, 0, 2}) {
+                FakeClock clock = new FakeClock(T0);
+                ManualScheduler scheduler = new ManualScheduler(clock);
+                ScriptedSource source = new ScriptedSource().thenThrow(
+                        TokenUnavailableException.retryable("down", retryAfterMillis));
+                try (RefreshingTokenProvider provider = provider(source, clock, scheduler, u)
+                        .backoffInitialMillis(1)
+                        .backoffMaxMillis(1)
+                        .build()) {
+                    Assert.assertEquals("the initial prefetch is still immediate", 0, scheduler.peek().delayNanos);
+                    final long expectedDelayNanos = TimeUnit.MILLISECONDS.toNanos(retryAfterMillis == 2 ? 2 : 1);
+                    for (int failure = 1; failure <= 64; failure++) {
+                        scheduler.advanceAndRunNext();
+                        Assert.assertEquals("backoff after failure " + failure + " [u=" + u
+                                        + ", retryAfterMillis=" + retryAfterMillis + ']',
+                                expectedDelayNanos, scheduler.peek().delayNanos);
+                        Assert.assertEquals(failure, provider.getConsecutiveFailures());
+                    }
+                    Assert.assertEquals(64, source.calls());
+                }
+            }
+        }
+    }
+
+    @Test
     public void testCloseFailsGetTokenPermanentlyAndStopsTheRefresher() {
         ScriptedSource source = new ScriptedSource().thenToken("TOKEN", System.currentTimeMillis() + HOUR);
         List<Thread> before = refresherThreads();

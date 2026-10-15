@@ -175,6 +175,8 @@ if retry_after is present:
     delay = max(delay, min(retry_after, retry_after_max))
 ```
 
+The delay MUST remain positive after rounding. Implementations using whole milliseconds MUST impose a 1 ms minimum.
+
 A successful fetch resets `n`.
 
 **While fetches are failing:**
