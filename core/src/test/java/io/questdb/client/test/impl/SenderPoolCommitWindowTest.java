@@ -64,21 +64,24 @@ public class SenderPoolCommitWindowTest {
         List<RecordingSender> built = new ArrayList<>();
         try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(1, 1, built)) {
             pool.setFlushOnClose(true);
-            pool.setCommitWindow(2, 60_000L);
-            try (Sender s = pool.borrow()) {
-                s.table("t").longColumn("v", 1L).atNow();
-            }
+            pool.setCommitWindow(3, 60_000L);
+            borrowAppendClose(pool, 1L);            // deferred: the window is open with 1 row
             try (Sender s = pool.borrow()) {
                 s.table("t").longColumn("v", 2L).atNow();
-                Assert.assertTrue(s.drain(0));      // app commits explicitly: 2 rows, window would close here
+                Assert.assertTrue(s.drain(0));      // app commits at 2 rows: the window restarts here
             }
             RecordingSender d = built.get(0);
+            Assert.assertEquals(1, d.deferredFlushCount.get());
             Assert.assertEquals(1, d.flushCount.get());
-            try (Sender s = pool.borrow()) {
-                s.table("t").longColumn("v", 3L).atNow();
-            }
-            Assert.assertEquals(2, d.deferredFlushCount.get());
+            // 3 rows in total: a counter that ignored the drain would commit here
+            borrowAppendClose(pool, 3L);
+            borrowAppendClose(pool, 4L);
+            Assert.assertEquals(3, d.deferredFlushCount.get());
             Assert.assertEquals(1, d.flushCount.get());
+            // 3 rows since the drain: the window closes with a committing frame
+            borrowAppendClose(pool, 5L);
+            Assert.assertEquals(3, d.deferredFlushCount.get());
+            Assert.assertEquals(2, d.flushCount.get());
         }
     }
 
@@ -87,23 +90,24 @@ public class SenderPoolCommitWindowTest {
         List<RecordingSender> built = new ArrayList<>();
         try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(1, 1, built)) {
             pool.setFlushOnClose(true);
-            pool.setCommitWindow(2, 60_000L);
-            try (Sender s = pool.borrow()) {
-                s.table("t").longColumn("v", 1L).atNow();
-            }
+            pool.setCommitWindow(3, 60_000L);
+            borrowAppendClose(pool, 1L);            // deferred: the window is open with 1 row
             try (Sender s = pool.borrow()) {
                 s.table("t").longColumn("v", 2L).atNow();
-                s.flush();                          // app commits explicitly: 2 rows, window would close here
+                s.flush();                          // app commits at 2 rows: the window restarts here
             }
             RecordingSender d = built.get(0);
+            Assert.assertEquals(1, d.deferredFlushCount.get());
             Assert.assertEquals(1, d.flushCount.get());
-            // the close after the explicit flush found nothing to ship and the
-            // window restarted at 2 rows, so this third close is deferred
-            try (Sender s = pool.borrow()) {
-                s.table("t").longColumn("v", 3L).atNow();
-            }
-            Assert.assertEquals(2, d.deferredFlushCount.get());
+            // 3 rows in total: a counter that ignored the flush would commit here
+            borrowAppendClose(pool, 3L);
+            borrowAppendClose(pool, 4L);
+            Assert.assertEquals(3, d.deferredFlushCount.get());
             Assert.assertEquals(1, d.flushCount.get());
+            // 3 rows since the flush: the window closes with a committing frame
+            borrowAppendClose(pool, 5L);
+            Assert.assertEquals(3, d.deferredFlushCount.get());
+            Assert.assertEquals(2, d.flushCount.get());
         }
     }
 
@@ -210,6 +214,12 @@ public class SenderPoolCommitWindowTest {
             RecordingSender d = built.get(0);
             Assert.assertEquals(2, d.flushCount.get());
             Assert.assertEquals(0, d.deferredFlushCount.get());
+        }
+    }
+
+    private static void borrowAppendClose(SenderPool pool, long v) {
+        try (Sender s = pool.borrow()) {
+            s.table("t").longColumn("v", v).atNow();
         }
     }
 }
