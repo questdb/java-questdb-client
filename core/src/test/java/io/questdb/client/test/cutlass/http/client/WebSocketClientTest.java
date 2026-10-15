@@ -394,7 +394,7 @@ public class WebSocketClientTest {
 
                 // sendPing() should use controlFrameBuffer, not sendBuffer
                 try {
-                    client.sendPing(1000);
+                    client.sendPing();
                 } catch (HttpClientException ignored) {
                     // Expected: doSend() fails because there's no real socket
                 }
