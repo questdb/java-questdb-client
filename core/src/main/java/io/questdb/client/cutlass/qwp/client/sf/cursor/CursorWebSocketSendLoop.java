@@ -526,8 +526,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // (trySendOne) or a keepalive PING (sendPingIfDue).
     // Throttles the keepalive PINGs so they fire only when the
     // configured interval has elapsed since the most recent outbound event.
-    // Set when the I/O loop starts; durable-ack mode backdates it on
-    // reconnect so its keepalive fires at once.
+    // Set when the I/O loop starts.
     private long lastFrameOrPingNanos;
     // Throttles the catch-up oversize WARN. Only consulted when the server
     // advertises NO batch cap, where the loop has no terminal to fall back on
@@ -1918,11 +1917,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             releasePendingEntry(pendingDurable.pollFirst());
         }
         durableTableWatermarks.clear();
-        // Backdate the keepalive throttle by one durable interval so the new
-        // connection can prod the server immediately rather than waiting out
-        // the leftover interval from before the reconnect. Relative to now,
-        // not 0, so the far longer idle keepalive is not also made due.
-        lastFrameOrPingNanos = System.nanoTime() - durableAckKeepaliveIntervalNanos;
     }
 
     private static boolean isCatchUpCapGap(Throwable t) {
