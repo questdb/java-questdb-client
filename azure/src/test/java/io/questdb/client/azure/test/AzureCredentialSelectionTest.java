@@ -135,7 +135,9 @@ public class AzureCredentialSelectionTest {
         } catch (TokenUnavailableException e) {
             Assert.assertFalse("missing configuration is permanent: " + e.getMessage(), e.isRetryable());
             Assert.assertTrue(e.getMessage(), e.getMessage().startsWith("no credential available for api://qdb/.default: "));
-            Assert.assertTrue(e.getMessage(), e.getMessage().contains("WorkloadIdentityCredentialBuilder"));
+            // Keep the classification/type, not the SDK builder's arbitrary message.
+            Assert.assertTrue(e.getMessage(), e.getMessage().contains("CredentialUnavailableException"));
+            Assert.assertNull(e.getCause());
         }
     }
 

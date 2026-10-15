@@ -73,7 +73,8 @@ import java.util.concurrent.TimeUnit;
  *   failure, such as a refused connection, which a managed identity otherwise hides behind a generic message.</li>
  * </ul>
  * Each attempt is bounded (30 s by default). Library exceptions never travel as a cause - their response
- * objects reference the raw HTTP request, which can carry a client secret - only their sanitized message does.
+ * objects reference the raw HTTP request, which can carry a client secret. Diagnostics name only the failure
+ * type, HTTP status, known configuration error codes and socket-level causes; SDK messages can embed raw bodies.
  */
 public final class AzureTokenSource implements TokenSource {
     /**
@@ -190,8 +191,10 @@ public final class AzureTokenSource implements TokenSource {
     }
 
     private static String describe(Throwable t) {
-        final String message = t.getMessage();
-        return message == null ? t.getClass().getName() : t.getClass().getSimpleName() + ": " + message;
+        // Even the outer SDK message can contain the complete token-endpoint response. Keep only the type;
+        // classify() adds safe status/error codes, and withNetworkCause() names socket-level failures.
+        final String name = t.getClass().getSimpleName();
+        return name.isEmpty() ? t.getClass().getName() : name;
     }
 
     // The outermost socket-level failure among the causes: a refused or reset connection, an unreachable or
@@ -251,18 +254,16 @@ public final class AzureTokenSource implements TokenSource {
         return TokenUnavailableException.NO_RETRY_AFTER;
     }
 
-    // Leads with the socket-level cause, unless the description already carries it: error text is capped, and a
-    // library's own message is often generic ("see inner exception").
+    // Lead with the socket-level cause so it survives the provider's error-text cap. Only socket failures
+    // contribute message text; other SDK/parser messages can contain the token-endpoint response.
     private static String withNetworkCause(Throwable failure, String description) {
         final Throwable network = networkCause(failure);
         if (network == null) {
             return description;
         }
         final String reason = network.getMessage();
-        if (reason != null && description.contains(reason)) {
-            return description;
-        }
-        return describe(network) + "; " + description;
+        final String networkDescription = describe(network) + (reason == null ? "" : ": " + reason);
+        return network == failure ? networkDescription : networkDescription + "; " + description;
     }
 
     @Override

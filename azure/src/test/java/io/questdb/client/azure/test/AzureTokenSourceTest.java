@@ -188,17 +188,21 @@ public class AzureTokenSourceTest {
         Assert.assertTrue(e.isRetryable());
         Assert.assertTrue(e.getMessage(), e.getMessage().startsWith("the token request for api://qdb/.default failed: "
                 + "ConnectException: finishConnect(..) failed with error(-111): Connection refused; "
-                + "ClientAuthenticationException: Managed Identity authentication failed"));
+                + "ClientAuthenticationException"));
 
         e = fetchFailure(new RuntimeException("wrapped", new UnknownHostException("login.microsoftonline.com")));
         Assert.assertTrue(e.isRetryable());
         Assert.assertTrue(e.getMessage(), e.getMessage().contains("UnknownHostException: login.microsoftonline.com"));
 
-        // a wrapper whose own message already carries the cause - as Reactor's wrapper of a checked exception does -
-        // names it once
+        // A wrapper whose message already carries the cause must not cause the source to echo arbitrary text.
         e = fetchFailure(new UncheckedIOException(new ConnectException("Connection refused")));
-        Assert.assertEquals("the token request for api://qdb/.default failed: UncheckedIOException: "
-                + "java.net.ConnectException: Connection refused", e.getMessage());
+        Assert.assertEquals("the token request for api://qdb/.default failed: ConnectException: "
+                + "Connection refused; UncheckedIOException", e.getMessage());
+
+        e = fetchFailure(new ConnectException("Connection refused"));
+        // Reactor wraps a checked socket exception before block() throws it.
+        Assert.assertEquals("the token request for api://qdb/.default failed: ConnectException: Connection refused; ReactiveException",
+                e.getMessage());
     }
 
     @Test
@@ -216,11 +220,11 @@ public class AzureTokenSourceTest {
         assertRetryable(new HttpResponseException("throttled", new FakeResponse(429, "7")), "HTTP 429", 7_000);
         assertRetryable(new HttpResponseException("unavailable", new FakeResponse(503, null)), "HTTP 503", -1);
         assertRetryable(new HttpResponseException("gone", new FakeResponse(410, "Wed, 21 Oct 2015 07:28:00 GMT")), "HTTP 410", -1);
-        assertRetryable(new IllegalStateException("connection reset"), "connection reset", -1);
+        assertRetryable(new IllegalStateException("connection reset"), "IllegalStateException", -1);
         assertRetryable(new MsalServiceException("temporarily unavailable", "temporarily_unavailable"),
-                "temporarily unavailable", -1);
+                "MsalServiceException", -1);
         assertRetryable(new ClientAuthenticationException("ManagedIdentityCredential: IMDS endpoint timed out", null,
-                (Object) null), "timed out", -1);
+                (Object) null), "ClientAuthenticationException", -1);
     }
 
     @Test

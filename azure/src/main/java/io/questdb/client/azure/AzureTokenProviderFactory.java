@@ -45,10 +45,13 @@ import java.util.Map;
 /**
  * The {@code azure} token provider (design/qwp-token-provider-spec.md, section 7.5): Microsoft Entra ID tokens
  * from Azure Identity. Discovered through {@link java.util.ServiceLoader}; put this artifact on the class path or
- * module path and connect with
+ * module path, together with its runtime dependencies, and connect with
  * <pre>
  * wss::addr=qdb1:9000,qdb2:9000;token_provider=azure;azure_resource=api://&lt;questdb-app-id&gt;;azure_credential=managed_identity;
  * </pre>
+ * On Java 11+, connect-string discovery needs only {@code requires io.questdb.client;} in the application.
+ * Service binding resolves this provider and its Azure SDK dependencies. The JDK 8 release jars carry the
+ * necessary descriptors in {@code META-INF/versions/11}.
  * <ul>
  *   <li>{@code azure_resource} (required) - the application ID URI or client ID of the QuestDB app
  *   registration; the requested scope is {@code <azure_resource>/.default}.</li>

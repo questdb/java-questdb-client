@@ -33,6 +33,7 @@ import com.azure.core.http.HttpRequest;
 import com.azure.core.http.HttpResponse;
 import com.azure.identity.ClientSecretCredentialBuilder;
 import io.questdb.client.azure.AzureTokenSource;
+import io.questdb.client.cutlass.auth.RefreshingTokenProvider;
 import io.questdb.client.cutlass.auth.TokenUnavailableException;
 import org.junit.Assert;
 import org.junit.Test;
@@ -51,6 +52,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public class AzureClientSecretCredentialLibraryTest {
     private static final String AUTHORITY = "https://login.microsoftonline.com/" + "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    private static final String BODY_SENTINEL = "BODY-SENTINEL";
     private static final String CLIENT_SECRET = "not-a-real-secret";
 
     @Test(timeout = 30_000)
@@ -59,10 +61,52 @@ public class AzureClientSecretCredentialLibraryTest {
     }
 
     @Test(timeout = 30_000)
+    public void testMalformedResponseBodyNeverReachesFailureDiagnostics() {
+        TokenEndpoint endpoint = new TokenEndpoint(400, null, "{\"unexpected\":\"" + BODY_SENTINEL + "\"}");
+        AzureTokenSource source = new AzureTokenSource(credential(endpoint), "api://qdb");
+        try {
+            source.fetchToken();
+            Assert.fail("expected the malformed token response to fail");
+        } catch (TokenUnavailableException e) {
+            assertNoResponseBody(e);
+        }
+        Assert.assertEquals(1, endpoint.tokenRequests.get());
+
+        try (RefreshingTokenProvider provider = RefreshingTokenProvider.builder(source)
+                .coldWaitMillis(10_000).backoffInitialMillis(60_000).backoffMaxMillis(60_000).build()) {
+            try {
+                provider.getToken();
+                Assert.fail("expected the provider to report the source failure");
+            } catch (TokenUnavailableException e) {
+                assertNoResponseBody(e);
+            }
+            Assert.assertNotNull(provider.getLastFailure());
+            Assert.assertFalse(provider.getLastFailure().getMessage(),
+                    provider.getLastFailure().getMessage().contains(BODY_SENTINEL));
+            Assert.assertEquals(2, endpoint.tokenRequests.get());
+        }
+    }
+
+    @Test(timeout = 30_000)
     public void testMissingOrMalformedRetryAfterUsesProviderBackoff() {
         for (String retryAfter : Arrays.asList(null, "", "not-a-delay", "Wed, 21 Oct 2015 07:28:00 GMT", "-1")) {
             assertRetryAfter(new TokenEndpoint(429, retryAfter), false, TokenUnavailableException.NO_RETRY_AFTER);
         }
+    }
+
+    @Test(timeout = 30_000)
+    public void testOAuthErrorDescriptionNeverReachesFailureDiagnostics() {
+        TokenEndpoint endpoint = new TokenEndpoint(400, null,
+                "{\"error\":\"invalid_client\",\"error_description\":\"AADSTS7000215: " + BODY_SENTINEL + "\"}");
+        try {
+            new AzureTokenSource(credential(endpoint), "api://qdb").fetchToken();
+            Assert.fail("expected Entra to reject the credential");
+        } catch (TokenUnavailableException e) {
+            assertNoResponseBody(e);
+            Assert.assertFalse(e.getMessage(), e.isRetryable());
+            Assert.assertTrue(e.getMessage(), e.getMessage().contains("AADSTS7000215"));
+        }
+        Assert.assertEquals(1, endpoint.tokenRequests.get());
     }
 
     @Test(timeout = 30_000)
@@ -75,14 +119,13 @@ public class AzureClientSecretCredentialLibraryTest {
         assertRetryAfter(new TokenEndpoint(429, " 7 "), true, 7_000);
     }
 
+    private static void assertNoResponseBody(TokenUnavailableException e) {
+        Assert.assertFalse(e.getMessage(), e.getMessage().contains(BODY_SENTINEL));
+        Assert.assertNull("never retain an SDK exception that references the raw request", e.getCause());
+    }
+
     private static void assertRetryAfter(TokenEndpoint endpoint, boolean isWrapped, long expectedRetryAfterMillis) {
-        TokenCredential credential = new ClientSecretCredentialBuilder()
-                .tenantId("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
-                .clientId("11111111-2222-3333-4444-555555555555")
-                .clientSecret(CLIENT_SECRET)
-                .disableInstanceDiscovery()
-                .httpClient(endpoint)
-                .build();
+        TokenCredential credential = credential(endpoint);
         if (isWrapped) {
             TokenCredential delegate = credential;
             credential = context -> delegate.getToken(context).onErrorMap(
@@ -98,6 +141,16 @@ public class AzureClientSecretCredentialLibraryTest {
             Assert.assertNull("never retain an SDK exception that references the raw request", e.getCause());
             Assert.assertFalse(e.getMessage(), e.getMessage().contains(CLIENT_SECRET));
         }
+    }
+
+    private static TokenCredential credential(TokenEndpoint endpoint) {
+        return new ClientSecretCredentialBuilder()
+                .tenantId("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+                .clientId("11111111-2222-3333-4444-555555555555")
+                .clientSecret(CLIENT_SECRET)
+                .disableInstanceDiscovery()
+                .httpClient(endpoint)
+                .build();
     }
 
     private static final class StubResponse extends HttpResponse {
@@ -152,11 +205,18 @@ public class AzureClientSecretCredentialLibraryTest {
     }
 
     private static final class TokenEndpoint implements HttpClient {
+        private final String body;
         private final String retryAfter;
         private final int status;
         private final AtomicInteger tokenRequests = new AtomicInteger();
 
         private TokenEndpoint(int status, String retryAfter) {
+            this(status, retryAfter, "{\"error\":\"temporarily_unavailable\","
+                    + "\"error_description\":\"The endpoint is throttling this application\"}");
+        }
+
+        private TokenEndpoint(int status, String retryAfter, String body) {
+            this.body = body;
             this.retryAfter = retryAfter;
             this.status = status;
         }
@@ -173,9 +233,7 @@ public class AzureClientSecretCredentialLibraryTest {
             Assert.assertEquals(HttpMethod.POST, request.getHttpMethod());
             // Keep the SDK's first three retries immediate; only its final response supplies the provider's hint.
             String delay = tokenRequests.incrementAndGet() <= 3 ? "0" : retryAfter;
-            return Mono.just(new StubResponse(request, status,
-                    "{\"error\":\"temporarily_unavailable\","
-                            + "\"error_description\":\"The endpoint is throttling this application\"}", delay));
+            return Mono.just(new StubResponse(request, status, body, delay));
         }
     }
 }
