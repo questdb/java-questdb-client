@@ -2033,12 +2033,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                         }
                         break;
                     }
-                    swapClient(newClient);
+                    long resumeFsn = swapClient(newClient);
                     counters.reconnects.incrementAndGet();
                     long elapsedMs = (System.nanoTime() - outageStartNanos) / 1_000_000L;
+                    // swapClient cleared replayTargetFsn when nothing below it is unacked
+                    long replayFrames = replayTargetFsn >= 0L ? replayTargetFsn - resumeFsn + 1L : 0L;
                     LOG.info("cursor I/O loop {} succeeded after {}ms, {} attempts; "
-                                    + "replaying from FSN {}",
-                            phase, elapsedMs, attempts, externalFsnBase + fsnAtZero);
+                                    + "resuming at FSN {}, {} unacked frames to replay",
+                            phase, elapsedMs, attempts, externalFsnBase + resumeFsn, replayFrames);
                     return;
                 }
                 // A null factory result is an unsuccessful connect state, not a cap-gap
@@ -2870,8 +2872,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * realign {@code fsnAtZero} to the next unacked FSN, restart wire
      * sequencing from 0, and reposition the cursor so the next
      * {@link #trySendOne} call replays the first unacked frame.
+     *
+     * @return the first unacked FSN, where sending resumes on the new connection
      */
-    private void swapClient(WebSocketClient newClient) {
+    private long swapClient(WebSocketClient newClient) {
         WebSocketClient old = this.client;
         this.client = newClient;
         this.lastReconnectError = null;
@@ -2915,6 +2919,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // established, so the sender stays INITIALIZING and a subsequent
         // endpoint-policy rejection still latches the startup terminal.
         this.hasEverConnected = true;
+        return replayStart;
     }
 
     /**
