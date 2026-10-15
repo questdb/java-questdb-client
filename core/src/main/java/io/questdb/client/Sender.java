@@ -764,7 +764,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * rolls back to: rows appended after this call are discarded by that
      * method, rows appended before it are kept. Any flush that ships the
      * pending rows empties the savepoint, so a later {@code resetToSavepoint()}
-     * behaves like {@link #reset()}. The pool marks a savepoint when it hands a
+     * discards every pending row like {@link #reset()}. The pool marks a savepoint when it hands a
      * slot to a borrower. Pure bookkeeping: it runs no error check. Default
      * no-op.
      */
@@ -842,8 +842,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * Discards the rows appended since the last {@link #markSavepoint()} and
      * keeps the rows buffered before it. Without a savepoint, or after a flush
      * emptied it, this discards every pending row like {@link #reset()}, and
-     * also removes the column definitions the server has not seen yet. A pooled sender's {@code reset()}
-     * calls this, so a borrower can drop its own bad batch without discarding
+     * also removes the column definitions the server has not seen yet. A pooled
+     * sender's {@code reset()} calls this, so a borrower can drop its own bad batch without discarding
      * rows earlier borrowers left in the shared slot buffer. Default calls
      * {@code reset()}.
      */

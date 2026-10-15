@@ -235,6 +235,37 @@ public class SenderProbeMethodsTest {
     }
 
     @Test
+    public void testResetToSavepointReclaimsTheSymbolIdsOfTheDroppedRows() throws Exception {
+        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+        try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+            server.setAdvertisedMaxBatchSize(4 * 1024);
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            try (Sender sender = Sender.fromConfig(config(server.getPort()))) {
+                sender.table("t").symbol("s", "a").atNow();
+                sender.markSavepoint();
+                String wide = QuestDBFlushOnCloseTest.wideValue(1000);
+                for (int i = 0; i < 6; i++) {
+                    sender.table("t").symbol("s", wide + i).atNow();
+                }
+                try {
+                    sender.flush();
+                    Assert.fail("six wide symbols do not fit a 4 KiB cap");
+                } catch (BatchTooLargeForCapException expected) {
+                    // retained for retry
+                }
+                sender.resetToSavepoint();
+                sender.flush();
+                log.awaitDataFrames(1, 5_000);
+                sender.table("t").symbol("s", "b").atNow();
+                sender.flush();
+                log.awaitDataFrames(2, 5_000);
+                sender.checkError();
+            }
+        }
+    }
+
+    @Test
     public void testResetToSavepointWithoutMarkIsReset() throws Exception {
         try (TestWebSocketServer server = new TestWebSocketServer(new AckAllHandler())) {
             server.start();

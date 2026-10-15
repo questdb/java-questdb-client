@@ -476,8 +476,10 @@ public class QwpWebSocketSender implements Sender {
     private int pendingRowCount;
     // Monotonic for the sender's life; reset() does not clear it. Counts rows whether or not they shipped.
     private long rowsAppended;
-    // Pending counters at the last markSavepoint(); zero once a flush ships the
-    // pending rows, at which point resetToSavepoint() is reset().
+    // Pending counters and batch symbol watermark at the last markSavepoint();
+    // zero once a flush ships the pending rows, at which point resetToSavepoint()
+    // discards every pending row like reset() and also removes the column
+    // definitions the server has not seen yet.
     private int savepointBatchMaxSymbolId;
     private long savepointFirstPendingRowTimeNanos;
     private long savepointPendingBytes;
@@ -3330,8 +3332,15 @@ public class QwpWebSocketSender implements Sender {
         }
         // Rows before the mark reference only symbol ids at or below the
         // watermark recorded at the mark, and the watermark only grows within a
-        // batch, so restoring it drops the ids the discarded rows registered.
+        // batch, so the batch range is restored to it. In delta mode the ids the
+        // discarded rows registered above it are reclaimed too (the floor keeps
+        // the ring's and the durable dictionary's ids), so the next new symbol
+        // does not re-ship the orphaned range. Full-dict mode cannot reclaim:
+        // its frames already on the ring define those ids. Its orphans stay in
+        // the dictionary, which reset() cannot shrink there either; they are
+        // only re-shipped once a later row's new symbol id lies above them.
         currentBatchMaxSymbolId = savepointBatchMaxSymbolId;
+        reclaimUnsentSymbolIds(savepointBatchMaxSymbolId + 1);
         pendingRowCount = savepointPendingRowCount;
         pendingBytes = savepointPendingBytes;
         firstPendingRowTimeNanos = savepointFirstPendingRowTimeNanos;
@@ -4756,7 +4765,7 @@ public class QwpWebSocketSender implements Sender {
         // leaves behind after a successful flush, and sendCommitMessage already reads
         // it as an empty delta.
         currentBatchMaxSymbolId = -1;
-        reclaimUnsentSymbolIds();
+        reclaimUnsentSymbolIds(0);
         pendingBytes = 0;
         pendingRowCount = 0;
         firstPendingRowTimeNanos = 0;
@@ -6857,17 +6866,19 @@ public class QwpWebSocketSender implements Sender {
      * </ul>
      * Handing either to a different string is the silent misattribution the dense
      * id space exists to prevent, so the floor is the max of the two.
+     * {@code minFloor} raises it further: resetToSavepoint() passes the ids the
+     * retained rows still reference. Pass 0 to reclaim everything unsent.
      * <p>
      * Full-dict mode is excluded. Its sections always start at id 0, so there is
      * no lifetime anchor to shrink and nothing to gain -- while reclaiming would
      * let a later frame define a different string at an id a frame already on the
      * ring defines, which is precisely the hazard above.
      */
-    private void reclaimUnsentSymbolIds() {
+    private void reclaimUnsentSymbolIds(int minFloor) {
         if (!deltaDictEnabled) {
             return;
         }
-        int floor = sentMaxSymbolId + 1;
+        int floor = Math.max(sentMaxSymbolId + 1, minFloor);
         PersistedSymbolDict pd = cursorEngine == null ? null : cursorEngine.getPersistedSymbolDict();
         if (pd != null) {
             int durable = pd.size();
