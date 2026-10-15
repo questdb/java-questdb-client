@@ -487,6 +487,24 @@ public class RefreshingTokenProviderTest {
     }
 
     @Test
+    public void testPromptReturnAssertionPropagatesErrors() throws Exception {
+        AssertionError failure = new AssertionError("worker error");
+        AssertionError reported = Assert.assertThrows(AssertionError.class, () -> assertReturnsPromptly(() -> {
+            throw failure;
+        }));
+        Assert.assertSame(failure, reported.getCause());
+    }
+
+    @Test
+    public void testPromptReturnAssertionPropagatesExceptions() throws Exception {
+        IllegalStateException failure = new IllegalStateException("worker exception");
+        AssertionError reported = Assert.assertThrows(AssertionError.class, () -> assertReturnsPromptly(() -> {
+            throw failure;
+        }));
+        Assert.assertSame(failure, reported.getCause());
+    }
+
+    @Test
     public void testRefreshScheduleFollowsTheSpec() {
         // C1: refresh times follow section 5.2 for L = 24 h, 60 min and 5 min, with and without refresh_at.
         // u = 0 is the earliest jitter (0.45 L), u = 0.5 the middle (0.5 L), u = 0.999 near the latest (0.55 L).
@@ -881,9 +899,19 @@ public class RefreshingTokenProviderTest {
     }
 
     private static void assertReturnsPromptly(Runnable r) throws InterruptedException {
-        Thread t = start(r);
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        Thread t = start(() -> {
+            try {
+                r.run();
+            } catch (Throwable e) {
+                failure.set(e);
+            }
+        });
         t.join(2_000);
         Assert.assertFalse("the call must return without waiting", t.isAlive());
+        if (failure.get() != null) {
+            throw new AssertionError("the call must return normally", failure.get());
+        }
     }
 
     private static List<String> burst(RefreshingTokenProvider provider, int callers, ScriptedSource source)

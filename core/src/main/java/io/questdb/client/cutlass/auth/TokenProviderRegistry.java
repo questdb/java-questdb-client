@@ -79,6 +79,15 @@ public final class TokenProviderRegistry {
     }
 
     /**
+     * Test seam: lets lifecycle tests control when linger callbacks run.
+     */
+    @TestOnly
+    public TokenProviderRegistry(long lingerMillis, ScheduledThreadPoolExecutor lingerTimer) {
+        this(lingerMillis);
+        this.lingerTimer = lingerTimer;
+    }
+
+    /**
      * Finds the factory serving {@code name} through {@link ServiceLoader}, trying the thread context class
      * loader first and then the loader of this library.
      *
@@ -212,10 +221,10 @@ public final class TokenProviderRegistry {
         }
     }
 
-    private void expire(Entry entry) {
+    private void expire(Entry entry, long generation) {
         synchronized (lock) {
-            if (entry.refs > 0 || entries.get(entry.key) != entry) {
-                return; // re-leased during the linger, or already replaced
+            if (entry.lingerGeneration != generation || entry.refs > 0 || entries.get(entry.key) != entry) {
+                return; // a newer linger superseded this callback, a lease is active, or another entry replaced it
             }
             entries.remove(entry.key);
             entry.lingerTask = null;
@@ -248,7 +257,8 @@ public final class TokenProviderRegistry {
                 entries.remove(entry.key, entry);
                 toClose = entry.provider;
             } else {
-                entry.lingerTask = lingerTimer().schedule(() -> expire(entry), lingerMillis, TimeUnit.MILLISECONDS);
+                final long generation = ++entry.lingerGeneration;
+                entry.lingerTask = lingerTimer().schedule(() -> expire(entry, generation), lingerMillis, TimeUnit.MILLISECONDS);
             }
         }
         if (toClose != null) {
@@ -259,6 +269,7 @@ public final class TokenProviderRegistry {
     private static final class Entry {
         final String key;
         final RefreshingTokenProvider provider;
+        long lingerGeneration;
         ScheduledFuture<?> lingerTask;
         int refs;
 
