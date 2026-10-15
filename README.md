@@ -151,7 +151,7 @@ try (Sender sender = db.borrowSender()) {
             sender.flush();
         }
     }
-    // Remaining rows are flushed by close().
+    // Remaining rows ship on the pool's next settle; flush() ships them now.
 }
 ```
 

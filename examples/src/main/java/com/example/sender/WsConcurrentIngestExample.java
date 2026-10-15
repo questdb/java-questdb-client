@@ -13,8 +13,9 @@ import io.questdb.client.Sender;
  * thread its own.
  * <p>
  * Each producer thread takes its own sender with {@link QuestDB#borrowSender()}
- * and reuses it for the batch (see {@link WsExample}); flush() ships the batch and close() returns the sender to the pool. We size the sender pool to the producer count so no
- * thread ever waits on the acquire timeout.
+ * and reuses it for the batch (see {@link WsExample}); flush() ships the
+ * batch and close() returns the sender to the pool. We size the sender pool to
+ * the producer count so no thread ever waits on the acquire timeout.
  */
 public class WsConcurrentIngestExample {
 
