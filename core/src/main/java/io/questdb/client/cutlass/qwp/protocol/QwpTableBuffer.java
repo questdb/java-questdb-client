@@ -73,8 +73,9 @@ public class QwpTableBuffer implements QuietCloseable {
     private int inProgressColumnCount;
     private int rowCount;
     // Savepoint for rollbackToSavepoint(): the row count and column count at the
-    // last markSavepoint(). reset() moves it to "no rows, all current columns",
-    // since a flushed buffer's columns are known to the server; clear() zeroes it.
+    // last markSavepoint(). reset() and retainInProgressRow() move it to "no rows,
+    // all current columns", since a flushed buffer's columns are known to the
+    // server; clear() zeroes it.
     private int savepointColumnCount;
     private int savepointRowCount;
 
@@ -395,6 +396,8 @@ public class QwpTableBuffer implements QuietCloseable {
             }
         }
         rowCount = 0;
+        savepointRowCount = 0;
+        savepointColumnCount = columns.size();
         committedColumnCount = columns.size();
     }
 
@@ -404,7 +407,9 @@ public class QwpTableBuffer implements QuietCloseable {
      * Columns the mark did not see are closed and removed: the server has not
      * seen them either, so they must not pad the retained rows. Without a mark
      * since the last {@link #reset()} this drops every row and keeps the column
-     * definitions, which is what {@code reset()} does.
+     * definitions, which is what {@code reset()} does; on a buffer that was never
+     * marked or reset it also removes every column, since the server has seen
+     * none of them.
      */
     public void rollbackToSavepoint() {
         columnAccessCursor = 0;

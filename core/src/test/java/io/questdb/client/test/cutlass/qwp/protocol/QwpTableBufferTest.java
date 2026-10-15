@@ -1468,6 +1468,29 @@ public class QwpTableBufferTest {
         });
     }
 
+    @Test
+    public void testRetainInProgressRowMovesTheSavepointToTheRetainedRow() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                QwpTableBuffer.ColumnBuffer v = table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false);
+                v.addLong(1L);
+                table.nextRow();
+                table.markSavepoint();
+                assertEquals(1, table.getSavepointRowCount());
+                v.addLong(2L); // row 2 in progress, not committed
+                table.retainInProgressRow(new int[]{1}, new int[]{1}, new int[]{0}, new int[]{0});
+                assertEquals(0, table.getRowCount());
+                assertEquals("the shipped rows are no longer a rollback target", 0, table.getSavepointRowCount());
+
+                table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false);
+                table.nextRow();
+                table.rollbackToSavepoint();
+                assertEquals(0, table.getRowCount());
+                assertEquals(1, table.getColumnCount());
+            }
+        });
+    }
+
     private static void addSymbolUtf8(QwpTableBuffer.ColumnBuffer col, String value) {
         byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
         long ptr = copyToNative(bytes);
