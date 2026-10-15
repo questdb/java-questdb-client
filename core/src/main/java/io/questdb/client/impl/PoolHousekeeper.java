@@ -33,6 +33,11 @@ import java.util.concurrent.TimeUnit;
  */
 final class PoolHousekeeper {
 
+    // Wait between startup-recovery steps that did not find more work to do at
+    // once: a finished scan, an empty one, or a transient failure such as an
+    // unreachable server. The same cadence SenderPool's private driver uses, and
+    // deliberately not the settle cadence, which can be 50 ms.
+    static final long STARTUP_RECOVERY_RETRY_MILLIS = 1_000L;
     // How long stop() waits for the daemon to exit. Kept ABOVE
     // SenderPool.RECOVERY_DRAIN_BUDGET_MILLIS so a startup-recovery drain still
     // in flight when close() arrives finishes well within this join (C1 fix).
@@ -46,11 +51,6 @@ final class PoolHousekeeper {
     // no application-level connect timeout); see the residual-window note on
     // SenderPool.recoverOneSlotStep.
     static final long STOP_TIMEOUT_MILLIS = 2_000;
-    // Wait between startup-recovery steps that did not find more work to do at
-    // once: a finished scan, an empty one, or a transient failure such as an
-    // unreachable server. The same cadence SenderPool's private driver uses, and
-    // deliberately not the settle cadence, which can be 50 ms.
-    static final long STARTUP_RECOVERY_RETRY_MILLIS = 1_000L;
 
     private final long intervalMillis;
     private final QueryClientPool queryPool;
@@ -62,7 +62,7 @@ final class PoolHousekeeper {
 
     /**
      * @param intervalMillis       reap cadence: idle and over-age slots
-     * @param settleIntervalMillis settle cadence: ship rows left in idle slots;
+     * @param settleIntervalMillis settle cadence: ships rows left in idle slots;
      *                             {@code auto_flush_interval} (100 ms when
      *                             unset), or the commit interval when that is
      *                             shorter
@@ -137,15 +137,6 @@ final class PoolHousekeeper {
     }
 
     /**
-     * Waits up to the supplied budget without letting cancellation skip the caller's remaining shutdown
-     * work. Every {@link InterruptedException} clears the caller's flag, so remember it and spend only the
-     * remainder of the original budget before handing the information back to {@link #stop()}.
-     * <p>
-     * Package-private so SenderPool's direct recovery driver can use the same deadline-preserving shutdown
-     * primitive. Keeping the two stop paths identical matters when an interrupt arrives during the first
-     * join: it must be remembered without skipping the target interrupt and second join that follow.
-     */
-    /**
      * {@code nowMillis + intervalMillis}, saturating at {@link Long#MAX_VALUE}
      * so an interval of {@code Long.MAX_VALUE} ("never") does not wrap negative
      * and either stall every other deadline or fire at once.
@@ -155,6 +146,15 @@ final class PoolHousekeeper {
         return d < nowMillis ? Long.MAX_VALUE : d;
     }
 
+    /**
+     * Waits up to the supplied budget without letting cancellation skip the caller's remaining shutdown
+     * work. Every {@link InterruptedException} clears the caller's flag, so remember it and spend only the
+     * remainder of the original budget before handing the information back to {@link #stop()}.
+     * <p>
+     * Package-private so SenderPool's direct recovery driver can use the same deadline-preserving shutdown
+     * primitive. Keeping the two stop paths identical matters when an interrupt arrives during the first
+     * join: it must be remembered without skipping the target interrupt and second join that follow.
+     */
     static boolean joinIgnoringCallerInterrupts(Thread target, long timeoutMillis) {
         final long timeoutNanos = TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
         final long deadlineNanos = System.nanoTime() + timeoutNanos;
@@ -195,8 +195,10 @@ final class PoolHousekeeper {
             // sole residual overrun is an in-flight connect to a black-holed
             // host, which no interrupt breaks. See SenderPool.recoverOneSlotStep.
             // While recovery still has work we skip the idle wait so the backlog
-            // drains promptly; once done we fall back to the normal interval.
-            // No-op once recovery completes or the pool is closing. Best-effort:
+            // drains promptly; otherwise the step is retried every
+            // STARTUP_RECOVERY_RETRY_MILLIS until the pool reports it done, and
+            // stays cheap after that. A no-op once recovery completes or the
+            // pool is closing. Best-effort:
             // a recovery failure (including an Error) must never kill this
             // daemon, so swallow Throwable -- exactly as the reap guards below.
             boolean recovering = false;

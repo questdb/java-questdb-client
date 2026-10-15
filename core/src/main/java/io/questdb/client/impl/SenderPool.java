@@ -1502,6 +1502,11 @@ public final class SenderPool implements AutoCloseable {
         this.creationWaitRetryHook = hook;
     }
 
+    @TestOnly
+    public int startupRecoveryBuildAttemptsForTesting() {
+        return startupRecoveryBuildAttempts;
+    }
+
     /**
      * Raises the shutdown signal early -- without tearing down live delegates --
      * so an in-flight startup-recovery step stops promptly between slots. Direct
@@ -1718,11 +1723,6 @@ public final class SenderPool implements AutoCloseable {
     public void setStartupRecoveryJoinHooksForTesting(Runnable beforeJoinHook, Runnable afterJoinHook) {
         this.beforeStartupRecoveryJoinHook = beforeJoinHook;
         this.afterStartupRecoveryJoinHook = afterJoinHook;
-    }
-
-    @TestOnly
-    public int startupRecoveryBuildAttemptsForTesting() {
-        return startupRecoveryBuildAttempts;
     }
 
     /**

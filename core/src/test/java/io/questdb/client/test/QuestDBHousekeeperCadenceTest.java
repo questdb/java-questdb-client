@@ -33,6 +33,7 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
 import java.io.File;
+import java.util.Arrays;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -71,7 +72,7 @@ public class QuestDBHousekeeperCadenceTest {
             Thread.sleep(2_600);
             int attempts = ((QuestDBImpl) db).getSenderPoolForTesting().startupRecoveryBuildAttemptsForTesting();
             Assert.assertTrue("about one attempt per second expected, got " + attempts
-                    + "; sf_dir=" + java.util.Arrays.toString(sfDir.list()), attempts >= 1 && attempts <= 5);
+                    + "; sf_dir=" + Arrays.toString(sfDir.list()), attempts >= 1 && attempts <= 5);
         }
     }
 
