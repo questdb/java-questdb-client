@@ -37,10 +37,12 @@ import java.io.IOException;
 import java.util.concurrent.TimeUnit;
 
 /**
- * The three probe methods the pool uses at release: {@code checkError()},
- * {@code hasRowInProgress()} and {@code pendingRowCount()}. Exercised on a
- * real WebSocket sender against the in-repo test server, which acks every
- * frame.
+ * The sender methods the pool relies on, exercised on a real WebSocket sender
+ * against the in-repo test server, which acks every frame: the probes it runs
+ * at release ({@code checkError()}, {@code hasRowInProgress()} and
+ * {@code pendingRowCount()}), the savepoint pair ({@code markSavepoint()} and
+ * {@code resetToSavepoint()}) behind a lease's {@code reset()}, the deferred
+ * flush of the commit window and the cap-bound byte trigger.
  */
 public class SenderProbeMethodsTest {
 
@@ -62,6 +64,9 @@ public class SenderProbeMethodsTest {
                     Assert.fail("six 1 KB rows do not fit a 4 KiB cap");
                 } catch (BatchTooLargeForCapException expected) {
                     // retained for retry, as the message says
+                    Assert.assertTrue(expected.getMessage(), expected.getMessage().contains("call reset()"));
+                    Assert.assertFalse("the detail leaves out the standalone remedy", expected.getDetail().contains("reset()"));
+                    Assert.assertTrue(expected.getDetail(), expected.getDetail().endsWith("serverMaxBatchSize=4096]"));
                 }
                 try {
                     sender.checkError();

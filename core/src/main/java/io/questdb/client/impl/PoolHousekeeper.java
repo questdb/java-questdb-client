@@ -37,7 +37,7 @@ final class PoolHousekeeper {
     // once: a finished scan, an empty one, or a transient failure such as an
     // unreachable server. The same cadence SenderPool's private driver uses, and
     // deliberately not the settle cadence, which can be 50 ms.
-    static final long STARTUP_RECOVERY_RETRY_MILLIS = 1_000L;
+    static final long STARTUP_RECOVERY_RETRY_MILLIS = SenderPool.RECOVERY_RETRY_INTERVAL_MILLIS;
     // How long stop() waits for the daemon to exit. Kept ABOVE
     // SenderPool.RECOVERY_DRAIN_BUDGET_MILLIS so a startup-recovery drain still
     // in flight when close() arrives finishes well within this join (C1 fix).

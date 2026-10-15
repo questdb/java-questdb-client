@@ -762,11 +762,15 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     /**
      * Marks the current buffer state as the point {@link #resetToSavepoint()}
      * rolls back to: rows appended after this call are discarded by that
-     * method, rows appended before it are kept. Any flush that ships the
-     * pending rows empties the savepoint, so a later {@code resetToSavepoint()}
-     * discards every pending row like {@link #reset()}. The pool marks a savepoint when it hands a
-     * slot to a borrower. Pure bookkeeping: it runs no error check. Default
-     * no-op.
+     * method, rows appended before it are kept. Take it between rows, not
+     * while a row is in progress. Any flush that ships the pending rows
+     * empties the savepoint, so a later {@code resetToSavepoint()} discards
+     * every pending row like {@link #reset()}. Pure bookkeeping: it runs no
+     * error check. Default no-op.
+     * <p>
+     * A pooled sender ignores this call: the pool marks a savepoint when it
+     * hands a slot to a borrower, and {@code resetToSavepoint()} on the pooled
+     * sender rolls back to that mark.
      */
     default void markSavepoint() {
     }
@@ -830,8 +834,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * data format) and want to continue sending new data without retrying the problematic data.
      * After calling this method, you can start building a new row by calling {@link #table(CharSequence)}.
      * <br>
-     * Supported by the HTTP and WebSocket transports; TCP does not support it. On a pooled
-     * sender this discards only the rows appended through the current lease, see
+     * Supported by the HTTP, WebSocket and UDP transports; TCP does not support it. On a
+     * pooled sender this discards only the rows appended through the current lease, see
      * {@link #resetToSavepoint()}.
      *
      * @see #flush()
@@ -842,10 +846,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * Discards the rows appended since the last {@link #markSavepoint()} and
      * keeps the rows buffered before it. Without a savepoint, or after a flush
      * emptied it, this discards every pending row like {@link #reset()}, and
-     * also removes the column definitions the server has not seen yet. A pooled
-     * sender's {@code reset()} calls this, so a borrower can drop its own bad batch without discarding
-     * rows earlier borrowers left in the shared slot buffer. Default calls
-     * {@code reset()}.
+     * also removes the column definitions the server has not seen yet. Default
+     * calls {@code reset()}.
+     * <p>
+     * On a pooled sender this is the lease-scoped {@code reset()}: it rolls
+     * back to the savepoint the pool marked at borrow, so a borrower can drop
+     * its own bad batch without discarding rows earlier borrowers left in the
+     * shared slot buffer.
      */
     default void resetToSavepoint() {
         reset();

@@ -135,7 +135,9 @@ public class QwpWebSocketSender implements Sender {
      * 90 percent of whatever batch cap the server advertises, and at no byte
      * threshold while it advertises none. The config-string default for the
      * WebSocket transport. An explicit {@code auto_flush_bytes=off} is {@code 0}
-     * and keeps byte flushing off whatever the server advertises.
+     * and keeps byte flushing off whatever the server advertises. Rows appended
+     * before the first handshake carry no byte trigger; the first append after it
+     * flushes the backlog.
      */
     public static final int AUTO_FLUSH_BYTES_SERVER_CAP = -1;
     public static final long DEFAULT_AUTH_TIMEOUT_MS = 15_000L;
@@ -462,8 +464,10 @@ public class QwpWebSocketSender implements Sender {
     // Optional owning-pool notification, relayed after the engine confirms the
     // flock release and slotLockReleased is visible to pool re-probes.
     private volatile Runnable slotLockReleaseListener;
-    // Pre-flight batch-cap rejection of the last flush attempt, kept until reset(),
-    // resetToSavepoint() or a successful flush clears it. Not a terminal: the
+    // Batch-cap rejection from a flush attempt's pre-flight. Cleared by reset(),
+    // resetToSavepoint() and by the next flush attempt whose batch passes the
+    // pre-flight, even when that attempt then fails for another reason, so an old
+    // rejection never outlives a batch the cap accepts. Not a terminal: the
     // standalone contract lets the caller reset() and carry on. checkError()
     // reports it so a pool can retire a slot whose batch no flush will ship.
     private BatchTooLargeForCapException retainedBatchRejection;
@@ -5272,6 +5276,8 @@ public class QwpWebSocketSender implements Sender {
                 flushPendingRowsSplit(deferCommit, combinedBodyStart, cap, deltaBaseline);
                 return;
             }
+            // The batch fits the cap: an earlier rejection no longer describes it.
+            retainedBatchRejection = null;
 
             // Write-ahead: durably persist this frame's new symbols BEFORE it is
             // published, so a recovered/orphan-drained slot can always rebuild the
@@ -5444,14 +5450,18 @@ public class QwpWebSocketSender implements Sender {
                         + "symbol for this data"
                         : "call reset() to discard the retained batch and keep this sender, close the "
                         + "sender to discard everything, or produce smaller batches";
-                throw new BatchTooLargeForCapException("single table batch too large for server batch cap")
-                        .put(" [table=").put(tableName)
+                BatchTooLargeForCapException rejection = new BatchTooLargeForCapException(
+                        "single table batch too large for server batch cap");
+                rejection.put(" [table=").put(tableName)
                         .put(", messageSize=").put(messageSize)
                         .put(", dictionaryFrameBytes=").put(frameOverhead)
-                        .put(", serverMaxBatchSize=").put(cap).put(']')
+                        .put(", serverMaxBatchSize=").put(cap).put(']');
+                // The pool recovers on its own and reports only the detail.
+                rejection.endDetail()
                         .put("; the batch is retained for retry and every flush() will "
                                 + "reject it again until a larger-cap node is reached -- ")
                         .put(remedy);
+                throw rejection;
             }
             // Mirror advanceSentMaxSymbolId: once the first frame ships the batch's
             // new ids, the remaining frames carry an empty delta above the baseline.
@@ -5459,6 +5469,9 @@ public class QwpWebSocketSender implements Sender {
                 simBaseline = currentBatchMaxSymbolId;
             }
         }
+        // Every split frame fits the cap: an earlier rejection no longer describes
+        // the batch.
+        retainedBatchRejection = null;
 
         int tableBodyOffset = combinedBodyStart;
         // Mirrors simBaseline above and advanceSentMaxSymbolId below, so the frame

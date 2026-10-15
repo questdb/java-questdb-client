@@ -130,10 +130,6 @@ public final class SenderPool implements AutoCloseable {
     // the dominant server-wide transient failure keeps its retry-the-same-
     // candidate behavior for the first attempts.
     private static final int RECOVERY_MAX_SLOT_FAILURE_STREAK = 3;
-    // A direct SenderPool has no PoolHousekeeper to retry a transient startup
-    // recovery failure. Its private driver waits this long between failed
-    // attempts so an unavailable server does not cause a hot retry loop.
-    private static final long RECOVERY_RETRY_INTERVAL_MILLIS = 1_000;
     // Hard cap on close()'s wait for a creation that is blocked in DNS, TCP,
     // TLS, or WebSocket setup. The creator retains ownership after this budget:
     // once construction returns, borrow() observes closed and tears down the
@@ -146,6 +142,11 @@ public final class SenderPool implements AutoCloseable {
     // shutdown join is capped at QueryWorker.SHUTDOWN_JOIN_MILLIS (same value)
     // regardless of user config.
     static final long MAX_CLOSE_LEASE_WAIT_MILLIS = 5_000;
+    // A direct SenderPool has no PoolHousekeeper to retry a transient startup
+    // recovery failure. Its private driver waits this long between failed
+    // attempts so an unavailable server does not cause a hot retry loop. The
+    // housekeeper waits the same between its own startup-recovery steps.
+    static final long RECOVERY_RETRY_INTERVAL_MILLIS = 1_000;
     private final long acquireTimeoutMillis;
     private final ArrayList<SenderSlot> all;
     private final ArrayDeque<SenderSlot> available;
@@ -1803,8 +1804,8 @@ public final class SenderPool implements AutoCloseable {
                     LOG.warn("settleIdle: flush threw an Error, retiring slot {}", lease.slot().slotIndex(), fatal);
                     retireLease(lease, " during settle");
                 } else if (overCap != null) {
-                    LOG.warn("settleIdle: slot {} holds a batch the server cap rejects, retiring it and dropping {} pending row(s): {}",
-                            lease.slot().slotIndex(), pendingRowsOf(lease.slot()), overCap.toString());
+                    LOG.error("settleIdle: slot {} holds a batch the server cap rejects, retiring it and dropping {} pending row(s): {}",
+                            lease.slot().slotIndex(), pendingRowsOf(lease.slot()), overCap.getDetail());
                     retireLease(lease, " during settle");
                 } else {
                     requeueSettled(lease);
@@ -2024,7 +2025,7 @@ public final class SenderPool implements AutoCloseable {
         } catch (Throwable t) {
             if (pendingAtRetire > 0) {
                 String error = t.toString();
-                LOG.warn("SenderPool: slot {} retired with {} unshipped row(s); delegate close failed: {}",
+                LOG.error("SenderPool: slot {} retired with {} unshipped row(s); delegate close failed: {}",
                         s.slotIndex(), pendingAtRetire, error);
             }
             // Best-effort teardown: a delegate close() can throw an Error

@@ -268,7 +268,11 @@ public final class PooledSender implements Sender {
                 typed.initCause(failure);
                 throw typed;
             }
-            String msg = failure.getMessage();
+            // A cap rejection's message ends with the standalone remedy, which does
+            // not apply to a retired slot: report only its detail.
+            String msg = failure instanceof BatchTooLargeForCapException
+                    ? ((BatchTooLargeForCapException) failure).getDetail()
+                    : failure.getMessage();
             boolean retryable = failure instanceof LineSenderException && ((LineSenderException) failure).isRetryable();
             LineSenderException wrapper = new LineSenderException("pooled sender close failed, slot retired with "
                     + pendingRowsAtRetire + " unshipped row(s): " + msg, retryable);
@@ -465,10 +469,10 @@ public final class PooledSender implements Sender {
     /**
      * Discards the rows appended through this lease and keeps the rows earlier
      * leases left in the slot's buffer: the pool marks a savepoint at borrow and
-     * this rolls back to it ({@link Sender#resetToSavepoint()}). After a
-     * {@code flush()} inside the lease every pending row is this lease's own and
-     * all of them go. Use it to drop a batch the server cannot accept, for
-     * example after a {@code BatchTooLargeForCapException}.
+     * this rolls back to it ({@link Sender#resetToSavepoint()}). After a flush
+     * inside the lease, explicit or by auto-flush, every pending row is this
+     * lease's own and all of them go. Use it to drop a batch the server cannot
+     * accept, for example after a {@code BatchTooLargeForCapException}.
      */
     @Override
     public void reset() {
