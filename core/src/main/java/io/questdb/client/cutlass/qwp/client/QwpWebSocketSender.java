@@ -339,6 +339,8 @@ public class QwpWebSocketSender implements Sender {
     // disables keepalive PINGs entirely.
     private long durableAckKeepaliveIntervalMillis =
             CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS;
+    // Idle keepalive PING cadence for the I/O loop; 0 or negative disables it.
+    private long keepaliveIntervalMillis = CursorWebSocketSendLoop.DEFAULT_KEEPALIVE_INTERVAL_MILLIS;
     // Effective per-batch soft-flush threshold in raw column-buffer bytes.
     // Initially equals autoFlushBytes; lowered to fit under the server's
     // advertised X-QWP-Max-Batch-Size at handshake so the wire payload stays
@@ -1223,7 +1225,7 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Master connect entry point — also accepts the poison-frame detector
+     * Connect entry point that also accepts the poison-frame detector
      * threshold ({@code max_frame_rejections}) and the symbol-dictionary
      * recycle knobs ({@code symbol_dict_reset}, {@code symbol_dict_reset_threshold},
      * {@code symbol_dict_reset_max_wait_millis}): consecutive server-active
@@ -1274,6 +1276,53 @@ public class QwpWebSocketSender implements Sender {
             int symbolDictResetThresholdSymbols,
             long symbolDictResetMaxWaitMillis
     ) {
+        return connectWithCredentialSupplier(endpoints, tlsConfig, autoFlushRows, autoFlushBytes,
+                autoFlushIntervalNanos, authorizationHeaderSupplier, requestDurableAck,
+                cursorEngine, closeFlushTimeoutMillis, reconnectMaxDurationMillis,
+                reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
+                initialConnectMode, errorHandler, errorInboxCapacity,
+                durableAckKeepaliveIntervalMillis, authTimeoutMs, connectTimeoutMs,
+                connectionListener, connectionListenerInboxCapacity,
+                maxFrameRejections, poisonMinEscalationWindowMillis,
+                catchUpCapGapMinEscalationWindowMillis,
+                symbolDictResetEnabled, symbolDictResetThresholdSymbols, symbolDictResetMaxWaitMillis,
+                CursorWebSocketSendLoop.DEFAULT_KEEPALIVE_INTERVAL_MILLIS);
+    }
+
+    /**
+     * Master connect entry point: the overload above plus the idle keepalive
+     * PING cadence ({@code keepalive_interval_millis}; {@code 0} or negative
+     * disables it).
+     */
+    public static QwpWebSocketSender connectWithCredentialSupplier(
+            List<Endpoint> endpoints,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            Supplier<String> authorizationHeaderSupplier,
+            boolean requestDurableAck,
+            CursorSendEngine cursorEngine,
+            long closeFlushTimeoutMillis,
+            long reconnectMaxDurationMillis,
+            long reconnectInitialBackoffMillis,
+            long reconnectMaxBackoffMillis,
+            Sender.InitialConnectMode initialConnectMode,
+            SenderErrorHandler errorHandler,
+            int errorInboxCapacity,
+            long durableAckKeepaliveIntervalMillis,
+            long authTimeoutMs,
+            int connectTimeoutMs,
+            SenderConnectionListener connectionListener,
+            int connectionListenerInboxCapacity,
+            int maxFrameRejections,
+            long poisonMinEscalationWindowMillis,
+            long catchUpCapGapMinEscalationWindowMillis,
+            boolean symbolDictResetEnabled,
+            int symbolDictResetThresholdSymbols,
+            long symbolDictResetMaxWaitMillis,
+            long keepaliveIntervalMillis
+    ) {
         if (symbolDictResetThresholdSymbols <= 0
                 || symbolDictResetThresholdSymbols > QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE / 2) {
             throw new LineSenderException("symbol_dict_reset_threshold must be > 0 and <= ")
@@ -1301,6 +1350,7 @@ public class QwpWebSocketSender implements Sender {
             sender.reconnectInitialBackoffMillis = reconnectInitialBackoffMillis;
             sender.reconnectMaxBackoffMillis = reconnectMaxBackoffMillis;
             sender.durableAckKeepaliveIntervalMillis = durableAckKeepaliveIntervalMillis;
+            sender.keepaliveIntervalMillis = keepaliveIntervalMillis;
             sender.maxFrameRejections = maxFrameRejections;
             sender.poisonMinEscalationWindowMillis = poisonMinEscalationWindowMillis;
             sender.catchUpCapGapMinEscalationWindowMillis = catchUpCapGapMinEscalationWindowMillis;
@@ -4896,6 +4946,7 @@ public class QwpWebSocketSender implements Sender {
                 errorDispatcher = new SenderErrorDispatcher(errorHandler, errorInboxCapacity);
             }
             cursorSendLoop.setErrorDispatcher(errorDispatcher);
+            cursorSendLoop.setKeepaliveIntervalMillis(keepaliveIntervalMillis);
             // Symmetric progress dispatcher: lazy-allocated mirror of the
             // error path. Wired before start() for the same reason -- the
             // I/O thread should never observe a null dispatcher between
