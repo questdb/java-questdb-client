@@ -117,6 +117,29 @@ public class SenderProbeMethodsTest {
         }
     }
 
+    @Test
+    public void testUnsetAutoFlushBytesShipsAtTheAdvertisedCap() throws Exception {
+        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+        try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+            server.setAdvertisedMaxBatchSize(16 * 1024);
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            // no auto_flush_bytes key: the sender binds its byte trigger to 90% of the 16 KiB cap
+            try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                    + ";auto_flush_rows=1000000;auto_flush_interval=60000;close_flush_timeout_millis=0;")) {
+                char[] wide = new char[1000];
+                java.util.Arrays.fill(wide, 'x');
+                String value = new String(wide);
+                for (int i = 0; i < 20; i++) {
+                    sender.table("t").stringColumn("s", value).atNow();
+                }
+                // 20 KB of rows against a 14.7 KB budget: the byte trigger shipped at least once
+                log.awaitDataFrames(1, 5_000);
+                Assert.assertTrue("rows left after the byte flush", sender.pendingRowCount() > 0 && sender.pendingRowCount() < 20);
+            }
+        }
+    }
+
     private static String config(int port) {
         return "ws::addr=localhost:" + port + ";auto_flush_bytes=off;auto_flush_rows=1000000;auto_flush_interval=60000;close_flush_timeout_millis=0;";
     }

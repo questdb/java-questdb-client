@@ -141,6 +141,30 @@ public class QuestDBFlushOnCloseTest {
         }
     }
 
+    @Test
+    public void testWideRowsAcrossLeasesShipAtTheServerCapNotAtTheRowThreshold() throws Exception {
+        FrameLog log = new FrameLog();
+        try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+            server.setAdvertisedMaxBatchSize(16 * 1024);
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            // settle 60 s, row threshold 1000: only the cap-bound byte trigger can ship inside the test
+            try (QuestDB db = QuestDB.connect(config(server.getPort(), "auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
+                String wide = wideValue(1000);
+                // initial_connect_retry=async: the cap is learned on the I/O thread's
+                // handshake, and rows appended before it carry no byte trigger. Keep
+                // appending (far below the 1000-row threshold) until a frame ships.
+                for (int i = 0; i < 200 && log.dataFrames() < 1; i++) {
+                    try (Sender s = db.borrowSender()) {
+                        s.table("t").stringColumn("s", wide).atNow();
+                    }
+                    Thread.sleep(10);
+                }
+                log.awaitDataFrames(1, 5_000);
+            }
+        }
+    }
+
     static void appendThreeRowsInThreeLeases(QuestDB db) {
         for (int i = 0; i < 3; i++) {
             try (Sender s = db.borrowSender()) {
@@ -156,6 +180,12 @@ public class QuestDBFlushOnCloseTest {
                 + ";initial_connect_retry=async"
                 + ";close_flush_timeout_millis=0;"
                 + extra;
+    }
+
+    public static String wideValue(int length) {
+        char[] chars = new char[length];
+        java.util.Arrays.fill(chars, 'x');
+        return new String(chars);
     }
 
     /**

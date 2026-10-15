@@ -98,7 +98,7 @@ import java.util.function.Supplier;
  * Configuration options:
  * <ul>
  *   <li>{@code autoFlushRows} - Maximum rows per batch (default: 1000)</li>
- *   <li>{@code autoFlushBytes} - Maximum bytes per batch (default: disabled)</li>
+ *   <li>{@code autoFlushBytes} - Maximum bytes per batch (default: bounded by the server's advertised cap, see {@link #AUTO_FLUSH_BYTES_SERVER_CAP})</li>
  *   <li>{@code autoFlushIntervalNanos} - Maximum age before auto-flush (default: 100ms)</li>
  * </ul>
  * <p>
@@ -130,6 +130,14 @@ import java.util.function.Supplier;
  */
 public class QwpWebSocketSender implements Sender {
 
+    /**
+     * {@code autoFlushBytes} value meaning "no byte budget of its own": flush at
+     * 90 percent of whatever batch cap the server advertises, and at no byte
+     * threshold while it advertises none. The config-string default for the
+     * WebSocket transport. An explicit {@code auto_flush_bytes=off} is {@code 0}
+     * and keeps byte flushing off whatever the server advertises.
+     */
+    public static final int AUTO_FLUSH_BYTES_SERVER_CAP = -1;
     public static final long DEFAULT_AUTH_TIMEOUT_MS = 15_000L;
     // Soft per-batch byte budget. Trips a flush when raw column-buffer bytes
     // cross the threshold, well before the server's 16 MB wire cap. Wide-row
@@ -681,12 +689,13 @@ public class QwpWebSocketSender implements Sender {
         this.autoFlushBytes = autoFlushBytes;
         // Until the handshake completes, honor the configured budget verbatim.
         // applyServerBatchSizeLimit() clamps this on connect once the server's
-        // X-QWP-Max-Batch-Size is known.
-        this.effectiveAutoFlushBytes = autoFlushBytes;
+        // X-QWP-Max-Batch-Size is known. A cap-bound sender (-1) has no budget of
+        // its own before that.
+        this.effectiveAutoFlushBytes = Math.max(0, autoFlushBytes);
         this.autoFlushIntervalNanos = autoFlushIntervalNanos;
         this.globalSymbolDictionary = new GlobalSymbolDictionary();
 
-        int microbatchBufferSize = Math.max(DEFAULT_MICROBATCH_BUFFER_SIZE, autoFlushBytes * 2);
+        int microbatchBufferSize = Math.max(DEFAULT_MICROBATCH_BUFFER_SIZE, Math.max(0, autoFlushBytes) * 2);
         try {
             this.buffer0 = new MicrobatchBuffer(microbatchBufferSize);
             this.buffer1 = new MicrobatchBuffer(microbatchBufferSize);
@@ -1368,7 +1377,7 @@ public class QwpWebSocketSender implements Sender {
      * @param host                   server host (not connected)
      * @param port                   server port (not connected)
      * @param autoFlushRows          rows per batch (0 = no limit)
-     * @param autoFlushBytes         bytes per batch (0 = no limit)
+     * @param autoFlushBytes         bytes per batch (0 = no limit, -1 = 90 percent of the server's advertised cap)
      * @param autoFlushIntervalNanos age before flush in nanos (0 = no limit)
      * @return unconnected sender
      */
@@ -2423,7 +2432,9 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Returns the auto-flush byte threshold.
+     * Returns the configured auto-flush byte threshold: a positive budget, {@code 0} for off,
+     * or {@link #AUTO_FLUSH_BYTES_SERVER_CAP}. See {@link #getEffectiveAutoFlushBytes()} for
+     * the value in force.
      */
     public int getAutoFlushBytes() {
         return autoFlushBytes;
@@ -3870,21 +3881,24 @@ public class QwpWebSocketSender implements Sender {
      * in {@link #sendRow} fires against the freshly advertised value. The
      * byte trigger, however, is only adjusted when the user left it enabled:
      * an explicit {@code auto_flush_bytes=off} (autoFlushBytes == 0) is
-     * preserved even when the server advertises a cap, so applications that
-     * opted out keep the contract they asked for.
+     * preserved even when the server advertises a cap, and a sender built with
+     * {@link #AUTO_FLUSH_BYTES_SERVER_CAP} takes the 90 percent budget as its only byte trigger,
+     * so applications that opted out keep the contract they asked for.
      */
     @TestOnly
     public void applyServerBatchSizeLimit(int advertisedMaxBatchSize) {
         serverMaxBatchSize = advertisedMaxBatchSize;
-        if (autoFlushBytes <= 0) {
-            // User opted out of byte-based auto-flush; respect that even when
-            // the server advertises a cap. The single-row guard still protects
-            // against oversize individual rows via serverMaxBatchSize.
+        if (autoFlushBytes == 0) {
+            // Explicit auto_flush_bytes=off: respect it even when the server
+            // advertises a cap. The single-row guard still protects against
+            // oversize individual rows via serverMaxBatchSize.
             effectiveAutoFlushBytes = 0;
             return;
         }
         if (advertisedMaxBatchSize <= 0) {
-            effectiveAutoFlushBytes = autoFlushBytes;
+            // Older build, no header: the configured budget verbatim, and no
+            // byte trigger at all for a sender bound to a cap it cannot see.
+            effectiveAutoFlushBytes = Math.max(0, autoFlushBytes);
             return;
         }
         // Cap at 90% of the server's hard limit. Raw column-buffer bytes are
@@ -3892,7 +3906,7 @@ public class QwpWebSocketSender implements Sender {
         // payload), but schema and dict-delta overhead can push the wire size
         // above the raw total in pathological cases.
         long safeBudget = (long) advertisedMaxBatchSize * 9 / 10;
-        if (autoFlushBytes < safeBudget) {
+        if (autoFlushBytes > 0 && autoFlushBytes < safeBudget) {
             effectiveAutoFlushBytes = autoFlushBytes;
         } else {
             effectiveAutoFlushBytes = (int) safeBudget;

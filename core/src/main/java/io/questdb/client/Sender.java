@@ -1131,7 +1131,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private static final int DEFAULT_TCP_PORT = 9009;
         private static final int DEFAULT_UDP_PORT = 9007;
         private static final int DEFAULT_WEBSOCKET_PORT = 9000;
-        private static final int DEFAULT_WS_AUTO_FLUSH_BYTES = 0;
+        private static final int DEFAULT_WS_AUTO_FLUSH_BYTES = QwpWebSocketSender.AUTO_FLUSH_BYTES_SERVER_CAP;
         private static final long DEFAULT_WS_AUTO_FLUSH_INTERVAL_NANOS = 100_000_000L; // 100ms
         private static final int DEFAULT_WS_AUTO_FLUSH_ROWS = 1_000;
         // Cadence at which the SF cursor I/O loop sends a keepalive PING
