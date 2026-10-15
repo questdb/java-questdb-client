@@ -493,9 +493,9 @@ public class ConnectionHealthTest {
                     Assert.assertTrue(h.getFailedRounds() >= 2);
                     Assert.assertFalse("no credential may appear: " + h, h.toString().contains(SENTINEL));
 
-                    // back to connected
-                    providerMode.set("ok");
+                    // Accept upgrades before restoring tokens to avoid another authentication failure.
                     rejectWith.set(0);
+                    providerMode.set("ok");
                     await(() -> sender.health().getState() == ConnectionHealth.State.CONNECTED, 10_000, "recovered");
                     h = sender.health();
                     Assert.assertEquals(ConnectionHealth.NONE, h.getOutageSinceEpochMillis());
