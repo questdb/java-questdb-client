@@ -146,7 +146,8 @@ public final class PooledSender implements Sender {
      * the rows stay in the slot's buffer and go out when an auto-flush
      * threshold trips on a later append or when the pool's housekeeper settles
      * the idle slot. With {@code flush_on_close=on} the rows are flushed first,
-     * as before 1.4. Does not close the underlying {@link Sender}; that only
+     * as before 1.4. {@link #reset()} on a lease discards only that lease's rows.
+     * Does not close the underlying {@link Sender}; that only
      * happens when the owning {@code QuestDB} is closed. If the pool is already
      * shutting down when this lease comes home, the underlying Sender is torn
      * down here, on the calling thread, which ships whatever it still buffers.
@@ -412,9 +413,17 @@ public final class PooledSender implements Sender {
         return slot.live(generation).pendingRowCount();
     }
 
+    /**
+     * Discards the rows appended through this lease and keeps the rows earlier
+     * leases left in the slot's buffer: the pool marks a savepoint at borrow and
+     * this rolls back to it ({@link Sender#resetToSavepoint()}). After a
+     * {@code flush()} inside the lease every pending row is this lease's own and
+     * all of them go. Use it to drop a batch the server cannot accept, for
+     * example after a {@code BatchTooLargeForCapException}.
+     */
     @Override
     public void reset() {
-        slot.live(generation).reset();
+        slot.live(generation).resetToSavepoint();
     }
 
     @Override

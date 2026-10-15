@@ -95,6 +95,31 @@ public class QuestDBFlushOnCloseTest {
     }
 
     @Test
+    public void testLaterLeaseResetKeepsEarlierLeasesRows() throws Exception {
+        FrameLog log = new FrameLog();
+        try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            try (QuestDB db = QuestDB.connect(config(server.getPort(), "auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
+                try (Sender a = db.borrowSender()) {
+                    a.table("t1").longColumn("v", 1L).atNow();
+                }
+                try (Sender b = db.borrowSender()) {
+                    b.table("t2").longColumn("v", 2L).atNow();
+                    b.reset();                                       // B drops its own bad batch
+                }
+                try (Sender c = db.borrowSender()) {
+                    Assert.assertEquals("A's row is still buffered", 1, c.pendingRowCount());
+                    c.flush();
+                }
+                log.awaitDataFrames(1, 5_000);
+                Assert.assertEquals("one frame, one table: t1 only", 1, log.tableCount(0));
+                Assert.assertEquals(1, log.dataFrames());
+            }
+        }
+    }
+
+    @Test
     public void testSettleShipsOnDefaultCadenceWhenIntervalUnset() throws Exception {
         FrameLog log = new FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {

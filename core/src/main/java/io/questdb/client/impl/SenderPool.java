@@ -1249,6 +1249,10 @@ public final class SenderPool implements AutoCloseable {
                     // wrapper handed out can be told apart from any prior,
                     // now-stale borrow of the same slot.
                     s.bumpGeneration();
+                    // Lease-scoped reset: the borrower's reset() rolls back to here, so rows
+                    // earlier leases left in this buffer survive it. Pure bookkeeping on the
+                    // delegate, no error check, no throw path while the lock is held.
+                    s.delegate().markSavepoint();
                     return new PooledSender(s, s.generation());
                 }
                 if (all.size() + inFlightCreations + closingSlots + leakedSlots + recoveringSlots < maxSize) {

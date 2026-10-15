@@ -55,6 +55,7 @@ class RecordingSender implements Sender {
     volatile int pendingRows;
     volatile boolean rowInProgress;
     volatile long rowsAppended;
+    volatile int savepointRows;
 
     @Override
     public void at(long timestamp, ChronoUnit unit) {
@@ -150,6 +151,7 @@ class RecordingSender implements Sender {
             flushCount.incrementAndGet();
         }
         pendingRows = 0;
+        savepointRows = 0;
         deferredFramesOpen = false;
     }
 
@@ -165,6 +167,7 @@ class RecordingSender implements Sender {
             return -1L;                       // nothing pending: the real sender publishes nothing
         }
         pendingRows = 0;
+        savepointRows = 0;
         deferredFramesOpen = true;
         return deferredFlushCount.incrementAndGet();
     }
@@ -205,6 +208,11 @@ class RecordingSender implements Sender {
     }
 
     @Override
+    public void markSavepoint() {
+        savepointRows = pendingRows;
+    }
+
+    @Override
     public int pendingRowCount() {
         return pendingRows;
     }
@@ -212,6 +220,13 @@ class RecordingSender implements Sender {
     @Override
     public void reset() {
         pendingRows = 0;
+        savepointRows = 0;
+        rowInProgress = false;
+    }
+
+    @Override
+    public void resetToSavepoint() {
+        pendingRows = savepointRows;
         rowInProgress = false;
     }
 

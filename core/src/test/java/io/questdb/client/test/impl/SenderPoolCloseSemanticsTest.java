@@ -220,6 +220,28 @@ public class SenderPoolCloseSemanticsTest {
     }
 
     @Test
+    public void testResetDiscardsOnlyTheResettingLeasesRows() {
+        List<RecordingSender> built = new ArrayList<>();
+        try (SenderPool pool = newPool(1, 1, built)) {
+            try (Sender a = pool.borrow()) {
+                a.table("t").longColumn("v", 1L).atNow();
+            }
+            RecordingSender delegate = built.get(0);
+            Assert.assertEquals("close() shipped nothing", 1, delegate.pendingRowCount());
+            try (Sender b = pool.borrow()) {
+                Assert.assertEquals("same slot", 1, built.size());
+                b.table("t").longColumn("v", 2L).atNow();
+                Assert.assertEquals(2, delegate.pendingRowCount());
+                b.reset();
+                Assert.assertEquals("A's row survives B's reset", 1, delegate.pendingRowCount());
+            }
+            Assert.assertEquals(1, pool.settleIdle());
+            Assert.assertEquals(1, delegate.flushCount.get());
+            Assert.assertEquals(0, delegate.pendingRowCount());
+        }
+    }
+
+    @Test
     public void testStaleCloseDoesNotTouchReborrowedSlot() {
         List<RecordingSender> built = new ArrayList<>();
         try (SenderPool pool = newPool(1, 1, built)) {
@@ -238,6 +260,25 @@ public class SenderPoolCloseSemanticsTest {
             second.atNow();
             second.close();
             Assert.assertEquals(1, pool.availableSize());
+        }
+    }
+
+    @Test
+    public void testStaleResetDoesNotTouchReborrowedSlot() {
+        List<RecordingSender> built = new ArrayList<>();
+        try (SenderPool pool = newPool(1, 1, built)) {
+            Sender first = pool.borrow();
+            first.close();
+            try (Sender second = pool.borrow()) {
+                second.table("t").longColumn("v", 1L).atNow();
+                try {
+                    first.reset();
+                    Assert.fail("a stale lease must not reset the slot");
+                } catch (IllegalStateException expected) {
+                    // "sender handle is closed (returned to the pool)"
+                }
+                Assert.assertEquals(1, built.get(0).pendingRowCount());
+            }
         }
     }
 
