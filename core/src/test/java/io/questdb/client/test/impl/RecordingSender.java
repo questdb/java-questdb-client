@@ -50,6 +50,7 @@ class RecordingSender implements Sender {
     volatile RuntimeException deferredFlushError; // thrown by flushDeferred() when set
     volatile boolean deferredFramesOpen;
     volatile RuntimeException flushError;      // thrown by flush() when set
+    volatile Error flushFatal;                 // thrown by flush() when set, before flushError
     volatile CountDownLatch flushGate;         // flush() blocks on it when set
     volatile RuntimeException latchedError;    // thrown by checkError() when set
     volatile int pendingRows;
@@ -141,6 +142,10 @@ class RecordingSender implements Sender {
     @Override
     public void flush() {
         awaitGate();
+        Error fatal = flushFatal;
+        if (fatal != null) {
+            throw fatal;
+        }
         RuntimeException e = flushError;
         if (e != null) {
             throw e;

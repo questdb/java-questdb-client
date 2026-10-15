@@ -68,6 +68,21 @@ public class SenderPoolSettleTest {
     }
 
     @Test
+    public void testSettleRetiresSlotWhenFlushThrowsAnError() {
+        List<RecordingSender> built = new ArrayList<>();
+        try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(1, 1, built)) {
+            try (Sender s = pool.borrow()) {
+                s.table("t").longColumn("v", 1L).atNow();
+            }
+            RecordingSender delegate = built.get(0);
+            delegate.flushFatal = new AssertionError("buffer invariant broken");
+            Assert.assertEquals(0, pool.settleIdle());
+            Assert.assertEquals("an Error is not transient: the slot is retired", 0, pool.totalSize());
+            Assert.assertEquals(1, delegate.closeCount.get());
+        }
+    }
+
+    @Test
     public void testSettleShipsRowsLeftInIdleSlot() throws Exception {
         List<RecordingSender> built = new ArrayList<>();
         try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(1, 1, built)) {

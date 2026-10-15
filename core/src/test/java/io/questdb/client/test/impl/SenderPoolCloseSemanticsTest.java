@@ -87,6 +87,29 @@ public class SenderPoolCloseSemanticsTest {
     }
 
     @Test
+    public void testCloseWrapperKeepsTheDelegatesRetryableFlag() {
+        List<RecordingSender> built = new ArrayList<>();
+        try (SenderPool pool = newPool(1, 1, built)) {
+            Sender first = pool.borrow();
+            built.get(0).latchedError = new LineSenderException("transient wire", true);
+            try {
+                first.close();
+                Assert.fail("close() must rethrow the latched error");
+            } catch (LineSenderException e) {
+                Assert.assertTrue("a retryable cause makes a retryable wrapper", e.isRetryable());
+            }
+            Sender second = pool.borrow();
+            built.get(1).latchedError = new LineSenderException("permanent", false);
+            try {
+                second.close();
+                Assert.fail("close() must rethrow the latched error");
+            } catch (LineSenderException e) {
+                Assert.assertFalse("a non-retryable cause makes a non-retryable wrapper", e.isRetryable());
+            }
+        }
+    }
+
+    @Test
     public void testFlushOnCloseRestoresShippingAtClose() {
         List<RecordingSender> built = new ArrayList<>();
         try (SenderPool pool = newPool(1, 1, built)) {
@@ -216,6 +239,25 @@ public class SenderPoolCloseSemanticsTest {
                 Assert.assertSame(original, e.getCause());
             }
             Assert.assertEquals(0, pool.totalSize());
+        }
+    }
+
+    @Test
+    public void testResetAfterAFlushInsideTheLeaseDropsEveryPendingRow() {
+        List<RecordingSender> built = new ArrayList<>();
+        try (SenderPool pool = newPool(1, 1, built)) {
+            try (Sender a = pool.borrow()) {
+                a.table("t").longColumn("v", 1L).atNow();
+            }
+            RecordingSender delegate = built.get(0);
+            try (Sender b = pool.borrow()) {
+                b.table("t").longColumn("v", 2L).atNow();
+                b.flush();
+                Assert.assertEquals("the flush shipped both rows", 1, delegate.flushCount.get());
+                b.table("t").longColumn("v", 3L).atNow();
+                b.reset();
+                Assert.assertEquals("the flush emptied the savepoint, so reset drops every pending row", 0, delegate.pendingRowCount());
+            }
         }
     }
 
