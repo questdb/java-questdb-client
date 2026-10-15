@@ -258,18 +258,19 @@ public class QwpTableBuffer implements QuietCloseable {
     }
 
     /**
+     * Row count recorded by the last {@link #markSavepoint()}; {@code 0} when
+     * none was taken since the buffer was last reset, cleared or
+     * retained a row in progress.
+     */
+    public int getSavepointRowCount() {
+        return savepointRowCount;
+    }
+
+    /**
      * Returns the table name.
      */
     public String getTableName() {
         return tableName;
-    }
-
-    /**
-     * Row count recorded by the last {@link #markSavepoint()}; {@code 0} when
-     * none was taken since the buffer was last reset or cleared.
-     */
-    public int getSavepointRowCount() {
-        return savepointRowCount;
     }
 
     /**
@@ -407,7 +408,8 @@ public class QwpTableBuffer implements QuietCloseable {
      * Columns the mark did not see are closed and removed: the server has not
      * seen them either, so they must not pad the retained rows. Without a mark
      * since the last {@link #reset()} this drops every row and keeps the column
-     * definitions, which is what {@code reset()} does; on a buffer that was never
+     * definitions, which is what {@code reset()} does, including keeping a retained
+     * column's geohash precision; on a buffer that was never
      * marked or reset it also removes every column, since the server has seen
      * none of them.
      */
@@ -427,7 +429,12 @@ public class QwpTableBuffer implements QuietCloseable {
             rebuildColumnAccessStructures();
         }
         for (int i = 0, n = columns.size(); i < n; i++) {
-            fastColumns[i].truncateTo(savepointRowCount);
+            ColumnBuffer col = fastColumns[i];
+            // truncateTo clears the geohash precision of a column it empties; a
+            // retained column is known to the server, which has locked it.
+            int geohashPrecisionBefore = col.geohashPrecision;
+            col.truncateTo(savepointRowCount);
+            col.geohashPrecision = geohashPrecisionBefore;
         }
         rowCount = savepointRowCount;
         committedColumnCount = columns.size();
