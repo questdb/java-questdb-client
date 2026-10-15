@@ -2258,6 +2258,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     recordFatal(e);
                     throw (Error) e;
                 }
+                // The factory publishes CONNECTED after upgrade, but swapClient can still lose the transport
+                // during dictionary catch-up. Publish that loss before backoff or another credential pull.
+                io.questdb.client.cutlass.qwp.client.QwpConnectionHealthTracker tracker = healthTracker;
+                if (tracker != null) {
+                    tracker.connectionLost();
+                }
                 if (!isCatchUpCapGap(e)) {
                     resetCatchUpCapGapEpisode();
                 }

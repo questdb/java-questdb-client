@@ -25,15 +25,21 @@
 package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.ConnectionHealth;
+import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.QuestDB;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.auth.TokenUnavailableException;
+import io.questdb.client.cutlass.http.client.WebSocketClientFactory;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
 import io.questdb.client.cutlass.qwp.client.QwpEgressMsgKind;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
+import io.questdb.client.network.NetworkFacade;
+import io.questdb.client.network.NetworkFacadeImpl;
+import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.cutlass.qwp.client.WebSocketDynamicCredentialTest.ErrorCollector;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
@@ -350,6 +356,79 @@ public class ConnectionHealthTest {
     }
 
     @Test(timeout = 60_000)
+    public void testSenderHealthIsReconnectingWhenDictionaryCatchUpLosesItsConnection() throws Exception {
+        assertMemoryLeak(() -> {
+            CatchUpFailingNetworkFacade networkFacade = new CatchUpFailingNetworkFacade();
+            DefaultHttpClientConfiguration configuration = new DefaultHttpClientConfiguration() {
+                @Override
+                public NetworkFacade getNetworkFacade() {
+                    return networkFacade;
+                }
+            };
+            CountDownLatch pullHeld = new CountDownLatch(1);
+            CountDownLatch release = new CountDownLatch(1);
+            try (TestWebSocketServer server = startServer(new WebSocketDynamicCredentialTest.AckHandler());
+                 Sender sender = Sender.builder(Sender.Transport.WEBSOCKET)
+                         .address("localhost:" + server.getPort())
+                         .symbolDictReset(false)
+                         .reconnectInitialBackoffMillis(10)
+                         .reconnectMaxBackoffMillis(20)
+                         .closeFlushTimeoutMillis(0)
+                         .httpTokenProvider(() -> {
+                             if (networkFacade.hasFailed.get()) {
+                                 pullHeld.countDown();
+                                 try {
+                                     if (!release.await(30, TimeUnit.SECONDS)) {
+                                         throw TokenUnavailableException.retryable("credential pull timed out");
+                                     }
+                                 } catch (InterruptedException e) {
+                                     Thread.currentThread().interrupt();
+                                     throw TokenUnavailableException.retryable("credential pull interrupted");
+                                 }
+                             }
+                             return SENTINEL;
+                         })
+                         .build()) {
+                try {
+                    // Populate the dictionary through the producer API, so reconnect must send catch-up.
+                    sender.table("t").symbol("s", "sym0").longColumn("v", 1).atNow();
+                    long first = sender.flushAndGetSequence();
+                    Assert.assertTrue("the initial row must reach the server", sender.awaitAckedFsn(first, 10_000));
+                    Assert.assertTrue(((QwpWebSocketSender) sender).isDeltaDictEnabledForTest());
+                    Assert.assertEquals(ConnectionHealth.State.CONNECTED, sender.health().getState());
+
+                    ((QwpWebSocketSender) sender).setClientFactoryOverride(
+                            () -> WebSocketClientFactory.newPlainTextInstance(configuration));
+                    server.dropAllConnections();
+                    Assert.assertTrue("the next credential pull follows the catch-up failure",
+                            pullHeld.await(10, TimeUnit.SECONDS));
+                    Assert.assertTrue("the replacement must complete a real upgrade", server.upgradeRequestCount() >= 2);
+                    Assert.assertEquals("shut down the real catch-up transport", 0, networkFacade.shutdownResult);
+                    Assert.assertTrue("the production socket send must fail", networkFacade.failedSendResult < 0);
+
+                    sender.table("t").symbol("s", "sym1").longColumn("v", 2).atNow();
+                    long queued = sender.flushAndGetSequence();
+                    Assert.assertFalse("no delivery while the credential pull is held", sender.awaitAckedFsn(queued, 100));
+                    ConnectionHealth h = sender.health();
+                    Assert.assertEquals(h.toString(), ConnectionHealth.State.RECONNECTING, h.getState());
+                    Assert.assertNotEquals("catch-up transport loss must start an outage: " + h,
+                            ConnectionHealth.NONE, h.getOutageSinceEpochMillis());
+                    Assert.assertEquals("the next connect round has not failed", 0, h.getFailedRounds());
+
+                    release.countDown();
+                    Assert.assertTrue("the buffered row must reach the server after recovery",
+                            sender.awaitAckedFsn(queued, 10_000));
+                    await(() -> sender.health().getState() == ConnectionHealth.State.CONNECTED, 10_000, "reconnected");
+                    Assert.assertEquals(ConnectionHealth.NONE, sender.health().getOutageSinceEpochMillis());
+                    Assert.assertEquals(0, sender.health().getFailedRounds());
+                } finally {
+                    release.countDown();
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 60_000)
     public void testSenderHealthMovesThroughEveryState() throws Exception {
         // C21: connecting -> connected -> reconnecting (with 401 and credential-unavailable failures) ->
         // connected. outage_since and failed_rounds reset on recovery; last_failure is kept; no credential appears.
@@ -469,6 +548,24 @@ public class ConnectionHealthTest {
         server.start();
         Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
         return server;
+    }
+
+    private static final class CatchUpFailingNetworkFacade extends NetworkFacadeImpl {
+        private final AtomicBoolean hasFailed = new AtomicBoolean();
+        private int failedSendResult;
+        private int shutdownResult;
+
+        @Override
+        public int sendRaw(int fd, long buffer, int bufferLen) {
+            // Let the HTTP upgrade pass, then break the first binary send on the replacement connection.
+            if (bufferLen > 0 && Unsafe.getUnsafe().getByte(buffer) == (byte) 0x82
+                    && hasFailed.compareAndSet(false, true)) {
+                shutdownResult = shutdown(fd);
+                failedSendResult = super.sendRaw(fd, buffer, bufferLen);
+                return failedSendResult;
+            }
+            return super.sendRaw(fd, buffer, bufferLen);
+        }
     }
 
     // Answers like ExecDoneHandler but, while drop is set, drops the connection a query arrives on.
