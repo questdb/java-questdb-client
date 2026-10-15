@@ -144,6 +144,12 @@ public interface QuestDB extends Closeable {
      * later). Call {@link Sender#flush()} to ship now and
      * {@link Sender#drain(long)} to wait for the server. Set
      * {@code flush_on_close=on} to have {@code close()} flush, as before 1.4.
+     * With the default, one frame carries the rows of every lease that closed
+     * since the last ship, so a server rejection of that frame discards those
+     * leases' rows together; the error is logged by the error handler and thrown
+     * by a later call on that slot. Call {@link Sender#flush()} before close, or
+     * set {@code flush_on_close=on}, when a lease's rows must not share a frame.
+     * {@link Sender#reset()} on a pooled Sender discards only that lease's rows.
      * Note that in this client "flush" means published to the store-and-forward
      * ring, not acknowledged by the server. A real disconnect only happens at
      * {@link #close()} on this {@code QuestDB} handle.

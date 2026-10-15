@@ -25,9 +25,11 @@
 package io.questdb.client.test;
 
 import io.questdb.client.QuestDB;
+import io.questdb.client.LineSenderServerException;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.BatchTooLargeForCapException;
+import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.impl.PooledSender;
 import io.questdb.client.test.cutlass.qwp.client.QwpWireTestUtils;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
@@ -242,6 +244,53 @@ public class QuestDBFlushOnCloseTest {
     }
 
     @Test
+    public void testTerminalRejectionDropsEveryLeaseRowInTheFrame() throws Exception {
+        RejectFirstFrameHandler handler = new RejectFirstFrameHandler();
+        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            try (QuestDB db = QuestDB.connect(config(server.getPort(), "auto_flush_interval=60000;housekeeper_interval_ms=60000;")
+                    + "reconnect_max_duration_millis=500;reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=50;")) {
+                try (Sender a = db.borrowSender()) {
+                    a.table("t1").longColumn("v", 1L).atNow();       // a clean row
+                }
+                try (Sender b = db.borrowSender()) {
+                    b.table("t2").longColumn("v", 2L).atNow();       // the row the server will reject
+                }
+                LineSenderServerException seen = null;
+                long deadline = System.currentTimeMillis() + 5_000;
+                for (int i = 0; seen == null && System.currentTimeMillis() < deadline; i++) {
+                    try (Sender c = db.borrowSender()) {
+                        if (i == 0) {
+                            c.flush();                                // ships A's and B's rows in ONE frame
+                        } else {
+                            c.table("t1").longColumn("v", 3L).atNow();
+                        }
+                    } catch (LineSenderServerException e) {
+                        seen = e;
+                    } catch (LineSenderException e) {
+                        if (!(e.getCause() instanceof LineSenderServerException)) {
+                            throw e;
+                        }
+                        seen = (LineSenderServerException) e.getCause();
+                    }
+                    Thread.sleep(20);
+                }
+                Assert.assertNotNull("the terminal surfaces on a later lease, not on A or B", seen);
+                Assert.assertEquals("both leases' rows shared the rejected frame", 1, handler.firstConnectionDataFrames());
+                Assert.assertEquals(2, handler.firstConnectionTableCount());
+                try (Sender d = db.borrowSender()) {
+                    d.table("t1").longColumn("v", 4L).atNow();
+                    d.flush();
+                }
+                handler.awaitLaterConnectionFrames(1, 5_000);
+                Assert.assertEquals("nothing is replayed after a terminal: only D's frame arrives on the fresh slot",
+                        1, handler.laterConnectionDataFrames());
+            }
+        }
+    }
+
+    @Test
     public void testThresholdOnLaterLeaseShipsEarlierRows() throws Exception {
         FrameLog log = new FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
@@ -413,6 +462,68 @@ public class QuestDBFlushOnCloseTest {
                 }
             }
             throw new AssertionError("no data frame at index " + dataFrameIndex);
+        }
+    }
+
+    /**
+     * First connection: NACKs its first data frame with SCHEMA_MISMATCH (a
+     * terminal) and acks nothing else. Later connections: ack everything and
+     * count their data frames, so a replay would show up there.
+     */
+    private static final class RejectFirstFrameHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private static final int OFFSET_TABLE_COUNT = 6;
+        private int connections;
+        private TestWebSocketServer.ClientHandler currentClient;
+        private int firstConnectionDataFrames;
+        private int firstConnectionTableCount;
+        private int laterConnectionDataFrames;
+        private long nextSeq;
+
+        void awaitLaterConnectionFrames(int atLeast, long timeoutMillis) throws InterruptedException {
+            long deadline = System.currentTimeMillis() + timeoutMillis;
+            while (laterConnectionDataFrames() < atLeast && System.currentTimeMillis() < deadline) {
+                Thread.sleep(10);
+            }
+        }
+
+        synchronized int firstConnectionDataFrames() {
+            return firstConnectionDataFrames;
+        }
+
+        synchronized int firstConnectionTableCount() {
+            return firstConnectionTableCount;
+        }
+
+        synchronized int laterConnectionDataFrames() {
+            return laterConnectionDataFrames;
+        }
+
+        @Override
+        public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            if (currentClient != client) {
+                currentClient = client;
+                connections++;
+                nextSeq = 0;
+            }
+            long seq = nextSeq++;
+            int tableCount = data.length >= 8 ? ((data[OFFSET_TABLE_COUNT] & 0xFF) | ((data[OFFSET_TABLE_COUNT + 1] & 0xFF) << 8)) : 0;
+            try {
+                if (connections == 1) {
+                    if (tableCount > 0) {
+                        firstConnectionDataFrames++;
+                        firstConnectionTableCount = tableCount;
+                        client.sendBinary(QwpWireTestUtils.buildNack(seq, WebSocketResponse.STATUS_SCHEMA_MISMATCH));
+                    }
+                    // rowless frames on the first connection: no ack, no nack
+                } else {
+                    if (tableCount > 0) {
+                        laterConnectionDataFrames++;
+                    }
+                    client.sendBinary(QwpWireTestUtils.buildAck(seq));
+                }
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
         }
     }
 }

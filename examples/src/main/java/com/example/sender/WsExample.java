@@ -9,8 +9,7 @@ import io.questdb.client.Sender;
  * The pooled {@link Sender} is the recommended way to ingest: one
  * {@code QuestDB} handle, created once and shared across threads, owns a pool
  * of senders that stay connected between uses. Take one with
- * {@link QuestDB#borrowSender()} -- a lease per use: {@code close()} flushes
- * pending rows and returns the sender to the pool (it does NOT disconnect).
+ * {@link QuestDB#borrowSender()} -- a lease per use: {@code close()} returns the sender to the pool (it does NOT disconnect or flush; rows ship on the next auto-flush threshold or the pool's settle, or on an explicit {@code flush()}).
  * Borrow one per producer thread, or once per batch, and close it when done.
  * <p>
  * A {@code Sender} is not thread-safe, so no two threads may share one -- the
@@ -23,8 +22,8 @@ public class WsExample {
     public static void main(String[] args) {
         try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;")) {
 
-            // Borrowed: lease per use. try-with-resources close() flushes and
-            // returns the sender to the pool for reuse.
+            // Borrowed: lease per use. try-with-resources close() returns the
+            // sender to the pool for reuse; flush() below ships the batch.
             try (Sender sender = db.borrowSender()) {
                 sender.table("trades")
                         .symbol("symbol", "ETH-USD")
@@ -46,10 +45,9 @@ public class WsExample {
                             .doubleColumn("amount", 0.001)
                             .atNow();
                 }
-                // Hand the buffered rows to the send engine. Auto-flush would
-                // also do this on the row/time thresholds; an explicit flush()
-                // makes the batch boundary deterministic. close() flushes too,
-                // so this call is optional here.
+                // Hand the buffered rows to the send engine. Auto-flush would also do
+                // this on the row/byte/time thresholds, and the pool settles an idle
+                // slot; an explicit flush() makes the batch boundary deterministic.
                 sender.flush();
             }
 

@@ -13,8 +13,7 @@ import io.questdb.client.Sender;
  * thread its own.
  * <p>
  * Each producer thread takes its own sender with {@link QuestDB#borrowSender()}
- * and reuses it for the batch (see {@link WsExample}); close() flushes and
- * returns it to the pool. We size the sender pool to the producer count so no
+ * and reuses it for the batch (see {@link WsExample}); flush() ships the batch and close() returns the sender to the pool. We size the sender pool to the producer count so no
  * thread ever waits on the acquire timeout.
  */
 public class WsConcurrentIngestExample {
@@ -45,8 +44,8 @@ public class WsConcurrentIngestExample {
     }
 
     private static void ingestBatch(QuestDB db, int producerId) {
-        // Each thread borrows its own sender and reuses it for the batch;
-        // close() (try-with-resources) flushes and returns it to the pool.
+        // Each thread borrows its own sender and reuses it for the batch; flush()
+        // ships it and close() (try-with-resources) returns it to the pool.
         try (Sender sender = db.borrowSender()) {
             String symbol = "SYM-" + producerId;
             for (int i = 0; i < ROWS_PER_PRODUCER; i++) {
