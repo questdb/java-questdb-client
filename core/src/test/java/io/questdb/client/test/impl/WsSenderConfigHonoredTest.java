@@ -27,6 +27,7 @@ package io.questdb.client.test.impl;
 import io.questdb.client.Sender;
 import io.questdb.client.impl.ConfigSchema;
 import io.questdb.client.impl.Side;
+import io.questdb.client.test.cutlass.auth.TestTokenProviderFactory;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -106,6 +107,20 @@ public class WsSenderConfigHonoredTest {
         Assert.assertEquals("/ca.p12", tls.get("tls_roots"));
         Assert.assertEquals("pw", tls.get("tls_roots_password"));
         markHonored("tls_roots", "tls_roots_password");
+
+        // token_provider and its azure keys (wss only; the factory is resolved at parse time, so install one).
+        TestTokenProviderFactory.install(new TestTokenProviderFactory("azure"));
+        try {
+            Map<String, Object> tp = snapshot("wss::addr=h:9000;token_provider=azure;azure_resource=api://app/.default;"
+                    + "azure_client_id=AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE;azure_credential=managed_identity;");
+            Assert.assertEquals("azure", tp.get("token_provider"));
+            Assert.assertEquals("api://app", tp.get("azure_resource"));
+            Assert.assertEquals("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", tp.get("azure_client_id"));
+            Assert.assertEquals("managed_identity", tp.get("azure_credential"));
+        } finally {
+            TestTokenProviderFactory.uninstall();
+        }
+        markHonored("token_provider", "azure_resource", "azure_client_id", "azure_credential");
 
         // Drift guard: every ingress-applied registry key must have an assertion
         // above. The honored set is populated by the assertions themselves, so

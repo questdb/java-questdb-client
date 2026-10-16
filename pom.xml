@@ -86,6 +86,7 @@
     </build>
     <modules>
         <module>core</module>
+        <module>azure</module>
         <module>examples</module>
     </modules>
 </project>

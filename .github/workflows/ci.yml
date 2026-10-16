@@ -86,8 +86,8 @@ jobs:
           if-no-files-found: error
 
   # Takes the JDK 8-built jar (the shipped artifact) from build-jdk8 and runs it
-  # on every newer JDK the client must work on, asserting (a) the automatic
-  # module name is io.questdb.client and (b) slow-path double formatting
+  # on every newer JDK the client must work on, asserting (a) the versioned
+  # module descriptor names io.questdb.client and (b) slow-path double formatting
   # resolves the META-INF/versions/11 bridge. These are only observable in the
   # PACKAGED jar on a modern JDK, and each regression here was invisible to the
   # other jobs until the jar was EXECUTED on the right JDK/flags:
@@ -134,7 +134,7 @@ jobs:
         run: |
           jar_file=(client-jar/questdb-client-*.jar)
           jar_file="${jar_file[0]}"
-          jar --describe-module --file "$jar_file" | tee module.txt
+          jar --describe-module --file "$jar_file" --release 11 | tee module.txt
           grep -q '^io\.questdb\.client@' module.txt
           javac -cp "$jar_file" -d smoke-classes \
             core/src/test/java/io/questdb/client/test/std/DoubleFormatSmoke.java

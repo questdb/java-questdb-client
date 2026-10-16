@@ -71,4 +71,8 @@ open module io.questdb.client {
     exports io.questdb.client.cutlass.qwp.client.sf.cursor;
     exports io.questdb.client.cutlass.qwp.protocol;
     exports io.questdb.client.cutlass.qwp.websocket;
+
+    // token_provider=<name> in a connect string resolves through this SPI; the optional questdb-client-azure
+    // artifact provides the "azure" factory (design/qwp-token-provider-spec.md, section 7).
+    uses io.questdb.client.cutlass.auth.TokenProviderFactory;
 }

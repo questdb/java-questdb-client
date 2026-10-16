@@ -24,6 +24,7 @@
 
 package io.questdb.client.impl;
 
+import io.questdb.client.ConnectionHealth;
 import io.questdb.client.HttpTokenProvider;
 import io.questdb.client.QueryException;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
@@ -482,6 +483,21 @@ public final class QueryClientPool implements AutoCloseable {
         } catch (Throwable ignored) {
             // Best-effort: a teardown Error (e.g. an -ea AssertionError) must
             // not propagate out of Query.close().
+        }
+    }
+
+    /**
+     * Adds the connection health of every pooled query client to {@code into}. Reading a client's health never
+     * waits on its I/O, so this is safe under the pool lock.
+     */
+    void collectHealth(java.util.List<ConnectionHealth> into) {
+        lock.lock();
+        try {
+            for (int i = 0, n = all.size(); i < n; i++) {
+                into.add(all.get(i).client().health());
+            }
+        } finally {
+            lock.unlock();
         }
     }
 
