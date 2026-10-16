@@ -171,9 +171,9 @@ public final class PooledSender implements Sender {
      * A server batch cap rejection ({@link BatchTooLargeForCapException}, retained
      * by an auto-flush or thrown by close's own flush) does not retire the slot at
      * once. QwpWebSocketSender handles a byte-trigger crossing row itself, so a
-     * rejection that reaches close comes from a lease whose own rows push the
-     * batch over the cap through an explicit flush() with the byte trigger off,
-     * or from a held row whose own frame exceeds the cap; either way the
+     * rejection that reaches close comes, for example, from a lease whose own
+     * rows push the batch over the cap through an explicit flush() with the byte
+     * trigger off, or from a held row whose own frame exceeds the cap. The
      * rejected batch can hold mostly rows earlier leases left. The lease is rolled
      * back to its borrow mark, which drops only this lease's rows, and the flush is
      * retried: when the rows left by earlier leases ship, the slot is returned and a
@@ -236,9 +236,10 @@ public final class PooledSender implements Sender {
             }
             if (failure instanceof BatchTooLargeForCapException) {
                 // QwpWebSocketSender handles a byte-trigger crossing row itself, so
-                // this rejection comes from the lease's own rows pushing the batch
-                // over the cap through an explicit flush() with the byte trigger
-                // off, or from a held row whose own frame exceeds the cap. The
+                // this rejection comes, for example, from the lease's own rows
+                // pushing the batch over the cap through an explicit flush() with
+                // the byte trigger off, or from a held row whose own frame exceeds
+                // the cap. The
                 // rejected batch can hold mostly rows earlier leases left.
                 // Drop only this lease's rows and retry: the slot stays in service
                 // when the rest ships, and an inherited batch the cap still

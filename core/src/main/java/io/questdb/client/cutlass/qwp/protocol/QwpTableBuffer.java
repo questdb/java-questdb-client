@@ -332,6 +332,12 @@ public class QwpTableBuffer implements QuietCloseable {
      * drops the rows before it and keeps it as the only row. The caller
      * resolves the hold with one of the two before it writes, cancels or rolls
      * back rows.
+     * <p>
+     * Columns first used by the held row are part of the prefix frame, all-null
+     * for the prefix rows, so the server learns them, including their type and
+     * any decimal scale or geohash precision, even if the held row is later
+     * rolled back. The local symbol dictionary of the prefix may carry entries
+     * only the held row uses.
      *
      * @return false, changing nothing, when the buffer has no committed row,
      * a row is in progress, or a row is already held

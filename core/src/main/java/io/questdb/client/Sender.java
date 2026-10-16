@@ -277,9 +277,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     void atNow();
 
     /**
-     * Runs the auto-flush check that every append runs and ships the pending rows when it trips.
-     * With no row in progress, only the age threshold can trip here, which lets a pool ship rows
-     * a lease left behind once they are older than {@code auto_flush_interval}.
+     * Runs the same row, byte and age thresholds every append runs and ships the pending rows
+     * when one trips. At a pooled release the age threshold is the one that usually trips, which
+     * lets a pool ship rows a lease left behind once they are older than
+     * {@code auto_flush_interval}. It does nothing while a row is in progress.
      * Only the WebSocket QWP transport implements it.
      */
     default void autoFlushIfDue() {
@@ -1473,7 +1474,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * <br>
          * This is only used when communicating over WebSocket transport.
          * <br>
-         * Unset by default, which flushes at 90 percent of the batch cap the server advertises, and not by bytes when it advertises none. 0 disables byte-based auto-flush.
+         * Unset by default, which flushes at 90 percent of the batch cap the server advertises,
+         * and not by bytes when it advertises none. 0 disables byte-based auto-flush.
          *
          * @param bytes maximum bytes per batch
          * @return this instance for method chaining

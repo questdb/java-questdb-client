@@ -942,7 +942,7 @@ public final class CursorSendEngine implements QuietCloseable {
         // deadline clock.
         counters.backpressureStalls.incrementAndGet();
         long deadlineNs = System.nanoTime() + appendDeadlineNanos;
-        boolean wasInterrupted = false;
+        boolean hasClearedInterrupt = false;
         try {
             // parkNanos returns at once while the interrupt flag is set, so the wait
             // clears the flag before each park and restores it on exit.
@@ -961,7 +961,7 @@ public final class CursorSendEngine implements QuietCloseable {
                             counters.backpressureStalls.get(), appendDeadlineNanos / 1_000_000L);
                 }
                 if (Thread.interrupted()) {
-                    wasInterrupted = true;
+                    hasClearedInterrupt = true;
                 }
                 LockSupport.parkNanos(50_000L); // 50 µs
                 fsn = ring.appendOrFsn(payloadAddr, payloadLen);
@@ -971,7 +971,7 @@ public final class CursorSendEngine implements QuietCloseable {
                 }
             }
         } finally {
-            if (wasInterrupted) {
+            if (hasClearedInterrupt) {
                 Thread.currentThread().interrupt();
             }
         }

@@ -3904,6 +3904,10 @@ public class QwpWebSocketSender implements Sender {
         return hasLoopEverConnected || (l != null && l.hasEverConnected());
     }
 
+    private static long byteBudgetForCap(int cap) {
+        return (long) cap * 9 / 10;
+    }
+
     private static Throwable captureCloseError(Throwable terminalError, Throwable t) {
         if (terminalError == null) {
             return t;
@@ -3976,7 +3980,7 @@ public class QwpWebSocketSender implements Sender {
         // a conservative proxy for wire size (compression usually shrinks the
         // payload), but schema and dict-delta overhead can push the wire size
         // above the raw total in pathological cases.
-        long safeBudget = (long) advertisedMaxBatchSize * 9 / 10;
+        long safeBudget = byteBudgetForCap(advertisedMaxBatchSize);
         if (autoFlushBytes > 0 && autoFlushBytes < safeBudget) {
             effectiveAutoFlushBytes = autoFlushBytes;
         } else {
@@ -4045,7 +4049,12 @@ public class QwpWebSocketSender implements Sender {
                 }
                 throw t;
             }
-            if (shouldAutoFlush()) {
+            // With auto_flush_bytes=off shouldAutoFlush() has no byte test, so a held row
+            // whose own frame exceeds the advertised cap would stay in the slot after its
+            // lease. Flush it at once when it reaches the same 90 percent budget the
+            // default byte trigger uses.
+            int cap = serverMaxBatchSize;
+            if (shouldAutoFlush() || (cap > 0 && getPendingBytes() >= byteBudgetForCap(cap))) {
                 flushPendingRows(transactional);
             }
         }

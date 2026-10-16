@@ -99,8 +99,8 @@ snippets below borrow from its pools.
 ### Ingest Data
 
 Borrow a `Sender`, write rows, and close it. Close releases, flush ships, drain waits: `close()` returns the sender to
-the pool and ships nothing by itself; rows go out when an auto-flush threshold trips on a later append, at a later `close()` once they are older than
-`auto_flush_interval` (100 ms by default), or when the pool's housekeeper settles the idle slot, typically within one
+the pool and ships only rows older than `auto_flush_interval` (100 ms by default), otherwise it only releases; the other rows go out when an auto-flush threshold trips on a later append, at a later `close()` once they are older than
+that interval, or when the pool's housekeeper settles the idle slot, typically within one
 `auto_flush_interval`. A lease that holds the slot without appending or closing, for example one that waits for input
 inside the `try` block, holds those rows back until it does: borrow once the data is in hand. Borrowing per
 message is the intended pattern and batches like a sender held for the whole run. Call `flush()` to ship now and
