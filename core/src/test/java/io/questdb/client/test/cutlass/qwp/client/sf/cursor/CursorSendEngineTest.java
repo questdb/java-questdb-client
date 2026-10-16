@@ -374,7 +374,6 @@ public class CursorSendEngineTest {
                 long cpu = mx.getCurrentThreadCpuTime() - cpuStart;
                 assertTrue("the interrupt flag survives the wait", Thread.interrupted());
                 assertTrue("waited out the deadline", wall >= TimeUnit.MILLISECONDS.toNanos(300));
-                System.out.println("TASK7 cpu=" + cpu + " wall=" + wall);
                 assertTrue("parked, not spinning: cpu=" + cpu + " wall=" + wall, cpu < wall / 2);
             } finally {
                 Thread.interrupted();
