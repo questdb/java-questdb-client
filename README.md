@@ -219,8 +219,34 @@ try (Query q = db.borrowQuery()) {
 
 ### Cancel or Time Out a Query
 
-`submit()` returns a `Completion`. `await(timeout, unit)` returns `false` if the query is still in flight; `cancel()`
-stops it.
+Give a query a timeout with `timeout(...)`, or every query a default with `query_timeout_ms` in the configuration
+string. The timeout bounds the whole query, measured from `submit()`. When it expires the query is stopped, `await()`
+throws a `QueryException` whose `isTimeout()` is `true`, and the pooled connection stays open for the next query.
+
+```java
+import io.questdb.client.QueryException;
+
+try (Query q = db.borrowQuery()) {
+    q.sql("SELECT * FROM big_table ORDER BY ts")
+            .handler(handler)
+            .timeout(5, TimeUnit.SECONDS);
+    try {
+        q.submit().await();
+    } catch (QueryException e) {
+        if (!e.isTimeout()) {
+            throw e;
+        }
+        // the query ran longer than 5 seconds and was stopped
+    }
+}
+```
+
+Servers that support per-query timeouts stop the query themselves; against older servers the client cancels it. If
+the server does not end the query within `query_close_timeout_ms` of the timeout, `await()` throws anyway while the
+connection finishes the aborted query in the background.
+
+`submit()` returns a `Completion`. `await(timeout, unit)` only bounds the wait: it returns `false` while the query keeps
+running. `cancel()` stops the query.
 
 ```java
 import io.questdb.client.Completion;
@@ -540,6 +566,7 @@ schema::key1=value1;key2=value2;
 | `query_pool_min`         | `1`     | Minimum query connections kept warm (`0` under `lazy_connect`)                 |
 | `query_pool_max`         | `4`     | Maximum query connections                                                      |
 | `acquire_timeout_ms`     | `5000`  | How long `borrowSender()`/`borrowQuery()` waits for a free slot                |
+| `query_close_timeout_ms` | `5000`  | How long `Query.close()` waits for a running query; grace of `query_timeout_ms` |
 | `idle_timeout_ms`        | `60000` | How long a pooled connection may stay idle before it is reaped                 |
 | `max_lifetime_ms`        | `1800000` | Maximum lifetime of a pooled connection before it is recycled                |
 
@@ -553,6 +580,12 @@ Applied by the query pool to select and fail over between the nodes in the `addr
 | `failover`  | `off`   | Enable query-side failover across the `addr` list                                        |
 | `zone`      |         | Prefer same-zone endpoints for `target=any`/`replica` (opaque, case-insensitive)         |
 | `client_id` |         | Opaque client identifier surfaced server-side for observability                          |
+
+### Query keys
+
+| Key                | Default | Description                                                                                |
+| ------------------ | ------- | ------------------------------------------------------------------------------------------ |
+| `query_timeout_ms` | `0`     | Default per-query timeout in milliseconds (`0` = none); override per query with `timeout()` |
 
 The ingest side also accepts store-and-forward and reconnection tuning keys (`auto_flush_*`, `initial_connect_retry`,
 `reconnect_*`, `request_durable_ack`, `sf_*`, `max_frame_rejections`, `poison_min_escalation_window_millis`, …).

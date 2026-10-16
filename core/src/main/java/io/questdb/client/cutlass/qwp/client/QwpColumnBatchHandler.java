@@ -38,7 +38,12 @@ package io.questdb.client.cutlass.qwp.client;
  * <strong>Exception contract:</strong> if any callback method throws, the
  * exception propagates out of the {@link QwpQueryClient#execute} call on the
  * caller's thread and no further callbacks fire for that query. The connection
- * remains usable for subsequent queries.
+ * remains usable for subsequent queries: when {@link #onBatch} throws while the
+ * query is still running, {@code execute} cancels the query, and the next query
+ * skips whatever the cancelled one still sends. When {@link #onError} reports a
+ * query timeout at the end of the grace period, the aborted query is still
+ * running as well; if that callback throws, {@code execute} first drains the
+ * query, as it does when the callback returns, and only then rethrows.
  */
 public interface QwpColumnBatchHandler {
 

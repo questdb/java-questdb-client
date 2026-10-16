@@ -62,6 +62,7 @@ public class QwpQueryClientConfigHonoredTest {
             assertHonored("failover_max_duration_ms=56000", "failover_max_duration_ms", 56000L);
             assertHonored("max_batch_rows=512", "max_batch_rows", 512);
             assertHonored("initial_credit=65536", "initial_credit", 65536L);
+            assertHonored("query_timeout_ms=1500", "query_timeout_ms", 1500L);
             assertHonored("buffer_pool_size=3", "buffer_pool_size", 3);
             assertHonored("compression=zstd", "compression", "zstd");
             assertHonored("compression_level=9", "compression_level", 9);
