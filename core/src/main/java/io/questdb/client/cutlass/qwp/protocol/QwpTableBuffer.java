@@ -70,12 +70,21 @@ public class QwpTableBuffer implements QuietCloseable {
     private boolean columnDefsCacheValid;
     private int committedColumnCount; // columns that existed at last nextRow()
     private ColumnBuffer[] fastColumns; // plain array for O(1) sequential access
+    // held* arrays: holdBackLastRow() captures each column's state before the
+    // last committed row here; while isRowHeld is set, the column writer encodes
+    // only the rows before the held one.
+    private int[] heldArrayDataOffsets;
+    private int[] heldArrayShapeOffsets;
+    private long[] heldStringDataSizes;
+    private int[] heldSymbolDictionarySizes;
+    private int[] heldValueCounts;
     private int inProgressColumnCount;
+    private boolean isRowHeld;
     private int rowCount;
     // Savepoint for rollbackToSavepoint(): the row count and column count at the
-    // last markSavepoint(). reset() and retainInProgressRow() move it to "no rows,
-    // all current columns", since a flushed buffer's columns are known to the
-    // server; clear() zeroes it.
+    // last markSavepoint(). reset(), retainInProgressRow() and retainHeldRow()
+    // move it to "no rows, all current columns", since a flushed buffer's columns
+    // are known to the server; clear() zeroes it.
     private int savepointColumnCount;
     private int savepointRowCount;
 
@@ -135,6 +144,7 @@ public class QwpTableBuffer implements QuietCloseable {
         columnAccessCursor = 0;
         committedColumnCount = 0;
         inProgressColumnCount = 0;
+        isRowHeld = false;
         rowCount = 0;
         savepointRowCount = 0;
         savepointColumnCount = 0;
@@ -199,6 +209,30 @@ public class QwpTableBuffer implements QuietCloseable {
     }
 
     /**
+     * Per-column string data size before the held row, indexed by column
+     * index. Valid only while {@link #hasHeldRow()}.
+     */
+    public long[] getHeldStringDataSizes() {
+        return heldStringDataSizes;
+    }
+
+    /**
+     * Per-column symbol dictionary size before the held row, indexed by column
+     * index. Valid only while {@link #hasHeldRow()}.
+     */
+    public int[] getHeldSymbolDictionarySizes() {
+        return heldSymbolDictionarySizes;
+    }
+
+    /**
+     * Per-column value count before the held row, indexed by column index.
+     * Valid only while {@link #hasHeldRow()}.
+     */
+    public int[] getHeldValueCounts() {
+        return heldValueCounts;
+    }
+
+    /**
      * Gets or creates a column with the given name and type.
      * <p>
      * Optimized for the common case where columns are accessed in the same
@@ -260,7 +294,7 @@ public class QwpTableBuffer implements QuietCloseable {
     /**
      * Row count recorded by the last {@link #markSavepoint()}; {@code 0} when
      * none was taken since the buffer was last reset, cleared or
-     * retained a row in progress.
+     * retained a row in progress or a held row.
      */
     public int getSavepointRowCount() {
         return savepointRowCount;
@@ -274,11 +308,54 @@ public class QwpTableBuffer implements QuietCloseable {
     }
 
     /**
+     * Returns true while {@link #holdBackLastRow()} holds the last committed
+     * row back, until {@link #restoreHeldRow()} or {@link #retainHeldRow()}.
+     */
+    public boolean hasHeldRow() {
+        return isRowHeld;
+    }
+
+    /**
      * Returns true if a row is partially built (columns written but not yet committed
      * via {@link #nextRow()}).
      */
     public boolean hasInProgressRow() {
         return inProgressColumnCount > 0;
+    }
+
+    /**
+     * Holds the last committed row back: records each column's state before
+     * that row and decrements the row count, so the column writer encodes only
+     * the rows before it. The row's values stay in the column buffers.
+     * {@link #restoreHeldRow()} puts the row back; {@link #retainHeldRow()}
+     * drops the rows before it and keeps it as the only row. The caller
+     * resolves the hold with one of the two before it writes, cancels or rolls
+     * back rows.
+     *
+     * @return false, changing nothing, when the buffer has no committed row,
+     * a row is in progress, or a row is already held
+     */
+    public boolean holdBackLastRow() {
+        if (rowCount == 0 || isRowHeld || hasInProgressRow()) {
+            return false;
+        }
+        int columnCount = columns.size();
+        ensureHeldColumnCapacity(columnCount);
+        int lastRow = rowCount - 1;
+        for (int i = 0; i < columnCount; i++) {
+            fastColumns[i].captureStateBeforeLastRow(
+                    lastRow,
+                    i,
+                    heldValueCounts,
+                    heldStringDataSizes,
+                    heldSymbolDictionarySizes,
+                    heldArrayShapeOffsets,
+                    heldArrayDataOffsets
+            );
+        }
+        rowCount = lastRow;
+        isRowHeld = true;
+        return true;
     }
 
     /**
@@ -371,9 +448,53 @@ public class QwpTableBuffer implements QuietCloseable {
         columnAccessCursor = 0;
         committedColumnCount = columns.size();
         inProgressColumnCount = 0;
+        isRowHeld = false;
         savepointRowCount = 0;
         savepointColumnCount = columns.size();
         rowCount = 0;
+    }
+
+    /**
+     * Undoes {@link #holdBackLastRow()}: the held row counts as committed
+     * again. A no-op when no row is held.
+     */
+    public void restoreHeldRow() {
+        if (isRowHeld) {
+            rowCount++;
+            isRowHeld = false;
+        }
+    }
+
+    /**
+     * Drops the rows before the held row and keeps the held row as the only
+     * committed row, as {@link #retainInProgressRow} does for a row in
+     * progress. The savepoint moves to "no rows, all current columns", since
+     * the caller has shipped the dropped rows and the server knows every
+     * column. A no-op when no row is held.
+     */
+    public void retainHeldRow() {
+        if (!isRowHeld) {
+            return;
+        }
+        for (int i = 0, n = columns.size(); i < n; i++) {
+            ColumnBuffer col = fastColumns[i];
+            // retainTailRow clears the geohash precision of a column whose held
+            // value is null; the server has locked it with the shipped rows.
+            int geohashPrecisionBefore = col.geohashPrecision;
+            col.retainTailRow(
+                    rowCount,
+                    heldValueCounts[i],
+                    heldArrayShapeOffsets[i],
+                    heldArrayDataOffsets[i]
+            );
+            col.geohashPrecision = geohashPrecisionBefore;
+        }
+        rowCount = 1;
+        savepointRowCount = 0;
+        savepointColumnCount = columns.size();
+        committedColumnCount = columns.size();
+        columnAccessCursor = 0;
+        isRowHeld = false;
     }
 
     public void retainInProgressRow(
@@ -498,6 +619,23 @@ public class QwpTableBuffer implements QuietCloseable {
             throw t;
         }
         return col;
+    }
+
+    private void ensureHeldColumnCapacity(int required) {
+        if (heldValueCounts != null && required <= heldValueCounts.length) {
+            return;
+        }
+
+        int newCapacity = heldValueCounts != null ? heldValueCounts.length : 8;
+        while (newCapacity < required) {
+            newCapacity *= 2;
+        }
+
+        heldValueCounts = new int[newCapacity];
+        heldStringDataSizes = new long[newCapacity];
+        heldSymbolDictionarySizes = new int[newCapacity];
+        heldArrayShapeOffsets = new int[newCapacity];
+        heldArrayDataOffsets = new int[newCapacity];
     }
 
     private ColumnBuffer lookupColumn(CharSequence name, byte type) {
@@ -2008,6 +2146,44 @@ public class QwpTableBuffer implements QuietCloseable {
             symbolList.add(symbol);
             symbolDict.put(symbol, 0);
             Unsafe.getUnsafe().putInt(dataBuffer.pageAddress(), 0);
+        }
+
+        /**
+         * Writes this column's state before {@code lastRow}, its last committed
+         * row, into slot {@code columnIndex} of each array. The symbol dictionary
+         * size stays the current local one: WebSocket frames encode global ids,
+         * so a local entry that only the last row uses rides along unused.
+         */
+        void captureStateBeforeLastRow(
+                int lastRow,
+                int columnIndex,
+                int[] valueCounts,
+                long[] stringDataSizes,
+                int[] symbolDictionarySizes,
+                int[] arrayShapeOffsets,
+                int[] arrayDataOffsets
+        ) {
+            boolean isLastNull = useNullBitmap && isNull(lastRow);
+            int valueCountBefore = isLastNull ? valueCount : valueCount - 1;
+            valueCounts[columnIndex] = valueCountBefore;
+            stringDataSizes[columnIndex] = stringOffsets != null
+                    ? Unsafe.getUnsafe().getInt(stringOffsets.pageAddress() + (long) valueCountBefore * Integer.BYTES)
+                    : 0;
+            symbolDictionarySizes[columnIndex] = getSymbolDictionarySize();
+
+            int shapeOffsetBefore = arrayShapeOffset;
+            int dataOffsetBefore = arrayDataOffset;
+            if (!isLastNull && arrayDims != null) {
+                int nDims = arrayDims[valueCountBefore] & 0xFF;
+                shapeOffsetBefore -= nDims;
+                int elemCount = 1;
+                for (int d = 0; d < nDims; d++) {
+                    elemCount *= arrayShapes[shapeOffsetBefore + d];
+                }
+                dataOffsetBefore -= elemCount;
+            }
+            arrayShapeOffsets[columnIndex] = shapeOffsetBefore;
+            arrayDataOffsets[columnIndex] = dataOffsetBefore;
         }
     }
 }
