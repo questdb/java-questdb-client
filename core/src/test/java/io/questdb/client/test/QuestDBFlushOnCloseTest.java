@@ -223,6 +223,54 @@ public class QuestDBFlushOnCloseTest {
     }
 
     @Test
+    public void testPartialRowReleaseAfterTheIntervalStillShipsEarlierRows() throws Exception {
+        FrameLog log = new FrameLog();
+        try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            try (QuestDB db = QuestDB.connect(config(server.getPort(), "auto_flush_interval=200;housekeeper_interval_ms=60000;"))) {
+                try (Sender s = db.borrowSender()) {
+                    s.table("t").longColumn("v", 1L).atNow();
+                }
+                Sender delegate;
+                Sender s = db.borrowSender();
+                delegate = ((PooledSender) s).getDelegateForTesting();
+                s.table("t").longColumn("v", 2L);
+                Thread.sleep(400);
+                try {
+                    s.close();
+                    Assert.fail("expected LineSenderException");
+                } catch (LineSenderException e) {
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("row in progress at close()"));
+                }
+                Assert.assertEquals("the earlier lease's aged row shipped", 0, delegate.pendingRowCount());
+                log.awaitDataFrames(1, 5_000);
+            }
+        }
+    }
+
+    @Test
+    public void testReleaseShipsAnEarlierLeasesRowOnceOlderThanTheInterval() throws Exception {
+        FrameLog log = new FrameLog();
+        try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            try (QuestDB db = QuestDB.connect(config(server.getPort(), "auto_flush_interval=200;housekeeper_interval_ms=60000;"))) {
+                try (Sender s = db.borrowSender()) {
+                    s.table("t").longColumn("v", 1L).atNow();
+                }
+                Sender delegate;
+                try (Sender s = db.borrowSender()) {         // the same slot; settle cannot reach a leased slot
+                    delegate = ((PooledSender) s).getDelegateForTesting();
+                    Thread.sleep(400);
+                }
+                Assert.assertEquals("the release shipped the earlier lease's aged row", 0, delegate.pendingRowCount());
+                log.awaitDataFrames(1, 5_000);
+            }
+        }
+    }
+
+    @Test
     public void testRowOverTheCapFailsOnlyThatRowAndKeepsTheSlot() throws Exception {
         FrameLog log = new FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {

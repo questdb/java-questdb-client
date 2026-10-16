@@ -47,6 +47,25 @@ import java.util.concurrent.TimeUnit;
 public class SenderProbeMethodsTest {
 
     @Test
+    public void testAutoFlushIfDueShipsOnlyRowsOlderThanTheInterval() throws Exception {
+        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+        try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                    + ";auto_flush_bytes=off;auto_flush_rows=1000000;auto_flush_interval=300;close_flush_timeout_millis=0;")) {
+                sender.table("t").longColumn("v", 1L).atNow();
+                sender.autoFlushIfDue();
+                Assert.assertEquals("younger than the interval: kept", 1, sender.pendingRowCount());
+                Thread.sleep(400);
+                sender.autoFlushIfDue();
+                Assert.assertEquals("older than the interval: shipped", 0, sender.pendingRowCount());
+                log.awaitDataFrames(1, 5_000);
+            }
+        }
+    }
+
+    @Test
     public void testCheckErrorReportsARetainedOverCapBatchUntilReset() throws Exception {
         QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
@@ -112,6 +131,7 @@ public class SenderProbeMethodsTest {
     @Test
     public void testDefaultsOnNonWebSocketTransport() {
         try (Sender sender = Sender.fromConfig("http::addr=127.0.0.1:1;protocol_version=2;auto_flush=off;")) {
+            sender.autoFlushIfDue();                        // default: no-op
             sender.checkError();                            // default: no-op
             Assert.assertFalse(sender.hasRowInProgress());  // default: false
             Assert.assertEquals(0, sender.pendingRowCount()); // default: 0

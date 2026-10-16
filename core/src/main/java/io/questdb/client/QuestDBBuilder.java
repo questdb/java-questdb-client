@@ -211,7 +211,8 @@ public final class QuestDBBuilder {
     /**
      * Whether {@code close()} on a borrowed sender flushes its rows before
      * returning the slot. Off by default: close releases, flush ships, drain
-     * waits, and rows left in a slot ship within one auto-flush interval. On
+     * waits, and rows left in a slot ship within one auto-flush interval of the slot going
+     * idle, or at the next append or close on it after that interval. On
      * restores the pre-1.4 behaviour, one frame and one WAL commit per close,
      * which is the slow path for applications that borrow per message. In this
      * client "flush" means published to the store-and-forward ring, not

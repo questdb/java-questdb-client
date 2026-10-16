@@ -86,6 +86,11 @@ public final class PooledSender implements Sender {
     }
 
     @Override
+    public void autoFlushIfDue() {
+        slot.live(generation).autoFlushIfDue();
+    }
+
+    @Override
     public boolean awaitAckedFsn(long targetFsn, long timeoutMillis) {
         return slot.live(generation).awaitAckedFsn(targetFsn, timeoutMillis);
     }
@@ -561,7 +566,8 @@ public final class PooledSender implements Sender {
      *       pending rows unflagged and commits the group;</li>
      *   <li>otherwise {@code flush_on_close=on}: {@code flushDeferred()} with a
      *       window, {@code flush()} without one;</li>
-     *   <li>otherwise nothing: rows wait for a threshold or the settle.</li>
+     *   <li>otherwise {@code autoFlushIfDue()}: ships only rows older than
+     *       {@code auto_flush_interval}.</li>
      * </ul>
      */
     private void ship(SenderPool pool, Sender delegate) {
@@ -580,6 +586,8 @@ public final class PooledSender implements Sender {
         }
         if (pool.isFlushOnClose()) {
             delegate.flush();
+        } else {
+            delegate.autoFlushIfDue();
         }
     }
 }

@@ -277,6 +277,15 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     void atNow();
 
     /**
+     * Runs the auto-flush check that every append runs and ships the pending rows when it trips.
+     * With no row in progress, only the age threshold can trip here, which lets a pool ship rows
+     * a lease left behind once they are older than {@code auto_flush_interval}.
+     * Only the WebSocket QWP transport implements it.
+     */
+    default void autoFlushIfDue() {
+    }
+
+    /**
      * Block until the server has acknowledged every frame up to {@code targetFsn},
      * or until {@code timeoutMillis} elapses. Pair with {@link #flushAndGetSequence()}
      * to obtain {@code targetFsn} for a specific flush.

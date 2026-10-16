@@ -1475,6 +1475,17 @@ public class QwpWebSocketSender implements Sender {
         }
     }
 
+    @Override
+    public void autoFlushIfDue() {
+        checkNotClosed();
+        if (currentTableBuffer != null && currentTableBuffer.hasInProgressRow()) {
+            return;
+        }
+        if (shouldAutoFlush()) {
+            flushPendingRows(transactional);
+        }
+    }
+
     /**
      * Blocks until {@link #getAckedFsn()} {@code >= targetFsn}, or until
      * {@code timeoutMillis} elapses. Polls on a 50us park; surfaces I/O loop
