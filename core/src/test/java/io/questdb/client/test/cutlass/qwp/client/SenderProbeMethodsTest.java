@@ -285,6 +285,26 @@ public class SenderProbeMethodsTest {
     }
 
     @Test
+    public void testFlushAfterAnEmptySavepointResetShipsTheNextRow() throws Exception {
+        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+        try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            try (Sender sender = Sender.fromConfig(config(server.getPort()))) {
+                sender.markSavepoint();
+                sender.table("t").longColumn("v", 1L).atNow();
+                sender.flush();                                        // empties the savepoint
+                sender.table("t").longColumn("v", 2L).atNow();
+                sender.resetToSavepoint();                             // drops row 2
+                sender.table("t").longColumn("v", 3L).atNow();
+                sender.flush();
+                log.awaitDataFrames(2, 5_000);
+                sender.checkError();
+            }
+        }
+    }
+
+    @Test
     public void testFlushEmptiesTheSavepoint() throws Exception {
         try (TestWebSocketServer server = new TestWebSocketServer(new AckAllHandler())) {
             server.start();

@@ -484,7 +484,7 @@ public class QwpWebSocketSender implements Sender {
     // zero once a flush ships the pending rows, at which point resetToSavepoint()
     // discards every pending row like reset() and also removes the column
     // definitions the server has not seen yet.
-    private int savepointBatchMaxSymbolId;
+    private int savepointBatchMaxSymbolId = -1;
     private long savepointFirstPendingRowTimeNanos;
     private long savepointPendingBytes;
     private int savepointPendingRowCount;
@@ -4639,7 +4639,7 @@ public class QwpWebSocketSender implements Sender {
     }
 
     private void clearSavepointAndRejection() {
-        savepointBatchMaxSymbolId = 0;
+        savepointBatchMaxSymbolId = -1;
         savepointPendingRowCount = 0;
         savepointPendingBytes = 0;
         savepointFirstPendingRowTimeNanos = 0;
