@@ -84,7 +84,8 @@ public class QwpTableBuffer implements QuietCloseable {
     // Savepoint for rollbackToSavepoint(): the row count and column count at the
     // last markSavepoint(). reset(), retainInProgressRow() and retainHeldRow()
     // move it to "no rows, all current columns", since a flushed buffer's columns
-    // are known to the server; clear() zeroes it.
+    // are known to the server; retainHeldRow() keeps the column count when no
+    // row of this table shipped. clear() zeroes it.
     private int savepointColumnCount;
     private int savepointRowCount;
 
@@ -468,14 +469,20 @@ public class QwpTableBuffer implements QuietCloseable {
     /**
      * Drops the rows before the held row and keeps the held row as the only
      * committed row, as {@link #retainInProgressRow} does for a row in
-     * progress. The savepoint moves to "no rows, all current columns", since
-     * the caller has shipped the dropped rows and the server knows every
-     * column. A no-op when no row is held.
+     * progress. The savepoint moves to no rows. When rows preceded the held
+     * row, the caller has shipped them with every current column, so the
+     * savepoint also takes every current column. When the held row is the
+     * table's only row, nothing of the table shipped, so the savepoint keeps
+     * its column count, which still names only columns the server knows: none
+     * for a new buffer, otherwise those at the last mark or flush. A later
+     * {@link #rollbackToSavepoint()} then drops the columns the held row
+     * added. A no-op when no row is held.
      */
     public void retainHeldRow() {
         if (!isRowHeld) {
             return;
         }
+        boolean hasShippedRows = rowCount > 0;
         for (int i = 0, n = columns.size(); i < n; i++) {
             ColumnBuffer col = fastColumns[i];
             // retainTailRow clears the geohash precision of a column whose held
@@ -491,7 +498,9 @@ public class QwpTableBuffer implements QuietCloseable {
         }
         rowCount = 1;
         savepointRowCount = 0;
-        savepointColumnCount = columns.size();
+        if (hasShippedRows) {
+            savepointColumnCount = columns.size();
+        }
         committedColumnCount = columns.size();
         columnAccessCursor = 0;
         isRowHeld = false;

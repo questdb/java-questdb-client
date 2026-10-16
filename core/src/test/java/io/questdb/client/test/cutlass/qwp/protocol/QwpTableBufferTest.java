@@ -1538,6 +1538,57 @@ public class QwpTableBufferTest {
     }
 
     @Test
+    public void testRetainHeldRowMovesTheSavepointColumnsOnlyWhenEarlierRowsShipped() throws Exception {
+        assertMemoryLeak(() -> {
+            // rows before the held row: the caller shipped them with every column,
+            // including the one the held row added, so the savepoint takes it
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false).addLong(1L);
+                table.nextRow();
+                table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false).addLong(2L);
+                table.getOrCreateColumn("z", QwpConstants.TYPE_VARCHAR, true).addString("held");
+                table.nextRow();
+                assertTrue(table.holdBackLastRow());
+                table.retainHeldRow();
+                assertEquals(1, table.getRowCount());
+                assertEquals(0, table.getSavepointRowCount());
+                table.rollbackToSavepoint();
+                assertEquals(0, table.getRowCount());
+                assertEquals("the server knows both columns", 2, table.getColumnCount());
+            }
+            // the held row is the only row of a new buffer: nothing of the table
+            // shipped, so the savepoint keeps no column
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                table.getOrCreateColumn("z", QwpConstants.TYPE_VARCHAR, true).addString("held");
+                table.nextRow();
+                assertTrue(table.holdBackLastRow());
+                table.retainHeldRow();
+                assertEquals(1, table.getRowCount());
+                assertEquals(0, table.getSavepointRowCount());
+                table.rollbackToSavepoint();
+                assertEquals(0, table.getRowCount());
+                assertEquals("the server has seen no column", 0, table.getColumnCount());
+            }
+            // the held row is the only row after a flush: the savepoint keeps the
+            // column the flush shipped, not the one the held row added
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false).addLong(1L);
+                table.nextRow();
+                table.reset();
+                table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false).addLong(2L);
+                table.getOrCreateColumn("z", QwpConstants.TYPE_VARCHAR, true).addString("held");
+                table.nextRow();
+                assertTrue(table.holdBackLastRow());
+                table.retainHeldRow();
+                assertEquals(1, table.getRowCount());
+                table.rollbackToSavepoint();
+                assertEquals(0, table.getRowCount());
+                assertEquals("only the column the flush shipped stays", 1, table.getColumnCount());
+            }
+        });
+    }
+
+    @Test
     public void testRetainInProgressRowFastClearsUnstagedNullableColumn() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpTableBuffer table = new QwpTableBuffer("test")) {

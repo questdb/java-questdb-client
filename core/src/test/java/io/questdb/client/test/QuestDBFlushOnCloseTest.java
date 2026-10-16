@@ -29,6 +29,7 @@ import io.questdb.client.LineSenderServerException;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.BatchTooLargeForCapException;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.impl.PooledSender;
 import io.questdb.client.test.cutlass.qwp.client.QwpWireTestUtils;
@@ -37,6 +38,7 @@ import org.junit.Assert;
 import org.junit.Test;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -206,6 +208,47 @@ public class QuestDBFlushOnCloseTest {
     }
 
     @Test
+    public void testOverCapFlushDropsOnlyThatLeasesRowsAndShipsTheRest() throws Exception {
+        FrameLog log = new FrameLog();
+        try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+            server.setAdvertisedMaxBatchSize(4 * 1024);
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            // auto_flush_bytes=off: no byte trigger, so the sender never holds a row back
+            // and the lease's explicit flush() meets the whole over-cap batch
+            try (QuestDB db = QuestDB.connect(config(server.getPort(),
+                    "auto_flush_bytes=off;auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
+                appendThreeWideRowsAfterAWarmUp(db, log);
+                Sender delegate = null;
+                boolean hasCloseThrown = false;
+                try (Sender s = db.borrowSender()) {
+                    delegate = ((PooledSender) s).getDelegateForTesting();
+                    String wide = wideValue(1000);
+                    s.table("t").stringColumn("s", wide).atNow();
+                    s.table("t").stringColumn("s", wide).atNow();
+                    try {
+                        s.flush();
+                        Assert.fail("the lease's two rows make the batch 5 KB, over the 4 KiB cap");
+                    } catch (BatchTooLargeForCapException expected) {
+                        // the batch is retained: close() rolls the lease back and retries
+                    }
+                } catch (LineSenderException e) {
+                    hasCloseThrown = true;
+                    Assert.assertTrue("close() wraps the rejection", e.getCause() instanceof BatchTooLargeForCapException);
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("dropped 2 row(s) of this lease"));
+                }
+                Assert.assertTrue("close() must report the dropped rows", hasCloseThrown);
+                log.awaitDataFrames(2, 5_000);
+                Assert.assertEquals("the three earlier rows ship as one frame with table t", 1, log.tableCount(1));
+                try (Sender s = db.borrowSender()) {
+                    Assert.assertSame("the slot stayed in service", delegate, ((PooledSender) s).getDelegateForTesting());
+                    Assert.assertEquals("only the lease's rows were dropped, the rest shipped", 0, s.pendingRowCount());
+                }
+            }
+        }
+    }
+
+    @Test
     public void testPartialRowReleaseAfterTheIntervalStillShipsEarlierRows() throws Exception {
         FrameLog log = new FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
@@ -249,6 +292,53 @@ public class QuestDBFlushOnCloseTest {
                 }
                 Assert.assertEquals("the release shipped the earlier lease's aged row", 0, delegate.pendingRowCount());
                 log.awaitDataFrames(1, 5_000);
+            }
+        }
+    }
+
+    @Test
+    public void testResetAfterACrossingRowAloneInItsTableDropsTheColumnItAdded() throws Exception {
+        FrameLog log = new FrameLog();
+        try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+            server.setAdvertisedMaxBatchSize(4 * 1024);
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            // auto_flush_bytes unset: the byte trigger sits at 90 percent of the 4 KiB cap (3686 bytes)
+            try (QuestDB db = QuestDB.connect(config(server.getPort(), "auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
+                // warm-up lease: the server learns late_table with kept_column, and late_table
+                // precedes t in the sender's tables, so its frame carries the batch's new
+                // symbols when the batch splits
+                try (Sender s = db.borrowSender()) {
+                    s.table("late_table").longColumn("kept_column", 1L).atNow();
+                    s.flush();
+                }
+                log.awaitDataFrames(1, 5_000);
+                for (int i = 0; i < 3; i++) {
+                    try (Sender s = db.borrowSender()) {
+                        s.table("t").symbol("y", i + wideValue(800)).atNow();    // 2.4 KB of new symbols
+                    }
+                }
+                try (Sender s = db.borrowSender()) {
+                    Assert.assertTrue("memory mode selects delta mode",
+                            ((QwpWebSocketSender) ((PooledSender) s).getDelegateForTesting()).isDeltaDictEnabledForTest());
+                    // late_table's frame would carry this 3.7 KB row and the 2.4 KB of new symbols:
+                    // the sender ships t's rows with the symbols and holds the row, the only row
+                    // of late_table in the batch
+                    s.table("late_table").longColumn("kept_column", 2L).stringColumn("discarded_column", wideValue(3700)).atNow();
+                    Assert.assertEquals("only the crossing row stays buffered", 1, s.pendingRowCount());
+                    s.reset();
+                }
+                log.awaitDataFrames(2, 5_000);
+                try (Sender s = db.borrowSender()) {
+                    s.table("late_table").longColumn("kept_column", 3L).atNow();
+                    s.flush();
+                }
+                log.awaitDataFrames(3, 5_000);
+                List<byte[]> frames = log.frames();
+                Assert.assertTrue("late_table ships kept_column", containsAscii(frames.get(frames.size() - 1), "kept_column"));
+                for (byte[] frame : frames) {
+                    Assert.assertFalse("reset() dropped the column the server never saw", containsAscii(frame, "discarded_column"));
+                }
             }
         }
     }
@@ -463,6 +553,20 @@ public class QuestDBFlushOnCloseTest {
                 + ";initial_connect_retry=async"
                 + ";close_flush_timeout_millis=0;"
                 + extra;
+    }
+
+    private static boolean containsAscii(byte[] frame, String text) {
+        byte[] needle = text.getBytes(StandardCharsets.US_ASCII);
+        for (int i = 0, n = frame.length - needle.length; i <= n; i++) {
+            int j = 0;
+            while (j < needle.length && frame[i + j] == needle[j]) {
+                j++;
+            }
+            if (j == needle.length) {
+                return true;
+            }
+        }
+        return false;
     }
 
     public static String wideValue(int length) {
