@@ -28,7 +28,9 @@ import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
+import com.azure.identity.WorkloadIdentityCredentialBuilder;
 import io.questdb.client.azure.AzureTokenProviderFactory;
+import io.questdb.client.azure.AzureTokenSource;
 import io.questdb.client.cutlass.auth.TokenProviderSpec;
 import io.questdb.client.cutlass.auth.TokenSource;
 import io.questdb.client.cutlass.auth.TokenUnavailableException;
@@ -36,9 +38,12 @@ import io.questdb.client.impl.ConfigString;
 import io.questdb.client.impl.ConfigView;
 import org.junit.Assert;
 import org.junit.Assume;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 import org.slf4j.LoggerFactory;
 
+import java.io.File;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -51,6 +56,9 @@ import java.util.Map;
 public class AzureCredentialSelectionTest {
     private static final String CLIENT_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
     private static final String WSS = "wss::addr=localhost:9000;token_provider=azure;azure_resource=api://qdb;";
+
+    @Rule
+    public final TemporaryFolder temp = TemporaryFolder.builder().assureDeletion().build();
 
     @Test
     public void testConnectStringSelectsTheCredential() {
@@ -121,6 +129,25 @@ public class AzureCredentialSelectionTest {
         assertRejected(() -> factory.createSource(environmentWithClientId),
                 "azure_client_id cannot be combined with azure_credential=environment");
         factory.validate(params("workload_identity", CLIENT_ID));
+    }
+
+    @Test(timeout = 30_000)
+    public void testMissingFederatedTokenFileIsPermanentWhenFetched() throws Exception {
+        File tokenFile = new File(temp.newFolder(), "federated-token.jwt");
+        Assert.assertFalse(tokenFile.exists());
+        TokenSource source = new AzureTokenSource(new WorkloadIdentityCredentialBuilder()
+                .tenantId("11111111-2222-3333-4444-555555555555")
+                .clientId(CLIENT_ID)
+                .tokenFilePath(tokenFile.getAbsolutePath())
+                .build(), "api://qdb");
+        try {
+            source.fetchToken();
+            Assert.fail("expected the fetch to fail");
+        } catch (TokenUnavailableException e) {
+            Assert.assertFalse("missing configuration is permanent: " + e.getMessage(), e.isRetryable());
+            Assert.assertEquals("credential file is missing for api://qdb/.default", e.getMessage());
+            Assert.assertNull("do not retain the SDK exception or file path", e.getCause());
+        }
     }
 
     @Test

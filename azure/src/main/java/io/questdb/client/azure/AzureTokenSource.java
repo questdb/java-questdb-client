@@ -39,6 +39,7 @@ import io.questdb.client.cutlass.auth.TokenUnavailableException;
 import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
+import java.nio.file.NoSuchFileException;
 import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.util.List;
@@ -64,8 +65,8 @@ import java.util.concurrent.TimeUnit;
  * 7.5 prescribes, the same way whichever credential is used:
  * <ul>
  *   <li>permanent - no credential available ({@link CredentialUnavailableException}): a credential chain that
- *   found nothing, or a credential whose configuration is missing; a managed identity that is not assigned to
- *   this host, which a managed-identity credential used alone reports only in a nested cause; and
+ *   found nothing, or a credential whose configuration or credential file is missing; a managed identity that is
+ *   not assigned to this host, which a managed-identity credential used alone reports only in a nested cause; and
  *   authentication failures Entra reports: an HTTP 400 or 401 from the token endpoint, or a known AADSTS
  *   configuration error such as an invalid client or an application that does not exist;</li>
  *   <li>retryable - network errors, timeouts, throttling, 5xx responses, and anything else. A
@@ -73,8 +74,9 @@ import java.util.concurrent.TimeUnit;
  *   failure, such as a refused connection, which a managed identity otherwise hides behind a generic message.</li>
  * </ul>
  * Each attempt is bounded (30 s by default). Library exceptions never travel as a cause - their response
- * objects reference the raw HTTP request, which can carry a client secret. Diagnostics name only the failure
- * type, HTTP status, known configuration error codes and socket-level causes; SDK messages can embed raw bodies.
+ * objects reference the raw HTTP request, which can carry a client secret. Diagnostics name only safe failure
+ * reasons, failure types, HTTP status, known configuration error codes and socket-level causes; SDK messages can
+ * embed raw bodies.
  */
 public final class AzureTokenSource implements TokenSource {
     /**
@@ -150,6 +152,9 @@ public final class AzureTokenSource implements TokenSource {
         long retryAfterMillis = TokenUnavailableException.NO_RETRY_AFTER;
         Throwable t = failure;
         for (int depth = 0; t != null && depth < MAX_CAUSE_DEPTH; depth++, t = t.getCause()) {
+            if (t instanceof NoSuchFileException) {
+                return TokenUnavailableException.permanent("credential file is missing for " + scope);
+            }
             if (t instanceof CredentialUnavailableException) {
                 return TokenUnavailableException.permanent("no credential available "
                         + (chain ? "in the Azure Identity chain " : "") + "for " + scope + ": " + description);
