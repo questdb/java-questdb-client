@@ -481,9 +481,9 @@ public class QwpWebSocketSender implements Sender {
     // Monotonic for the sender's life; reset() does not clear it. Counts rows whether or not they shipped.
     private long rowsAppended;
     // Pending counters and batch symbol watermark at the last markSavepoint();
-    // zero once a flush ships the pending rows, at which point resetToSavepoint()
-    // discards every pending row like reset() and also removes the column
-    // definitions the server has not seen yet.
+    // the counters are zero and the watermark is -1 once a flush ships the pending
+    // rows, at which point resetToSavepoint() discards every pending row like
+    // reset() and also removes the column definitions the server has not seen yet.
     private int savepointBatchMaxSymbolId = -1;
     private long savepointFirstPendingRowTimeNanos;
     private long savepointPendingBytes;
@@ -4823,9 +4823,10 @@ public class QwpWebSocketSender implements Sender {
         // by the discarded batch keeps re-encoding that batch's symbols: a single-row
         // batch after reset() would still carry the whole abandoned range and hit the
         // very cap rejection reset() is documented to clear, leaving the sender unable
-        // to flush anything at all. -1 is the same value resetTableBuffersAfterFlush
-        // leaves behind after a successful flush, and sendCommitMessage already reads
-        // it as an empty delta.
+        // to flush anything at all. -1 is what resetTableBuffersAfterFlush leaves
+        // behind after a flush that ships every pending row (after a hold-back flush
+        // the watermark stays at the batch max while the held row is pending), and
+        // sendCommitMessage already reads -1 as an empty delta.
         currentBatchMaxSymbolId = -1;
         reclaimUnsentSymbolIds(0);
         pendingBytes = 0;

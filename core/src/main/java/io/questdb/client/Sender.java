@@ -1473,7 +1473,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * <br>
          * This is only used when communicating over WebSocket transport.
          * <br>
-         * Default value is 0, which disables byte-based auto-flush.
+         * Unset by default, which flushes at 90 percent of the batch cap the server advertises, and not by bytes when it advertises none. 0 disables byte-based auto-flush.
          *
          * @param bytes maximum bytes per batch
          * @return this instance for method chaining

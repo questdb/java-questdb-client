@@ -128,7 +128,8 @@ pool's next settle; call `flush()` before `close()` if you need it on the wire n
 
 If you borrow per message and want each message in the store-and-forward ring the moment `close()` returns, set
 `flush_on_close=on` together with a commit window (`commit_rows`, `commit_interval_ms`): every close ships one frame
-flagged defer-commit, the server appends it, and the pool commits once per window instead of once per close.
+flagged defer-commit, the server appends it, and the pool commits once per window instead of once per close. A rejected
+frame then rolls back the whole open group, so every lease since the last commit loses its rows.
 
 A server rejection covers a whole frame. With the default `flush_on_close=off` one frame carries the rows of every
 lease that closed since the last ship, so one rejected row discards the other leases' rows in that frame as well,
@@ -561,7 +562,7 @@ schema::key1=value1;key2=value2;
 | `acquire_timeout_ms`     | `5000`  | How long `borrowSender()`/`borrowQuery()` waits for a free slot                |
 | `idle_timeout_ms`        | `60000` | How long a pooled connection may stay idle before it is reaped                 |
 | `max_lifetime_ms`        | `1800000` | Maximum lifetime of a pooled connection before it is recycled                |
-| `flush_on_close`         | `off`   | `on` makes a pooled `close()` flush before releasing (one frame and one commit per close, the pre-1.4 behaviour). Note: "flush" means published to the store-and-forward ring, not acknowledged. Close-time errors are wrapped; the delegate's error is the cause; with `on` each lease ships its own frame, so a server rejection cannot take other leases' rows with it |
+| `flush_on_close`         | `off`   | `on` makes a pooled `close()` flush before releasing (one frame and one commit per close, the pre-1.4 behaviour). Note: "flush" means published to the store-and-forward ring, not acknowledged. Close-time errors are wrapped; the delegate's error is the cause; with `on` and no commit window each lease ships its own frame, so a server rejection cannot discard other leases' rows; with `off` leases share frames and a rejection covers all of them; with a commit window a rejection rolls back the whole open group, every lease since the last commit |
 | `commit_rows`            | _(unset)_ | Commit window: with `flush_on_close=on`, closes ship frames flagged defer-commit and the server commits once per window of this many rows. Acks arrive at the commit; `drain()` after `flush()` |
 | `commit_interval_ms`     | _(unset)_ | Commit window age in milliseconds; setting either window key enables the window, the other defaults to 1000 rows / 100 ms. An idle slot's open group is committed at the settle cadence, so the interval only bounds groups on busy slots |
 

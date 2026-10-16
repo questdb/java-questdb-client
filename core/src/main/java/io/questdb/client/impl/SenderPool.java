@@ -1331,8 +1331,8 @@ public final class SenderPool implements AutoCloseable {
                     creationFinished.signalAll();
                     PooledSender lease = new PooledSender(created, created.generation());
                     lock.unlock();
-                    // Every lease handed to a caller starts at a mark. The new slot is not
-                    // yet visible to other threads, so the mark runs outside the pool lock.
+                    // Every lease handed to a caller starts at a mark. The new slot is off
+                    // the free list and owned by this borrower, so the mark runs outside the pool lock.
                     created.delegate().markSavepoint();
                     return lease;
                 }

@@ -217,9 +217,11 @@ public final class QuestDBBuilder {
      * which is the slow path for applications that borrow per message. In this
      * client "flush" means published to the store-and-forward ring, not
      * acknowledged by the server; use {@link Sender#drain(long)} for that.
-     * With {@code on} every lease ships its own frame, so a server rejection
-     * cannot discard other leases' rows; with {@code off} leases share frames
-     * and a rejection covers all of them.
+     * With {@code on} and no commit window every lease ships its own frame, so
+     * a server rejection cannot discard other leases' rows. With {@code off}
+     * leases share frames and a rejection covers all of them. With a commit
+     * window a rejection rolls back the whole open group, every lease since the
+     * last commit.
      * Overrides {@code flush_on_close} in the config string.
      */
     public QuestDBBuilder flushOnClose(boolean flushOnClose) {
