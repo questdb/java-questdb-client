@@ -199,6 +199,45 @@ public class SenderProbeMethodsTest {
     }
 
     @Test
+    public void testCrossingRowWhoseOwnFrameExceedsTheCapThrowsAfterTheRowsBeforeItShip() throws Exception {
+        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+        try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+            server.setAdvertisedMaxBatchSize(4 * 1024);
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            // no auto_flush_bytes key: the byte trigger sits at 90% of the 4 KiB cap (3686 bytes)
+            try (Sender sender = Sender.fromConfig(configWithoutAutoFlushBytes(server.getPort()))) {
+                String wide = QuestDBFlushOnCloseTest.wideValue(1000);
+                for (int i = 0; i < 3; i++) {
+                    sender.table("t").stringColumn("s", wide).atNow();
+                }
+                // 4070 bytes pass the per-row guard, but the table name and schema take the
+                // row's own frame over the cap: the rows before it ship, and the row, alone
+                // over the byte trigger, fails its own flush
+                BatchTooLargeForCapException rejection = null;
+                try {
+                    sender.table("u").stringColumn("z", QuestDBFlushOnCloseTest.wideValue(4070)).atNow();
+                    Assert.fail("the row's own frame exceeds the 4 KiB cap");
+                } catch (BatchTooLargeForCapException expected) {
+                    rejection = expected;
+                }
+                log.awaitDataFrames(1, 5_000);
+                Assert.assertEquals("the three t rows ship as one frame with table t", 1, log.tableCount(0));
+                try {
+                    sender.checkError();
+                    Assert.fail("the probe must report the retained row");
+                } catch (BatchTooLargeForCapException expected) {
+                    Assert.assertSame(rejection, expected);
+                }
+                Assert.assertEquals("only the crossing row stays buffered", 1, sender.pendingRowCount());
+                sender.reset();
+                Assert.assertEquals(0, sender.pendingRowCount());
+                sender.checkError();
+            }
+        }
+    }
+
+    @Test
     public void testDefaultsOnNonWebSocketTransport() {
         try (Sender sender = Sender.fromConfig("http::addr=127.0.0.1:1;protocol_version=2;auto_flush=off;")) {
             sender.autoFlushIfDue();                        // default: no-op

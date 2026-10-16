@@ -4010,10 +4010,11 @@ public class QwpWebSocketSender implements Sender {
      * that row alone can push the batch over the server batch cap, for example
      * when earlier pooled leases left rows behind. On that rejection this method
      * holds the row back and ships the rows before it, and
-     * {@link #resetTableBuffersAfterFlush()} keeps the row buffered alone. When
-     * the rows before it do not fit either, the row goes back into the batch,
-     * and the method retains and throws the first rejection, which describes the
-     * whole batch.
+     * {@link #resetTableBuffersAfterFlush()} keeps the row buffered alone. A
+     * held row that still trips a threshold on its own is flushed at once, so a
+     * rejection of its own frame reaches this caller. When the rows before it do
+     * not fit either, the row goes back into the batch, and the method retains
+     * and throws the first rejection, which describes the whole batch.
      */
     private void autoFlushAfterRow() {
         try {
@@ -4022,6 +4023,11 @@ public class QwpWebSocketSender implements Sender {
             // The hold-back runs only where the sender used to throw. Every cap
             // rejection precedes the first publish, so the whole batch is still
             // buffered and the retry below sees exactly the rows before this one.
+            // Once the rows before it ship, the held row gets the normal auto-flush
+            // check once, with no further hold-back: at or above the byte budget the
+            // next append would flush it anyway, and flushing it now puts a rejection
+            // of its own frame on this row's at() call, which a pooled close() rolls
+            // back while the slot stays in service.
             if (pendingRowCount < 2 || !currentTableBuffer.holdBackLastRow()) {
                 throw rejection;
             }
@@ -4038,6 +4044,9 @@ public class QwpWebSocketSender implements Sender {
                     throw rejection;
                 }
                 throw t;
+            }
+            if (shouldAutoFlush()) {
+                flushPendingRows(transactional);
             }
         }
     }
