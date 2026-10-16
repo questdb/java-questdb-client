@@ -53,6 +53,7 @@ class RecordingSender implements Sender {
     volatile Error flushFatal;                 // thrown by flush() when set, before flushError
     volatile CountDownLatch flushGate;         // flush() blocks on it when set
     volatile RuntimeException latchedError;    // thrown by checkError() when set
+    volatile CountDownLatch markSavepointGate; // markSavepoint() blocks on it when set
     volatile int pendingRows;
     volatile boolean rowInProgress;
     volatile long rowsAppended;
@@ -141,7 +142,7 @@ class RecordingSender implements Sender {
 
     @Override
     public void flush() {
-        awaitGate();
+        awaitGate(flushGate, "flushGate");
         Error fatal = flushFatal;
         if (fatal != null) {
             throw fatal;
@@ -162,7 +163,7 @@ class RecordingSender implements Sender {
 
     @Override
     public long flushDeferred() {
-        awaitGate();
+        awaitGate(flushGate, "flushGate");
         RuntimeException deferredError = deferredFlushError;
         if (deferredError != null) {
             throw deferredError;
@@ -214,6 +215,7 @@ class RecordingSender implements Sender {
 
     @Override
     public void markSavepoint() {
+        awaitGate(markSavepointGate, "markSavepointGate");
         savepointRows = pendingRows;
     }
 
@@ -266,12 +268,11 @@ class RecordingSender implements Sender {
         return this;
     }
 
-    private void awaitGate() {
-        CountDownLatch gate = flushGate;
+    private static void awaitGate(CountDownLatch gate, String name) {
         if (gate != null) {
             try {
                 if (!gate.await(10, TimeUnit.SECONDS)) {
-                    throw new AssertionError("flushGate was never released");
+                    throw new AssertionError(name + " was never released");
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();

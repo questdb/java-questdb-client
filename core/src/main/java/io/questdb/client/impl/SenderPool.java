@@ -1252,11 +1252,14 @@ public final class SenderPool implements AutoCloseable {
                     // wrapper handed out can be told apart from any prior,
                     // now-stale borrow of the same slot.
                     s.bumpGeneration();
+                    PooledSender lease = new PooledSender(s, s.generation());
+                    lock.unlock();
                     // Lease-scoped reset: the borrower's reset() rolls back to here, so rows
-                    // earlier leases left in this buffer survive it. Pure bookkeeping on the
-                    // delegate, no error check, no throw path while the lock is held.
+                    // earlier leases left in this buffer survive it. The slot is off the free
+                    // list under a fresh generation, so no other thread touches the delegate,
+                    // and the mark's walk over every buffered table no longer serializes borrowers.
                     s.delegate().markSavepoint();
-                    return new PooledSender(s, s.generation());
+                    return lease;
                 }
                 if (all.size() + inFlightCreations + closingSlots + leakedSlots + recoveringSlots < maxSize) {
                     inFlightCreations++;
@@ -1326,9 +1329,12 @@ public final class SenderPool implements AutoCloseable {
                     created.bumpGeneration();
                     inFlightCreations--;
                     creationFinished.signalAll();
-                    // Every lease handed to a caller starts at a mark.
+                    PooledSender lease = new PooledSender(created, created.generation());
+                    lock.unlock();
+                    // Every lease handed to a caller starts at a mark. The new slot is not
+                    // yet visible to other threads, so the mark runs outside the pool lock.
                     created.delegate().markSavepoint();
-                    return new PooledSender(created, created.generation());
+                    return lease;
                 }
                 // Capacity-starved: re-probe retired slots BEFORE the terminal
                 // timeout check — a deferred engine cleanup may have released a

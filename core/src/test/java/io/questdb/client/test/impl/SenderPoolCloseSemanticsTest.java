@@ -37,6 +37,8 @@ import org.junit.Test;
 import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * The pooled close() contract after the release-mode change: close releases,
@@ -306,6 +308,38 @@ public class SenderPoolCloseSemanticsTest {
     }
 
     @Test
+    public void testMarkSavepointRunsOutsideThePoolLock() throws Exception {
+        List<RecordingSender> built = new ArrayList<>();
+        try (SenderPool pool = newPool(2, 2, built)) {
+            Sender a = pool.borrow();
+            Sender b = pool.borrow();
+            a.close();
+            b.close();
+            CountDownLatch gate = new CountDownLatch(1);
+            for (RecordingSender rs : built) {
+                rs.markSavepointGate = gate;
+            }
+            AtomicReference<Sender> first = new AtomicReference<>();
+            AtomicReference<Sender> second = new AtomicReference<>();
+            Thread t1 = new Thread(() -> first.set(pool.borrow()), "first");
+            Thread t2 = new Thread(() -> second.set(pool.borrow()), "second");
+            try {
+                t1.start();
+                awaitAvailable(pool, 1);
+                t2.start();
+                awaitAvailable(pool, 0);
+                Assert.assertEquals("a second borrower takes the other slot while the first is still marking", 0, pool.availableSize());
+            } finally {
+                gate.countDown();
+                t1.join(2_000);
+                t2.join(2_000);
+            }
+            first.get().close();
+            second.get().close();
+        }
+    }
+
+    @Test
     public void testStaleResetDoesNotTouchReborrowedSlot() {
         List<RecordingSender> built = new ArrayList<>();
         try (SenderPool pool = newPool(1, 1, built)) {
@@ -339,6 +373,13 @@ public class SenderPoolCloseSemanticsTest {
             return f.get(pooledWrapper);
         } catch (ReflectiveOperationException e) {
             throw new AssertionError(e);
+        }
+    }
+
+    private static void awaitAvailable(SenderPool pool, int target) throws InterruptedException {
+        long deadline = System.nanoTime() + 2_000_000_000L;
+        while (pool.availableSize() != target && System.nanoTime() < deadline) {
+            Thread.sleep(5);
         }
     }
 }
