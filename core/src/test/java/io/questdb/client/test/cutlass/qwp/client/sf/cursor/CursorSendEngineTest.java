@@ -44,9 +44,12 @@ import io.questdb.client.std.ObjList;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
+import org.junit.Assume;
 import org.junit.Before;
 import org.junit.Test;
 
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadMXBean;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
@@ -340,6 +343,42 @@ public class CursorSendEngineTest {
                                 expected == failure);
                     }
                 }
+            }
+        });
+    }
+
+    @Test
+    public void testAppendBlockingParksInsteadOfSpinningWhenInterrupted() throws Exception {
+        ThreadMXBean mx = ManagementFactory.getThreadMXBean();
+        Assume.assumeTrue(mx.isCurrentThreadCpuTimeSupported());
+        TestUtils.assertMemoryLeak(() -> {
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096, 2 * 4096, TimeUnit.MILLISECONDS.toNanos(300))) {
+                while (true) { // fill the ring; nothing drains it
+                    try {
+                        engine.appendBlocking(buf, 16);
+                    } catch (LineSenderException full) {
+                        break;
+                    }
+                }
+                Thread.currentThread().interrupt();
+                long cpuStart = mx.getCurrentThreadCpuTime();
+                long wallStart = System.nanoTime();
+                try {
+                    engine.appendBlocking(buf, 16);
+                    fail("a full ring rejects after the deadline");
+                } catch (LineSenderException expected) {
+                    // backpressure deadline
+                }
+                long wall = System.nanoTime() - wallStart;
+                long cpu = mx.getCurrentThreadCpuTime() - cpuStart;
+                assertTrue("the interrupt flag survives the wait", Thread.interrupted());
+                assertTrue("waited out the deadline", wall >= TimeUnit.MILLISECONDS.toNanos(300));
+                System.out.println("TASK7 cpu=" + cpu + " wall=" + wall);
+                assertTrue("parked, not spinning: cpu=" + cpu + " wall=" + wall, cpu < wall / 2);
+            } finally {
+                Thread.interrupted();
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
             }
         });
     }

@@ -942,25 +942,37 @@ public final class CursorSendEngine implements QuietCloseable {
         // deadline clock.
         counters.backpressureStalls.incrementAndGet();
         long deadlineNs = System.nanoTime() + appendDeadlineNanos;
-        while (true) {
-            long now = System.nanoTime();
-            if (now >= deadlineNs) {
-                throw new io.questdb.client.cutlass.line.LineSenderException(
-                        "cursor ring backpressured for ").put(appendDeadlineNanos / 1_000_000L)
-                        .put(" ms - wire path is not draining (server slow / disconnected, "
-                                + "periodic disk sync is slow, or sf_max_total_bytes is too small)");
+        boolean wasInterrupted = false;
+        try {
+            // parkNanos returns at once while the interrupt flag is set, so the wait
+            // clears the flag before each park and restores it on exit.
+            while (true) {
+                long now = System.nanoTime();
+                if (now >= deadlineNs) {
+                    throw new io.questdb.client.cutlass.line.LineSenderException(
+                            "cursor ring backpressured for ").put(appendDeadlineNanos / 1_000_000L)
+                            .put(" ms - wire path is not draining (server slow / disconnected, "
+                                    + "periodic disk sync is slow, or sf_max_total_bytes is too small)");
+                }
+                if (now - lastBackpressureLogNs >= BACKPRESSURE_LOG_THROTTLE_NANOS) {
+                    lastBackpressureLogNs = now;
+                    LOG.warn("cursor producer backpressured ({} stalls so far); waiting for I/O or periodic disk sync; "
+                                    + "will throw after {} ms",
+                            counters.backpressureStalls.get(), appendDeadlineNanos / 1_000_000L);
+                }
+                if (Thread.interrupted()) {
+                    wasInterrupted = true;
+                }
+                LockSupport.parkNanos(50_000L); // 50 µs
+                fsn = ring.appendOrFsn(payloadAddr, payloadLen);
+                if (fsn >= 0) return fsn;
+                if (fsn == SegmentRing.PAYLOAD_TOO_LARGE) {
+                    throw new MmapSegmentException("payload too large for segment");
+                }
             }
-            if (now - lastBackpressureLogNs >= BACKPRESSURE_LOG_THROTTLE_NANOS) {
-                lastBackpressureLogNs = now;
-                LOG.warn("cursor producer backpressured ({} stalls so far); waiting for I/O or periodic disk sync; "
-                                + "will throw after {} ms",
-                        counters.backpressureStalls.get(), appendDeadlineNanos / 1_000_000L);
-            }
-            LockSupport.parkNanos(50_000L); // 50 µs
-            fsn = ring.appendOrFsn(payloadAddr, payloadLen);
-            if (fsn >= 0) return fsn;
-            if (fsn == SegmentRing.PAYLOAD_TOO_LARGE) {
-                throw new MmapSegmentException("payload too large for segment");
+        } finally {
+            if (wasInterrupted) {
+                Thread.currentThread().interrupt();
             }
         }
     }
