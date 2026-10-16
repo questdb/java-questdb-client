@@ -244,6 +244,94 @@ public class SenderPoolSettleTest {
     }
 
     @Test
+    public void testSettleKeepsOtherSlotsBorrowableWhileOneFlushBlocks() throws Exception {
+        List<RecordingSender> built = new ArrayList<>();
+        try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(2, 2, built)) {
+            Sender a = pool.borrow();
+            Sender b = pool.borrow();
+            a.table("t").longColumn("v", 1L).atNow();
+            b.table("t").longColumn("v", 2L).atNow();
+            a.close();
+            b.close();
+            CountDownLatch gate = new CountDownLatch(1);
+            for (RecordingSender rs : built) {
+                rs.flushGate = gate;
+            }
+            Thread settler = new Thread(pool::settleIdle, "settler");
+            settler.start();
+            try {
+                long deadline = System.currentTimeMillis() + 2_000;
+                while (pool.availableSize() == 2 && System.currentTimeMillis() < deadline) {
+                    Thread.sleep(5);
+                }
+                Assert.assertEquals("settle holds one slot at a time", 1, pool.availableSize());
+                try (Sender borrowed = pool.borrow()) {
+                    RecordingSender other = (RecordingSender) ((PooledSender) borrowed).getDelegateForTesting();
+                    gate.countDown();
+                    settler.join(2_000);
+                    Assert.assertFalse(settler.isAlive());
+                    Assert.assertEquals("settle never flushes a slot a borrower took mid-pass", 0, other.flushCount.get());
+                }
+            } finally {
+                gate.countDown();
+            }
+        }
+    }
+
+    @Test
+    public void testSettleStopsTakingSlotsOnceThePoolCloses() throws Exception {
+        List<RecordingSender> built = new ArrayList<>();
+        SenderPool pool = SenderPoolCloseSemanticsTest.newPool(2, 2, built);
+        try {
+            Sender a = pool.borrow();
+            Sender b = pool.borrow();
+            a.table("t").longColumn("v", 1L).atNow();
+            b.table("t").longColumn("v", 2L).atNow();
+            a.close();
+            b.close();
+            CountDownLatch gate = new CountDownLatch(1);
+            for (RecordingSender rs : built) {
+                rs.flushGate = gate;
+            }
+            AtomicReference<Throwable> settleFailure = new AtomicReference<>();
+            Thread settler = new Thread(() -> {
+                try {
+                    pool.settleIdle();
+                } catch (Throwable t) {
+                    settleFailure.set(t);
+                }
+            }, "settler");
+            Thread closer = new Thread(pool::close, "closer");
+            settler.start();
+            try {
+                long deadline = System.currentTimeMillis() + 2_000;
+                while (pool.availableSize() == 2 && System.currentTimeMillis() < deadline) {
+                    Thread.sleep(5);
+                }
+                Assert.assertTrue(pool.availableSize() < 2);
+                closer.start();
+                deadline = System.currentTimeMillis() + 2_000;
+                while (closer.getState() != Thread.State.TIMED_WAITING && System.currentTimeMillis() < deadline) {
+                    Thread.sleep(5);
+                }
+                Assert.assertEquals("close() must be waiting for the internal lease",
+                        Thread.State.TIMED_WAITING, closer.getState());
+            } finally {
+                gate.countDown();
+            }
+            settler.join(2_000);
+            closer.join(2_000);
+            Assert.assertFalse(settler.isAlive());
+            Assert.assertFalse(closer.isAlive());
+            Assert.assertNull(settleFailure.get());
+            Assert.assertEquals("a closing pool stops the settle after the slot in flight", 1,
+                    built.get(0).flushCount.get() + built.get(1).flushCount.get());
+        } finally {
+            pool.close();
+        }
+    }
+
+    @Test
     public void testSettleHandlesSeveralCandidatesIndependently() {
         List<RecordingSender> built = new ArrayList<>();
         try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(2, 2, built)) {

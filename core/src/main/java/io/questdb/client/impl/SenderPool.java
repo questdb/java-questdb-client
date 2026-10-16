@@ -1738,8 +1738,9 @@ public final class SenderPool implements AutoCloseable {
      * so a slot nobody borrows again would keep its last rows until the pool
      * closes. The housekeeper calls this on its settle cadence.
      * <p>
-     * Each candidate slot is taken off the free list under the pool lock and
-     * stamped with a fresh generation, which makes it an internal lease: a
+     * The settle lists the dirty slots under the pool lock, then takes one slot at
+     * a time off the free list under that lock and stamps it with a fresh
+     * generation, which makes it an internal lease: a
      * borrower arriving meanwhile takes another slot or waits, and
      * {@link #close()} waits for it like any outstanding lease. The flush runs
      * outside the lock. After the flush, whether it succeeded or not, the
@@ -1757,74 +1758,91 @@ public final class SenderPool implements AutoCloseable {
         if (closed) {
             return 0;
         }
-        ArrayList<PooledSender> leases = null;
+        ArrayList<SenderSlot> candidates = null;
         lock.lock();
         try {
             if (closed) {
                 return 0;
             }
-            Iterator<SenderSlot> it = available.iterator();
-            while (it.hasNext()) {
-                SenderSlot s = it.next();
+            for (SenderSlot s : available) {
                 if (hasUnshippedWork(s.delegate())) {
-                    it.remove();
-                    s.bumpGeneration();
-                    if (leases == null) {
-                        leases = new ArrayList<>();
+                    if (candidates == null) {
+                        candidates = new ArrayList<>();
                     }
-                    leases.add(new PooledSender(s, s.generation()));
+                    candidates.add(s);
                 }
             }
         } finally {
             lock.unlock();
         }
-        if (leases == null) {
+        if (candidates == null) {
             return 0;
         }
         int settled = 0;
-        for (int i = 0, n = leases.size(); i < n; i++) {
-            PooledSender lease = leases.get(i);
-            boolean flushed = false;
-            Throwable fatal = null;
-            BatchTooLargeForCapException overCap = null;
+        for (int i = 0, n = candidates.size(); i < n; i++) {
+            SenderSlot s = candidates.get(i);
+            PooledSender lease;
+            lock.lock();
             try {
-                // PooledSender.flush() already marks the commit on the slot.
-                lease.flush();
-                lease.slot().settleFailureLogged(false);
-                flushed = true;
-            } catch (BatchTooLargeForCapException e) {
-                // Deterministic: the probe would report it too, but no settle retry
-                // can ship this batch and no lease owns it any more. Retire the
-                // slot below.
-                overCap = e;
-            } catch (Exception e) {
-                // Transient (ring full, recycle in flight) or terminal: the
-                // requeue below tells them apart with the probe.
-                logSettleFailure(lease.slot(), e);
-            } catch (Throwable t) {
-                // An Error (AssertionError, OutOfMemoryError) is not transient.
-                fatal = t;
-            }
-            try {
-                if (fatal != null) {
-                    LOG.warn("settleIdle: flush threw an Error, retiring slot {}", lease.slot().slotIndex(), fatal);
-                    retireLease(lease, " during settle");
-                } else if (overCap != null) {
-                    LOG.error("settleIdle: slot {} holds a batch the server cap rejects, retiring it and dropping {} pending row(s): {}",
-                            lease.slot().slotIndex(), pendingRowsOf(lease.slot()), overCap.getDetail());
-                    retireLease(lease, " during settle");
-                } else {
-                    requeueSettled(lease);
+                if (closed) {
+                    break;
                 }
-            } catch (Throwable t) {
-                // Keep going: the remaining leases must not stay out of `available`.
-                LOG.warn("settleIdle: could not requeue or retire slot {}", lease.slot().slotIndex(), t);
+                // A borrower may have taken the slot since the listing: check
+                // membership before reading the delegate of a leased slot.
+                if (!available.contains(s) || !hasUnshippedWork(s.delegate())) {
+                    continue;
+                }
+                available.remove(s);
+                s.bumpGeneration();
+                lease = new PooledSender(s, s.generation());
+            } finally {
+                lock.unlock();
             }
-            if (flushed) {
+            if (settleOne(lease)) {
                 settled++;
             }
         }
         return settled;
+    }
+
+    private boolean settleOne(PooledSender lease) {
+        boolean flushed = false;
+        Throwable fatal = null;
+        BatchTooLargeForCapException overCap = null;
+        try {
+            // PooledSender.flush() already marks the commit on the slot.
+            lease.flush();
+            lease.slot().settleFailureLogged(false);
+            flushed = true;
+        } catch (BatchTooLargeForCapException e) {
+            // Deterministic: the probe would report it too, but no settle retry
+            // can ship this batch and no lease owns it any more. Retire the
+            // slot below.
+            overCap = e;
+        } catch (Exception e) {
+            // Transient (ring full, recycle in flight) or terminal: the
+            // requeue below tells them apart with the probe.
+            logSettleFailure(lease.slot(), e);
+        } catch (Throwable t) {
+            // An Error (AssertionError, OutOfMemoryError) is not transient.
+            fatal = t;
+        }
+        try {
+            if (fatal != null) {
+                LOG.warn("settleIdle: flush threw an Error, retiring slot {}", lease.slot().slotIndex(), fatal);
+                retireLease(lease, " during settle");
+            } else if (overCap != null) {
+                LOG.error("settleIdle: slot {} holds a batch the server cap rejects, retiring it and dropping {} pending row(s): {}",
+                        lease.slot().slotIndex(), pendingRowsOf(lease.slot()), overCap.getDetail());
+                retireLease(lease, " during settle");
+            } else {
+                requeueSettled(lease);
+            }
+        } catch (Throwable t) {
+            // Keep going: the remaining leases must not stay out of `available`.
+            LOG.warn("settleIdle: could not requeue or retire slot {}", lease.slot().slotIndex(), t);
+        }
+        return flushed;
     }
 
     private void logSettleFailure(SenderSlot slot, Exception e) {
