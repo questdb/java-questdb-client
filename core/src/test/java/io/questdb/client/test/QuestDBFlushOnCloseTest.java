@@ -38,6 +38,7 @@ import org.junit.Test;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
@@ -69,7 +70,7 @@ public class QuestDBFlushOnCloseTest {
     }
 
     @Test
-    public void testCrossingRowOverTheMarginDropsOnlyThatLeasesRowsAndShipsTheRest() throws Exception {
+    public void testCrossingRowShipsTheEarlierRowsAndStaysBuffered() throws Exception {
         FrameLog log = new FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.setAdvertisedMaxBatchSize(4 * 1024);
@@ -77,41 +78,23 @@ public class QuestDBFlushOnCloseTest {
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
             // auto_flush_bytes unset: the byte trigger sits at 90 percent of the 4 KiB cap (3686 bytes)
             try (QuestDB db = QuestDB.connect(config(server.getPort(), "auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
-                // warm-up lease: proves the connection and the advertised cap are in place
-                // (initial_connect_retry=async learns the cap on the I/O thread)
-                try (Sender s = db.borrowSender()) {
-                    s.table("w").longColumn("v", 1L).atNow();
-                    s.flush();
-                }
-                log.awaitDataFrames(1, 5_000);
-                String wide = wideValue(1000);
-                for (int i = 0; i < 3; i++) {
-                    try (Sender s = db.borrowSender()) {
-                        s.table("t").stringColumn("s", wide).atNow();    // 3 KB in all, below the trigger
-                    }
-                }
-                Sender delegate = null;
-                boolean hasCloseThrown = false;
+                appendThreeWideRowsAfterAWarmUp(db, log);
+                Sender delegate;
                 try (Sender s = db.borrowSender()) {
                     delegate = ((PooledSender) s).getDelegateForTesting();
-                    try {
-                        s.table("t").stringColumn("s", wideValue(1500)).atNow();
-                        Assert.fail("the crossing row makes the auto-flushed batch 4.5 KB, over the 4 KiB cap");
-                    } catch (BatchTooLargeForCapException expected) {
-                        // the row stays committed and the rejection is retained
-                    }
-                } catch (LineSenderException e) {
-                    hasCloseThrown = true;
-                    Assert.assertTrue("close() wraps the rejection", e.getCause() instanceof BatchTooLargeForCapException);
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("dropped 1 row(s) of this lease"));
+                    // the auto-flushed batch would be 4.5 KB, over the 4 KiB cap: the sender
+                    // ships the three rows before the crossing row and keeps that row
+                    s.table("t").stringColumn("s", wideValue(1500)).atNow();
+                    Assert.assertEquals("only the crossing row stays buffered", 1, s.pendingRowCount());
                 }
-                Assert.assertTrue("close() must report the dropped row", hasCloseThrown);
                 log.awaitDataFrames(2, 5_000);
                 Assert.assertEquals("the three earlier rows ship as one frame with table t", 1, log.tableCount(1));
                 try (Sender s = db.borrowSender()) {
                     Assert.assertSame("the slot stayed in service", delegate, ((PooledSender) s).getDelegateForTesting());
-                    Assert.assertEquals("only the crossing row was dropped, the rest shipped", 0, s.pendingRowCount());
+                    Assert.assertEquals(1, s.pendingRowCount());
+                    s.flush();
                 }
+                log.awaitDataFrames(3, 5_000);
             }
         }
     }
@@ -266,6 +249,31 @@ public class QuestDBFlushOnCloseTest {
                 }
                 Assert.assertEquals("the release shipped the earlier lease's aged row", 0, delegate.pendingRowCount());
                 log.awaitDataFrames(1, 5_000);
+            }
+        }
+    }
+
+    @Test
+    public void testResetAfterACrossingRowDropsOnlyThatRow() throws Exception {
+        FrameLog log = new FrameLog();
+        try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+            server.setAdvertisedMaxBatchSize(4 * 1024);
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            // auto_flush_bytes unset: the byte trigger sits at 90 percent of the 4 KiB cap (3686 bytes)
+            try (QuestDB db = QuestDB.connect(config(server.getPort(), "auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
+                appendThreeWideRowsAfterAWarmUp(db, log);
+                try (Sender s = db.borrowSender()) {
+                    s.table("t").stringColumn("s", wideValue(1500)).atNow();
+                    // the three earlier rows shipped with the auto-flush, so the
+                    // crossing row is the only row left and it is this lease's own
+                    s.reset();
+                    Assert.assertEquals("reset() drops the crossing row", 0, s.pendingRowCount());
+                }
+                log.awaitDataFrames(2, 5_000);
+                try (Sender s = db.borrowSender()) {
+                    Assert.assertEquals(0, s.pendingRowCount());
+                }
             }
         }
     }
@@ -432,6 +440,22 @@ public class QuestDBFlushOnCloseTest {
         }
     }
 
+    static void appendThreeWideRowsAfterAWarmUp(QuestDB db, FrameLog log) throws InterruptedException {
+        // warm-up lease: proves the connection and the advertised cap are in place
+        // (initial_connect_retry=async learns the cap on the I/O thread)
+        try (Sender s = db.borrowSender()) {
+            s.table("w").longColumn("v", 1L).atNow();
+            s.flush();
+        }
+        log.awaitDataFrames(1, 5_000);
+        String wide = wideValue(1000);
+        for (int i = 0; i < 3; i++) {
+            try (Sender s = db.borrowSender()) {
+                s.table("t").stringColumn("s", wide).atNow();    // 3 KB in all, below the trigger
+            }
+        }
+    }
+
     static String config(int port, String extra) {
         return "ws::addr=localhost:" + port
                 + ";sender_pool_min=1;sender_pool_max=1"
@@ -443,13 +467,13 @@ public class QuestDBFlushOnCloseTest {
 
     public static String wideValue(int length) {
         char[] chars = new char[length];
-        java.util.Arrays.fill(chars, 'x');
+        Arrays.fill(chars, 'x');
         return new String(chars);
     }
 
     /**
      * Parses every QWP frame in each WebSocket message (a read can carry more
-     * than one on replay), records its flags byte and table count, and acks
+     * than one on replay), records its flags byte, table count and bytes, and acks
      * cumulatively so the sender never backs up. Public: the sender-level
      * probe test in a sub-package and the benchmark reuse it.
      */
@@ -459,6 +483,7 @@ public class QuestDBFlushOnCloseTest {
         private static final int OFFSET_PAYLOAD_LENGTH = 8;
         private static final int OFFSET_TABLE_COUNT = 6;
         private final List<Integer> flags = new ArrayList<>();
+        private final List<byte[]> frames = new ArrayList<>();
         private final List<Integer> tableCounts = new ArrayList<>();
         private TestWebSocketServer.ClientHandler currentClient;
         private long nextSeq;
@@ -517,6 +542,14 @@ public class QuestDBFlushOnCloseTest {
             throw new AssertionError("no data frame at index " + dataFrameIndex);
         }
 
+        /**
+         * A copy of every frame {@link #onBinaryMessage} parsed, in arrival order,
+         * each frame's header and payload as one array.
+         */
+        public synchronized List<byte[]> frames() {
+            return new ArrayList<>(frames);
+        }
+
         @Override
         public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
             if (currentClient != client) {
@@ -535,6 +568,7 @@ public class QuestDBFlushOnCloseTest {
                     break;
                 }
                 flags.add(data[pos + OFFSET_FLAGS] & 0xFF);
+                frames.add(Arrays.copyOfRange(data, pos, pos + HEADER_SIZE + (int) payloadLength));
                 tableCounts.add(tableCount);
                 framesInMessage++;
                 pos += HEADER_SIZE + (int) payloadLength;

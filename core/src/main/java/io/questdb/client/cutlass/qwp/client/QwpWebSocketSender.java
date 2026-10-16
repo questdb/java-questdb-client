@@ -4005,6 +4005,44 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Runs the auto-flush {@link #sendRow()} starts once a row trips a
+     * threshold. The byte trigger fires after the crossing row is committed, so
+     * that row alone can push the batch over the server batch cap, for example
+     * when earlier pooled leases left rows behind. On that rejection this method
+     * holds the row back and ships the rows before it, and
+     * {@link #resetTableBuffersAfterFlush()} keeps the row buffered alone. When
+     * the rows before it do not fit either, the row goes back into the batch,
+     * and the method retains and throws the first rejection, which describes the
+     * whole batch.
+     */
+    private void autoFlushAfterRow() {
+        try {
+            flushPendingRows(transactional);
+        } catch (BatchTooLargeForCapException rejection) {
+            // The hold-back runs only where the sender used to throw. Every cap
+            // rejection precedes the first publish, so the whole batch is still
+            // buffered and the retry below sees exactly the rows before this one.
+            if (pendingRowCount < 2 || !currentTableBuffer.holdBackLastRow()) {
+                throw rejection;
+            }
+            try {
+                // Ships every row but the held one; resetTableBuffersAfterFlush
+                // resolves the hold by retaining the held row.
+                flushPendingRows(transactional);
+            } catch (Throwable t) {
+                // restoreHeldRow() does nothing when resetTableBuffersAfterFlush
+                // already retained the row.
+                currentTableBuffer.restoreHeldRow();
+                if (t instanceof BatchTooLargeForCapException) {
+                    retainedBatchRejection = rejection;
+                    throw rejection;
+                }
+                throw t;
+            }
+        }
+    }
+
+    /**
      * Resolves the connect timeout for one {@code buildAndConnect} walk.
      * Foreground connects honour the configured value verbatim: 0 (the
      * default) keeps the historical untimed native connect, bounded only by
@@ -5559,16 +5597,34 @@ public class QwpWebSocketSender implements Sender {
 
     private void resetTableBuffersAfterFlush() {
         for (int i = 0, n = flushTableBuffers.size(); i < n; i++) {
-            flushTableBuffers.getQuick(i).reset();
+            QwpTableBuffer tableBuffer = flushTableBuffers.getQuick(i);
+            if (!tableBuffer.hasHeldRow()) {
+                tableBuffer.reset();
+            }
         }
         // Drop the references; the next flush re-collects.
         flushTableNames.clear();
         flushTableBuffers.clear();
-        currentBatchMaxSymbolId = -1;
-        pendingBytes = 0;
-        currentTableBufferSnapshotBytes = 0;
-        pendingRowCount = 0;
-        firstPendingRowTimeNanos = 0;
+        if (currentTableBuffer != null && currentTableBuffer.hasHeldRow()) {
+            // autoFlushAfterRow shipped every row but the one it held back, which
+            // stays buffered as the only pending row. currentBatchMaxSymbolId keeps
+            // its value: the held row's symbol ids are at or below it, and a
+            // full-dictionary frame must still carry them. In delta mode the frame
+            // that just shipped carried them, and advanceSentMaxSymbolId moved the
+            // baseline past them.
+            currentTableBuffer.retainHeldRow();
+            long heldRowBytes = currentTableBuffer.getBufferedBytes();
+            pendingRowCount = 1;
+            pendingBytes = heldRowBytes;
+            currentTableBufferSnapshotBytes = heldRowBytes;
+            firstPendingRowTimeNanos = System.nanoTime();
+        } else {
+            currentBatchMaxSymbolId = -1;
+            pendingBytes = 0;
+            currentTableBufferSnapshotBytes = 0;
+            pendingRowCount = 0;
+            firstPendingRowTimeNanos = 0;
+        }
         clearSavepointAndRejection();
         armIfEligible();
     }
@@ -7187,7 +7243,7 @@ public class QwpWebSocketSender implements Sender {
         currentTableBufferSnapshotBytes = bufferedNow;
 
         if (shouldAutoFlush()) {
-            flushPendingRows(transactional);
+            autoFlushAfterRow();
         }
     }
 

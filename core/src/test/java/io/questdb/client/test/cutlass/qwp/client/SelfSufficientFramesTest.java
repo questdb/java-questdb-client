@@ -45,6 +45,7 @@ import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -1005,6 +1006,62 @@ public class SelfSufficientFramesTest {
 
                 Assert.assertEquals("nothing may reach the server -- neither a data frame "
                         + "nor a stranded dictionary chunk", 0, handler.batches.size());
+            }
+        });
+    }
+
+    @Test
+    public void testHeldCrossingRowFrameCarriesTheDictionaryInFullDictMode() throws Exception {
+        // A row that pushes an auto-flushed batch over the cap stays buffered while
+        // the rows before it ship. The sender registered the row's symbol before it
+        // encoded that frame, so the frame defines the id. In full-dict mode every
+        // frame must define every id its rows reference, so the frame that later
+        // ships the held row must carry the dictionary again: the sender keeps the
+        // batch's symbol watermark when it retains the row.
+        Path sfDir = temporaryFolder.newFolder("qwp-sf-held-row").toPath();
+        String slot = sfDir.resolve("default").toString();
+        assertMemoryLeak(() -> {
+            CapturingHandler handler = new CapturingHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.setAdvertisedMaxBatchSize(4 * 1024);
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                // openCleanRW fails against nothing on disk, so the slot runs full-dict.
+                UnopenableDictFacade dictFf = new UnopenableDictFacade();
+                CursorSendEngine engine = new CursorSendEngine(
+                        slot, 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                        CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, dictFf);
+                // the default auto_flush_bytes binds the byte trigger to 90% of the 4 KiB cap
+                try (Sender sender = QwpWebSocketSender.connect(
+                        "localhost", port, null, 1_000_000, QwpWebSocketSender.DEFAULT_AUTO_FLUSH_BYTES,
+                        0L, null, false, engine)) {
+                    Assert.assertFalse("the slot runs full-dict",
+                            ((QwpWebSocketSender) sender).isDeltaDictEnabledForTest());
+                    String wide = TestUtils.repeat("x", 1000);
+                    for (int i = 0; i < 3; i++) {
+                        sender.table("t").symbol("y", "a").stringColumn("s", wide).atNow();
+                    }
+                    // the auto-flushed batch would be 4.5 KB: the three rows before this
+                    // one ship, and this row, which registered "b", stays buffered
+                    sender.table("t").symbol("y", "b").stringColumn("s", TestUtils.repeat("x", 1500)).atNow();
+                    Assert.assertEquals(1, sender.pendingRowCount());
+                    sender.flush();
+                    sender.table("t").symbol("y", "b").atNow();
+                    sender.flush();
+                    waitFor(() -> handler.batches.size() >= 3, 10_000);
+                }
+
+                Assert.assertEquals(3, handler.batches.size());
+                for (int i = 0; i < 3; i++) {
+                    byte[] frame = handler.batches.get(i);
+                    Assert.assertEquals("frame " + i + " carries table t", 1, QwpWireTestUtils.tableCount(frame));
+                    List<String> dictionary = new ArrayList<>();
+                    QwpWireTestUtils.accumulateDeltaDictionary(frame, dictionary);
+                    Assert.assertEquals("frame " + i + " defines every id its rows reference",
+                            Arrays.asList("a", "b"), dictionary);
+                }
             }
         });
     }
