@@ -56,6 +56,13 @@ public class AzureClientSecretCredentialLibraryTest {
     private static final String CLIENT_SECRET = "not-a-real-secret";
 
     @Test(timeout = 30_000)
+    public void testClientRejectionsWithoutKnownAadstsCodesArePermanent() {
+        for (int status : new int[]{400, 401}) {
+            assertPermanentClientRejection(status, false);
+        }
+    }
+
+    @Test(timeout = 30_000)
     public void testFinalRetryAfterSurvivesSdkRetries() {
         assertRetryAfter(new TokenEndpoint(429, "7"), false, 7_000);
     }
@@ -115,24 +122,44 @@ public class AzureClientSecretCredentialLibraryTest {
     }
 
     @Test(timeout = 30_000)
+    public void testWrappedClientRejectionsWithoutKnownAadstsCodesArePermanent() {
+        for (int status : new int[]{400, 401}) {
+            assertPermanentClientRejection(status, true);
+        }
+    }
+
+    @Test(timeout = 30_000)
     public void testWrappedMsalFailureRetainsRetryAfter() {
         assertRetryAfter(new TokenEndpoint(429, " 7 "), true, 7_000);
     }
 
     private static void assertNoResponseBody(TokenUnavailableException e) {
         Assert.assertFalse(e.getMessage(), e.getMessage().contains(BODY_SENTINEL));
+        Assert.assertFalse(e.getMessage(), e.getMessage().contains(CLIENT_SECRET));
         Assert.assertNull("never retain an SDK exception that references the raw request", e.getCause());
     }
 
-    private static void assertRetryAfter(TokenEndpoint endpoint, boolean isWrapped, long expectedRetryAfterMillis) {
-        TokenCredential credential = credential(endpoint);
-        if (isWrapped) {
-            TokenCredential delegate = credential;
-            credential = context -> delegate.getToken(context).onErrorMap(
-                    failure -> new ClientAuthenticationException("authentication failed", null, failure));
-        }
+    private static void assertPermanentClientRejection(int status, boolean isWrapped) {
+        // Entra reports an invalid application ID as AADSTS700038, outside the known-code allowlist.
+        TokenEndpoint endpoint = new TokenEndpoint(status, null,
+                "{\"error\":\"unauthorized_client\",\"error_description\":\"AADSTS700038: "
+                        + "00000000-0000-0000-0000-000000000000 is not a valid application identifier. "
+                        + BODY_SENTINEL + "\"}");
         try {
-            new AzureTokenSource(credential, "api://qdb").fetchToken();
+            new AzureTokenSource(credential(endpoint, isWrapped), "api://qdb").fetchToken();
+            Assert.fail("expected Entra to reject the application");
+        } catch (TokenUnavailableException e) {
+            Assert.assertFalse(e.getMessage(), e.isRetryable());
+            Assert.assertTrue(e.getMessage(), e.getMessage().contains("HTTP " + status));
+            Assert.assertEquals(TokenUnavailableException.NO_RETRY_AFTER, e.getRetryAfterMillis());
+            assertNoResponseBody(e);
+        }
+        Assert.assertEquals("a configuration rejection must not trigger SDK retries", 1, endpoint.tokenRequests.get());
+    }
+
+    private static void assertRetryAfter(TokenEndpoint endpoint, boolean isWrapped, long expectedRetryAfterMillis) {
+        try {
+            new AzureTokenSource(credential(endpoint, isWrapped), "api://qdb").fetchToken();
             Assert.fail("expected the token endpoint to reject the request");
         } catch (TokenUnavailableException e) {
             Assert.assertEquals("the SDK must exhaust its default three retries", 4, endpoint.tokenRequests.get());
@@ -151,6 +178,12 @@ public class AzureClientSecretCredentialLibraryTest {
                 .disableInstanceDiscovery()
                 .httpClient(endpoint)
                 .build();
+    }
+
+    private static TokenCredential credential(TokenEndpoint endpoint, boolean isWrapped) {
+        TokenCredential credential = credential(endpoint);
+        return isWrapped ? context -> credential.getToken(context).onErrorMap(
+                failure -> new ClientAuthenticationException("authentication failed", null, failure)) : credential;
     }
 
     private static final class StubResponse extends HttpResponse {

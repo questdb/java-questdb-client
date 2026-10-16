@@ -167,10 +167,6 @@ public final class AzureTokenSource implements TokenSource {
                             retryAfterMillis(response));
                 }
             }
-            if (t instanceof MsalServiceException && retryAfterMillis == TokenUnavailableException.NO_RETRY_AFTER) {
-                // Service-principal credentials expose response headers through MSAL, not HttpResponseException.
-                retryAfterMillis = retryAfterMillis(((MsalServiceException) t).headers());
-            }
             final String message = t.getMessage();
             if (message != null) {
                 for (String code : PERMANENT_AADSTS) {
@@ -183,6 +179,18 @@ public final class AzureTokenSource implements TokenSource {
                     // the library's reason, never its message: that also carries the raw response
                     return TokenUnavailableException.permanent("managed identity unavailable for " + scope
                             + ": the requested identity has not been assigned to this resource");
+                }
+            }
+            if (t instanceof MsalServiceException) {
+                // Service-principal credentials expose status and headers through MSAL, not HttpResponseException.
+                final MsalServiceException msal = (MsalServiceException) t;
+                final Integer status = msal.statusCode();
+                if (status != null && (status == 400 || status == 401)) {
+                    return TokenUnavailableException.permanent(
+                            "Entra rejected the token request for " + scope + " with HTTP " + status + ": " + description);
+                }
+                if (retryAfterMillis == TokenUnavailableException.NO_RETRY_AFTER) {
+                    retryAfterMillis = retryAfterMillis(msal.headers());
                 }
             }
         }
