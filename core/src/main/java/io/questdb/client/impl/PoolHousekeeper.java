@@ -53,6 +53,7 @@ final class PoolHousekeeper {
     static final long STOP_TIMEOUT_MILLIS = 2_000;
 
     private final long intervalMillis;
+    private final long originNanos = System.nanoTime();
     private final QueryClientPool queryPool;
     private final SenderPool senderPool;
     private final long settleIntervalMillis;
@@ -175,8 +176,12 @@ final class PoolHousekeeper {
         return callerWasInterrupted;
     }
 
+    private long monotonicMillis() {
+        return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - originNanos);
+    }
+
     private void runLoop() {
-        long startMillis = System.currentTimeMillis();
+        long startMillis = monotonicMillis();
         long nextSettleAt = deadline(startMillis, settleIntervalMillis);
         long nextReapAt = deadline(startMillis, intervalMillis);
         long nextRecoveryAt = startMillis;
@@ -202,7 +207,7 @@ final class PoolHousekeeper {
             // a recovery failure (including an Error) must never kill this
             // daemon, so swallow Throwable -- exactly as the reap guards below.
             boolean recovering = false;
-            if (System.currentTimeMillis() >= nextRecoveryAt) {
+            if (monotonicMillis() >= nextRecoveryAt) {
                 try {
                     recovering = senderPool.runStartupRecoveryStep();
                 } catch (Throwable ignored) {
@@ -212,7 +217,7 @@ final class PoolHousekeeper {
                 // found nothing or hit a transient failure is retried on its own
                 // cadence, never on the settle cadence: a stranded slot against an
                 // unreachable server must not become a hot connect loop.
-                long afterStep = System.currentTimeMillis();
+                long afterStep = monotonicMillis();
                 nextRecoveryAt = recovering ? afterStep : deadline(afterStep, STARTUP_RECOVERY_RETRY_MILLIS);
             }
             synchronized (signalLock) {
@@ -221,7 +226,7 @@ final class PoolHousekeeper {
                 }
                 if (!recovering) {
                     long nextAt = Math.min(Math.min(nextSettleAt, nextReapAt), nextRecoveryAt);
-                    long waitMillis = nextAt - System.currentTimeMillis();
+                    long waitMillis = nextAt - monotonicMillis();
                     if (waitMillis > 0) {
                         try {
                             signalLock.wait(waitMillis);
@@ -235,7 +240,7 @@ final class PoolHousekeeper {
             if (stop) {
                 return;
             }
-            long now = System.currentTimeMillis();
+            long now = monotonicMillis();
             if (now >= nextSettleAt) {
                 try {
                     senderPool.settleIdle();
