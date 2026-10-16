@@ -129,6 +129,21 @@ public class TokenProviderConfigTest {
     }
 
     @Test
+    public void testQueryClientResolvesTokenProviderOnce() throws Exception {
+        assertMemoryLeak(() -> {
+            String cfg = WSS + "token_provider=azure;azure_resource=api://qdb-app/.default;";
+            try (QwpQueryClient client = QwpQueryClient.fromConfig(cfg)) {
+                Assert.assertEquals("one factory validation per client", 1, azure.validations.get());
+                Map<String, Object> snap = client.configSnapshotForTest();
+                Assert.assertEquals("azure", snap.get("token_provider"));
+                Assert.assertEquals("api://qdb-app", snap.get("azure_resource"));
+            }
+            Assert.assertEquals("configuration must not create a source", 0, azure.created.get());
+            Assert.assertEquals("configuration must not fetch a token", 0, azure.fetches.get());
+        });
+    }
+
+    @Test
     public void testRegistryLifecycle() {
         // C19: lease release, linger, and re-acquiring a lease during the linger period.
         TokenProviderRegistry registry = new TokenProviderRegistry(300);
@@ -263,7 +278,10 @@ public class TokenProviderConfigTest {
             String cfg = WSS + "token_provider=azure;azure_resource=api://validate-only;"
                     + "sender_pool_min=0;query_pool_min=0;";
             Sender.builder(cfg);
+            int validations = azure.validations.get();
             QwpQueryClient.validateConfig(new ConfigView(ConfigString.parse(cfg)), true);
+            Assert.assertEquals("standalone validation must still resolve the provider", validations + 1,
+                    azure.validations.get());
             QwpQueryClient.fromConfig(cfg).close();
             try (QuestDB ignored = QuestDB.connect(cfg)) {
                 Assert.assertEquals("no provider may be started", 0, azure.created.get());

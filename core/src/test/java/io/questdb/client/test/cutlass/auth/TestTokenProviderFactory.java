@@ -39,7 +39,7 @@ import java.util.function.Function;
 
 /**
  * A {@link TokenProviderFactory} for tests, installed in place of {@link java.util.ServiceLoader} discovery with
- * {@link #install(TestTokenProviderFactory...)}. It counts the sources it creates and the fetches they make.
+ * {@link #install(TestTokenProviderFactory...)}. It counts source creation, token fetches and configuration validation.
  * Registering one named {@code azure} lets core tests drive the {@code azure} connect-string keys without the
  * optional module.
  */
@@ -47,6 +47,7 @@ public final class TestTokenProviderFactory implements TokenProviderFactory {
     public final AtomicInteger created = new AtomicInteger();
     public final AtomicInteger fetches = new AtomicInteger();
     public final List<Map<String, String>> params = new CopyOnWriteArrayList<>();
+    public final AtomicInteger validations = new AtomicInteger();
     private final String name;
     private final Function<Map<String, String>, ExpiringToken> tokens;
 
@@ -92,6 +93,7 @@ public final class TestTokenProviderFactory implements TokenProviderFactory {
 
     @Override
     public void validate(Map<String, String> params) {
+        validations.incrementAndGet();
         String resource = params.get("azure_resource");
         if (resource != null && resource.startsWith("invalid:")) {
             throw new IllegalArgumentException("azure_resource rejected by the factory");

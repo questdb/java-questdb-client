@@ -399,8 +399,7 @@ public class QwpQueryClient implements QuietCloseable {
                     "unsupported schema [schema=" + cs.schema() + ", supported-schemas=[ws, wss]]");
         }
         ConfigView view = new ConfigView(cs);
-        validateConfig(view, tls);
-        TokenProviderSpec tokenProviderSpec = TokenProviderSpec.parse(view, tls);
+        TokenProviderSpec tokenProviderSpec = validateConfigAndResolveTokenProvider(view, tls);
 
         List<Endpoint> parsedEndpoints = new ArrayList<>();
         view.getHostPorts("addr", DEFAULT_WS_PORT, (h, p) -> parsedEndpoints.add(new Endpoint(h, p)));
@@ -513,85 +512,12 @@ public class QwpQueryClient implements QuietCloseable {
 
     /**
      * Validates the cross-key invariants of an egress {@code ws}/{@code wss}
-     * config without constructing a client. Shared by {@link #fromConfig} and
-     * the {@code QuestDB} facade's fail-fast build path. {@code tls} is true for
-     * the {@code wss} schema.
+     * config without constructing a client. The {@code QuestDB} facade uses
+     * this for fail-fast validation with the same rules as {@link #fromConfig}.
+     * {@code tls} is true for the {@code wss} schema.
      */
     public static void validateConfig(ConfigView view, boolean tls) {
-        view.getHostPorts("addr", DEFAULT_WS_PORT, (h, p) -> {
-        });
-        if (!view.has("addr")) {
-            throw new IllegalArgumentException("missing required key: addr");
-        }
-        // Trigger range/enum validation of every typed value.
-        view.getEnum("target");
-        view.getEnum("compression");
-        view.getEnum("tls_verify");
-        view.getBoolOnOff("failover", false);
-        view.getInt("failover_max_attempts", 0);
-        view.getInt("max_batch_rows", 0);
-        view.getInt("buffer_pool_size", 0);
-        view.getInt("compression_level", 0);
-        boolean hasBackoffInitial = view.has("failover_backoff_initial_ms");
-        boolean hasBackoffMax = view.has("failover_backoff_max_ms");
-        // getLong also range-validates the value; call it even for an absent key.
-        long backoffInitial = view.getLong("failover_backoff_initial_ms", -1);
-        long backoffMax = view.getLong("failover_backoff_max_ms", -1);
-        view.getLong("failover_max_duration_ms", -1);
-        view.getLong("initial_credit", -1);
-        view.getLong("auth_timeout_ms", -1);
-        // getInt: connect_timeout feeds an int API, so validation must also
-        // reject values that fit a long but not an int.
-        view.getInt("connect_timeout", -1);
-        String username = view.getStr("username");
-        String password = view.getStr("password");
-        String token = view.getStr("token");
-        // A present-but-blank credential is rejected up front, matching the
-        // ingress Sender, so a shared ws/wss string fails the same way on both
-        // sides and the client never builds an empty Authorization header.
-        if (username != null && Chars.isBlank(username)) {
-            throw new IllegalArgumentException("username cannot be empty nor null");
-        }
-        if (password != null && Chars.isBlank(password)) {
-            throw new IllegalArgumentException("password cannot be empty nor null");
-        }
-        if (token != null && Chars.isBlank(token)) {
-            throw new IllegalArgumentException("token cannot be empty nor null");
-        }
-        boolean hasBasic = username != null || password != null;
-        if (hasBasic && (username == null || password == null)) {
-            throw new IllegalArgumentException("username and password must be provided together");
-        }
-        if (hasBasic && token != null) {
-            throw new IllegalArgumentException("cannot use both token and username/password authentication");
-        }
-        String tlsVerify = view.getStr("tls_verify");
-        String tlsRoots = view.getStr("tls_roots");
-        String tlsRootsPassword = view.getStr("tls_roots_password");
-        if (!tls && (tlsVerify != null || tlsRoots != null || tlsRootsPassword != null)) {
-            throw new IllegalArgumentException(
-                    "tls_verify/tls_roots/tls_roots_password require the wss:: schema");
-        }
-        if (tlsRoots == null && tlsRootsPassword != null) {
-            throw new IllegalArgumentException("tls_roots_password requires tls_roots");
-        }
-        if (tlsRoots != null && "unsafe_off".equals(tlsVerify)) {
-            throw new IllegalArgumentException(TLS_ROOTS_INSECURE_CONFIG_ERROR);
-        }
-        // token_provider and its keys (design/qwp-token-provider-spec.md, section 7.2): resolves the factory, never
-        // fetches a token.
-        TokenProviderSpec.parse(view, tls);
-        // Mirror fromConfig's effective values: a missing bound takes its
-        // default, so the ordering is enforced even when only one key is set
-        // (e.g. failover_backoff_max_ms alone, below the default initial backoff).
-        if (hasBackoffInitial || hasBackoffMax) {
-            long effectiveInitial = hasBackoffInitial ? backoffInitial : DEFAULT_FAILOVER_INITIAL_BACKOFF_MS;
-            long effectiveMax = hasBackoffMax ? backoffMax : Math.max(effectiveInitial, DEFAULT_FAILOVER_MAX_BACKOFF_MS);
-            if (effectiveMax < effectiveInitial) {
-                throw new IllegalArgumentException(
-                        "failover_backoff_max_ms must be >= failover_backoff_initial_ms");
-            }
-        }
+        validateConfigAndResolveTokenProvider(view, tls);
     }
 
     /**
@@ -1550,6 +1476,84 @@ public class QwpQueryClient implements QuietCloseable {
             return role == QwpEgressMsgKind.ROLE_REPLICA;
         }
         return true;
+    }
+
+    private static TokenProviderSpec validateConfigAndResolveTokenProvider(ConfigView view, boolean tls) {
+        view.getHostPorts("addr", DEFAULT_WS_PORT, (h, p) -> {
+        });
+        if (!view.has("addr")) {
+            throw new IllegalArgumentException("missing required key: addr");
+        }
+        // Trigger range/enum validation of every typed value.
+        view.getEnum("target");
+        view.getEnum("compression");
+        view.getEnum("tls_verify");
+        view.getBoolOnOff("failover", false);
+        view.getInt("failover_max_attempts", 0);
+        view.getInt("max_batch_rows", 0);
+        view.getInt("buffer_pool_size", 0);
+        view.getInt("compression_level", 0);
+        boolean hasBackoffInitial = view.has("failover_backoff_initial_ms");
+        boolean hasBackoffMax = view.has("failover_backoff_max_ms");
+        // getLong also range-validates the value; call it even for an absent key.
+        long backoffInitial = view.getLong("failover_backoff_initial_ms", -1);
+        long backoffMax = view.getLong("failover_backoff_max_ms", -1);
+        view.getLong("failover_max_duration_ms", -1);
+        view.getLong("initial_credit", -1);
+        view.getLong("auth_timeout_ms", -1);
+        // getInt: connect_timeout feeds an int API, so validation must also
+        // reject values that fit a long but not an int.
+        view.getInt("connect_timeout", -1);
+        String username = view.getStr("username");
+        String password = view.getStr("password");
+        String token = view.getStr("token");
+        // A present-but-blank credential is rejected up front, matching the
+        // ingress Sender, so a shared ws/wss string fails the same way on both
+        // sides and the client never builds an empty Authorization header.
+        if (username != null && Chars.isBlank(username)) {
+            throw new IllegalArgumentException("username cannot be empty nor null");
+        }
+        if (password != null && Chars.isBlank(password)) {
+            throw new IllegalArgumentException("password cannot be empty nor null");
+        }
+        if (token != null && Chars.isBlank(token)) {
+            throw new IllegalArgumentException("token cannot be empty nor null");
+        }
+        boolean hasBasic = username != null || password != null;
+        if (hasBasic && (username == null || password == null)) {
+            throw new IllegalArgumentException("username and password must be provided together");
+        }
+        if (hasBasic && token != null) {
+            throw new IllegalArgumentException("cannot use both token and username/password authentication");
+        }
+        String tlsVerify = view.getStr("tls_verify");
+        String tlsRoots = view.getStr("tls_roots");
+        String tlsRootsPassword = view.getStr("tls_roots_password");
+        if (!tls && (tlsVerify != null || tlsRoots != null || tlsRootsPassword != null)) {
+            throw new IllegalArgumentException(
+                    "tls_verify/tls_roots/tls_roots_password require the wss:: schema");
+        }
+        if (tlsRoots == null && tlsRootsPassword != null) {
+            throw new IllegalArgumentException("tls_roots_password requires tls_roots");
+        }
+        if (tlsRoots != null && "unsafe_off".equals(tlsVerify)) {
+            throw new IllegalArgumentException(TLS_ROOTS_INSECURE_CONFIG_ERROR);
+        }
+        // token_provider and its keys (design/qwp-token-provider-spec.md, section 7.2): resolves the factory, never
+        // fetches a token.
+        TokenProviderSpec tokenProviderSpec = TokenProviderSpec.parse(view, tls);
+        // Mirror fromConfig's effective values: a missing bound takes its
+        // default, so the ordering is enforced even when only one key is set
+        // (e.g. failover_backoff_max_ms alone, below the default initial backoff).
+        if (hasBackoffInitial || hasBackoffMax) {
+            long effectiveInitial = hasBackoffInitial ? backoffInitial : DEFAULT_FAILOVER_INITIAL_BACKOFF_MS;
+            long effectiveMax = hasBackoffMax ? backoffMax : Math.max(effectiveInitial, DEFAULT_FAILOVER_MAX_BACKOFF_MS);
+            if (effectiveMax < effectiveInitial) {
+                throw new IllegalArgumentException(
+                        "failover_backoff_max_ms must be >= failover_backoff_initial_ms");
+            }
+        }
+        return tokenProviderSpec;
     }
 
     /**
