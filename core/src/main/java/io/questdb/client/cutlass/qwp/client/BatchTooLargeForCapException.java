@@ -38,7 +38,36 @@ import io.questdb.client.cutlass.line.LineSenderException;
  */
 public class BatchTooLargeForCapException extends LineSenderException {
 
+    // Length of getMessage() when endDetail() ran: the detail ends there and the
+    // standalone remedy follows. -1 until then, when the whole message is the detail.
+    private int detailLength = -1;
+
     public BatchTooLargeForCapException(CharSequence message) {
         super(message);
+    }
+
+    /**
+     * Marks the end of the detail: the text appended so far says what was rejected
+     * and the sizes involved, and the text appended after this call is the remedy for
+     * a standalone sender, which {@link #getDetail()} leaves out.
+     *
+     * @return this exception, to append the remedy
+     */
+    public BatchTooLargeForCapException endDetail() {
+        detailLength = getMessage().length();
+        return this;
+    }
+
+    /**
+     * The message without the standalone remedy ("call reset() and keep this sender"),
+     * for a caller that handles the rejection itself, such as the connection pool,
+     * which retires the slot. Equals {@link #getMessage()} when the message carries no
+     * such remedy.
+     *
+     * @return what was rejected and the sizes involved
+     */
+    public String getDetail() {
+        String message = getMessage();
+        return detailLength < 0 || detailLength > message.length() ? message : message.substring(0, detailLength);
     }
 }

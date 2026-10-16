@@ -44,9 +44,9 @@ import java.util.concurrent.atomic.AtomicInteger;
  * <p>
  * Tests never call methods that would attempt a network round-trip
  * (no {@code flush}, no row builders that auto-flush). Pooled
- * {@link io.questdb.client.impl.PooledSender#close()} does call
- * {@code delegate.flush()}, but on an empty buffer that path is a no-op for
- * HTTP transport.
+ * {@link io.questdb.client.impl.PooledSender#close()} only flushes when
+ * {@code setFlushOnClose(true)} is set; the two tests that need the flushing
+ * path set it.
  */
 public class SenderPoolTest {
 
@@ -82,6 +82,7 @@ public class SenderPoolTest {
         // is also unusable. Either way, the next borrower must get a fresh
         // slot, not the broken one.
         try (SenderPool pool = new SenderPool(DEAD_HTTP_CONFIG, 1, 1, 1_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+            pool.setFlushOnClose(true); // this test is about the flushing close path
             Sender first = pool.borrow();
             Object firstSlot = slotOf(first);
             first.table("t").longColumn("v", 1).atNow();
@@ -138,6 +139,7 @@ public class SenderPoolTest {
         // acquireTimeout is kept short: it doubles as close()'s bounded
         // lease-wait budget, which this test intentionally exhausts.
         try (SenderPool pool = new SenderPool(DEAD_HTTP_CONFIG, 1, 1, 150, Long.MAX_VALUE, Long.MAX_VALUE)) {
+            pool.setFlushOnClose(true); // this test is about the flushing close path
             Sender s = pool.borrow();
             // A row in the buffer forces flush() to attempt a real HTTP
             // request on close(); against the unreachable DEAD_HTTP target

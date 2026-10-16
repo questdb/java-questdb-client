@@ -277,6 +277,16 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     void atNow();
 
     /**
+     * Runs the same row, byte and age thresholds every append runs and ships the pending rows
+     * when one trips. At a pooled release the age threshold is the one that usually trips, which
+     * lets a pool ship rows a lease left behind once they are older than
+     * {@code auto_flush_interval}. It does nothing while a row is in progress.
+     * Only the WebSocket QWP transport implements it.
+     */
+    default void autoFlushIfDue() {
+    }
+
+    /**
      * Block until the server has acknowledged every frame up to {@code targetFsn},
      * or until {@code timeoutMillis} elapses. Pair with {@link #flushAndGetSequence()}
      * to obtain {@code targetFsn} for a specific flush.
@@ -413,6 +423,21 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      */
     default Sender charColumn(CharSequence name, char value) {
         throw new LineSenderException("current protocol version does not support char");
+    }
+
+    /**
+     * Throws the error this sender has latched, if any: the terminal error of
+     * the WebSocket I/O loop (server rejection, exhausted reconnect budget,
+     * authentication failure) or a connection error. Publishes nothing and
+     * never blocks. Used by the connection pool to decide whether a returned
+     * sender may be handed to the next borrower.
+     * <br>
+     * Only the WebSocket QWP transport latches errors; on other transports this
+     * is a no-op.
+     *
+     * @throws LineSenderException if a terminal or connection error is latched
+     */
+    default void checkError() {
     }
 
     /**
@@ -571,6 +596,22 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     }
 
     /**
+     * Ships the pending rows as frames carrying the defer-commit flag: the
+     * server appends them to its WAL writers and withholds both the commit and
+     * the acknowledgement until the group is closed. A later {@link #flush()},
+     * {@link #close()}, or (outside transactional mode) an auto-flush that
+     * ships an unflagged frame closes the group. Used by the connection pool's
+     * commit window. Only the WebSocket QWP transport supports deferred commits.
+     *
+     * @return the highest FSN published by this call, or {@code -1} if nothing was pending
+     * @throws UnsupportedOperationException on transports without deferred commits
+     * @throws LineSenderException           if the transport has latched a terminal error
+     */
+    default long flushDeferred() {
+        throw new UnsupportedOperationException("deferred flush requires the WebSocket transport");
+    }
+
+    /**
      * Add a GEOHASH column value from pre-packed bits and an explicit bit precision.
      * <p>
      * The {@code bits} long carries the geohash in its low {@code precisionBits} bits;
@@ -640,6 +681,30 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     }
 
     /**
+     * Whether frames shipped with {@link #flushDeferred()}, or by auto-flush in
+     * {@code transaction=on} mode, are still waiting for the commit that a
+     * {@link #flush()} sends. Only the WebSocket QWP transport tracks this.
+     *
+     * @return {@code true} while a deferred group is open
+     */
+    default boolean hasDeferredFrames() {
+        return false;
+    }
+
+    /**
+     * Whether a row is in progress: at least one column value has been set for
+     * the current row (just {@link #table(CharSequence)} does not count) and the
+     * row is not yet finished with {@link #at}, {@link #atNow()} or {@link #cancelRow()}.
+     * Only the WebSocket QWP transport tracks this; other transports return
+     * {@code false}.
+     *
+     * @return {@code true} while a row is in progress
+     */
+    default boolean hasRowInProgress() {
+        return false;
+    }
+
+    /**
      * Add a column with a 32-bit signed integer value.
      *
      * @param name  name of the column
@@ -704,6 +769,32 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      */
     Sender longColumn(CharSequence name, long value);
 
+    /**
+     * Marks the current buffer state as the point {@link #resetToSavepoint()}
+     * rolls back to: rows appended after this call are discarded by that
+     * method, rows appended before it are kept. Take it between rows, not
+     * while a row is in progress. Any flush that ships the pending rows
+     * empties the savepoint, so a later {@code resetToSavepoint()} discards
+     * every pending row like {@link #reset()}. Pure bookkeeping: it runs no
+     * error check. Default no-op.
+     * <p>
+     * A pooled sender ignores this call: the pool marks a savepoint when it
+     * hands a slot to a borrower, and {@code resetToSavepoint()} on the pooled
+     * sender rolls back to that mark.
+     */
+    default void markSavepoint() {
+    }
+
+    /**
+     * Number of rows appended with {@link #at}/{@link #atNow()} that have not
+     * been shipped to the server yet. Only the WebSocket QWP transport counts
+     * pending rows; other transports return {@code 0}.
+     *
+     * @return rows buffered and not yet flushed
+     */
+    default int pendingRowCount() {
+        return 0;
+    }
 
     /**
      * Advisory request to start a fresh symbol-dictionary epoch. The reset
@@ -753,12 +844,41 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * data format) and want to continue sending new data without retrying the problematic data.
      * After calling this method, you can start building a new row by calling {@link #table(CharSequence)}.
      * <br>
-     * Note: This method is only available for HTTP transport. TCP transport doesn't support
-     * this operation.
+     * Supported by the HTTP, WebSocket and UDP transports; TCP does not support it. On a
+     * pooled sender this discards only the rows appended through the current lease, see
+     * {@link #resetToSavepoint()}.
      *
      * @see #flush()
      */
     void reset();
+
+    /**
+     * Discards the rows appended since the last {@link #markSavepoint()} and
+     * keeps the rows buffered before it. Without a savepoint, or after a flush
+     * emptied it, this discards every pending row like {@link #reset()}, and
+     * also removes the column definitions the server has not seen yet. Default
+     * calls {@code reset()}.
+     * <p>
+     * On a pooled sender this is the lease-scoped {@code reset()}: it rolls
+     * back to the savepoint the pool marked at borrow, so a borrower can drop
+     * its own bad batch without discarding rows earlier borrowers left in the
+     * shared slot buffer.
+     */
+    default void resetToSavepoint() {
+        reset();
+    }
+
+    /**
+     * Monotonic count of rows finished with {@link #at}/{@link #atNow()} over
+     * this sender's life, whether or not they have shipped. The connection
+     * pool measures its commit window on deltas of this value. Only the
+     * WebSocket QWP transport counts; other transports return {@code 0}.
+     *
+     * @return rows appended so far
+     */
+    default long rowsAppended() {
+        return 0L;
+    }
 
     /**
      * Add a column with a 16-bit signed integer value.
@@ -1053,7 +1173,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private static final int DEFAULT_TCP_PORT = 9009;
         private static final int DEFAULT_UDP_PORT = 9007;
         private static final int DEFAULT_WEBSOCKET_PORT = 9000;
-        private static final int DEFAULT_WS_AUTO_FLUSH_BYTES = 0;
+        private static final int DEFAULT_WS_AUTO_FLUSH_BYTES = QwpWebSocketSender.AUTO_FLUSH_BYTES_SERVER_CAP;
         private static final long DEFAULT_WS_AUTO_FLUSH_INTERVAL_NANOS = 100_000_000L; // 100ms
         private static final int DEFAULT_WS_AUTO_FLUSH_ROWS = 1_000;
         // Cadence at which the SF cursor I/O loop sends a keepalive PING
@@ -1354,7 +1474,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * <br>
          * This is only used when communicating over WebSocket transport.
          * <br>
-         * Default value is 0, which disables byte-based auto-flush.
+         * Unset by default, which flushes at 90 percent of the batch cap the server advertises,
+         * and not by bytes when it advertises none. 0 disables byte-based auto-flush.
          *
          * @param bytes maximum bytes per batch
          * @return this instance for method chaining

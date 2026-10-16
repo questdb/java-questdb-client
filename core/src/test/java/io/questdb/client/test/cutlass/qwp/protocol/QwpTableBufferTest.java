@@ -28,6 +28,7 @@ import io.questdb.client.cairo.CairoException;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketEncoder;
 import io.questdb.client.cutlass.qwp.protocol.OffHeapAppendMemory;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
@@ -1151,6 +1152,81 @@ public class QwpTableBufferTest {
     }
 
     @Test
+    public void testHeldRowEncodesThePrefixAndRetainsTheTailRow() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer both = new QwpTableBuffer("t");
+                 QwpTableBuffer first = new QwpTableBuffer("t");
+                 QwpTableBuffer second = new QwpTableBuffer("t")) {
+                appendMixedRow(both, 1L, 1.5, true, "alpha", "n1", "sym", new double[]{1.0, 2.0});
+                appendMixedRow(both, 2L, 2.5, false, "beta", null, "sym", new double[]{3.0, 4.0, 5.0});
+                appendMixedRow(first, 1L, 1.5, true, "alpha", "n1", "sym", new double[]{1.0, 2.0});
+                appendMixedRow(second, 2L, 2.5, false, "beta", null, "sym", new double[]{3.0, 4.0, 5.0});
+
+                assertTrue(both.holdBackLastRow());
+                assertEquals(1, both.getRowCount());
+                assertArrayEquals("the prefix encodes as the first row alone", encodeForTest(first), encodeForTest(both));
+
+                both.retainHeldRow();
+                assertFalse(both.hasHeldRow());
+                assertEquals(1, both.getRowCount());
+                assertArrayEquals("the retained row encodes as the second row alone", encodeForTest(second), encodeForTest(both));
+            }
+        });
+    }
+
+    @Test
+    public void testHoldBackLastRowGrowsPastTheInitialColumnCapacity() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer both = new QwpTableBuffer("t");
+                 QwpTableBuffer first = new QwpTableBuffer("t");
+                 QwpTableBuffer second = new QwpTableBuffer("t")) {
+                int columnCount = 20;
+                for (int i = 0; i < columnCount; i++) {
+                    both.getOrCreateColumn("c" + i, QwpConstants.TYPE_LONG, false).addLong(i);
+                    first.getOrCreateColumn("c" + i, QwpConstants.TYPE_LONG, false).addLong(i);
+                }
+                both.nextRow();
+                first.nextRow();
+                for (int i = 0; i < columnCount; i++) {
+                    both.getOrCreateColumn("c" + i, QwpConstants.TYPE_LONG, false).addLong(100 + i);
+                    second.getOrCreateColumn("c" + i, QwpConstants.TYPE_LONG, false).addLong(100 + i);
+                }
+                both.nextRow();
+                second.nextRow();
+
+                assertTrue(both.holdBackLastRow());
+                assertTrue(both.getHeldValueCounts().length >= columnCount);
+                assertArrayEquals(encodeForTest(first), encodeForTest(both));
+                both.retainHeldRow();
+                assertArrayEquals(encodeForTest(second), encodeForTest(both));
+            }
+        });
+    }
+
+    @Test
+    public void testHoldBackLastRowRefusesWithoutACommittedRowOrMidRow() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                assertFalse("an empty buffer has no row to hold", table.holdBackLastRow());
+                assertFalse(table.hasHeldRow());
+
+                table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false).addLong(1L);
+                table.nextRow();
+                table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false).addLong(2L);
+                assertTrue(table.hasInProgressRow());
+                assertFalse("a row in progress blocks the hold", table.holdBackLastRow());
+                assertFalse(table.hasHeldRow());
+                assertEquals(1, table.getRowCount());
+
+                table.nextRow();
+                assertTrue(table.holdBackLastRow());
+                assertFalse("a held row blocks a second hold", table.holdBackLastRow());
+                assertEquals(1, table.getRowCount());
+            }
+        });
+    }
+
+    @Test
     public void testLongArrayMultipleRows() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpTableBuffer table = new QwpTableBuffer("test")) {
@@ -1389,6 +1465,130 @@ public class QwpTableBufferTest {
     }
 
     @Test
+    public void testResetAndClearDropTheHeldRow() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                appendMixedRow(table, 1L, 1.5, true, "alpha", "n1", "sym", new double[]{1.0, 2.0});
+                appendMixedRow(table, 2L, 2.5, false, "beta", null, "sym", new double[]{3.0, 4.0, 5.0});
+                assertTrue(table.holdBackLastRow());
+                table.reset();
+                assertFalse("reset() drops the hold", table.hasHeldRow());
+                assertEquals(0, table.getRowCount());
+
+                appendMixedRow(table, 3L, 3.5, true, "gamma", "n3", "sym", new double[]{6.0});
+                assertTrue(table.holdBackLastRow());
+                table.clear();
+                assertFalse("clear() drops the hold", table.hasHeldRow());
+                assertEquals(0, table.getRowCount());
+            }
+        });
+    }
+
+    @Test
+    public void testResetMovesTheSavepointToTheEmptyBuffer() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false).addLong(1L);
+                table.nextRow();
+                table.markSavepoint();
+                table.reset();
+                table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false).addLong(2L);
+                table.nextRow();
+                table.rollbackToSavepoint();
+                assertEquals("reset() emptied the savepoint", 0, table.getRowCount());
+                assertEquals("columns the server already knows stay", 1, table.getColumnCount());
+            }
+        });
+    }
+
+    @Test
+    public void testRestoreHeldRowPutsTheRowBack() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                appendMixedRow(table, 1L, 1.5, true, "alpha", "n1", "sym", new double[]{1.0, 2.0});
+                appendMixedRow(table, 2L, 2.5, false, "beta", null, "sym", new double[]{3.0, 4.0, 5.0});
+                byte[] before = encodeForTest(table);
+
+                assertTrue(table.holdBackLastRow());
+                table.restoreHeldRow();
+                assertFalse(table.hasHeldRow());
+                assertArrayEquals(before, encodeForTest(table));
+                assertEquals(2, table.getRowCount());
+            }
+        });
+    }
+
+    @Test
+    public void testRetainHeldRowKeepsGeoHashPrecisionOfANullHeldValue() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                QwpTableBuffer.ColumnBuffer g = table.getOrCreateColumn("g", QwpConstants.TYPE_GEOHASH, true);
+                g.addGeoHash(123L, 20);
+                table.nextRow();
+                table.getOrCreateColumn("g", QwpConstants.TYPE_GEOHASH, true).addNull();
+                table.nextRow();
+
+                assertTrue(table.holdBackLastRow());
+                table.retainHeldRow();
+                assertEquals(1, table.getRowCount());
+                assertTrue(g.isNull(0));
+                assertEquals("the server locked the precision with the shipped rows", 20, g.getGeoHashPrecision());
+            }
+        });
+    }
+
+    @Test
+    public void testRetainHeldRowMovesTheSavepointColumnsOnlyWhenEarlierRowsShipped() throws Exception {
+        assertMemoryLeak(() -> {
+            // rows before the held row: the caller shipped them with every column,
+            // including the one the held row added, so the savepoint takes it
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false).addLong(1L);
+                table.nextRow();
+                table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false).addLong(2L);
+                table.getOrCreateColumn("z", QwpConstants.TYPE_VARCHAR, true).addString("held");
+                table.nextRow();
+                assertTrue(table.holdBackLastRow());
+                table.retainHeldRow();
+                assertEquals(1, table.getRowCount());
+                assertEquals(0, table.getSavepointRowCount());
+                table.rollbackToSavepoint();
+                assertEquals(0, table.getRowCount());
+                assertEquals("the server knows both columns", 2, table.getColumnCount());
+            }
+            // the held row is the only row of a new buffer: nothing of the table
+            // shipped, so the savepoint keeps no column
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                table.getOrCreateColumn("z", QwpConstants.TYPE_VARCHAR, true).addString("held");
+                table.nextRow();
+                assertTrue(table.holdBackLastRow());
+                table.retainHeldRow();
+                assertEquals(1, table.getRowCount());
+                assertEquals(0, table.getSavepointRowCount());
+                table.rollbackToSavepoint();
+                assertEquals(0, table.getRowCount());
+                assertEquals("the server has seen no column", 0, table.getColumnCount());
+            }
+            // the held row is the only row after a flush: the savepoint keeps the
+            // column the flush shipped, not the one the held row added
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false).addLong(1L);
+                table.nextRow();
+                table.reset();
+                table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false).addLong(2L);
+                table.getOrCreateColumn("z", QwpConstants.TYPE_VARCHAR, true).addString("held");
+                table.nextRow();
+                assertTrue(table.holdBackLastRow());
+                table.retainHeldRow();
+                assertEquals(1, table.getRowCount());
+                table.rollbackToSavepoint();
+                assertEquals(0, table.getRowCount());
+                assertEquals("only the column the flush shipped stays", 1, table.getColumnCount());
+            }
+        });
+    }
+
+    @Test
     public void testRetainInProgressRowFastClearsUnstagedNullableColumn() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpTableBuffer table = new QwpTableBuffer("test")) {
@@ -1451,6 +1651,145 @@ public class QwpTableBufferTest {
         });
     }
 
+    @Test
+    public void testRetainInProgressRowMovesTheSavepointToTheRetainedRow() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false).addLong(1L);
+                table.nextRow();
+                table.markSavepoint();
+                assertEquals(1, table.getSavepointRowCount());
+                table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false).addLong(2L); // row 2 in progress
+                assertTrue(table.hasInProgressRow());
+                table.retainInProgressRow(new int[]{1}, new int[]{1}, new int[]{0}, new int[]{0});
+                assertEquals(0, table.getRowCount());
+                assertEquals("the shipped rows are no longer a rollback target", 0, table.getSavepointRowCount());
+
+                table.nextRow();
+                table.rollbackToSavepoint();
+                assertEquals(0, table.getRowCount());
+                assertEquals(1, table.getColumnCount());
+            }
+
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false).addLong(1L);
+                table.nextRow();
+                table.markSavepoint();
+                table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false).addLong(2L);
+                table.getOrCreateColumn("s", QwpConstants.TYPE_VARCHAR, false).addString("x");
+                // "s" was created by the in-progress row: sizeBefore -1 clears it to empty
+                table.retainInProgressRow(new int[]{1, -1}, new int[]{1, -1}, new int[]{0, 0}, new int[]{0, 0});
+                table.nextRow();
+                table.rollbackToSavepoint();
+                assertEquals(0, table.getRowCount());
+                assertEquals("the column the server now knows is not dropped", 2, table.getColumnCount());
+            }
+        });
+    }
+
+    @Test
+    public void testRollbackToSavepointDiscardsAnInProgressRow() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                QwpTableBuffer.ColumnBuffer v = table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false);
+                v.addLong(1L);
+                table.nextRow();
+                table.markSavepoint();
+                table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false).addLong(2L);   // row 2 started, not committed
+                assertTrue(table.hasInProgressRow());
+                table.rollbackToSavepoint();
+                assertEquals(1, table.getRowCount());
+                assertFalse(table.hasInProgressRow());
+                assertEquals(1, v.getSize());
+            }
+        });
+    }
+
+    @Test
+    public void testRollbackToSavepointKeepsEarlierRowsAndDropsLaterColumns() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                QwpTableBuffer.ColumnBuffer v = table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false);
+                v.addLong(1L);
+                long bytesAtMark = table.nextRow();
+                table.markSavepoint();
+                assertEquals(1, table.getSavepointRowCount());
+                table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false).addLong(2L);
+                table.getOrCreateColumn("s", QwpConstants.TYPE_VARCHAR, false).addString("later");
+                table.nextRow();
+                assertEquals(2, table.getRowCount());
+                assertEquals(2, table.getColumnCount());
+
+                table.rollbackToSavepoint();
+
+                assertEquals(1, table.getRowCount());
+                assertEquals("the column added after the mark is gone", 1, table.getColumnCount());
+                assertEquals(1, v.getSize());
+                assertEquals(bytesAtMark, table.getBufferedBytes());
+                assertFalse(table.hasInProgressRow());
+                // still usable: the dropped column can come back
+                table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false).addLong(3L);
+                table.getOrCreateColumn("s", QwpConstants.TYPE_VARCHAR, false).addString("again");
+                table.nextRow();
+                assertEquals(2, table.getRowCount());
+                assertEquals(2, table.getColumnCount());
+                assertEquals(2, v.getSize());
+            }
+        });
+    }
+
+    @Test
+    public void testRollbackToSavepointKeepsGeoHashPrecisionOfARetainedColumn() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                QwpTableBuffer.ColumnBuffer g = table.getOrCreateColumn("g", QwpConstants.TYPE_GEOHASH, true);
+                g.addGeoHash(123L, 20);
+                table.nextRow();
+                table.reset();
+                table.getOrCreateColumn("g", QwpConstants.TYPE_GEOHASH, true).addGeoHash(456L, 20);
+                table.nextRow();
+                table.rollbackToSavepoint();
+                assertEquals(0, table.getRowCount());
+                assertEquals(20, g.getGeoHashPrecision());
+            }
+        });
+    }
+
+    @Test
+    public void testRollbackToSavepointOnANeverMarkedBufferRemovesEveryColumn() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false).addLong(1L);
+                table.nextRow();
+                table.rollbackToSavepoint();
+                assertEquals(0, table.getRowCount());
+                assertEquals(0, table.getColumnCount());
+                table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false).addLong(2L);
+                table.nextRow();
+                assertEquals(1, table.getRowCount());
+                assertEquals(1, table.getColumnCount());
+            }
+        });
+    }
+
+    @Test
+    public void testRollbackToSavepointWithoutMarkDropsEveryRowButKeepsColumns() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                QwpTableBuffer.ColumnBuffer v = table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false);
+                v.addLong(1L);
+                table.nextRow();
+                table.reset();
+                table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, false).addLong(2L);
+                table.nextRow();
+                table.rollbackToSavepoint();
+                assertEquals(0, table.getRowCount());
+                assertEquals(0, v.getSize());
+                assertEquals("no mark: behaves like reset(), definitions stay", 1, table.getColumnCount());
+            }
+        });
+    }
+
     private static void addSymbolUtf8(QwpTableBuffer.ColumnBuffer col, String value) {
         byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
         long ptr = copyToNative(bytes);
@@ -1461,12 +1800,49 @@ public class QwpTableBufferTest {
         }
     }
 
+    private static void appendMixedRow(
+            QwpTableBuffer table,
+            long a,
+            double d,
+            boolean b,
+            String s,
+            String n,
+            String y,
+            double[] arr
+    ) {
+        table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false).addLong(a);
+        table.getOrCreateColumn("d", QwpConstants.TYPE_DOUBLE, true).addDouble(d);
+        table.getOrCreateColumn("b", QwpConstants.TYPE_BOOLEAN, false).addBoolean(b);
+        table.getOrCreateColumn("s", QwpConstants.TYPE_VARCHAR, true).addString(s);
+        QwpTableBuffer.ColumnBuffer nColumn = table.getOrCreateColumn("n", QwpConstants.TYPE_VARCHAR, true);
+        if (n == null) {
+            nColumn.addNull();
+        } else {
+            nColumn.addString(n);
+        }
+        table.getOrCreateColumn("y", QwpConstants.TYPE_SYMBOL, true).addSymbol(y);
+        table.getOrCreateColumn("arr", QwpConstants.TYPE_DOUBLE_ARRAY, true).addDoubleArray(arr);
+        table.nextRow();
+    }
+
     private static long copyToNative(byte[] bytes) {
         long ptr = Unsafe.malloc(bytes.length, MemoryTag.NATIVE_DEFAULT);
         for (int i = 0; i < bytes.length; i++) {
             Unsafe.getUnsafe().putByte(ptr + i, bytes[i]);
         }
         return ptr;
+    }
+
+    private static byte[] encodeForTest(QwpTableBuffer table) {
+        try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder()) {
+            int length = encoder.encode(table);
+            long ptr = encoder.getBuffer().getBufferPtr();
+            byte[] bytes = new byte[length];
+            for (int i = 0; i < length; i++) {
+                bytes[i] = Unsafe.getUnsafe().getByte(ptr + i);
+            }
+            return bytes;
+        }
     }
 
     /**

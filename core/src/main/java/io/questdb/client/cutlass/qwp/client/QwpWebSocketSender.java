@@ -98,7 +98,7 @@ import java.util.function.Supplier;
  * Configuration options:
  * <ul>
  *   <li>{@code autoFlushRows} - Maximum rows per batch (default: 1000)</li>
- *   <li>{@code autoFlushBytes} - Maximum bytes per batch (default: disabled)</li>
+ *   <li>{@code autoFlushBytes} - Maximum bytes per batch (default: bounded by the server's advertised cap, see {@link #AUTO_FLUSH_BYTES_SERVER_CAP})</li>
  *   <li>{@code autoFlushIntervalNanos} - Maximum age before auto-flush (default: 100ms)</li>
  * </ul>
  * <p>
@@ -130,6 +130,16 @@ import java.util.function.Supplier;
  */
 public class QwpWebSocketSender implements Sender {
 
+    /**
+     * {@code autoFlushBytes} value meaning "no byte budget of its own": flush at
+     * 90 percent of whatever batch cap the server advertises, and at no byte
+     * threshold while it advertises none. The config-string default for the
+     * WebSocket transport. An explicit {@code auto_flush_bytes=off} is {@code 0}
+     * and keeps byte flushing off whatever the server advertises. Rows appended
+     * before the first handshake carry no byte trigger; the first append after it
+     * flushes the backlog.
+     */
+    public static final int AUTO_FLUSH_BYTES_SERVER_CAP = -1;
     public static final long DEFAULT_AUTH_TIMEOUT_MS = 15_000L;
     // Soft per-batch byte budget. Trips a flush when raw column-buffer bytes
     // cross the threshold, well before the server's 16 MB wire cap. Wide-row
@@ -454,6 +464,13 @@ public class QwpWebSocketSender implements Sender {
     // Optional owning-pool notification, relayed after the engine confirms the
     // flock release and slotLockReleased is visible to pool re-probes.
     private volatile Runnable slotLockReleaseListener;
+    // Batch-cap rejection from a flush attempt's pre-flight. Cleared by reset(),
+    // resetToSavepoint() and by the next flush attempt whose batch passes the
+    // pre-flight, even when that attempt then fails for another reason, so an old
+    // rejection never outlives a batch the cap accepts. Not a terminal: the
+    // standalone contract lets the caller reset() and carry on. checkError()
+    // reports it so a pool can retire a slot whose batch no flush will ship.
+    private BatchTooLargeForCapException retainedBatchRejection;
     // Engine whose close() could not complete during sender close() — its
     // cleanup is pending on a worker/I/O-thread exit path. isSlotLockReleased()
     // re-probes it so a late flock release becomes visible to the owning pool.
@@ -461,6 +478,16 @@ public class QwpWebSocketSender implements Sender {
     // while no engine is retained.
     private volatile CursorSendEngine retainedEngine;
     private int pendingRowCount;
+    // Monotonic for the sender's life; reset() does not clear it. Counts rows whether or not they shipped.
+    private long rowsAppended;
+    // Pending counters and batch symbol watermark at the last markSavepoint();
+    // the counters are zero and the watermark is -1 once a flush ships the pending
+    // rows, at which point resetToSavepoint() discards every pending row like
+    // reset() and also removes the column definitions the server has not seen yet.
+    private int savepointBatchMaxSymbolId = -1;
+    private long savepointFirstPendingRowTimeNanos;
+    private long savepointPendingBytes;
+    private int savepointPendingRowCount;
     private SenderProgressDispatcher progressDispatcher;
     // Async-delivery sink for ack-watermark advances. Default no-op; a
     // setProgressHandler call before connect() swaps in a real handler.
@@ -679,12 +706,13 @@ public class QwpWebSocketSender implements Sender {
         this.autoFlushBytes = autoFlushBytes;
         // Until the handshake completes, honor the configured budget verbatim.
         // applyServerBatchSizeLimit() clamps this on connect once the server's
-        // X-QWP-Max-Batch-Size is known.
-        this.effectiveAutoFlushBytes = autoFlushBytes;
+        // X-QWP-Max-Batch-Size is known. A cap-bound sender (-1) has no budget of
+        // its own before that.
+        this.effectiveAutoFlushBytes = Math.max(0, autoFlushBytes);
         this.autoFlushIntervalNanos = autoFlushIntervalNanos;
         this.globalSymbolDictionary = new GlobalSymbolDictionary();
 
-        int microbatchBufferSize = Math.max(DEFAULT_MICROBATCH_BUFFER_SIZE, autoFlushBytes * 2);
+        int microbatchBufferSize = Math.max(DEFAULT_MICROBATCH_BUFFER_SIZE, Math.max(0, autoFlushBytes) * 2);
         try {
             this.buffer0 = new MicrobatchBuffer(microbatchBufferSize);
             this.buffer1 = new MicrobatchBuffer(microbatchBufferSize);
@@ -1366,7 +1394,7 @@ public class QwpWebSocketSender implements Sender {
      * @param host                   server host (not connected)
      * @param port                   server port (not connected)
      * @param autoFlushRows          rows per batch (0 = no limit)
-     * @param autoFlushBytes         bytes per batch (0 = no limit)
+     * @param autoFlushBytes         bytes per batch (0 = no limit, -1 = 90 percent of the server's advertised cap)
      * @param autoFlushIntervalNanos age before flush in nanos (0 = no limit)
      * @return unconnected sender
      */
@@ -1444,6 +1472,17 @@ public class QwpWebSocketSender implements Sender {
         } catch (RuntimeException | Error e) {
             rollbackRow();
             throw e;
+        }
+    }
+
+    @Override
+    public void autoFlushIfDue() {
+        checkNotClosed();
+        if (currentTableBuffer != null && currentTableBuffer.hasInProgressRow()) {
+            return;
+        }
+        if (shouldAutoFlush()) {
+            flushPendingRows(transactional);
         }
     }
 
@@ -1654,6 +1693,15 @@ public class QwpWebSocketSender implements Sender {
             throw e;
         }
         return this;
+    }
+
+    @Override
+    public void checkError() {
+        checkNotClosed();
+        BatchTooLargeForCapException rejected = retainedBatchRejection;
+        if (rejected != null) {
+            throw rejected;
+        }
     }
 
     /**
@@ -2238,6 +2286,33 @@ public class QwpWebSocketSender implements Sender {
         return afterFsn > beforeFsn ? fsnEpochBase + afterFsn : -1L;
     }
 
+    @Override
+    public long flushDeferred() {
+        checkNotClosed();
+        checkRecycleFailure();
+        if (cursorEngine != null) {
+            cursorEngine.checkDurability();
+        }
+        ensureNoInProgressRow();
+        ensureConnected();
+
+        long beforeFsn = cursorEngine != null ? cursorEngine.publishedFsn() : -1L;
+
+        // Same publish path as flushAndGetSequence() with the flag forced on:
+        // the frame is appended server-side, not committed, and its ack is
+        // withheld until a later unflagged frame or commit message. The commit
+        // boundary is deliberately NOT advanced here.
+        flushPendingRows(true);
+        if (activeBuffer != null && activeBuffer.hasData()) {
+            sealAndSwapBuffer();
+        }
+        cursorSendLoop.checkError();
+        checkConnectionError();
+
+        long afterFsn = cursorEngine != null ? cursorEngine.publishedFsn() : -1L;
+        return afterFsn > beforeFsn ? fsnEpochBase + afterFsn : -1L;
+    }
+
     /**
      * Flushes pending rows and blocks until the server has acknowledged
      * every frame published so far (the current published-FSN watermark),
@@ -2389,7 +2464,9 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Returns the auto-flush byte threshold.
+     * Returns the configured auto-flush byte threshold: a positive budget, {@code 0} for off,
+     * or {@link #AUTO_FLUSH_BYTES_SERVER_CAP}. See {@link #getEffectiveAutoFlushBytes()} for
+     * the value in force.
      */
     public int getAutoFlushBytes() {
         return autoFlushBytes;
@@ -2899,6 +2976,16 @@ public class QwpWebSocketSender implements Sender {
         return counters.serverErrors.get();
     }
 
+    @Override
+    public boolean hasDeferredFrames() {
+        return hasDeferredMessages;
+    }
+
+    @Override
+    public boolean hasRowInProgress() {
+        return currentTableBuffer != null && currentTableBuffer.hasInProgressRow();
+    }
+
     /**
      * Adds an INT column value to the current row.
      *
@@ -3108,6 +3195,21 @@ public class QwpWebSocketSender implements Sender {
         return this;
     }
 
+    @Override
+    public void markSavepoint() {
+        ObjList<CharSequence> keys = tableBuffers.keys();
+        for (int i = 0, n = keys.size(); i < n; i++) {
+            QwpTableBuffer buf = tableBuffers.get(keys.getQuick(i));
+            if (buf != null) {
+                buf.markSavepoint();
+            }
+        }
+        savepointBatchMaxSymbolId = currentBatchMaxSymbolId;
+        savepointPendingRowCount = pendingRowCount;
+        savepointPendingBytes = pendingBytes;
+        savepointFirstPendingRowTimeNanos = firstPendingRowTimeNanos;
+    }
+
     /**
      * Returns a {@link CursorWebSocketSendLoop.ReconnectFactory} that, on each
      * call, performs the multi-endpoint walk and returns a freshly connected
@@ -3131,6 +3233,11 @@ public class QwpWebSocketSender implements Sender {
             java.util.function.BooleanSupplier stopFlag
     ) {
         return new ReconnectSupplier(stopFlag, "drainer stop requested during connect");
+    }
+
+    @Override
+    public int pendingRowCount() {
+        return pendingRowCount;
     }
 
     /**
@@ -3184,25 +3291,7 @@ public class QwpWebSocketSender implements Sender {
                 buf.reset();
             }
         }
-        // Drop the batch's symbol watermark along with the rows that raised it. A
-        // later flush encodes the delta section as
-        // [sentMaxSymbolId+1 .. currentBatchMaxSymbolId], so a watermark left behind
-        // by the discarded batch keeps re-encoding that batch's symbols: a single-row
-        // batch after reset() would still carry the whole abandoned range and hit the
-        // very cap rejection reset() is documented to clear, leaving the sender unable
-        // to flush anything at all. -1 is the same value resetTableBuffersAfterFlush
-        // leaves behind after a successful flush, and sendCommitMessage already reads
-        // it as an empty delta.
-        currentBatchMaxSymbolId = -1;
-        reclaimUnsentSymbolIds();
-        pendingBytes = 0;
-        pendingRowCount = 0;
-        firstPendingRowTimeNanos = 0;
-        currentTableBuffer = null;
-        currentTableBufferSnapshotBytes = 0;
-        currentTableName = null;
-        cachedTimestampColumn = null;
-        cachedTimestampNanosColumn = null;
+        discardPendingBatchState();
     }
 
     /**
@@ -3234,6 +3323,53 @@ public class QwpWebSocketSender implements Sender {
         if (pendingRowCount == 0) {
             armIfEligible();
         }
+    }
+
+    @Override
+    public void resetToSavepoint() {
+        checkNotClosed();
+        // Always roll back, also with an empty savepoint: after a flush each
+        // buffer's mark sits at "no rows, server-known columns", so the rollback
+        // drops the column definitions the lease created that the server has not
+        // seen, which reset() would keep and ship null-padded.
+        ObjList<CharSequence> keys = tableBuffers.keys();
+        for (int i = 0, n = keys.size(); i < n; i++) {
+            QwpTableBuffer buf = tableBuffers.get(keys.getQuick(i));
+            if (buf != null) {
+                buf.rollbackToSavepoint();
+            }
+        }
+        if (savepointPendingRowCount == 0) {
+            // No rows before the mark, or a flush since emptied it: every pending
+            // row is the caller's own and the sender-level clears of reset() apply.
+            discardPendingBatchState();
+            return;
+        }
+        // Rows before the mark reference only symbol ids at or below the
+        // watermark recorded at the mark, and the watermark only grows within a
+        // batch, so the batch range is restored to it. In delta mode the ids the
+        // discarded rows registered above it are reclaimed too (the floor keeps
+        // the ring's and the durable dictionary's ids), so the next new symbol
+        // does not re-ship the orphaned range. Full-dict mode cannot reclaim:
+        // its frames already on the ring define those ids. Its orphans stay in
+        // the dictionary, which reset() cannot shrink there either; they are
+        // only re-shipped once a later row's new symbol id lies above them.
+        currentBatchMaxSymbolId = savepointBatchMaxSymbolId;
+        reclaimUnsentSymbolIds(savepointBatchMaxSymbolId + 1);
+        pendingRowCount = savepointPendingRowCount;
+        pendingBytes = savepointPendingBytes;
+        firstPendingRowTimeNanos = savepointFirstPendingRowTimeNanos;
+        currentTableBuffer = null;
+        currentTableBufferSnapshotBytes = 0;
+        currentTableName = null;
+        cachedTimestampColumn = null;
+        cachedTimestampNanosColumn = null;
+        retainedBatchRejection = null;
+    }
+
+    @Override
+    public long rowsAppended() {
+        return rowsAppended;
     }
 
     /**
@@ -3768,6 +3904,10 @@ public class QwpWebSocketSender implements Sender {
         return hasLoopEverConnected || (l != null && l.hasEverConnected());
     }
 
+    private static long byteBudgetForCap(int cap) {
+        return (long) cap * 9 / 10;
+    }
+
     private static Throwable captureCloseError(Throwable terminalError, Throwable t) {
         if (terminalError == null) {
             return t;
@@ -3816,29 +3956,32 @@ public class QwpWebSocketSender implements Sender {
      * in {@link #sendRow} fires against the freshly advertised value. The
      * byte trigger, however, is only adjusted when the user left it enabled:
      * an explicit {@code auto_flush_bytes=off} (autoFlushBytes == 0) is
-     * preserved even when the server advertises a cap, so applications that
-     * opted out keep the contract they asked for.
+     * preserved even when the server advertises a cap, and a sender built with
+     * {@link #AUTO_FLUSH_BYTES_SERVER_CAP} takes the 90 percent budget as its only byte trigger,
+     * so applications that opted out keep the contract they asked for.
      */
     @TestOnly
     public void applyServerBatchSizeLimit(int advertisedMaxBatchSize) {
         serverMaxBatchSize = advertisedMaxBatchSize;
-        if (autoFlushBytes <= 0) {
-            // User opted out of byte-based auto-flush; respect that even when
-            // the server advertises a cap. The single-row guard still protects
-            // against oversize individual rows via serverMaxBatchSize.
+        if (autoFlushBytes == 0) {
+            // Explicit auto_flush_bytes=off: respect it even when the server
+            // advertises a cap. The single-row guard still protects against
+            // oversize individual rows via serverMaxBatchSize.
             effectiveAutoFlushBytes = 0;
             return;
         }
         if (advertisedMaxBatchSize <= 0) {
-            effectiveAutoFlushBytes = autoFlushBytes;
+            // Older build, no header: the configured budget verbatim, and no
+            // byte trigger at all for a sender bound to a cap it cannot see.
+            effectiveAutoFlushBytes = Math.max(0, autoFlushBytes);
             return;
         }
         // Cap at 90% of the server's hard limit. Raw column-buffer bytes are
         // a conservative proxy for wire size (compression usually shrinks the
         // payload), but schema and dict-delta overhead can push the wire size
         // above the raw total in pathological cases.
-        long safeBudget = (long) advertisedMaxBatchSize * 9 / 10;
-        if (autoFlushBytes < safeBudget) {
+        long safeBudget = byteBudgetForCap(advertisedMaxBatchSize);
+        if (autoFlushBytes > 0 && autoFlushBytes < safeBudget) {
             effectiveAutoFlushBytes = autoFlushBytes;
         } else {
             effectiveAutoFlushBytes = (int) safeBudget;
@@ -3863,6 +4006,58 @@ public class QwpWebSocketSender implements Sender {
         }
         cachedTimestampNanosColumn.addLong(timestampNanos);
         sendRow();
+    }
+
+    /**
+     * Runs the auto-flush {@link #sendRow()} starts once a row trips a
+     * threshold. The byte trigger fires after the crossing row is committed, so
+     * that row alone can push the batch over the server batch cap, for example
+     * when earlier pooled leases left rows behind. On that rejection this method
+     * holds the row back and ships the rows before it, and
+     * {@link #resetTableBuffersAfterFlush()} keeps the row buffered alone. A
+     * held row that still trips a threshold on its own is flushed at once, so a
+     * rejection of its own frame reaches this caller. When the rows before it do
+     * not fit either, the row goes back into the batch, and the method retains
+     * and throws the first rejection, which describes the whole batch.
+     */
+    private void autoFlushAfterRow() {
+        try {
+            flushPendingRows(transactional);
+        } catch (BatchTooLargeForCapException rejection) {
+            // The hold-back runs only where the sender used to throw. Every cap
+            // rejection precedes the first publish, so the whole batch is still
+            // buffered and the retry below sees exactly the rows before this one.
+            // Once the rows before it ship, the held row gets the normal auto-flush
+            // check once, with no further hold-back: at or above the byte budget the
+            // next append would flush it anyway, and flushing it now puts a rejection
+            // of its own frame on this row's at() call, which a pooled close() rolls
+            // back while the slot stays in service.
+            if (pendingRowCount < 2 || !currentTableBuffer.holdBackLastRow()) {
+                throw rejection;
+            }
+            try {
+                // Ships every row but the held one; resetTableBuffersAfterFlush
+                // resolves the hold by retaining the held row.
+                flushPendingRows(transactional);
+            } catch (Throwable t) {
+                // restoreHeldRow() does nothing when resetTableBuffersAfterFlush
+                // already retained the row.
+                currentTableBuffer.restoreHeldRow();
+                if (t instanceof BatchTooLargeForCapException) {
+                    retainedBatchRejection = rejection;
+                    throw rejection;
+                }
+                throw t;
+            }
+            // With auto_flush_bytes=off shouldAutoFlush() has no byte test, so a held row
+            // whose own frame exceeds the advertised cap would stay in the slot after its
+            // lease. Flush it at once when it reaches the same 90 percent budget the
+            // default byte trigger uses.
+            int cap = serverMaxBatchSize;
+            if (shouldAutoFlush() || (cap > 0 && getPendingBytes() >= byteBudgetForCap(cap))) {
+                flushPendingRows(transactional);
+            }
+        }
     }
 
     /**
@@ -4452,6 +4647,14 @@ public class QwpWebSocketSender implements Sender {
         }
     }
 
+    private void clearSavepointAndRejection() {
+        savepointBatchMaxSymbolId = -1;
+        savepointPendingRowCount = 0;
+        savepointPendingBytes = 0;
+        savepointFirstPendingRowTimeNanos = 0;
+        retainedBatchRejection = null;
+    }
+
     private synchronized Throwable closeRemainingResources(Throwable terminalError) {
         if (closeCleanupStarted) {
             return terminalError;
@@ -4620,6 +4823,30 @@ public class QwpWebSocketSender implements Sender {
     private Endpoint currentEndpoint() {
         int idx = currentEndpointIdx;
         return idx < 0 ? null : endpoints.get(idx);
+    }
+
+    private void discardPendingBatchState() {
+        // Drop the batch's symbol watermark along with the rows that raised it. A
+        // later flush encodes the delta section as
+        // [sentMaxSymbolId+1 .. currentBatchMaxSymbolId], so a watermark left behind
+        // by the discarded batch keeps re-encoding that batch's symbols: a single-row
+        // batch after reset() would still carry the whole abandoned range and hit the
+        // very cap rejection reset() is documented to clear, leaving the sender unable
+        // to flush anything at all. -1 is what resetTableBuffersAfterFlush leaves
+        // behind after a flush that ships every pending row (after a hold-back flush
+        // the watermark stays at the batch max while the held row is pending), and
+        // sendCommitMessage already reads -1 as an empty delta.
+        currentBatchMaxSymbolId = -1;
+        reclaimUnsentSymbolIds(0);
+        pendingBytes = 0;
+        pendingRowCount = 0;
+        firstPendingRowTimeNanos = 0;
+        clearSavepointAndRejection();
+        currentTableBuffer = null;
+        currentTableBufferSnapshotBytes = 0;
+        currentTableName = null;
+        cachedTimestampColumn = null;
+        cachedTimestampNanosColumn = null;
     }
 
     /**
@@ -5032,6 +5259,7 @@ public class QwpWebSocketSender implements Sender {
                     ? 0 : currentTableBuffer.getBufferedBytes();
             pendingRowCount = 0;
             firstPendingRowTimeNanos = 0;
+            clearSavepointAndRejection();
             return;
         }
 
@@ -5095,7 +5323,13 @@ public class QwpWebSocketSender implements Sender {
                 && !deltaDictEnabled && currentBatchMaxSymbolId > deltaBaseline
                 && !splitFramesFit(cap, deltaBaseline)
                 && splitFramesFit(cap, currentBatchMaxSymbolId)) {
-            publishDictionaryChunks(cap, deltaBaseline + 1, currentBatchMaxSymbolId);
+            try {
+                publishDictionaryChunks(cap, deltaBaseline + 1, currentBatchMaxSymbolId);
+            } catch (BatchTooLargeForCapException e) {
+                // Thrown before the try block below, which would latch it.
+                retainedBatchRejection = e;
+                throw e;
+            }
             dictionaryChunksAwaitCommit = true;
             deltaBaseline = currentBatchMaxSymbolId;
             combinedBodyStart = encodeCombinedFrame(tableCount, deferCommit, deltaBaseline);
@@ -5110,6 +5344,8 @@ public class QwpWebSocketSender implements Sender {
                 flushPendingRowsSplit(deferCommit, combinedBodyStart, cap, deltaBaseline);
                 return;
             }
+            // The batch fits the cap: an earlier rejection no longer describes it.
+            retainedBatchRejection = null;
 
             // Write-ahead: durably persist this frame's new symbols BEFORE it is
             // published, so a recovered/orphan-drained slot can always rebuild the
@@ -5131,6 +5367,9 @@ public class QwpWebSocketSender implements Sender {
 
             resetTableBuffersAfterFlush();
         } catch (Throwable t) {
+            if (t instanceof BatchTooLargeForCapException) {
+                retainedBatchRejection = (BatchTooLargeForCapException) t;
+            }
             if (dictionaryChunksAwaitCommit) {
                 commitOrphanedDictionaryChunks(t);
             }
@@ -5279,14 +5518,18 @@ public class QwpWebSocketSender implements Sender {
                         + "symbol for this data"
                         : "call reset() to discard the retained batch and keep this sender, close the "
                         + "sender to discard everything, or produce smaller batches";
-                throw new BatchTooLargeForCapException("single table batch too large for server batch cap")
-                        .put(" [table=").put(tableName)
+                BatchTooLargeForCapException rejection = new BatchTooLargeForCapException(
+                        "single table batch too large for server batch cap");
+                rejection.put(" [table=").put(tableName)
                         .put(", messageSize=").put(messageSize)
                         .put(", dictionaryFrameBytes=").put(frameOverhead)
-                        .put(", serverMaxBatchSize=").put(cap).put(']')
+                        .put(", serverMaxBatchSize=").put(cap).put(']');
+                // The pool recovers on its own and reports only the detail.
+                rejection.endDetail()
                         .put("; the batch is retained for retry and every flush() will "
                                 + "reject it again until a larger-cap node is reached -- ")
                         .put(remedy);
+                throw rejection;
             }
             // Mirror advanceSentMaxSymbolId: once the first frame ships the batch's
             // new ids, the remaining frames carry an empty delta above the baseline.
@@ -5294,6 +5537,9 @@ public class QwpWebSocketSender implements Sender {
                 simBaseline = currentBatchMaxSymbolId;
             }
         }
+        // Every split frame fits the cap: an earlier rejection no longer describes
+        // the batch.
+        retainedBatchRejection = null;
 
         int tableBodyOffset = combinedBodyStart;
         // Mirrors simBaseline above and advanceSentMaxSymbolId below, so the frame
@@ -5370,16 +5616,35 @@ public class QwpWebSocketSender implements Sender {
 
     private void resetTableBuffersAfterFlush() {
         for (int i = 0, n = flushTableBuffers.size(); i < n; i++) {
-            flushTableBuffers.getQuick(i).reset();
+            QwpTableBuffer tableBuffer = flushTableBuffers.getQuick(i);
+            if (!tableBuffer.hasHeldRow()) {
+                tableBuffer.reset();
+            }
         }
         // Drop the references; the next flush re-collects.
         flushTableNames.clear();
         flushTableBuffers.clear();
-        currentBatchMaxSymbolId = -1;
-        pendingBytes = 0;
-        currentTableBufferSnapshotBytes = 0;
-        pendingRowCount = 0;
-        firstPendingRowTimeNanos = 0;
+        if (currentTableBuffer != null && currentTableBuffer.hasHeldRow()) {
+            // autoFlushAfterRow shipped every row but the one it held back, which
+            // stays buffered as the only pending row. currentBatchMaxSymbolId keeps
+            // its value: the held row's symbol ids are at or below it, and a
+            // full-dictionary frame must still carry them. In delta mode the frame
+            // that just shipped carried them, and advanceSentMaxSymbolId moved the
+            // baseline past them.
+            currentTableBuffer.retainHeldRow();
+            long heldRowBytes = currentTableBuffer.getBufferedBytes();
+            pendingRowCount = 1;
+            pendingBytes = heldRowBytes;
+            currentTableBufferSnapshotBytes = heldRowBytes;
+            firstPendingRowTimeNanos = System.nanoTime();
+        } else {
+            currentBatchMaxSymbolId = -1;
+            pendingBytes = 0;
+            currentTableBufferSnapshotBytes = 0;
+            pendingRowCount = 0;
+            firstPendingRowTimeNanos = 0;
+        }
+        clearSavepointAndRejection();
         armIfEligible();
     }
 
@@ -6700,17 +6965,19 @@ public class QwpWebSocketSender implements Sender {
      * </ul>
      * Handing either to a different string is the silent misattribution the dense
      * id space exists to prevent, so the floor is the max of the two.
+     * {@code minFloor} raises it further: resetToSavepoint() passes the ids the
+     * retained rows still reference. Pass 0 to reclaim everything unsent.
      * <p>
      * Full-dict mode is excluded. Its sections always start at id 0, so there is
      * no lifetime anchor to shrink and nothing to gain -- while reclaiming would
      * let a later frame define a different string at an id a frame already on the
      * ring defines, which is precisely the hazard above.
      */
-    private void reclaimUnsentSymbolIds() {
+    private void reclaimUnsentSymbolIds(int minFloor) {
         if (!deltaDictEnabled) {
             return;
         }
-        int floor = sentMaxSymbolId + 1;
+        int floor = Math.max(sentMaxSymbolId + 1, minFloor);
         PersistedSymbolDict pd = cursorEngine == null ? null : cursorEngine.getPersistedSymbolDict();
         if (pd != null) {
             int durable = pd.size();
@@ -6983,6 +7250,7 @@ public class QwpWebSocketSender implements Sender {
             firstPendingRowTimeNanos = System.nanoTime();
         }
         pendingRowCount++;
+        rowsAppended++;
 
         // Advance pendingBytes by the bytes the just-committed row added to
         // the current table. nextRow() accumulated the total during its
@@ -6994,7 +7262,7 @@ public class QwpWebSocketSender implements Sender {
         currentTableBufferSnapshotBytes = bufferedNow;
 
         if (shouldAutoFlush()) {
-            flushPendingRows(transactional);
+            autoFlushAfterRow();
         }
     }
 
