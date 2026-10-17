@@ -443,56 +443,6 @@ public class WebSocketDynamicCredentialTest {
         });
     }
 
-    @Test(timeout = 30_000)
-    public void testStaleTokenGetsExactlyOne401ThenAnImmediateRetry() throws Exception {
-        // C10: the reconnect presents a token the server has revoked. Exactly one 401, then an immediate retry of
-        // the same endpoint with the refreshed token: no backoff, no failed-attempt event, no AUTH_FAILED.
-        assertMemoryLeak(() -> {
-            ScriptedSource source = new ScriptedSource()
-                    .thenToken("T1", System.currentTimeMillis() + HOUR)
-                    .thenToken("T2", System.currentTimeMillis() + HOUR);
-            DropAfterFirstAckHandler handler = new DropAfterFirstAckHandler();
-            List<SenderConnectionEvent> events = new CopyOnWriteArrayList<>();
-            Set<String> revoked = Collections.synchronizedSet(new HashSet<>());
-            try (TestWebSocketServer server = startServer(handler);
-                 RefreshingTokenProvider provider = fastProvider(source).build()) {
-                server.setAuthorizationValidator(h -> revoked.contains(h) ? 401 : 0);
-                try (Sender sender = Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address("localhost:" + server.getPort())
-                        .initialConnectMode(Sender.InitialConnectMode.OFF)
-                        // a retry through the reconnect loop would wait at least this long
-                        .reconnectInitialBackoffMillis(5_000)
-                        .reconnectMaxBackoffMillis(5_000)
-                        .connectionListener(events::add)
-                        .httpTokenProvider(provider)
-                        .build()) {
-                    Assert.assertEquals("Bearer T1", server.pollAuthorizationHeader(5, TimeUnit.SECONDS));
-                    revoked.add("Bearer T1");
-                    sender.table("t").longColumn("v", 1).atNow();
-                    sender.flush(); // ACKed, then the server drops the connection
-                    Assert.assertEquals("the reconnect first presents the cached token",
-                            "Bearer T1", server.pollAuthorizationHeader(5, TimeUnit.SECONDS));
-                    long rejectedAt = System.nanoTime();
-                    Assert.assertEquals("then retries with the refreshed one",
-                            "Bearer T2", server.pollAuthorizationHeader(5, TimeUnit.SECONDS));
-                    long retryMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - rejectedAt);
-                    Assert.assertTrue("the retry must be immediate, not after backoff; took " + retryMillis + " ms",
-                            retryMillis < 4_000);
-                    sender.table("t").longColumn("v", 2).atNow();
-                    sender.flush();
-                    await(() -> handler.frames.get() >= 2, 10_000, "the second row");
-                    await(() -> kinds(events).contains(SenderConnectionEvent.Kind.RECONNECTED), 5_000, "RECONNECTED");
-                }
-                Assert.assertEquals("exactly one 401", 1, server.authRejectCount());
-                List<SenderConnectionEvent.Kind> kinds = kinds(events);
-                Assert.assertFalse("only the round's final outcome is reported: " + kinds,
-                        kinds.contains(SenderConnectionEvent.Kind.AUTH_FAILED));
-                Assert.assertFalse("the retried 401 is not an endpoint failure: " + kinds,
-                        kinds.contains(SenderConnectionEvent.Kind.ENDPOINT_ATTEMPT_FAILED));
-            }
-        });
-    }
-
     @Test(timeout = 60_000)
     public void testSentinelTokensNeverLeakFromTheClient() throws Exception {
         // C20 at the client level: across a stale-token 401 and its retry (C10), a persistent 401 (C11), a cold
@@ -593,6 +543,56 @@ public class WebSocketDynamicCredentialTest {
                 Assert.assertFalse("a token leaked into: " + s, s.contains(stale) || s.contains(fresh));
             }
         }
+    }
+
+    @Test(timeout = 30_000)
+    public void testStaleTokenGetsExactlyOne401ThenAnImmediateRetry() throws Exception {
+        // C10: the reconnect presents a token the server has revoked. Exactly one 401, then an immediate retry of
+        // the same endpoint with the refreshed token: no backoff, no failed-attempt event, no AUTH_FAILED.
+        assertMemoryLeak(() -> {
+            ScriptedSource source = new ScriptedSource()
+                    .thenToken("T1", System.currentTimeMillis() + HOUR)
+                    .thenToken("T2", System.currentTimeMillis() + HOUR);
+            DropAfterFirstAckHandler handler = new DropAfterFirstAckHandler();
+            List<SenderConnectionEvent> events = new CopyOnWriteArrayList<>();
+            Set<String> revoked = Collections.synchronizedSet(new HashSet<>());
+            try (TestWebSocketServer server = startServer(handler);
+                 RefreshingTokenProvider provider = fastProvider(source).build()) {
+                server.setAuthorizationValidator(h -> revoked.contains(h) ? 401 : 0);
+                try (Sender sender = Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address("localhost:" + server.getPort())
+                        .initialConnectMode(Sender.InitialConnectMode.OFF)
+                        // a retry through the reconnect loop would wait at least this long
+                        .reconnectInitialBackoffMillis(5_000)
+                        .reconnectMaxBackoffMillis(5_000)
+                        .connectionListener(events::add)
+                        .httpTokenProvider(provider)
+                        .build()) {
+                    Assert.assertEquals("Bearer T1", server.pollAuthorizationHeader(5, TimeUnit.SECONDS));
+                    revoked.add("Bearer T1");
+                    sender.table("t").longColumn("v", 1).atNow();
+                    sender.flush(); // ACKed, then the server drops the connection
+                    Assert.assertEquals("the reconnect first presents the cached token",
+                            "Bearer T1", server.pollAuthorizationHeader(5, TimeUnit.SECONDS));
+                    long rejectedAt = System.nanoTime();
+                    Assert.assertEquals("then retries with the refreshed one",
+                            "Bearer T2", server.pollAuthorizationHeader(5, TimeUnit.SECONDS));
+                    long retryMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - rejectedAt);
+                    Assert.assertTrue("the retry must be immediate, not after backoff; took " + retryMillis + " ms",
+                            retryMillis < 4_000);
+                    sender.table("t").longColumn("v", 2).atNow();
+                    sender.flush();
+                    await(() -> handler.frames.get() >= 2, 10_000, "the second row");
+                    await(() -> kinds(events).contains(SenderConnectionEvent.Kind.RECONNECTED), 5_000, "RECONNECTED");
+                }
+                Assert.assertEquals("exactly one 401", 1, server.authRejectCount());
+                List<SenderConnectionEvent.Kind> kinds = kinds(events);
+                Assert.assertFalse("only the round's final outcome is reported: " + kinds,
+                        kinds.contains(SenderConnectionEvent.Kind.AUTH_FAILED));
+                Assert.assertFalse("the retried 401 is not an endpoint failure: " + kinds,
+                        kinds.contains(SenderConnectionEvent.Kind.ENDPOINT_ATTEMPT_FAILED));
+            }
+        });
     }
 
     @Test(timeout = 30_000)
@@ -814,15 +814,6 @@ public class WebSocketDynamicCredentialTest {
         });
     }
 
-    private static void renderThrowable(Throwable t, List<String> into) {
-        for (Throwable c = t; c != null; c = c.getCause()) {
-            into.add(c.toString());
-            for (Throwable s : c.getSuppressed()) {
-                renderThrowable(s, into);
-            }
-        }
-    }
-
     private static List<String> drainHeaders(TestWebSocketServer server) throws InterruptedException {
         List<String> headers = new ArrayList<>();
         String h;
@@ -861,6 +852,15 @@ public class WebSocketDynamicCredentialTest {
             last = h;
         }
         return last;
+    }
+
+    private static void renderThrowable(Throwable t, List<String> into) {
+        for (Throwable c = t; c != null; c = c.getCause()) {
+            into.add(c.toString());
+            for (Throwable s : c.getSuppressed()) {
+                renderThrowable(s, into);
+            }
+        }
     }
 
     private static TestWebSocketServer startServer(TestWebSocketServer.WebSocketServerHandler handler)

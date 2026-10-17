@@ -741,6 +741,16 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
     }
 
     /**
+     * Handle to a task submitted to a {@link Scheduler}.
+     */
+    public interface ScheduledTask {
+        /**
+         * Best-effort: a task that has already started may still run, and the provider ignores it.
+         */
+        void cancel();
+    }
+
+    /**
      * Runs fetches on the provider's background context. The default owns one daemon thread. A test may supply
      * its own to run fetches deterministically.
      */
@@ -755,16 +765,6 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
          * progress.
          */
         void shutdown();
-    }
-
-    /**
-     * Handle to a task submitted to a {@link Scheduler}.
-     */
-    public interface ScheduledTask {
-        /**
-         * Best-effort: a task that has already started may still run, and the provider ignores it.
-         */
-        void cancel();
     }
 
     /**
@@ -945,6 +945,50 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
         }
     }
 
+    private static final class DefaultScheduler implements Scheduler {
+        private final ScheduledThreadPoolExecutor executor;
+        private volatile Thread thread;
+
+        DefaultScheduler() {
+            final String threadName = "qdb-token-refresh-" + THREAD_IDS.incrementAndGet();
+            this.executor = new ScheduledThreadPoolExecutor(1, r -> {
+                Thread t = new Thread(r, threadName);
+                t.setDaemon(true);
+                thread = t;
+                return t;
+            });
+            executor.setRemoveOnCancelPolicy(true);
+            executor.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
+            executor.setContinueExistingPeriodicTasksAfterShutdownPolicy(false);
+        }
+
+        @Override
+        public ScheduledTask schedule(Runnable task, long delayNanos) {
+            final ScheduledFuture<?> future = executor.schedule(task, delayNanos, TimeUnit.NANOSECONDS);
+            return () -> future.cancel(false);
+        }
+
+        @Override
+        public void shutdown() {
+            executor.shutdownNow();
+            if (Thread.currentThread() == thread) {
+                return; // closed from inside a fetch: the thread exits once this task unwinds
+            }
+            // Interrupt-neutral, like the other close paths in this library: a carried interrupt flag would
+            // turn the bounded wait into an immediate return.
+            final boolean interrupted = Thread.interrupted();
+            try {
+                executor.awaitTermination(CLOSE_AWAIT_MILLIS, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } finally {
+                if (interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+    }
+
     /**
      * A failed fetch: its classification, sanitized message and time. Never carries the token.
      */
@@ -998,50 +1042,6 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
             final String clean = CredentialRedaction.sanitizeErrorText(message);
             return new FetchFailure(retryable, retryAfterMillis, clean == null || clean.isEmpty()
                     ? "token source failed without a message" : clean, epochMillis);
-        }
-    }
-
-    private static final class DefaultScheduler implements Scheduler {
-        private final ScheduledThreadPoolExecutor executor;
-        private volatile Thread thread;
-
-        DefaultScheduler() {
-            final String threadName = "qdb-token-refresh-" + THREAD_IDS.incrementAndGet();
-            this.executor = new ScheduledThreadPoolExecutor(1, r -> {
-                Thread t = new Thread(r, threadName);
-                t.setDaemon(true);
-                thread = t;
-                return t;
-            });
-            executor.setRemoveOnCancelPolicy(true);
-            executor.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
-            executor.setContinueExistingPeriodicTasksAfterShutdownPolicy(false);
-        }
-
-        @Override
-        public ScheduledTask schedule(Runnable task, long delayNanos) {
-            final ScheduledFuture<?> future = executor.schedule(task, delayNanos, TimeUnit.NANOSECONDS);
-            return () -> future.cancel(false);
-        }
-
-        @Override
-        public void shutdown() {
-            executor.shutdownNow();
-            if (Thread.currentThread() == thread) {
-                return; // closed from inside a fetch: the thread exits once this task unwinds
-            }
-            // Interrupt-neutral, like the other close paths in this library: a carried interrupt flag would
-            // turn the bounded wait into an immediate return.
-            final boolean interrupted = Thread.interrupted();
-            try {
-                executor.awaitTermination(CLOSE_AWAIT_MILLIS, TimeUnit.MILLISECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            } finally {
-                if (interrupted) {
-                    Thread.currentThread().interrupt();
-                }
-            }
         }
     }
 

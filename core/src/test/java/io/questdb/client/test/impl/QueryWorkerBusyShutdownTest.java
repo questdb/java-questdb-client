@@ -69,6 +69,16 @@ public class QueryWorkerBusyShutdownTest {
     private static final String SENDER_CFG = "http::addr=127.0.0.1:1;protocol_version=2;auto_flush=off;";
 
     @Test(timeout = 60_000)
+    public void testShutdownDuringAReconnectWalkWithBinds() throws Exception {
+        assertShutdownDuringAReconnectWalkIsSafe(true);
+    }
+
+    @Test(timeout = 60_000)
+    public void testShutdownDuringAReconnectWalkWithoutBinds() throws Exception {
+        assertShutdownDuringAReconnectWalkIsSafe(false);
+    }
+
+    @Test(timeout = 60_000)
     public void testShutdownLeavesTheCloseToADispatchThreadStillInsideExecute() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             try (TestWebSocketServer server = startServer(new AtomicBoolean())) {
@@ -117,16 +127,6 @@ public class QueryWorkerBusyShutdownTest {
                 }
             }
         });
-    }
-
-    @Test(timeout = 60_000)
-    public void testShutdownDuringAReconnectWalkWithBinds() throws Exception {
-        assertShutdownDuringAReconnectWalkIsSafe(true);
-    }
-
-    @Test(timeout = 60_000)
-    public void testShutdownDuringAReconnectWalkWithoutBinds() throws Exception {
-        assertShutdownDuringAReconnectWalkIsSafe(false);
     }
 
     /**
