@@ -573,8 +573,9 @@ public final class PooledSender implements Sender {
      *       pending rows unflagged and commits the group;</li>
      *   <li>otherwise {@code flush_on_close=on}: {@code flushDeferred()} with a
      *       window, {@code flush()} without one;</li>
-     *   <li>otherwise {@code autoFlushIfDue()}: ships only rows older than
-     *       {@code auto_flush_interval}.</li>
+     *   <li>otherwise {@code autoFlushIfDue()}: ships every pending row once
+     *       the oldest is older than {@code auto_flush_interval} or another
+     *       auto-flush threshold trips.</li>
      * </ul>
      */
     private void ship(SenderPool pool, Sender delegate) {

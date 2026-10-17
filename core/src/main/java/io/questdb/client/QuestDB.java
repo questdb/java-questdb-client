@@ -138,11 +138,11 @@ public interface QuestDB extends Closeable {
      * Borrows a {@link Sender} from the pool. The caller MUST call
      * {@link Sender#close()} on the returned instance to release it back to
      * the pool. Close releases, flush ships, drain waits: {@code close()} on a
-     * pooled Sender returns the slot and by default ships only rows older than
-     * {@code auto_flush_interval}, otherwise it only releases; the other rows go
-     * out when an auto-flush threshold trips on a later append, at a later
-     * release once they are older than that interval, or when the
-     * housekeeper settles the idle slot, within about one
+     * pooled Sender returns the slot and by default ships the slot's pending
+     * rows once the oldest is older than {@code auto_flush_interval} or another
+     * auto-flush threshold trips, otherwise it only releases; rows left in the
+     * slot go out when an auto-flush threshold trips on a later append or
+     * release, or when the housekeeper settles the idle slot, within about one
      * {@code auto_flush_interval} of it going idle. A lease that holds the slot
      * without appending or closing holds those rows back until it does. Call
      * {@link Sender#flush()} to ship now and
