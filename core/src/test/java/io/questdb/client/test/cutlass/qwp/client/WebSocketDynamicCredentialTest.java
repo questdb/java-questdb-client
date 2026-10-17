@@ -34,6 +34,7 @@ import io.questdb.client.cutlass.auth.TokenUnavailableException;
 import io.questdb.client.cutlass.qwp.client.QwpAuthFailedException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.test.cutlass.auth.TokenTestKit.FakeClock;
+import io.questdb.client.test.cutlass.auth.TokenTestKit.ForgetfulTokenProvider;
 import io.questdb.client.test.cutlass.auth.TokenTestKit.ManualScheduler;
 import io.questdb.client.test.cutlass.auth.TokenTestKit.ScriptedSource;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
@@ -166,6 +167,42 @@ public class WebSocketDynamicCredentialTest {
     @Test(timeout = 30_000)
     public void testCloseInterruptsThePost401RejectionCallback() throws Exception {
         assertCloseInterruptsPost401Wait(true);
+    }
+
+    @Test(timeout = 30_000)
+    public void testFailedRefreshAfterA401EndsStartupWithTheRejection() throws Exception {
+        // Section 8.2: when the pull after a 401 fails, there is no new token to retry with. The round ends with the
+        // 401, which carries the provider's failure as a suppressed diagnostic, and startup fails fast in OFF and in
+        // SYNC mode rather than retrying a credential outage.
+        for (Sender.InitialConnectMode mode : new Sender.InitialConnectMode[]{
+                Sender.InitialConnectMode.OFF, Sender.InitialConnectMode.SYNC}) {
+            assertMemoryLeak(() -> {
+                ForgetfulTokenProvider provider = new ForgetfulTokenProvider("T1");
+                try (TestWebSocketServer server = startServer(new AckHandler())) {
+                    server.setAuthorizationValidator(h -> 401);
+                    long start = System.nanoTime();
+                    try {
+                        Sender.builder(Sender.Transport.WEBSOCKET)
+                                .address("localhost:" + server.getPort())
+                                .initialConnectMode(mode)
+                                .reconnectMaxDurationMillis(20_000)
+                                .httpTokenProvider(provider)
+                                .build()
+                                .close();
+                        Assert.fail("a 401 must fail startup [mode=" + mode + ']');
+                    } catch (QwpAuthFailedException e) {
+                        Assert.assertEquals(401, e.getStatusCode());
+                        Assert.assertTrue("the provider's failure must ride along [mode=" + mode + ']',
+                                Arrays.asList(e.getSuppressed()).contains(provider.outage()));
+                    }
+                    long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+                    Assert.assertTrue("startup must fail fast, took " + elapsedMillis + " ms", elapsedMillis < 10_000);
+                    Assert.assertEquals("one pull for the attempt, one after the 401 [mode=" + mode + ']',
+                            2, provider.pulls());
+                    Assert.assertEquals("nothing to retry with [mode=" + mode + ']', 1, server.upgradeRequestCount());
+                }
+            });
+        }
     }
 
     @Test(timeout = 60_000)
@@ -812,6 +849,41 @@ public class WebSocketDynamicCredentialTest {
                 Assert.assertEquals(0, server.upgradeRequestCount());
             }
         });
+    }
+
+    @Test(timeout = 30_000)
+    public void testUnchangedTokenAfterA401IsNotRetried() throws Exception {
+        // Section 8.2 step 4: the endpoint is retried only with a token that differs from the rejected one. Here
+        // the forced refresh hands the same token back, as a platform that caches tokens - an Azure managed
+        // identity - usually does, so the 401 ends the round in OFF and in SYNC mode.
+        for (Sender.InitialConnectMode mode : new Sender.InitialConnectMode[]{
+                Sender.InitialConnectMode.OFF, Sender.InitialConnectMode.SYNC}) {
+            assertMemoryLeak(() -> {
+                ScriptedSource source = new ScriptedSource().thenToken("T1", System.currentTimeMillis() + HOUR);
+                try (TestWebSocketServer server = startServer(new AckHandler());
+                     RefreshingTokenProvider provider = fastProvider(source).build()) {
+                    server.setAuthorizationValidator(h -> 401);
+                    long start = System.nanoTime();
+                    try {
+                        Sender.builder(Sender.Transport.WEBSOCKET)
+                                .address("localhost:" + server.getPort())
+                                .initialConnectMode(mode)
+                                .reconnectMaxDurationMillis(20_000)
+                                .httpTokenProvider(provider)
+                                .build()
+                                .close();
+                        Assert.fail("a 401 must fail startup [mode=" + mode + ']');
+                    } catch (QwpAuthFailedException e) {
+                        Assert.assertEquals(401, e.getStatusCode());
+                    }
+                    long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+                    Assert.assertTrue("startup must fail fast, took " + elapsedMillis + " ms", elapsedMillis < 10_000);
+                    Assert.assertEquals("the prefetch, then the forced refresh [mode=" + mode + ']', 2, source.calls());
+                    Assert.assertEquals("the rejected token must not be presented again [mode=" + mode + ']',
+                            Collections.singletonList("Bearer T1"), drainHeaders(server));
+                }
+            });
+        }
     }
 
     private static List<String> drainHeaders(TestWebSocketServer server) throws InterruptedException {

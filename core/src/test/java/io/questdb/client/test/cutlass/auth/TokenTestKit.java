@@ -24,9 +24,11 @@
 
 package io.questdb.client.test.cutlass.auth;
 
+import io.questdb.client.HttpTokenProvider;
 import io.questdb.client.cutlass.auth.ExpiringToken;
 import io.questdb.client.cutlass.auth.RefreshingTokenProvider;
 import io.questdb.client.cutlass.auth.TokenSource;
+import io.questdb.client.cutlass.auth.TokenUnavailableException;
 import org.junit.Assert;
 
 import java.util.ArrayDeque;
@@ -41,7 +43,8 @@ import java.util.function.Supplier;
 
 /**
  * Deterministic fixtures for the dynamic-credential conformance tests (design/qwp-token-provider-spec.md, section
- * 10): a fake clock, a scheduler the test drives by hand, and a scripted token source.
+ * 10): a fake clock, a scheduler the test drives by hand, a scripted token source, and an application-supplied
+ * provider that forgets a token once a server rejects it.
  */
 public final class TokenTestKit {
 
@@ -93,6 +96,47 @@ public final class TokenTestKit {
         @Override
         public long wallClockMillis() {
             return wall.get();
+        }
+    }
+
+    /**
+     * An application-supplied provider that hands out its cached token until a server rejects it, then drops the
+     * cache and fails every later pull with {@link #outage()}, as if its identity platform had become unreachable.
+     */
+    public static final class ForgetfulTokenProvider implements HttpTokenProvider {
+        private final TokenUnavailableException outage =
+                TokenUnavailableException.retryable("identity platform unreachable");
+        private final AtomicInteger pulls = new AtomicInteger();
+        private final String token;
+        private volatile boolean hasCachedToken = true;
+
+        public ForgetfulTokenProvider(String token) {
+            this.token = token;
+        }
+
+        @Override
+        public CharSequence getToken() {
+            pulls.incrementAndGet();
+            if (!hasCachedToken) {
+                throw outage;
+            }
+            return token;
+        }
+
+        @Override
+        public void onTokenRejected(CharSequence token, int httpStatus) {
+            hasCachedToken = false;
+        }
+
+        /**
+         * The exception every pull throws once the cached token is gone.
+         */
+        public TokenUnavailableException outage() {
+            return outage;
+        }
+
+        public int pulls() {
+            return pulls.get();
         }
     }
 

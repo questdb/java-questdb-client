@@ -36,6 +36,7 @@ import io.questdb.client.cutlass.qwp.client.QwpCredentialUnavailableException;
 import io.questdb.client.cutlass.qwp.client.QwpEgressMsgKind;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
+import io.questdb.client.test.cutlass.auth.TokenTestKit.ForgetfulTokenProvider;
 import io.questdb.client.test.cutlass.auth.TokenTestKit.ScriptedSource;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
@@ -46,6 +47,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -80,6 +82,32 @@ public class QwpQueryClientDynamicCredentialTest {
                     Assert.assertTrue(e.getCause() instanceof TokenUnavailableException);
                 }
                 Assert.assertEquals("no endpoint may be contacted", 0, server.upgradeRequestCount());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testConnectFailedRefreshAfterA401EndsWithTheRejection() throws Exception {
+        // Section 8.2 on egress: when the pull after a 401 fails, there is no new token to retry with. connect() ends
+        // with the 401, which carries the credential-unavailable failure as a suppressed diagnostic.
+        assertMemoryLeak(() -> {
+            ForgetfulTokenProvider provider = new ForgetfulTokenProvider("T1");
+            try (TestWebSocketServer server = startServer();
+                 QwpQueryClient client = QwpQueryClient.fromConfig("ws::addr=localhost:" + server.getPort() + ";")
+                         .withBearerTokenProvider(provider)) {
+                server.setAuthorizationValidator(h -> 401);
+                try {
+                    client.connect();
+                    Assert.fail();
+                } catch (QwpAuthFailedException e) {
+                    Assert.assertEquals(401, e.getStatusCode());
+                    Throwable[] suppressed = e.getSuppressed();
+                    Assert.assertEquals(Arrays.toString(suppressed), 1, suppressed.length);
+                    Assert.assertTrue(suppressed[0].toString(), suppressed[0] instanceof QwpCredentialUnavailableException);
+                    Assert.assertSame("the provider's own failure", provider.outage(), suppressed[0].getCause());
+                }
+                Assert.assertEquals("one pull for the attempt, one after the 401", 2, provider.pulls());
+                Assert.assertEquals("nothing to retry with", 1, server.upgradeRequestCount());
             }
         });
     }
@@ -168,6 +196,29 @@ public class QwpQueryClientDynamicCredentialTest {
                 ResultCollector result = new ResultCollector();
                 client.execute("SELECT 1", result);
                 Assert.assertNull(result.error.get());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testConnectUnchangedTokenAfterA401IsNotRetried() throws Exception {
+        // Section 8.2 step 4 on egress: the forced refresh hands the rejected token back, as a platform that caches
+        // tokens usually does, so connect() ends with the 401 instead of presenting that token again.
+        assertMemoryLeak(() -> {
+            ScriptedSource source = new ScriptedSource().thenToken("T1", System.currentTimeMillis() + HOUR);
+            try (TestWebSocketServer server = startServer();
+                 RefreshingTokenProvider provider = RefreshingTokenProvider.builder(source).build();
+                 QwpQueryClient client = QwpQueryClient.fromConfig("ws::addr=localhost:" + server.getPort() + ";")
+                         .withBearerTokenProvider(provider)) {
+                server.setAuthorizationValidator(h -> 401);
+                try {
+                    client.connect();
+                    Assert.fail();
+                } catch (QwpAuthFailedException e) {
+                    Assert.assertEquals(401, e.getStatusCode());
+                }
+                Assert.assertEquals("the prefetch, then the forced refresh", 2, source.calls());
+                Assert.assertEquals(Collections.singletonList("Bearer T1"), headers(server));
             }
         });
     }
@@ -321,6 +372,34 @@ public class QwpQueryClientDynamicCredentialTest {
                 client.execute("SELECT 1", result);
                 Assert.assertNull(result.error.get());
                 Assert.assertEquals(Arrays.asList("Bearer T1", "Bearer T2"), headers(b));
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testFailoverUnchangedTokenAfterA401IsNotRetried() throws Exception {
+        // Section 8.2 step 4 on the egress failover path: B rejects the token and the forced refresh hands the same
+        // one back, so the failover reconnect ends with the 401 instead of presenting that token to B again.
+        assertMemoryLeak(() -> {
+            ScriptedSource source = new ScriptedSource().thenToken("T1", System.currentTimeMillis() + HOUR);
+            try (TestWebSocketServer a = startServer();
+                 TestWebSocketServer b = startServer();
+                 RefreshingTokenProvider provider = RefreshingTokenProvider.builder(source).build();
+                 QwpQueryClient client = QwpQueryClient.fromConfig(
+                                 "ws::addr=localhost:" + a.getPort() + ",localhost:" + b.getPort()
+                                         + ";failover_backoff_initial_ms=0;")
+                         .withBearerTokenProvider(provider)) {
+                b.setAuthorizationValidator(h -> 401);
+                client.connect();
+                Assert.assertEquals("Bearer T1", a.pollAuthorizationHeader(5, TimeUnit.SECONDS));
+                a.close();
+                ResultCollector result = new ResultCollector();
+                client.execute("SELECT 1", result);
+                Assert.assertNotNull("the failover reconnect must fail", result.error.get());
+                Assert.assertTrue(result.error.get(),
+                        result.error.get().contains("auth-rejected during failover reconnect"));
+                Assert.assertEquals(Collections.singletonList("Bearer T1"), headers(b));
+                Assert.assertEquals("the prefetch, then the forced refresh", 2, source.calls());
             }
         });
     }
