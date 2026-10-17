@@ -25,6 +25,10 @@
 
 package io.questdb.client.test.impl;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import io.questdb.client.LineSenderServerException;
 import io.questdb.client.Sender;
 import io.questdb.client.SenderError;
@@ -33,6 +37,7 @@ import io.questdb.client.impl.PooledSender;
 import io.questdb.client.impl.SenderPool;
 import org.junit.Assert;
 import org.junit.Test;
+import org.slf4j.LoggerFactory;
 
 import java.lang.reflect.Field;
 import java.util.ArrayList;
@@ -74,7 +79,7 @@ public class SenderPoolCloseSemanticsTest {
     }
 
     @Test
-    public void testCloseDoesNotFlushByDefault() {
+    public void testCloseDoesNotFlushWithFlushOnCloseOff() {
         List<RecordingSender> built = new ArrayList<>();
         try (SenderPool pool = newPool(1, 1, built)) {
             Assert.assertFalse(pool.isFlushOnClose());
@@ -108,6 +113,21 @@ public class SenderPoolCloseSemanticsTest {
             } catch (LineSenderException e) {
                 Assert.assertFalse("a non-retryable cause makes a non-retryable wrapper", e.isRetryable());
             }
+        }
+    }
+
+    @Test
+    public void testDirectPoolFlushesOnCloseByDefault() {
+        List<RecordingSender> built = new ArrayList<>();
+        try (SenderPool pool = newPoolWithDefaults(1, 1, Long.MAX_VALUE, built)) {
+            Assert.assertTrue("a direct pool has no housekeeper to settle released rows", pool.isFlushOnClose());
+            try (Sender s = pool.borrow()) {
+                s.table("t").longColumn("v", 1L).atNow();
+            }
+            RecordingSender delegate = built.get(0);
+            Assert.assertEquals(1, delegate.flushCount.get());
+            Assert.assertEquals(0, delegate.pendingRowCount());
+            Assert.assertEquals(1, pool.availableSize());
         }
     }
 
@@ -245,6 +265,49 @@ public class SenderPoolCloseSemanticsTest {
     }
 
     @Test
+    public void testPoolCloseLogsRowsAFailedIdleCloseDrops() {
+        Logger poolLogger = (Logger) LoggerFactory.getLogger(SenderPool.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        Level savedLevel = poolLogger.getLevel();
+        poolLogger.setLevel(Level.ALL);
+        poolLogger.addAppender(appender);
+        try {
+            List<RecordingSender> built = new ArrayList<>();
+            SenderPool pool = new SenderPool(CONFIG, 1, 1, 150L, Long.MAX_VALUE, Long.MAX_VALUE, idx -> {
+                RecordingSender s = new RecordingSender() {
+                    @Override
+                    public void close() {
+                        super.close();
+                        throw new LineSenderException("cursor SF append failed");
+                    }
+                };
+                built.add(s);
+                return s;
+            });
+            pool.setFlushOnClose(false);
+            try (Sender s = pool.borrow()) {
+                s.table("t").longColumn("v", 1L).atNow();
+                s.table("t").longColumn("v", 2L).atNow();
+            }
+            pool.close();
+            Assert.assertEquals(1, built.get(0).closeCount.get());
+            boolean logged = false;
+            for (ILoggingEvent e : appender.list) {
+                String msg = e.getFormattedMessage();
+                if (e.getLevel() == Level.ERROR && msg.contains("2 unshipped row(s)")
+                        && msg.contains("cursor SF append failed")) {
+                    logged = true;
+                }
+            }
+            Assert.assertTrue("a failed idle close must log the rows it drops", logged);
+        } finally {
+            poolLogger.detachAppender(appender);
+            poolLogger.setLevel(savedLevel);
+        }
+    }
+
+    @Test
     public void testResetAfterAFlushInsideTheLeaseDropsEveryPendingRow() {
         List<RecordingSender> built = new ArrayList<>();
         try (SenderPool pool = newPool(1, 1, built)) {
@@ -358,8 +421,16 @@ public class SenderPoolCloseSemanticsTest {
         }
     }
 
+    // Release-only close, the QuestDB facade's default. A directly built pool
+    // flushes on close unless told otherwise.
     static SenderPool newPool(int min, int max, List<RecordingSender> built) {
-        return new SenderPool(CONFIG, min, max, 150L, Long.MAX_VALUE, Long.MAX_VALUE, idx -> {
+        SenderPool pool = newPoolWithDefaults(min, max, Long.MAX_VALUE, built);
+        pool.setFlushOnClose(false);
+        return pool;
+    }
+
+    static SenderPool newPoolWithDefaults(int min, int max, long idleTimeoutMillis, List<RecordingSender> built) {
+        return new SenderPool(CONFIG, min, max, 150L, idleTimeoutMillis, Long.MAX_VALUE, idx -> {
             RecordingSender s = new RecordingSender();
             built.add(s);
             return s;

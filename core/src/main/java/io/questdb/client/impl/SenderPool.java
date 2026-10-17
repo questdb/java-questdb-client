@@ -255,7 +255,9 @@ public final class SenderPool implements AutoCloseable {
     // production; lifecycle tests use it to acknowledge distinct retries
     // without inspecting transient Condition queue membership.
     private volatile Runnable creationWaitRetryHook;
-    private volatile boolean flushOnClose;
+    // On for a directly built pool, which has no housekeeper to settle rows a
+    // release leaves in an idle slot. QuestDBImpl sets it from flush_on_close.
+    private volatile boolean flushOnClose = true;
     // Slots removed from `all` whose delegate is still releasing its flock.
     // They keep reserving capacity (and their slotInUse mark) until the
     // flock drops, so the cap check and the slot allocator stay consistent
@@ -1652,9 +1654,18 @@ public final class SenderPool implements AutoCloseable {
         // Close each idle delegate outside the lock so a slow real-close()
         // doesn't keep the pool latched.
         for (int i = 0; i < idleSnapshot.length; i++) {
+            SenderSlot s = idleSnapshot[i];
+            // Rows earlier leases released into the slot; a failed close drops
+            // them, and nothing else reports it.
+            int pendingRows = pendingRowsOf(s);
             try {
-                idleSnapshot[i].delegate().close();
-            } catch (Throwable ignored) {
+                s.delegate().close();
+            } catch (Throwable t) {
+                if (pendingRows > 0) {
+                    String error = t.toString();
+                    LOG.error("SenderPool.close(): idle slot {} closed with {} unshipped row(s); delegate close failed: {}",
+                            s.slotIndex(), pendingRows, error);
+                }
                 // Best-effort: an Error from one delegate's teardown must not
                 // abort the loop and strand the remaining delegates unclosed.
             }
@@ -1733,8 +1744,9 @@ public final class SenderPool implements AutoCloseable {
     }
 
     /**
-     * Ships rows left behind in idle slots. A pooled {@code close()} does not
-     * flush by default, and auto-flush thresholds are only evaluated on append,
+     * Ships rows left behind in idle slots. With flush on close off, the
+     * {@code QuestDB} facade's default, a pooled {@code close()} does not flush,
+     * and auto-flush thresholds are only evaluated on append,
      * so a slot nobody borrows again would keep its last rows until the pool
      * closes. The housekeeper calls this on its settle cadence.
      * <p>
@@ -2080,7 +2092,10 @@ public final class SenderPool implements AutoCloseable {
     /**
      * Closes idle slots that have exceeded {@code idleTimeoutMillis} or that
      * have aged past {@code maxLifetimeMillis}. Never shrinks below
-     * {@code minSize}. Called by the {@link PoolHousekeeper} on its tick.
+     * {@code minSize}. Skips a slot that still holds unshipped work: closing it
+     * would drop rows a release left there, so it waits until
+     * {@link #settleIdle()} ships them. Called by the {@link PoolHousekeeper}
+     * on its tick.
      */
     public void reapIdle() {
         if (closed) {
@@ -2105,7 +2120,7 @@ public final class SenderPool implements AutoCloseable {
                         && (now - s.idleSinceMillis()) >= idleTimeoutMillis;
                 boolean overAge = maxLifetimeMillis < Long.MAX_VALUE
                         && (now - s.createdAtMillis()) >= maxLifetimeMillis;
-                if (idleExpired || overAge) {
+                if ((idleExpired || overAge) && !hasUnshippedWork(s.delegate())) {
                     it.remove();
                     all.remove(s);
                     // Keep the SF slot reserved until its flock is released
@@ -2197,9 +2212,11 @@ public final class SenderPool implements AutoCloseable {
 
     /**
      * Whether a pooled {@code close()} ships the lease's rows before releasing
-     * the slot (the pre-1.4 behaviour) or only releases it. Off by default:
-     * rows then ship when an auto-flush threshold trips on a later append, or
-     * when the housekeeper settles the idle slot.
+     * the slot (the pre-1.4 behaviour) or only releases it. On by default for a
+     * directly built pool, since nothing settles its idle slots. The
+     * {@code QuestDB} facade sets it from {@code flush_on_close}, off by
+     * default: rows then ship when an auto-flush threshold trips on a later
+     * append, or when the housekeeper settles the idle slot.
      */
     public boolean isFlushOnClose() {
         return flushOnClose;

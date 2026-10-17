@@ -49,6 +49,35 @@ import java.util.concurrent.atomic.AtomicReference;
 public class SenderPoolSettleTest {
 
     @Test
+    public void testReapSkipsSlotUntilSettleShipsItsRows() throws Exception {
+        List<RecordingSender> built = new ArrayList<>();
+        try (SenderPool pool = SenderPoolCloseSemanticsTest.newPoolWithDefaults(0, 1, 1L, built)) {
+            pool.setFlushOnClose(false);
+            try (Sender s = pool.borrow()) {
+                s.table("t").longColumn("v", 1L).atNow();
+            }
+            RecordingSender delegate = built.get(0);
+            Thread.sleep(20);
+            pool.reapIdle();
+            Assert.assertEquals("an idle-expired slot holding rows is not reaped", 1, pool.totalSize());
+            Assert.assertEquals(0, delegate.closeCount.get());
+            Assert.assertEquals(1, delegate.pendingRowCount());
+
+            delegate.deferredFramesOpen = true;
+            delegate.pendingRows = 0;
+            pool.reapIdle();
+            Assert.assertEquals("an open commit group is unshipped work too", 1, pool.totalSize());
+
+            delegate.deferredFramesOpen = false;
+            delegate.pendingRows = 1;
+            Assert.assertEquals(1, pool.settleIdle());
+            pool.reapIdle();
+            Assert.assertEquals("the reap closes the slot once the settle shipped it", 0, pool.totalSize());
+            Assert.assertEquals(1, delegate.closeCount.get());
+        }
+    }
+
+    @Test
     public void testSettleRetiresSlotHoldingAnOverCapBatch() {
         List<RecordingSender> built = new ArrayList<>();
         try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(1, 1, built)) {
@@ -194,6 +223,7 @@ public class SenderPoolSettleTest {
                     built.add(rs);
                     return rs;
                 });
+        pool.setFlushOnClose(false);
         try {
             try (Sender s = pool.borrow()) {
                 s.table("t").longColumn("v", 1L).atNow();

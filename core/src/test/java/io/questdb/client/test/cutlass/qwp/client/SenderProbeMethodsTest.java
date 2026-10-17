@@ -133,6 +133,34 @@ public class SenderProbeMethodsTest {
     }
 
     @Test
+    public void testCrossingRowInATransactionShipsTheRowsBeforeItDeferred() throws Exception {
+        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+        try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+            server.setAdvertisedMaxBatchSize(4 * 1024);
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            // transaction=on, which a commit window injects: the rows before the crossing
+            // row ship inside the open transaction, and only flush() commits it
+            try (Sender sender = Sender.fromConfig(configWithoutAutoFlushBytes(server.getPort()) + "transaction=on;")) {
+                String wide = QuestDBFlushOnCloseTest.wideValue(1000);
+                for (int i = 0; i < 3; i++) {
+                    sender.table("t").stringColumn("s", wide).atNow();
+                }
+                sender.table("t").stringColumn("s", QuestDBFlushOnCloseTest.wideValue(1500)).atNow();
+                Assert.assertEquals("only the crossing row stays buffered", 1, sender.pendingRowCount());
+                log.awaitDataFrames(1, 5_000);
+                Assert.assertTrue("the rows before the crossing row ship without committing", log.deferFlag(0));
+                Assert.assertTrue(sender.hasDeferredFrames());
+                sender.flush();
+                log.awaitDataFrames(2, 5_000);
+                Assert.assertFalse("flush() commits the transaction with the held row", log.deferFlag(1));
+                Assert.assertEquals(0, log.commitFrames());
+                sender.checkError();
+            }
+        }
+    }
+
+    @Test
     public void testCrossingRowShipsTheRowsBeforeIt() throws Exception {
         QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
@@ -517,6 +545,39 @@ public class SenderProbeMethodsTest {
                 sender.table("t").longColumn("v", 2L).atNow();
                 sender.resetToSavepoint();
                 Assert.assertEquals(0, sender.pendingRowCount());
+            }
+        }
+    }
+
+    @Test
+    public void testSingleRowWhoseOwnFrameExceedsTheCapThrowsAndStaysBuffered() throws Exception {
+        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+        try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+            server.setAdvertisedMaxBatchSize(4 * 1024);
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            try (Sender sender = Sender.fromConfig(configWithoutAutoFlushBytes(server.getPort()))) {
+                // the crossing row is the only pending row: no rows before it can ship,
+                // so the sender holds nothing back and the rejection reaches this call
+                BatchTooLargeForCapException rejection = null;
+                try {
+                    sender.table("u").stringColumn("z", QuestDBFlushOnCloseTest.wideValue(4070)).atNow();
+                    Assert.fail("the only pending row's own frame exceeds the 4 KiB cap");
+                } catch (BatchTooLargeForCapException expected) {
+                    rejection = expected;
+                }
+                Assert.assertEquals("the row stays buffered", 1, sender.pendingRowCount());
+                try {
+                    sender.checkError();
+                    Assert.fail("the probe must report the retained row");
+                } catch (BatchTooLargeForCapException expected) {
+                    Assert.assertSame(rejection, expected);
+                }
+                sender.reset();
+                sender.table("u").longColumn("v", 1L).atNow();
+                sender.flush();
+                log.awaitDataFrames(1, 5_000);
+                sender.checkError();
             }
         }
     }
