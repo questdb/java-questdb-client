@@ -124,6 +124,10 @@ public class DurableAckIntegrationTest {
                 } catch (QwpDurableAckMismatchException e) {
                     Assert.assertEquals("localhost", e.getHost());
                     Assert.assertEquals(port, e.getPort());
+                    Assert.assertEquals(
+                            "WebSocket upgrade failed: server does not support durable ack [host=localhost, port=" + port
+                                    + ", requested=on, echoed=<no X-QWP-Durable-Ack header>]",
+                            e.getMessage());
                 }
             }
         });
@@ -201,6 +205,12 @@ public class DurableAckIntegrationTest {
                 } catch (QwpDurableAckMismatchException e) {
                     Assert.assertEquals("localhost", e.getHost());
                     Assert.assertEquals(port, e.getPort());
+                    // The message names the requested set and that the server
+                    // answered with no confirmation header at all.
+                    Assert.assertEquals(
+                            "WebSocket upgrade failed: server does not support durable ack [host=localhost, port=" + port
+                                    + ", requested=local, echoed=<no X-QWP-Durable-Ack header>]",
+                            e.getMessage());
                 }
             }
         });
@@ -226,6 +236,12 @@ public class DurableAckIntegrationTest {
                     Assert.fail("expected connect to fail with QwpDurableAckMismatchException");
                 } catch (QwpDurableAckMismatchException e) {
                     Assert.assertEquals(port, e.getPort());
+                    // The message names both sides of the mismatch: the
+                    // requested set and the foreign token the server echoed.
+                    Assert.assertEquals(
+                            "WebSocket upgrade failed: server does not support durable ack [host=localhost, port=" + port
+                                    + ", requested=local, echoed=enabled]",
+                            e.getMessage());
                 }
             }
         });

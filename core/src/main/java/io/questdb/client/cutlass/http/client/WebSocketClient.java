@@ -136,18 +136,25 @@ public abstract class WebSocketClient implements QuietCloseable {
     // down to its own hard limit.
     private int qwpMaxBatchRows;
     private int qwpMaxVersion = 1;
-    // Opt-in for STATUS_DURABLE_ACK frames; sent as X-QWP-Request-Durable-Ack: true
+    // Requested durable-ack tier set (DurableAckTiers bitmask), sent as
+    // X-QWP-Request-Durable-Ack: <DurableAckTiers.requestHeaderValue>
     private int qwpDurableAckTiers = DurableAckTiers.NONE;
     // Receive buffer (native memory)
     private long recvBufPtr;
     private int recvBufSize;
     private int recvPos;      // Write position
     private int recvReadPos;  // Read position
+    // Raw X-QWP-Durable-Ack value from the 101 upgrade response, or null when
+    // the server sent no such header. Reported in the durable-ack mismatch
+    // error so an operator sees what the server answered.
+    private String serverDurableAckEcho;
     // Set during upgrade response validation when the server echoed
-    // X-QWP-Durable-Ack: enabled. Tells the sender it landed on a server that
-    // will actually emit STATUS_DURABLE_ACK frames, so its store-and-forward
-    // path can rely on durable-ack-driven trim. Absence (after opting in via
-    // setQwpRequestDurableAck) is the early-fail signal.
+    // X-QWP-Durable-Ack with the token DurableAckTiers.expectedConfirmToken
+    // expects for the requested set (the set itself, or "enabled" for a
+    // legacy request). Tells the sender it landed on a server that will emit
+    // the requested ack frames, so its store-and-forward path can rely on
+    // durable-ack-driven trim. Absence (after requesting tiers via
+    // setQwpDurableAckTiers) is the early-fail signal.
     private boolean serverDurableAckEnabled;
     // Server's hard cap on ingest QWP message payload bytes, extracted from
     // X-QWP-Max-Batch-Size on the 101 upgrade response. 0 when the server did
@@ -330,6 +337,15 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
+     * Raw {@code X-QWP-Durable-Ack} value from the most recent 101 upgrade
+     * response, trimmed, or null when the server sent no such header.
+     * Meaningful only after {@link #upgrade} returns.
+     */
+    public String getServerDurableAckEcho() {
+        return serverDurableAckEcho;
+    }
+
+    /**
      * Server-advertised hard cap on QWP ingest payload bytes, taken from the
      * {@code X-QWP-Max-Batch-Size} response header on the 101 upgrade. Returns
      * {@code 0} when the server did not advertise the header, in which case
@@ -401,10 +417,13 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
-     * Returns true when the server echoed X-QWP-Durable-Ack: enabled in the
-     * 101 upgrade response. Meaningful only after {@link #upgrade} returns;
-     * always false when the client did not opt in via
-     * {@link #setQwpRequestDurableAck}.
+     * Returns true when the server granted the requested durable-ack tier set:
+     * the 101 upgrade response carried {@code X-QWP-Durable-Ack} with the
+     * token {@link DurableAckTiers#expectedConfirmToken} expects (the
+     * requested set, such as {@code local} or {@code local,replicated}, or
+     * {@code enabled} for a legacy request). Meaningful only after
+     * {@link #upgrade} returns; always false when no tier was requested via
+     * {@link #setQwpDurableAckTiers}.
      */
     public boolean isServerDurableAckEnabled() {
         return serverDurableAckEnabled;
@@ -801,10 +820,7 @@ public abstract class WebSocketClient implements QuietCloseable {
         return 0;
     }
 
-    private static boolean extractDurableAckConfirmed(String response, String expectedToken) {
-        if (expectedToken == null) {
-            return false;
-        }
+    private static String extractDurableAckEcho(String response) {
         int headerLen = QWP_DURABLE_ACK_HEADER_NAME.length();
         int responseLen = response.length();
         for (int i = 0; i <= responseLen - headerLen; i++) {
@@ -814,15 +830,10 @@ public abstract class WebSocketClient implements QuietCloseable {
                 if (lineEnd < 0) {
                     lineEnd = responseLen;
                 }
-                String value = response.substring(valueStart, lineEnd).trim();
-                // The server echoes the granted set verbatim (or the
-                // "enabled" token for a legacy "true" request); anything
-                // else is a partial or foreign grant and counts as a
-                // denial -- all-or-nothing, never a silent downgrade.
-                return value.equalsIgnoreCase(expectedToken);
+                return response.substring(valueStart, lineEnd).trim();
             }
         }
-        return false;
+        return null;
     }
 
     private static int extractMaxBatchSize(String response) {
@@ -1395,13 +1406,18 @@ public abstract class WebSocketClient implements QuietCloseable {
             throw new QwpVersionMismatchException(serverQwpVersion, qwpMaxVersion);
         }
 
-        // Extract X-QWP-Durable-Ack confirmation (optional, absent on servers
-        // without primary replication or when the client did not opt in).
-        // Only meaningful when qwpRequestDurableAck is true; the sender
-        // checks this value to fail at connect rather than silently
-        // missing trim signals.
-        serverDurableAckEnabled = extractDurableAckConfirmed(
-                response, DurableAckTiers.expectedConfirmToken(qwpDurableAckTiers));
+        // Extract X-QWP-Durable-Ack confirmation (optional, absent when the
+        // server cannot grant the requested tier set or the client requested
+        // none). Only meaningful when qwpDurableAckTiers is not NONE; the
+        // sender checks this value to fail at connect rather than silently
+        // missing trim signals. The server echoes the granted set verbatim
+        // (or the "enabled" token for a legacy "true" request); anything
+        // else is a partial or foreign grant and counts as a denial --
+        // all-or-nothing, never a silent downgrade.
+        serverDurableAckEcho = extractDurableAckEcho(response);
+        String expectedDurableAckToken = DurableAckTiers.expectedConfirmToken(qwpDurableAckTiers);
+        serverDurableAckEnabled = expectedDurableAckToken != null
+                && expectedDurableAckToken.equalsIgnoreCase(serverDurableAckEcho);
 
         // Extract X-QWP-Max-Batch-Size (optional). Older servers omit it; the
         // sender falls back to its locally configured byte budget in that case.

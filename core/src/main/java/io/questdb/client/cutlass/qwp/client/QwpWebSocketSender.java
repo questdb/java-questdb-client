@@ -4723,7 +4723,7 @@ public class QwpWebSocketSender implements Sender {
                     newClient.close();
                     hostTracker.recordRoleReject(idx, false, !background);
                     QwpDurableAckMismatchException ackErr = new QwpDurableAckMismatchException(
-                            ep.host, ep.port, null);
+                            ep.host, ep.port, durableAckTiers, newClient.getServerDurableAckEcho());
                     if (terminalUpgradeError == null) {
                         terminalUpgradeError = ackErr;
                     }
