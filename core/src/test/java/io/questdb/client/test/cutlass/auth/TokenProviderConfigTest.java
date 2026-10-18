@@ -66,6 +66,17 @@ public class TokenProviderConfigTest {
     }
 
     @Test
+    public void testAzureClientIdRejectsNonAsciiHex() throws Exception {
+        assertMemoryLeak(() -> {
+            for (char c : new char[]{'\uFF10', '\u0660', '\uFF21', '\uFF41'}) {
+                assertRejectedOnBoth(WSS + "token_provider=azure;azure_resource=api://x;azure_client_id="
+                                + c + "0000000-0000-0000-0000-000000000000;",
+                        "invalid azure_client_id: expected a GUID");
+            }
+        });
+    }
+
+    @Test
     public void testAzureCredentialSelectsOneCredential() throws Exception {
         // C24, connect-string half: every value of section 7.1 is accepted by every entry point, reaches the factory,
         // and keys the registry; "default" is the default and adds nothing.

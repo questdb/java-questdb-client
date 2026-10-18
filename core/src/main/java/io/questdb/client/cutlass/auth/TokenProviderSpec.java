@@ -204,8 +204,9 @@ public final class TokenProviderSpec {
         }
         for (int i = 0; i < 36; i++) {
             char c = value.charAt(i);
-            boolean dash = i == 8 || i == 13 || i == 18 || i == 23;
-            if (dash ? c != '-' : Character.digit(c, 16) < 0) {
+            boolean isDash = i == 8 || i == 13 || i == 18 || i == 23;
+            boolean isHex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+            if (isDash ? c != '-' : !isHex) {
                 throw invalidClientId(value);
             }
         }
