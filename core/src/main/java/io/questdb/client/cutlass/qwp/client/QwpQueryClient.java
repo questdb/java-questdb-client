@@ -252,6 +252,9 @@ public class QwpQueryClient implements QuietCloseable {
     // -- crashing the JVM on the next decode cycle.
     private volatile QwpEgressIoThread ioThread;
     private volatile Thread ioThreadHandle;
+    // Set when a failover reconnect inside execute() failed, leaving the client disconnected: the next
+    // execute() reconnects instead of throwing "not connected". Cleared by every successful connect.
+    private volatile boolean isReconnectOnNextExecute;
     // Sticky, non-freeing stop request: a pooled worker may still be inside a handler or reconnect walk.
     private volatile boolean isShutdownRequested;
     private boolean lastCloseTimedOut;
@@ -278,9 +281,6 @@ public class QwpQueryClient implements QuietCloseable {
     // currentRequestId. Volatile so a cancel from any thread is visible to the
     // worker thread's post-requestId read.
     private volatile boolean pendingCancel;
-    // Set when a failover reconnect inside execute() failed, leaving the client disconnected: the next
-    // execute() reconnects instead of throwing "not connected". Cleared by every successful connect.
-    private volatile boolean reconnectOnNextExecute;
     // Decoded SERVER_INFO from the current connection's handshake. Null before
     // connect() has succeeded; non-null on every established connection (the
     // server always emits the frame). Volatile so getServerInfo(), callable
@@ -844,7 +844,7 @@ public class QwpQueryClient implements QuietCloseable {
             spawnIoThread();
             hostTracker.recordSuccess(i);
             currentEndpointIndex = i;
-            reconnectOnNextExecute = false;
+            isReconnectOnNextExecute = false;
             connected = true;
             return;
         }
@@ -1704,7 +1704,7 @@ public class QwpQueryClient implements QuietCloseable {
             throw new IllegalStateException("QwpQueryClient is closed");
         }
         if (!connected) {
-            if (!reconnectOnNextExecute) {
+            if (!isReconnectOnNextExecute) {
                 throw new IllegalStateException("QwpQueryClient not connected; call connect() first");
             }
             // A previous failover reconnect failed. Reconnect on this operation rather than leave the client
@@ -1781,7 +1781,7 @@ public class QwpQueryClient implements QuietCloseable {
             healthTracker.connectionLost();
             // Every exit from here on - an exhausted deadline, an interrupted backoff, a failed reconnect - leaves
             // the client disconnected; the next execute() reconnects rather than throw "not connected".
-            reconnectOnNextExecute = true;
+            isReconnectOnNextExecute = true;
             if (failoverInitialBackoffMs > 0L) {
                 long base = failoverInitialBackoffMs << Math.min(attempt - 1, 30);
                 if (base < 0L) base = failoverMaxBackoffMs;
@@ -2122,7 +2122,7 @@ public class QwpQueryClient implements QuietCloseable {
             spawnIoThread();
             hostTracker.recordSuccess(i);
             currentEndpointIndex = i;
-            reconnectOnNextExecute = false;
+            isReconnectOnNextExecute = false;
             connected = true;
             return;
         }

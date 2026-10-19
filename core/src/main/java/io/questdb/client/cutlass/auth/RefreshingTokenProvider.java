@@ -143,17 +143,18 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
     // Signalled whenever a fetch completes and on close.
     private final Condition stateChanged = lock.newCondition();
     // ---- guarded by lock ----
-    private boolean backoffActive;
     private long backoffUntilNanos;
-    private volatile boolean closed;
     private long completedFetches;
     private volatile int consecutiveFailures;
-    private boolean failureLogged;
-    private volatile boolean fetchRunning;
-    private boolean forcedRefreshed;
     // The current token, or null. Immutable snapshot, published with a volatile write so the warm path in
     // getToken() needs no lock.
     private volatile Held held;
+    private boolean isBackoffActive;
+    private volatile boolean isClosed;
+    private boolean isFailureLogged;
+    private volatile boolean isFetchRunning;
+    private boolean isForcedRefreshed;
+    private boolean isShortWindowWarned;
     private volatile FetchFailure lastFailure;
     private long lastFailureLogNanos;
     private long lastForcedNanos;
@@ -161,7 +162,6 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
     private long scheduledDueNanos;
     private long scheduledSeq;
     private ScheduledTask scheduledTask;
-    private boolean shortWindowWarned;
 
     private RefreshingTokenProvider(Builder b) {
         this.source = b.source;
@@ -258,7 +258,7 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
                 requestFetchNowLocked(start);
             }
             while (true) {
-                if (closed) {
+                if (isClosed) {
                     return false;
                 }
                 if (usable(held, clock.wallClockMillis())) {
@@ -289,10 +289,10 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
     public void close() {
         lock.lock();
         try {
-            if (closed) {
+            if (isClosed) {
                 return;
             }
-            closed = true;
+            isClosed = true;
             cancelScheduledLocked();
             held = null;
             stateChanged.signalAll();
@@ -344,7 +344,7 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
      */
     @Override
     public CharSequence getToken() {
-        if (closed) {
+        if (isClosed) {
             throw closedException();
         }
         final Held h = held;
@@ -354,7 +354,7 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
                 // Warm path: a volatile read, no I/O and no lock. Only when the refresh is overdue - its
                 // scheduled fetch has not run, say after the host slept through it - does a caller take the
                 // lock, to start that fetch in the background.
-                if (!fetchRunning && consecutiveFailures == 0
+                if (!isFetchRunning && consecutiveFailures == 0
                         && (wallNow >= h.refreshAtEpochMillis || clock.monotonicNanos() - h.refreshAtNanos >= 0)) {
                     startOverdueRefresh(h);
                 }
@@ -376,7 +376,7 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
      * @return true once {@link #close()} has been called
      */
     public boolean isClosed() {
-        return closed;
+        return isClosed;
     }
 
     /**
@@ -393,7 +393,7 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
         }
         lock.lock();
         try {
-            if (closed) {
+            if (isClosed) {
                 return;
             }
             final Held h = held;
@@ -401,16 +401,16 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
                 return; // stale: the token has already rotated, so the caller's next pull gets the new one
             }
             final long now = clock.monotonicNanos();
-            if (forcedRefreshed && now - lastForcedNanos < forcedMinIntervalNanos) {
+            if (isForcedRefreshed && now - lastForcedNanos < forcedMinIntervalNanos) {
                 return;
             }
-            forcedRefreshed = true;
+            isForcedRefreshed = true;
             lastForcedNanos = now;
             LOG.info("token provider {}: the server rejected the current token with 401, refreshing early", name);
             final long target = completedFetches + 1;
             requestFetchNowLocked(now);
             final long deadline = now + forcedWaitNanos;
-            while (!closed && completedFetches < target) {
+            while (!isClosed && completedFetches < target) {
                 final long remaining = deadline - clock.monotonicNanos();
                 if (remaining <= 0) {
                     break;
@@ -444,7 +444,7 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
         if (f != null) {
             sb.append(", lastFailure=").append(f);
         }
-        if (closed) {
+        if (isClosed) {
             sb.append(", closed");
         }
         return sb.append('}').toString();
@@ -463,7 +463,7 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
                 requestFetchNowLocked(start);
             }
             while (true) {
-                if (closed) {
+                if (isClosed) {
                     throw closedException();
                 }
                 final Held h = held;
@@ -473,7 +473,7 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
                 final long now = clock.monotonicNanos();
                 // The earliest permitted fetch lies beyond the caller's deadline: nothing can arrive in time,
                 // so say so now rather than parking the caller for nothing.
-                if (!fetchRunning && inBackoffLocked(now) && backoffUntilNanos - deadline > 0) {
+                if (!isFetchRunning && inBackoffLocked(now) && backoffUntilNanos - deadline > 0) {
                     throw unavailableLocked(now, start);
                 }
                 final long remaining = deadline - now;
@@ -562,7 +562,7 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
     }
 
     private boolean inBackoffLocked(long now) {
-        return backoffActive && now - backoffUntilNanos < 0;
+        return isBackoffActive && now - backoffUntilNanos < 0;
     }
 
     private String onFailureLocked(FetchFailure failure, long receivedNanos) {
@@ -571,13 +571,13 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
         lastFailure = failure;
         final long delayMillis = backoffMillis(failures, failure.retryAfterMillis);
         final long delayNanos = millisToNanos(delayMillis);
-        backoffActive = true;
+        isBackoffActive = true;
         backoffUntilNanos = receivedNanos + delayNanos;
         scheduleFetchLocked(delayNanos, receivedNanos);
-        if (failureLogged && receivedNanos - lastFailureLogNanos < FAILURE_LOG_INTERVAL_NANOS) {
+        if (isFailureLogged && receivedNanos - lastFailureLogNanos < FAILURE_LOG_INTERVAL_NANOS) {
             return null;
         }
-        failureLogged = true;
+        isFailureLogged = true;
         lastFailureLogNanos = receivedNanos;
         return "token provider " + name + ": fetch failed [retryable=" + failure.retryable
                 + ", consecutiveFailures=" + failures + ", retryInMillis=" + delayMillis + "]: " + failure.message;
@@ -598,7 +598,7 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
         held = new Held(result.getToken(), result.getExpiresAtEpochMillis(), refreshAt, receivedNanos + delayNanos);
         lastSuccessEpochMillis = receivedAt;
         consecutiveFailures = 0;
-        backoffActive = false;
+        isBackoffActive = false;
         scheduleFetchLocked(delayNanos, receivedNanos);
         if (failures > 0) {
             LOG.info("token provider {}: fetch succeeded after {} consecutive failure(s) [token={}, expiresAt={}]",
@@ -610,10 +610,10 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
                     instant(result.getExpiresAtEpochMillis()), instant(refreshAt));
         }
         final long handoutEnd = result.getExpiresAtEpochMillis() - handoutFloorMillis;
-        if (!shortWindowWarned && refreshAt > handoutEnd) {
+        if (!isShortWindowWarned && refreshAt > handoutEnd) {
             // The token stops being handed out before the next refresh may run, so callers will wait for a fetch.
             // Say why, once: the cure is configuration.
-            shortWindowWarned = true;
+            isShortWindowWarned = true;
             LOG.warn("token provider {}: a token from the source is handed out for only {} ms - it expires {} ms "
                             + "after it arrives and handout_floor is {} ms - but the next refresh cannot run sooner "
                             + "than {} ms after a fetch, so callers wait for a fetch whenever a token stops being "
@@ -625,7 +625,7 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
 
     // Starts a fetch now unless one is running, one is already due, or the provider is in failure backoff.
     private void requestFetchNowLocked(long now) {
-        if (closed || fetchRunning || inBackoffLocked(now)) {
+        if (isClosed || isFetchRunning || inBackoffLocked(now)) {
             return;
         }
         if (scheduledTask != null && now - scheduledDueNanos >= 0) {
@@ -637,11 +637,11 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
     private void runFetch(long seq) {
         lock.lock();
         try {
-            if (closed || seq != scheduledSeq || fetchRunning) {
+            if (isClosed || seq != scheduledSeq || isFetchRunning) {
                 return; // cancelled, superseded, or a fetch is already in flight
             }
             scheduledTask = null;
-            fetchRunning = true;
+            isFetchRunning = true;
         } finally {
             lock.unlock();
         }
@@ -663,9 +663,9 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
         String warning = null;
         lock.lock();
         try {
-            fetchRunning = false;
+            isFetchRunning = false;
             completedFetches++;
-            if (!closed) {
+            if (!isClosed) {
                 if (failure == null) {
                     onSuccessLocked(result, receivedAt, receivedNanos);
                 } else {
@@ -682,7 +682,7 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
     }
 
     private void scheduleFetchLocked(long delayNanos, long now) {
-        if (closed) {
+        if (isClosed) {
             return;
         }
         cancelScheduledLocked();
@@ -714,7 +714,7 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
             return new TokenUnavailableException("no usable token from " + name + " after waiting "
                     + waitedMillis + " ms", true);
         }
-        final long retryAfter = backoffActive && backoffUntilNanos - now > 0
+        final long retryAfter = isBackoffActive && backoffUntilNanos - now > 0
                 ? TimeUnit.NANOSECONDS.toMillis(backoffUntilNanos - now)
                 : TokenUnavailableException.NO_RETRY_AFTER;
         return new TokenUnavailableException("no usable token from " + name + " after waiting " + waitedMillis

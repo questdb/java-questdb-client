@@ -109,10 +109,10 @@ public final class AzureTokenSource implements TokenSource {
             "AADSTS7000112", // application disabled
             "AADSTS50049", // unknown or invalid instance
     };
-    // whether the credential is a chain, such as DefaultAzureCredential: only the wording of errors depends on it
-    private final boolean chain;
     private final TokenRequestContext context;
     private final TokenCredential credential;
+    // whether the credential is a chain, such as DefaultAzureCredential: only the wording of errors depends on it
+    private final boolean isChain;
     private final String scope;
     private final Duration timeout;
 
@@ -142,7 +142,7 @@ public final class AzureTokenSource implements TokenSource {
             throw new IllegalArgumentException("timeout must be positive");
         }
         this.credential = credential;
-        this.chain = credential instanceof ChainedTokenCredential;
+        this.isChain = credential instanceof ChainedTokenCredential;
         this.scope = resource.endsWith(DEFAULT_SCOPE_SUFFIX) ? resource : resource + DEFAULT_SCOPE_SUFFIX;
         this.context = new TokenRequestContext().addScopes(scope);
         this.timeout = timeout;
@@ -151,7 +151,7 @@ public final class AzureTokenSource implements TokenSource {
     /**
      * Classifies a failure from Azure Identity per section 7.5. Never attaches the library exception.
      */
-    static TokenUnavailableException classify(Throwable failure, String scope, boolean chain) {
+    static TokenUnavailableException classify(Throwable failure, String scope, boolean isChain) {
         final String description = describe(failure);
         boolean hasCertificateParseFailure = false;
         long retryAfterMillis = TokenUnavailableException.NO_RETRY_AFTER;
@@ -162,7 +162,7 @@ public final class AzureTokenSource implements TokenSource {
             }
             if (t instanceof CredentialUnavailableException) {
                 return TokenUnavailableException.permanent("no credential available "
-                        + (chain ? "in the Azure Identity chain " : "") + "for " + scope + ": " + description);
+                        + (isChain ? "in the Azure Identity chain " : "") + "for " + scope + ": " + description);
             }
             if (t instanceof HttpResponseException) {
                 final HttpResponse response = ((HttpResponseException) t).getResponse();
@@ -297,7 +297,7 @@ public final class AzureTokenSource implements TokenSource {
         try {
             token = credential.getToken(context).block(timeout);
         } catch (RuntimeException e) {
-            throw classify(e, scope, chain);
+            throw classify(e, scope, isChain);
         }
         if (token == null) {
             throw TokenUnavailableException.retryable("Azure Identity returned no token for " + scope);
