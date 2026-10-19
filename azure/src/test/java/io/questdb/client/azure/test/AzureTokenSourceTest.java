@@ -52,6 +52,7 @@ import org.junit.Test;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.net.ConnectException;
@@ -86,6 +87,17 @@ public class AzureTokenSourceTest {
                 "AADSTS700016");
         assertPermanent(new RuntimeException("wrapper", new IllegalStateException(
                 "AADSTS7000215: Invalid client secret provided.")), "AADSTS7000215");
+    }
+
+    @Test
+    public void testCertificateParseFailuresArePermanentWithoutExposingLibraryText() {
+        RuntimeException failure = new RuntimeException(
+                "Failed to parse the certificate for the credential: CERTIFICATE-SENTINEL", new EOFException());
+        TokenUnavailableException e = fetchFailure(new RuntimeException("wrapper", failure));
+        Assert.assertFalse(e.getMessage(), e.isRetryable());
+        Assert.assertEquals("credential certificate could not be parsed for api://qdb/.default", e.getMessage());
+        Assert.assertEquals(TokenUnavailableException.NO_RETRY_AFTER, e.getRetryAfterMillis());
+        Assert.assertNull("do not retain the SDK exception or certificate details", e.getCause());
     }
 
     @Test
@@ -221,6 +233,9 @@ public class AzureTokenSourceTest {
         assertRetryable(new HttpResponseException("unavailable", new FakeResponse(503, null)), "HTTP 503", -1);
         assertRetryable(new HttpResponseException("gone", new FakeResponse(410, "Wed, 21 Oct 2015 07:28:00 GMT")), "HTTP 410", -1);
         assertRetryable(new IllegalStateException("connection reset"), "IllegalStateException", -1);
+        assertRetryable(new RuntimeException("unexpected end of stream", new EOFException()), "RuntimeException", -1);
+        assertRetryable(new RuntimeException("response body: Failed to parse the certificate for the credential: text"),
+                "RuntimeException", -1);
         assertRetryable(new MsalServiceException("temporarily unavailable", "temporarily_unavailable"),
                 "MsalServiceException", -1);
         assertRetryable(new ClientAuthenticationException("ManagedIdentityCredential: IMDS endpoint timed out", null,

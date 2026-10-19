@@ -101,6 +101,13 @@
 
         <!-- test dependencies -->
         <dependency>
+            <groupId>org.questdb</groupId>
+            <artifactId>questdb-client</artifactId>
+            <version>${project.version}</version>
+            <type>test-jar</type>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
             <groupId>junit</groupId>
             <artifactId>junit</artifactId>
             <version>4.13.2</version>

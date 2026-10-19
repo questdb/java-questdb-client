@@ -65,8 +65,9 @@ import java.util.concurrent.TimeUnit;
  * 7.5 prescribes, the same way whichever credential is used:
  * <ul>
  *   <li>permanent - no credential available ({@link CredentialUnavailableException}): a credential chain that
- *   found nothing, or a credential whose configuration or credential file is missing; a managed identity that is
- *   not assigned to this host, which a managed-identity credential used alone reports only in a nested cause; and
+ *   found nothing, or a credential whose configuration or credential file is missing or whose certificate cannot
+ *   be parsed; a managed identity that is not assigned to this host, which a managed-identity credential used alone
+ *   reports only in a nested cause; and
  *   authentication failures Entra reports: an HTTP 400 or 401 from the token endpoint, or a known AADSTS
  *   configuration error such as an invalid client or an application that does not exist;</li>
  *   <li>retryable - network errors, timeouts, throttling, 5xx responses, and anything else. A
@@ -83,6 +84,9 @@ public final class AzureTokenSource implements TokenSource {
      * The bound on one token request.
      */
     public static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(30);
+    // Azure Identity wraps certificate-loading I/O/security failures in a plain RuntimeException with this prefix.
+    // Recognize that failure without treating unrelated I/O errors as permanent or exposing the SDK message.
+    private static final String CERTIFICATE_PARSE_FAILURE = "Failed to parse the certificate for the credential:";
     private static final String DEFAULT_SCOPE_SUFFIX = "/.default";
     // A managed identity that is not assigned to this host, or does not exist: IMDS answers 400 "Identity not
     // found". Inside a chain that arrives as a CredentialUnavailableException, but a ManagedIdentityCredential used
@@ -149,6 +153,7 @@ public final class AzureTokenSource implements TokenSource {
      */
     static TokenUnavailableException classify(Throwable failure, String scope, boolean chain) {
         final String description = describe(failure);
+        boolean hasCertificateParseFailure = false;
         long retryAfterMillis = TokenUnavailableException.NO_RETRY_AFTER;
         Throwable t = failure;
         for (int depth = 0; t != null && depth < MAX_CAUSE_DEPTH; depth++, t = t.getCause()) {
@@ -174,6 +179,9 @@ public final class AzureTokenSource implements TokenSource {
             }
             final String message = t.getMessage();
             if (message != null) {
+                if (t.getClass() == RuntimeException.class && message.startsWith(CERTIFICATE_PARSE_FAILURE)) {
+                    hasCertificateParseFailure = true;
+                }
                 for (String code : PERMANENT_AADSTS) {
                     if (message.contains(code)) {
                         return TokenUnavailableException.permanent(
@@ -198,6 +206,10 @@ public final class AzureTokenSource implements TokenSource {
                     retryAfterMillis = retryAfterMillis(msal.headers());
                 }
             }
+        }
+        if (hasCertificateParseFailure) {
+            // Keep more specific nested reasons, such as NoSuchFileException, ahead of the parsing fallback.
+            return TokenUnavailableException.permanent("credential certificate could not be parsed for " + scope);
         }
         return TokenUnavailableException.retryable("the token request for " + scope + " failed: "
                 + withNetworkCause(failure, description), retryAfterMillis);
