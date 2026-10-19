@@ -43,6 +43,16 @@ public final class BearerChallenge {
     }
 
     /**
+     * Whether a {@code 401} carrying {@code wwwAuthenticate} warrants refreshing the token: true when the header
+     * has no {@code Bearer} challenge with an {@code error} parameter (the status code alone decides), or when
+     * that error is {@code invalid_token}.
+     */
+    public static boolean allowsTokenRefresh(CharSequence wwwAuthenticate) {
+        final String error = bearerError(wwwAuthenticate);
+        return error == null || INVALID_TOKEN.equals(error);
+    }
+
+    /**
      * @param wwwAuthenticate the value of one or more {@code WWW-Authenticate} headers (joined with commas), or
      *                        null
      * @return the {@code error} parameter of the first {@code Bearer} challenge that carries one, or null when
@@ -107,16 +117,6 @@ public final class BearerChallenge {
             }
         }
         return null;
-    }
-
-    /**
-     * Whether a {@code 401} carrying {@code wwwAuthenticate} warrants refreshing the token: true when the header
-     * has no {@code Bearer} challenge with an {@code error} parameter (the status code alone decides), or when
-     * that error is {@code invalid_token}.
-     */
-    public static boolean allowsTokenRefresh(CharSequence wwwAuthenticate) {
-        final String error = bearerError(wwwAuthenticate);
-        return error == null || INVALID_TOKEN.equals(error);
     }
 
     private static boolean isTokenChar(char c) {
