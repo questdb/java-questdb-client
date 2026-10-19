@@ -86,17 +86,17 @@ public final class ExpiringToken {
         if (token == null || token.length() == 0) {
             return "token is null or empty";
         }
-        boolean blank = true;
+        boolean isBlank = true;
         for (int i = 0, n = token.length(); i < n; i++) {
             char c = token.charAt(i);
             if (c < 0x20 || c > 0x7e) {
                 return "token contains a control or non-ASCII character";
             }
             if (c != ' ') {
-                blank = false;
+                isBlank = false;
             }
         }
-        return blank ? "token is blank" : null;
+        return isBlank ? "token is blank" : null;
     }
 
     private static String instant(long epochMillis) {

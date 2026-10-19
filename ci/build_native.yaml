@@ -70,19 +70,30 @@ steps:
 
   - powershell: |
       $ErrorActionPreference = "Stop"
-      # The CMake build is GCC/MinGW based (gcc flags, -static-libgcc/-static-libstdc++),
-      # so build the Windows DLL with the MinGW-w64 toolchain + NASM, not MSVC.
-      choco install -y --no-progress nasm mingw
-      Import-Module "$env:ChocolateyInstall\helpers\chocolateyProfile.psm1"
-      refreshenv
-      # choco's nasm package does not put nasm on PATH; add it explicitly.
-      $env:PATH = "C:\Program Files\NASM;" + $env:PATH
-      gcc --version
-      mingw32-make --version
-      nasm --version
+      # windows-2022 already supplies MinGW-w64. Avoid Chocolatey's package feed: a 503 there
+      # used to leave NASM missing even though GCC and mingw32-make were ready to use.
+      $nasmVersion = "2.16.03"
+      $nasmZip = Join-Path $env:AGENT_TEMPDIRECTORY "nasm-$nasmVersion-win64.zip"
+      $nasmDir = Join-Path $env:AGENT_TEMPDIRECTORY "nasm-$nasmVersion"
+      $nasmUrl = "https://www.nasm.us/pub/nasm/releasebuilds/$nasmVersion/win64/nasm-$nasmVersion-win64.zip"
+      curl.exe --fail --location --retry 3 --retry-delay 5 --connect-timeout 30 --max-time 120 --output $nasmZip $nasmUrl
+      if ($LASTEXITCODE -ne 0) { throw "NASM download failed with exit code $LASTEXITCODE" }
+      $nasmHash = (Get-FileHash -Path $nasmZip -Algorithm SHA256).Hash
+      if ($nasmHash -ne "3ee4782247bcb874378d02f7eab4e294a84d3d15f3f6ee2de2f47a46aa7226e6") {
+        throw "NASM archive SHA-256 mismatch: $nasmHash"
+      }
+      Expand-Archive -Path $nasmZip -DestinationPath $env:AGENT_TEMPDIRECTORY -Force
+      $env:PATH = "$nasmDir;" + $env:PATH
+      # PowerShell 5.1 does not turn native exit codes into terminating errors.
+      foreach ($tool in @("gcc.exe", "g++.exe", "mingw32-make.exe", "nasm.exe")) {
+        & $tool --version
+        if ($LASTEXITCODE -ne 0) { throw "$tool failed with exit code $LASTEXITCODE" }
+      }
       cd core
       cmake -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release -B cmake-build-release -S .
+      if ($LASTEXITCODE -ne 0) { throw "CMake configuration failed with exit code $LASTEXITCODE" }
       cmake --build cmake-build-release --config Release
+      if ($LASTEXITCODE -ne 0) { throw "Native build failed with exit code $LASTEXITCODE" }
       $lib = "target/classes/io/questdb/client/bin-local/libquestdb.dll"
       if (!(Test-Path $lib)) { throw "native build produced no $lib" }
       New-Item -ItemType Directory -Force -Path "src/main/resources/io/questdb/client/bin/windows-x86-64" | Out-Null

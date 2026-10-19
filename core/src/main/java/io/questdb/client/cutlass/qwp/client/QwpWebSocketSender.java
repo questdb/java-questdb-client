@@ -4214,7 +4214,7 @@ public class QwpWebSocketSender implements Sender {
         // is pulled again and, if it changed, the SAME endpoint is retried at once. The retried attempt is not an
         // endpoint failure: it records no health penalty, fires no event, and does not consume the round's pick.
         // A static credential never gets it - re-presenting the same bytes cannot change the answer.
-        boolean authRetryAvailable = hasDynamicCredential();
+        boolean isAuthRetryAvailable = hasDynamicCredential();
         int retryIdx = -1;
         while (true) {
             if (ctx.isAborted()) {
@@ -4299,8 +4299,8 @@ public class QwpWebSocketSender implements Sender {
                 }
                 if (classified instanceof QwpAuthFailedException) {
                     QwpAuthFailedException rejection = (QwpAuthFailedException) classified;
-                    if (authRetryAvailable && rejection.isTokenRefreshable()) {
-                        authRetryAvailable = false;
+                    if (isAuthRetryAvailable && rejection.isTokenRefreshable()) {
+                        isAuthRetryAvailable = false;
                         String refreshed = refreshCredentialAfterRejection(
                                 authHeader, rejection, ctx, cancellation);
                         if (refreshed != null && !refreshed.equals(authHeader)) {

@@ -63,7 +63,7 @@ public final class BearerChallenge {
             return null;
         }
         final int n = wwwAuthenticate.length();
-        boolean inBearer = false;
+        boolean isInBearer = false;
         int i = 0;
         while (i < n) {
             char c = wwwAuthenticate.charAt(i);
@@ -106,13 +106,13 @@ public final class BearerChallenge {
                     }
                     value = wwwAuthenticate.subSequence(valueStart, j).toString();
                 }
-                if (inBearer && "error".equalsIgnoreCase(token)) {
+                if (isInBearer && "error".equalsIgnoreCase(token)) {
                     return value;
                 }
                 i = j;
             } else {
                 // a new challenge's auth-scheme (or a token68, which carries no parameters)
-                inBearer = "Bearer".equalsIgnoreCase(token);
+                isInBearer = "Bearer".equalsIgnoreCase(token);
                 i = j;
             }
         }

@@ -976,13 +976,13 @@ public final class RefreshingTokenProvider implements HttpTokenProvider, QuietCl
             }
             // Interrupt-neutral, like the other close paths in this library: a carried interrupt flag would
             // turn the bounded wait into an immediate return.
-            final boolean interrupted = Thread.interrupted();
+            final boolean isInterrupted = Thread.interrupted();
             try {
                 executor.awaitTermination(CLOSE_AWAIT_MILLIS, TimeUnit.MILLISECONDS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             } finally {
-                if (interrupted) {
+                if (isInterrupted) {
                     Thread.currentThread().interrupt();
                 }
             }

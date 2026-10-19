@@ -1599,7 +1599,7 @@ public class QwpQueryClient implements QuietCloseable {
         String authHeader = resolveAuthorizationHeader();
         // One same-endpoint retry after a refreshable 401 per connect, for a token provider only
         // (design/qwp-token-provider-spec.md, section 8.2). The retried attempt records no health penalty.
-        boolean authRetryAvailable = tokenProvider != null;
+        boolean isAuthRetryAvailable = tokenProvider != null;
         int retryIdx = -1;
         while (true) {
             int i;
@@ -1617,8 +1617,8 @@ public class QwpQueryClient implements QuietCloseable {
                 connectToEndpoint(ep, authHeader);
             } catch (QwpAuthFailedException ae) {
                 cleanupFailedConnect();
-                if (authRetryAvailable && ae.isTokenRefreshable()) {
-                    authRetryAvailable = false;
+                if (isAuthRetryAvailable && ae.isTokenRefreshable()) {
+                    isAuthRetryAvailable = false;
                     String refreshed = refreshAfterRejection(authHeader, ae);
                     if (refreshed != null && !refreshed.equals(authHeader)) {
                         LOG.info("QwpQueryClient {}:{} rejected the token with {}; retrying once with a refreshed token",
@@ -1918,13 +1918,16 @@ public class QwpQueryClient implements QuietCloseable {
         try {
             io.submitQuery(sql, requestId, initialCreditBytes, bindValues.count(), bindValues.bufferPtr(), bindValues.bufferLen(),
                     resolveQueryFlags(resetSymbolDict));
+            boolean isBatchSkipped = false;
             while (true) {
                 QueryEvent ev = io.takeEvent();
                 try {
                     switch (ev.kind) {
                         case QueryEvent.KIND_BATCH:
                             try {
-                                if (!isShutdownRequested) {
+                                if (isShutdownRequested) {
+                                    isBatchSkipped = true;
+                                } else {
                                     probe.onBatch(ev.buffer.batch);
                                 }
                             } finally {
@@ -1934,7 +1937,13 @@ public class QwpQueryClient implements QuietCloseable {
                             }
                             break;
                         case QueryEvent.KIND_END:
-                            probe.onEnd(requestId, ev.totalRows);
+                            // The I/O thread can reach END before requestShutdown() stops it. Never report
+                            // success after shutdown made us release a batch without delivering its rows.
+                            if (isBatchSkipped) {
+                                probe.deliverFinal(requestId, "query client shut down");
+                            } else {
+                                probe.onEnd(requestId, ev.totalRows);
+                            }
                             return;
                         case QueryEvent.KIND_EXEC_DONE:
                             probe.onExecDone(requestId, ev.opType, ev.rowsAffected);
@@ -2059,7 +2068,7 @@ public class QwpQueryClient implements QuietCloseable {
         // reason as connect(): a provider failure is cluster-wide, so surface it directly rather than
         // as a per-endpoint transport error retried across every host.
         String authHeader = resolveAuthorizationHeader();
-        boolean authRetryAvailable = tokenProvider != null;
+        boolean isAuthRetryAvailable = tokenProvider != null;
         int retryIdx = -1;
         while (true) {
             int i;
@@ -2082,8 +2091,8 @@ public class QwpQueryClient implements QuietCloseable {
                 connectToEndpoint(ep, authHeader);
             } catch (QwpAuthFailedException ae) {
                 cleanupFailedConnect();
-                if (authRetryAvailable && ae.isTokenRefreshable()) {
-                    authRetryAvailable = false;
+                if (isAuthRetryAvailable && ae.isTokenRefreshable()) {
+                    isAuthRetryAvailable = false;
                     String refreshed = refreshAfterRejection(authHeader, ae);
                     if (refreshed != null && !refreshed.equals(authHeader)) {
                         LOG.info("QwpQueryClient {}:{} rejected the token with {} on failover; retrying once with "

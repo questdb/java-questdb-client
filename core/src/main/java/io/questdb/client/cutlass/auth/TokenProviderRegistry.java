@@ -160,14 +160,14 @@ public final class TokenProviderRegistry {
                         CredentialRedaction.sanitizeErrorText(String.valueOf(e.getMessage())));
                 continue;
             }
-            boolean duplicate = false;
+            boolean isDuplicate = false;
             for (int i = 0, n = into.size(); i < n; i++) {
                 if (into.get(i).getClass() == factory.getClass()) {
-                    duplicate = true;
+                    isDuplicate = true;
                     break;
                 }
             }
-            if (!duplicate) {
+            if (!isDuplicate) {
                 into.add(factory);
             }
         }
