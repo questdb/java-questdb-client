@@ -29,11 +29,15 @@ import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.QuestDB;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.auth.TokenUnavailableException;
+import io.questdb.client.cutlass.http.client.HttpClientException;
 import io.questdb.client.cutlass.http.client.WebSocketClientFactory;
+import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
+import io.questdb.client.cutlass.qwp.client.QwpConnectionHealthTracker;
 import io.questdb.client.cutlass.qwp.client.QwpEgressMsgKind;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
+import io.questdb.client.cutlass.qwp.client.QwpVersionMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
@@ -183,6 +187,27 @@ public class ConnectionHealthTest {
         });
     }
 
+    @Test
+    public void testHealthClassifiesTransportAndWrappedUpgradeFailures() {
+        HttpClientException transport = new HttpClientException("connection refused");
+        ConnectionHealth.Failure failure = QwpConnectionHealthTracker.classify(transport, 42L);
+        Assert.assertEquals(ConnectionHealth.FailureClass.TRANSPORT, failure.getFailureClass());
+        Assert.assertEquals(0, failure.getStatusCode());
+
+        HttpClientException upgrade = new HttpClientException("all endpoints failed");
+        upgrade.initCause(new WebSocketUpgradeException(503, null, "service unavailable"));
+        failure = QwpConnectionHealthTracker.classify(upgrade, 42L);
+        Assert.assertEquals(ConnectionHealth.FailureClass.OTHER, failure.getFailureClass());
+        Assert.assertEquals(503, failure.getStatusCode());
+        Assert.assertEquals("service unavailable", failure.getMessage());
+
+        HttpClientException protocol = new HttpClientException("all endpoints failed");
+        protocol.initCause(new QwpVersionMismatchException(99, 1));
+        failure = QwpConnectionHealthTracker.classify(protocol, 42L);
+        Assert.assertEquals(ConnectionHealth.FailureClass.OTHER, failure.getFailureClass());
+        Assert.assertEquals(0, failure.getStatusCode());
+    }
+
     @Test(timeout = 60_000)
     public void testQueryClientHealthFollowsConnectFailoverAndRecovery() throws Exception {
         // C21 for egress: connecting, connected, reconnecting after a failed failover - with the class of the
@@ -248,6 +273,71 @@ public class ConnectionHealthTest {
     }
 
     @Test(timeout = 60_000)
+    public void testQueryClientHealthPreservesUpgradeStatusOnConnect() throws Exception {
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = startServer(new ExecDoneHandler())) {
+                server.setSendServerInfo(true);
+                for (int status : new int[]{400, 404, 426, 500, 503}) {
+                    server.setRejectWithStatus(status, "Rejected");
+                    try (QwpQueryClient client = QwpQueryClient.fromConfig("ws::addr=localhost:" + server.getPort() + ';')) {
+                        try {
+                            client.connect();
+                            Assert.fail("the upgrade must fail with HTTP " + status);
+                        } catch (HttpClientException expected) {
+                            Assert.assertTrue("the endpoint walk must preserve the typed rejection",
+                                    expected.getCause() instanceof WebSocketUpgradeException);
+                            Assert.assertEquals(status, ((WebSocketUpgradeException) expected.getCause()).getStatusCode());
+                        }
+                        ConnectionHealth health = client.health();
+                        Assert.assertEquals(ConnectionHealth.State.CONNECTING, health.getState());
+                        Assert.assertEquals(1, health.getFailedRounds());
+                        assertUpgradeFailure(health, status);
+                    }
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 60_000)
+    public void testQueryClientHealthPreservesUpgradeStatusOnFailoverAndRecovery() throws Exception {
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = startServer(new ExecDoneHandler())) {
+                server.setSendServerInfo(true);
+                for (int status : new int[]{500, 503}) {
+                    server.setRejectWithStatus(0, null);
+                    try (QwpQueryClient client = QwpQueryClient.fromConfig("ws::addr=localhost:" + server.getPort()
+                            + ";failover_backoff_initial_ms=0;")) {
+                        client.connect();
+                        server.setRejectWithStatus(status, "Rejected");
+                        server.dropAllConnections();
+                        RecordingHandler failed = new RecordingHandler();
+                        client.execute("SELECT 1", failed);
+                        Assert.assertNotNull("the failover must fail", failed.error);
+                        ConnectionHealth health = client.health();
+                        Assert.assertEquals(ConnectionHealth.State.RECONNECTING, health.getState());
+                        Assert.assertEquals(1, health.getFailedRounds());
+                        assertUpgradeFailure(health, status);
+
+                        // The next operation takes connectWalk(), not reconnectViaTracker(). Both must
+                        // preserve the status, and a successful recovery must keep the last failure.
+                        client.execute("SELECT 1", new NoopHandler());
+                        Assert.assertEquals(2, client.health().getFailedRounds());
+                        assertUpgradeFailure(client.health(), status);
+                        server.setRejectWithStatus(0, null);
+                        RecordingHandler recovered = new RecordingHandler();
+                        client.execute("SELECT 1", recovered);
+                        Assert.assertNull(recovered.error, recovered.error);
+                        Assert.assertEquals(1, recovered.execDone);
+                        Assert.assertEquals(ConnectionHealth.State.CONNECTED, client.health().getState());
+                        Assert.assertEquals(0, client.health().getFailedRounds());
+                        assertUpgradeFailure(client.health(), status);
+                    }
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 60_000)
     public void testQueryClientHealthReportsAConnectionLostOnTheLastAttempt() throws Exception {
         // C21 for egress: execute() gives up when a query loses its connection on the last attempt its failover
         // budget allows - here attempt 2 of 2, right after a successful failover reconnect. The health must not
@@ -279,6 +369,27 @@ public class ConnectionHealthTest {
                     Assert.assertEquals(h.toString(), ConnectionHealth.State.CONNECTED, h.getState());
                     Assert.assertEquals(ConnectionHealth.NONE, h.getOutageSinceEpochMillis());
                 }
+            }
+        });
+    }
+
+    @Test(timeout = 60_000)
+    public void testQueryClientHealthReportsTransportFailureOnConnect() throws Exception {
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = startServer(new ExecDoneHandler());
+                 QwpQueryClient client = QwpQueryClient.fromConfig("ws::addr=localhost:" + server.getPort() + ';')) {
+                server.close();
+                try {
+                    client.connect();
+                    Assert.fail("a closed endpoint must not accept a connection");
+                } catch (HttpClientException expected) {
+                    Assert.assertNotNull(expected.getCause());
+                }
+                ConnectionHealth health = client.health();
+                Assert.assertEquals(ConnectionHealth.State.CONNECTING, health.getState());
+                Assert.assertEquals(1, health.getFailedRounds());
+                Assert.assertEquals(ConnectionHealth.FailureClass.TRANSPORT, health.getLastFailure().getFailureClass());
+                Assert.assertEquals(0, health.getLastFailure().getStatusCode());
             }
         });
     }
@@ -540,6 +651,14 @@ public class ConnectionHealthTest {
                 Assert.assertEquals(ConnectionHealth.State.FAILED, client.health().getState());
             }
         }
+    }
+
+    private static void assertUpgradeFailure(ConnectionHealth health, int status) {
+        ConnectionHealth.Failure failure = health.getLastFailure();
+        Assert.assertNotNull(failure);
+        Assert.assertEquals(health.toString(), ConnectionHealth.FailureClass.OTHER, failure.getFailureClass());
+        Assert.assertEquals(status, failure.getStatusCode());
+        Assert.assertTrue(failure.getMessage(), failure.getMessage().contains(Integer.toString(status)));
     }
 
     private static TestWebSocketServer startServer(TestWebSocketServer.WebSocketServerHandler handler)

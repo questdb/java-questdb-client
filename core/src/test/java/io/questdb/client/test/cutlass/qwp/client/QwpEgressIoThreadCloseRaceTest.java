@@ -26,7 +26,9 @@ package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.cutlass.qwp.client.QwpBatchBuffer;
 import io.questdb.client.cutlass.qwp.client.QwpEgressIoThread;
+import io.questdb.client.cutlass.qwp.client.QueryEvent;
 import io.questdb.client.test.tools.TestUtils;
+import org.junit.Assert;
 import org.junit.Test;
 
 import java.lang.reflect.Method;
@@ -48,6 +50,25 @@ import java.util.concurrent.atomic.AtomicInteger;
  * leak delta at the end of the test.
  */
 public class QwpEgressIoThreadCloseRaceTest {
+
+    @Test(timeout = 5_000)
+    public void testIdleShutdownWakesARacingEventConsumer() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            QwpEgressIoThread io = new QwpEgressIoThread(null, 2, (status, message) -> { });
+            try {
+                io.shutdown();
+                io.run(); // The loop exits before consuming a request.
+                QueryEvent event = io.takeEvent();
+                Assert.assertEquals(QueryEvent.KIND_ERROR, event.kind);
+                Assert.assertTrue(event.errorMessage, event.errorMessage.contains("shut down"));
+                io.releaseEvent(event);
+            } finally {
+                Method closePool = QwpEgressIoThread.class.getDeclaredMethod("closePool");
+                closePool.setAccessible(true);
+                closePool.invoke(io);
+            }
+        });
+    }
 
     @Test
     public void testReleaseBufferRacesClosePoolSafely() throws Exception {

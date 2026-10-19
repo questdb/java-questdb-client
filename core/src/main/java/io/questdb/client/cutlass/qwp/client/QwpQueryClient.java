@@ -252,6 +252,8 @@ public class QwpQueryClient implements QuietCloseable {
     // -- crashing the JVM on the next decode cycle.
     private volatile QwpEgressIoThread ioThread;
     private volatile Thread ioThreadHandle;
+    // Sticky, non-freeing stop request: a pooled worker may still be inside a handler or reconnect walk.
+    private volatile boolean isShutdownRequested;
     private boolean lastCloseTimedOut;
     // Client preference for server-side per-batch row cap. 0 means "unset",
     // server uses its default. Set via {@code max_batch_rows=N} in the
@@ -575,8 +577,9 @@ public class QwpQueryClient implements QuietCloseable {
      * those pointers and SIGSEGV the JVM. The interrupt-driven I/O thread shutdown
      * does NOT detect or wait for a still-running user handler -- the timeout-based
      * leak fallback only protects against an unresponsive I/O thread, not an
-     * unresponsive user thread. {@link #cancel()} is the right way to ask an
-     * in-flight {@code execute()} to return; close after it does.
+     * unresponsive user thread. Use {@link #cancel()} to cancel the current query, or
+     * {@link #requestShutdown()} to stop execution and reconnects permanently; close
+     * after the in-flight {@code execute()} returns.
      */
     @Override
     public void close() {
@@ -709,7 +712,7 @@ public class QwpQueryClient implements QuietCloseable {
      * rather than being retried across endpoints as a transport failure.
      */
     public synchronized void connect() {
-        if (closedFlag.get()) {
+        if (closedFlag.get() || isShutdownRequested) {
             throw new IllegalStateException("QwpQueryClient is closed");
         }
         if (connected) {
@@ -731,6 +734,20 @@ public class QwpQueryClient implements QuietCloseable {
      */
     public ConnectionHealth health() {
         return healthTracker.snapshot();
+    }
+
+    /**
+     * Permanently stops query execution and reconnects without freeing any resources. Safe to call from
+     * another thread, including while a handler still reads batch column pointers. A connect already in
+     * progress may run until its timeout; any I/O thread it publishes also receives the stop request.
+     * Finish the in-flight {@code execute()} before calling {@link #close()} to release the resources.
+     */
+    public void requestShutdown() {
+        isShutdownRequested = true;
+        QwpEgressIoThread io = ioThread;
+        if (io != null) {
+            io.shutdown();
+        }
     }
 
     // One connect round: resolve the credential, walk the endpoints. See connect().
@@ -856,9 +873,11 @@ public class QwpQueryClient implements QuietCloseable {
             ex.initCause(lastUpgradeRoleReject);
             throw ex;
         }
-        throw new HttpClientException(
+        HttpClientException failure = new HttpClientException(
                 "all QWP endpoints unreachable [count=" + endpoints.size()
                         + ", lastError=" + (lastTransportError == null ? "<none>" : lastTransportError.getMessage()) + ']');
+        failure.initCause(lastTransportError);
+        throw failure;
     }
 
     /**
@@ -1643,6 +1662,9 @@ public class QwpQueryClient implements QuietCloseable {
     }
 
     private void connectToEndpoint(Endpoint ep, String authHeader) {
+        if (isShutdownRequested) {
+            throw new IllegalStateException("QwpQueryClient is closed");
+        }
         if (tlsEnabled) {
             webSocketClient = WebSocketClientFactory.newTlsInstance(
                     new ClientTlsConfiguration(trustStorePath, trustStorePassword, tlsValidationMode));
@@ -1678,7 +1700,7 @@ public class QwpQueryClient implements QuietCloseable {
     }
 
     private void executeImpl(CharSequence sql, QwpBindSetter binds, QwpColumnBatchHandler handler, boolean resetSymbolDict) {
-        if (closedFlag.get()) {
+        if (closedFlag.get() || isShutdownRequested) {
             throw new IllegalStateException("QwpQueryClient is closed");
         }
         if (!connected) {
@@ -1712,10 +1734,18 @@ public class QwpQueryClient implements QuietCloseable {
         }
         int attempt = 0;
         while (true) {
+            if (isShutdownRequested) {
+                handler.onError(-1L, WebSocketResponse.STATUS_INTERNAL_ERROR, "query client shut down");
+                return;
+            }
             attempt++;
             FailoverProbeHandler probe = new FailoverProbeHandler(handler);
             executeOnce(sql, binds, probe, resetSymbolDict);
             if (!probe.transportFailureIntercepted) {
+                return;
+            }
+            if (isShutdownRequested) {
+                handler.onError(probe.interceptedRequestId, probe.interceptedStatus, "query client shut down");
                 return;
             }
             if (!failoverEnabled) {
@@ -1825,6 +1855,10 @@ public class QwpQueryClient implements QuietCloseable {
                                 + reconnectErr.getMessage() + ']');
                 return;
             }
+            if (isShutdownRequested) {
+                handler.onError(probe.interceptedRequestId, probe.interceptedStatus, "query client shut down");
+                return;
+            }
             handler.onFailoverReset(probe.interceptedRequestId, serverInfo);
         }
     }
@@ -1868,6 +1902,10 @@ public class QwpQueryClient implements QuietCloseable {
                 return;
             }
         }
+        if (isShutdownRequested) {
+            probe.deliverFinal(-1L, "query client shut down");
+            return;
+        }
         long requestId = nextRequestId++;
         currentRequestId = requestId;
         // Honor a cancel that arrived during the dispatch window. The latch
@@ -1886,8 +1924,12 @@ public class QwpQueryClient implements QuietCloseable {
                     switch (ev.kind) {
                         case QueryEvent.KIND_BATCH:
                             try {
-                                probe.onBatch(ev.buffer.batch);
+                                if (!isShutdownRequested) {
+                                    probe.onBatch(ev.buffer.batch);
+                                }
                             } finally {
+                                // Even during shutdown, drain and release a queued batch: the I/O thread
+                                // cannot leave its receive buffer until this token arrives.
                                 io.releaseBuffer(ev.buffer);
                             }
                             break;
@@ -2089,9 +2131,11 @@ public class QwpQueryClient implements QuietCloseable {
                     "no endpoint matches target=" + target + " on failover; last observed role="
                             + QwpServerInfo.roleName(lastMismatch.getRole()));
         }
-        throw new HttpClientException(
+        HttpClientException failure = new HttpClientException(
                 "all QWP endpoints unreachable on failover [count=" + total
                         + ", lastError=" + (lastError == null ? "<none>" : lastError.getMessage()) + ']');
+        failure.initCause(lastError);
+        throw failure;
     }
 
     private String resolveAuthorizationHeader() {
@@ -2203,6 +2247,11 @@ public class QwpQueryClient implements QuietCloseable {
         handle.start();
         ioThreadHandle = handle;
         ioThread = newIoThread;
+        // Pair the post-publication check with requestShutdown()'s flag-before-read ordering. Even if
+        // shutdown saw the old (or null) ioThread during a reconnect, this generation must stop too.
+        if (isShutdownRequested) {
+            newIoThread.shutdown();
+        }
     }
 
     private static final class Endpoint {

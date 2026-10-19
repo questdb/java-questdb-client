@@ -232,7 +232,10 @@ public final class QueryWorker {
         try {
             // If a query is in flight on this worker, force execute() to return
             // promptly so the dispatch thread exits before the join below times
-            // out. Two nudges, strongest first:
+            // out. Stop without freeing anything first: a handler can consume an
+            // interrupt, and a reconnect walk can outlive it. The sticky request
+            // stops the I/O loop and prevents query replay on a new connection.
+            client.requestShutdown();
             //   1. Interrupt the dispatch thread. takeEvent() (QwpSpscQueue.take)
             //      is interrupt-aware, and executeOnce() turns the resulting
             //      InterruptedException into a terminal event -> signalDone. This

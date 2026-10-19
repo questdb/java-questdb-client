@@ -32,6 +32,7 @@ import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
 import io.questdb.client.cutlass.qwp.client.QwpEgressMsgKind;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
+import io.questdb.client.cutlass.qwp.client.QwpServerInfo;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.impl.QueryClientPool;
 import io.questdb.client.impl.QueryWorker;
@@ -129,6 +130,124 @@ public class QueryWorkerBusyShutdownTest {
         });
     }
 
+    @Test(timeout = 60_000)
+    public void testShutdownPreservesBatchUntilInterruptSwallowingHandlerReturns() throws Exception {
+        assertShutdownAfterConsumedInterrupt(true, false);
+    }
+
+    @Test(timeout = 60_000)
+    public void testShutdownStopsWorkerAfterBatchHandlerConsumesInterrupt() throws Exception {
+        assertShutdownAfterConsumedInterrupt(false, false);
+    }
+
+    @Test(timeout = 60_000)
+    public void testShutdownStopsWorkerAfterConsumedInterruptAndConnectionLoss() throws Exception {
+        assertShutdownAfterConsumedInterrupt(false, true);
+    }
+
+    private static void assertShutdownAfterConsumedInterrupt(boolean isHandlerHeld, boolean isConnectionDropped)
+            throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            AtomicInteger queries = new AtomicInteger();
+            TestWebSocketServer server = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
+                @Override
+                public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+                    if (data.length > 0 && data[0] == QwpEgressMsgKind.QUERY_REQUEST) {
+                        queries.incrementAndGet();
+                        try {
+                            client.sendBinary(buildBatch(data));
+                        } catch (IOException ignored) {
+                            // Surfaces as a transport error. No RESULT_END or response to CANCEL follows.
+                        }
+                    }
+                }
+            });
+            server.setSendServerInfo(true);
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            CountDownLatch inHandler = new CountDownLatch(1);
+            CountDownLatch releaseHandler = new CountDownLatch(1);
+            AtomicBoolean hasConsumedInterrupt = new AtomicBoolean();
+            AtomicBoolean hasReadBatchAfterShutdown = new AtomicBoolean();
+            AtomicInteger closes = new AtomicInteger();
+            AtomicInteger failovers = new AtomicInteger();
+            AtomicReference<String> error = new AtomicReference<>();
+            try (TestWebSocketServer ignored = server;
+                 QuestDB db = QuestDB.connect("ws::addr=localhost:" + server.getPort()
+                         + ";sender_pool_min=0;query_pool_min=1;query_pool_max=1;failover_backoff_initial_ms=0;")) {
+                QueryWorker worker = pooledWorker(db);
+                Thread dispatch = dispatchThread(db);
+                worker.client().setBeforeCloseHookForTest(closes::incrementAndGet);
+                try {
+                    Query q = db.borrowQuery();
+                    Completion completion = q.sql("SELECT v FROM t").handler(new Handler() {
+                        @Override
+                        public void onBatch(QwpColumnBatch batch) {
+                            Assert.assertEquals(42L, batch.getLongValue(0, 0));
+                            inHandler.countDown();
+                            try {
+                                if (releaseHandler.await(30, TimeUnit.SECONDS)) {
+                                    return;
+                                }
+                                throw new AssertionError("shutdown never interrupted the handler");
+                            } catch (InterruptedException consumed) {
+                                hasConsumedInterrupt.set(true); // Deliberately do not restore the flag.
+                            }
+                            if (isConnectionDropped) {
+                                server.dropAllConnections();
+                            }
+                            if (isHandlerHeld) {
+                                awaitUninterruptibly(releaseHandler);
+                            }
+                            // Shutdown must not free or compact the native bytes while the handler reads them.
+                            Assert.assertEquals(42L, batch.getLongValue(0, 0));
+                            hasReadBatchAfterShutdown.set(true);
+                        }
+
+                        @Override
+                        public void onError(byte status, String message) {
+                            error.set(message);
+                        }
+
+                        @Override
+                        public void onFailoverReset(long requestId, QwpServerInfo serverInfo) {
+                            failovers.incrementAndGet();
+                        }
+                    }).submit();
+                    Assert.assertTrue("the query never reached its handler", inHandler.await(10, TimeUnit.SECONDS));
+                    db.close();
+                    if (isHandlerHeld) {
+                        Assert.assertTrue("the handler must still own its batch", dispatch.isAlive());
+                        Assert.assertEquals("shutdown must not free a batch still in use", 0, closes.get());
+                        Assert.assertFalse(completion.isDone());
+                    }
+                    releaseHandler.countDown();
+                    dispatch.join(TimeUnit.SECONDS.toMillis(10));
+                    Assert.assertFalse("shutdown must wake a worker even after its handler consumes the interrupt",
+                            dispatch.isAlive());
+                    Assert.assertTrue(hasConsumedInterrupt.get());
+                    Assert.assertTrue(hasReadBatchAfterShutdown.get());
+                    Assert.assertEquals("the dispatch thread must close its client exactly once", 1, closes.get());
+                    Assert.assertTrue("shutdown must release completion waiters", completion.isDone());
+                    try {
+                        completion.await();
+                        Assert.fail("the cancelled query must fail");
+                    } catch (QueryException expected) {
+                        Assert.assertNotNull(error.get());
+                    }
+                    Assert.assertEquals("shutdown must not replay the query", 1, queries.get());
+                    Assert.assertEquals(0, failovers.get());
+                    Assert.assertEquals(1, server.upgradeRequestCount());
+                } finally {
+                    releaseHandler.countDown();
+                    db.close();
+                    server.close();
+                    dispatch.join(TimeUnit.SECONDS.toMillis(10));
+                }
+            }
+        });
+    }
+
     /**
      * The failure from the review: a pooled client whose failover reconnect failed reconnects on its next
      * execute(). The walk stalls on an endpoint that accepts TCP but never answers the upgrade, outlasting the
@@ -167,8 +286,14 @@ public class QueryWorkerBusyShutdownTest {
                     Assert.assertFalse(client.isConnected());
 
                     // the next execute() walks the endpoints and parks on the stalling one
+                    AtomicInteger executions = new AtomicInteger();
                     Query q = db.borrowQuery();
-                    q.sql(binds ? "SELECT $1" : "SELECT 1").handler(new Handler());
+                    q.sql(binds ? "SELECT $1" : "SELECT 1").handler(new Handler() {
+                        @Override
+                        public void onExecDone(short opType, long rowsAffected) {
+                            executions.incrementAndGet();
+                        }
+                    });
                     if (binds) {
                         q.binds(b -> b.setLong(0, 42L));
                     }
@@ -181,6 +306,8 @@ public class QueryWorkerBusyShutdownTest {
                     dispatchThread.join(TimeUnit.SECONDS.toMillis(30)); // the walk resumes, then the thread exits
                     Assert.assertFalse("the dispatch thread must exit", dispatchThread.isAlive());
                     Assert.assertFalse("a closed client must not stay connected", client.isConnected());
+                    Assert.assertTrue("shutdown must release the query completion", completion.isDone());
+                    Assert.assertEquals("a walk that finishes after shutdown must not execute the query", 0, executions.get());
                     long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
                     while (healthy.liveConnectionCount() > 0 && System.nanoTime() < deadline) {
                         Thread.sleep(10);
@@ -212,6 +339,18 @@ public class QueryWorkerBusyShutdownTest {
                 Thread.currentThread().interrupt();
             }
         }
+    }
+
+    private static byte[] buildBatch(byte[] queryRequest) {
+        int bodyLen = 25; // kind, request id, schema and one non-null LONG value
+        ByteBuffer frame = ByteBuffer.allocate(QwpConstants.HEADER_SIZE + bodyLen).order(ByteOrder.LITTLE_ENDIAN);
+        frame.putInt(QwpConstants.MAGIC_MESSAGE).put(QwpConstants.VERSION);
+        frame.put((byte) 0).put((byte) 0).put((byte) 1).putInt(bodyLen);
+        frame.put(QwpEgressMsgKind.RESULT_BATCH).put(queryRequest, 1, 8);
+        frame.put((byte) 0).put((byte) 0).put((byte) 1).put((byte) 1); // seq, table name, rows, columns
+        frame.put((byte) 1).put((byte) 'v').put(QwpConstants.TYPE_LONG).put((byte) 0);
+        frame.putLong(42L);
+        return frame.array();
     }
 
     private static byte[] buildExecDone(byte[] queryRequest) {
