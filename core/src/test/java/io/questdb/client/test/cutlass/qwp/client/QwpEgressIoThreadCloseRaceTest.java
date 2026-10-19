@@ -52,7 +52,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class QwpEgressIoThreadCloseRaceTest {
 
     @Test(timeout = 5_000)
-    public void testIdleShutdownWakesARacingEventConsumer() throws Exception {
+    public void testInitialShutdownWakesARacingEventConsumer() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             QwpEgressIoThread io = new QwpEgressIoThread(null, 2, (status, message) -> { });
             try {

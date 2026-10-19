@@ -30,9 +30,11 @@ import io.questdb.client.QueryException;
 import io.questdb.client.QuestDB;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
+import io.questdb.client.cutlass.qwp.client.QwpEgressIoThread;
 import io.questdb.client.cutlass.qwp.client.QwpEgressMsgKind;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 import io.questdb.client.cutlass.qwp.client.QwpServerInfo;
+import io.questdb.client.cutlass.qwp.client.QueryEvent;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.impl.QueryClientPool;
 import io.questdb.client.impl.QueryWorker;
@@ -52,6 +54,7 @@ import java.nio.ByteOrder;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -68,6 +71,58 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 public class QueryWorkerBusyShutdownTest {
     private static final String SENDER_CFG = "http::addr=127.0.0.1:1;protocol_version=2;auto_flush=off;";
+
+    @Test(timeout = 20_000)
+    public void testIdleShutdownWakesARacingEventConsumer() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = startServer(new AtomicBoolean());
+                 QwpQueryClient client = QwpQueryClient.fromConfig("ws::addr=localhost:" + server.getPort() + ";")) {
+                client.connect();
+                AtomicInteger completed = new AtomicInteger();
+                client.execute("SELECT 1", new Handler() {
+                    @Override
+                    public void onError(byte status, String message) {
+                        Assert.fail(message);
+                    }
+
+                    @Override
+                    public void onExecDone(short opType, long rowsAffected) {
+                        completed.incrementAndGet();
+                    }
+                });
+                Assert.assertEquals("consume the query's original terminal event", 1, completed.get());
+
+                Field ioField = QwpQueryClient.class.getDeclaredField("ioThread");
+                ioField.setAccessible(true);
+                QwpEgressIoThread io = (QwpEgressIoThread) ioField.get(client);
+                Field threadField = QwpQueryClient.class.getDeclaredField("ioThreadHandle");
+                threadField.setAccessible(true);
+                Thread ioThread = (Thread) threadField.get(client);
+                FutureTask<QueryEvent> nextEvent = new FutureTask<>(io::takeEvent);
+                Thread consumer = new Thread(nextEvent, "idle-shutdown-event-consumer");
+                consumer.setDaemon(true);
+                consumer.start();
+                try {
+                    // The completed query leaves currentQueryDone true. Shutdown must still publish a new
+                    // event, before closePool() runs, for a consumer racing the now-idle I/O thread's exit.
+                    io.shutdown();
+                    ioThread.join(TimeUnit.SECONDS.toMillis(5));
+                    Assert.assertFalse("the idle I/O thread must stop", ioThread.isAlive());
+                    QueryEvent event = nextEvent.get(5, TimeUnit.SECONDS);
+                    try {
+                        Assert.assertEquals(QueryEvent.KIND_ERROR, event.kind);
+                        Assert.assertTrue(event.errorMessage, event.errorMessage.contains("shut down"));
+                    } finally {
+                        io.releaseEvent(event);
+                    }
+                } finally {
+                    consumer.interrupt();
+                    consumer.join(TimeUnit.SECONDS.toMillis(5));
+                    Assert.assertFalse("the event consumer must stop", consumer.isAlive());
+                }
+            }
+        });
+    }
 
     @Test(timeout = 60_000)
     public void testShutdownDuringAReconnectWalkWithBinds() throws Exception {

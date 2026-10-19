@@ -378,11 +378,11 @@ public class RefreshingTokenProviderTest {
             Assert.assertNotEquals("a 403 must not schedule a fetch", 0, scheduler.peek().delayNanos);
 
             // 401 for the current token: a fetch starts now and the caller waits for it
-            Thread rejecter = start(() -> provider.onTokenRejected("T1", 401));
+            FutureTask<Void> rejection = new FutureTask<>(() -> provider.onTokenRejected("T1", 401), null);
+            start(rejection);
             await(scheduler::isNextImmediate, 5_000, "the forced fetch to be scheduled");
             scheduler.runNext();
-            rejecter.join(5_000);
-            Assert.assertFalse("onTokenRejected must return once the forced fetch completes", rejecter.isAlive());
+            rejection.get(5, TimeUnit.SECONDS);
             Assert.assertEquals("T2", provider.getToken().toString());
             Assert.assertEquals(2, source.calls());
 
@@ -400,11 +400,11 @@ public class RefreshingTokenProviderTest {
             Assert.assertEquals(2, source.calls());
 
             // a forced fetch that returns the same token is a normal success
-            rejecter = start(() -> provider.onTokenRejected("T2", 401));
+            rejection = new FutureTask<>(() -> provider.onTokenRejected("T2", 401), null);
+            start(rejection);
             await(scheduler::isNextImmediate, 5_000, "the second forced fetch to be scheduled");
             scheduler.runNext();
-            rejecter.join(5_000);
-            Assert.assertFalse(rejecter.isAlive());
+            rejection.get(5, TimeUnit.SECONDS);
             Assert.assertEquals(3, source.calls());
             Assert.assertEquals("T2", provider.getToken().toString());
             Assert.assertEquals(0, provider.getConsecutiveFailures());

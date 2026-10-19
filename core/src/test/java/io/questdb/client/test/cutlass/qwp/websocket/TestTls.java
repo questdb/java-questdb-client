@@ -32,6 +32,8 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.security.KeyStore;
 import java.util.concurrent.TimeUnit;
 
@@ -54,6 +56,35 @@ public final class TestTls {
         return factory;
     }
 
+    static void waitForKeytool(Process process, Path output, long timeout, TimeUnit unit) throws IOException {
+        try {
+            if (!process.waitFor(timeout, unit)) {
+                throw new IOException("keytool timed out");
+            }
+            if (process.exitValue() != 0) {
+                throw new IOException("keytool failed: " + new String(Files.readAllBytes(output), StandardCharsets.UTF_8));
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("interrupted while running keytool", e);
+        } finally {
+            if (process.isAlive()) {
+                process.destroyForcibly();
+                // Reap the child even when the caller interrupted the wait, then restore its interrupt flag.
+                boolean isInterrupted = Thread.interrupted();
+                try {
+                    process.waitFor(5, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    isInterrupted = true;
+                } finally {
+                    if (isInterrupted) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            }
+        }
+    }
+
     private static SSLServerSocketFactory create() throws IOException {
         File keystore = File.createTempFile("qdb-test-server", ".p12");
         if (!keystore.delete()) {
@@ -74,16 +105,12 @@ public final class TestTls {
                 "-storepass", new String(PASSWORD),
                 "-keypass", new String(PASSWORD)
         );
-        pb.redirectErrorStream(true);
-        Process process = pb.start();
-        byte[] output = readAll(process.getInputStream());
+        Path output = Files.createTempFile("qdb-test-keytool", ".log");
         try {
-            if (!process.waitFor(60, TimeUnit.SECONDS) || process.exitValue() != 0) {
-                throw new IOException("keytool failed: " + new String(output, StandardCharsets.UTF_8));
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("interrupted while running keytool", e);
+            Process process = pb.redirectErrorStream(true).redirectOutput(output.toFile()).start();
+            waitForKeytool(process, output, 60, TimeUnit.SECONDS);
+        } finally {
+            Files.deleteIfExists(output);
         }
         try (InputStream in = new FileInputStream(keystore)) {
             KeyStore ks = KeyStore.getInstance("PKCS12");
@@ -98,15 +125,5 @@ public final class TestTls {
         } catch (Exception e) {
             throw new IOException("could not load the test keystore", e);
         }
-    }
-
-    private static byte[] readAll(InputStream in) throws IOException {
-        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
-        byte[] buf = new byte[4096];
-        int n;
-        while ((n = in.read(buf)) > 0) {
-            out.write(buf, 0, n);
-        }
-        return out.toByteArray();
     }
 }
