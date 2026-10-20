@@ -84,11 +84,15 @@ public class BearerChallengeTest {
     @Test
     public void testRefreshDecision() {
         // section 8.2: without a Bearer challenge carrying an error, the status code alone decides
-        Assert.assertTrue(BearerChallenge.allowsTokenRefresh(null));
-        Assert.assertTrue(BearerChallenge.allowsTokenRefresh("Basic realm=\"questdb\""));
-        Assert.assertTrue(BearerChallenge.allowsTokenRefresh("Bearer realm=\"questdb\""));
-        Assert.assertTrue(BearerChallenge.allowsTokenRefresh("Bearer error=\"invalid_token\""));
-        Assert.assertFalse(BearerChallenge.allowsTokenRefresh("Bearer error=\"insufficient_scope\""));
-        Assert.assertFalse(BearerChallenge.allowsTokenRefresh("Bearer error=\"invalid_request\""));
+        Assert.assertTrue(isTokenRefreshableAfter401(null));
+        Assert.assertTrue(isTokenRefreshableAfter401("Basic realm=\"questdb\""));
+        Assert.assertTrue(isTokenRefreshableAfter401("Bearer realm=\"questdb\""));
+        Assert.assertTrue(isTokenRefreshableAfter401("Bearer error=\"invalid_token\""));
+        Assert.assertFalse(isTokenRefreshableAfter401("Bearer error=\"insufficient_scope\""));
+        Assert.assertFalse(isTokenRefreshableAfter401("Bearer error=\"invalid_request\""));
+    }
+
+    private static boolean isTokenRefreshableAfter401(String wwwAuthenticate) {
+        return new QwpAuthFailedException(401, "h", 1, wwwAuthenticate).isTokenRefreshable();
     }
 }

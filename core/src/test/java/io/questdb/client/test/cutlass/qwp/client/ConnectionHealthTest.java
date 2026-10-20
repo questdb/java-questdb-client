@@ -40,6 +40,7 @@ import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 import io.questdb.client.cutlass.qwp.client.QwpVersionMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.network.NetworkFacade;
 import io.questdb.client.network.NetworkFacadeImpl;
@@ -47,8 +48,11 @@ import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.cutlass.qwp.client.WebSocketDynamicCredentialTest.ErrorCollector;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 
+import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -59,6 +63,7 @@ import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -71,6 +76,9 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  */
 public class ConnectionHealthTest {
     private static final String SENTINEL = "SENTINEL-TOKEN-7f3a91";
+
+    @Rule
+    public final TemporaryFolder temp = TemporaryFolder.builder().assureDeletion().build();
 
     @Test
     public void testAggregateReportsTheOldestOutageAndTheLatestFailure() {
@@ -390,6 +398,49 @@ public class ConnectionHealthTest {
                 Assert.assertEquals(1, health.getFailedRounds());
                 Assert.assertEquals(ConnectionHealth.FailureClass.TRANSPORT, health.getLastFailure().getFailureClass());
                 Assert.assertEquals(0, health.getLastFailure().getStatusCode());
+            }
+        });
+    }
+
+    @Test(timeout = 60_000)
+    public void testSenderHealthIgnoresOrphanDrainerRounds() throws Exception {
+        // C21: health describes the sender's own connection. An orphan drainer that the server rejects while the
+        // sender is connected leaves the sender CONNECTED, with no failed round: drainers report through
+        // BackgroundDrainerListener and the error handler, never through Sender.health().
+        assertMemoryLeak(() -> {
+            String sfDir = temp.newFolder("orphan-health").getAbsolutePath();
+            // leave an orphan slot behind: its sender's server never acknowledges a batch
+            try (TestWebSocketServer silent = startServer(new TestWebSocketServer.WebSocketServerHandler() {
+            })) {
+                try (Sender ghost = Sender.fromConfig("ws::addr=localhost:" + silent.getPort() + ";sf_dir=" + sfDir
+                        + ";sender_id=ghost;close_flush_timeout_millis=0;")) {
+                    ghost.table("t").longColumn("v", 1).atNow();
+                    ghost.flush();
+                }
+            }
+            Assert.assertEquals(1, OrphanScanner.scan(sfDir, "primary").size());
+
+            AtomicInteger upgrades = new AtomicInteger();
+            try (TestWebSocketServer server = startServer(new WebSocketDynamicCredentialTest.AckHandler())) {
+                // the sender's upgrade is accepted; every later one, the drainer's, is rejected
+                server.setAuthorizationValidator(h -> upgrades.incrementAndGet() == 1 ? 0 : 401);
+                try (Sender sender = Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address("localhost:" + server.getPort())
+                        .storeAndForwardDir(sfDir)
+                        .senderId("primary")
+                        .drainOrphans(true)
+                        .httpToken(SENTINEL)
+                        .build()) {
+                    // a 401 against a constant credential makes the drainer quarantine the orphan slot
+                    File failed = new File(sfDir, "ghost/" + OrphanScanner.FAILED_SENTINEL_NAME);
+                    await(failed::exists, 10_000, "the drainer to give up on the orphan slot");
+                    Assert.assertTrue("the drainer's upgrade was rejected", server.authRejectCount() >= 1);
+                    ConnectionHealth h = sender.health();
+                    Assert.assertEquals(h.toString(), ConnectionHealth.State.CONNECTED, h.getState());
+                    Assert.assertEquals(h.toString(), ConnectionHealth.NONE, h.getOutageSinceEpochMillis());
+                    Assert.assertEquals(h.toString(), 0, h.getFailedRounds());
+                    Assert.assertNull(h.toString(), h.getLastFailure());
+                }
             }
         });
     }

@@ -27,7 +27,8 @@ package io.questdb.client.cutlass.http;
 /**
  * Reads the {@code error} parameter of a {@code Bearer} challenge in a {@code WWW-Authenticate} header
  * (RFC 6750, section 3; RFC 7235, section 4.1). Clients use it to decide whether a {@code 401} is worth a token
- * refresh: {@code invalid_token} is, {@code insufficient_scope} is not.
+ * refresh: {@code invalid_token} is, {@code insufficient_scope} is not. The decision itself is
+ * {@link io.questdb.client.cutlass.qwp.client.QwpAuthFailedException#isTokenRefreshable()}.
  * <p>
  * The parser is tolerant. It walks a comma-separated list of challenges - {@code scheme [token68 | auth-param,
  * ...]} - accepts quoted and unquoted parameter values, and ignores what it cannot read. Only the first
@@ -40,16 +41,6 @@ public final class BearerChallenge {
     public static final String INVALID_TOKEN = "invalid_token";
 
     private BearerChallenge() {
-    }
-
-    /**
-     * Whether a {@code 401} carrying {@code wwwAuthenticate} warrants refreshing the token: true when the header
-     * has no {@code Bearer} challenge with an {@code error} parameter (the status code alone decides), or when
-     * that error is {@code invalid_token}.
-     */
-    public static boolean allowsTokenRefresh(CharSequence wwwAuthenticate) {
-        final String error = bearerError(wwwAuthenticate);
-        return error == null || INVALID_TOKEN.equals(error);
     }
 
     /**
