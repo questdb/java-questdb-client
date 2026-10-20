@@ -2607,10 +2607,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * server's own idle timeout, from closing a quiet connection, which
          * would otherwise cost a reconnect each time.
          * <p>
-         * Pass {@code 0} or negative to disable it. Default
-         * {@value io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop#DEFAULT_KEEPALIVE_INTERVAL_MILLIS}
-         * ms. Background orphan drainers ({@link #drainOrphans(boolean)})
-         * always use the default. WebSocket transport only.
+         * Off by default; opt in with a positive value ({@code 30000} suits
+         * an AWS ALB). {@code 0} or negative disables it. Background orphan
+         * drainers ({@link #drainOrphans(boolean)}) never send it. WebSocket
+         * transport only.
          */
         public LineSenderBuilder keepaliveIntervalMillis(long millis) {
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {

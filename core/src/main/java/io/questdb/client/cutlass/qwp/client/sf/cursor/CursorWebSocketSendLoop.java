@@ -145,9 +145,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * server's own idle reaper ({@code http.net.connection.timeout}, 5 min),
      * and the loop pays a reconnect each time. TCP keepalive does not help
      * through an L7 proxy, which terminates TCP. {@code 0} or negative
-     * disables it.
+     * disables it. Opt-in: off by default, {@code 30000} suits an AWS ALB.
      */
-    public static final long DEFAULT_KEEPALIVE_INTERVAL_MILLIS = 30_000L;
+    public static final long DEFAULT_KEEPALIVE_INTERVAL_MILLIS = 0L;
     public static final long DEFAULT_PARK_NANOS = 50_000L; // 50us idle backoff
     /**
      * Default initial reconnect backoff (100 ms).

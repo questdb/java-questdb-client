@@ -57,10 +57,10 @@ public class KeepaliveTest {
     }
 
     @Test
-    public void testZeroIntervalDisablesPings() throws Exception {
+    public void testNoPingsByDefault() throws Exception {
         AtomicInteger pings = new AtomicInteger();
         try (TestWebSocketServer server = startServer(pings);
-             Sender ignored = Sender.fromConfig(config(server, 0))) {
+             Sender ignored = Sender.fromConfig("ws::addr=localhost:" + server.getPort() + ";")) {
             // A broken disable (interval 0 treated as "always due") pings on every idle pass
             Thread.sleep(500);
         }
