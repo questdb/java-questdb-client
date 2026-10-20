@@ -183,7 +183,7 @@ These behaviours are already pinned by tests:
   - `MockOidcServer`: a raw-socket HTTP mock that can return JSON, chunked, dropped or dribbled responses.
   - `assertMemoryLeak`, and `HandOffCharSequence` for TOCTOU tests.
   - Scripted `ReconnectFactory` stubs, as in `BackgroundDrainerMidDrainAuthRejectTest`.
-- **API compatibility:** `ExportedApiCompatibilityTest` pins exported signatures. Adding is fine; retyping is not.
+- **API compatibility:** only `Sender` and its builder are public API: adding is fine, retyping is not. Internal factories (`QwpWebSocketSender`, `CursorWebSocketSendLoop`) have no callers outside this jar, so they are widened in place rather than overloaded.
 
 ## 6. Problems with ~2 KB rotating bearer tokens
 
@@ -522,7 +522,7 @@ Build in this order. Each step is one PR and must pass the conformance tests lis
 - Code must build on Java 8 and also compile on JDK 11+.
 - Zero-GC applies to per-row producer calls and the steady-state I/O loop, not to connect paths.
 - Tests run under `assertMemoryLeak`.
-- `ExportedApiCompatibilityTest` must stay green: add API, never retype it.
+- Public API (`Sender` and its builder): add to it, never retype it.
 
 1. **Token cache.**
    - Implements spec §4–§5, with the types named in spec Appendix B.

@@ -539,14 +539,14 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
-     * Sends a ping frame.
+     * Sends a ping frame with the same timeout as data frames.
      */
-    public void sendPing(int timeout) {
+    public void sendPing() {
         checkConnected();
         controlFrameBuffer.reset();
         WebSocketSendBuffer.FrameInfo frame = controlFrameBuffer.writePingFrame();
         try {
-            doSend(controlFrameBuffer.getBufferPtr() + frame.offset, frame.length, timeout);
+            doSend(controlFrameBuffer.getBufferPtr() + frame.offset, frame.length, defaultTimeout);
         } finally {
             controlFrameBuffer.reset();
         }

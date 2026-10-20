@@ -512,6 +512,16 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
+    public void testKeepaliveIntervalNotSupportedForTcp() {
+        assertThrows("keepalive_interval_millis is only supported for WebSocket transport",
+                () -> Sender.builder(Sender.Transport.TCP)
+                        .address(LOCALHOST)
+                        .keepaliveIntervalMillis(100));
+        assertThrows("keepalive_interval_millis is only supported for WebSocket transport",
+                () -> Sender.fromConfig("tcp::addr=localhost:9009;keepalive_interval_millis=100;"));
+    }
+
+    @Test
     public void testAuthTimeoutConfig_acceptsPositive() {
         Sender.LineSenderBuilder builder = Sender.builder("ws::addr=localhost:9000;auth_timeout_ms=2500;");
         Assert.assertNotNull(builder);

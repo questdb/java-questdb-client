@@ -129,14 +129,25 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     /**
      * Default cadence for the keepalive PING the I/O loop emits while
      * waiting on STATUS_DURABLE_ACK frames. See
-     * {@link #sendDurableAckKeepaliveIfDue()} for the rationale: the OSS
+     * {@link #sendPingIfDue(long)} for the rationale: the OSS
      * server only flushes pending durable-ack frames on inbound recv
      * events, so an opted-in idle client has to prod it. {@code 200} ms
      * trades one PING per 200 ms per idle opted-in connection for
      * sub-second confirmation latency once the upload completes
-     * server-side. {@code 0} or negative disables the keepalive entirely.
+     * server-side. {@code 0} or negative disables this PING, not the idle keepalive.
      */
     public static final long DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS = 200L;
+    /**
+     * Default cadence for the idle keepalive PING, sent once nothing has gone
+     * out on the wire for this long. Without it a quiet connection is closed
+     * by whatever sits on the path with an idle timeout -- L7 load balancers
+     * and proxies (AWS ALB: 60 s), firewalls, NAT gateways -- and by the
+     * server's own idle reaper ({@code http.net.connection.timeout}, 5 min),
+     * and the loop pays a reconnect each time. TCP keepalive does not help
+     * through an L7 proxy, which terminates TCP. {@code 0} or negative
+     * disables it. Opt-in: off by default, {@code 30000} suits an AWS ALB.
+     */
+    public static final long DEFAULT_KEEPALIVE_INTERVAL_MILLIS = 0L;
     public static final long DEFAULT_PARK_NANOS = 50_000L; // 50us idle backoff
     /**
      * Default initial reconnect backoff (100 ms).
@@ -271,9 +282,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // visible to the loop under test.
     @TestOnly
     public static volatile boolean forceMirrorSeedFailureForTest;
-    // Pre-converted to nanos for the comparison in sendDurableAckKeepaliveIfDue.
-    // Zero or negative disables the keepalive entirely.
+    // Pre-converted to nanos for the comparison in sendPingIfDue.
+    // Zero or negative disables the durable-ack PING only.
     private final long durableAckKeepaliveIntervalNanos;
+    // Idle keepalive PING cadence in nanos; 0 or negative disables. Set before start().
+    private long keepaliveIntervalNanos = TimeUnit.MILLISECONDS.toNanos(DEFAULT_KEEPALIVE_INTERVAL_MILLIS);
     // When true, OK frames do NOT advance engine.acknowledge -- only
     // STATUS_DURABLE_ACK frames do. The OK frame's wireSeq is stashed in
     // pendingDurable along with its per-table seqTxns, and trim only advances
@@ -513,10 +526,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // rethrows always deliver the same instance.
     private volatile LineSenderException terminalError;
     // Wall clock of the last outbound activity on the wire -- a sent frame
-    // (trySendOne) or a keepalive PING (sendDurableAckKeepaliveIfDue).
-    // Throttles the durable-ack keepalive PING so it fires only when the
+    // (trySendOne) or a keepalive PING (sendPingIfDue).
+    // Throttles the keepalive PINGs so they fire only when the
     // configured interval has elapsed since the most recent outbound event.
-    // Zero until the first send; reset to zero on reconnect.
+    // Set when the I/O loop starts.
     private long lastFrameOrPingNanos;
     // Throttles the catch-up oversize WARN. Only consulted when the server
     // advertises NO batch cap, where the loop has no terminal to fall back on
@@ -666,7 +679,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     /**
      * Master constructor — also accepts the cadence at which the I/O loop
      * sends keepalive PINGs while waiting on STATUS_DURABLE_ACK frames.
-     * Pass {@code 0} or negative to disable keepalive PINGs entirely (the
+     * Pass {@code 0} or negative to disable this durable-ack PING (the
      * caller takes responsibility for prodding the server, e.g. by sending
      * data, or by accepting indefinite waits on idle connections).
      */
@@ -972,7 +985,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * The policy-aware constructor as released in 1.3.x: equivalent to the overload
      * below with {@code externalFsnBase = 0L}, the value every caller outside a
      * symbol-dictionary recycle passes. Kept so callers compiled against a released
-     * jar keep linking; {@code ExportedApiCompatibilityTest} pins it.
+     * jar keep linking.
      */
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
                                    long fsnAtZero, long parkNanos,
@@ -1746,6 +1759,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * Idle keepalive PING cadence, see {@link #DEFAULT_KEEPALIVE_INTERVAL_MILLIS}.
+     * {@code 0} or negative disables it. Set once before {@link #start()}.
+     */
+    public void setKeepaliveIntervalMillis(long millis) {
+        this.keepaliveIntervalNanos = TimeUnit.MILLISECONDS.toNanos(millis);
+    }
+
+    /**
      * Test seam: resize the {@link #close()} graceful-stop window (default
      * {@link #DEFAULT_CLOSE_GRACEFUL_STOP_MILLIS}). {@code 0} disables it, so
      * close() breaks traffic up front. Production never calls this. Set
@@ -1925,10 +1946,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             releasePendingEntry(pendingDurable.pollFirst());
         }
         durableTableWatermarks.clear();
-        // Reset the keepalive throttle so the new connection can prod the
-        // server immediately rather than waiting out the leftover interval
-        // from before the reconnect.
-        lastFrameOrPingNanos = 0L;
     }
 
     private static boolean isCatchUpCapGap(Throwable t) {
@@ -2071,9 +2088,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     swapClient(newClient);
                     counters.reconnects.incrementAndGet();
                     long elapsedMs = (System.nanoTime() - outageStartNanos) / 1_000_000L;
-                    LOG.info("cursor I/O loop {} succeeded after {}ms, {} attempts; "
-                                    + "replaying from FSN {}",
-                            phase, elapsedMs, attempts, externalFsnBase + fsnAtZero);
+                    LOG.info("cursor I/O loop {} succeeded after {}ms, {} attempts; resuming at FSN {}",
+                            phase, elapsedMs, attempts, externalFsnBase + engine.ackedFsn() + 1L);
                     return;
                 }
                 // A null factory result is an unsuccessful connect state, not a cap-gap
@@ -2643,6 +2659,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             if (client == null && running) {
                 attemptInitialConnect();
             }
+            // The upgrade handshake was outbound traffic: start the idle
+            // keepalive clock here rather than pinging on the first idle pass.
+            lastFrameOrPingNanos = System.nanoTime();
             while (running) {
                 boolean didWork = trySendOne();
                 // 1. Try to send next frame(s).
@@ -2660,7 +2679,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 if (!didWork && running && durableAckMode
                         && durableAckKeepaliveIntervalNanos > 0L
                         && !pendingDurable.isEmpty()) {
-                    sendDurableAckKeepaliveIfDue();
+                    sendPingIfDue(durableAckKeepaliveIntervalNanos);
+                }
+                // 4. Idle keepalive PING, see DEFAULT_KEEPALIVE_INTERVAL_MILLIS.
+                if (!didWork && running && keepaliveIntervalNanos > 0L) {
+                    sendPingIfDue(keepaliveIntervalNanos);
                 }
                 if (!didWork && running) {
                     LockSupport.parkNanos(parkNanos);
@@ -2868,27 +2891,29 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
-     * Send a WebSocket PING to prod the server into flushing pending
-     * STATUS_DURABLE_ACK frames, but only when the throttle interval has
-     * elapsed since the last outbound activity -- a sent frame or a prior
-     * keepalive PING. The server's egress code only runs flushPendingAck on
-     * inbound recv events; without this prod, an idle connection waiting on
-     * durable-ack confirmation can sit forever. The "last sent frame" half
-     * of the gate avoids a redundant PING shortly after a producer batch
-     * goes idle: the recent frame already triggered a server-side flush.
+     * Send a WebSocket PING, but only when {@code intervalNanos} has elapsed
+     * since the last outbound activity -- a sent frame or a prior PING.
+     * Serves two callers: the idle keepalive, and the durable-ack keepalive
+     * that prods the server into flushing pending STATUS_DURABLE_ACK frames
+     * (its egress code only runs flushPendingAck on inbound recv events, so
+     * an idle connection waiting on durable-ack confirmation can sit
+     * forever). The "last sent frame" half of the gate avoids a redundant
+     * PING shortly after a producer batch goes idle.
      * <p>
      * Best-effort: any send failure routes through the standard fail() path
      * so the reconnect loop can take over. Caller is responsible for the
-     * "do we even need to send" gate (durableAckMode + non-empty pending).
+     * "do we even need to send" gate.
      */
-    private void sendDurableAckKeepaliveIfDue() {
+    private void sendPingIfDue(long intervalNanos) {
         long now = System.nanoTime();
-        if (now - lastFrameOrPingNanos < durableAckKeepaliveIntervalNanos) {
+        if (now - lastFrameOrPingNanos < intervalNanos) {
             return;
         }
         lastFrameOrPingNanos = now;
         try {
-            client.sendPing(1000);
+            // A timeout here reconnects and replays unacked frames, so it must be as
+            // tolerant as a data send: a slow-draining server or a GC pause is not a dead peer.
+            client.sendPing();
         } catch (Throwable t) {
             fail(t);
         }

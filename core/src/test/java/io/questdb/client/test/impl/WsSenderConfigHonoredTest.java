@@ -70,6 +70,7 @@ public class WsSenderConfigHonoredTest {
         assertHonored("close_flush_timeout_millis=2500", "close_flush_timeout_millis", 2500L);
         assertHonored("durable_ack_keepalive_interval_millis=900", "durable_ack_keepalive_interval_millis", 900L);
         assertHonored("initial_connect_retry=async", "initial_connect_retry", "ASYNC");
+        assertHonored("keepalive_interval_millis=900", "keepalive_interval_millis", 900L);
         assertHonored("reconnect_max_duration_millis=12345", "reconnect_max_duration_millis", 12345L);
         assertHonored("reconnect_initial_backoff_millis=111", "reconnect_initial_backoff_millis", 111L);
         assertHonored("reconnect_max_backoff_millis=2222", "reconnect_max_backoff_millis", 2222L);

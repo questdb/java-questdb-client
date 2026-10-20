@@ -347,9 +347,11 @@ public class QwpWebSocketSender implements Sender {
     // Keepalive PING cadence used by the I/O loop while
     // request_durable_ack=on AND there are pending durable-ack
     // confirmations. Default mirrors the loop's spec value; 0 or negative
-    // disables keepalive PINGs entirely.
+    // disables this PING (the idle keepalive PING is separate).
     private long durableAckKeepaliveIntervalMillis =
             CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS;
+    // Idle keepalive PING cadence for the I/O loop; 0 or negative disables it.
+    private long keepaliveIntervalMillis = CursorWebSocketSendLoop.DEFAULT_KEEPALIVE_INTERVAL_MILLIS;
     // Effective per-batch soft-flush threshold in raw column-buffer bytes.
     // Initially equals autoFlushBytes; lowered to fit under the server's
     // advertised X-QWP-Max-Batch-Size at handshake so the wire payload stays
@@ -899,7 +901,7 @@ public class QwpWebSocketSender implements Sender {
     /**
      * Master connect overload — also accepts the keepalive PING cadence
      * the I/O loop uses while waiting on STATUS_DURABLE_ACK frames.
-     * {@code 0} or negative disables the keepalive entirely (caller takes
+     * {@code 0} or negative disables this durable-ack PING (caller takes
      * responsibility for prodding the server).
      */
     public static QwpWebSocketSender connect(
@@ -1058,7 +1060,8 @@ public class QwpWebSocketSender implements Sender {
                 CursorWebSocketSendLoop.DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS,
                 DEFAULT_SYMBOL_DICT_RESET_ENABLED,
                 DEFAULT_SYMBOL_DICT_RESET_THRESHOLD_SYMBOLS,
-                DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS);
+                DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS,
+                CursorWebSocketSendLoop.DEFAULT_KEEPALIVE_INTERVAL_MILLIS);
     }
 
     /**
@@ -1116,7 +1119,8 @@ public class QwpWebSocketSender implements Sender {
                 catchUpCapGapMinEscalationWindowMillis,
                 DEFAULT_SYMBOL_DICT_RESET_ENABLED,
                 DEFAULT_SYMBOL_DICT_RESET_THRESHOLD_SYMBOLS,
-                DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS);
+                DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS,
+                CursorWebSocketSendLoop.DEFAULT_KEEPALIVE_INTERVAL_MILLIS);
     }
 
     /**
@@ -1177,7 +1181,7 @@ public class QwpWebSocketSender implements Sender {
                 maxFrameRejections, poisonMinEscalationWindowMillis,
                 catchUpCapGapMinEscalationWindowMillis,
                 symbolDictResetEnabled, symbolDictResetThresholdSymbols,
-                symbolDictResetMaxWaitMillis);
+                symbolDictResetMaxWaitMillis, CursorWebSocketSendLoop.DEFAULT_KEEPALIVE_INTERVAL_MILLIS);
     }
 
     /**
@@ -1187,7 +1191,7 @@ public class QwpWebSocketSender implements Sender {
      * long, long, long, long, Sender.InitialConnectMode, SenderErrorHandler, int, long, long, int,
      * SenderConnectionListener, int, int, long, long)}. Kept as its own overload, delegating to the master
      * below with the symbol-dictionary recycle knobs defaulted, so a caller compiled before those knobs'
-     * arity moved into the master keeps linking; {@code ExportedApiCompatibilityTest} pins it.
+     * arity moved into the master keeps linking.
      * <p>
      * Recycling requires a non-null engine rebuild factory installed via
      * {@link #setEngineRebuildFactory(EngineRebuildFactory)};
@@ -1230,7 +1234,8 @@ public class QwpWebSocketSender implements Sender {
                 catchUpCapGapMinEscalationWindowMillis,
                 DEFAULT_SYMBOL_DICT_RESET_ENABLED,
                 DEFAULT_SYMBOL_DICT_RESET_THRESHOLD_SYMBOLS,
-                DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS);
+                DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS,
+                CursorWebSocketSendLoop.DEFAULT_KEEPALIVE_INTERVAL_MILLIS);
     }
 
     /**
@@ -1239,7 +1244,8 @@ public class QwpWebSocketSender implements Sender {
      * recycle knobs ({@code symbol_dict_reset}, {@code symbol_dict_reset_threshold},
      * {@code symbol_dict_reset_max_wait_millis}): consecutive server-active
      * rejections of the same head-of-line frame, with no ack progress in
-     * between, before the loop escalates to a typed terminal.
+     * between, before the loop escalates to a typed terminal. Also takes the
+     * idle keepalive PING cadence ({@code keepalive_interval_millis}).
      * <p>
      * Named apart from {@code connect} for the reason given on
      * {@link #connectWithCredentialSupplier(List, ClientTlsConfiguration, int, int, long, Supplier,
@@ -1283,7 +1289,8 @@ public class QwpWebSocketSender implements Sender {
             long catchUpCapGapMinEscalationWindowMillis,
             boolean symbolDictResetEnabled,
             int symbolDictResetThresholdSymbols,
-            long symbolDictResetMaxWaitMillis
+            long symbolDictResetMaxWaitMillis,
+            long keepaliveIntervalMillis
     ) {
         if (symbolDictResetThresholdSymbols <= 0
                 || symbolDictResetThresholdSymbols > QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE / 2) {
@@ -1312,6 +1319,7 @@ public class QwpWebSocketSender implements Sender {
             sender.reconnectInitialBackoffMillis = reconnectInitialBackoffMillis;
             sender.reconnectMaxBackoffMillis = reconnectMaxBackoffMillis;
             sender.durableAckKeepaliveIntervalMillis = durableAckKeepaliveIntervalMillis;
+            sender.keepaliveIntervalMillis = keepaliveIntervalMillis;
             sender.maxFrameRejections = maxFrameRejections;
             sender.poisonMinEscalationWindowMillis = poisonMinEscalationWindowMillis;
             sender.catchUpCapGapMinEscalationWindowMillis = catchUpCapGapMinEscalationWindowMillis;
@@ -5039,6 +5047,7 @@ public class QwpWebSocketSender implements Sender {
                 errorDispatcher = new SenderErrorDispatcher(errorHandler, errorInboxCapacity);
             }
             cursorSendLoop.setErrorDispatcher(errorDispatcher);
+            cursorSendLoop.setKeepaliveIntervalMillis(keepaliveIntervalMillis);
             // Symmetric progress dispatcher: lazy-allocated mirror of the
             // error path. Wired before start() for the same reason -- the
             // I/O thread should never observe a null dispatcher between
