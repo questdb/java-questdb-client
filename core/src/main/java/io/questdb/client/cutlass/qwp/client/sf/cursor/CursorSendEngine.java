@@ -108,10 +108,6 @@ public final class CursorSendEngine implements QuietCloseable {
     // many engines (one per Sender), the caller owns and closes it.
     private final boolean ownsManager;
     private final SegmentRing ring;
-    // Rings the I/O loop's doorbell after a frame is published, so the loop
-    // can block instead of polling publishedFsn().
-    // Installed by CursorWebSocketSendLoop; null until a loop attaches.
-    private volatile Runnable ioWakeup;
     private final long segmentSizeBytes;
     private final String sfDir;
     private final long syncIntervalNanos;
@@ -199,6 +195,10 @@ public final class CursorSendEngine implements QuietCloseable {
     // isCloseCompleted() from pool threads re-probing a retired slot (see the
     // getter for why it must not synchronize).
     private volatile boolean closeCompleted;
+    // Rings the I/O loop's doorbell after a frame is published, so the loop
+    // can block instead of polling publishedFsn().
+    // Installed by CursorWebSocketSendLoop; null until a loop attaches.
+    private volatile Runnable ioWakeup;
     // Invoked after closeCompleted publishes a confirmed flock release. Used
     // by an owning sender pool to wake capacity-starved borrowers immediately.
     private volatile Runnable slotLockReleaseListener;

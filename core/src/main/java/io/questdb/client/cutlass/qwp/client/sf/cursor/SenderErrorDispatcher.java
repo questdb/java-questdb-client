@@ -150,14 +150,12 @@ public final class SenderErrorDispatcher implements QuietCloseable {
                 return;
             }
             closed = true;
-            // Wake the dispatcher even if the inbox is empty — POISON also
-            // forces it past any pending poll() without losing real entries
-            // already queued (they're delivered before POISON since the
-            // queue is FIFO). The offer's return value is intentionally
-            // ignored: if the inbox is at capacity the dispatcher will
-            // still wake on its 100ms poll timeout and re-check `closed`,
-            // so failure to enqueue POISON only adds at most one tick of
-            // shutdown latency — not a correctness issue.
+            // Wake the dispatcher even if the inbox is empty — POISON ends
+            // its blocking take() without losing real entries already queued
+            // (they're delivered before POISON since the queue is FIFO). The
+            // offer's return value is intentionally ignored: an inbox at
+            // capacity means the dispatcher is awake draining it, and its
+            // loop condition re-checks `closed` once the inbox is empty.
             //noinspection ResultOfMethodCallIgnored
             inbox.offer(POISON);
             Thread t = dispatcherThread;

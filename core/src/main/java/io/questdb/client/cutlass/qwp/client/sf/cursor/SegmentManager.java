@@ -56,6 +56,7 @@ import java.util.function.LongSupplier;
  */
 public final class SegmentManager implements QuietCloseable {
 
+    public static final long DISK_FULL_LOG_THROTTLE_NANOS = 30_000_000_000L; // 30 s
     /**
      * Retry cadence after a failed hot-spare provisioning attempt (disk full,
      * budget exhausted, I/O error). Nothing else wakes the worker for that
@@ -63,6 +64,7 @@ public final class SegmentManager implements QuietCloseable {
      * A wake from SegmentBudget.release() would make it fully event-driven.
      */
     public static final long PROVISION_RETRY_NANOS = 10_000_000L; // 10 ms
+    public static final long UNLIMITED_TOTAL_BYTES = Long.MAX_VALUE;
     /**
      * Upper bound on how far the mmap ack watermark trails {@code ackedFsn}
      * while ACKs keep landing inside the active segment. The first such ACK
@@ -70,8 +72,6 @@ public final class SegmentManager implements QuietCloseable {
      * is current, so a crash replays at most this much already-acked data.
      */
     public static final long WATERMARK_LAG_NANOS = 1_000_000L; // 1 ms
-    public static final long DISK_FULL_LOG_THROTTLE_NANOS = 30_000_000_000L; // 30 s
-    public static final long UNLIMITED_TOTAL_BYTES = Long.MAX_VALUE;
     private static final int ENTRY_DEREGISTERED = 3;
     private static final int ENTRY_DEREGISTERED_IN_SERVICE = 2;
     private static final int ENTRY_IN_SERVICE = 1;
@@ -100,10 +100,6 @@ public final class SegmentManager implements QuietCloseable {
     // budget to several managers -- a sender pool does, so sf_max_total_bytes
     // caps all of its senders together.
     private final SegmentBudget budget;
-    // Worker-local: when a hot-spare provisioning attempt fails (disk full, budget
-    // exhausted, I/O error) the worker schedules its own retry here instead of
-    // relying on a tick. Reset every pass; Long.MAX_VALUE = nothing to retry.
-    private long provisionRetryDeadlineNanos = Long.MAX_VALUE;
     private final AtomicLong fileGeneration = new AtomicLong();
     private final FilesFacade filesFacade;
     // Per-ring segment bytes below which the cap check never refuses to
@@ -197,6 +193,10 @@ public final class SegmentManager implements QuietCloseable {
     // array. Guarded by lock and consumed on worker-loop exit outside lock.
     private Runnable ownedEngineExitCleanup;
     private long lastDiskFullLogNs;
+    // Worker-local: when a hot-spare provisioning attempt fails (disk full, budget
+    // exhausted, I/O error) the worker schedules its own retry here instead of
+    // relying on a tick. Reset every pass; Long.MAX_VALUE = nothing to retry.
+    private long provisionRetryDeadlineNanos = Long.MAX_VALUE;
     private volatile boolean running;
     // pathScratch free-exactly-once coordination between a timed-out close()
     // and the worker's exit path. All three are guarded by {@link #lock}.

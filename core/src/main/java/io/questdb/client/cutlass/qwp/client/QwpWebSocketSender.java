@@ -41,11 +41,11 @@ import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWaiters;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerListener;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerPool;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendCounters;
-import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWaiters;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderConnectionListener;
@@ -1487,15 +1487,17 @@ public class QwpWebSocketSender implements Sender {
 
     /**
      * Blocks until {@link #getAckedFsn()} {@code >= targetFsn}, or until
-     * {@code timeoutMillis} elapses. Polls on a 50us park; surfaces I/O loop
-     * errors synchronously via {@code cursorSendLoop.checkError()}.
+     * {@code timeoutMillis} elapses. Parks in {@link AckWaiters}: the I/O
+     * thread wakes it on every ack advance, terminal error and loop close;
+     * I/O loop errors surface synchronously via {@code checkError()}.
      * <p>
-     * Every pass re-reads the epoch base and the cursor engine through
+     * Every wake re-reads the epoch base and the cursor engine through
      * {@link #getAckedFsn()} (base first, then engine, clamped to the durable
      * watermark), so a symbol-dictionary recycle that swaps the engine while a
-     * monitor thread is parked here is observed on the next pass instead of
+     * monitor thread is parked here is observed on the next wake instead of
      * pinning the wait to the engine it started on. While the engine is null
      * mid-swap the durable watermark stands in, as in {@link #getAckedFsn()}.
+     * Any number of threads may wait at once.
      * <p>
      * Useful for tests and user code that need to confirm a specific publish
      * has been server-acknowledged. Pair with {@link #flushAndGetSequence()} to

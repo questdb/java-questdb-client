@@ -1512,15 +1512,15 @@ public final class SegmentRing implements QuietCloseable {
      * instant, never behind them. Returns -1 when nothing has been appended yet.
      * Volatile read; safe to call from any thread.
      */
+    public long publishedFsn() {
+        return publishedFsn;
+    }
+
     /**
      * Changes after every completed publish; see the field comment.
      */
     public long publishStamp() {
         return publishStamp;
-    }
-
-    public long publishedFsn() {
-        return publishedFsn;
     }
 
     /**

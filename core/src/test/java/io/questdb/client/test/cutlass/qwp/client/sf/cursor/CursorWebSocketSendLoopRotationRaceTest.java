@@ -56,8 +56,8 @@ import org.junit.Test;
  * The one non-obvious knob: segments hold enough frames that the producer never
  * out-runs the hot-spare manager. With tiny segments it parks ~50&nbsp;µs on
  * every rotation, and that gap lets the consumer observe the tail frame before
- * the rotation — masking the race. Larger segments plus a microsecond
- * spare-provision poll keep a spare ready so the seal follows the last publish
+ * the rotation — masking the race. Larger segments, with the manager woken on
+ * every rotation, keep a spare ready so the seal follows the last publish
  * back-to-back, which is the only arrangement that opens the window.
  */
 public class CursorWebSocketSendLoopRotationRaceTest {
