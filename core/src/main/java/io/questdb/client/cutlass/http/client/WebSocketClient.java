@@ -163,6 +163,11 @@ public abstract class WebSocketClient implements QuietCloseable {
     private int serverNegotiatedZstdLevel;
     private int serverQwpVersion = 1;
     private String upgradeRejectRole;
+    // WWW-Authenticate value(s) from the most recent rejected upgrade, joined with ", " when the server sent
+    // several, or null when absent. Lets a 401 carrying "Bearer error=insufficient_scope" be told apart from an
+    // expired token, so a dynamic credential is refreshed only when a new token can help. Reset to null on every
+    // upgrade() invocation.
+    private String upgradeRejectWwwAuthenticate;
     // Server-advertised zone identifier from the most recent rejected upgrade,
     // captured from the X-QuestDB-Zone response header on a 421. Null when the
     // header was absent or empty. Per failover.md §5 servers SHOULD emit this
@@ -372,6 +377,14 @@ public abstract class WebSocketClient implements QuietCloseable {
      */
     public String getUpgradeRejectRole() {
         return upgradeRejectRole;
+    }
+
+    /**
+     * {@code WWW-Authenticate} value(s) on the most recent rejected upgrade, joined with {@code ", "} when the
+     * server sent several, or null when absent.
+     */
+    public String getUpgradeRejectWwwAuthenticate() {
+        return upgradeRejectWwwAuthenticate;
     }
 
     /**
@@ -648,6 +661,7 @@ public abstract class WebSocketClient implements QuietCloseable {
             return; // Already upgraded
         }
         upgradeRejectRole = null;
+        upgradeRejectWwwAuthenticate = null;
         upgradeRejectZone = null;
         upgradeStatusCode = 0;
 
@@ -876,6 +890,34 @@ public abstract class WebSocketClient implements QuietCloseable {
             lineStart = response.indexOf("\r\n", hStart);
         }
         return null;
+    }
+
+    // Every value of the named header, joined with ", " (RFC 7230 section 3.2.2), or null when absent.
+    private static String extractHeaderValues(String response, String headerName) {
+        int headerLen = headerName.length();
+        int responseLen = response.length();
+        StringBuilder values = null;
+        int lineStart = response.indexOf("\r\n");
+        while (lineStart >= 0 && lineStart + 2 + headerLen <= responseLen) {
+            int hStart = lineStart + 2;
+            if (response.regionMatches(true, hStart, headerName, 0, headerLen)) {
+                int valueStart = hStart + headerLen;
+                int lineEnd = response.indexOf('\r', valueStart);
+                if (lineEnd < 0) {
+                    lineEnd = responseLen;
+                }
+                String value = response.substring(valueStart, lineEnd).trim();
+                if (!value.isEmpty()) {
+                    if (values == null) {
+                        values = new StringBuilder(value);
+                    } else {
+                        values.append(", ").append(value);
+                    }
+                }
+            }
+            lineStart = response.indexOf("\r\n", hStart);
+        }
+        return values == null ? null : values.toString();
     }
 
     private static String extractZoneHeader(String response) {
@@ -1346,6 +1388,9 @@ public abstract class WebSocketClient implements QuietCloseable {
         if (!response.startsWith("HTTP/1.1 101")) {
             String statusLine = response.split("\r\n")[0];
             upgradeStatusCode = parseStatusCode(statusLine);
+            if (upgradeStatusCode == 401) {
+                upgradeRejectWwwAuthenticate = extractHeaderValues(response, "WWW-Authenticate:");
+            }
             if (upgradeStatusCode == 421) {
                 upgradeRejectRole = extractRoleHeader(response);
                 upgradeRejectZone = extractZoneHeader(response);

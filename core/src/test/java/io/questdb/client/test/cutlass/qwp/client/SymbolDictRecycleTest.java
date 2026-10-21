@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.ConnectionHealth;
 import io.questdb.client.Sender;
 import io.questdb.client.SenderConnectionEvent;
 import io.questdb.client.SenderError;
@@ -387,7 +388,7 @@ public class SymbolDictRecycleTest {
                     QwpWebSocketSender ws = (QwpWebSocketSender) sender;
                     QwpWebSocketSender.EngineRebuildFactory real =
                             ws.getEngineRebuildFactoryForTesting();
-                    AtomicInteger remainingFaults = new AtomicInteger(1);
+                    AtomicInteger remainingFaults = new AtomicInteger(2);
                     ws.setEngineRebuildFactory(() -> {
                         if (remainingFaults.getAndDecrement() > 0) {
                             throw new RuntimeException("injected engine rebuild fault");
@@ -395,21 +396,40 @@ public class SymbolDictRecycleTest {
                         return real.rebuild();
                     });
 
+                    ConnectionHealth initialHealth = sender.health();
+                    Assert.assertEquals(ConnectionHealth.State.CONNECTED, initialHealth.getState());
                     sender.resetSymbolDictionary();
                     Assert.assertTrue(ws.isResetArmed());
-                    try {
-                        sender.table("t");
-                        Assert.fail("expected the triggering table() call to throw");
-                    } catch (LineSenderException expected) {
+                    long outageSince = ConnectionHealth.NONE;
+                    for (int attempt = 0; attempt < 2; attempt++) {
+                        try {
+                            sender.table("t");
+                            Assert.fail("expected the rebuild to fail");
+                        } catch (LineSenderException expected) {
+                            TestUtils.assertContains(expected.getMessage(), "could not rebuild its engine");
+                        }
+                        // The retired connection stays down until a rebuild succeeds.
+                        ConnectionHealth health = sender.health();
+                        Assert.assertEquals(health.toString(), ConnectionHealth.State.RECONNECTING, health.getState());
+                        Assert.assertNotEquals(ConnectionHealth.NONE, health.getOutageSinceEpochMillis());
+                        Assert.assertEquals(initialHealth.getLastConnectedAtEpochMillis(), health.getLastConnectedAtEpochMillis());
+                        Assert.assertEquals("no connect round has failed", 0, health.getFailedRounds());
+                        if (attempt == 0) {
+                            outageSince = health.getOutageSinceEpochMillis();
+                        } else {
+                            Assert.assertEquals("retrying the rebuild must not restart the outage",
+                                    outageSince, health.getOutageSinceEpochMillis());
+                        }
+                        Assert.assertEquals("the swap must not commit on failure", 0, ws.getSymbolDictEpoch());
                     }
-                    // NOT latched, and the swap did NOT commit.
-                    Assert.assertEquals(0, ws.getSymbolDictEpoch());
                     // The next call resumes the pending recycle with the real
                     // factory and completes it.
                     sender.table("t").symbol("s", "post").longColumn("v", 1L).atNow();
                     Assert.assertEquals(1, ws.getSymbolDictEpoch());
                     long f = sender.flushAndGetSequence();
                     Assert.assertTrue(sender.awaitAckedFsn(f, 5_000));
+                    Assert.assertEquals(ConnectionHealth.State.CONNECTED, sender.health().getState());
+                    Assert.assertEquals(ConnectionHealth.NONE, sender.health().getOutageSinceEpochMillis());
                 }
             }
         });

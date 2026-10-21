@@ -109,6 +109,10 @@ public class JarPackagingIT {
                         "root FdBig of a JDK 8 build must use sun.misc.FDBigInteger",
                         classReferences(jar, FD_BIG_ENTRY, "sun/misc/FDBigInteger")
                 );
+                Assert.assertNull("JDK 8 must not load a root module descriptor", jar.getEntry("module-info.class"));
+                Assert.assertTrue("the released descriptor must declare the token-provider service use",
+                        classReferences(jar, "META-INF/versions/11/module-info.class",
+                                "io/questdb/client/cutlass/auth/TokenProviderFactory"));
                 // the java11 bridge never names the class (JDK 26 made it package-private);
                 // it loads it by dotted name and binds method handles, so the
                 // constant-pool witness is the dotted string literal
