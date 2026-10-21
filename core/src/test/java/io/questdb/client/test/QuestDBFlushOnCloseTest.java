@@ -621,7 +621,7 @@ public class QuestDBFlushOnCloseTest {
      * Parses every QWP frame in each WebSocket message (a read can carry more
      * than one on replay), records its flags byte, table count and bytes, and acks
      * cumulatively so the sender never backs up. Public: the sender-level
-     * probe test in a sub-package and the benchmark reuse it.
+     * probe test in a sub-package reuses it.
      */
     public static final class FrameLog implements TestWebSocketServer.WebSocketServerHandler {
         private static final int HEADER_SIZE = 12;
