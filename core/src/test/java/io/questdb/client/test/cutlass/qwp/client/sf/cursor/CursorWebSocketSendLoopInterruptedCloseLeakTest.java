@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.test.tools.TestWebSocketClient;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
@@ -105,7 +106,7 @@ public class CursorWebSocketSendLoopInterruptedCloseLeakTest {
             try {
                 CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
                         null /* async-initial-connect: the I/O thread drives the connect */,
-                        engine, 0L, 1_000L,
+                        engine, 0L,
                         stuckConnect,
                         100L, 5_000L, false);
                 loop.start();
@@ -178,7 +179,7 @@ public class CursorWebSocketSendLoopInterruptedCloseLeakTest {
      * Close remains idempotent via the superclass, matching the production
      * contract owners rely on.
      */
-    private static final class TrackingStubWebSocketClient extends WebSocketClient {
+    private static final class TrackingStubWebSocketClient extends TestWebSocketClient {
         private final AtomicInteger closeCount = new AtomicInteger();
 
         TrackingStubWebSocketClient() {

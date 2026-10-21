@@ -32,7 +32,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.concurrent.LinkedBlockingDeque;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -310,7 +309,7 @@ public final class SenderErrorDispatcher implements QuietCloseable {
         while (!closed || !inbox.isEmpty()) {
             SenderError err;
             try {
-                err = inbox.poll(100, TimeUnit.MILLISECONDS);
+                err = inbox.take(); // close() enqueues POISON, so blocking here cannot wedge shutdown
             } catch (InterruptedException e) {
                 if (closed) {
                     return;

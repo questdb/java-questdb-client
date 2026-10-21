@@ -90,7 +90,7 @@ public class SegmentManagerTest {
             AtomicReference<Throwable> failure = new AtomicReference<>();
             try (SegmentRing busyRing = new SegmentRing(MmapSegment.createInMemory(0, segSize), segSize);
                  SegmentRing siblingRing = new SegmentRing(MmapSegment.createInMemory(0, segSize), segSize);
-                 SegmentManager manager = new SegmentManager(segSize, TimeUnit.SECONDS.toNanos(60))) {
+                 SegmentManager manager = new SegmentManager(segSize)) {
                 for (int i = 0; i < sealedCount; i++) {
                     assertEquals(i, busyRing.appendOrFsn(buf, 1));
                     busyRing.installHotSpare(MmapSegment.createInMemory(busyRing.nextSeqHint(), segSize));
@@ -144,7 +144,7 @@ public class SegmentManagerTest {
                     + 4 * (MmapSegment.FRAME_HEADER_SIZE + 32);
             MmapSegment seg0 = MmapSegment.create(tmpDir + "/0000000000000000.sfa", 0, segSize);
             try (SegmentRing ring = new SegmentRing(seg0, segSize);
-                 SegmentManager mgr = new SegmentManager(segSize, 200_000L /* 0.2ms */)) {
+                 SegmentManager mgr = new SegmentManager(segSize)) {
                 mgr.start();
                 mgr.register(ring, tmpDir);
 
@@ -163,7 +163,7 @@ public class SegmentManagerTest {
             MmapSegment seg0 = MmapSegment.create(tmpDir + "/0000000000000000.sfa", 0, segSize);
             long buf = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
             try (SegmentRing ring = new SegmentRing(seg0, segSize);
-                 SegmentManager mgr = new SegmentManager(segSize, 200_000L)) {
+                 SegmentManager mgr = new SegmentManager(segSize)) {
                 mgr.start();
                 mgr.register(ring, tmpDir);
 
@@ -202,7 +202,7 @@ public class SegmentManagerTest {
             long buf = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
             try (AckWatermark watermark = AckWatermark.open(tmpDir);
                  SegmentRing ring = new SegmentRing(seg0, segSize);
-                 SegmentManager mgr = new SegmentManager(segSize, 200_000L)) {
+                 SegmentManager mgr = new SegmentManager(segSize)) {
                 assertTrue("watermark must open", watermark != null);
                 mgr.start();
                 mgr.register(ring, tmpDir, watermark);
@@ -244,7 +244,7 @@ public class SegmentManagerTest {
             MmapSegment seg0 = MmapSegment.create(tmpDir + "/0000000000000000.sfa", 0, segSize);
             long buf = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
             try (SegmentRing ring = new SegmentRing(seg0, segSize);
-                 SegmentManager mgr = new SegmentManager(segSize, 200_000L)) {
+                 SegmentManager mgr = new SegmentManager(segSize)) {
                 mgr.start();
                 mgr.register(ring, tmpDir);
 
@@ -281,7 +281,7 @@ public class SegmentManagerTest {
             long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
             try (AckWatermark watermark = AckWatermark.open(tmpDir);
                  SegmentRing ring = new SegmentRing(seg0, segSize);
-                 SegmentManager mgr = new SegmentManager(segSize, 200_000L, cap)) {
+                 SegmentManager mgr = new SegmentManager(segSize, cap)) {
                 assertTrue("watermark must open", watermark != null);
                 mgr.start();
                 // register seeds totalBytes = 1*segSize (initial active).
@@ -327,9 +327,8 @@ public class SegmentManagerTest {
     @Test
     public void testFirstSpareLandsBeforeFirstPoll() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            // pollNanos is intentionally long enough that the 5s park can be
-            // ruled out as the mechanism by which the first spare arrives.
-            // register() unparks the worker after publishing the new ring,
+            // The worker never polls, so the first spare can only arrive via a
+            // wakeup. register() unparks the worker after publishing the new ring,
             // so the worker re-iterates and provisions the spare even when
             // its first loop snapshot ran before register() acquired `lock`.
             // The spare must therefore land within seconds of register(),
@@ -343,13 +342,12 @@ public class SegmentManagerTest {
             // testRotationWakeupTriggersImmediateSparePrep, and the
             // deterministic register-after-park case is covered by
             // testRegisterAfterWorkerParkedWakesWorker.
-            long pollNanos = 5_000_000_000L; // 5 seconds
             long segSize = MmapSegment.HEADER_SIZE
                     + 4 * (MmapSegment.FRAME_HEADER_SIZE + 16);
             MmapSegment seg0 = MmapSegment.create(tmpDir + "/0000000000000000.sfa", 0, segSize);
             long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
             try (SegmentRing ring = new SegmentRing(seg0, segSize);
-                 SegmentManager mgr = new SegmentManager(segSize, pollNanos)) {
+                 SegmentManager mgr = new SegmentManager(segSize)) {
                 mgr.start();
                 mgr.register(ring, tmpDir);
                 long t0 = System.nanoTime();
@@ -380,12 +378,11 @@ public class SegmentManagerTest {
             // promptly because register() unparks the worker out of its park.
             // No append at all, so no producer-side wakeup can mask a missing
             // register-side wakeup.
-            long pollNanos = 5_000_000_000L; // 5 seconds
             long segSize = MmapSegment.HEADER_SIZE
                     + 4 * (MmapSegment.FRAME_HEADER_SIZE + 16);
             MmapSegment seg0 = MmapSegment.create(tmpDir + "/0000000000000000.sfa", 0, segSize);
             try (SegmentRing ring = new SegmentRing(seg0, segSize);
-                 SegmentManager mgr = new SegmentManager(segSize, pollNanos)) {
+                 SegmentManager mgr = new SegmentManager(segSize)) {
                 mgr.start();
                 // Give the worker plenty of time to enter workerLoop, snapshot
                 // an empty rings list, and reach parkNanos. 250ms is far more
@@ -408,13 +405,12 @@ public class SegmentManagerTest {
         TestUtils.assertMemoryLeak(() -> {
             // Segment small enough that one frame fills it; verifies that the
             // post-rotation wakeup runs before the next 5s poll.
-            long pollNanos = 5_000_000_000L;
             long segSize = MmapSegment.HEADER_SIZE
                     + (MmapSegment.FRAME_HEADER_SIZE + 16);
             MmapSegment seg0 = MmapSegment.create(tmpDir + "/0000000000000000.sfa", 0, segSize);
             long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
             try (SegmentRing ring = new SegmentRing(seg0, segSize);
-                 SegmentManager mgr = new SegmentManager(segSize, pollNanos)) {
+                 SegmentManager mgr = new SegmentManager(segSize)) {
                 mgr.start();
                 mgr.register(ring, tmpDir);
                 // First spare via high-water signal on the very first append.
@@ -443,7 +439,7 @@ public class SegmentManagerTest {
     @Test
     public void testCloseStopsWorkerAndIsIdempotent() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            SegmentManager mgr = new SegmentManager(8192, 200_000L);
+            SegmentManager mgr = new SegmentManager(8192);
             mgr.start();
             // Give the worker a moment to exist.
             Thread.sleep(50);
@@ -466,7 +462,7 @@ public class SegmentManagerTest {
                     SegmentRing ringA = new SegmentRing(MmapSegment.create(dirA + "/0000000000000000.sfa", 0, segSize), segSize);
                     SegmentRing ringB = new SegmentRing(MmapSegment.create(dirB + "/0000000000000000.sfa", 0, segSize), segSize);
                     SegmentRing ringC = new SegmentRing(MmapSegment.create(dirC + "/0000000000000000.sfa", 0, segSize), segSize);
-                    SegmentManager mgr = new SegmentManager(segSize, 200_000L)
+                    SegmentManager mgr = new SegmentManager(segSize)
             ) {
                 mgr.start();
                 mgr.register(ringA, dirA);

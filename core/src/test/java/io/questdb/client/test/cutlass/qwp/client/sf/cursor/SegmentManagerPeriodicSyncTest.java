@@ -64,7 +64,6 @@ public class SegmentManagerPeriodicSyncTest {
 
                 manager = new SegmentManager(
                         segmentSize,
-                        SegmentManager.DEFAULT_POLL_NANOS,
                         segmentSize * 4L,
                         filesFacade,
                         ticks::get);
@@ -149,7 +148,6 @@ public class SegmentManagerPeriodicSyncTest {
                         filesFacade, dir + "/spare.sfa", 2L, segmentSize));
                 manager = new SegmentManager(
                         segmentSize,
-                        SegmentManager.DEFAULT_POLL_NANOS,
                         segmentSize * 4L,
                         filesFacade,
                         ticks::get);
@@ -250,7 +248,6 @@ public class SegmentManagerPeriodicSyncTest {
 
                 manager = new SegmentManager(
                         segmentSize,
-                        SegmentManager.DEFAULT_POLL_NANOS,
                         segmentSize * 8L,
                         filesFacade,
                         ticks::get);
@@ -344,7 +341,6 @@ public class SegmentManagerPeriodicSyncTest {
 
                 manager = new SegmentManager(
                         segmentSize,
-                        SegmentManager.DEFAULT_POLL_NANOS,
                         segmentSize * 8L,
                         filesFacade,
                         ticks::get);
@@ -407,7 +403,6 @@ public class SegmentManagerPeriodicSyncTest {
 
                 manager = new SegmentManager(
                         segmentSize,
-                        SegmentManager.DEFAULT_POLL_NANOS,
                         segmentSize * 4L,
                         filesFacade,
                         ticks::get);
@@ -555,7 +550,6 @@ public class SegmentManagerPeriodicSyncTest {
 
                 manager = new SegmentManager(
                         segmentSize,
-                        SegmentManager.DEFAULT_POLL_NANOS,
                         segmentSize * 4L,
                         filesFacade,
                         ticks::get);

@@ -88,7 +88,7 @@ public class SegmentManagerWatermarkDeregisterRaceTest {
             SegmentRing ring = new SegmentRing(seg0, segSize);
             AckWatermark watermark = AckWatermark.open(slot);
             assertNotNull(watermark);
-            SegmentManager mgr = new SegmentManager(segSize, TimeUnit.SECONDS.toNanos(60));
+            SegmentManager mgr = new SegmentManager(segSize);
             long buf = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
             boolean managerClosed = false;
             boolean watermarkStorageReleased = false;

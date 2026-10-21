@@ -24,8 +24,8 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.test.tools.TestWebSocketClient;
 import io.questdb.client.DefaultHttpClientConfiguration;
-import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
@@ -69,7 +69,6 @@ public class CursorWebSocketSendLoopRotationRaceTest {
     // rescans the sealed list (~FRAMES/FRAMES_PER_SEGMENT entries) on every
     // rotation — keep the product small enough that scan stays cheap.
     private static final int FRAMES = 50_000;
-    private static final long MANAGER_POLL_NANOS = 1_000L; // 1us: keep a hot spare ready
     // Upper bound on the drain wait. A healthy run exits the instant the last
     // frame lands, so this only caps how long a *failing* (frame-dropped) run
     // takes — set high enough that a stalled, overloaded CI box is never
@@ -82,13 +81,13 @@ public class CursorWebSocketSendLoopRotationRaceTest {
             final int n = FRAMES;
 
             SegmentManager manager = new SegmentManager(
-                    SEGMENT_BYTES, MANAGER_POLL_NANOS, SegmentManager.UNLIMITED_TOTAL_BYTES);
+                    SEGMENT_BYTES, SegmentManager.UNLIMITED_TOTAL_BYTES);
             manager.start();
             // sfDir == null => memory-only segments (no files/fds); same trySendOne() path.
             CursorSendEngine engine = new CursorSendEngine(null, SEGMENT_BYTES, manager);
             RecordingClient client = new RecordingClient(n);
             CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
-                    client, engine, 0L, 0L /* busy-spin so the consumer sits on the active tip */,
+                    client, engine, 0L,
                     () -> {
                         throw new UnsupportedOperationException("no reconnect in this test");
                     },
@@ -141,7 +140,7 @@ public class CursorWebSocketSendLoopRotationRaceTest {
      * test never receives ACKs and never reconnects. Only {@code sentCount} is
      * read cross-thread (by the test, for progress) and so is volatile.
      */
-    private static final class RecordingClient extends WebSocketClient {
+    private static final class RecordingClient extends TestWebSocketClient {
         final long[] recorded;
         volatile long sentCount;
         private int recordedCount;

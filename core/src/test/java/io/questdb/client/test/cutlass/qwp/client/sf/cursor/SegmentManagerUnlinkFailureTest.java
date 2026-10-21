@@ -79,7 +79,7 @@ public class SegmentManagerUnlinkFailureTest {
             byte[] originalHigher = java.nio.file.Files.readAllBytes(Paths.get(higherPath));
             FailingFilesFacade facade = new FailingFilesFacade(null, dir, lowerName);
             try (SegmentManager manager = new SegmentManager(
-                    segmentSize, TimeUnit.SECONDS.toNanos(60), segmentSize * 4, facade)) {
+                    segmentSize, segmentSize * 4, facade)) {
                 try {
                     manager.register(ring, dir);
                     Assert.fail("register accepted a partially enumerated SF directory");
@@ -125,7 +125,7 @@ public class SegmentManagerUnlinkFailureTest {
                 FailingFilesFacade facade = new FailingFilesFacade(failedPath, null, null);
                 AtomicLong ticks = new AtomicLong();
                 try (SegmentManager manager = new SegmentManager(
-                        segmentSize, TimeUnit.SECONDS.toNanos(60), segmentSize * 8, facade, ticks::get)) {
+                        segmentSize, segmentSize * 8, facade, ticks::get)) {
                     manager.register(ring, dir, watermark);
                     manager.start();
                     Assert.assertTrue("manager never attempted the injected unlink",
@@ -164,7 +164,7 @@ public class SegmentManagerUnlinkFailureTest {
 
                 facade.allowUnlink();
                 try (SegmentManager retryManager = new SegmentManager(
-                        segmentSize, TimeUnit.SECONDS.toNanos(60), segmentSize * 8, facade)) {
+                        segmentSize, segmentSize * 8, facade)) {
                     retryManager.register(ring, dir, watermark);
                     retryManager.start();
                     retryManager.wakeWorker();

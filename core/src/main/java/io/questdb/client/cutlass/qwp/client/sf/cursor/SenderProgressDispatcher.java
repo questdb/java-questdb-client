@@ -70,9 +70,6 @@ public final class SenderProgressDispatcher implements QuietCloseable {
 
     public static final int DEFAULT_CAPACITY = 256;
     private static final long DRAIN_DEADLINE_NANOS = 100_000_000L; // 100 ms
-    // Park interval used when the mailbox is idle. Bounded so a missed unpark
-    // (e.g. from a future code path) cannot wedge the dispatcher.
-    private static final long IDLE_PARK_NANOS = 100_000_000L; // 100 ms
     private static final Logger LOG = LoggerFactory.getLogger(SenderProgressDispatcher.class);
     // Sentinel for "no value ever offered". Real FSNs are non-negative, so
     // Long.MIN_VALUE is unambiguous and the dispatcher's "deliver if greater
@@ -237,9 +234,11 @@ public final class SenderProgressDispatcher implements QuietCloseable {
             if (closed) {
                 return;
             }
-            // No new value; park until the producer unparks us or the idle
-            // tick fires. Spurious wakeups loop back to the top and re-check.
-            LockSupport.parkNanos(this, IDLE_PARK_NANOS);
+            // No new value; park until offer() or close() unparks us. Both write
+            // their state (latestFsn / closed) before the unpark and this loop
+            // re-reads it before parking, so no wake can be lost.
+            // Spurious wakeups loop back to the top and re-check.
+            LockSupport.park(this);
         }
     }
 

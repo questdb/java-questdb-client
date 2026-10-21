@@ -47,7 +47,6 @@ import java.util.function.BooleanSupplier;
 public class SegmentManagerSharedBudgetTest {
 
     private static final int FRAME_PAYLOAD = 64;
-    private static final long POLL_NANOS = 200_000L;
     // Exactly two frames per segment, so the rotation arithmetic below is exact.
     private static final long SEGMENT_SIZE = MmapSegment.HEADER_SIZE
             + 2 * (MmapSegment.FRAME_HEADER_SIZE + FRAME_PAYLOAD);
@@ -70,7 +69,7 @@ public class SegmentManagerSharedBudgetTest {
             try {
                 for (int i = 0; i < ringCount; i++) {
                     rings[i] = newRing();
-                    managers[i] = new SegmentManager(SEGMENT_SIZE, POLL_NANOS, budget);
+                    managers[i] = new SegmentManager(SEGMENT_SIZE, budget);
                     managers[i].start();
                     managers[i].register(rings[i], null);
                 }
@@ -148,8 +147,8 @@ public class SegmentManagerSharedBudgetTest {
             long buf = Unsafe.malloc(FRAME_PAYLOAD, MemoryTag.NATIVE_DEFAULT);
             try (SegmentRing busy = newRing();
                  SegmentRing sibling = newRing();
-                 SegmentManager busyManager = new SegmentManager(SEGMENT_SIZE, POLL_NANOS, budget);
-                 SegmentManager siblingManager = new SegmentManager(SEGMENT_SIZE, POLL_NANOS, budget)) {
+                 SegmentManager busyManager = new SegmentManager(SEGMENT_SIZE, budget);
+                 SegmentManager siblingManager = new SegmentManager(SEGMENT_SIZE, budget)) {
                 busyManager.start();
                 siblingManager.start();
 

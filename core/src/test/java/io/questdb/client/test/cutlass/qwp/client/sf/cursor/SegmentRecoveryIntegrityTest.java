@@ -611,7 +611,7 @@ public class SegmentRecoveryIntegrityTest {
                 }
             };
             SegmentManager manager = new SegmentManager(
-                    SEGMENT_SIZE, SegmentManager.DEFAULT_POLL_NANOS,
+                    SEGMENT_SIZE,
                     SegmentManager.UNLIMITED_TOTAL_BYTES, facade);
             manager.start();
             try {
@@ -643,7 +643,7 @@ public class SegmentRecoveryIntegrityTest {
                 }
             };
             SegmentManager manager = new SegmentManager(
-                    SEGMENT_SIZE, SegmentManager.DEFAULT_POLL_NANOS,
+                    SEGMENT_SIZE,
                     SegmentManager.UNLIMITED_TOTAL_BYTES, facade);
             manager.start();
             try {

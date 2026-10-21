@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.test.tools.TestWebSocketClient;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
@@ -79,7 +80,6 @@ public class CursorWebSocketSendLoopGracefulCloseTest {
                     null,
                     engine,
                     0L,
-                    CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                     factory,
                     1_000L,
                     5_000L,
@@ -122,7 +122,6 @@ public class CursorWebSocketSendLoopGracefulCloseTest {
                     client,
                     engine,
                     0L,
-                    CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                     null,
                     1_000L,
                     5_000L,
@@ -154,7 +153,7 @@ public class CursorWebSocketSendLoopGracefulCloseTest {
      * Connected client with nothing to receive. Records which thread closes it
      * first and whether anyone broke its traffic.
      */
-    private static final class IdleClient extends WebSocketClient {
+    private static final class IdleClient extends TestWebSocketClient {
         final AtomicReference<Thread> firstCloseThread = new AtomicReference<>();
         final AtomicReference<Thread> pollThread = new AtomicReference<>();
         final CountDownLatch polled = new CountDownLatch(1);
@@ -197,7 +196,7 @@ public class CursorWebSocketSendLoopGracefulCloseTest {
      * Fake in-flight connect: parks until {@link #closeTraffic()} releases it,
      * like a native connect that neither unpark nor interrupt can cancel.
      */
-    private static final class InFlightConnectClient extends WebSocketClient {
+    private static final class InFlightConnectClient extends TestWebSocketClient {
         final CountDownLatch trafficBroken = new CountDownLatch(1);
         final AtomicInteger trafficCloseCount = new AtomicInteger();
 

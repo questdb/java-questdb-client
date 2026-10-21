@@ -88,12 +88,12 @@ public class SegmentManagerTrimDeregisterRaceTest {
             long segSize = MmapSegment.HEADER_SIZE + (MmapSegment.FRAME_HEADER_SIZE + 32);
             long maxTotal = segSize * 8L;
 
-            // Large pollNanos: the worker parks until explicitly woken, so we
-            // own the tick boundaries. SegmentRing fires managerWakeup on
+            // The worker parks until explicitly woken, so we own the tick
+            // boundaries. SegmentRing fires managerWakeup on
             // appendOrFsn whenever a spare is needed, so the producer-driven
             // setup phase still gets prompt service.
             try (SegmentManager mgr = new SegmentManager(
-                    segSize, TimeUnit.SECONDS.toNanos(60), maxTotal)) {
+                    segSize, maxTotal)) {
                 mgr.start();
 
                 String dir = tmpDir + "/single-ring";
@@ -167,9 +167,9 @@ public class SegmentManagerTrimDeregisterRaceTest {
                     // Wait for the worker to park again, which is our signal
                     // that the trim block following the hook has finished
                     // (drain + maybe-subtract + lock release + iteration
-                    // exit). The 60 s pollNanos means TIMED_WAITING is a
-                    // strong signal; with the entry deregistered, no further
-                    // wakeups arrive.
+                    // exit). The worker parks indefinitely between wakeups, so a
+                    // parked state is a strong signal; with the entry
+                    // deregistered, no further wakeups arrive.
                     Thread worker = workerThread(mgr);
                     awaitParked(worker);
 

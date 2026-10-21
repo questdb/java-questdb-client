@@ -1522,14 +1522,26 @@ public class QwpWebSocketSender implements Sender {
             return false;
         }
         long deadlineNanos = System.nanoTime() + timeoutMillis * 1_000_000L;
-        while (getAckedFsn() < targetFsn) {
+        while (true) {
+            // Read the watermark before the comparison: awaitAckProgress() returns
+            // at once if it has moved since, so no ack is slept through.
+            CursorSendEngine engine = cursorEngine;
+            long seen = engine == null ? -1L : engine.ackedFsn();
+            if (getAckedFsn() >= targetFsn) {
+                return true;
+            }
             checkAwaitAckedFsnErrors();
-            if (System.nanoTime() >= deadlineNanos) {
+            long now = System.nanoTime();
+            if (now >= deadlineNanos) {
                 return false;
             }
-            java.util.concurrent.locks.LockSupport.parkNanos(50_000L);
+            CursorWebSocketSendLoop loop = cursorSendLoop;
+            if (loop == null) {
+                java.util.concurrent.locks.LockSupport.parkNanos(this, deadlineNanos - now);
+            } else {
+                loop.awaitAckProgress(seen, deadlineNanos);
+            }
         }
-        return true;
     }
 
     /**
@@ -4870,7 +4882,11 @@ public class QwpWebSocketSender implements Sender {
         long deadlineNanos = System.nanoTime() + closeFlushTimeoutMillis * 1_000_000L;
         restoreInterrupt[0] |= Thread.interrupted();
         try {
-            while (cursorEngine.ackedFsn() < target) {
+            while (true) {
+                long seen = cursorEngine.ackedFsn();
+                if (seen >= target) {
+                    break;
+                }
                 // PoolHousekeeper.stop() escalates to interrupt when this close runs past its join budget. A carried
                 // interrupt makes parkNanos return immediately without clearing the flag, turning the remainder of a
                 // close drain (up to 60s by default) into a full-core spin. Consume any later interrupt before the
@@ -4909,7 +4925,7 @@ public class QwpWebSocketSender implements Sender {
                                     ? " pending batches; data may be lost (use larger closeFlushTimeoutMillis or smaller batches)"
                                     : " pending batches; the wire is not draining: " + outage.getMessage());
                 }
-                java.util.concurrent.locks.LockSupport.parkNanos(50_000L);
+                cursorSendLoop.awaitAckProgress(seen, deadlineNanos);
             }
         } finally {
             // Close the last-iteration race: an interrupt can land after the loop observes its final ACK but
@@ -5024,7 +5040,7 @@ public class QwpWebSocketSender implements Sender {
         try {
             cursorSendLoop = new CursorWebSocketSendLoop(
                     client, cursorEngine,
-                    0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                    0L,
                     reconnectFactory,
                     reconnectInitialBackoffMillis,
                     reconnectMaxBackoffMillis,

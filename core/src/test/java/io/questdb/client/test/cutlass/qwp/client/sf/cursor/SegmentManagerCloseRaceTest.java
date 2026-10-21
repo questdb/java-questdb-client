@@ -87,7 +87,7 @@ public class SegmentManagerCloseRaceTest {
         TestUtils.assertMemoryLeak(() -> {
             // Aggressive 1us poll so the worker is almost always running
             // serviceRing — maximizes overlap with concurrent deregister/close.
-            SegmentManager manager = new SegmentManager(SEGMENT_SIZE, 1_000L,
+            SegmentManager manager = new SegmentManager(SEGMENT_SIZE,
                     Long.MAX_VALUE);
             manager.start();
 
@@ -138,7 +138,7 @@ public class SegmentManagerCloseRaceTest {
             Assert.assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
             MmapSegment initial = MmapSegment.create(slot + "/sf-initial.sfa", 0L, segSize);
             SegmentRing ring = new SegmentRing(initial, segSize);
-            SegmentManager manager = new SegmentManager(segSize, TimeUnit.SECONDS.toNanos(60));
+            SegmentManager manager = new SegmentManager(segSize);
             CountDownLatch workerBlocked = new CountDownLatch(1);
             CountDownLatch releaseWorker = new CountDownLatch(1);
             AtomicBoolean fired = new AtomicBoolean();
@@ -225,7 +225,7 @@ public class SegmentManagerCloseRaceTest {
     public void testStaleSnapshotEntrySkippedAfterDeregisterBeforeServiceClaim() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             long segSize = MmapSegment.HEADER_SIZE + (MmapSegment.FRAME_HEADER_SIZE + 32);
-            SegmentManager manager = new SegmentManager(segSize, TimeUnit.SECONDS.toNanos(60));
+            SegmentManager manager = new SegmentManager(segSize);
             SegmentRing[] rings = new SegmentRing[3];
             String[] slots = new String[3];
             CountDownLatch workerBlocked = new CountDownLatch(1);
@@ -354,7 +354,7 @@ public class SegmentManagerCloseRaceTest {
             Assert.assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
             MmapSegment initial = MmapSegment.create(slot + "/sf-initial.sfa", 0L, segSize);
             SegmentRing ring = new SegmentRing(initial, segSize);
-            SegmentManager manager = new SegmentManager(segSize, TimeUnit.SECONDS.toNanos(60));
+            SegmentManager manager = new SegmentManager(segSize);
             CountDownLatch workerBlocked = new CountDownLatch(1);
             CountDownLatch releaseWorker = new CountDownLatch(1);
             AtomicBoolean fired = new AtomicBoolean();
@@ -438,7 +438,7 @@ public class SegmentManagerCloseRaceTest {
             Assert.assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
             MmapSegment initial = MmapSegment.create(slot + "/sf-initial.sfa", 0L, segSize);
             SegmentRing ring = new SegmentRing(initial, segSize);
-            SegmentManager manager = new SegmentManager(segSize, TimeUnit.SECONDS.toNanos(60));
+            SegmentManager manager = new SegmentManager(segSize);
             CountDownLatch workerBlocked = new CountDownLatch(1);
             CountDownLatch releaseWorker = new CountDownLatch(1);
             CountDownLatch cleanupRan = new CountDownLatch(1);
@@ -526,7 +526,7 @@ public class SegmentManagerCloseRaceTest {
             Assert.assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
             MmapSegment initial = MmapSegment.create(slot + "/sf-initial.sfa", 0L, segSize);
             SegmentRing ring = new SegmentRing(initial, segSize);
-            SegmentManager manager = new SegmentManager(segSize, TimeUnit.SECONDS.toNanos(60));
+            SegmentManager manager = new SegmentManager(segSize);
             CountDownLatch workerBlocked = new CountDownLatch(1);
             CountDownLatch releaseWorker = new CountDownLatch(1);
             AtomicBoolean fired = new AtomicBoolean();
@@ -591,7 +591,7 @@ public class SegmentManagerCloseRaceTest {
             Assert.assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
             MmapSegment initial = MmapSegment.create(slot + "/sf-initial.sfa", 0L, segSize);
             SegmentRing ring = new SegmentRing(initial, segSize);
-            SegmentManager manager = new SegmentManager(segSize, TimeUnit.SECONDS.toNanos(60));
+            SegmentManager manager = new SegmentManager(segSize);
             CountDownLatch workerBlocked = new CountDownLatch(1);
             CountDownLatch releaseWorker = new CountDownLatch(1);
             CountDownLatch closeReturned = new CountDownLatch(1);
@@ -713,7 +713,7 @@ public class SegmentManagerCloseRaceTest {
             Assert.assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
             MmapSegment initial = MmapSegment.create(slot + "/sf-initial.sfa", 0L, segSize);
             SegmentRing ring = new SegmentRing(initial, segSize);
-            SegmentManager manager = new SegmentManager(segSize, TimeUnit.SECONDS.toNanos(60));
+            SegmentManager manager = new SegmentManager(segSize);
             CountDownLatch cleanupEntered = new CountDownLatch(1);
             CountDownLatch releaseCleanup = new CountDownLatch(1);
             AtomicReference<Throwable> err = new AtomicReference<>();

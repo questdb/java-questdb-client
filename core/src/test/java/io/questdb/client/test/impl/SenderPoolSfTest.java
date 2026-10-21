@@ -1626,7 +1626,7 @@ public class SenderPoolSfTest {
 
                 long segSize = io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment.HEADER_SIZE
                         + io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment.FRAME_HEADER_SIZE + 32L;
-                SegmentManager manager = new SegmentManager(segSize, TimeUnit.SECONDS.toNanos(60));
+                SegmentManager manager = new SegmentManager(segSize);
                 CountDownLatch cleanupFinished = new CountDownLatch(1);
                 CountDownLatch workerBlocked = new CountDownLatch(1);
                 CountDownLatch releaseWorker = new CountDownLatch(1);

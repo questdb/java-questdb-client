@@ -98,7 +98,7 @@ public class CursorSendEngineSlotReacquisitionTest {
             String slot = tmpDir + "/slot";
             // 60 s poll: the worker only acts when explicitly woken, so the
             // single pass we park below is the only pass in flight.
-            SegmentManager manager = new SegmentManager(segSize, TimeUnit.SECONDS.toNanos(60));
+            SegmentManager manager = new SegmentManager(segSize);
             CountDownLatch cleanupFinished = new CountDownLatch(1);
             CountDownLatch workerBlocked = new CountDownLatch(1);
             CountDownLatch releaseWorker = new CountDownLatch(1);

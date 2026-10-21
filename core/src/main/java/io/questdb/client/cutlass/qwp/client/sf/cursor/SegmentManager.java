@@ -56,7 +56,13 @@ import java.util.function.LongSupplier;
  */
 public final class SegmentManager implements QuietCloseable {
 
-    public static final long DEFAULT_POLL_NANOS = 1_000_000L; // 1 ms
+    /**
+     * Retry cadence after a failed hot-spare provisioning attempt (disk full,
+     * budget exhausted, I/O error). Nothing else wakes the worker for that
+     * ring until its next rotation or ACK, so the retry needs its own timer.
+     * A wake from SegmentBudget.release() would make it fully event-driven.
+     */
+    public static final long PROVISION_RETRY_NANOS = 10_000_000L; // 10 ms
     public static final long DISK_FULL_LOG_THROTTLE_NANOS = 30_000_000_000L; // 30 s
     public static final long UNLIMITED_TOTAL_BYTES = Long.MAX_VALUE;
     private static final int ENTRY_DEREGISTERED = 3;
@@ -87,6 +93,10 @@ public final class SegmentManager implements QuietCloseable {
     // budget to several managers -- a sender pool does, so sf_max_total_bytes
     // caps all of its senders together.
     private final SegmentBudget budget;
+    // Worker-local: when a hot-spare provisioning attempt fails (disk full, budget
+    // exhausted, I/O error) the worker schedules its own retry here instead of
+    // relying on a tick. Reset every pass; Long.MAX_VALUE = nothing to retry.
+    private long provisionRetryDeadlineNanos = Long.MAX_VALUE;
     private final AtomicLong fileGeneration = new AtomicLong();
     private final FilesFacade filesFacade;
     // Per-ring segment bytes below which the cap check never refuses to
@@ -114,7 +124,6 @@ public final class SegmentManager implements QuietCloseable {
     // otherwise allocate per call. Sized for typical SF directory paths;
     // grows on demand if a longer path is registered. Closed in close().
     private final DirectUtf8Sink pathScratch = new DirectUtf8Sink(256);
-    private final long pollNanos;
     // Reused by the worker thread each tick to snapshot `rings` under the
     // lock without per-tick allocation. Owned exclusively by workerLoop().
     private final ObjList<RingEntry> ringSnapshot = new ObjList<>();
@@ -193,7 +202,6 @@ public final class SegmentManager implements QuietCloseable {
     // returns.
     private boolean scratchFreed;
     private boolean scratchHandedToWorker;
-    private volatile long shortestSyncIntervalNanos = Long.MAX_VALUE;
     private boolean workerLoopExited;
     // volatile: read by awaitRingQuiescence() from arbitrary caller threads
     // while the @TestOnly setter may run on another.
@@ -204,19 +212,13 @@ public final class SegmentManager implements QuietCloseable {
     private volatile Thread workerThread;
 
     public SegmentManager(long segmentSizeBytes) {
-        this(segmentSizeBytes, DEFAULT_POLL_NANOS, UNLIMITED_TOTAL_BYTES);
-    }
-
-    public SegmentManager(long segmentSizeBytes, long pollNanos) {
-        this(segmentSizeBytes, pollNanos, UNLIMITED_TOTAL_BYTES);
+        this(segmentSizeBytes, UNLIMITED_TOTAL_BYTES);
     }
 
     /**
      * Full constructor.
      *
      * @param segmentSizeBytes per-segment file size in bytes
-     * @param pollNanos        how often the worker polls each registered ring;
-     *                         default {@link #DEFAULT_POLL_NANOS}
      * @param maxTotalBytes    upper bound on total bytes the manager tracks
      *                         across all registered rings — counts every segment
      *                         the ring owns (initial active + sealed + hot
@@ -233,40 +235,38 @@ public final class SegmentManager implements QuietCloseable {
      *                         {@code 2 × segmentSizeBytes} so the manager can
      *                         hold an initial active plus one hot spare.
      */
-    public SegmentManager(long segmentSizeBytes, long pollNanos, long maxTotalBytes) {
-        this(segmentSizeBytes, pollNanos, new SegmentBudget(maxTotalBytes), FilesFacade.INSTANCE, System::nanoTime);
+    public SegmentManager(long segmentSizeBytes, long maxTotalBytes) {
+        this(segmentSizeBytes, new SegmentBudget(maxTotalBytes), FilesFacade.INSTANCE, System::nanoTime);
     }
 
     /**
-     * As {@link #SegmentManager(long, long, long)}, but charging
+     * As {@link #SegmentManager(long, long)}, but charging
      * {@code budget}, which other managers may share: its capacity then caps
      * the rings of all of them together. The capacity must allow at least one
      * {@code segmentSizeBytes}.
      */
-    public SegmentManager(long segmentSizeBytes, long pollNanos, SegmentBudget budget) {
-        this(segmentSizeBytes, pollNanos, budget, FilesFacade.INSTANCE, System::nanoTime);
+    public SegmentManager(long segmentSizeBytes, SegmentBudget budget) {
+        this(segmentSizeBytes, budget, FilesFacade.INSTANCE, System::nanoTime);
     }
 
     @TestOnly
-    public SegmentManager(long segmentSizeBytes, long pollNanos, long maxTotalBytes, FilesFacade filesFacade) {
-        this(segmentSizeBytes, pollNanos, new SegmentBudget(maxTotalBytes), filesFacade, System::nanoTime);
+    public SegmentManager(long segmentSizeBytes, long maxTotalBytes, FilesFacade filesFacade) {
+        this(segmentSizeBytes, new SegmentBudget(maxTotalBytes), filesFacade, System::nanoTime);
     }
 
     @TestOnly
     public SegmentManager(
             long segmentSizeBytes,
-            long pollNanos,
             long maxTotalBytes,
             FilesFacade filesFacade,
             LongSupplier ticks
     ) {
-        this(segmentSizeBytes, pollNanos, new SegmentBudget(maxTotalBytes), filesFacade, ticks);
+        this(segmentSizeBytes, new SegmentBudget(maxTotalBytes), filesFacade, ticks);
     }
 
     @TestOnly
     public SegmentManager(
             long segmentSizeBytes,
-            long pollNanos,
             SegmentBudget budget,
             FilesFacade filesFacade,
             LongSupplier ticks
@@ -292,7 +292,6 @@ public final class SegmentManager implements QuietCloseable {
         this.budget = budget;
         this.filesFacade = filesFacade;
         this.segmentSizeBytes = segmentSizeBytes;
-        this.pollNanos = pollNanos;
         // Clamp rather than multiply blind: segmentSizeBytes is user-supplied
         // and only bounded below, so a pathological value would wrap the
         // product negative and make the floor test trivially false -- silently
@@ -628,9 +627,9 @@ public final class SegmentManager implements QuietCloseable {
      * MUST already have its initial active segment in place.
      * <p>
      * Also wires the ring's "I need a spare" wakeup callback to
-     * {@link #wakeWorker()}, so the producer thread can preempt the polling
-     * tick the moment a rotation consumes the spare or the active crosses
-     * the high-water mark — no waiting on the next tick.
+     * {@link #wakeWorker()}, so the producer thread wakes the parked worker
+     * the moment a rotation consumes the spare or the active crosses the
+     * high-water mark.
      */
     public void register(SegmentRing ring, String dir) {
         register(ring, dir, null, 0L);
@@ -713,9 +712,6 @@ public final class SegmentManager implements QuietCloseable {
             budget.charge(ringBytes);
             if (syncIntervalNanos > 0L) {
                 ring.enablePeriodicSync();
-                if (syncIntervalNanos < shortestSyncIntervalNanos) {
-                    shortestSyncIntervalNanos = syncIntervalNanos;
-                }
             }
         }
         ring.setManagerWakeup(managerWakeup);
@@ -726,7 +722,7 @@ public final class SegmentManager implements QuietCloseable {
         // an empty `rings` snapshot, services nothing, then parkNanos
         // (potentially seconds). A new ring whose first append does not
         // cross the high-water mark fires no producer-side wakeup either,
-        // leaving the ring without a spare for the full poll interval.
+        // leaving the ring without a spare until some later event.
         // wakeWorker is cheap (a single LockSupport.unpark) and a no-op
         // when the worker has not been started yet.
         wakeWorker();
@@ -827,7 +823,7 @@ public final class SegmentManager implements QuietCloseable {
     }
 
     /**
-     * Unparks the worker thread out of its poll-park so it processes
+     * Unparks the worker thread out of its idle park so it processes
      * registered rings on the very next loop iteration. Cheap — a single
      * {@code LockSupport.unpark}; safe to call from any thread; idempotent
      * (multiple unparks coalesce into a single permit). No-op if the worker
@@ -960,6 +956,13 @@ public final class SegmentManager implements QuietCloseable {
         return hasMoreTrimmable;
     }
 
+    private void scheduleProvisionRetry() {
+        long at = ticks.getAsLong() + PROVISION_RETRY_NANOS;
+        if (at < provisionRetryDeadlineNanos) {
+            provisionRetryDeadlineNanos = at;
+        }
+    }
+
     private boolean serviceRing0(RingEntry e) {
         boolean memoryMode = e.dir == null;
         if (!memoryMode) {
@@ -1006,6 +1009,7 @@ public final class SegmentManager implements QuietCloseable {
                             sideFileBytes, budget.getCapacityBytes(), segmentSizeBytes);
                     lastDiskFullLogNs = now;
                 }
+                scheduleProvisionRetry();
             } else {
                 if (belowLivenessFloor) {
                     // Exceeding a configured cap is worth saying out loud, and
@@ -1094,6 +1098,7 @@ public final class SegmentManager implements QuietCloseable {
                             memoryMode ? "<memory>" : e.dir, t);
                 }
                 if (!installed) {
+                    scheduleProvisionRetry();
                     budget.release(segmentSizeBytes);
                     if (spare != null) {
                         try {
@@ -1392,6 +1397,7 @@ public final class SegmentManager implements QuietCloseable {
                 // (potentially slow) syscalls during creation/unlink. ringSnapshot
                 // is a thread-confined field — no per-tick allocation.
                 ringSnapshot.clear();
+                provisionRetryDeadlineNanos = Long.MAX_VALUE;
                 synchronized (lock) {
                     for (int i = 0, n = rings.size(); i < n; i++) {
                         ringSnapshot.add(rings.getQuick(i));
@@ -1404,13 +1410,35 @@ public final class SegmentManager implements QuietCloseable {
                         hasMoreTrimmable = true;
                     }
                 }
+                // Event-driven idle: every state change the worker services
+                // wakes it (register/deregister, rotation, high-water publish,
+                // an ACK that completes a sealed segment), so with nothing
+                // trimmable the only timed work left is periodic sync. Park
+                // until the nearest sync deadline, or indefinitely without one.
+                long parkNanos = Long.MAX_VALUE;
+                if (!hasMoreTrimmable) {
+                    long now = ticks.getAsLong();
+                    if (provisionRetryDeadlineNanos != Long.MAX_VALUE) {
+                        parkNanos = Math.max(0L, provisionRetryDeadlineNanos - now);
+                    }
+                    for (int i = 0, n = ringSnapshot.size(); i < n; i++) {
+                        RingEntry e = ringSnapshot.getQuick(i);
+                        if (e.syncIntervalNanos > 0L) {
+                            parkNanos = Math.min(parkNanos, Math.max(0L, e.nextDataSyncNanos - now));
+                        }
+                    }
+                }
                 // Drop strong refs so a deregistered ring becomes collectable
-                // before the next tick (otherwise the snapshot pins it for up
-                // to pollNanos after deregister).
+                // before the next tick (otherwise the snapshot pins it until
+                // the next wakeup).
                 ringSnapshot.clear();
                 if (!running) break;
                 if (!hasMoreTrimmable) {
-                    LockSupport.parkNanos(Math.min(pollNanos, shortestSyncIntervalNanos));
+                    if (parkNanos == Long.MAX_VALUE) {
+                        LockSupport.park(this);
+                    } else if (parkNanos > 0L) {
+                        LockSupport.parkNanos(this, parkNanos);
+                    }
                 }
             }
         } finally {

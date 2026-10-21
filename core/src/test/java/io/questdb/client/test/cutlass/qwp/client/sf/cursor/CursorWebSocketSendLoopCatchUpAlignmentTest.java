@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.test.tools.TestWebSocketClient;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.line.LineSenderException;
@@ -1144,7 +1145,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
             CursorWebSocketSendLoop[] loopRef = new CursorWebSocketSendLoop[1];
             try (CursorSendEngine engine = newEngine()) {
                 CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
-                        null, engine, 0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                        null, engine, 0L,
                         () -> {
                             int call = ++reconnectCalls[0];
                             if (call < maxAttempts) {
@@ -1323,7 +1324,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
             CursorSendEngine engine, WebSocketClient client, long capGapWindowMillis
     ) {
         return new CursorWebSocketSendLoop(
-                client, engine, 0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                client, engine, 0L,
                 () -> {
                     throw new UnsupportedOperationException("test loop is never started");
                 },
@@ -1340,7 +1341,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         // Deliberately use the compatibility overload: its safe default must remain the
         // foreground RETRY_FOREVER policy for external callers.
         return new CursorWebSocketSendLoop(
-                client, engine, 0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                client, engine, 0L,
                 () -> {
                     throw new UnsupportedOperationException("test loop is never started");
                 },
@@ -1425,7 +1426,6 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                         // A 160-byte cap against a 200-byte mirror entry: the catch-up
                         // cannot re-register it, which is a genuine cap gap.
                         new CatchUpCapturingClient(160), engine, 0L,
-                        CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                         () -> {
                             // First point after the entry guard; the no-cap client lets
                             // the ensuing catch-up succeed so the loop exits promptly.
@@ -1642,7 +1642,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
     // catch-up split; sendBinary counts the frames the catch-up emitted, or --
     // when throwOnSend is set -- raises a transient wire error to model the fresh
     // connection dropping mid-catch-up.
-    private static final class CatchUpCapturingClient extends WebSocketClient {
+    private static final class CatchUpCapturingClient extends TestWebSocketClient {
         // Mutable so a test can model a rolling-cap cluster: raise it for a node that
         // accepts the dictionary, lower it for a smaller-cap node that cap-gaps.
         private int cap;

@@ -164,6 +164,34 @@ public final class Net {
 
     public static native int socketUdp();
 
+    /**
+     * Doorbell for a thread blocked in {@link #pollReadable}: an {@code eventfd}
+     * on Linux, a kqueue {@code EVFILT_USER} on macOS/FreeBSD, a manual-reset
+     * Event on Windows. Returns a non-negative handle, or -1 on failure (errno
+     * set). Release with {@link #doorbellClose}, never with a socket close.
+     */
+    public static native int doorbellCreate();
+
+    /**
+     * Clears every pending ring (non-blocking).
+     */
+    public static native void doorbellDrain(int doorbell);
+
+    /**
+     * Rings the doorbell; a repeat ring is a no-op. Returns 0, or -1 on failure.
+     */
+    public static native int doorbellRing(int doorbell);
+
+    public static native void doorbellClose(int doorbell);
+
+    /**
+     * Blocks until {@code socketFd} is readable (or hung up), {@code doorbell}
+     * rings, or {@code timeoutMillis} elapses (negative = no timeout). Returns
+     * positive when ready, 0 on timeout or signal, -1 on error (errno set).
+     * Callers re-check their inputs after every return.
+     */
+    public static native int pollReadable(int socketFd, int doorbell, int timeoutMillis);
+
     private static native void freeAddrInfo0(long pAddrInfo);
 
     private static native void freeSockAddr0(long sockaddr);

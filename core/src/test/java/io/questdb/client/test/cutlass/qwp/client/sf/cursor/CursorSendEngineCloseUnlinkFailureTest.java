@@ -43,7 +43,6 @@ import java.nio.file.Paths;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.util.Set;
-import java.util.concurrent.TimeUnit;
 
 /**
  * Regression for the close-time segment cleanup on a fully-drained slot.
@@ -88,7 +87,7 @@ public class CursorSendEngineCloseUnlinkFailureTest {
             String slot = tmpDir + "/slot";
             Path slotPath = Paths.get(slot);
             long payload = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
-            SegmentManager manager = new SegmentManager(segmentSize, TimeUnit.SECONDS.toNanos(60));
+            SegmentManager manager = new SegmentManager(segmentSize);
             CursorSendEngine pred = null;
             CursorSendEngine succ = null;
             boolean slotDirReadOnly = false;

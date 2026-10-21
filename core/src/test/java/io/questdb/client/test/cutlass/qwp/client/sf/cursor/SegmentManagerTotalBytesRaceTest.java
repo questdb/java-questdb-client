@@ -93,7 +93,7 @@ public class SegmentManagerTotalBytesRaceTest {
             long maxTotal = segSize * 8L;
 
             try (SegmentManager mgr = new SegmentManager(
-                    segSize, TimeUnit.SECONDS.toNanos(60), maxTotal)) {
+                    segSize, maxTotal)) {
                 String dir = tmpDir + "/single-ring";
                 assertEquals(0, Files.mkdir(dir, Files.DIR_MODE_DEFAULT));
                 String activePath = dir + "/sf-initial.sfa";
@@ -149,8 +149,8 @@ public class SegmentManagerTotalBytesRaceTest {
 
                     // Wait for the worker to park again. With the entry
                     // deregistered, the next loop iteration finds rings
-                    // empty and parks for the full 60 s pollNanos. That
-                    // TIMED_WAITING transition is the test's signal that
+                    // empty and parks until the next wakeup. That parked
+                    // state is the test's signal that
                     // the worker has finished serviceRing -- including the
                     // stillRegistered re-check and the (skipped) commit --
                     // so readTotalBytes below observes the final state.

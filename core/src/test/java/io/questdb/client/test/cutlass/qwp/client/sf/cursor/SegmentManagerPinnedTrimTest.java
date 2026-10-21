@@ -47,7 +47,7 @@ public class SegmentManagerPinnedTrimTest {
 
                 CountDownLatch trimPass = new CountDownLatch(1);
                 try (SegmentManager manager = new SegmentManager(
-                        segmentSize, TimeUnit.SECONDS.toNanos(60), segmentSize * 8L)) {
+                        segmentSize, segmentSize * 8L)) {
                     manager.setBeforeTrimSyncHook(trimPass::countDown);
                     manager.register(ring, null);
                     manager.start();
@@ -63,7 +63,7 @@ public class SegmentManagerPinnedTrimTest {
 
                 ring.releasePinnedSegmentForTest(pinned);
                 try (SegmentManager manager = new SegmentManager(
-                        segmentSize, TimeUnit.SECONDS.toNanos(60), segmentSize * 8L)) {
+                        segmentSize, segmentSize * 8L)) {
                     manager.register(ring, null);
                     manager.start();
                     awaitTrimmed(ring);

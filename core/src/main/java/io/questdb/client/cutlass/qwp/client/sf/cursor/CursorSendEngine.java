@@ -108,6 +108,10 @@ public final class CursorSendEngine implements QuietCloseable {
     // many engines (one per Sender), the caller owns and closes it.
     private final boolean ownsManager;
     private final SegmentRing ring;
+    // Rings the I/O loop's doorbell after a frame is published, so the loop
+    // can block instead of polling publishedFsn().
+    // Installed by CursorWebSocketSendLoop; null until a loop attaches.
+    private volatile Runnable ioWakeup;
     private final long segmentSizeBytes;
     private final String sfDir;
     private final long syncIntervalNanos;
@@ -372,7 +376,7 @@ public final class CursorSendEngine implements QuietCloseable {
         }
         if (ownsManager && manager == null) {
             manager = new SegmentManager(
-                    segmentSizeBytes, SegmentManager.DEFAULT_POLL_NANOS, budget);
+                    segmentSizeBytes, budget);
         }
         SlotLock acquiredLock = null;
         if (!memoryMode) {
@@ -934,7 +938,7 @@ public final class CursorSendEngine implements QuietCloseable {
      */
     public long appendBlocking(long payloadAddr, int payloadLen) {
         long fsn = ring.appendOrFsn(payloadAddr, payloadLen);
-        if (fsn >= 0) return fsn;
+        if (fsn >= 0) return published(fsn);
         if (fsn == SegmentRing.PAYLOAD_TOO_LARGE) {
             throw new MmapSegmentException("payload too large for segment");
         }
@@ -958,7 +962,7 @@ public final class CursorSendEngine implements QuietCloseable {
             }
             LockSupport.parkNanos(50_000L); // 50 µs
             fsn = ring.appendOrFsn(payloadAddr, payloadLen);
-            if (fsn >= 0) return fsn;
+            if (fsn >= 0) return published(fsn);
             if (fsn == SegmentRing.PAYLOAD_TOO_LARGE) {
                 throw new MmapSegmentException("payload too large for segment");
             }
@@ -978,7 +982,7 @@ public final class CursorSendEngine implements QuietCloseable {
     public long appendOrFsn(long payloadAddr, int payloadLen, long spinDeadlineNanos) {
         long fsn = ring.appendOrFsn(payloadAddr, payloadLen);
         if (fsn >= 0) {
-            return fsn;
+            return published(fsn);
         }
         if (fsn == SegmentRing.PAYLOAD_TOO_LARGE) {
             return fsn;
@@ -989,11 +993,30 @@ public final class CursorSendEngine implements QuietCloseable {
         while (System.nanoTime() < spinDeadlineNanos) {
             Compat.onSpinWait();
             fsn = ring.appendOrFsn(payloadAddr, payloadLen);
-            if (fsn >= 0 || fsn == SegmentRing.PAYLOAD_TOO_LARGE) {
+            if (fsn >= 0) {
+                return published(fsn);
+            }
+            if (fsn == SegmentRing.PAYLOAD_TOO_LARGE) {
                 return fsn;
             }
         }
         return SegmentRing.BACKPRESSURE_NO_SPARE;
+    }
+
+    /**
+     * Callback run after every successful append; every producer path goes
+     * through the append methods, so this is the single wake point.
+     */
+    public void setIoWakeup(Runnable wakeup) {
+        this.ioWakeup = wakeup;
+    }
+
+    private long published(long fsn) {
+        Runnable w = ioWakeup;
+        if (w != null) {
+            w.run();
+        }
+        return fsn;
     }
 
     public void checkDurability() {

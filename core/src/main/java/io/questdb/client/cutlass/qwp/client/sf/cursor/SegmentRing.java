@@ -993,6 +993,11 @@ public final class SegmentRing implements QuietCloseable {
         }
         if (seq > ackedFsn) {
             ackedFsn = seq;
+            // Trim is ACK-driven: the manager no longer polls for it, so tell it
+            // when this ACK completes the oldest sealed segment.
+            if (firstTrimmable() != null) {
+                wakeManager();
+            }
             return true;
         }
         return false;

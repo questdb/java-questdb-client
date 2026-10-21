@@ -85,7 +85,7 @@ public class SegmentManagerRecoveryCapTest {
             SegmentRing ring = SegmentRing.openExisting(slotDir, SEGMENT_SIZE);
             Assert.assertNotNull("recovery should produce a ring", ring);
 
-            SegmentManager manager = new SegmentManager(SEGMENT_SIZE, 1_000_000L /* 1ms */, cap);
+            SegmentManager manager = new SegmentManager(SEGMENT_SIZE, cap);
             try (SegmentManager ignored = manager) {
                 manager.start();
                 manager.register(ring, slotDir);
