@@ -316,7 +316,20 @@ class QwpColumnWriter {
     }
 
     void encodeTable(QwpTableBuffer tableBuffer, boolean useGlobalSymbols, boolean useGorilla) {
-        encodeTable(tableBuffer, tableBuffer.getRowCount(), null, null, null, useGlobalSymbols, useGorilla);
+        if (tableBuffer.hasHeldRow()) {
+            // the table buffer keeps the held row in its columns; this writer encodes only the rows before it
+            encodeTable(
+                    tableBuffer,
+                    tableBuffer.getRowCount(),
+                    tableBuffer.getHeldValueCounts(),
+                    tableBuffer.getHeldStringDataSizes(),
+                    tableBuffer.getHeldSymbolDictionarySizes(),
+                    useGlobalSymbols,
+                    useGorilla
+            );
+        } else {
+            encodeTable(tableBuffer, tableBuffer.getRowCount(), null, null, null, useGlobalSymbols, useGorilla);
+        }
     }
 
     void encodeTable(

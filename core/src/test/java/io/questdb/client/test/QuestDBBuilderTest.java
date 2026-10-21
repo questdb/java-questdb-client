@@ -29,6 +29,8 @@ import io.questdb.client.QuestDB;
 import io.questdb.client.QuestDBBuilder;
 import io.questdb.client.Query;
 import io.questdb.client.Sender;
+import io.questdb.client.impl.ConfigString;
+import io.questdb.client.impl.ConfigView;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
 import org.junit.Test;
@@ -239,6 +241,166 @@ public class QuestDBBuilderTest {
                 "wss::addr=127.0.0.1:1;tls_roots=/ca.pem;tls_verify=unsafe_off;sender_pool_min=0;query_pool_min=0;",
                 "tls_roots cannot be combined with tls_verify=unsafe_off"
         );
+    }
+
+    @Test
+    public void testFlushOnCloseBuilderCallOverridesString() {
+        QuestDBBuilder b = QuestDB.builder()
+                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=off;")
+                .flushOnClose(true);
+        try (QuestDB ignored = b.build()) {
+            Assert.assertEquals(Boolean.TRUE, b.poolConfigSnapshotForTest().get("flush_on_close"));
+        }
+    }
+
+    @Test
+    public void testFlushOnCloseKeyParsedAndSnapshotted() {
+        QuestDBBuilder on = QuestDB.builder()
+                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=on;");
+        try (QuestDB ignored = on.build()) {
+            Assert.assertEquals(Boolean.TRUE, on.poolConfigSnapshotForTest().get("flush_on_close"));
+        }
+        QuestDBBuilder dflt = QuestDB.builder()
+                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;");
+        try (QuestDB ignored = dflt.build()) {
+            Assert.assertEquals("default is off", Boolean.FALSE, dflt.poolConfigSnapshotForTest().get("flush_on_close"));
+        }
+        QuestDBBuilder t = QuestDB.builder()
+                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=true;");
+        try (QuestDB ignored = t.build()) {
+            Assert.assertEquals(Boolean.TRUE, t.poolConfigSnapshotForTest().get("flush_on_close"));
+        }
+        QuestDBBuilder f = QuestDB.builder()
+                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=false;");
+        try (QuestDB ignored = f.build()) {
+            Assert.assertEquals(Boolean.FALSE, f.poolConfigSnapshotForTest().get("flush_on_close"));
+        }
+    }
+
+    @Test
+    public void testFlushOnCloseRejectsInvalidValue() {
+        assertBuildRejected(
+                "ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=maybe;",
+                "flush_on_close");
+    }
+
+    @Test
+    public void testCommitWindowKeysParsedWithDefaults() {
+        QuestDBBuilder rowsOnly = QuestDB.builder()
+                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=on;commit_rows=500;");
+        try (QuestDB ignored = rowsOnly.build()) {
+            Assert.assertEquals(500, rowsOnly.poolConfigSnapshotForTest().get("commit_rows"));
+            Assert.assertEquals("interval defaults to the auto-flush default", 100L, rowsOnly.poolConfigSnapshotForTest().get("commit_interval_ms"));
+        }
+        QuestDBBuilder intervalOnly = QuestDB.builder()
+                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=on;commit_interval_ms=250;");
+        try (QuestDB ignored = intervalOnly.build()) {
+            Assert.assertEquals("rows default to the auto-flush default", 1000, intervalOnly.poolConfigSnapshotForTest().get("commit_rows"));
+            Assert.assertEquals(250L, intervalOnly.poolConfigSnapshotForTest().get("commit_interval_ms"));
+        }
+        QuestDBBuilder none = QuestDB.builder()
+                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;");
+        try (QuestDB ignored = none.build()) {
+            Assert.assertEquals("no window", 0, none.poolConfigSnapshotForTest().get("commit_rows"));
+            Assert.assertEquals(0L, none.poolConfigSnapshotForTest().get("commit_interval_ms"));
+        }
+    }
+
+    @Test
+    public void testCommitWindowBuilderCallsOverrideString() {
+        QuestDBBuilder b = QuestDB.builder()
+                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=on;commit_rows=500;")
+                .commitRows(7)
+                .commitIntervalMillis(9L);
+        try (QuestDB ignored = b.build()) {
+            Assert.assertEquals(7, b.poolConfigSnapshotForTest().get("commit_rows"));
+            Assert.assertEquals(9L, b.poolConfigSnapshotForTest().get("commit_interval_ms"));
+        }
+    }
+
+    @Test
+    public void testSettleIntervalTakesShorterOfAutoFlushAndCommitIntervals() {
+        ConfigView v = new ConfigView(ConfigString.parse("ws::addr=127.0.0.1:1;auto_flush_interval=250;"));
+        Assert.assertEquals(40L, QuestDBBuilder.resolveSettleIntervalMillis(v, 40L));
+        Assert.assertEquals(250L, QuestDBBuilder.resolveSettleIntervalMillis(v, 900L));
+        Assert.assertEquals(250L, QuestDBBuilder.resolveSettleIntervalMillis(v, 0L));
+        ConfigView unset = new ConfigView(ConfigString.parse("ws::addr=127.0.0.1:1;"));
+        Assert.assertEquals(40L, QuestDBBuilder.resolveSettleIntervalMillis(unset, 40L));
+        Assert.assertEquals(100L, QuestDBBuilder.resolveSettleIntervalMillis(unset, 900L));
+    }
+
+    @Test
+    public void testWindowInjectsTransactionOnIntoIngestConfig() {
+        QuestDBBuilder b = QuestDB.builder()
+                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=on;commit_rows=10;");
+        try (QuestDB ignored = b.build()) {
+            Assert.assertTrue(b.ingestConfigForTest().startsWith("ws::transaction=on;"));
+        }
+        QuestDBBuilder explicitOn = QuestDB.builder()
+                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=on;commit_rows=10;transaction=on;");
+        try (QuestDB ignored = explicitOn.build()) {
+            String resolved = explicitOn.ingestConfigForTest();
+            Assert.assertEquals(resolved, resolved.indexOf("transaction=on;"), resolved.lastIndexOf("transaction=on;"));
+            Assert.assertTrue(resolved.contains("transaction=on;"));
+        }
+        QuestDBBuilder none = QuestDB.builder()
+                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;");
+        try (QuestDB ignored = none.build()) {
+            Assert.assertFalse(none.ingestConfigForTest().contains("transaction="));
+        }
+    }
+
+    @Test
+    public void testWindowWithTransactionOffIsRejected() {
+        assertBuildRejected(
+                "ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=on;commit_rows=10;transaction=off;",
+                "transaction");
+    }
+
+    @Test
+    public void testWindowWithoutFlushOnCloseIsRejected() {
+        assertBuildRejected(
+                "ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;commit_rows=10;",
+                "flush_on_close");
+        assertBuildRejected(
+                "ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=off;commit_interval_ms=10;",
+                "flush_on_close");
+    }
+
+    @Test
+    public void testBuildTwiceWithoutWindowStaysWindowless() {
+        QuestDBBuilder b = QuestDB.builder()
+                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;");
+        for (int i = 0; i < 2; i++) {
+            try (QuestDB ignored = b.build()) {
+                Assert.assertEquals(0, b.poolConfigSnapshotForTest().get("commit_rows"));
+                Assert.assertEquals(0L, b.poolConfigSnapshotForTest().get("commit_interval_ms"));
+                Assert.assertFalse(b.ingestConfigForTest().contains("transaction="));
+            }
+        }
+    }
+
+    @Test
+    public void testCommitWindowStringKeysBelowOneAreRejected() {
+        assertBuildRejected(
+                "ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=on;commit_rows=0;",
+                "commit_rows");
+        assertBuildRejected(
+                "ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=on;commit_interval_ms=-5;",
+                "commit_interval_ms");
+    }
+
+    @Test
+    public void testSettleIntervalFollowsAutoFlushInterval() {
+        // The WebSocket transport rejects both auto_flush=off and
+        // auto_flush_interval=off, so the interval is unset (the sender's
+        // 100 ms default) or a number (underscore separators allowed).
+        ConfigView dflt = new ConfigView(ConfigString.parse("ws::addr=127.0.0.1:1;"));
+        Assert.assertEquals(100L, QuestDBBuilder.resolveSettleIntervalMillis(dflt, 0L));
+        ConfigView explicit = new ConfigView(ConfigString.parse("ws::addr=127.0.0.1:1;auto_flush_interval=250;"));
+        Assert.assertEquals(250L, QuestDBBuilder.resolveSettleIntervalMillis(explicit, 0L));
+        ConfigView underscored = new ConfigView(ConfigString.parse("ws::addr=127.0.0.1:1;auto_flush_interval=1_000;"));
+        Assert.assertEquals(1_000L, QuestDBBuilder.resolveSettleIntervalMillis(underscored, 0L));
     }
 
     @Test

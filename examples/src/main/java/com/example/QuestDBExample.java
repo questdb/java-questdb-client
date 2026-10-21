@@ -33,9 +33,10 @@ public class QuestDBExample {
         try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;");
              Query q = db.borrowQuery()) {
 
-            // Ingest: borrow a Sender, write rows, close() flushes it and
-            // returns it to the pool. The WebSocket is NOT torn down here --
-            // a real disconnect only happens at db.close().
+            // Ingest: borrow a Sender, write rows, close() returns it to the pool.
+            // Close releases, flush ships, drain waits: the rows go out on the next
+            // auto-flush threshold or the pool's settle. The WebSocket is NOT torn
+            // down here -- a real disconnect only happens at db.close().
             try (Sender sender = db.borrowSender()) {
                 sender.table("trades")
                         .symbol("symbol", "ETH-USD")

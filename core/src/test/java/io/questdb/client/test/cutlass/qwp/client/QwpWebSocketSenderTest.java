@@ -123,6 +123,24 @@ public class QwpWebSocketSenderTest {
     }
 
     @Test
+    public void testApplyServerBatchSizeLimit_serverCapBoundFollowsAdvertisedCap() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                    "localhost", 9000,
+                    /*autoFlushRows*/ 1000,
+                    /*autoFlushBytes*/ QwpWebSocketSender.AUTO_FLUSH_BYTES_SERVER_CAP,
+                    /*autoFlushIntervalNanos*/ 0L)) {
+                Assert.assertEquals("no byte trigger before the handshake", 0, sender.getEffectiveAutoFlushBytes());
+                sender.applyServerBatchSizeLimit(16 * 1024 * 1024);
+                Assert.assertEquals("90% of the advertised cap", (long) (16 * 1024 * 1024) * 9 / 10, sender.getEffectiveAutoFlushBytes());
+                Assert.assertEquals(16 * 1024 * 1024, sender.getServerMaxBatchSize());
+                sender.applyServerBatchSizeLimit(0);
+                Assert.assertEquals("a node that advertises no cap: no byte trigger", 0, sender.getEffectiveAutoFlushBytes());
+            }
+        });
+    }
+
+    @Test
     public void testAtAfterCloseThrows() throws Exception {
         assertMemoryLeak(() -> {
             QwpWebSocketSender sender = createUnconnectedSender();

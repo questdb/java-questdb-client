@@ -33,6 +33,11 @@ import java.util.concurrent.TimeUnit;
  */
 final class PoolHousekeeper {
 
+    // Wait between startup-recovery steps that did not find more work to do at
+    // once: a finished scan, an empty one, or a transient failure such as an
+    // unreachable server. The same cadence SenderPool's private driver uses, and
+    // deliberately not the settle cadence, which can be 50 ms.
+    static final long STARTUP_RECOVERY_RETRY_MILLIS = SenderPool.RECOVERY_RETRY_INTERVAL_MILLIS;
     // How long stop() waits for the daemon to exit. Kept ABOVE
     // SenderPool.RECOVERY_DRAIN_BUDGET_MILLIS so a startup-recovery drain still
     // in flight when close() arrives finishes well within this join (C1 fix).
@@ -48,16 +53,26 @@ final class PoolHousekeeper {
     static final long STOP_TIMEOUT_MILLIS = 2_000;
 
     private final long intervalMillis;
+    private final long originNanos = System.nanoTime();
     private final QueryClientPool queryPool;
     private final SenderPool senderPool;
+    private final long settleIntervalMillis;
     private final Object signalLock = new Object();
     private final Thread thread;
     private volatile boolean stop;
 
-    PoolHousekeeper(SenderPool senderPool, QueryClientPool queryPool, long intervalMillis) {
+    /**
+     * @param intervalMillis       reap cadence: idle and over-age slots
+     * @param settleIntervalMillis settle cadence: ships rows left in idle slots;
+     *                             {@code auto_flush_interval} (100 ms when
+     *                             unset), or the commit interval when that is
+     *                             shorter
+     */
+    PoolHousekeeper(SenderPool senderPool, QueryClientPool queryPool, long intervalMillis, long settleIntervalMillis) {
         this.senderPool = senderPool;
         this.queryPool = queryPool;
         this.intervalMillis = intervalMillis;
+        this.settleIntervalMillis = Math.max(1L, settleIntervalMillis);
         this.thread = new Thread(this::runLoop, "questdb-pool-housekeeper");
         this.thread.setDaemon(true);
     }
@@ -123,6 +138,16 @@ final class PoolHousekeeper {
     }
 
     /**
+     * {@code nowMillis + intervalMillis}, saturating at {@link Long#MAX_VALUE}
+     * so an interval of {@code Long.MAX_VALUE} ("never") does not wrap negative
+     * and either stall every other deadline or fire at once.
+     */
+    static long deadline(long nowMillis, long intervalMillis) {
+        long d = nowMillis + intervalMillis;
+        return d < nowMillis ? Long.MAX_VALUE : d;
+    }
+
+    /**
      * Waits up to the supplied budget without letting cancellation skip the caller's remaining shutdown
      * work. Every {@link InterruptedException} clears the caller's flag, so remember it and spend only the
      * remainder of the original budget before handing the information back to {@link #stop()}.
@@ -151,7 +176,15 @@ final class PoolHousekeeper {
         return callerWasInterrupted;
     }
 
+    private long monotonicMillis() {
+        return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - originNanos);
+    }
+
     private void runLoop() {
+        long startMillis = monotonicMillis();
+        long nextSettleAt = deadline(startMillis, settleIntervalMillis);
+        long nextReapAt = deadline(startMillis, intervalMillis);
+        long nextRecoveryAt = startMillis;
         while (!stop) {
             // Per-slot startup SF recovery, driven on THIS (the reap-loop)
             // thread, one stranded slot per iteration. Doing it here rather than
@@ -167,49 +200,76 @@ final class PoolHousekeeper {
             // sole residual overrun is an in-flight connect to a black-holed
             // host, which no interrupt breaks. See SenderPool.recoverOneSlotStep.
             // While recovery still has work we skip the idle wait so the backlog
-            // drains promptly; once done we fall back to the normal interval.
-            // No-op once recovery completes or the pool is closing. Best-effort:
+            // drains promptly; otherwise the step is retried every
+            // STARTUP_RECOVERY_RETRY_MILLIS until the pool reports it done, and
+            // stays cheap after that. A no-op once recovery completes or the
+            // pool is closing. Best-effort:
             // a recovery failure (including an Error) must never kill this
             // daemon, so swallow Throwable -- exactly as the reap guards below.
-            boolean recovering;
-            try {
-                recovering = senderPool.runStartupRecoveryStep();
-            } catch (Throwable ignored) {
-                recovering = false;
+            boolean recovering = false;
+            if (monotonicMillis() >= nextRecoveryAt) {
+                try {
+                    recovering = senderPool.runStartupRecoveryStep();
+                } catch (Throwable ignored) {
+                    recovering = false;
+                }
+                // A step with more work runs again at once. A step that finished,
+                // found nothing or hit a transient failure is retried on its own
+                // cadence, never on the settle cadence: a stranded slot against an
+                // unreachable server must not become a hot connect loop.
+                long afterStep = monotonicMillis();
+                nextRecoveryAt = recovering ? afterStep : deadline(afterStep, STARTUP_RECOVERY_RETRY_MILLIS);
             }
             synchronized (signalLock) {
                 if (stop) {
                     return;
                 }
                 if (!recovering) {
-                    try {
-                        signalLock.wait(intervalMillis);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        return;
+                    long nextAt = Math.min(Math.min(nextSettleAt, nextReapAt), nextRecoveryAt);
+                    long waitMillis = nextAt - monotonicMillis();
+                    if (waitMillis > 0) {
+                        try {
+                            signalLock.wait(waitMillis);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
                     }
                 }
             }
             if (stop) {
                 return;
             }
-            try {
-                senderPool.reapIdle();
-            } catch (Throwable ignored) {
-                // Defensive, intentionally unreachable in normal operation:
-                // SenderPool.reapIdle() already swallows per-delegate close()
-                // failures internally. The outer catch is a belt-and-braces
-                // guard. Reaping must not propagate -- it's best-effort
-                // housekeeping. Catch Throwable (not just RuntimeException) so
-                // an Error from a delegate teardown can never kill this daemon
-                // thread and stop all future reaping for the life of the handle.
+            long now = monotonicMillis();
+            if (now >= nextSettleAt) {
+                try {
+                    senderPool.settleIdle();
+                } catch (Throwable ignored) {
+                    // Best-effort: settleIdle() already guards per-slot
+                    // failures; a Throwable here must never kill the daemon.
+                }
+                nextSettleAt = deadline(monotonicMillis(), settleIntervalMillis);
             }
-            try {
-                queryPool.reapIdle();
-            } catch (Throwable ignored) {
-                // Same rationale as the senderPool guard above: best-effort,
-                // must never propagate, and Throwable (not RuntimeException) so
-                // an Error from query-client teardown cannot kill the daemon.
+            if (now >= nextReapAt) {
+                try {
+                    senderPool.reapIdle();
+                } catch (Throwable ignored) {
+                    // Defensive, intentionally unreachable in normal operation:
+                    // SenderPool.reapIdle() already swallows per-delegate close()
+                    // failures internally. The outer catch is a belt-and-braces
+                    // guard. Reaping must not propagate -- it's best-effort
+                    // housekeeping. Catch Throwable (not just RuntimeException) so
+                    // an Error from a delegate teardown can never kill this daemon
+                    // thread and stop all future reaping for the life of the handle.
+                }
+                try {
+                    queryPool.reapIdle();
+                } catch (Throwable ignored) {
+                    // Same rationale as the senderPool guard above: best-effort,
+                    // must never propagate, and Throwable (not RuntimeException) so
+                    // an Error from query-client teardown cannot kill the daemon.
+                }
+                nextReapAt = deadline(now, intervalMillis);
             }
         }
     }

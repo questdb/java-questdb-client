@@ -451,6 +451,13 @@ public class SymbolDictRecycleSlotHealTest {
                         TestUtils.assertContains(expected.getMessage(),
                                 "sender is terminal: symbol dictionary recycle failed");
                     }
+                    try {
+                        sender.checkError();
+                        Assert.fail("the probe must report the latch");
+                    } catch (LineSenderException expected) {
+                        TestUtils.assertContains(expected.getMessage(),
+                                "sender is terminal: symbol dictionary recycle failed");
+                    }
                     sender.close(); // must still work
                 }
             }

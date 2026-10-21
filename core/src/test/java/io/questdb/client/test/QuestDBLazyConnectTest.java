@@ -66,14 +66,14 @@ public class QuestDBLazyConnectTest {
             // Return the lease before db.close(): a borrowed sender left
             // outstanding makes close() wait out the acquire timeout and then
             // leak the delegate (close() never tears down a borrowed sender --
-            // C1). The server never comes up here, so the close-flush may
-            // legitimately fail once the tiny reconnect budget (200ms) is
-            // spent; either way the lease comes home -- a failed flush routes
-            // the delegate to discardBroken on this thread.
+            // C1). The server never comes up here, so the release itself ships
+            // nothing, but a latched connect error can surface at close;
+            // either way the lease comes home -- the pool retires the slot
+            // (retireLease) on this thread.
             try {
                 sender.close();
             } catch (RuntimeException ignored) {
-                // acceptable: flush against the never-up server
+                // acceptable: the server never came up, so a latched connect error can surface here
             }
         }
     }
@@ -106,7 +106,7 @@ public class QuestDBLazyConnectTest {
             try {
                 sender.close();
             } catch (RuntimeException ignored) {
-                // acceptable: the close-flush runs against a server that never came up
+                // acceptable: a latched connect error can surface at close against a server that never came up
             }
         }
         // Deliberately not asserting a pull count. The async connect thread may or may not have attempted
