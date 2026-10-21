@@ -1426,8 +1426,8 @@ public final class SegmentManager implements QuietCloseable {
                 // wakes it (register/deregister, rotation, high-water publish,
                 // the first ACK past the watermark, an ACK that completes a
                 // sealed segment). Timed work: periodic sync, a provision retry,
-                // and re-persisting the watermark while ACKs keep landing.
-                // Otherwise park indefinitely.
+                // a failed trim's retry, and re-persisting the watermark while
+                // ACKs keep landing. Otherwise park indefinitely.
                 long parkNanos = Long.MAX_VALUE;
                 if (!hasMoreTrimmable) {
                     long now = ticks.getAsLong();
@@ -1438,6 +1438,9 @@ public final class SegmentManager implements QuietCloseable {
                         RingEntry e = ringSnapshot.getQuick(i);
                         if (e.syncIntervalNanos > 0L) {
                             parkNanos = Math.min(parkNanos, Math.max(0L, e.nextDataSyncNanos - now));
+                        }
+                        if (e.trimRetryDelayNanos != 0L) {
+                            parkNanos = Math.min(parkNanos, Math.max(0L, e.trimRetryAtNanos - now));
                         }
                         // Dekker with SegmentRing.acknowledge: it writes ackedFsn
                         // then reads persistedAckFsn; we wrote persistedAckFsn
