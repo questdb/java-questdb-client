@@ -91,35 +91,34 @@ public class QueryWorkerTest {
     @Test(timeout = 30_000)
     public void testShutdownHandsBackACarriedInterrupt() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            // A null client is enough: shutdown()'s cancel() and close() calls NPE and are swallowed by
-            // their own catch (Throwable), which is the documented best-effort teardown, and the dispatch
-            // thread this asserts on does not touch the client while parked.
-            QueryWorker worker = new QueryWorker(null, null, 0);
-            // start()/shutdown() are package-private; reached the same way the sibling tests in this class
-            // reach bumpGeneration() and isCurrentThreadWorker(), rather than widening them for a test
-            Method start = QueryWorker.class.getDeclaredMethod("start");
-            start.setAccessible(true);
-            Method shutdown = QueryWorker.class.getDeclaredMethod("shutdown");
-            shutdown.setAccessible(true);
-            start.invoke(worker);
+            try (QwpQueryClient client = QwpQueryClient.newPlainText("localhost", 9000)) {
+                QueryWorker worker = new QueryWorker(client, null, 0);
+                // start()/shutdown() are package-private; reached the same way the sibling tests in this class
+                // reach bumpGeneration() and isCurrentThreadWorker(), rather than widening them for a test
+                Method start = QueryWorker.class.getDeclaredMethod("start");
+                start.setAccessible(true);
+                Method shutdown = QueryWorker.class.getDeclaredMethod("shutdown");
+                shutdown.setAccessible(true);
+                start.invoke(worker);
 
-            Field threadField = QueryWorker.class.getDeclaredField("thread");
-            threadField.setAccessible(true);
-            Thread dispatch = (Thread) threadField.get(worker);
-            Assert.assertTrue("the dispatch thread must be running before shutdown", dispatch.isAlive());
+                Field threadField = QueryWorker.class.getDeclaredField("thread");
+                threadField.setAccessible(true);
+                Thread dispatch = (Thread) threadField.get(worker);
+                Assert.assertTrue("the dispatch thread must be running before shutdown", dispatch.isAlive());
 
-            Thread.currentThread().interrupt();
-            try {
-                shutdown.invoke(worker);
-                Assert.assertTrue("shutdown() must hand the caller's cancellation back, or the pool loop "
-                        + "that set it silently loses its stop signal", Thread.currentThread().isInterrupted());
-            } finally {
-                // do not leak the flag into the next test
-                Thread.interrupted();
+                Thread.currentThread().interrupt();
+                try {
+                    shutdown.invoke(worker);
+                    Assert.assertTrue("shutdown() must hand the caller's cancellation back, or the pool loop "
+                            + "that set it silently loses its stop signal", Thread.currentThread().isInterrupted());
+                } finally {
+                    // do not leak the flag into the next test
+                    Thread.interrupted();
+                }
+
+                dispatch.join(TimeUnit.SECONDS.toMillis(10));
+                Assert.assertFalse("shutdown() must not leave its dispatch thread running", dispatch.isAlive());
             }
-
-            dispatch.join(TimeUnit.SECONDS.toMillis(10));
-            Assert.assertFalse("shutdown() must not leave its dispatch thread running", dispatch.isAlive());
         });
     }
 

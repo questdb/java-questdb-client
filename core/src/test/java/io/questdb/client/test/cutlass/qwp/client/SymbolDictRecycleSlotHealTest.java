@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.ConnectionHealth;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
@@ -369,6 +370,10 @@ public class SymbolDictRecycleSlotHealTest {
                         Assert.assertEquals("rebuild #1 recovers, the heal rebuilds #2, which recovers again",
                                 2, rebuilds.get());
                         Assert.assertEquals("no swap on a recovered engine", 0, ws.getSymbolDictEpoch());
+                        ConnectionHealth health = sender.health();
+                        Assert.assertEquals(health.toString(), ConnectionHealth.State.RECONNECTING, health.getState());
+                        Assert.assertNotEquals("the retired connection must start an outage",
+                                ConnectionHealth.NONE, health.getOutageSinceEpochMillis());
                         Assert.assertTrue("the leftovers are still on the slot",
                                 Files.exists(doctoredSlot + "/sf-initial.sfa"));
 
@@ -386,6 +391,8 @@ public class SymbolDictRecycleSlotHealTest {
                         long fsn2 = sender.flushAndGetSequence();
                         Assert.assertTrue("post-heal batch must still get acked",
                                 sender.awaitAckedFsn(fsn2, 5_000));
+                        Assert.assertEquals(ConnectionHealth.State.CONNECTED, sender.health().getState());
+                        Assert.assertEquals(ConnectionHealth.NONE, sender.health().getOutageSinceEpochMillis());
                         Assert.assertTrue("post-recycle FSN must exceed pre-recycle FSN "
                                 + "[fsn1=" + fsn1 + ", fsn2=" + fsn2 + ']', fsn2 > fsn1);
                     } finally {

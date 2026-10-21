@@ -57,6 +57,13 @@ public final class ConfigSchema {
         str("tls_roots_password", Side.COMMON);
         longRange("auth_timeout_ms", Side.COMMON, 0, OPEN_MAX, true, false); // > 0
         longRange("connect_timeout", Side.COMMON, 0, OPEN_MAX, true, false); // > 0
+        // Dynamic bearer credentials (design/qwp-token-provider-spec.md, section 7.1): a refreshing token
+        // provider selected by name, wss:: only, mutually exclusive with token/username/password. The values are
+        // never secret. Validated by TokenProviderSpec on both clients.
+        str("token_provider", Side.COMMON);
+        str("azure_resource", Side.COMMON);
+        str("azure_client_id", Side.COMMON);
+        enumKey("azure_credential", Side.COMMON, "default", "managed_identity", "workload_identity", "environment");
 
         // INGRESS -- the WebSocket Sender applies. STRING in the registry; the
         // Sender parses suffix/mode values (off/on, 64k, durability) with its

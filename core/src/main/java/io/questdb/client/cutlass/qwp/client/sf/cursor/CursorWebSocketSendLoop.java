@@ -432,6 +432,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // indefinitely and never gives up on a wall-clock budget).
     private volatile SenderConnectionDispatcher connectionDispatcher;
     private volatile SenderErrorDispatcher errorDispatcher;
+    // Foreground connection health (spec section 8.4): the loop reports connection loss and its terminal failure.
+    // Null for orphan drainers.
+    private volatile io.questdb.client.cutlass.qwp.client.QwpConnectionHealthTracker healthTracker;
     // The send cursor has two coordinate systems:
     //
     //   FSN: durable frame sequence number in the local cursor engine. This is
@@ -1130,18 +1133,32 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                         contextLabel, e.getMessage());
                 throw e;
             } catch (QwpCredentialUnavailableException e) {
-                // A credential the client cannot ACQUIRE (the configured token provider threw) is NOT a
-                // transport outage: retrying the connect cannot conjure a token the provider will not hand
-                // over, so fail fast with the provider's own exception rather than burn the whole connect
-                // budget treating it as a reachable-server problem (which would block build() for up to
-                // maxDurationMillis, default 5 min, and surface a transport-shaped wrapper). Mirrors the
-                // foreground OFF-mode connect (QwpWebSocketSender) and the background reconnect loop above,
-                // which both give credential acquisition its own terminal handling; only this SYNC
-                // initial-connect path lacked it. QwpCredentialUnavailableException is a LineSenderException,
-                // disjoint from the HttpClientException-based terminal set above, so it reaches here.
-                LOG.error("{} could not acquire a credential, won't retry: {}",
-                        contextLabel, e.getMessage());
-                throw e.providerFailure();
+                // A credential the client cannot ACQUIRE (the configured token provider threw) is classified by
+                // the provider (design/qwp-token-provider-spec.md, section 8.3 and decisions D6/D8):
+                //  - a TokenUnavailableException marked retryable - the IdP is unreachable, timing out or
+                //    throttling - is a transient outage like any other, so it consumes the connect budget and is
+                //    retried within it (D6);
+                //  - anything else is permanent - no sign-in yet, a missing or wrong configuration - and retrying
+                //    cannot conjure a token the provider will not hand over, so fail fast with the provider's own
+                //    exception rather than burn the whole budget (up to maxDurationMillis, default 5 min) and
+                //    surface a transport-shaped wrapper (D8). This is how an OIDC device-flow provider that is
+                //    not signed in behaves, and how every provider failure behaved before D6.
+                // An interrupt on the calling thread also ends the retries: a provider wait it cut short reports
+                // retryable, and re-entering it with the flag still set would only spin through the budget.
+                // QwpCredentialUnavailableException is a LineSenderException, disjoint from the
+                // HttpClientException-based terminal set above, so it reaches here.
+                if (!e.isRetryable() || Thread.currentThread().isInterrupted()) {
+                    LOG.error("{} could not acquire a credential, won't retry: {}",
+                            contextLabel, e.getMessage());
+                    throw e.providerFailure();
+                }
+                lastError = e;
+                long now = System.nanoTime();
+                if (now - lastLogNanos >= RECONNECT_LOG_THROTTLE_NANOS) {
+                    LOG.warn("{} attempt {}: credential-unavailable (retryable): {}; retrying within connect budget",
+                            contextLabel, attempts, e.getMessage());
+                    lastLogNanos = now;
+                }
             } catch (Throwable e) {
                 if (e instanceof Error) {
                     // JVM/programming failure (OOM, LinkageError): not a
@@ -1184,7 +1201,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             backoffMillis = Math.min(backoffMillis * 2, maxBackoffMillis);
         }
         long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L;
-        String lastMsg = lastError == null ? "no attempts made" : lastError.getMessage();
+        String lastMsg = lastError == null
+                ? "no attempts made"
+                : lastError instanceof QwpCredentialUnavailableException
+                ? "credential-unavailable: " + lastError.getMessage()
+                : lastError.getMessage();
         throw new LineSenderException(
                 contextLabel + " failed after " + elapsedMs + "ms / "
                         + attempts + " attempts: " + lastMsg,
@@ -1721,6 +1742,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * Plugs the owning sender's connection-health tracker: the loop reports connection loss and its terminal
+     * failure there. Set before {@link #start()}; foreground loops only.
+     */
+    public void setConnectionHealthTracker(io.questdb.client.cutlass.qwp.client.QwpConnectionHealthTracker tracker) {
+        this.healthTracker = tracker;
+    }
+
+    /**
      * Plug an async-delivery sink for {@link SenderError} notifications.
      * Idempotent — set once before {@link #start()}; later reassignment is
      * permitted but races between dispatchers are the caller's problem.
@@ -1985,6 +2014,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         snapshotReplayTarget();
         LOG.warn("cursor I/O loop entering {} loop: {}",
                 phase, initial.getMessage());
+        if (hasEverConnected) {
+            io.questdb.client.cutlass.qwp.client.QwpConnectionHealthTracker tracker = healthTracker;
+            if (tracker != null) {
+                tracker.connectionLost();
+            }
+        }
         long outageStartNanos = System.nanoTime();
         // INVARIANT B: a store-and-forward loop must NEVER terminate on a
         // wall-clock reconnect budget. A replica-only / all-endpoints-replica
@@ -2170,10 +2205,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // hands over a token again once the IdP is reachable or the user finishes signing in, and the
                 // un-acked rows stay safe in on-disk SF meanwhile. So retry indefinitely with capped backoff --
                 // NEVER bound by a wall-clock budget and NEVER latch a terminal, which would drop a producer
-                // that store-and-forward promised to keep alive on a recoverable fault. The foreground/SYNC
-                // initial connect still fails fast with the provider's own exception (connectWithRetry, and the
-                // OFF-mode connect in QwpWebSocketSender), because a connectivity error is only the caller's to
-                // see DURING initialization, not after the drainer is running.
+                // that store-and-forward promised to keep alive on a recoverable fault. The initial connect
+                // handles it in connectWithRetry (SYNC: a retryable failure is retried within the budget,
+                // anything else fails fast with the provider's own exception) and in the OFF-mode connect in
+                // QwpWebSocketSender (fails fast), because a connectivity error is only the caller's to see
+                // DURING initialization, not after the drainer is running.
                 //
                 // Ends any open cap-gap episode like every other unrelated reconnect state: we never reached a
                 // node to observe its batch cap, so this outage's wall clock must not accrue toward the orphan
@@ -2237,6 +2273,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     // down the shutdown latch and close() cannot hang.
                     recordFatal(e);
                     throw (Error) e;
+                }
+                // The factory publishes CONNECTED after upgrade, but swapClient can still lose the transport
+                // during dictionary catch-up. Publish that loss before backoff or another credential pull.
+                io.questdb.client.cutlass.qwp.client.QwpConnectionHealthTracker tracker = healthTracker;
+                if (tracker != null) {
+                    tracker.connectionLost();
                 }
                 if (!isCatchUpCapGap(e)) {
                     resetCatchUpCapGapEpisode();
@@ -2798,6 +2840,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * every rethrow delivers the same instance.
      */
     private void recordFatal(Throwable t) {
+        io.questdb.client.cutlass.qwp.client.QwpConnectionHealthTracker tracker = healthTracker;
+        if (tracker != null) {
+            tracker.failed();
+        }
         if (terminalError == null) {
             terminalError = t instanceof LineSenderException
                     ? (LineSenderException) t
