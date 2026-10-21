@@ -451,7 +451,6 @@ public class SenderPoolSettleTest {
         }
     }
 
-    @SuppressWarnings("unchecked")
     @Test
     public void testSettleOnABusyRingKeepsTheRowsAndRequeuesTheSlot() throws Exception {
         List<RecordingSender> built = new ArrayList<>();
@@ -462,7 +461,22 @@ public class SenderPoolSettleTest {
             RecordingSender delegate = built.get(0);
             long idleSince = idleSinceOf(pool);
             delegate.ringBusy = true;
-            Assert.assertEquals(0, pool.settleIdle());
+            Logger poolLogger = (Logger) LoggerFactory.getLogger(SenderPool.class);
+            ListAppender<ILoggingEvent> appender = new ListAppender<>();
+            appender.start();
+            Level savedLevel = poolLogger.getLevel();
+            poolLogger.setLevel(Level.ALL);
+            poolLogger.addAppender(appender);
+            try {
+                Assert.assertEquals(0, pool.settleIdle());
+                for (ILoggingEvent e : appender.list) {
+                    Assert.assertTrue("a busy ring is not a failure, but logged: " + e.getFormattedMessage(),
+                            e.getLevel().toInt() < Level.WARN.toInt());
+                }
+            } finally {
+                poolLogger.detachAppender(appender);
+                poolLogger.setLevel(savedLevel);
+            }
             Assert.assertEquals(1, pool.availableSize());
             Assert.assertEquals(1, delegate.pendingRows);
             Assert.assertEquals(0, delegate.flushCount.get());
@@ -474,6 +488,7 @@ public class SenderPoolSettleTest {
         }
     }
 
+    @SuppressWarnings("unchecked")
     private static long idleSinceOf(SenderPool pool) throws Exception {
         Field availableF = SenderPool.class.getDeclaredField("available");
         availableF.setAccessible(true);

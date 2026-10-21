@@ -254,15 +254,6 @@ class RecordingSender implements Sender {
     }
 
     @Override
-    public boolean tryFlush() {
-        if (ringBusy) {
-            return false;
-        }
-        flush();
-        return true;
-    }
-
-    @Override
     public Sender table(CharSequence table) {
         rowInProgress = true;
         return this;
@@ -276,6 +267,15 @@ class RecordingSender implements Sender {
     @Override
     public Sender timestampColumn(CharSequence name, Instant value) {
         return this;
+    }
+
+    @Override
+    public boolean tryFlush() {
+        if (ringBusy) {
+            return false;
+        }
+        flush();
+        return true;
     }
 
     private static void awaitGate(CountDownLatch gate, String name) {

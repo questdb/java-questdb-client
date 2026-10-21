@@ -68,12 +68,12 @@ public class QuestDBLazyConnectTest {
             // leak the delegate (close() never tears down a borrowed sender --
             // C1). The server never comes up here, so the release itself ships
             // nothing, but a latched connect error can surface at close;
-            // either way the lease comes home -- a failed flush routes
-            // the delegate to discardBroken on this thread.
+            // either way the lease comes home -- the pool retires the slot
+            // (retireLease) on this thread.
             try {
                 sender.close();
             } catch (RuntimeException ignored) {
-                // acceptable: flush against the never-up server
+                // acceptable: the server never came up, so a latched connect error can surface here
             }
         }
     }

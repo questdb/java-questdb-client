@@ -1642,6 +1642,8 @@ public final class SenderPool implements AutoCloseable {
             }
             int outstanding = all.size() - available.size() + pendingLeaseTeardowns;
             if (outstanding > 0) {
+                // The clamp only keeps borrowed non-negative in the microsecond window
+                // between a settle lease's requeue and its settling--.
                 int heldBySettle = Math.min(settling, outstanding);
                 int borrowed = outstanding - heldBySettle;
                 LOG.warn("SenderPool.close(): {} sender lease(s) still outstanding after {}ms: "
@@ -1828,43 +1830,45 @@ public final class SenderPool implements AutoCloseable {
 
     private boolean settleOne(PooledSender lease) {
         boolean flushed = false;
-        Throwable fatal = null;
-        BatchTooLargeForCapException overCap = null;
         try {
-            // PooledSender.tryFlush() already marks the commit on the slot. A
-            // false result means the ring could not take the frame at once:
-            // not a failure, the rows stay and the next settle retries.
-            flushed = lease.tryFlush();
-            if (flushed) {
-                lease.slot().settleFailureLogged(false);
+            Throwable fatal = null;
+            BatchTooLargeForCapException overCap = null;
+            try {
+                // PooledSender.tryFlush() already marks the commit on the slot. A
+                // false result means the ring could not take the frame at once:
+                // not a failure, the rows stay and the next settle retries.
+                flushed = lease.tryFlush();
+                if (flushed) {
+                    lease.slot().settleFailureLogged(false);
+                }
+            } catch (BatchTooLargeForCapException e) {
+                // Deterministic: the probe would report it too, but no settle retry
+                // can ship this batch and no lease owns it any more. Retire the
+                // slot below.
+                overCap = e;
+            } catch (Exception e) {
+                // Transient (ring full, recycle in flight) or terminal: the
+                // requeue below tells them apart with the probe.
+                logSettleFailure(lease.slot(), e);
+            } catch (Throwable t) {
+                // An Error (AssertionError, OutOfMemoryError) is not transient.
+                fatal = t;
             }
-        } catch (BatchTooLargeForCapException e) {
-            // Deterministic: the probe would report it too, but no settle retry
-            // can ship this batch and no lease owns it any more. Retire the
-            // slot below.
-            overCap = e;
-        } catch (Exception e) {
-            // Transient (ring full, recycle in flight) or terminal: the
-            // requeue below tells them apart with the probe.
-            logSettleFailure(lease.slot(), e);
-        } catch (Throwable t) {
-            // An Error (AssertionError, OutOfMemoryError) is not transient.
-            fatal = t;
-        }
-        try {
-            if (fatal != null) {
-                LOG.warn("settleIdle: flush threw an Error, retiring slot {}", lease.slot().slotIndex(), fatal);
-                retireLease(lease, " during settle");
-            } else if (overCap != null) {
-                LOG.error("settleIdle: slot {} holds a batch the server cap rejects, retiring it and dropping {} pending row(s): {}",
-                        lease.slot().slotIndex(), pendingRowsOf(lease.slot()), overCap.getDetail());
-                retireLease(lease, " during settle");
-            } else {
-                requeueSettled(lease);
+            try {
+                if (fatal != null) {
+                    LOG.warn("settleIdle: flush threw an Error, retiring slot {}", lease.slot().slotIndex(), fatal);
+                    retireLease(lease, " during settle");
+                } else if (overCap != null) {
+                    LOG.error("settleIdle: slot {} holds a batch the server cap rejects, retiring it and dropping {} pending row(s): {}",
+                            lease.slot().slotIndex(), pendingRowsOf(lease.slot()), overCap.getDetail());
+                    retireLease(lease, " during settle");
+                } else {
+                    requeueSettled(lease);
+                }
+            } catch (Throwable t) {
+                // Keep going: the remaining leases must not stay out of `available`.
+                LOG.warn("settleIdle: could not requeue or retire slot {}", lease.slot().slotIndex(), t);
             }
-        } catch (Throwable t) {
-            // Keep going: the remaining leases must not stay out of `available`.
-            LOG.warn("settleIdle: could not requeue or retire slot {}", lease.slot().slotIndex(), t);
         } finally {
             lock.lock();
             try {
@@ -2231,8 +2235,8 @@ public final class SenderPool implements AutoCloseable {
 
     /**
      * Whether a pooled {@code close()} ships the lease's rows before releasing
-     * the slot (the behaviour before 1.3.11) or only releases it. On by default for a
-     * directly built pool, since nothing settles its idle slots. The
+     * the slot (the behaviour before 1.3.11) or only releases it. On by default
+     * for a directly built pool, since nothing settles its idle slots. The
      * {@code QuestDB} facade sets it from {@code flush_on_close}, off by
      * default: rows then ship when an auto-flush threshold trips on a later
      * append, or when the housekeeper settles the idle slot.

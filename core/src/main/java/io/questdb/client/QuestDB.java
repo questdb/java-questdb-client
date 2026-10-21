@@ -161,8 +161,8 @@ public interface QuestDB extends Closeable {
      * to keep every connection warm. Close-time errors are wrapped: only
      * {@code LineSenderServerException} keeps its type, so code that catches
      * another {@code LineSenderException} subclass around a pooled
-     * {@code close()} must look at {@code getCause()}. A real disconnect only happens at
-     * {@link #close()} on this {@code QuestDB} handle.
+     * {@code close()} must look at {@code getCause()}. A real disconnect only
+     * happens at {@link #close()} on this {@code QuestDB} handle.
      * <p>
      * Allocation: zero at steady state -- the returned instance is a
      * pre-allocated decorator backed by a pre-allocated underlying Sender.

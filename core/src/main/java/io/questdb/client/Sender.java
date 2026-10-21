@@ -950,6 +950,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * about a millisecond. Returns {@code false}, publishes nothing and keeps every pending row
      * when the ring is full. Any other failure throws as {@code flush()} does. Only the
      * WebSocket transport implements the non-waiting path; other transports flush normally.
+     * Once the first frame is on the ring, later frames of the same flush (a split batch,
+     * dictionary chunks, the commit) wait for ring room exactly as {@code flush()} does.
      *
      * @return {@code true} if the flush completed, {@code false} if the ring was full
      */

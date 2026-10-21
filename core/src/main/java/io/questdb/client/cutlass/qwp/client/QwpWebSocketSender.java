@@ -7534,4 +7534,5 @@ public class QwpWebSocketSender implements Sender {
         private RingBusyException() {
             super("store-and-forward ring is full", null, false, false);
         }
-    }}
+    }
+}

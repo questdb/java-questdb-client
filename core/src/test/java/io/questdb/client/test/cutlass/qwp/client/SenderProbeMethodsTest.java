@@ -32,7 +32,9 @@ import io.questdb.client.test.QuestDBFlushOnCloseTest;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -50,6 +52,9 @@ import java.util.concurrent.TimeUnit;
  * the sender holds back when the cap rejects the auto-flushed batch.
  */
 public class SenderProbeMethodsTest {
+
+    @Rule
+    public final TemporaryFolder temp = new TemporaryFolder();
 
     @Test
     public void testAutoFlushIfDueShipsOnlyRowsOlderThanTheInterval() throws Exception {
@@ -588,10 +593,10 @@ public class SenderProbeMethodsTest {
         try (TestWebSocketServer server = new TestWebSocketServer(new SilentHandler())) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-            String sfDir = java.nio.file.Files.createTempDirectory("sf").toString();
+            String sfDir = temp.newFolder("sf").getAbsolutePath();
             try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
                     + ";sf_dir=" + sfDir + ";sf_max_segment_bytes=1024;sf_max_total_bytes=8192"
-                    + ";sf_append_deadline_millis=200;auto_flush_rows=100000;auto_flush_interval=3600000"
+                    + ";sf_append_deadline_millis=2000;auto_flush_rows=100000;auto_flush_interval=3600000"
                     + ";auto_flush_bytes=off;close_flush_timeout_millis=0;")) {
                 String pad = QuestDBFlushOnCloseTest.wideValue(128);
                 boolean full = false;
@@ -600,6 +605,7 @@ public class SenderProbeMethodsTest {
                     try {
                         sender.flush();
                     } catch (LineSenderException e) {
+                        Assert.assertNotNull("backpressure must carry the engine's cause", e.getCause());
                         TestUtils.assertContains(e.getCause().getMessage(), "backpressured");
                         full = true;
                     }
@@ -610,7 +616,7 @@ public class SenderProbeMethodsTest {
                 long start = System.nanoTime();
                 Assert.assertFalse(sender.tryFlush());
                 Assert.assertTrue("tryFlush must not wait out the append deadline",
-                        System.nanoTime() - start < TimeUnit.MILLISECONDS.toNanos(150));
+                        System.nanoTime() - start < TimeUnit.MILLISECONDS.toNanos(1_000));
                 Assert.assertEquals(pending, sender.pendingRowCount());
                 sender.checkError(); // a busy ring is not an error
                 sender.reset();      // so close() has nothing left to publish
