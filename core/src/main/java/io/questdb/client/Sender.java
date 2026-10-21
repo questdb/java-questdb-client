@@ -1252,6 +1252,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private String orphanDrainBase;
         private int orphanDrainSlotCount;
         private long durableAckKeepaliveIntervalMillis = DURABLE_ACK_KEEPALIVE_NOT_SET;
+        private long keepaliveIntervalMillis = CursorWebSocketSendLoop.DEFAULT_KEEPALIVE_INTERVAL_MILLIS;
         // Optional user-supplied async error handler. When null, the sender
         // uses DefaultSenderErrorHandler.INSTANCE (loud-not-silent log).
         private io.questdb.client.SenderErrorHandler errorHandler;
@@ -1837,7 +1838,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                                     actualCatchUpCapGapMinEscalationWindowMillis,
                                     symbolDictReset,
                                     actualSymbolDictResetThreshold,
-                                    actualSymbolDictResetMaxWaitMillis
+                                    actualSymbolDictResetMaxWaitMillis,
+                                    keepaliveIntervalMillis
                             );
                         } catch (UnreplayableSlotException e) {
                             // The one failure build() recovers from. The slot's frames reference ids
@@ -2350,10 +2352,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * the server periodically. Effective only when
          * {@link #requestDurableAck(boolean) request_durable_ack=on}.
          * <p>
-         * Pass {@code 0} or negative to disable keepalive PINGs entirely
-         * — the caller then accepts that durable-ack frames may not
-         * arrive on idle connections (e.g. they are sending data
-         * continuously, or have their own ping driver).
+         * Pass {@code 0} or negative to disable it. The idle PING
+         * ({@link #keepaliveIntervalMillis(long)}) is separate.
          * <p>
          * Default
          * {@value io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop#DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS}
@@ -2717,6 +2717,27 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 throw new LineSenderException("initial_connect_retry is only supported for WebSocket transport");
             }
             this.initialConnectMode = enabled ? InitialConnectMode.SYNC : InitialConnectMode.OFF;
+            return this;
+        }
+
+        /**
+         * Cadence (in millis) of the keepalive PING the SF cursor I/O loop
+         * sends once nothing has gone out on the connection for this long.
+         * It stops load balancers, proxies, firewalls and NAT gateways (an
+         * AWS ALB closes idle connections after 60 s by default), and the
+         * server's own idle timeout, from closing a quiet connection, which
+         * would otherwise cost a reconnect each time.
+         * <p>
+         * Off by default; opt in with a positive value ({@code 30000} suits
+         * an AWS ALB). {@code 0} or negative disables it. Background orphan
+         * drainers ({@link #drainOrphans(boolean)}) never send it. WebSocket
+         * transport only.
+         */
+        public LineSenderBuilder keepaliveIntervalMillis(long millis) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("keepalive_interval_millis is only supported for WebSocket transport");
+            }
+            this.keepaliveIntervalMillis = millis;
             return this;
         }
 
@@ -4278,6 +4299,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     }
                     pos = getValue(configurationString, pos, sink, "durable_ack_keepalive_interval_millis");
                     durableAckKeepaliveIntervalMillis(parseLongValue(sink, "durable_ack_keepalive_interval_millis"));
+                } else if (Chars.equals("keepalive_interval_millis", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("keepalive_interval_millis is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "keepalive_interval_millis");
+                    keepaliveIntervalMillis(parseLongValue(sink, "keepalive_interval_millis"));
                 } else if (Chars.equals("reconnect_max_duration_millis", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException("reconnect_max_duration_millis is only supported for WebSocket transport");
@@ -4589,6 +4616,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 if (view.has("durable_ack_keepalive_interval_millis")) {
                     durableAckKeepaliveIntervalMillis(wsLong(view, v, "durable_ack_keepalive_interval_millis"));
                 }
+                if (view.has("keepalive_interval_millis")) {
+                    keepaliveIntervalMillis(wsLong(view, v, "keepalive_interval_millis"));
+                }
                 if (view.has("reconnect_max_duration_millis")) {
                     reconnectMaxDurationMillis(wsLong(view, v, "reconnect_max_duration_millis"));
                 }
@@ -4798,6 +4828,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             m.put("sf_sync_interval_millis", sfSyncIntervalMillis);
             m.put("close_flush_timeout_millis", closeFlushTimeoutMillis);
             m.put("durable_ack_keepalive_interval_millis", durableAckKeepaliveIntervalMillis);
+            m.put("keepalive_interval_millis", keepaliveIntervalMillis);
             m.put("initial_connect_retry", initialConnectMode == null ? null : initialConnectMode.name());
             m.put("reconnect_max_duration_millis", reconnectMaxDurationMillis);
             m.put("reconnect_initial_backoff_millis", reconnectInitialBackoffMillis);

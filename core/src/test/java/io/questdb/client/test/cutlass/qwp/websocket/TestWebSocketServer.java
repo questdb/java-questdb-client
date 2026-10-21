@@ -439,6 +439,9 @@ public class TestWebSocketServer implements Closeable {
     public interface WebSocketServerHandler {
         default void onBinaryMessage(ClientHandler client, byte[] data) {
         }
+
+        default void onPing(ClientHandler client) {
+        }
     }
 
     /**
@@ -601,6 +604,7 @@ public class TestWebSocketServer implements Closeable {
                         handler.onBinaryMessage(this, payload);
                         break;
                     case WebSocketOpcode.PING:
+                        handler.onPing(this);
                         try {
                             writeFrame(WebSocketOpcode.PONG, payload, payload.length);
                         } catch (IOException e) {
