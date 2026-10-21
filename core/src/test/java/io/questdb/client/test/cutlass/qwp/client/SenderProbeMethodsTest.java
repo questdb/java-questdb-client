@@ -30,6 +30,7 @@ import io.questdb.client.cutlass.qwp.client.BatchTooLargeForCapException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.test.QuestDBFlushOnCloseTest;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
+import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -583,6 +584,59 @@ public class SenderProbeMethodsTest {
     }
 
     @Test
+    public void testTryFlushOnAFullRingReturnsFalseAndKeepsTheRows() throws Exception {
+        try (TestWebSocketServer server = new TestWebSocketServer(new SilentHandler())) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            String sfDir = java.nio.file.Files.createTempDirectory("sf").toString();
+            try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                    + ";sf_dir=" + sfDir + ";sf_max_segment_bytes=1024;sf_max_total_bytes=8192"
+                    + ";sf_append_deadline_millis=200;auto_flush_rows=100000;auto_flush_interval=3600000"
+                    + ";auto_flush_bytes=off;close_flush_timeout_millis=0;")) {
+                String pad = QuestDBFlushOnCloseTest.wideValue(128);
+                boolean full = false;
+                for (int i = 0; i < 200 && !full; i++) {
+                    sender.table("t").stringColumn("p", pad).longColumn("v", i).atNow();
+                    try {
+                        sender.flush();
+                    } catch (LineSenderException e) {
+                        TestUtils.assertContains(e.getCause().getMessage(), "backpressured");
+                        full = true;
+                    }
+                }
+                Assert.assertTrue("setup: the ring must fill", full);
+                int pending = sender.pendingRowCount();
+                Assert.assertTrue(pending > 0);
+                long start = System.nanoTime();
+                Assert.assertFalse(sender.tryFlush());
+                Assert.assertTrue("tryFlush must not wait out the append deadline",
+                        System.nanoTime() - start < TimeUnit.MILLISECONDS.toNanos(150));
+                Assert.assertEquals(pending, sender.pendingRowCount());
+                sender.checkError(); // a busy ring is not an error
+                sender.reset();      // so close() has nothing left to publish
+            }
+        }
+    }
+
+    @Test
+    public void testTryFlushShipsLikeFlushWhenTheRingHasRoom() throws Exception {
+        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+        try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            try (Sender sender = Sender.fromConfig(config(server.getPort()))) {
+                sender.table("t").longColumn("v", 1L).atNow();
+                sender.table("t").longColumn("v", 2L).atNow();
+                Assert.assertTrue(sender.tryFlush());
+                Assert.assertEquals(0, sender.pendingRowCount());
+                Assert.assertFalse(sender.hasDeferredFrames());
+                log.awaitDataFrames(1, 5_000);
+                Assert.assertEquals(1, log.dataFrames());
+            }
+        }
+    }
+
+    @Test
     public void testUnsetAutoFlushBytesShipsAtTheAdvertisedCap() throws Exception {
         QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
@@ -626,6 +680,13 @@ public class SenderProbeMethodsTest {
             } catch (IOException e) {
                 throw new RuntimeException(e);
             }
+        }
+    }
+
+    private static final class SilentHandler implements TestWebSocketServer.WebSocketServerHandler {
+        @Override
+        public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            // no ack: the frame stays unacked on disk
         }
     }
 }

@@ -49,7 +49,9 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderConnectionLis
 import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderErrorHandler;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderProgressHandler;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegmentException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderConnectionDispatcher;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderProgressDispatcher;
@@ -193,6 +195,9 @@ public class QwpWebSocketSender implements Sender {
     // past any transient disk/NFS stall the deferred-close machinery exists
     // to survive.
     private static final long RECYCLE_DEFERRED_CLOSE_MAX_WAIT_MILLIS = 30_000L;
+    // How long tryFlush() lets the first frame of a flush wait for ring room
+    // before reporting the ring busy.
+    private static final long RING_BUSY_SPIN_NANOS = 1_000_000L;
     private static final String WRITE_PATH = "/write/v4";
     // Yields the Authorization header value presented on each WebSocket upgrade. A constant for a
     // fixed token or Basic credential; for an httpTokenProvider it pulls a freshly refreshed token,
@@ -494,6 +499,11 @@ public class QwpWebSocketSender implements Sender {
     // Async-delivery sink for ack-watermark advances. Default no-op; a
     // setProgressHandler call before connect() swaps in a real handler.
     private SenderProgressHandler progressHandler = DefaultSenderProgressHandler.INSTANCE;
+    // True only inside tryFlush(): the first publish of the flush must not wait
+    // for a full ring.
+    private boolean publishWithoutWaiting;
+    // Frames this flush has put on the ring so far; reset by tryFlush().
+    private int publishesThisFlush;
     // Poison-frame detector threshold forwarded to the cursor send loop and to
     // every background drainer (connect-string key max_frame_rejections).
     private int maxFrameRejections = CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS;
@@ -3872,6 +3882,32 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Flushes like {@link #flush()}, except that it does not wait for a full
+     * store-and-forward ring: when the ring cannot take the first frame within
+     * about a millisecond it returns {@code false}, publishes nothing and keeps
+     * every pending row. Once the first frame is on the ring the flush completes
+     * as {@code flush()} does.
+     *
+     * @return {@code true} if the flush completed, {@code false} if the ring was full
+     */
+    @Override
+    public boolean tryFlush() {
+        publishWithoutWaiting = true;
+        publishesThisFlush = 0;
+        try {
+            flush();
+            return true;
+        } catch (LineSenderException e) {
+            if (e.getCause() instanceof RingBusyException) {
+                return false;
+            }
+            throw e;
+        } finally {
+            publishWithoutWaiting = false;
+        }
+    }
+
+    /**
      * Adds a UUID column value to the current row.
      *
      * @param columnName the column name
@@ -7206,7 +7242,18 @@ public class QwpWebSocketSender implements Sender {
         // (durable mmap append, returns once published).
         try {
             toSend.markSending();
-            cursorEngine.appendBlocking(toSend.getBufferPtr(), toSend.getBufferPos());
+            if (publishWithoutWaiting && publishesThisFlush == 0) {
+                long fsn = cursorEngine.appendOrFsn(toSend.getBufferPtr(), toSend.getBufferPos(), System.nanoTime() + RING_BUSY_SPIN_NANOS);
+                if (fsn == SegmentRing.PAYLOAD_TOO_LARGE) {
+                    throw new MmapSegmentException("payload too large for segment");
+                }
+                if (fsn < 0) {
+                    throw new RingBusyException();
+                }
+            } else {
+                cursorEngine.appendBlocking(toSend.getBufferPtr(), toSend.getBufferPos());
+            }
+            publishesThisFlush++;
             toSend.markRecycled();
         } catch (Throwable t) {
             // appendBlocking failed synchronously on the user thread — the
@@ -7481,4 +7528,9 @@ public class QwpWebSocketSender implements Sender {
             return buildAndConnect(this, cancellation);
         }
     }
-}
+
+    private static final class RingBusyException extends RuntimeException {
+        private RingBusyException() {
+            super("store-and-forward ring is full", null, false, false);
+        }
+    }}

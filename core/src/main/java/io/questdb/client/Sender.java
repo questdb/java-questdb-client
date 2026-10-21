@@ -944,6 +944,21 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     Sender timestampColumn(CharSequence name, Instant value);
 
     /**
+     * Flushes like {@link #flush()}, but does not wait for a full store-and-forward ring.
+     * <p>
+     * Ships the pending rows like {@code flush()} when the ring takes the first frame within
+     * about a millisecond. Returns {@code false}, publishes nothing and keeps every pending row
+     * when the ring is full. Any other failure throws as {@code flush()} does. Only the
+     * WebSocket transport implements the non-waiting path; other transports flush normally.
+     *
+     * @return {@code true} if the flush completed, {@code false} if the ring was full
+     */
+    default boolean tryFlush() {
+        flush();
+        return true;
+    }
+
+    /**
      * Add a UUID column value, packed as two 64-bit halves.
      *
      * @param name name of the column
