@@ -36,7 +36,7 @@
 
     <groupId>org.questdb</groupId>
     <artifactId>questdb-client-azure</artifactId>
-    <version>1.3.11-SNAPSHOT</version>
+    <version>1.3.11</version>
     <packaging>jar</packaging>
     <name>QuestDB client - Microsoft Entra ID token provider</name>
     <description>token_provider=azure for the QuestDB Java client: Microsoft Entra ID bearer tokens through Azure Identity's DefaultAzureCredential</description>
