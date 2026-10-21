@@ -428,9 +428,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     /**
      * Throws the error this sender has latched, if any: the terminal error of
      * the WebSocket I/O loop (server rejection, exhausted reconnect budget,
-     * authentication failure) or a connection error. Publishes nothing and
-     * never blocks. Used by the connection pool to decide whether a returned
-     * sender may be handed to the next borrower.
+     * authentication failure), a connection error or a failed symbol-dictionary
+     * recycle. Publishes nothing and never blocks. Used by the connection pool
+     * to decide whether a returned sender may be handed to the next borrower.
      * <br>
      * Only the WebSocket QWP transport latches errors; on other transports this
      * is a no-op.

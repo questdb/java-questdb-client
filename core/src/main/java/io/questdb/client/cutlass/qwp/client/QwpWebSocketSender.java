@@ -1716,6 +1716,7 @@ public class QwpWebSocketSender implements Sender {
     @Override
     public void checkError() {
         checkNotClosed();
+        checkRecycleFailure();
         BatchTooLargeForCapException rejected = retainedBatchRejection;
         if (rejected != null) {
             throw rejected;
