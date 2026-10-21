@@ -2742,8 +2742,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // 5. Nothing to do: block until the socket has bytes (an ACK),
                 //    a producer publishes a frame (engine rings the doorbell via
                 //    setIoWakeup), close() rings it, or the next PING is due.
-                //    No spinning: an idle connection costs zero CPU.
-                if (!didWork && running) {
+                //    No spinning: an idle connection costs zero CPU. A PING that
+                //    failed in 3/4 reconnected and rewound the cursor, which set
+                //    recycledThisIteration again: go back to trySendOne instead.
+                if (!didWork && running && !recycledThisIteration) {
                     ioParked = true;
                     try {
                         if (engine.publishStamp() == publishedBeforeWork) {
