@@ -248,7 +248,7 @@ final class PoolHousekeeper {
                     // Best-effort: settleIdle() already guards per-slot
                     // failures; a Throwable here must never kill the daemon.
                 }
-                nextSettleAt = deadline(now, settleIntervalMillis);
+                nextSettleAt = deadline(monotonicMillis(), settleIntervalMillis);
             }
             if (now >= nextReapAt) {
                 try {

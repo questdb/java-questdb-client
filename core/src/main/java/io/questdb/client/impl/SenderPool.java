@@ -280,6 +280,10 @@ public final class SenderPool implements AutoCloseable {
     // outstanding so it does not return while a delegate is still being torn
     // down on another thread. Guarded by lock.
     private int pendingLeaseTeardowns;
+    // Internal settle leases currently out (settleIdle() took the slot, its
+    // settleOne() has not finished). close() reports them apart from borrowed
+    // leases. Guarded by lock.
+    private int settling;
     // Slots whose delegate close() returned with the SF flock still held
     // because an I/O or manager worker did not stop. Consumed while retired:
     // never freed and never reused, so no borrow ever hands out a still-
@@ -1638,9 +1642,12 @@ public final class SenderPool implements AutoCloseable {
             }
             int outstanding = all.size() - available.size() + pendingLeaseTeardowns;
             if (outstanding > 0) {
-                LOG.warn("SenderPool.close(): {} borrowed sender lease(s) still outstanding after {}ms; "
-                                + "each connection is torn down when its lease is closed, or leaks if it never is",
-                        outstanding, waitMillis);
+                int heldBySettle = Math.min(settling, outstanding);
+                int borrowed = outstanding - heldBySettle;
+                LOG.warn("SenderPool.close(): {} sender lease(s) still outstanding after {}ms: "
+                                + "{} borrowed by the application, {} held by the housekeeper's settle; "
+                                + "each connection is torn down when its lease is closed, or leaks if a borrowed one never is",
+                        outstanding, waitMillis, borrowed, heldBySettle);
             }
             // Only idle slots are safe to close from this thread: no lease
             // means no user thread inside the delegate. `available` cannot
@@ -1757,8 +1764,9 @@ public final class SenderPool implements AutoCloseable {
      * {@link #close()} waits for it like any outstanding lease. The flush runs
      * outside the lock. After the flush, whether it succeeded or not, the
      * delegate is probed with {@link Sender#checkError()}: a latched error
-     * retires the slot, anything else returns it to the free list, and rows a
-     * failed flush left behind wait for the next settle. An {@link Error}
+     * retires the slot, anything else returns it to the free list, and a ring that
+     * cannot take the frame at once is not a failure: the slot goes back unchanged and its rows wait
+     * for the next settle; rows a failed flush left behind wait the same way. An {@link Error}
      * thrown by the flush is not transient and retires the slot, and so does a
      * {@code BatchTooLargeForCapException}: that batch belongs to no lease, a settle retry
      * cannot ship it, so the slot is retired and the dropped row count logged. The slot's idle clock
@@ -1807,6 +1815,7 @@ public final class SenderPool implements AutoCloseable {
                 available.remove(s);
                 s.bumpGeneration();
                 lease = new PooledSender(s, s.generation());
+                settling++;
             } finally {
                 lock.unlock();
             }
@@ -1822,10 +1831,13 @@ public final class SenderPool implements AutoCloseable {
         Throwable fatal = null;
         BatchTooLargeForCapException overCap = null;
         try {
-            // PooledSender.flush() already marks the commit on the slot.
-            lease.flush();
-            lease.slot().settleFailureLogged(false);
-            flushed = true;
+            // PooledSender.tryFlush() already marks the commit on the slot. A
+            // false result means the ring could not take the frame at once:
+            // not a failure, the rows stay and the next settle retries.
+            flushed = lease.tryFlush();
+            if (flushed) {
+                lease.slot().settleFailureLogged(false);
+            }
         } catch (BatchTooLargeForCapException e) {
             // Deterministic: the probe would report it too, but no settle retry
             // can ship this batch and no lease owns it any more. Retire the
@@ -1853,6 +1865,13 @@ public final class SenderPool implements AutoCloseable {
         } catch (Throwable t) {
             // Keep going: the remaining leases must not stay out of `available`.
             LOG.warn("settleIdle: could not requeue or retire slot {}", lease.slot().slotIndex(), t);
+        } finally {
+            lock.lock();
+            try {
+                settling--;
+            } finally {
+                lock.unlock();
+            }
         }
         return flushed;
     }

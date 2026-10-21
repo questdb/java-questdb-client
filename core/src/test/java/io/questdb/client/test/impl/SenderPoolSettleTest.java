@@ -24,6 +24,10 @@
 
 package io.questdb.client.test.impl;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.BatchTooLargeForCapException;
@@ -31,6 +35,7 @@ import io.questdb.client.impl.PooledSender;
 import io.questdb.client.impl.SenderPool;
 import org.junit.Assert;
 import org.junit.Test;
+import org.slf4j.LoggerFactory;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -38,6 +43,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -215,6 +221,67 @@ public class SenderPoolSettleTest {
     }
 
     @Test
+    public void testPoolCloseDoesNotWaitForASettleOnABusyRing() throws Exception {
+        List<RecordingSender> built = new ArrayList<>();
+        SenderPool pool = SenderPoolCloseSemanticsTest.newPool(1, 1, built);
+        try (Sender s = pool.borrow()) {
+            s.table("t").longColumn("v", 1L).atNow();
+        }
+        built.get(0).ringBusy = true;
+        Assert.assertEquals(0, pool.settleIdle());
+        long start = System.nanoTime();
+        pool.close();
+        Assert.assertTrue("close() must not wait for a settle that never held the slot",
+                System.nanoTime() - start < TimeUnit.MILLISECONDS.toNanos(1_000));
+        Assert.assertEquals(1, built.get(0).closeCount.get());
+    }
+
+    @Test
+    public void testPoolCloseWarnNamesTheSettleLease() throws Exception {
+        List<RecordingSender> built = new ArrayList<>();
+        SenderPool pool = SenderPoolCloseSemanticsTest.newPool(1, 1, built);
+        try (Sender s = pool.borrow()) {
+            s.table("t").longColumn("v", 1L).atNow();
+        }
+        CountDownLatch gate = new CountDownLatch(1);
+        built.get(0).flushGate = gate;
+        Thread settler = new Thread(pool::settleIdle, "settler");
+        Logger poolLogger = (Logger) LoggerFactory.getLogger(SenderPool.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        Level savedLevel = poolLogger.getLevel();
+        poolLogger.setLevel(Level.ALL);
+        poolLogger.addAppender(appender);
+        try {
+            settler.start();
+            long deadline = System.currentTimeMillis() + 2_000;
+            while (pool.availableSize() != 0 && System.currentTimeMillis() < deadline) {
+                Thread.sleep(5);
+            }
+            Assert.assertEquals(0, pool.availableSize());
+            pool.close();
+            int matching = 0;
+            for (ILoggingEvent e : appender.list) {
+                String msg = e.getFormattedMessage();
+                if (e.getLevel() == Level.WARN && msg.contains("1 held by the housekeeper's settle")
+                        && msg.contains("0 borrowed by the application")) {
+                    matching++;
+                }
+            }
+            Assert.assertEquals("close() must name the settle lease in its WARN", 1, matching);
+            gate.countDown();
+            settler.join(2_000);
+            Assert.assertFalse(settler.isAlive());
+            Assert.assertEquals(0, pool.totalSize());
+            Assert.assertEquals(1, built.get(0).closeCount.get());
+        } finally {
+            gate.countDown();
+            poolLogger.detachAppender(appender);
+            poolLogger.setLevel(savedLevel);
+        }
+    }
+
+    @Test
     public void testPoolCloseDuringSettleRetiresSlotOnSettleThread() throws Exception {
         List<RecordingSender> built = new ArrayList<>();
         SenderPool pool = new SenderPool("http::addr=127.0.0.1:1;protocol_version=2;auto_flush=off;", 1, 1, 2_000L, Long.MAX_VALUE, Long.MAX_VALUE,
@@ -385,6 +452,28 @@ public class SenderPoolSettleTest {
     }
 
     @SuppressWarnings("unchecked")
+    @Test
+    public void testSettleOnABusyRingKeepsTheRowsAndRequeuesTheSlot() throws Exception {
+        List<RecordingSender> built = new ArrayList<>();
+        try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(1, 1, built)) {
+            try (Sender s = pool.borrow()) {
+                s.table("t").longColumn("v", 1L).atNow();
+            }
+            RecordingSender delegate = built.get(0);
+            long idleSince = idleSinceOf(pool);
+            delegate.ringBusy = true;
+            Assert.assertEquals(0, pool.settleIdle());
+            Assert.assertEquals(1, pool.availableSize());
+            Assert.assertEquals(1, delegate.pendingRows);
+            Assert.assertEquals(0, delegate.flushCount.get());
+            Assert.assertEquals("a busy ring must not touch the idle clock", idleSince, idleSinceOf(pool));
+            delegate.ringBusy = false;
+            Assert.assertEquals(1, pool.settleIdle());
+            Assert.assertEquals(1, delegate.flushCount.get());
+            Assert.assertEquals(0, delegate.pendingRows);
+        }
+    }
+
     private static long idleSinceOf(SenderPool pool) throws Exception {
         Field availableF = SenderPool.class.getDeclaredField("available");
         availableF.setAccessible(true);

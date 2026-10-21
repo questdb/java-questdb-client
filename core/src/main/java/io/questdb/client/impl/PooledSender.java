@@ -538,6 +538,16 @@ public final class PooledSender implements Sender {
     }
 
     @Override
+    public boolean tryFlush() {
+        Sender delegate = slot.live(generation);
+        boolean flushed = delegate.tryFlush();
+        if (flushed) {
+            slot.markCommitted(delegate.rowsAppended());
+        }
+        return flushed;
+    }
+
+    @Override
     public Sender uuidColumn(CharSequence name, long lo, long hi) {
         slot.live(generation).uuidColumn(name, lo, hi);
         return this;

@@ -55,6 +55,7 @@ class RecordingSender implements Sender {
     volatile RuntimeException latchedError;    // thrown by checkError() when set
     volatile CountDownLatch markSavepointGate; // markSavepoint() blocks on it when set
     volatile int pendingRows;
+    volatile boolean ringBusy;                 // tryFlush() returns false without flushing when set
     volatile boolean rowInProgress;
     volatile long rowsAppended;
     volatile int savepointRows;
@@ -250,6 +251,15 @@ class RecordingSender implements Sender {
     @Override
     public Sender symbol(CharSequence name, CharSequence value) {
         return this;
+    }
+
+    @Override
+    public boolean tryFlush() {
+        if (ringBusy) {
+            return false;
+        }
+        flush();
+        return true;
     }
 
     @Override
