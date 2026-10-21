@@ -1526,11 +1526,11 @@ public class QwpWebSocketSender implements Sender {
         }
         long deadlineNanos = System.nanoTime() + timeoutMillis * 1_000_000L;
         Thread me = Thread.currentThread();
-        while (true) {
-            // Register before the check: an ack that lands after it unparks us,
-            // one that landed before it is seen by the check.
-            ackWaiters.add(me);
-            try {
+        // Registered before the first check: an ack that lands after a check
+        // unparks us (or leaves the permit), one that landed before is seen by it.
+        ackWaiters.add(me);
+        try {
+            while (true) {
                 if (getAckedFsn() >= targetFsn) {
                     return true;
                 }
@@ -1540,9 +1540,9 @@ public class QwpWebSocketSender implements Sender {
                     return false;
                 }
                 java.util.concurrent.locks.LockSupport.parkNanos(this, remaining);
-            } finally {
-                ackWaiters.remove(me);
             }
+        } finally {
+            ackWaiters.remove(me);
         }
     }
 
@@ -4886,10 +4886,9 @@ public class QwpWebSocketSender implements Sender {
         restoreInterrupt[0] |= Thread.interrupted();
         try {
             Thread me = Thread.currentThread();
-            while (true) {
-                // Register before the check, see AckWaiters.
-                ackWaiters.add(me);
-                try {
+            ackWaiters.add(me); // once per drain, see AckWaiters
+            try {
+                while (true) {
                     if (cursorEngine.ackedFsn() >= target) {
                         break;
                     }
@@ -4932,9 +4931,9 @@ public class QwpWebSocketSender implements Sender {
                                         : " pending batches; the wire is not draining: " + outage.getMessage());
                     }
                     java.util.concurrent.locks.LockSupport.parkNanos(this, deadlineNanos - System.nanoTime());
-                } finally {
-                    ackWaiters.remove(me);
                 }
+            } finally {
+                ackWaiters.remove(me);
             }
         } finally {
             // Close the last-iteration race: an interrupt can land after the loop observes its final ACK but

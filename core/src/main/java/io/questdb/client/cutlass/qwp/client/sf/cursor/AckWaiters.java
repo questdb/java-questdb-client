@@ -30,10 +30,12 @@ import java.util.concurrent.locks.LockSupport;
 /**
  * Threads parked for ack progress: the producer in a close drain plus any
  * monitor threads in {@code awaitAckedFsn}. Owned by the Sender, so it outlives
- * the I/O loops and engines a recycle replaces. A waiter registers, re-checks
- * its condition, parks, deregisters; the I/O thread advances the watermark and
- * then calls {@link #signal()}. Either the waiter sees the new value or the
- * signal sees the waiter. {@link #signal()} allocates nothing.
+ * the I/O loops and engines a recycle replaces. A waiter registers once per
+ * call, then loops check / park until done, and deregisters; the I/O thread
+ * advances the watermark and then calls {@link #signal()}. Either the waiter's
+ * check sees the new value or the signal sees the waiter, and an unpark that
+ * lands between check and park is kept as the park permit. Registration
+ * allocates; {@link #signal()} and the check/park loop do not.
  */
 public final class AckWaiters {
     private static final Thread[] NONE = new Thread[0];
@@ -50,6 +52,10 @@ public final class AckWaiters {
         Thread[] w = waiters;
         for (int i = 0; i < w.length; i++) {
             if (w[i] == t) {
+                if (w.length == 1) {
+                    waiters = NONE;
+                    return;
+                }
                 Thread[] n = new Thread[w.length - 1];
                 System.arraycopy(w, 0, n, 0, i);
                 System.arraycopy(w, i + 1, n, i, w.length - i - 1);
