@@ -66,8 +66,8 @@ import java.util.concurrent.locks.LockSupport;
  *       to the server.</li>
  *   <li>Receives server ACK frames; on each ACK with cumulative wire sequence
  *       {@code N}, calls {@code engine.acknowledge(fsnAtZero + N)} so the
- *       segment manager can trim fully-acked segments, and unparks a producer
- *       waiting in {@link #awaitAckProgress}.</li>
+ *       segment manager can trim fully-acked segments, and runs the
+ *       {@link #setAckProgressListener ack-progress listener}.</li>
  *   <li>On wire failure, runs the configured reconnect policy: capped
  *       exponential backoff with jitter, retried indefinitely (Invariant B --
  *       a store-and-forward drainer never gives up on a wall-clock budget).
@@ -492,10 +492,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // is why a revoked token surfaced to operators as "sf_max_total_bytes too small".
     private volatile Throwable lastReconnectError;
     private volatile Thread ioThread;
-    // The one producer thread (Sender is single-threaded) parked in
-    // awaitAckProgress(), or null. The I/O thread unparks it on every ack
-    // advance and on a terminal latch, so producers never poll ackedFsn.
-    private volatile Thread ackWaiter;
+    // Run on every ack advance, on a terminal latch and on close(): the Sender
+    // installs AckWaiters::signal so threads waiting for acks never poll.
+    private volatile Runnable ackProgressListener;
     // True while the I/O thread is committed to blocking in awaitIdle(). The
     // engine's publish hook rings the doorbell only when this is set, so a busy
     // loop costs the producer no syscall per flush. Dekker-ordered with the
@@ -2525,35 +2524,18 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     private void signalAckProgress() {
-        Thread w = ackWaiter;
-        if (w != null) {
-            LockSupport.unpark(w);
+        Runnable l = ackProgressListener;
+        if (l != null) {
+            l.run();
         }
     }
 
     /**
-     * Parks the calling producer thread until the engine's acked FSN moves past
-     * {@code seenAckedFsn}, a terminal error is latched, the loop stops, or
-     * {@code deadlineNanos} passes -- whichever comes first. Spurious returns
-     * are possible; callers re-check and call again. {@code seenAckedFsn} must
-     * be a value the caller read <em>before</em> deciding to wait, so an ack
-     * landing in between is detected by the re-check below rather than lost.
+     * Installs the callback run after every ack advance, on a terminal latch
+     * and on {@link #close()}; see {@link AckWaiters}.
      */
-    public void awaitAckProgress(long seenAckedFsn, long deadlineNanos) {
-        ackWaiter = Thread.currentThread();
-        try {
-            if (engine.ackedFsn() != seenAckedFsn || terminalError != null) {
-                return;
-            }
-            // A stopped loop (close() raced us) has already unparked any earlier
-            // waiter; a later one simply waits out its own deadline rather than spin.
-            long remaining = deadlineNanos - System.nanoTime();
-            if (remaining > 0L) {
-                LockSupport.parkNanos(this, remaining);
-            }
-        } finally {
-            ackWaiter = null;
-        }
+    public void setAckProgressListener(Runnable listener) {
+        this.ackProgressListener = listener;
     }
 
     /**

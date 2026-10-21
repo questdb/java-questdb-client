@@ -9,7 +9,7 @@ I/O thread. These two models check the hand-offs.
 | Model | What it checks |
 |---|---|
 | `IdleWait.tla` | Producer publish/ring vs. the loop's idle decision (`ioParked`, `publishedBeforeWork` re-check, `recycledThisIteration`), with server drops, reconnect cursor rewinds and `close()`. Invariants: `NoStrandedWork`, `NoWaitAfterRecycle`, `TypeOK`. Liveness: every published frame is acked (`AllAcked`), `close()` stops the loop (`Terminates`). |
-| `AckWait.tla` | `awaitAckProgress()` / `signalAckProgress()`: the producer never parks on progress it has not been signalled about (`NoLostAck`); reaching the target returns the producer (`Returns`). |
+| `AckWait.tla` | The `AckWaiters` hand-off (register, re-check, park vs. advance, signal): a waiter never parks on progress it has not been signalled about (`NoLostAck`); reaching the target returns it (`Returns`). One waiter modelled; the registry holds any number, each following the same protocol. |
 
 `IdleWait_bug.cfg` sets `RecycleFix = FALSE`, the design before a reconnect
 counted as work for its iteration. TLC finds the stranded wait in 10 steps,
