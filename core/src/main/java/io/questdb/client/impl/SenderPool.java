@@ -2231,7 +2231,7 @@ public final class SenderPool implements AutoCloseable {
 
     /**
      * Whether a pooled {@code close()} ships the lease's rows before releasing
-     * the slot (the pre-1.4 behaviour) or only releases it. On by default for a
+     * the slot (the behaviour before 1.3.11) or only releases it. On by default for a
      * directly built pool, since nothing settles its idle slots. The
      * {@code QuestDB} facade sets it from {@code flush_on_close}, off by
      * default: rows then ship when an auto-flush threshold trips on a later

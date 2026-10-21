@@ -147,7 +147,7 @@ public interface QuestDB extends Closeable {
      * without appending or closing holds those rows back until it does. Call
      * {@link Sender#flush()} to ship now and
      * {@link Sender#drain(long)} to wait for the server. Set
-     * {@code flush_on_close=on} to have {@code close()} flush, as before 1.4.
+     * {@code flush_on_close=on} to have {@code close()} flush, as before 1.3.11.
      * With the default, one frame carries the rows of every lease that closed
      * since the last ship, so a server rejection of that frame discards those
      * leases' rows together; the error is logged by the error handler and thrown
