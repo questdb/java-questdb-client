@@ -1311,8 +1311,8 @@ public class SenderPoolSfTest {
                     AtomicReference<Throwable> hookErr = new AtomicReference<>();
                     try {
                         // Park the manager worker inside a service pass for
-                        // the delegate's ring. The trim-sync point is reached
-                        // on every ~1ms tick, so this wedges deterministically.
+                        // the delegate's ring. The worker is event-driven, so
+                        // wake it explicitly; the hook sits in every pass.
                         manager.setBeforeTrimSyncHook(() -> {
                             if (!fired.compareAndSet(false, true)) return;
                             workerBlocked.countDown();
@@ -1325,6 +1325,7 @@ public class SenderPoolSfTest {
                                 hookErr.compareAndSet(null, t);
                             }
                         });
+                        manager.wakeWorker();
                         Assert.assertTrue("manager worker never entered a service pass",
                                 workerBlocked.await(5, TimeUnit.SECONDS));
 
@@ -4620,6 +4621,7 @@ public class SenderPoolSfTest {
                                     hookErr.compareAndSet(null, t);
                                 }
                             });
+                            manager.wakeWorker();
                             if (!workerBlocked.await(5, TimeUnit.SECONDS)) {
                                 throw new AssertionError("recovery manager never entered a service pass");
                             }

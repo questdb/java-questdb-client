@@ -63,6 +63,13 @@ public final class SegmentManager implements QuietCloseable {
      * A wake from SegmentBudget.release() would make it fully event-driven.
      */
     public static final long PROVISION_RETRY_NANOS = 10_000_000L; // 10 ms
+    /**
+     * Upper bound on how far the mmap ack watermark trails {@code ackedFsn}
+     * while ACKs keep landing inside the active segment. The first such ACK
+     * wakes the worker; it then re-parks on this cadence until the watermark
+     * is current, so a crash replays at most this much already-acked data.
+     */
+    public static final long WATERMARK_LAG_NANOS = 1_000_000L; // 1 ms
     public static final long DISK_FULL_LOG_THROTTLE_NANOS = 30_000_000_000L; // 30 s
     public static final long UNLIMITED_TOTAL_BYTES = Long.MAX_VALUE;
     private static final int ENTRY_DEREGISTERED = 3;
@@ -714,6 +721,9 @@ public final class SegmentManager implements QuietCloseable {
                 ring.enablePeriodicSync();
             }
         }
+        if (watermark != null) {
+            ring.setPersistedAckFsn(-1L); // the first ACK wakes the worker to persist it
+        }
         ring.setManagerWakeup(managerWakeup);
         // Nudge the worker so it picks up the new ring on its very next
         // iteration. Without this, register-after-start has a race window:
@@ -1142,6 +1152,7 @@ public final class SegmentManager implements QuietCloseable {
                     if (currentAck > e.lastPersistedAck) {
                         e.watermark.write(currentAck);
                         e.lastPersistedAck = currentAck;
+                        e.ring.setPersistedAckFsn(currentAck);
                     }
                 }
             }
@@ -1210,6 +1221,7 @@ public final class SegmentManager implements QuietCloseable {
             if (durableAck > e.lastPersistedAck) {
                 e.watermark.write(durableAck);
                 e.lastPersistedAck = durableAck;
+                e.ring.setPersistedAckFsn(durableAck);
             }
         }
         try {
@@ -1412,9 +1424,10 @@ public final class SegmentManager implements QuietCloseable {
                 }
                 // Event-driven idle: every state change the worker services
                 // wakes it (register/deregister, rotation, high-water publish,
-                // an ACK that completes a sealed segment), so with nothing
-                // trimmable the only timed work left is periodic sync. Park
-                // until the nearest sync deadline, or indefinitely without one.
+                // the first ACK past the watermark, an ACK that completes a
+                // sealed segment). Timed work: periodic sync, a provision retry,
+                // and re-persisting the watermark while ACKs keep landing.
+                // Otherwise park indefinitely.
                 long parkNanos = Long.MAX_VALUE;
                 if (!hasMoreTrimmable) {
                     long now = ticks.getAsLong();
@@ -1425,6 +1438,12 @@ public final class SegmentManager implements QuietCloseable {
                         RingEntry e = ringSnapshot.getQuick(i);
                         if (e.syncIntervalNanos > 0L) {
                             parkNanos = Math.min(parkNanos, Math.max(0L, e.nextDataSyncNanos - now));
+                        }
+                        // Dekker with SegmentRing.acknowledge: it writes ackedFsn
+                        // then reads persistedAckFsn; we wrote persistedAckFsn
+                        // (in serviceRing) and read ackedFsn here.
+                        if (e.watermark != null && e.ring.ackedFsn() > e.lastPersistedAck) {
+                            parkNanos = Math.min(parkNanos, WATERMARK_LAG_NANOS);
                         }
                     }
                 }
