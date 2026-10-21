@@ -48,8 +48,11 @@ import java.time.temporal.ChronoUnit;
  * that generation first via {@link SenderSlot#live(long)}.
  * <p>
  * Behaviour difference from a raw Sender: {@link #close()} returns the slot to
- * the pool and, by default, ships nothing; rows ship by threshold or by the
- * pool's housekeeper. With {@code flush_on_close=on} close flushes first. The
+ * the pool and ships the slot's pending rows once the oldest is older than
+ * {@code auto_flush_interval} or another auto-flush threshold trips; otherwise
+ * the rows wait for a later append or release, or for the pool's housekeeper
+ * settle. With {@code flush_on_close=on}, the default of a directly built
+ * {@code SenderPool}, close flushes first. The
  * underlying Sender is only truly closed when
  * {@link io.questdb.client.QuestDB#close()} shuts the pool down.
  * <p>
@@ -147,12 +150,13 @@ public final class PooledSender implements Sender {
     }
 
     /**
-     * Returns this lease's slot to the pool. By default nothing is shipped
-     * (see the commit-window note below):
-     * the rows stay in the slot's buffer and go out when an auto-flush
-     * threshold trips on a later append or when the pool's housekeeper settles
-     * the idle slot. With {@code flush_on_close=on} the rows are flushed first,
-     * as before 1.4. {@link #reset()} on a lease discards only that lease's rows.
+     * Returns this lease's slot to the pool and ships the slot's pending
+     * rows once the oldest is older than {@code auto_flush_interval} or another
+     * auto-flush threshold trips (see the commit-window note below); otherwise
+     * the rows wait in the slot's buffer for a later append or release, or for
+     * the pool's housekeeper settle. With {@code flush_on_close=on}, the
+     * default of a directly built {@code SenderPool}, the rows are flushed
+     * first, as before 1.4. {@link #reset()} on a lease discards only that lease's rows.
      * Does not close the underlying {@link Sender}; that only
      * happens when the owning {@code QuestDB} is closed. If the pool is already
      * shutting down when this lease comes home, the underlying Sender is torn

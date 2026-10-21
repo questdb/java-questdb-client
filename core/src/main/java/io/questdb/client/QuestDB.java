@@ -155,7 +155,13 @@ public interface QuestDB extends Closeable {
      * set {@code flush_on_close=on}, when a lease's rows must not share a frame.
      * {@link Sender#reset()} on a pooled Sender discards only that lease's rows.
      * Note that in this client "flush" means published to the store-and-forward
-     * ring, not acknowledged by the server. A real disconnect only happens at
+     * ring, not acknowledged by the server. The free list is LIFO, so under
+     * steady load the pool shrinks to its working set and reopens connections
+     * on a burst; set {@code sender_pool_min} equal to {@code sender_pool_max}
+     * to keep every connection warm. Close-time errors are wrapped: only
+     * {@code LineSenderServerException} keeps its type, so code that catches
+     * another {@code LineSenderException} subclass around a pooled
+     * {@code close()} must look at {@code getCause()}. A real disconnect only happens at
      * {@link #close()} on this {@code QuestDB} handle.
      * <p>
      * Allocation: zero at steady state -- the returned instance is a
