@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentBudget;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
 import io.questdb.client.std.Files;
@@ -93,7 +94,7 @@ public class SegmentManagerTotalBytesRaceTest {
             long maxTotal = segSize * 8L;
 
             try (SegmentManager mgr = new SegmentManager(
-                    segSize, maxTotal)) {
+                    segSize, new SegmentBudget(maxTotal))) {
                 String dir = tmpDir + "/single-ring";
                 assertEquals(0, Files.mkdir(dir, Files.DIR_MODE_DEFAULT));
                 String activePath = dir + "/sf-initial.sfa";

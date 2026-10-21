@@ -14,6 +14,7 @@
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentBudget;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
 import io.questdb.client.std.MemoryTag;
@@ -47,7 +48,7 @@ public class SegmentManagerPinnedTrimTest {
 
                 CountDownLatch trimPass = new CountDownLatch(1);
                 try (SegmentManager manager = new SegmentManager(
-                        segmentSize, segmentSize * 8L)) {
+                        segmentSize, new SegmentBudget(segmentSize * 8L))) {
                     manager.setBeforeTrimSyncHook(trimPass::countDown);
                     manager.register(ring, null);
                     manager.start();
@@ -63,7 +64,7 @@ public class SegmentManagerPinnedTrimTest {
 
                 ring.releasePinnedSegmentForTest(pinned);
                 try (SegmentManager manager = new SegmentManager(
-                        segmentSize, segmentSize * 8L)) {
+                        segmentSize, new SegmentBudget(segmentSize * 8L))) {
                     manager.register(ring, null);
                     manager.start();
                     awaitTrimmed(ring);

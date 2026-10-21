@@ -1002,6 +1002,96 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * The 1.3.x constructors, with the {@code parkNanos} the loop no longer
+     * uses. Kept so callers compiled against a released jar keep linking.
+     *
+     * @deprecated use the overload without {@code parkNanos}.
+     */
+    @Deprecated
+    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
+                                   long fsnAtZero, long parkNanos,
+                                   ReconnectFactory reconnectFactory,
+                                   long reconnectInitialBackoffMillis,
+                                   long reconnectMaxBackoffMillis) {
+        this(client, engine, fsnAtZero, reconnectFactory, reconnectInitialBackoffMillis, reconnectMaxBackoffMillis);
+    }
+
+    @Deprecated
+    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
+                                   long fsnAtZero, long parkNanos,
+                                   ReconnectFactory reconnectFactory,
+                                   long reconnectInitialBackoffMillis,
+                                   long reconnectMaxBackoffMillis,
+                                   boolean durableAckMode) {
+        this(client, engine, fsnAtZero, reconnectFactory, reconnectInitialBackoffMillis, reconnectMaxBackoffMillis, durableAckMode);
+    }
+
+    @Deprecated
+    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
+                                   long fsnAtZero, long parkNanos,
+                                   ReconnectFactory reconnectFactory,
+                                   long reconnectInitialBackoffMillis,
+                                   long reconnectMaxBackoffMillis,
+                                   boolean durableAckMode,
+                                   long durableAckKeepaliveIntervalMillis) {
+        this(client, engine, fsnAtZero, reconnectFactory, reconnectInitialBackoffMillis, reconnectMaxBackoffMillis, durableAckMode, durableAckKeepaliveIntervalMillis);
+    }
+
+    @Deprecated
+    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
+                                   long fsnAtZero, long parkNanos,
+                                   ReconnectFactory reconnectFactory,
+                                   long reconnectInitialBackoffMillis,
+                                   long reconnectMaxBackoffMillis,
+                                   boolean durableAckMode,
+                                   long durableAckKeepaliveIntervalMillis,
+                                   int maxHeadFrameRejections) {
+        this(client, engine, fsnAtZero, reconnectFactory, reconnectInitialBackoffMillis, reconnectMaxBackoffMillis, durableAckMode, durableAckKeepaliveIntervalMillis, maxHeadFrameRejections);
+    }
+
+    @Deprecated
+    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
+                                   long fsnAtZero, long parkNanos,
+                                   ReconnectFactory reconnectFactory,
+                                   long reconnectInitialBackoffMillis,
+                                   long reconnectMaxBackoffMillis,
+                                   boolean durableAckMode,
+                                   long durableAckKeepaliveIntervalMillis,
+                                   int maxHeadFrameRejections,
+                                   long poisonMinEscalationWindowMillis) {
+        this(client, engine, fsnAtZero, reconnectFactory, reconnectInitialBackoffMillis, reconnectMaxBackoffMillis, durableAckMode, durableAckKeepaliveIntervalMillis, maxHeadFrameRejections, poisonMinEscalationWindowMillis);
+    }
+
+    @Deprecated
+    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
+                                   long fsnAtZero, long parkNanos,
+                                   ReconnectFactory reconnectFactory,
+                                   long reconnectInitialBackoffMillis,
+                                   long reconnectMaxBackoffMillis,
+                                   boolean durableAckMode,
+                                   long durableAckKeepaliveIntervalMillis,
+                                   int maxHeadFrameRejections,
+                                   long poisonMinEscalationWindowMillis,
+                                   long catchUpCapGapMinEscalationWindowMillis) {
+        this(client, engine, fsnAtZero, reconnectFactory, reconnectInitialBackoffMillis, reconnectMaxBackoffMillis, durableAckMode, durableAckKeepaliveIntervalMillis, maxHeadFrameRejections, poisonMinEscalationWindowMillis, catchUpCapGapMinEscalationWindowMillis);
+    }
+
+    @Deprecated
+    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
+                                   long fsnAtZero, long parkNanos,
+                                   ReconnectFactory reconnectFactory,
+                                   long reconnectInitialBackoffMillis,
+                                   long reconnectMaxBackoffMillis,
+                                   boolean durableAckMode,
+                                   long durableAckKeepaliveIntervalMillis,
+                                   int maxHeadFrameRejections,
+                                   long poisonMinEscalationWindowMillis,
+                                   long catchUpCapGapMinEscalationWindowMillis,
+                                   ReconnectPolicy reconnectPolicy) {
+        this(client, engine, fsnAtZero, reconnectFactory, reconnectInitialBackoffMillis, reconnectMaxBackoffMillis, durableAckMode, durableAckKeepaliveIntervalMillis, maxHeadFrameRejections, poisonMinEscalationWindowMillis, catchUpCapGapMinEscalationWindowMillis, reconnectPolicy);
+    }
+
+    /**
      * The policy-aware constructor as released in 1.3.x: equivalent to the overload
      * below with {@code externalFsnBase = 0L}, the value every caller outside a
      * symbol-dictionary recycle passes. Kept so callers compiled against a released

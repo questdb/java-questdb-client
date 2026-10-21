@@ -30,6 +30,7 @@ import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentBudget;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.std.MemoryTag;
@@ -81,7 +82,7 @@ public class CursorWebSocketSendLoopRotationRaceTest {
             final int n = FRAMES;
 
             SegmentManager manager = new SegmentManager(
-                    SEGMENT_BYTES, SegmentManager.UNLIMITED_TOTAL_BYTES);
+                    SEGMENT_BYTES, new SegmentBudget(SegmentManager.UNLIMITED_TOTAL_BYTES));
             manager.start();
             // sfDir == null => memory-only segments (no files/fds); same trySendOne() path.
             CursorSendEngine engine = new CursorSendEngine(null, SEGMENT_BYTES, manager);

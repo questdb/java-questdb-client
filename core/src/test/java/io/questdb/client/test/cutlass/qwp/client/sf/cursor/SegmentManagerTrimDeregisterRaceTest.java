@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentBudget;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
 import io.questdb.client.std.Files;
@@ -93,7 +94,7 @@ public class SegmentManagerTrimDeregisterRaceTest {
             // appendOrFsn whenever a spare is needed, so the producer-driven
             // setup phase still gets prompt service.
             try (SegmentManager mgr = new SegmentManager(
-                    segSize, maxTotal)) {
+                    segSize, new SegmentBudget(maxTotal))) {
                 mgr.start();
 
                 String dir = tmpDir + "/single-ring";

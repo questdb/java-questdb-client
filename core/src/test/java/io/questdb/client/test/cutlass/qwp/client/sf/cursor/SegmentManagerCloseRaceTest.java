@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentBudget;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
 import io.questdb.client.std.Files;
@@ -87,8 +88,7 @@ public class SegmentManagerCloseRaceTest {
         TestUtils.assertMemoryLeak(() -> {
             // Aggressive 1us poll so the worker is almost always running
             // serviceRing — maximizes overlap with concurrent deregister/close.
-            SegmentManager manager = new SegmentManager(SEGMENT_SIZE,
-                    Long.MAX_VALUE);
+            SegmentManager manager = new SegmentManager(SEGMENT_SIZE, new SegmentBudget(Long.MAX_VALUE));
             manager.start();
 
             SegmentRing[] rings = new SegmentRing[ITERATIONS];

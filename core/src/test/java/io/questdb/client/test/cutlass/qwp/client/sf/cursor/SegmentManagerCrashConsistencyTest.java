@@ -15,6 +15,7 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentBudget;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
 import io.questdb.client.std.Files;
@@ -203,7 +204,7 @@ public class SegmentManagerCrashConsistencyTest {
                 ring = createRing(root, segmentSize, payload, 1);
                 CountDownLatch servicePass = new CountDownLatch(1);
                 try (SegmentManager manager = new SegmentManager(
-                        segmentSize, segmentSize * 8L)) {
+                        segmentSize, new SegmentBudget(segmentSize * 8L))) {
                     manager.setBeforeTrimSyncHook(servicePass::countDown);
                     manager.register(ring, root, null);
                     manager.start();

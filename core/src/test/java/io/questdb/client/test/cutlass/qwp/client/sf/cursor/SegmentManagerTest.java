@@ -26,6 +26,7 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentBudget;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
 import io.questdb.client.std.Files;
@@ -281,7 +282,7 @@ public class SegmentManagerTest {
             long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
             try (AckWatermark watermark = AckWatermark.open(tmpDir);
                  SegmentRing ring = new SegmentRing(seg0, segSize);
-                 SegmentManager mgr = new SegmentManager(segSize, cap)) {
+                 SegmentManager mgr = new SegmentManager(segSize, new SegmentBudget(cap))) {
                 assertTrue("watermark must open", watermark != null);
                 mgr.start();
                 // register seeds totalBytes = 1*segSize (initial active).

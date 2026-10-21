@@ -219,15 +219,16 @@ public final class SegmentManager implements QuietCloseable {
     private volatile Thread workerThread;
 
     public SegmentManager(long segmentSizeBytes) {
-        this(segmentSizeBytes, UNLIMITED_TOTAL_BYTES);
+        this(segmentSizeBytes, new SegmentBudget(UNLIMITED_TOTAL_BYTES));
     }
 
     /**
-     * Full constructor.
-     *
      * @param segmentSizeBytes per-segment file size in bytes
-     * @param maxTotalBytes    upper bound on total bytes the manager tracks
-     *                         across all registered rings — counts every segment
+     * @param budget           charged for every segment the manager tracks, and
+     *                         shareable between managers (a sender pool does, so
+     *                         sf_max_total_bytes caps all of its senders
+     *                         together). Its capacity is the upper bound on total
+     *                         bytes across all registered rings — counts every segment
      *                         the ring owns (initial active + sealed + hot
      *                         spare), including bytes already on disk at
      *                         register-time (e.g. after recovery or orphan
@@ -242,18 +243,26 @@ public final class SegmentManager implements QuietCloseable {
      *                         {@code 2 × segmentSizeBytes} so the manager can
      *                         hold an initial active plus one hot spare.
      */
-    public SegmentManager(long segmentSizeBytes, long maxTotalBytes) {
-        this(segmentSizeBytes, new SegmentBudget(maxTotalBytes), FilesFacade.INSTANCE, System::nanoTime);
+    public SegmentManager(long segmentSizeBytes, SegmentBudget budget) {
+        this(segmentSizeBytes, budget, FilesFacade.INSTANCE, System::nanoTime);
     }
 
     /**
-     * As {@link #SegmentManager(long, long)}, but charging
-     * {@code budget}, which other managers may share: its capacity then caps
-     * the rings of all of them together. The capacity must allow at least one
-     * {@code segmentSizeBytes}.
+     * @deprecated {@code pollNanos} is ignored, the worker is event-driven. Kept
+     * so callers compiled against 1.3.x keep linking; {@code (long, long)} must
+     * keep this meaning, so a byte cap goes through {@link SegmentBudget}.
      */
-    public SegmentManager(long segmentSizeBytes, SegmentBudget budget) {
-        this(segmentSizeBytes, budget, FilesFacade.INSTANCE, System::nanoTime);
+    @Deprecated
+    public SegmentManager(long segmentSizeBytes, long pollNanos) {
+        this(segmentSizeBytes);
+    }
+
+    /**
+     * @deprecated see {@link #SegmentManager(long, long)}.
+     */
+    @Deprecated
+    public SegmentManager(long segmentSizeBytes, long pollNanos, long maxTotalBytes) {
+        this(segmentSizeBytes, new SegmentBudget(maxTotalBytes));
     }
 
     @TestOnly
