@@ -157,7 +157,7 @@ public final class PooledSender implements Sender {
      * the rows wait in the slot's buffer for a later append or release, or for
      * the pool's housekeeper settle. With {@code flush_on_close=on}, the
      * default of a directly built {@code SenderPool}, the rows are flushed
-     * first, as before 1.3.11. {@link #reset()} on a lease discards only that
+     * first, as before 1.3.12. {@link #reset()} on a lease discards only that
      * lease's rows. Does not close the underlying {@link Sender}; that only
      * happens when the owning {@code QuestDB} is closed. If the pool is already
      * shutting down when this lease comes home, the underlying Sender is torn

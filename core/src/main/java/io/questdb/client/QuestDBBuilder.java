@@ -213,7 +213,7 @@ public final class QuestDBBuilder {
      * returning the slot. Off by default: close releases, flush ships, drain
      * waits, and rows left in a slot ship within one auto-flush interval of
      * the slot going idle, or at the next append or close on it after that
-     * interval. On restores the behaviour before 1.3.11, one frame and one WAL
+     * interval. On restores the behaviour before 1.3.12, one frame and one WAL
      * commit per close, which is the slow path for applications that borrow per message. In this
      * client "flush" means published to the store-and-forward ring, not
      * acknowledged by the server; use {@link Sender#drain(long)} for that.
