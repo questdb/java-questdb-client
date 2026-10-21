@@ -8,18 +8,23 @@ I/O thread. These two models check the hand-offs.
 
 | Model | What it checks |
 |---|---|
-| `IdleWait.tla` | Producer publish/ring vs. the loop's idle decision (`ioParked`, `publishedBeforeWork` re-check, `recycledThisIteration`), with server drops, reconnect cursor rewinds and `close()`. Invariants: `NoStrandedWork`, `NoWaitAfterRecycle`, `TypeOK`. Liveness: every published frame is acked (`AllAcked`), `close()` stops the loop (`Terminates`). |
+| `IdleWait.tla` | Producer publish (two stores: `publishedFsn`, then the bytes) and ring vs. the loop's idle decision (`ioParked`, `publishStamp` re-check, `recycledThisIteration`), with server drops, reconnect cursor rewinds and `close()`. Invariants: `NoStrandedWork`, `NoWaitAfterRecycle`, `TypeOK`. Liveness: every published frame is acked (`AllAcked`), `close()` stops the loop (`Terminates`). |
 | `AckWait.tla` | The `AckWaiters` hand-off (register, re-check, park vs. advance, signal): a waiter never parks on progress it has not been signalled about (`NoLostAck`); reaching the target returns it (`Returns`). One waiter modelled; the registry holds any number, each following the same protocol. |
 
 `IdleWait_bug.cfg` sets `RecycleFix = FALSE`, the design before a reconnect
 counted as work for its iteration. TLC finds the stranded wait in 10 steps,
 the hang `ReconnectTest.testReplayResendsUnackedFramesAcrossReconnect` hit.
+`IdleWait_stampbug.cfg` sets `StampFix = FALSE`: the re-check keys on
+`publishedFsn`, which the producer stores before the bytes, so a loop that
+saw the FSN but not the bytes blocks on a frame nobody announces (found in
+review with a forced interleaving).
 
 Run (needs `tla2tools.jar` from https://github.com/tlaplus/tlaplus/releases):
 
 ```
 java -cp tla2tools.jar tlc2.TLC -workers 8 -config IdleWait_fix.cfg IdleWait.tla
 java -cp tla2tools.jar tlc2.TLC -workers 8 -config IdleWait_bug.cfg IdleWait.tla
+java -cp tla2tools.jar tlc2.TLC -workers 8 -config IdleWait_stampbug.cfg IdleWait.tla
 java -cp tla2tools.jar tlc2.TLC -config AckWait.cfg AckWait.tla
 ```
 

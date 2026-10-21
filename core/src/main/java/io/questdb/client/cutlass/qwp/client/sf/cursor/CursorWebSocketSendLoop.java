@@ -498,9 +498,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // True while the I/O thread is committed to blocking in awaitIdle(). The
     // engine's publish hook rings the doorbell only when this is set, so a busy
     // loop costs the producer no syscall per flush. Dekker-ordered with the
-    // publishedFsn re-check in ioLoop: the I/O thread sets the flag BEFORE its
-    // final publishedFsn read, the producer publishes BEFORE reading the flag,
-    // so a publish that misses the flag is seen by the re-check and vice versa.
+    // publishStamp re-check in ioLoop: the I/O thread sets the flag BEFORE its
+    // final publishStamp read, the producer completes the publish (FSN, bytes,
+    // stamp) BEFORE reading the flag, so a publish that misses the flag is seen
+    // by the re-check and vice versa.
     private volatile boolean ioParked;
     // I/O-thread-only. Set by swapClient(): a reconnect rewinds the send cursor
     // to ackedFsn+1, which creates sendable work from inside the I/O thread --
@@ -2708,7 +2709,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             while (running) {
                 // Snapshot before the send attempt: a publish after this point is
                 // caught by the re-check below, so the idle decision cannot race it.
-                long publishedBeforeWork = engine.publishedFsn();
+                long publishedBeforeWork = engine.publishStamp();
                 boolean didWork = trySendOne();
                 // 1. Try to send next frame(s).
                 // 2. Try to receive ACKs.
@@ -2745,7 +2746,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 if (!didWork && running) {
                     ioParked = true;
                     try {
-                        if (engine.publishedFsn() == publishedBeforeWork) {
+                        if (engine.publishStamp() == publishedBeforeWork) {
                             awaitIdle();
                         }
                     } finally {

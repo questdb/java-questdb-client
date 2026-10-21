@@ -1865,6 +1865,15 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
+     * I/O thread accessor: changes after every completed publish (FSN and
+     * bytes). The idle re-check in the I/O loop keys on this, see
+     * {@link SegmentRing#publishStamp()}.
+     */
+    public long publishStamp() {
+        return ring.publishStamp();
+    }
+
+    /**
      * I/O thread accessor: sealed segments waiting to drain. Direct view —
      * NOT thread-safe under producer-thread rotation. The I/O loop should
      * use {@link #sealedSegmentsSnapshot(MmapSegment[])} instead.

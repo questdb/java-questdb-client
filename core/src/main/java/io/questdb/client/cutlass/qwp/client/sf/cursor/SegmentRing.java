@@ -158,6 +158,12 @@ public final class SegmentRing implements QuietCloseable {
     private long nextSeq;
     private boolean periodicSyncEnabled;
     private volatile long publishedFsn;
+    // Bumped after the LAST store of a publish (the bytes, publishWritten()).
+    // The I/O loop snapshots this, not publishedFsn, before deciding to block:
+    // publishedFsn is stored before the bytes, so a loop that saw the new FSN
+    // but not yet the bytes would find nothing to send and, re-checking
+    // publishedFsn alone, block on a frame nobody announces.
+    private volatile long publishStamp;
     private volatile boolean syncRequested;
     // Plain (producer-thread-only) flag; set to true the first time we ask
     // the manager for a spare for the current active segment, cleared on
@@ -1117,6 +1123,7 @@ public final class SegmentRing implements QuietCloseable {
         // publishedOffset() for an instant, but never behind it.
         publishedFsn = fsn;
         target.publishWritten();
+        publishStamp = publishStamp + 1; // single producer
         if (!rotated
                 && !wakeupRequestedForActive
                 && hotSpare == null
@@ -1505,6 +1512,13 @@ public final class SegmentRing implements QuietCloseable {
      * instant, never behind them. Returns -1 when nothing has been appended yet.
      * Volatile read; safe to call from any thread.
      */
+    /**
+     * Changes after every completed publish; see the field comment.
+     */
+    public long publishStamp() {
+        return publishStamp;
+    }
+
     public long publishedFsn() {
         return publishedFsn;
     }
