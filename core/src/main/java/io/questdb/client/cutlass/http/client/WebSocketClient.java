@@ -1494,6 +1494,11 @@ public abstract class WebSocketClient implements QuietCloseable {
      * into a handshake or send wait.
      */
     public boolean awaitReadableOrWake(int timeoutMillis) {
+        if (socket.hasBufferedInput()) {
+            // TLS: decrypted or undecrypted input already sits in user space,
+            // invisible to poll(2). Report readable without blocking.
+            return true;
+        }
         int n = Net.pollReadable(socket.getFd(), doorbell, timeoutMillis);
         if (n < 0) {
             throw new HttpClientException("internal error: poll failure [errno=").put(nf.errno()).put(']');
