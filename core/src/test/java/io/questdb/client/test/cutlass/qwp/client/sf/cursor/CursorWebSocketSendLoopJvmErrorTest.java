@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendCounters;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.std.Unsafe;
 import org.junit.Assert;
@@ -35,7 +36,6 @@ import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Regression coverage (M3): {@code catch (Throwable)} in the reconnect
@@ -160,8 +160,7 @@ public class CursorWebSocketSendLoopJvmErrorTest {
         };
         setField(loop, "reconnectFactory", factory);
         setField(loop, "running", true);
-        setField(loop, "totalReconnectAttempts", new AtomicLong());
-        setField(loop, "totalReconnects", new AtomicLong());
+        setField(loop, "counters", new CursorSendCounters());
     }
 
     private static CursorWebSocketSendLoop newBareLoop() throws Exception {

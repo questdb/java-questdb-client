@@ -25,6 +25,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.ConnectionHealth;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
 import io.questdb.client.cutlass.qwp.client.QwpEgressMsgKind;
@@ -422,6 +423,7 @@ public class QwpQueryClientQueryTimeoutTest {
                 client.execute("INSERT INTO t VALUES (2)", null, next, false, 0);
                 Assert.assertTrue("the next statement must get its own reply", next.execDone);
                 Assert.assertEquals("a replacement connection must have been opened", 2, server.handshakeCount());
+                Assert.assertEquals(ConnectionHealth.State.CONNECTED, client.health().getState());
             } finally {
                 script.close();
             }
@@ -681,6 +683,7 @@ public class QwpQueryClientQueryTimeoutTest {
                 client.execute("SELECT slow()", null, failed, false, timeoutMs);
                 failed.assertReleasedOnlyByTheGracePeriod();
                 Assert.assertTrue("the connection failure must have ended the drain", client.hasTerminalFailure());
+                Assert.assertEquals(ConnectionHealth.State.RECONNECTING, client.health().getState());
 
                 RecordingHandler next = new RecordingHandler();
                 client.execute("INSERT INTO t VALUES (1)", null, next, false, 0);
@@ -860,6 +863,7 @@ public class QwpQueryClientQueryTimeoutTest {
                 client.execute("INSERT INTO t VALUES (1)", null, next, false, 0);
                 Assert.assertTrue(next.execDone);
                 Assert.assertEquals("a replacement connection must have been opened", 2, server.handshakeCount());
+                Assert.assertEquals(ConnectionHealth.State.CONNECTED, client.health().getState());
             } finally {
                 script.close();
             }
@@ -1001,12 +1005,14 @@ public class QwpQueryClientQueryTimeoutTest {
                 Assert.assertTrue("execute() must give up after two grace periods, took " + elapsed + "ms",
                         elapsed >= 100 + 2 * 200 && elapsed < 5_000);
                 Assert.assertTrue("a silent connection must be marked failed", client.hasTerminalFailure());
+                Assert.assertEquals(ConnectionHealth.State.RECONNECTING, client.health().getState());
 
                 // failover=on (the default) replaces the connection for the next query.
                 RecordingHandler next = new RecordingHandler();
                 client.execute("INSERT INTO t VALUES (1)", null, next, false, 0);
                 Assert.assertTrue(next.execDone);
                 Assert.assertEquals("a replacement connection must have been opened", 2, server.handshakeCount());
+                Assert.assertEquals(ConnectionHealth.State.CONNECTED, client.health().getState());
                 Assert.assertFalse(client.hasTerminalFailure());
             } finally {
                 script.close();
@@ -1028,6 +1034,7 @@ public class QwpQueryClientQueryTimeoutTest {
                 client.execute("SELECT slow()", null, h, false, 100);
                 h.assertTimedOut();
                 Assert.assertTrue(client.hasTerminalFailure());
+                Assert.assertEquals(ConnectionHealth.State.FAILED, client.health().getState());
 
                 RecordingHandler next = new RecordingHandler();
                 client.execute("SELECT 1", null, next, false, 0);

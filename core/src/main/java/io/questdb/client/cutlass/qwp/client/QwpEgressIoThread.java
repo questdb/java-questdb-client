@@ -349,7 +349,10 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
             // (or any abnormal exit) while a user thread is mid-execute() would let
             // takeEvent() block forever -- once the I/O thread is gone, no further
             // events arrive on the queue.
-            if (!currentQueryDone) {
+            // Publish on shutdown even if idle: the dispatch thread can submit a request just as
+            // this loop exits, before it observes the client's sticky stop request. It must still
+            // find a terminal event rather than wait forever on an I/O thread that has already gone.
+            if (!currentQueryDone || shutdown) {
                 String msg = shutdown
                         ? "I/O thread shut down with query in flight"
                         : "I/O thread terminated with query in flight";

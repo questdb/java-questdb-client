@@ -27,6 +27,7 @@ package io.questdb.client.test.impl;
 import io.questdb.client.Sender;
 import io.questdb.client.impl.ConfigSchema;
 import io.questdb.client.impl.Side;
+import io.questdb.client.test.cutlass.auth.TestTokenProviderFactory;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -69,6 +70,7 @@ public class WsSenderConfigHonoredTest {
         assertHonored("close_flush_timeout_millis=2500", "close_flush_timeout_millis", 2500L);
         assertHonored("durable_ack_keepalive_interval_millis=900", "durable_ack_keepalive_interval_millis", 900L);
         assertHonored("initial_connect_retry=async", "initial_connect_retry", "ASYNC");
+        assertHonored("keepalive_interval_millis=900", "keepalive_interval_millis", 900L);
         assertHonored("reconnect_max_duration_millis=12345", "reconnect_max_duration_millis", 12345L);
         assertHonored("reconnect_initial_backoff_millis=111", "reconnect_initial_backoff_millis", 111L);
         assertHonored("reconnect_max_backoff_millis=2222", "reconnect_max_backoff_millis", 2222L);
@@ -78,6 +80,9 @@ public class WsSenderConfigHonoredTest {
         assertHonored("poison_min_escalation_window_millis=7500", "poison_min_escalation_window_millis", 7500L);
         assertHonored("catch_up_cap_gap_min_escalation_window_millis=90000",
                 "catch_up_cap_gap_min_escalation_window_millis", 90000L);
+        assertHonored("symbol_dict_reset=off", "symbol_dict_reset", false);
+        assertHonored("symbol_dict_reset_threshold=250000", "symbol_dict_reset_threshold", 250000);
+        assertHonored("symbol_dict_reset_max_wait_millis=45000", "symbol_dict_reset_max_wait_millis", 45000L);
         assertHonored("error_inbox_capacity=128", "error_inbox_capacity", 128);
         assertHonored("connection_listener_inbox_capacity=64", "connection_listener_inbox_capacity", 64);
         assertHonored("token=ey.abc", "token", "ey.abc");
@@ -103,6 +108,20 @@ public class WsSenderConfigHonoredTest {
         Assert.assertEquals("/ca.p12", tls.get("tls_roots"));
         Assert.assertEquals("pw", tls.get("tls_roots_password"));
         markHonored("tls_roots", "tls_roots_password");
+
+        // token_provider and its azure keys (wss only; the factory is resolved at parse time, so install one).
+        TestTokenProviderFactory.install(new TestTokenProviderFactory("azure"));
+        try {
+            Map<String, Object> tp = snapshot("wss::addr=h:9000;token_provider=azure;azure_resource=api://app/.default;"
+                    + "azure_client_id=AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE;azure_credential=managed_identity;");
+            Assert.assertEquals("azure", tp.get("token_provider"));
+            Assert.assertEquals("api://app", tp.get("azure_resource"));
+            Assert.assertEquals("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", tp.get("azure_client_id"));
+            Assert.assertEquals("managed_identity", tp.get("azure_credential"));
+        } finally {
+            TestTokenProviderFactory.uninstall();
+        }
+        markHonored("token_provider", "azure_resource", "azure_client_id", "azure_credential");
 
         // Drift guard: every ingress-applied registry key must have an assertion
         // above. The honored set is populated by the assertions themselves, so
