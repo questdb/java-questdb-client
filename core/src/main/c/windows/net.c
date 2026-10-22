@@ -338,11 +338,6 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_doorbellCreate
     return (jint) (uintptr_t) h;
 }
 
-JNIEXPORT void JNICALL Java_io_questdb_client_network_Net_doorbellDrain
-        (JNIEnv *e, jclass cl, jint doorbell) {
-    ResetEvent((HANDLE) (uintptr_t) (uint32_t) doorbell);
-}
-
 JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_doorbellRing
         (JNIEnv *e, jclass cl, jint doorbell) {
     if (!SetEvent((HANDLE) (uintptr_t) (uint32_t) doorbell)) {
@@ -357,7 +352,7 @@ JNIEXPORT void JNICALL Java_io_questdb_client_network_Net_doorbellClose
     CloseHandle((HANDLE) (uintptr_t) (uint32_t) doorbell);
 }
 
-JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_pollReadable
+JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_awaitReadableOrRing
         (JNIEnv *e, jclass cl, jint socketFd, jint doorbell, jint timeoutMillis) {
     WSAEVENT sockEvent = WSACreateEvent();
     if (sockEvent == WSA_INVALID_EVENT) {
@@ -378,6 +373,10 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_pollReadable
     WSACloseEvent(sockEvent);
     if (r == WAIT_TIMEOUT) {
         return 0;
+    }
+    if (r == WAIT_OBJECT_0 + 1) {
+        // Consume the ring (manual-reset event).
+        ResetEvent((HANDLE) (uintptr_t) (uint32_t) doorbell);
     }
     if (r == WAIT_FAILED) {
         SaveLastError();

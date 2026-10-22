@@ -457,13 +457,6 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_doorbellCreate
     return eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
 }
 
-JNIEXPORT void JNICALL Java_io_questdb_client_network_Net_doorbellDrain
-        (JNIEnv *e, jclass cl, jint fd) {
-    uint64_t v;
-    ssize_t n;
-    RESTARTABLE(read((int) fd, &v, sizeof(v)), n);
-}
-
 JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_doorbellRing
         (JNIEnv *e, jclass cl, jint fd) {
     uint64_t one = 1;
@@ -478,7 +471,7 @@ JNIEXPORT void JNICALL Java_io_questdb_client_network_Net_doorbellClose
     close((int) fd);
 }
 
-JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_pollReadable
+JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_awaitReadableOrRing
         (JNIEnv *e, jclass cl, jint socketFd, jint doorbell, jint timeoutMillis) {
     struct pollfd fds[2];
     fds[0].fd = (int) socketFd;
@@ -488,6 +481,13 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_pollReadable
     fds[1].events = POLLIN;
     fds[1].revents = 0;
     int n = poll(fds, 2, (int) timeoutMillis);
+    if (n > 0 && (fds[1].revents & POLLIN)) {
+        // Consume the ring here: a wait that ended on the socket alone skips
+        // the (would-be EAGAIN) read entirely.
+        uint64_t v;
+        ssize_t r;
+        RESTARTABLE(read((int) doorbell, &v, sizeof(v)), r);
+    }
     return (n < 0 && errno == EINTR) ? 0 : n;
 }
 
@@ -511,11 +511,6 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_doorbellCreate
     return kq;
 }
 
-JNIEXPORT void JNICALL Java_io_questdb_client_network_Net_doorbellDrain
-        (JNIEnv *e, jclass cl, jint kq) {
-    // EV_CLEAR consumed the ring when the wait delivered it.
-}
-
 JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_doorbellRing
         (JNIEnv *e, jclass cl, jint kq) {
     struct kevent ev;
@@ -530,7 +525,7 @@ JNIEXPORT void JNICALL Java_io_questdb_client_network_Net_doorbellClose
     close((int) kq);
 }
 
-JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_pollReadable
+JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_awaitReadableOrRing
         (JNIEnv *e, jclass cl, jint socketFd, jint kq, jint timeoutMillis) {
     // Re-armed on every wait; a closed (reconnected) socket drops out of the
     // kqueue by itself, so there is nothing to unregister.

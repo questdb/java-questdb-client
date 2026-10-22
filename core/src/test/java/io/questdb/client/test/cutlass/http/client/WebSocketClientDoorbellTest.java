@@ -99,7 +99,7 @@ public class WebSocketClientDoorbellTest {
                     //    the lowest free numbers, i.e. the ones close() just
                     //    released; a stale ring would make one of them readable.
                     //    Linux only: the probe polls a bare doorbell (socket -1),
-                    //    which kqueue's pollReadable cannot register.
+                    //    which kqueue's awaitReadableOrRing cannot register.
                     client.close();
                     if (Os.isLinux()) {
                         int[] fresh = new int[4];
@@ -111,7 +111,7 @@ public class WebSocketClientDoorbellTest {
                             client.wake();
                             for (int fd : fresh) {
                                 assertEquals("wake() after close() rang a reused descriptor " + fd,
-                                        0, Net.pollReadable(-1, fd, 0));
+                                        0, Net.awaitReadableOrRing(-1, fd, 0));
                             }
                         } finally {
                             for (int fd : fresh) {

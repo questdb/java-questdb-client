@@ -109,6 +109,11 @@ public abstract class WebSocketClient implements QuietCloseable {
     // See awaitReadableOrWake/wake. wakeLock serialises wake() with close().
     private final Object wakeLock = new Object();
     private int doorbell = -1;
+    // True after a recv() found nothing. Until the next send or
+    // awaitReadableOrWake, tryReceiveFrame answers false without a syscall:
+    // the I/O loop's pre-park receive pass otherwise repeats the EAGAIN it got
+    // on the previous iteration. I/O-thread-only, like the recv buffer.
+    private boolean recvDrained;
     // Upper bound (ms) on the TCP connect. <= 0 disables the application-level
     // timeout and falls back to the OS connect timeout. Seeded from the
     // configuration; the QWP sender may override it via setConnectTimeout().
@@ -635,6 +640,13 @@ public abstract class WebSocketClient implements QuietCloseable {
             return result == PARSE_OK;
         }
 
+        if (recvDrained) {
+            // The last recv found nothing and nothing has been sent or waited
+            // for since: a repeat recv would be another EAGAIN. Bytes that land
+            // meanwhile end the next awaitReadableOrWake at once (level-triggered).
+            return false;
+        }
+
         // Try one non-blocking recv
         if (recvPos >= recvBufSize - 1024) {
             growRecvBuffer();
@@ -645,6 +657,7 @@ public abstract class WebSocketClient implements QuietCloseable {
             throw new HttpClientException("peer disconnect [errno=").errno(nf.errno()).put(']');
         }
         if (n == 0) {
+            recvDrained = true;
             return false; // No data available
         }
         recvPos += n;
@@ -1110,6 +1123,7 @@ public abstract class WebSocketClient implements QuietCloseable {
 
     private void doSend(long ptr, int len, int timeout) {
         long startTime = System.nanoTime();
+        recvDrained = false;
         while (len > 0) {
             int remainingTimeout = getRemainingTimeOrThrow(timeout, startTime);
             ioWait(remainingTimeout, IOOperation.WRITE);
@@ -1494,16 +1508,16 @@ public abstract class WebSocketClient implements QuietCloseable {
      * into a handshake or send wait.
      */
     public boolean awaitReadableOrWake(int timeoutMillis) {
+        recvDrained = false;
         if (socket.hasBufferedInput()) {
             // TLS: decrypted or undecrypted input already sits in user space,
             // invisible to poll(2). Report readable without blocking.
             return true;
         }
-        int n = Net.pollReadable(socket.getFd(), doorbell, timeoutMillis);
+        int n = Net.awaitReadableOrRing(socket.getFd(), doorbell, timeoutMillis);
         if (n < 0) {
             throw new HttpClientException("internal error: poll failure [errno=").put(nf.errno()).put(']');
         }
-        Net.doorbellDrain(doorbell);
         return n > 0;
     }
 
