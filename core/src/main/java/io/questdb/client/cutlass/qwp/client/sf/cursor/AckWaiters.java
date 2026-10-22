@@ -24,7 +24,6 @@
 
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
-import java.util.Arrays;
 import java.util.concurrent.locks.LockSupport;
 
 /**
@@ -34,32 +33,45 @@ import java.util.concurrent.locks.LockSupport;
  * call, then loops check / park until done, and deregisters; the I/O thread
  * advances the watermark and then calls {@link #signal()}. Either the waiter's
  * check sees the new value or the signal sees the waiter, and an unpark that
- * lands between check and park is kept as the park permit. Registration
- * allocates; {@link #signal()} and the check/park loop do not.
+ * lands between check and park is kept as the park permit.
+ * <p>
+ * Waiters live in a fixed slot array: {@link #add} takes a null slot and
+ * {@link #remove} nulls it again, so steady-state registration allocates
+ * nothing; the array only grows (doubles, under the lock) when more threads
+ * wait at once than ever before. {@link #signal()} is lock-free and
+ * allocation-free: it reads the volatile array and unparks every non-null
+ * slot. A slot nulled concurrently is read as null (unpark(null) is a no-op)
+ * or as the departing thread, which then receives one extra permit; that is
+ * harmless because a permit is per thread, consumed by its next park, and
+ * every park in this codebase sits in a re-check loop.
  */
 public final class AckWaiters {
-    private static final Thread[] NONE = new Thread[0];
-    private volatile Thread[] waiters = NONE;
+    private volatile Thread[] slots = new Thread[4];
 
     public synchronized void add(Thread t) {
-        Thread[] w = waiters;
-        Thread[] n = Arrays.copyOf(w, w.length + 1);
-        n[w.length] = t;
-        waiters = n;
+        Thread[] s = slots;
+        for (int i = 0; i < s.length; i++) {
+            if (s[i] == null) {
+                s[i] = t;
+                // Volatile self-store: orders the slot write before the waiter's
+                // first check, so a signal() that misses the slot (its volatile
+                // read of the array predates this store) is one whose watermark
+                // write that check is guaranteed to see.
+                slots = s;
+                return;
+            }
+        }
+        Thread[] n = new Thread[s.length * 2];
+        System.arraycopy(s, 0, n, 0, s.length);
+        n[s.length] = t;
+        slots = n;
     }
 
     public synchronized void remove(Thread t) {
-        Thread[] w = waiters;
-        for (int i = 0; i < w.length; i++) {
-            if (w[i] == t) {
-                if (w.length == 1) {
-                    waiters = NONE;
-                    return;
-                }
-                Thread[] n = new Thread[w.length - 1];
-                System.arraycopy(w, 0, n, 0, i);
-                System.arraycopy(w, i + 1, n, i, w.length - i - 1);
-                waiters = n;
+        Thread[] s = slots;
+        for (int i = 0; i < s.length; i++) {
+            if (s[i] == t) {
+                s[i] = null;
                 return;
             }
         }
@@ -70,9 +82,12 @@ public final class AckWaiters {
      * fine because waiters re-check their condition.
      */
     public void signal() {
-        Thread[] w = waiters;
-        for (int i = 0; i < w.length; i++) {
-            LockSupport.unpark(w[i]);
+        Thread[] s = slots;
+        for (int i = 0; i < s.length; i++) {
+            Thread t = s[i];
+            if (t != null) {
+                LockSupport.unpark(t);
+            }
         }
     }
 }
