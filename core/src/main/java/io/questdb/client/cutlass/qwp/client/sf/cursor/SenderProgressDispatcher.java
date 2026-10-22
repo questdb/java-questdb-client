@@ -96,6 +96,12 @@ public final class SenderProgressDispatcher implements QuietCloseable {
     // delivered. Monotonic FSNs make overwrite safe -- the latest value
     // subsumes any prior undelivered value.
     private volatile long latestFsn = EMPTY;
+    // Dekker flag mirroring CursorWebSocketSendLoop.ioParked: the dispatcher
+    // sets it, re-reads latestFsn/closed, then parks; offer() writes
+    // latestFsn, then reads it and unparks only if set. Either the dispatcher
+    // sees the new value before parking, or offer() sees parked=true and
+    // unparks -- no lost wake, and a busy dispatcher costs offer() no futex.
+    private volatile boolean parked;
 
     public SenderProgressDispatcher(SenderProgressHandler handler, int capacity) {
         this(handler, capacity, "qdb-sf-progress-dispatcher");
@@ -175,6 +181,11 @@ public final class SenderProgressDispatcher implements QuietCloseable {
         return dispatcherThread;
     }
 
+    @TestOnly
+    public boolean isParkedForTesting() {
+        return parked;
+    }
+
     /**
      * Replace the user-supplied handler. Effective immediately for any
      * subsequent delivery. Pass {@code null} to install the no-op default.
@@ -205,7 +216,7 @@ public final class SenderProgressDispatcher implements QuietCloseable {
             startDispatcherIfNeeded();
             t = dispatcherThread;
         }
-        if (t != null) {
+        if (t != null && parked) {
             LockSupport.unpark(t);
         }
         return true;
@@ -234,11 +245,19 @@ public final class SenderProgressDispatcher implements QuietCloseable {
             if (closed) {
                 return;
             }
-            // No new value; park until offer() or close() unparks us. Both write
-            // their state (latestFsn / closed) before the unpark and this loop
-            // re-reads it before parking, so no wake can be lost.
-            // Spurious wakeups loop back to the top and re-check.
-            LockSupport.park(this);
+            // No new value; park until offer() or close() unparks us. Publish
+            // parked=true first, then re-read latestFsn/closed: offer() writes
+            // latestFsn before reading parked, so either we see the value here
+            // or it sees the flag and unparks -- no wake can be lost. close()
+            // unparks unconditionally. Spurious wakeups loop back and re-check.
+            parked = true;
+            try {
+                if (latestFsn == v && !closed) {
+                    LockSupport.park(this);
+                }
+            } finally {
+                parked = false;
+            }
         }
     }
 

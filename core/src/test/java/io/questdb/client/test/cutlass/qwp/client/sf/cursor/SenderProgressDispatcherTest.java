@@ -218,6 +218,27 @@ public class SenderProgressDispatcherTest {
     }
 
     @Test
+    public void testIdleDispatcherIsUnparkedByOffer() throws Exception {
+        // Lost-wake guard for the parked/offer Dekker: a dispatcher that has
+        // been idle (parked, no timeout) must be woken by the next offer and
+        // deliver it promptly. Without the unpark it would sleep until close.
+        CountDownLatch second = new CountDownLatch(1);
+        try (SenderProgressDispatcher d = new SenderProgressDispatcher(fsn -> {
+            if (fsn == 2) {
+                second.countDown();
+            }
+        }, 4)) {
+            Assert.assertTrue(d.offer(1));
+            waitForDelivered(d, 1);
+            TimeUnit.MILLISECONDS.sleep(200);
+            Assert.assertTrue("idle dispatcher must be parked", d.isParkedForTesting());
+            Assert.assertTrue(d.offer(2));
+            Assert.assertTrue("parked dispatcher must be woken by offer()",
+                    second.await(100, TimeUnit.MILLISECONDS));
+        }
+    }
+
+    @Test
     public void testLazyStartOnFirstOffer() throws Exception {
         // No thread should exist before the first offer; workloads with zero
         // acks pay zero thread cost.
@@ -244,6 +265,39 @@ public class SenderProgressDispatcherTest {
         Assert.assertFalse(d.offer(1));
         Assert.assertEquals(0L, d.getDroppedNotifications());
         Assert.assertEquals(0L, d.getTotalDelivered());
+    }
+
+    @Test
+    public void testOfferWhileHandlerBusyDoesNotSeeParked() throws Exception {
+        // While the handler is running the dispatcher is not parked, so
+        // offer() must not pay an unpark; the busy dispatcher picks the
+        // newest value up on its next loop iteration instead.
+        CountDownLatch unblock = new CountDownLatch(1);
+        CountDownLatch entered = new CountDownLatch(1);
+        AtomicLong last = new AtomicLong(-1);
+        CountDownLatch delivered = new CountDownLatch(2);
+        try (SenderProgressDispatcher d = new SenderProgressDispatcher(fsn -> {
+            entered.countDown();
+            try {
+                unblock.await();
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            last.set(fsn);
+            delivered.countDown();
+        }, 4)) {
+            Assert.assertTrue(d.offer(0));
+            Assert.assertTrue(entered.await(2, TimeUnit.SECONDS));
+            for (int i = 1; i <= 1000; i++) {
+                Assert.assertTrue(d.offer(i));
+                Assert.assertFalse("dispatcher must not report parked while the handler runs",
+                        d.isParkedForTesting());
+            }
+            unblock.countDown();
+            Assert.assertTrue(delivered.await(2, TimeUnit.SECONDS));
+            Assert.assertEquals("busy dispatcher must deliver the newest value", 1000L, last.get());
+            Assert.assertEquals(2L, d.getTotalDelivered());
+        }
     }
 
     @Test
