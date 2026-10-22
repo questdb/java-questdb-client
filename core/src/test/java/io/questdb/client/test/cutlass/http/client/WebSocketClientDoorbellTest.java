@@ -26,12 +26,15 @@ package io.questdb.client.test.cutlass.http.client;
 
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketClientFactory;
+import io.questdb.client.network.Net;
+import io.questdb.client.std.Os;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Test;
 
 import java.util.concurrent.TimeUnit;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
@@ -90,9 +93,34 @@ public class WebSocketClientDoorbellTest {
                     client.sendPing();
                     assertTrue("socket readability did not end the wait", client.awaitReadableOrWake(5_000));
 
-                    // 6. wake() on a closed client is a safe no-op.
+                    // 6. wake() on a closed client is a safe no-op: close()
+                    //    forgets the doorbell descriptor, so a late wake cannot
+                    //    ring whoever now owns that number. Fresh eventfds take
+                    //    the lowest free numbers, i.e. the ones close() just
+                    //    released; a stale ring would make one of them readable.
+                    //    Linux only: the probe polls a bare doorbell (socket -1),
+                    //    which kqueue's pollReadable cannot register.
                     client.close();
-                    client.wake();
+                    if (Os.isLinux()) {
+                        int[] fresh = new int[4];
+                        for (int i = 0; i < fresh.length; i++) {
+                            fresh[i] = Net.doorbellCreate();
+                            assertTrue(fresh[i] >= 0);
+                        }
+                        try {
+                            client.wake();
+                            for (int fd : fresh) {
+                                assertEquals("wake() after close() rang a reused descriptor " + fd,
+                                        0, Net.pollReadable(-1, fd, 0));
+                            }
+                        } finally {
+                            for (int fd : fresh) {
+                                Net.doorbellClose(fd);
+                            }
+                        }
+                    } else {
+                        client.wake();
+                    }
                 }
             }
         });

@@ -41,6 +41,7 @@ import org.junit.Test;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Paths;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -215,6 +216,101 @@ public class CursorWebSocketSendLoopIdleWaitTest {
         });
     }
 
+    /**
+     * The publish hook rings the doorbell only while the I/O thread is parked
+     * (or committing to park). A loop that is busy -- here, inside the
+     * transport's receive -- picks the frames up on its next iteration, so a
+     * burst of publishes must not cost one wake syscall each.
+     */
+    @Test
+    public void testBusyLoopIsNotWokenPerPublish() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 16384)) {
+                BlockingDoorbellClient client = new BlockingDoorbellClient();
+                // Hold the very first receive: the loop is busy from its first
+                // iteration and never reaches the idle wait before the burst.
+                CountDownLatch gate = new CountDownLatch(1);
+                client.receiveGate = gate;
+                CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
+                        client, engine, 0L,
+                        BlockingDoorbellClient::new,
+                        100L, 1_000L,
+                        false,
+                        CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
+                        CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS);
+                try {
+                    loop.start();
+                    assertTrue("loop never entered the held receive", client.receiveHeld.await(5, TimeUnit.SECONDS));
+                    int wakesBefore = client.wakes.get();
+                    final int frames = 200;
+                    for (int i = 0; i < frames; i++) {
+                        appendFrame(engine);
+                    }
+                    int wakes = client.wakes.get() - wakesBefore;
+                    assertEquals("busy loop was rung " + wakes + " times for " + frames + " publishes", 0, wakes);
+                    gate.countDown();
+                    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                    while (client.sentFrames.get() < frames && System.nanoTime() < deadline) {
+                        Thread.sleep(1);
+                    }
+                    assertEquals("frames published to a busy loop were not all sent", frames, client.sentFrames.get());
+                } finally {
+                    gate.countDown();
+                    loop.close();
+                }
+            }
+        });
+    }
+
+    /**
+     * The idle decision re-checks the engine's publish stamp after committing
+     * to park: a publish that lands after trySendOne found nothing but before
+     * ioParked is set rings no doorbell, so without the re-check the loop
+     * would block on an untimed wait with the frame stranded behind it. The
+     * transport's receive, which runs inside that window, is gated so the
+     * publish lands exactly there.
+     */
+    @Test
+    public void testPublishInsideIdleDecisionWindowIsNotStranded() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 16384)) {
+                BlockingDoorbellClient client = new BlockingDoorbellClient();
+                CountDownLatch gate = new CountDownLatch(1);
+                client.receiveGate = gate;
+                client.gateInIdleWindow = true;
+                CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
+                        client, engine, 0L,
+                        BlockingDoorbellClient::new,
+                        100L, 1_000L,
+                        false,
+                        CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
+                        CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS);
+                try {
+                    loop.start();
+                    appendFrame(engine);
+                    assertTrue("loop never reached the idle-decision window",
+                            client.receiveHeld.await(5, TimeUnit.SECONDS));
+                    assertEquals(1, client.sentFrames.get());
+                    // The loop is between trySendOne (found nothing) and the
+                    // park decision: this publish rings no doorbell.
+                    int wakesBefore = client.wakes.get();
+                    appendFrame(engine);
+                    assertEquals("publish to a non-parked loop must not ring", 0, client.wakes.get() - wakesBefore);
+                    gate.countDown();
+                    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+                    while (client.sentFrames.get() < 2 && System.nanoTime() < deadline) {
+                        Thread.sleep(1);
+                    }
+                    assertEquals("frame published inside the idle-decision window was stranded",
+                            2, client.sentFrames.get());
+                } finally {
+                    gate.countDown();
+                    loop.close();
+                }
+            }
+        });
+    }
+
     private static void appendFrame(CursorSendEngine engine) {
         long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
         try {
@@ -237,12 +333,22 @@ public class CursorWebSocketSendLoopIdleWaitTest {
         final AtomicInteger sentFrames = new AtomicInteger();
         final AtomicInteger waits = new AtomicInteger();
         final AtomicInteger pingAttempts = new AtomicInteger();
+        final AtomicInteger wakes = new AtomicInteger();
+        // Counted down once the receive below is held at receiveGate.
+        final CountDownLatch receiveHeld = new CountDownLatch(1);
         volatile boolean failFirstSend;
         volatile boolean failPing;
         // Answer the first sent frame with a STATUS_OK naming one table, so a
         // durable-ack loop has a pending entry and starts PINGing.
         volatile boolean deliverOkWithPendingTable;
+        // One-shot: the receive that takes the gate blocks on it (5 s cap).
+        // Plain: the very first receive. gateInIdleWindow: the second
+        // receive after the first send, i.e. the one that runs after
+        // trySendOne found nothing and before the park decision.
+        volatile CountDownLatch receiveGate;
+        volatile boolean gateInIdleWindow;
         private boolean okDelivered;
+        private int receivesSinceSend;
         private final Semaphore doorbell = new Semaphore(0);
 
         BlockingDoorbellClient() {
@@ -269,6 +375,7 @@ public class CursorWebSocketSendLoopIdleWaitTest {
 
         @Override
         public void wake() {
+            wakes.incrementAndGet();
             doorbell.release();
         }
 
@@ -279,6 +386,7 @@ public class CursorWebSocketSendLoopIdleWaitTest {
                 throw new HttpClientException("peer disconnect [errno=104]");
             }
             sentFrames.incrementAndGet();
+            receivesSinceSend = 0;
         }
 
         @Override
@@ -292,6 +400,17 @@ public class CursorWebSocketSendLoopIdleWaitTest {
         @Override
         public boolean tryReceiveFrame(WebSocketFrameHandler handler) {
             receiveAttempts.incrementAndGet();
+            receivesSinceSend++;
+            CountDownLatch gate = receiveGate;
+            if (gate != null && (!gateInIdleWindow || (sentFrames.get() == 1 && receivesSinceSend == 2))) {
+                receiveGate = null;
+                receiveHeld.countDown();
+                try {
+                    gate.await(5, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
             if (deliverOkWithPendingTable && !okDelivered && sentFrames.get() > 0) {
                 okDelivered = true;
                 // STATUS_OK | sequence 0 | tableCount 1 | nameLen 1 't' seqTxn 1

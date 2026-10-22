@@ -25,7 +25,9 @@
 package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.Sender;
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
+import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegmentException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
@@ -163,12 +165,96 @@ public class AckWaiterSignalTest {
         });
     }
 
+    /**
+     * A terminal NACK ({@code STATUS_PARSE_ERROR}) latched by the I/O loop
+     * while a thread is parked in {@code awaitAckedFsn} must end that wait
+     * at once: the loop signals ack progress when it records the terminal,
+     * and nothing else ever will (no ack advances after a terminal).
+     */
+    @Test
+    public void testAwaitAckedFsnWakesOnTerminalNack() throws Exception {
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = startedServer(new DelayedTerminalNackHandler(300))) {
+                QwpWebSocketSender sender = (QwpWebSocketSender) Sender.fromConfig(
+                        "ws::addr=localhost:" + server.getPort() + ";close_flush_timeout_millis=0;");
+                try {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    long fsn = sender.flushAndGetSequence();
+                    long t0 = System.nanoTime();
+                    try {
+                        sender.awaitAckedFsn(fsn, 20_000);
+                        Assert.fail("the terminal NACK must surface from awaitAckedFsn");
+                    } catch (LineSenderException expected) {
+                        // terminal
+                    }
+                    long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
+                    Assert.assertTrue("terminal surfaced only after " + elapsedMs + "ms: recording it did not "
+                            + "wake the waiter", elapsedMs < 2000L);
+                } finally {
+                    try {
+                        sender.close();
+                    } catch (LineSenderException ignored) {
+                        // close() rethrows the terminal
+                    }
+                }
+            }
+        });
+    }
+
+    /**
+     * Same latch, observed through {@code close()}'s drain: the drain parks
+     * on the same ack waiter and must return as soon as the terminal lands,
+     * not at {@code close_flush_timeout_millis}.
+     */
+    @Test
+    public void testCloseDrainWakesOnTerminalNack() throws Exception {
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = startedServer(new DelayedTerminalNackHandler(300))) {
+                Sender sender = Sender.fromConfig(
+                        "ws::addr=localhost:" + server.getPort() + ";close_flush_timeout_millis=20000;");
+                sender.table("t").longColumn("v", 1L).atNow();
+                sender.flush();
+                long t0 = System.nanoTime();
+                try {
+                    sender.close();
+                } catch (LineSenderException ignored) {
+                    // close() rethrows the terminal
+                }
+                long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
+                Assert.assertTrue("close() drained for " + elapsedMs + "ms despite the terminal NACK: recording "
+                        + "it did not wake the drain", elapsedMs < 2000L);
+            }
+        });
+    }
+
     private static TestWebSocketServer startedServer(TestWebSocketServer.WebSocketServerHandler handler)
             throws Exception {
         TestWebSocketServer server = new TestWebSocketServer(handler);
         server.start();
         Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
         return server;
+    }
+
+    /**
+     * Answers the first frame with a TERMINAL-policy NACK after a delay long
+     * enough for the producer to park in its wait first.
+     */
+    private static class DelayedTerminalNackHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private final long delayMs;
+
+        DelayedTerminalNackHandler(long delayMs) {
+            this.delayMs = delayMs;
+        }
+
+        @Override
+        public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            try {
+                Thread.sleep(delayMs);
+                client.sendBinary(QwpWireTestUtils.buildNack(0L, WebSocketResponse.STATUS_PARSE_ERROR));
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        }
     }
 
     private static class DelayingAckHandler implements TestWebSocketServer.WebSocketServerHandler {

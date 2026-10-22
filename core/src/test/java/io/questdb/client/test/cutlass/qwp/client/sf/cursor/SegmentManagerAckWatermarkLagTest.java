@@ -117,6 +117,50 @@ public class SegmentManagerAckWatermarkLagTest {
         });
     }
 
+    /**
+     * The round-0 case above with the startup race removed: register seeds the
+     * ring's persisted-ACK mark so that the very first ACK wakes the worker.
+     * Wait until the worker is parked without a timeout before acking, so the
+     * register wake cannot service the ACK by accident.
+     */
+    @Test(timeout = 20_000L)
+    public void testFirstAckAfterRegisterWakesParkedWorker() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segmentSize = MmapSegment.HEADER_SIZE + 64 * (MmapSegment.FRAME_HEADER_SIZE + 32L);
+            MmapSegment initial = MmapSegment.create(tmpDir + "/sf-0000000000000000.sfa", 0L, segmentSize);
+            SegmentRing ring = new SegmentRing(initial, segmentSize);
+            AckWatermark watermark = AckWatermark.open(tmpDir);
+            Assert.assertNotNull(watermark);
+            long payload = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
+            try (SegmentManager manager = new SegmentManager(segmentSize, new SegmentBudget(segmentSize * 8))) {
+                manager.register(ring, tmpDir, watermark);
+                manager.start();
+                Thread worker = manager.getWorkerThreadForTesting();
+                Assert.assertNotNull(worker);
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                while (worker.getState() != Thread.State.WAITING && System.nanoTime() < deadline) {
+                    Thread.sleep(1);
+                }
+                Assert.assertEquals("worker must park without a timeout once the register wake is serviced",
+                        Thread.State.WAITING, worker.getState());
+                for (int i = 0; i < 10; i++) {
+                    Assert.assertTrue(ring.appendOrFsn(payload, 32) >= 0);
+                }
+                ring.acknowledge(9L);
+                deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+                while (watermark.read() != 9L && System.nanoTime() < deadline) {
+                    Thread.sleep(1);
+                }
+                Assert.assertEquals("the first ACK after register did not wake the parked worker",
+                        9L, watermark.read());
+            } finally {
+                Unsafe.free(payload, 32, MemoryTag.NATIVE_DEFAULT);
+                watermark.close();
+                ring.close();
+            }
+        });
+    }
+
     @Test(timeout = 30_000L)
     public void testStreamingAcksWakeWorkerOnWatermarkCadenceNotPerAck() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
