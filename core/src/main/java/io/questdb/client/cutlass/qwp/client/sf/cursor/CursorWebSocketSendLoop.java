@@ -66,8 +66,8 @@ import java.util.concurrent.locks.LockSupport;
  *       to the server.</li>
  *   <li>Receives server ACK frames; on each ACK with cumulative wire sequence
  *       {@code N}, calls {@code engine.acknowledge(fsnAtZero + N)} so the
- *       segment manager can trim fully-acked segments, and runs the
- *       {@link #setAckProgressListener ack-progress listener}.</li>
+ *       segment manager can trim fully-acked segments and the engine's
+ *       ack-state listener wakes any ack waiters.</li>
  *   <li>On wire failure, runs the configured reconnect policy: capped
  *       exponential backoff with jitter, retried indefinitely (Invariant B --
  *       a store-and-forward drainer never gives up on a wall-clock budget).
@@ -2607,7 +2607,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * {@link #externalFsnBase} before it reaches the user-visible dispatcher.
      */
     private void dispatchProgress(long ackedFsn) {
-        signalAckProgress();
         SenderProgressDispatcher d = progressDispatcher;
         if (d != null) {
             d.offer(externalFsnBase + ackedFsn);
@@ -2622,8 +2621,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
-     * Installs the callback run after every ack advance, on a terminal latch
-     * and on {@link #close()}; see {@link AckWaiters}.
+     * Installs the callback run on a terminal latch and on {@link #close()}.
+     * Ack advances signal from the engine ({@link CursorSendEngine#setAckStateListener}),
+     * which also covers acks the loop never sees; see {@link AckWaiters}.
      */
     public void setAckProgressListener(Runnable listener) {
         this.ackProgressListener = listener;

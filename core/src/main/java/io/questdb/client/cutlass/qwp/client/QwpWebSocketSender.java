@@ -3388,6 +3388,9 @@ public class QwpWebSocketSender implements Sender {
         if (cursorEngine != null) {
             throw new LineSenderException("CursorSendEngine is already attached");
         }
+        if (engine != null) {
+            engine.setAckStateListener(ackWaiters::signal);
+        }
         this.cursorEngine = engine;
         this.ownsCursorEngine = takeOwnership && engine != null;
         // Delta encoding is available in memory-mode (in-process catch-up) and in
@@ -5828,6 +5831,7 @@ public class QwpWebSocketSender implements Sender {
         // again on its first append (SymbolDictRecycleHealingTest).
         deltaDictEnabled = rebuilt.isDeltaDictEnabled();
         rebuilt.adoptCounters(counters);
+        rebuilt.setAckStateListener(ackWaiters::signal);
         cursorEngine = rebuilt;
         ownsCursorEngine = true;
         cursorEngine.setSlotLockReleaseListener(this::onSlotLockReleased);

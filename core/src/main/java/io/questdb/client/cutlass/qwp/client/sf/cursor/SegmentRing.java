@@ -150,6 +150,9 @@ public final class SegmentRing implements QuietCloseable {
     // again once a subsequent periodic sync pass succeeds, so a transient
     // disk fault does not permanently brick the producer.
     private volatile MmapSegmentException durabilityFailure;
+    // Run after every ackedFsn advance and durability-latch set, from whichever
+    // thread made the change: the sender's ack waiters re-check both.
+    private volatile Runnable ackStateListener;
     // hotSpare: written by segment manager (installHotSpare), read+cleared by
     // producer thread on rotation. Volatile so the producer sees fresh installs.
     private volatile MmapSegment hotSpare;
@@ -1020,9 +1023,25 @@ public final class SegmentRing implements QuietCloseable {
             if (before <= persistedAckFsn || seq >= oldestTrimmableLastSeq) {
                 wakeManager();
             }
+            signalAckState();
             return true;
         }
         return false;
+    }
+
+    private void signalAckState() {
+        Runnable l = ackStateListener;
+        if (l != null) {
+            l.run();
+        }
+    }
+
+    /**
+     * Installs the callback run after every {@link #acknowledge} advance and
+     * every {@link #recordDurabilityFailure} latch, on the calling thread.
+     */
+    public void setAckStateListener(Runnable listener) {
+        this.ackStateListener = listener;
     }
 
     /**
@@ -1248,6 +1267,7 @@ public final class SegmentRing implements QuietCloseable {
                     durabilityFailure = wrapped;
                 }
             }
+            signalAckState();
         }
     }
 

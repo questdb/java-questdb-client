@@ -909,6 +909,15 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
+     * Installs the callback run after every ack advance -- from any caller of
+     * {@link #acknowledge}, including the orphan-tail retirement self-ack --
+     * and after a durability failure is latched. See {@link AckWaiters}.
+     */
+    public void setAckStateListener(Runnable listener) {
+        ring.setAckStateListener(listener);
+    }
+
+    /**
      * I/O thread accessor: the current active mmap'd segment.
      */
     public MmapSegment activeSegment() {
