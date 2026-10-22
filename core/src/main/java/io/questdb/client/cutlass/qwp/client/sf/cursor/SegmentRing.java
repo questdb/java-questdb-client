@@ -120,11 +120,12 @@ public final class SegmentRing implements QuietCloseable {
     // producer would otherwise hit BACKPRESSURE_NO_SPARE.
     private final long signalAtBytes;
     private volatile long ackedFsn = -1L;
-    // Highest FSN the manager has written to the slot's ack watermark;
-    // Long.MIN_VALUE until a manager registers one, so no ACK counts as "past
-    // it". acknowledge() wakes the manager on the first ACK past it; while it
-    // is stale the manager is already awake or on its WATERMARK_LAG_NANOS
-    // cadence, so later ACKs ring nothing.
+    // The ACK wake arm: the acked FSN at which the manager last went idle.
+    // Long.MIN_VALUE until a manager registers a watermark, so no ACK counts
+    // as "past it". acknowledge() wakes the manager on the first ACK past it.
+    // The manager deliberately leaves it stale while it persists the watermark
+    // on its WATERMARK_LAG_NANOS cadence, so later ACKs ring nothing; it is
+    // re-armed by a timed pass that finds no new ACK.
     private volatile long persistedAckFsn = Long.MIN_VALUE;
     // active: written by producer (constructor + appendOrFsn rotation),
     // read by I/O thread via getActive(). Volatile so the I/O thread sees
@@ -1693,8 +1694,8 @@ public final class SegmentRing implements QuietCloseable {
     }
 
     /**
-     * Manager-only: records the highest FSN written to the ack watermark, see
-     * {@link #acknowledge}.
+     * Manager-only: re-arms the ACK wake at {@code fsn}, the current acked
+     * FSN at the moment the manager goes idle; see {@link #acknowledge}.
      */
     public void setPersistedAckFsn(long fsn) {
         this.persistedAckFsn = fsn;
