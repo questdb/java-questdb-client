@@ -127,6 +127,13 @@ public final class SegmentRing implements QuietCloseable {
     // on its WATERMARK_LAG_NANOS cadence, so later ACKs ring nothing; it is
     // re-armed by a timed pass that finds no new ACK.
     private volatile long persistedAckFsn = Long.MIN_VALUE;
+    // Last FSN of the oldest sealed segment that is not I/O-pinned, or
+    // Long.MAX_VALUE when there is none: the ACK at or past it completes a
+    // trimmable segment. Re-derived under the monitor by every writer of the
+    // sealed head or the I/O pin (refreshOldestTrimmable), so acknowledge()
+    // can detect "completes the oldest sealed segment" without taking the
+    // monitor, which rotation and trim staging hold across a manifest fsync.
+    private volatile long oldestTrimmableLastSeq = Long.MAX_VALUE;
     // active: written by producer (constructor + appendOrFsn rotation),
     // read by I/O thread via getActive(). Volatile so the I/O thread sees
     // rotations promptly and never observes a torn reference.
@@ -678,6 +685,7 @@ public final class SegmentRing implements QuietCloseable {
             for (int i = 0, n = chain.size() - 1; i < n; i++) {
                 ring.sealedSegments.add(chain.get(i));
             }
+            ring.refreshOldestTrimmable();
             // Allocate the return wrapper before transfer. Until this succeeds,
             // the outer catch remains the sole owner and can close all segments
             // and the manifest if construction or sealed-list growth fails.
@@ -1009,7 +1017,7 @@ public final class SegmentRing implements QuietCloseable {
             ackedFsn = seq;
             // The manager does not poll: wake it when this ACK is the first past
             // the persisted watermark or completes the oldest sealed segment.
-            if (before <= persistedAckFsn || firstTrimmable() != null) {
+            if (before <= persistedAckFsn || seq >= oldestTrimmableLastSeq) {
                 wakeManager();
             }
             return true;
@@ -1091,6 +1099,7 @@ public final class SegmentRing implements QuietCloseable {
                 }
                 previous.linkSuccessor(spare);
                 sealedSegments.add(previous);
+                refreshOldestTrimmable();
                 active = spare;
             }
             hotSpare = null;
@@ -1266,6 +1275,7 @@ public final class SegmentRing implements QuietCloseable {
         sealedSegments.clear();
         sealedHead = 0;
         firstNonDurableSealed = 0;
+        oldestTrimmableLastSeq = Long.MAX_VALUE;
         for (int i = 0, n = pendingTrims.size(); i < n; i++) {
             pendingTrims.getQuick(i).close();
         }
@@ -1616,6 +1626,7 @@ public final class SegmentRing implements QuietCloseable {
     synchronized void releasePinnedSegment(MmapSegment expected) {
         if (ioPinnedSegment == expected) {
             ioPinnedSegment = null;
+            refreshOldestTrimmable();
             wakeManager();
         }
     }
@@ -1823,11 +1834,20 @@ public final class SegmentRing implements QuietCloseable {
         } else if (sealedHead >= 64 && sealedHead >= size - sealedHead) {
             compactSealedSegments();
         }
+        refreshOldestTrimmable();
+    }
+
+    private void refreshOldestTrimmable() {
+        MmapSegment head = sealedHead < sealedSegments.size() ? sealedSegments.get(sealedHead) : null;
+        oldestTrimmableLastSeq = head == null || head == ioPinnedSegment
+                ? Long.MAX_VALUE
+                : head.baseSeq() + head.frameCount() - 1;
     }
 
     private void switchIoPin(MmapSegment segment) {
         MmapSegment previous = ioPinnedSegment;
         ioPinnedSegment = segment;
+        refreshOldestTrimmable();
         if (previous != null && previous != segment) {
             wakeManager();
         }
