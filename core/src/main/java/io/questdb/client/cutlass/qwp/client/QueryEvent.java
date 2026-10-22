@@ -29,8 +29,20 @@ package io.questdb.client.cutlass.qwp.client;
  * One event per {@code RESULT_BATCH} / {@code RESULT_END} / {@code QUERY_ERROR}
  * received from the server, plus a synthetic error event if the connection drops
  * mid-query.
+ * <p>
+ * The I/O thread stamps the events of a query with that query's id
+ * ({@link #requestId}), so {@code execute()} can tell its own events from the
+ * leftovers of an earlier query that its {@code execute()} stopped waiting for.
+ * Connection-level events -- the connection failed, the I/O thread stopped, the
+ * client closed -- carry {@link #ANY_REQUEST} and reach whichever query waits.
  */
 public class QueryEvent {
+
+    /**
+     * {@link #requestId} of an event that belongs to no query in particular, such
+     * as a connection failure. Whichever query waits for events must see it.
+     */
+    public static final long ANY_REQUEST = -1L;
 
     public static final int KIND_BATCH = 0;
     public static final int KIND_END = 1;
@@ -50,12 +62,14 @@ public class QueryEvent {
     public byte errorStatus;          // valid for KIND_ERROR
     public int kind;
     public short opType;              // valid for KIND_EXEC_DONE (matches CompiledQuery.SELECT/INSERT/etc.)
+    public long requestId = ANY_REQUEST; // query the event belongs to; see forRequest()
     public long rowsAffected;         // valid for KIND_EXEC_DONE
     public long totalRows;            // valid for KIND_END
 
     public QueryEvent asBatch(QwpBatchBuffer buffer) {
         this.kind = KIND_BATCH;
         this.buffer = buffer;
+        this.requestId = ANY_REQUEST;
         return this;
     }
 
@@ -63,6 +77,7 @@ public class QueryEvent {
         this.kind = KIND_END;
         this.buffer = null;
         this.totalRows = totalRows;
+        this.requestId = ANY_REQUEST;
         return this;
     }
 
@@ -71,6 +86,7 @@ public class QueryEvent {
         this.buffer = null;
         this.errorStatus = status;
         this.errorMessage = message;
+        this.requestId = ANY_REQUEST;
         return this;
     }
 
@@ -79,6 +95,7 @@ public class QueryEvent {
         this.buffer = null;
         this.opType = opType;
         this.rowsAffected = rowsAffected;
+        this.requestId = ANY_REQUEST;
         return this;
     }
 
@@ -87,7 +104,27 @@ public class QueryEvent {
         this.buffer = null;
         this.errorStatus = status;
         this.errorMessage = message;
+        this.requestId = ANY_REQUEST;
         return this;
+    }
+
+    /**
+     * Ties the event to the query with id {@code requestId}. Call it after the
+     * {@code asX()} builder, which leaves the event at {@link #ANY_REQUEST}.
+     */
+    public QueryEvent forRequest(long requestId) {
+        this.requestId = requestId;
+        return this;
+    }
+
+    /**
+     * Returns {@code true} when the event belongs to a query other than
+     * {@code requestId}: a leftover of an earlier query that its
+     * {@code execute()} stopped waiting for. An {@link #ANY_REQUEST} event
+     * belongs to every query.
+     */
+    public boolean isForOtherRequest(long requestId) {
+        return this.requestId != ANY_REQUEST && this.requestId != requestId;
     }
 
     /**
@@ -106,5 +143,6 @@ public class QueryEvent {
         this.opType = 0;
         this.rowsAffected = 0;
         this.totalRows = 0;
+        this.requestId = ANY_REQUEST;
     }
 }

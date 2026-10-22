@@ -146,4 +146,47 @@ public final class QwpSpscQueue<T> {
             consumerThread = null;
         }
     }
+
+    /**
+     * Spin-then-park take bounded by an absolute {@link System#nanoTime()}
+     * deadline. Returns the next value, or {@code null} once the deadline has
+     * passed with the ring still empty. A deadline already in the past
+     * degenerates to a single {@link #poll()}: a value that is already
+     * available is still returned. Allocation-free, like {@link #take()}.
+     *
+     * @throws InterruptedException when the consumer thread was interrupted
+     *                              while waiting
+     */
+    public T take(long deadlineNanos) throws InterruptedException {
+        T value = poll();
+        if (value != null) {
+            return value;
+        }
+        if (deadlineNanos - System.nanoTime() <= 0) {
+            return null;
+        }
+        for (int i = 0; i < SPIN_ITERATIONS; i++) {
+            Compat.onSpinWait();
+            if ((value = poll()) != null) {
+                return value;
+            }
+        }
+        // Same publish-then-re-poll handshake as take(); see the comment there.
+        consumerThread = Thread.currentThread();
+        try {
+            while ((value = poll()) == null) {
+                if (Thread.interrupted()) {
+                    throw new InterruptedException();
+                }
+                final long remainingNanos = deadlineNanos - System.nanoTime();
+                if (remainingNanos <= 0) {
+                    return null;
+                }
+                LockSupport.parkNanos(remainingNanos);
+            }
+            return value;
+        } finally {
+            consumerThread = null;
+        }
+    }
 }
