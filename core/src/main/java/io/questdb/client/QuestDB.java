@@ -161,6 +161,18 @@ public interface QuestDB extends Closeable {
     Sender borrowSender();
 
     /**
+     * Aggregated connection health of every pooled connection - ingest senders and query clients: the number of
+     * connections in each state, the oldest outage and the most recent failed connect round
+     * (design/qwp-token-provider-spec.md, section 8.4). Cheap and safe to call from any thread, so it can back a
+     * health endpoint; it never waits on I/O and never contains a credential.
+     *
+     * @return the aggregate
+     */
+    default ConnectionHealth.Aggregate health() {
+        throw new UnsupportedOperationException("connection health is not available from this QuestDB implementation");
+    }
+
+    /**
      * Shuts down the pools and their published clients. Idempotent. Threads
      * currently blocked in {@link #borrowSender()} or {@link Query#submit()}
      * are released with an error.

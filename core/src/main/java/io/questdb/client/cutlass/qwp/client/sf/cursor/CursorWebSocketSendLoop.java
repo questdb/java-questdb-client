@@ -130,14 +130,25 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     /**
      * Default cadence for the keepalive PING the I/O loop emits while
      * waiting on STATUS_DURABLE_ACK frames. See
-     * {@link #sendDurableAckKeepaliveIfDue()} for the rationale: the OSS
+     * {@link #sendPingIfDue(long)} for the rationale: the OSS
      * server only flushes pending durable-ack frames on inbound recv
      * events, so an opted-in idle client has to prod it. {@code 200} ms
      * trades one PING per 200 ms per idle opted-in connection for
      * sub-second confirmation latency once the upload completes
-     * server-side. {@code 0} or negative disables the keepalive entirely.
+     * server-side. {@code 0} or negative disables this PING, not the idle keepalive.
      */
     public static final long DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS = 200L;
+    /**
+     * Default cadence for the idle keepalive PING, sent once nothing has gone
+     * out on the wire for this long. Without it a quiet connection is closed
+     * by whatever sits on the path with an idle timeout -- L7 load balancers
+     * and proxies (AWS ALB: 60 s), firewalls, NAT gateways -- and by the
+     * server's own idle reaper ({@code http.net.connection.timeout}, 5 min),
+     * and the loop pays a reconnect each time. TCP keepalive does not help
+     * through an L7 proxy, which terminates TCP. {@code 0} or negative
+     * disables it. Opt-in: off by default, {@code 30000} suits an AWS ALB.
+     */
+    public static final long DEFAULT_KEEPALIVE_INTERVAL_MILLIS = 0L;
     public static final long DEFAULT_PARK_NANOS = 50_000L; // 50us idle backoff
     /**
      * Default initial reconnect backoff (100 ms).
@@ -272,9 +283,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // visible to the loop under test.
     @TestOnly
     public static volatile boolean forceMirrorSeedFailureForTest;
-    // Pre-converted to nanos for the comparison in sendDurableAckKeepaliveIfDue.
-    // Zero or negative disables the keepalive entirely.
+    // Pre-converted to nanos for the comparison in sendPingIfDue.
+    // Zero or negative disables the durable-ack PING only.
     private final long durableAckKeepaliveIntervalNanos;
+    // Idle keepalive PING cadence in nanos; 0 or negative disables. Set before start().
+    private long keepaliveIntervalNanos = TimeUnit.MILLISECONDS.toNanos(DEFAULT_KEEPALIVE_INTERVAL_MILLIS);
     // When true, OK frames do NOT advance engine.acknowledge -- only
     // STATUS_DURABLE_ACK frames do. The OK frame's wireSeq is stashed in
     // pendingDurable along with its per-table seqTxns, and trim only advances
@@ -431,6 +444,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // indefinitely and never gives up on a wall-clock budget).
     private volatile SenderConnectionDispatcher connectionDispatcher;
     private volatile SenderErrorDispatcher errorDispatcher;
+    // Foreground connection health (spec section 8.4): the loop reports connection loss and its terminal failure.
+    // Null for orphan drainers.
+    private volatile io.questdb.client.cutlass.qwp.client.QwpConnectionHealthTracker healthTracker;
     // The send cursor has two coordinate systems:
     //
     //   FSN: durable frame sequence number in the local cursor engine. This is
@@ -522,10 +538,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // rethrows always deliver the same instance.
     private volatile LineSenderException terminalError;
     // Wall clock of the last outbound activity on the wire -- a sent frame
-    // (trySendOne) or a keepalive PING (sendDurableAckKeepaliveIfDue).
-    // Throttles the durable-ack keepalive PING so it fires only when the
+    // (trySendOne) or a keepalive PING (sendPingIfDue).
+    // Throttles the keepalive PINGs so they fire only when the
     // configured interval has elapsed since the most recent outbound event.
-    // Zero until the first send; reset to zero on reconnect.
+    // Set when the I/O loop starts.
     private long lastFrameOrPingNanos;
     // Throttles the catch-up oversize WARN. Only consulted when the server
     // advertises NO batch cap, where the loop has no terminal to fall back on
@@ -785,7 +801,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     /**
      * Master constructor — also accepts the cadence at which the I/O loop
      * sends keepalive PINGs while waiting on STATUS_DURABLE_ACK frames.
-     * Pass {@code 0} or negative to disable keepalive PINGs entirely (the
+     * Pass {@code 0} or negative to disable this durable-ack PING (the
      * caller takes responsibility for prodding the server, e.g. by sending
      * data, or by accepting indefinite waits on idle connections).
      */
@@ -1238,18 +1254,32 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                         contextLabel, e.getMessage());
                 throw e;
             } catch (QwpCredentialUnavailableException e) {
-                // A credential the client cannot ACQUIRE (the configured token provider threw) is NOT a
-                // transport outage: retrying the connect cannot conjure a token the provider will not hand
-                // over, so fail fast with the provider's own exception rather than burn the whole connect
-                // budget treating it as a reachable-server problem (which would block build() for up to
-                // maxDurationMillis, default 5 min, and surface a transport-shaped wrapper). Mirrors the
-                // foreground OFF-mode connect (QwpWebSocketSender) and the background reconnect loop above,
-                // which both give credential acquisition its own terminal handling; only this SYNC
-                // initial-connect path lacked it. QwpCredentialUnavailableException is a LineSenderException,
-                // disjoint from the HttpClientException-based terminal set above, so it reaches here.
-                LOG.error("{} could not acquire a credential, won't retry: {}",
-                        contextLabel, e.getMessage());
-                throw e.providerFailure();
+                // A credential the client cannot ACQUIRE (the configured token provider threw) is classified by
+                // the provider (design/qwp-token-provider-spec.md, section 8.3 and decisions D6/D8):
+                //  - a TokenUnavailableException marked retryable - the IdP is unreachable, timing out or
+                //    throttling - is a transient outage like any other, so it consumes the connect budget and is
+                //    retried within it (D6);
+                //  - anything else is permanent - no sign-in yet, a missing or wrong configuration - and retrying
+                //    cannot conjure a token the provider will not hand over, so fail fast with the provider's own
+                //    exception rather than burn the whole budget (up to maxDurationMillis, default 5 min) and
+                //    surface a transport-shaped wrapper (D8). This is how an OIDC device-flow provider that is
+                //    not signed in behaves, and how every provider failure behaved before D6.
+                // An interrupt on the calling thread also ends the retries: a provider wait it cut short reports
+                // retryable, and re-entering it with the flag still set would only spin through the budget.
+                // QwpCredentialUnavailableException is a LineSenderException, disjoint from the
+                // HttpClientException-based terminal set above, so it reaches here.
+                if (!e.isRetryable() || Thread.currentThread().isInterrupted()) {
+                    LOG.error("{} could not acquire a credential, won't retry: {}",
+                            contextLabel, e.getMessage());
+                    throw e.providerFailure();
+                }
+                lastError = e;
+                long now = System.nanoTime();
+                if (now - lastLogNanos >= RECONNECT_LOG_THROTTLE_NANOS) {
+                    LOG.warn("{} attempt {}: credential-unavailable (retryable): {}; retrying within connect budget",
+                            contextLabel, attempts, e.getMessage());
+                    lastLogNanos = now;
+                }
             } catch (Throwable e) {
                 if (e instanceof Error) {
                     // JVM/programming failure (OOM, LinkageError): not a
@@ -1292,7 +1322,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             backoffMillis = Math.min(backoffMillis * 2, maxBackoffMillis);
         }
         long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L;
-        String lastMsg = lastError == null ? "no attempts made" : lastError.getMessage();
+        String lastMsg = lastError == null
+                ? "no attempts made"
+                : lastError instanceof QwpCredentialUnavailableException
+                ? "credential-unavailable: " + lastError.getMessage()
+                : lastError.getMessage();
         throw new LineSenderException(
                 contextLabel + " failed after " + elapsedMs + "ms / "
                         + attempts + " attempts: " + lastMsg,
@@ -1851,12 +1885,28 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * Plugs the owning sender's connection-health tracker: the loop reports connection loss and its terminal
+     * failure there. Set before {@link #start()}; foreground loops only.
+     */
+    public void setConnectionHealthTracker(io.questdb.client.cutlass.qwp.client.QwpConnectionHealthTracker tracker) {
+        this.healthTracker = tracker;
+    }
+
+    /**
      * Plug an async-delivery sink for {@link SenderError} notifications.
      * Idempotent — set once before {@link #start()}; later reassignment is
      * permitted but races between dispatchers are the caller's problem.
      */
     public void setErrorDispatcher(SenderErrorDispatcher dispatcher) {
         this.errorDispatcher = dispatcher;
+    }
+
+    /**
+     * Idle keepalive PING cadence, see {@link #DEFAULT_KEEPALIVE_INTERVAL_MILLIS}.
+     * {@code 0} or negative disables it. Set once before {@link #start()}.
+     */
+    public void setKeepaliveIntervalMillis(long millis) {
+        this.keepaliveIntervalNanos = TimeUnit.MILLISECONDS.toNanos(millis);
     }
 
     /**
@@ -2057,10 +2107,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         }
         durableTableWatermarks.clear();
         localDurableTableWatermarks.clear();
-        // Reset the keepalive throttle so the new connection can prod the
-        // server immediately rather than waiting out the leftover interval
-        // from before the reconnect.
-        lastFrameOrPingNanos = 0L;
     }
 
     private static boolean isCatchUpCapGap(Throwable t) {
@@ -2129,6 +2175,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         snapshotReplayTarget();
         LOG.warn("cursor I/O loop entering {} loop: {}",
                 phase, initial.getMessage());
+        if (hasEverConnected) {
+            io.questdb.client.cutlass.qwp.client.QwpConnectionHealthTracker tracker = healthTracker;
+            if (tracker != null) {
+                tracker.connectionLost();
+            }
+        }
         long outageStartNanos = System.nanoTime();
         // INVARIANT B: a store-and-forward loop must NEVER terminate on a
         // wall-clock reconnect budget. A replica-only / all-endpoints-replica
@@ -2197,9 +2249,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     swapClient(newClient);
                     counters.reconnects.incrementAndGet();
                     long elapsedMs = (System.nanoTime() - outageStartNanos) / 1_000_000L;
-                    LOG.info("cursor I/O loop {} succeeded after {}ms, {} attempts; "
-                                    + "replaying from FSN {}",
-                            phase, elapsedMs, attempts, externalFsnBase + fsnAtZero);
+                    LOG.info("cursor I/O loop {} succeeded after {}ms, {} attempts; resuming at FSN {}",
+                            phase, elapsedMs, attempts, externalFsnBase + engine.ackedFsn() + 1L);
                     return;
                 }
                 // A null factory result is an unsuccessful connect state, not a cap-gap
@@ -2315,10 +2366,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // hands over a token again once the IdP is reachable or the user finishes signing in, and the
                 // un-acked rows stay safe in on-disk SF meanwhile. So retry indefinitely with capped backoff --
                 // NEVER bound by a wall-clock budget and NEVER latch a terminal, which would drop a producer
-                // that store-and-forward promised to keep alive on a recoverable fault. The foreground/SYNC
-                // initial connect still fails fast with the provider's own exception (connectWithRetry, and the
-                // OFF-mode connect in QwpWebSocketSender), because a connectivity error is only the caller's to
-                // see DURING initialization, not after the drainer is running.
+                // that store-and-forward promised to keep alive on a recoverable fault. The initial connect
+                // handles it in connectWithRetry (SYNC: a retryable failure is retried within the budget,
+                // anything else fails fast with the provider's own exception) and in the OFF-mode connect in
+                // QwpWebSocketSender (fails fast), because a connectivity error is only the caller's to see
+                // DURING initialization, not after the drainer is running.
                 //
                 // Ends any open cap-gap episode like every other unrelated reconnect state: we never reached a
                 // node to observe its batch cap, so this outage's wall clock must not accrue toward the orphan
@@ -2382,6 +2434,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     // down the shutdown latch and close() cannot hang.
                     recordFatal(e);
                     throw (Error) e;
+                }
+                // The factory publishes CONNECTED after upgrade, but swapClient can still lose the transport
+                // during dictionary catch-up. Publish that loss before backoff or another credential pull.
+                io.questdb.client.cutlass.qwp.client.QwpConnectionHealthTracker tracker = healthTracker;
+                if (tracker != null) {
+                    tracker.connectionLost();
                 }
                 if (!isCatchUpCapGap(e)) {
                     resetCatchUpCapGapEpisode();
@@ -2762,6 +2820,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             if (client == null && running) {
                 attemptInitialConnect();
             }
+            // The upgrade handshake was outbound traffic: start the idle
+            // keepalive clock here rather than pinging on the first idle pass.
+            lastFrameOrPingNanos = System.nanoTime();
             while (running) {
                 boolean didWork = trySendOne();
                 // 1. Try to send next frame(s).
@@ -2779,7 +2840,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 if (!didWork && running && durableAckMode
                         && durableAckKeepaliveIntervalNanos > 0L
                         && !pendingDurable.isEmpty()) {
-                    sendDurableAckKeepaliveIfDue();
+                    sendPingIfDue(durableAckKeepaliveIntervalNanos);
+                }
+                // 4. Idle keepalive PING, see DEFAULT_KEEPALIVE_INTERVAL_MILLIS.
+                if (!didWork && running && keepaliveIntervalNanos > 0L) {
+                    sendPingIfDue(keepaliveIntervalNanos);
                 }
                 if (!didWork && running) {
                     LockSupport.parkNanos(parkNanos);
@@ -2936,6 +3001,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * every rethrow delivers the same instance.
      */
     private void recordFatal(Throwable t) {
+        io.questdb.client.cutlass.qwp.client.QwpConnectionHealthTracker tracker = healthTracker;
+        if (tracker != null) {
+            tracker.failed();
+        }
         if (terminalError == null) {
             terminalError = t instanceof LineSenderException
                     ? (LineSenderException) t
@@ -2983,27 +3052,29 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
-     * Send a WebSocket PING to prod the server into flushing pending
-     * STATUS_DURABLE_ACK frames, but only when the throttle interval has
-     * elapsed since the last outbound activity -- a sent frame or a prior
-     * keepalive PING. The server's egress code only runs flushPendingAck on
-     * inbound recv events; without this prod, an idle connection waiting on
-     * durable-ack confirmation can sit forever. The "last sent frame" half
-     * of the gate avoids a redundant PING shortly after a producer batch
-     * goes idle: the recent frame already triggered a server-side flush.
+     * Send a WebSocket PING, but only when {@code intervalNanos} has elapsed
+     * since the last outbound activity -- a sent frame or a prior PING.
+     * Serves two callers: the idle keepalive, and the durable-ack keepalive
+     * that prods the server into flushing pending STATUS_DURABLE_ACK frames
+     * (its egress code only runs flushPendingAck on inbound recv events, so
+     * an idle connection waiting on durable-ack confirmation can sit
+     * forever). The "last sent frame" half of the gate avoids a redundant
+     * PING shortly after a producer batch goes idle.
      * <p>
      * Best-effort: any send failure routes through the standard fail() path
      * so the reconnect loop can take over. Caller is responsible for the
-     * "do we even need to send" gate (durableAckMode + non-empty pending).
+     * "do we even need to send" gate.
      */
-    private void sendDurableAckKeepaliveIfDue() {
+    private void sendPingIfDue(long intervalNanos) {
         long now = System.nanoTime();
-        if (now - lastFrameOrPingNanos < durableAckKeepaliveIntervalNanos) {
+        if (now - lastFrameOrPingNanos < intervalNanos) {
             return;
         }
         lastFrameOrPingNanos = now;
         try {
-            client.sendPing(1000);
+            // A timeout here reconnects and replays unacked frames, so it must be as
+            // tolerant as a data send: a slow-draining server or a GC pause is not a dead peer.
+            client.sendPing();
         } catch (Throwable t) {
             fail(t);
         }

@@ -25,12 +25,14 @@
 package io.questdb.client.cutlass.qwp.client;
 
 import io.questdb.client.ClientTlsConfiguration;
+import io.questdb.client.ConnectionHealth;
 import io.questdb.client.HttpTokenProvider;
 import io.questdb.client.cutlass.http.client.HttpClientException;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketClientFactory;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
-import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.auth.TokenProviderRegistry;
+import io.questdb.client.cutlass.auth.TokenProviderSpec;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.impl.ConfigString;
 import io.questdb.client.impl.ConfigView;
@@ -151,6 +153,8 @@ public class QwpQueryClient implements QuietCloseable {
      * is already in the client's kernel recv buffer by the time this wait starts.
      */
     private static final int DEFAULT_SERVER_INFO_TIMEOUT_MS = 5_000;
+    // Warn once per process when an application-supplied token provider is used over ws:: (spec section 9).
+    private static final AtomicBoolean CLEARTEXT_PROVIDER_WARNED = new AtomicBoolean();
     private static final Logger LOG = LoggerFactory.getLogger(QwpQueryClient.class);
     // Reusable typed bind-value sink. Populated on the user thread by the
     // {@link QwpBindSetter} passed to execute(); the pre-encoded bytes are
@@ -166,6 +170,8 @@ public class QwpQueryClient implements QuietCloseable {
     private final List<Endpoint> endpoints = new ArrayList<>();
     private final AtomicBoolean executing = new AtomicBoolean();
     private final Random failoverRandom = new Random();
+    // Connection health (design/qwp-token-provider-spec.md, section 8.4).
+    private final QwpConnectionHealthTracker healthTracker = new QwpConnectionHealthTracker();
     private long authTimeoutMs = DEFAULT_AUTH_TIMEOUT_MS;
     private String authorizationHeader;
     // Deterministic lifecycle barrier used by facade shutdown tests. Null in
@@ -246,6 +252,11 @@ public class QwpQueryClient implements QuietCloseable {
     // -- crashing the JVM on the next decode cycle.
     private volatile QwpEgressIoThread ioThread;
     private volatile Thread ioThreadHandle;
+    // Set when a failover reconnect inside execute() failed, leaving the client disconnected: the next
+    // execute() reconnects instead of throwing "not connected". Cleared by every successful connect.
+    private volatile boolean isReconnectOnNextExecute;
+    // Sticky, non-freeing stop request: a pooled worker may still be inside a handler or reconnect walk.
+    private volatile boolean isShutdownRequested;
     private boolean lastCloseTimedOut;
     // Client preference for server-side per-batch row cap. 0 means "unset",
     // server uses its default. Set via {@code max_batch_rows=N} in the
@@ -300,6 +311,12 @@ public class QwpQueryClient implements QuietCloseable {
     // token rotation. Mutually exclusive with the fixed authorizationHeader
     // synthesized by withBearerToken/withBasicAuth; null when unset.
     private HttpTokenProvider tokenProvider;
+    // The registry lease behind tokenProvider when the connect string selected a token_provider. Acquired on
+    // the first connect() - never by fromConfig(), so building or validating a client fetches no token - and
+    // released by close().
+    private volatile TokenProviderRegistry.Lease tokenProviderLease;
+    // A token_provider selected by the connect string (wss:: only); null otherwise.
+    private TokenProviderSpec tokenProviderSpec;
     private char[] trustStorePassword;
     private String trustStorePath;
     private volatile WebSocketClient webSocketClient;
@@ -384,7 +401,7 @@ public class QwpQueryClient implements QuietCloseable {
                     "unsupported schema [schema=" + cs.schema() + ", supported-schemas=[ws, wss]]");
         }
         ConfigView view = new ConfigView(cs);
-        validateConfig(view, tls);
+        TokenProviderSpec tokenProviderSpec = validateConfigAndResolveTokenProvider(view, tls);
 
         List<Endpoint> parsedEndpoints = new ArrayList<>();
         view.getHostPorts("addr", DEFAULT_WS_PORT, (h, p) -> parsedEndpoints.add(new Endpoint(h, p)));
@@ -484,6 +501,7 @@ public class QwpQueryClient implements QuietCloseable {
             }
             if (hasBasic) client.withBasicAuth(username, password);
             if (token != null) client.withBearerToken(token);
+            client.tokenProviderSpec = tokenProviderSpec;
             if (cid != null) client.withClientId(cid);
             if (maxBatchRows > 0) client.withMaxBatchRows(maxBatchRows);
             if (zone != null) client.withZone(zone);
@@ -496,82 +514,12 @@ public class QwpQueryClient implements QuietCloseable {
 
     /**
      * Validates the cross-key invariants of an egress {@code ws}/{@code wss}
-     * config without constructing a client. Shared by {@link #fromConfig} and
-     * the {@code QuestDB} facade's fail-fast build path. {@code tls} is true for
-     * the {@code wss} schema.
+     * config without constructing a client. The {@code QuestDB} facade uses
+     * this for fail-fast validation with the same rules as {@link #fromConfig}.
+     * {@code tls} is true for the {@code wss} schema.
      */
     public static void validateConfig(ConfigView view, boolean tls) {
-        view.getHostPorts("addr", DEFAULT_WS_PORT, (h, p) -> {
-        });
-        if (!view.has("addr")) {
-            throw new IllegalArgumentException("missing required key: addr");
-        }
-        // Trigger range/enum validation of every typed value.
-        view.getEnum("target");
-        view.getEnum("compression");
-        view.getEnum("tls_verify");
-        view.getBoolOnOff("failover", false);
-        view.getInt("failover_max_attempts", 0);
-        view.getInt("max_batch_rows", 0);
-        view.getInt("buffer_pool_size", 0);
-        view.getInt("compression_level", 0);
-        boolean hasBackoffInitial = view.has("failover_backoff_initial_ms");
-        boolean hasBackoffMax = view.has("failover_backoff_max_ms");
-        // getLong also range-validates the value; call it even for an absent key.
-        long backoffInitial = view.getLong("failover_backoff_initial_ms", -1);
-        long backoffMax = view.getLong("failover_backoff_max_ms", -1);
-        view.getLong("failover_max_duration_ms", -1);
-        view.getLong("initial_credit", -1);
-        view.getLong("auth_timeout_ms", -1);
-        // getInt: connect_timeout feeds an int API, so validation must also
-        // reject values that fit a long but not an int.
-        view.getInt("connect_timeout", -1);
-        String username = view.getStr("username");
-        String password = view.getStr("password");
-        String token = view.getStr("token");
-        // A present-but-blank credential is rejected up front, matching the
-        // ingress Sender, so a shared ws/wss string fails the same way on both
-        // sides and the client never builds an empty Authorization header.
-        if (username != null && Chars.isBlank(username)) {
-            throw new IllegalArgumentException("username cannot be empty nor null");
-        }
-        if (password != null && Chars.isBlank(password)) {
-            throw new IllegalArgumentException("password cannot be empty nor null");
-        }
-        if (token != null && Chars.isBlank(token)) {
-            throw new IllegalArgumentException("token cannot be empty nor null");
-        }
-        boolean hasBasic = username != null || password != null;
-        if (hasBasic && (username == null || password == null)) {
-            throw new IllegalArgumentException("username and password must be provided together");
-        }
-        if (hasBasic && token != null) {
-            throw new IllegalArgumentException("cannot use both token and username/password authentication");
-        }
-        String tlsVerify = view.getStr("tls_verify");
-        String tlsRoots = view.getStr("tls_roots");
-        String tlsRootsPassword = view.getStr("tls_roots_password");
-        if (!tls && (tlsVerify != null || tlsRoots != null || tlsRootsPassword != null)) {
-            throw new IllegalArgumentException(
-                    "tls_verify/tls_roots/tls_roots_password require the wss:: schema");
-        }
-        if (tlsRoots == null && tlsRootsPassword != null) {
-            throw new IllegalArgumentException("tls_roots_password requires tls_roots");
-        }
-        if (tlsRoots != null && "unsafe_off".equals(tlsVerify)) {
-            throw new IllegalArgumentException(TLS_ROOTS_INSECURE_CONFIG_ERROR);
-        }
-        // Mirror fromConfig's effective values: a missing bound takes its
-        // default, so the ordering is enforced even when only one key is set
-        // (e.g. failover_backoff_max_ms alone, below the default initial backoff).
-        if (hasBackoffInitial || hasBackoffMax) {
-            long effectiveInitial = hasBackoffInitial ? backoffInitial : DEFAULT_FAILOVER_INITIAL_BACKOFF_MS;
-            long effectiveMax = hasBackoffMax ? backoffMax : Math.max(effectiveInitial, DEFAULT_FAILOVER_MAX_BACKOFF_MS);
-            if (effectiveMax < effectiveInitial) {
-                throw new IllegalArgumentException(
-                        "failover_backoff_max_ms must be >= failover_backoff_initial_ms");
-            }
-        }
+        validateConfigAndResolveTokenProvider(view, tls);
     }
 
     /**
@@ -629,8 +577,9 @@ public class QwpQueryClient implements QuietCloseable {
      * those pointers and SIGSEGV the JVM. The interrupt-driven I/O thread shutdown
      * does NOT detect or wait for a still-running user handler -- the timeout-based
      * leak fallback only protects against an unresponsive I/O thread, not an
-     * unresponsive user thread. {@link #cancel()} is the right way to ask an
-     * in-flight {@code execute()} to return; close after it does.
+     * unresponsive user thread. Use {@link #cancel()} to cancel the current query, or
+     * {@link #requestShutdown()} to stop execution and reconnects permanently; close
+     * after the in-flight {@code execute()} returns.
      */
     @Override
     public void close() {
@@ -640,6 +589,7 @@ public class QwpQueryClient implements QuietCloseable {
             // scratch, double-freeing it.
             return;
         }
+        healthTracker.closed();
         Runnable hook = beforeCloseHook;
         beforeCloseHook = null;
         if (hook != null) {
@@ -720,6 +670,13 @@ public class QwpQueryClient implements QuietCloseable {
             // (submitQuery copies its bytes into sendScratch), so it is safe to free
             // even when we otherwise leak the I/O thread and buffer pool.
             bindValues.close();
+            // Release the token_provider lease: the registry keeps the shared provider alive for its linger
+            // period, which also covers an I/O thread that failed to join above.
+            TokenProviderRegistry.Lease lease = tokenProviderLease;
+            tokenProviderLease = null;
+            if (lease != null) {
+                lease.close();
+            }
             if (wasInterrupted) {
                 // Hand the caller's cancellation back exactly as it arrived. Restoring it here rather
                 // than earlier keeps it out of the joins above, which is the whole point.
@@ -746,110 +703,28 @@ public class QwpQueryClient implements QuietCloseable {
      * endpoints unreachable" (the latter surfaces as a plain
      * {@link HttpClientException}).
      * <p>
-     * A configured token provider is queried once here, before the walk. A
-     * provider failure (not signed in, a failed silent refresh, a rejected
-     * token) is cluster-wide, so it fails fast with the provider's own error
+     * A configured token provider is queried once here, before the walk, and once
+     * more if an endpoint rejects its token with {@code 401}. A provider failure
+     * (not signed in, a failed silent refresh, a rejected token) is cluster-wide,
+     * so it fails fast, without contacting any endpoint, as a
+     * {@link QwpCredentialUnavailableException} whose message starts with
+     * {@code credential-unavailable} and whose cause is the provider's own error,
      * rather than being retried across endpoints as a transport failure.
      */
     public synchronized void connect() {
-        if (closedFlag.get()) {
+        if (closedFlag.get() || isShutdownRequested) {
             throw new IllegalStateException("QwpQueryClient is closed");
         }
         if (connected) {
             return;
         }
-        lastCloseTimedOut = false;
-        if (hostTracker == null) {
-            hostTracker = new QwpHostHealthTracker(
-                    endpoints.size(), clientZone, TARGET_PRIMARY.equals(target));
-        } else {
-            hostTracker.beginRound(false);
+        try {
+            connectWalk();
+            healthTracker.upgraded();
+        } catch (RuntimeException e) {
+            healthTracker.roundFailed(e);
+            throw e;
         }
-        QwpServerInfo lastObservedMismatch = null;
-        QwpIngressRoleRejectedException lastUpgradeRoleReject = null;
-        Throwable lastTransportError = null;
-        // Resolve the bearer credential once, before the endpoint walk: a token is cluster-wide, so a
-        // token-provider failure (not signed in, a failed silent refresh, a rejected token) is not a
-        // per-endpoint transport fault. Resolving here lets it propagate as the provider's own error
-        // instead of being folded into "all endpoints unreachable", and avoids re-querying the provider
-        // once per endpoint.
-        String authHeader = resolveAuthorizationHeader();
-        while (true) {
-            int i = hostTracker.pickNext();
-            if (i < 0) {
-                break;
-            }
-            Endpoint ep = endpoints.get(i);
-            try {
-                connectToEndpoint(ep, authHeader);
-            } catch (QwpAuthFailedException ae) {
-                cleanupFailedConnect();
-                throw ae;
-            } catch (QwpIngressRoleRejectedException re) {
-                lastTransportError = re;
-                lastUpgradeRoleReject = re;
-                hostTracker.recordZone(i, re.getZoneId());
-                hostTracker.recordRoleReject(i, re.isTransient());
-                LOG.info("QwpQueryClient {}:{} rejected upgrade with role={}; trying next",
-                        ep.host, ep.port, re.getRole());
-                cleanupFailedConnect();
-                continue;
-            } catch (RuntimeException e) {
-                lastTransportError = e;
-                hostTracker.recordTransportError(i);
-                LOG.warn("QwpQueryClient connect failed for {}:{} -- {}", ep.host, ep.port, e.getMessage());
-                cleanupFailedConnect();
-                continue;
-            }
-            // info is non-null: connectToEndpoint() returns only after
-            // receiveServerInfoSync() set serverInfo (it returns non-null or throws).
-            QwpServerInfo info = serverInfo;
-            if ((info.getCapabilities() & QwpEgressMsgKind.CAP_ZONE) != 0) {
-                hostTracker.recordZone(i, info.getZoneId());
-            }
-            if (!matchesTarget(info.getRole(), target)) {
-                lastObservedMismatch = info;
-                boolean isTransient = info.getRole() == QwpEgressMsgKind.ROLE_PRIMARY_CATCHUP;
-                hostTracker.recordRoleReject(i, isTransient);
-                LOG.info("QwpQueryClient {}:{} role={} does not match target={}, trying next",
-                        ep.host, ep.port, QwpServerInfo.roleName(info.getRole()), target);
-                cleanupFailedConnect();
-                continue;
-            }
-            spawnIoThread();
-            hostTracker.recordSuccess(i);
-            currentEndpointIndex = i;
-            connected = true;
-            return;
-        }
-        if (lastObservedMismatch != null) {
-            throw new QwpRoleMismatchException(
-                    target,
-                    lastObservedMismatch,
-                    "no endpoint matches target=" + target + "; last observed role="
-                            + QwpServerInfo.roleName(lastObservedMismatch.getRole())
-                            + " cluster=" + lastObservedMismatch.getClusterId()
-            );
-        }
-        if (lastUpgradeRoleReject != null) {
-            // 421 + X-QuestDB-Role on every host: the cluster answered with role
-            // information at upgrade time but no host satisfied target=. Surface
-            // QwpRoleMismatchException with the last role for diagnostics so
-            // callers can distinguish "no primary available" from "all unreachable"
-            // (failover.md §6 Topology / wire-egress.md §11.9.2).
-            QwpRoleMismatchException ex = new QwpRoleMismatchException(
-                    target,
-                    null,
-                    "no endpoint matches target=" + target
-                            + "; last observed role=" + lastUpgradeRoleReject.getRole()
-                            + " at " + lastUpgradeRoleReject.getHost() + ':' + lastUpgradeRoleReject.getPort()
-            );
-            ex.initCause(lastUpgradeRoleReject);
-            throw ex;
-        }
-        throw new HttpClientException(
-                "all QWP endpoints unreachable [count=" + endpoints.size()
-                        + ", lastError=" + (lastTransportError == null ? "<none>" : lastTransportError.getMessage()) + ']');
     }
 
     /**
@@ -973,6 +848,13 @@ public class QwpQueryClient implements QuietCloseable {
         m.put("tls_verify", tlsValidationMode);
         m.put("tls_roots", trustStorePath);
         m.put("tls_roots_password", trustStorePassword == null ? null : new String(trustStorePassword));
+        m.put("token_provider", tokenProviderSpec == null ? null : tokenProviderSpec.name());
+        m.put("azure_resource", tokenProviderSpec == null ? null
+                : tokenProviderSpec.params().get(TokenProviderSpec.KEY_AZURE_RESOURCE));
+        m.put("azure_client_id", tokenProviderSpec == null ? null
+                : tokenProviderSpec.params().get(TokenProviderSpec.KEY_AZURE_CLIENT_ID));
+        m.put("azure_credential", tokenProviderSpec == null ? null
+                : tokenProviderSpec.params().get(TokenProviderSpec.KEY_AZURE_CREDENTIAL));
         return m;
     }
 
@@ -1034,6 +916,15 @@ public class QwpQueryClient implements QuietCloseable {
         return serverInfo;
     }
 
+    /**
+     * Connection health (design/qwp-token-provider-spec.md, section 8.4). A query client connects on demand, so
+     * {@link ConnectionHealth.State#RECONNECTING} means its last connect or failover reconnect failed and the next
+     * operation will try again. Cheap and safe from any thread; never contains a credential.
+     */
+    public ConnectionHealth health() {
+        return healthTracker.snapshot();
+    }
+
     public boolean isConnected() {
         return connected;
     }
@@ -1062,6 +953,20 @@ public class QwpQueryClient implements QuietCloseable {
         GenerationListener listener = currentGenerationListener;
         if (listener != null) {
             listener.onTerminalFailure(status, message);
+        }
+    }
+
+    /**
+     * Permanently stops query execution and reconnects without freeing any resources. Safe to call from
+     * another thread, including while a handler still reads batch column pointers. A connect already in
+     * progress may run until its timeout; any I/O thread it publishes also receives the stop request.
+     * Finish the in-flight {@code execute()} before calling {@link #close()} to release the resources.
+     */
+    public void requestShutdown() {
+        isShutdownRequested = true;
+        QwpEgressIoThread io = ioThread;
+        if (io != null) {
+            io.shutdown();
         }
     }
 
@@ -1126,6 +1031,9 @@ public class QwpQueryClient implements QuietCloseable {
      */
     public QwpQueryClient withBasicAuth(String username, String password) {
         checkPreConnect("withBasicAuth");
+        if (tokenProviderSpec != null) {
+            throw new IllegalStateException("withBasicAuth cannot be combined with token_provider in the configuration");
+        }
         if (tokenProvider != null) {
             throw new IllegalStateException("withBasicAuth cannot be combined with withBearerTokenProvider");
         }
@@ -1146,6 +1054,9 @@ public class QwpQueryClient implements QuietCloseable {
      */
     public QwpQueryClient withBearerToken(String token) {
         checkPreConnect("withBearerToken");
+        if (tokenProviderSpec != null) {
+            throw new IllegalStateException("withBearerToken cannot be combined with token_provider in the configuration");
+        }
         if (tokenProvider != null) {
             throw new IllegalStateException("withBearerToken cannot be combined with withBearerTokenProvider");
         }
@@ -1178,6 +1089,10 @@ public class QwpQueryClient implements QuietCloseable {
         checkPreConnect("withBearerTokenProvider");
         if (provider == null) {
             throw new IllegalArgumentException("provider must not be null");
+        }
+        if (tokenProviderSpec != null) {
+            throw new IllegalStateException(
+                    "withBearerTokenProvider cannot be combined with token_provider in the configuration");
         }
         if (authorizationHeader != null) {
             throw new IllegalStateException("withBearerTokenProvider cannot be combined with withBearerToken or withBasicAuth");
@@ -1452,6 +1367,84 @@ public class QwpQueryClient implements QuietCloseable {
         return true;
     }
 
+    private static TokenProviderSpec validateConfigAndResolveTokenProvider(ConfigView view, boolean tls) {
+        view.getHostPorts("addr", DEFAULT_WS_PORT, (h, p) -> {
+        });
+        if (!view.has("addr")) {
+            throw new IllegalArgumentException("missing required key: addr");
+        }
+        // Trigger range/enum validation of every typed value.
+        view.getEnum("target");
+        view.getEnum("compression");
+        view.getEnum("tls_verify");
+        view.getBoolOnOff("failover", false);
+        view.getInt("failover_max_attempts", 0);
+        view.getInt("max_batch_rows", 0);
+        view.getInt("buffer_pool_size", 0);
+        view.getInt("compression_level", 0);
+        boolean hasBackoffInitial = view.has("failover_backoff_initial_ms");
+        boolean hasBackoffMax = view.has("failover_backoff_max_ms");
+        // getLong also range-validates the value; call it even for an absent key.
+        long backoffInitial = view.getLong("failover_backoff_initial_ms", -1);
+        long backoffMax = view.getLong("failover_backoff_max_ms", -1);
+        view.getLong("failover_max_duration_ms", -1);
+        view.getLong("initial_credit", -1);
+        view.getLong("auth_timeout_ms", -1);
+        // getInt: connect_timeout feeds an int API, so validation must also
+        // reject values that fit a long but not an int.
+        view.getInt("connect_timeout", -1);
+        String username = view.getStr("username");
+        String password = view.getStr("password");
+        String token = view.getStr("token");
+        // A present-but-blank credential is rejected up front, matching the
+        // ingress Sender, so a shared ws/wss string fails the same way on both
+        // sides and the client never builds an empty Authorization header.
+        if (username != null && Chars.isBlank(username)) {
+            throw new IllegalArgumentException("username cannot be empty nor null");
+        }
+        if (password != null && Chars.isBlank(password)) {
+            throw new IllegalArgumentException("password cannot be empty nor null");
+        }
+        if (token != null && Chars.isBlank(token)) {
+            throw new IllegalArgumentException("token cannot be empty nor null");
+        }
+        boolean hasBasic = username != null || password != null;
+        if (hasBasic && (username == null || password == null)) {
+            throw new IllegalArgumentException("username and password must be provided together");
+        }
+        if (hasBasic && token != null) {
+            throw new IllegalArgumentException("cannot use both token and username/password authentication");
+        }
+        String tlsVerify = view.getStr("tls_verify");
+        String tlsRoots = view.getStr("tls_roots");
+        String tlsRootsPassword = view.getStr("tls_roots_password");
+        if (!tls && (tlsVerify != null || tlsRoots != null || tlsRootsPassword != null)) {
+            throw new IllegalArgumentException(
+                    "tls_verify/tls_roots/tls_roots_password require the wss:: schema");
+        }
+        if (tlsRoots == null && tlsRootsPassword != null) {
+            throw new IllegalArgumentException("tls_roots_password requires tls_roots");
+        }
+        if (tlsRoots != null && "unsafe_off".equals(tlsVerify)) {
+            throw new IllegalArgumentException(TLS_ROOTS_INSECURE_CONFIG_ERROR);
+        }
+        // token_provider and its keys (design/qwp-token-provider-spec.md, section 7.2): resolves the factory, never
+        // fetches a token.
+        TokenProviderSpec tokenProviderSpec = TokenProviderSpec.parse(view, tls);
+        // Mirror fromConfig's effective values: a missing bound takes its
+        // default, so the ordering is enforced even when only one key is set
+        // (e.g. failover_backoff_max_ms alone, below the default initial backoff).
+        if (hasBackoffInitial || hasBackoffMax) {
+            long effectiveInitial = hasBackoffInitial ? backoffInitial : DEFAULT_FAILOVER_INITIAL_BACKOFF_MS;
+            long effectiveMax = hasBackoffMax ? backoffMax : Math.max(effectiveInitial, DEFAULT_FAILOVER_MAX_BACKOFF_MS);
+            if (effectiveMax < effectiveInitial) {
+                throw new IllegalArgumentException(
+                        "failover_backoff_max_ms must be >= failover_backoff_initial_ms");
+            }
+        }
+        return tokenProviderSpec;
+    }
+
     /**
      * Builds the {@code X-QWP-Accept-Encoding} header value from the user's
      * preference. {@code raw} (the library default) omits the header entirely
@@ -1539,6 +1532,9 @@ public class QwpQueryClient implements QuietCloseable {
     }
 
     private void connectToEndpoint(Endpoint ep, String authHeader) {
+        if (isShutdownRequested) {
+            throw new IllegalStateException("QwpQueryClient is closed");
+        }
         if (tlsEnabled) {
             webSocketClient = WebSocketClientFactory.newTlsInstance(
                     new ClientTlsConfiguration(trustStorePath, trustStorePassword, tlsValidationMode));
@@ -1573,12 +1569,155 @@ public class QwpQueryClient implements QuietCloseable {
         }
     }
 
+    // One connect round: resolve the credential, walk the endpoints. See connect().
+    private void connectWalk() {
+        if (tokenProviderSpec != null && tokenProviderLease == null) {
+            // The connect string selected a token_provider: share the process-wide provider for it (spec section
+            // 7.4). The lease is this client's until close().
+            tokenProviderLease = TokenProviderRegistry.global().acquire(tokenProviderSpec);
+            tokenProvider = tokenProviderLease.provider();
+        } else if (tokenProvider != null && !tlsEnabled && CLEARTEXT_PROVIDER_WARNED.compareAndSet(false, true)) {
+            // spec section 9: an application-supplied provider over ws:: is the application's call - warn once
+            LOG.warn("a token provider is used over ws:: (no TLS): bearer tokens cross the network in cleartext; "
+                    + "use wss:: in production");
+        }
+        lastCloseTimedOut = false;
+        if (hostTracker == null) {
+            hostTracker = new QwpHostHealthTracker(
+                    endpoints.size(), clientZone, TARGET_PRIMARY.equals(target));
+        } else {
+            hostTracker.beginRound(false);
+        }
+        QwpServerInfo lastObservedMismatch = null;
+        QwpIngressRoleRejectedException lastUpgradeRoleReject = null;
+        Throwable lastTransportError = null;
+        // Resolve the bearer credential once, before the endpoint walk: a token is cluster-wide, so a
+        // token-provider failure (not signed in, a failed silent refresh, a rejected token) is not a
+        // per-endpoint transport fault. Resolving here lets it propagate as a credential-unavailable failure
+        // that carries the provider's own error, instead of being folded into "all endpoints unreachable",
+        // and avoids re-querying the provider once per endpoint.
+        String authHeader = resolveAuthorizationHeader();
+        // One same-endpoint retry after a refreshable 401 per connect, for a token provider only
+        // (design/qwp-token-provider-spec.md, section 8.2). The retried attempt records no health penalty.
+        boolean isAuthRetryAvailable = tokenProvider != null;
+        int retryIdx = -1;
+        while (true) {
+            int i;
+            if (retryIdx >= 0) {
+                i = retryIdx;
+                retryIdx = -1;
+            } else {
+                i = hostTracker.pickNext();
+            }
+            if (i < 0) {
+                break;
+            }
+            Endpoint ep = endpoints.get(i);
+            try {
+                connectToEndpoint(ep, authHeader);
+            } catch (QwpAuthFailedException ae) {
+                cleanupFailedConnect();
+                if (isAuthRetryAvailable && ae.isTokenRefreshable()) {
+                    isAuthRetryAvailable = false;
+                    String refreshed = refreshAfterRejection(authHeader, ae);
+                    if (refreshed != null && !refreshed.equals(authHeader)) {
+                        LOG.info("QwpQueryClient {}:{} rejected the token with {}; retrying once with a refreshed token",
+                                ep.host, ep.port, ae.getStatusCode());
+                        authHeader = refreshed;
+                        retryIdx = i;
+                        continue;
+                    }
+                }
+                throw ae;
+            } catch (QwpIngressRoleRejectedException re) {
+                lastTransportError = re;
+                lastUpgradeRoleReject = re;
+                hostTracker.recordZone(i, re.getZoneId());
+                hostTracker.recordRoleReject(i, re.isTransient());
+                LOG.info("QwpQueryClient {}:{} rejected upgrade with role={}; trying next",
+                        ep.host, ep.port, re.getRole());
+                cleanupFailedConnect();
+                continue;
+            } catch (RuntimeException e) {
+                lastTransportError = e;
+                hostTracker.recordTransportError(i);
+                LOG.warn("QwpQueryClient connect failed for {}:{} -- {}", ep.host, ep.port, e.getMessage());
+                cleanupFailedConnect();
+                continue;
+            }
+            // info is non-null: connectToEndpoint() returns only after
+            // receiveServerInfoSync() set serverInfo (it returns non-null or throws).
+            QwpServerInfo info = serverInfo;
+            if ((info.getCapabilities() & QwpEgressMsgKind.CAP_ZONE) != 0) {
+                hostTracker.recordZone(i, info.getZoneId());
+            }
+            if (!matchesTarget(info.getRole(), target)) {
+                lastObservedMismatch = info;
+                boolean isTransient = info.getRole() == QwpEgressMsgKind.ROLE_PRIMARY_CATCHUP;
+                hostTracker.recordRoleReject(i, isTransient);
+                LOG.info("QwpQueryClient {}:{} role={} does not match target={}, trying next",
+                        ep.host, ep.port, QwpServerInfo.roleName(info.getRole()), target);
+                cleanupFailedConnect();
+                continue;
+            }
+            spawnIoThread();
+            hostTracker.recordSuccess(i);
+            currentEndpointIndex = i;
+            isReconnectOnNextExecute = false;
+            connected = true;
+            return;
+        }
+        if (lastObservedMismatch != null) {
+            throw new QwpRoleMismatchException(
+                    target,
+                    lastObservedMismatch,
+                    "no endpoint matches target=" + target + "; last observed role="
+                            + QwpServerInfo.roleName(lastObservedMismatch.getRole())
+                            + " cluster=" + lastObservedMismatch.getClusterId()
+            );
+        }
+        if (lastUpgradeRoleReject != null) {
+            // 421 + X-QuestDB-Role on every host: the cluster answered with role
+            // information at upgrade time but no host satisfied target=. Surface
+            // QwpRoleMismatchException with the last role for diagnostics so
+            // callers can distinguish "no primary available" from "all unreachable"
+            // (failover.md §6 Topology / wire-egress.md §11.9.2).
+            QwpRoleMismatchException ex = new QwpRoleMismatchException(
+                    target,
+                    null,
+                    "no endpoint matches target=" + target
+                            + "; last observed role=" + lastUpgradeRoleReject.getRole()
+                            + " at " + lastUpgradeRoleReject.getHost() + ':' + lastUpgradeRoleReject.getPort()
+            );
+            ex.initCause(lastUpgradeRoleReject);
+            throw ex;
+        }
+        HttpClientException failure = new HttpClientException(
+                "all QWP endpoints unreachable [count=" + endpoints.size()
+                        + ", lastError=" + (lastTransportError == null ? "<none>" : lastTransportError.getMessage()) + ']');
+        failure.initCause(lastTransportError);
+        throw failure;
+    }
+
     private void executeImpl(CharSequence sql, QwpBindSetter binds, QwpColumnBatchHandler handler, boolean resetSymbolDict) {
-        if (closedFlag.get()) {
+        if (closedFlag.get() || isShutdownRequested) {
             throw new IllegalStateException("QwpQueryClient is closed");
         }
         if (!connected) {
-            throw new IllegalStateException("QwpQueryClient not connected; call connect() first");
+            if (!isReconnectOnNextExecute) {
+                throw new IllegalStateException("QwpQueryClient not connected; call connect() first");
+            }
+            // A previous failover reconnect failed. Reconnect on this operation rather than leave the client
+            // permanently unusable (design/qwp-token-provider-spec.md, section 8.3, "Egress recovery") -- a
+            // pooled client is never discarded by its pool on its own, so without this a single failed
+            // failover (say, a token outage) would poison the slot for the life of the pool.
+            try {
+                connect();
+            } catch (RuntimeException e) {
+                handler.onError(-1L, WebSocketResponse.STATUS_INTERNAL_ERROR,
+                        "reconnect failed: " + e.getMessage());
+                return;
+            }
         }
         hostTracker.beginRound(false);
         long failoverDeadlineNanos;
@@ -1595,17 +1734,35 @@ public class QwpQueryClient implements QuietCloseable {
         }
         int attempt = 0;
         while (true) {
+            if (isShutdownRequested) {
+                handler.onError(-1L, WebSocketResponse.STATUS_INTERNAL_ERROR, "query client shut down");
+                return;
+            }
             attempt++;
             FailoverProbeHandler probe = new FailoverProbeHandler(handler);
             executeOnce(sql, binds, probe, resetSymbolDict);
             if (!probe.transportFailureIntercepted) {
                 return;
             }
+            if (isShutdownRequested) {
+                handler.onError(probe.interceptedRequestId, probe.interceptedStatus, "query client shut down");
+                return;
+            }
             if (!failoverEnabled) {
+                // With failover off the transport failure stays latched: every later execute() reports it.
+                healthTracker.connectionLost();
+                healthTracker.failed();
                 handler.onError(probe.interceptedRequestId, probe.interceptedStatus, probe.interceptedMessage);
                 return;
             }
             if (attempt >= failoverMaxAttempts || System.nanoTime() - failoverDeadlineNanos >= 0) {
+                // The connection is dead: its generation latched the transport failure, so no later query runs on
+                // it. Record the loss, as the exits below do. With a single attempt per execute(), every later
+                // execute() ends here on that same latch and never reconnects: terminal, as with failover off.
+                healthTracker.connectionLost();
+                if (failoverMaxAttempts <= 1) {
+                    healthTracker.failed();
+                }
                 int failovers = Math.max(0, attempt - 1);
                 handler.onError(probe.interceptedRequestId, probe.interceptedStatus,
                         "transport failure after " + attempt + " execute attempt"
@@ -1621,6 +1778,10 @@ public class QwpQueryClient implements QuietCloseable {
             }
             cleanupFailedConnect();
             connected = false;
+            healthTracker.connectionLost();
+            // Every exit from here on - an exhausted deadline, an interrupted backoff, a failed reconnect - leaves
+            // the client disconnected; the next execute() reconnects rather than throw "not connected".
+            isReconnectOnNextExecute = true;
             if (failoverInitialBackoffMs > 0L) {
                 long base = failoverInitialBackoffMs << Math.min(attempt - 1, 30);
                 if (base < 0L) base = failoverMaxBackoffMs;
@@ -1661,17 +1822,30 @@ public class QwpQueryClient implements QuietCloseable {
                 }
             }
             try {
-                reconnectViaTracker();
+                try {
+                    reconnectViaTracker();
+                    healthTracker.upgraded();
+                } catch (RuntimeException e) {
+                    healthTracker.roundFailed(e);
+                    throw e;
+                }
             } catch (QwpAuthFailedException authErr) {
                 // failover.md S6: AuthError is terminal across all hosts.
                 // Credentials are cluster-wide, so retrying floods server logs
                 // without recovery. Surface a distinct message so monitoring
-                // can pull auth incidents apart from generic transport failures.
+                // can pull auth incidents apart from generic transport failures;
+                // it names the failure class (design/qwp-token-provider-spec.md, 8.3).
                 handler.onError(probe.interceptedRequestId, probe.interceptedStatus,
-                        "auth failure during failover reconnect [host="
+                        "auth-rejected during failover reconnect [host="
                                 + authErr.getHost() + ':' + authErr.getPort()
                                 + ", status=" + authErr.getStatusCode()
                                 + ", last error: " + probe.interceptedMessage + ']');
+                return;
+            } catch (QwpCredentialUnavailableException credentialErr) {
+                // The token provider could not supply a credential; no endpoint was contacted.
+                handler.onError(probe.interceptedRequestId, probe.interceptedStatus,
+                        "failover reconnect failed: " + credentialErr.getMessage()
+                                + " [last error: " + probe.interceptedMessage + ']');
                 return;
             } catch (RuntimeException reconnectErr) {
                 handler.onError(probe.interceptedRequestId, probe.interceptedStatus,
@@ -1679,6 +1853,10 @@ public class QwpQueryClient implements QuietCloseable {
                                 + (attempt == 1 ? "" : "s") + " [last error: "
                                 + probe.interceptedMessage + ", reconnect error: "
                                 + reconnectErr.getMessage() + ']');
+                return;
+            }
+            if (isShutdownRequested) {
+                handler.onError(probe.interceptedRequestId, probe.interceptedStatus, "query client shut down");
                 return;
             }
             handler.onFailoverReset(probe.interceptedRequestId, serverInfo);
@@ -1724,6 +1902,10 @@ public class QwpQueryClient implements QuietCloseable {
                 return;
             }
         }
+        if (isShutdownRequested) {
+            probe.deliverFinal(-1L, "query client shut down");
+            return;
+        }
         long requestId = nextRequestId++;
         currentRequestId = requestId;
         // Honor a cancel that arrived during the dispatch window. The latch
@@ -1736,19 +1918,32 @@ public class QwpQueryClient implements QuietCloseable {
         try {
             io.submitQuery(sql, requestId, initialCreditBytes, bindValues.count(), bindValues.bufferPtr(), bindValues.bufferLen(),
                     resolveQueryFlags(resetSymbolDict));
+            boolean isBatchSkipped = false;
             while (true) {
                 QueryEvent ev = io.takeEvent();
                 try {
                     switch (ev.kind) {
                         case QueryEvent.KIND_BATCH:
                             try {
-                                probe.onBatch(ev.buffer.batch);
+                                if (isShutdownRequested) {
+                                    isBatchSkipped = true;
+                                } else {
+                                    probe.onBatch(ev.buffer.batch);
+                                }
                             } finally {
+                                // Even during shutdown, drain and release a queued batch: the I/O thread
+                                // cannot leave its receive buffer until this token arrives.
                                 io.releaseBuffer(ev.buffer);
                             }
                             break;
                         case QueryEvent.KIND_END:
-                            probe.onEnd(requestId, ev.totalRows);
+                            // The I/O thread can reach END before requestShutdown() stops it. Never report
+                            // success after shutdown made us release a batch without delivering its rows.
+                            if (isBatchSkipped) {
+                                probe.deliverFinal(requestId, "query client shut down");
+                            } else {
+                                probe.onEnd(requestId, ev.totalRows);
+                            }
                             return;
                         case QueryEvent.KIND_EXEC_DONE:
                             probe.onExecDone(requestId, ev.opType, ev.rowsAffected);
@@ -1873,8 +2068,16 @@ public class QwpQueryClient implements QuietCloseable {
         // reason as connect(): a provider failure is cluster-wide, so surface it directly rather than
         // as a per-endpoint transport error retried across every host.
         String authHeader = resolveAuthorizationHeader();
+        boolean isAuthRetryAvailable = tokenProvider != null;
+        int retryIdx = -1;
         while (true) {
-            int i = hostTracker.pickNext();
+            int i;
+            if (retryIdx >= 0) {
+                i = retryIdx;
+                retryIdx = -1;
+            } else {
+                i = hostTracker.pickNext();
+            }
             if (i < 0) {
                 if (!retriedAfterReset) {
                     hostTracker.beginRound(true);
@@ -1888,6 +2091,17 @@ public class QwpQueryClient implements QuietCloseable {
                 connectToEndpoint(ep, authHeader);
             } catch (QwpAuthFailedException ae) {
                 cleanupFailedConnect();
+                if (isAuthRetryAvailable && ae.isTokenRefreshable()) {
+                    isAuthRetryAvailable = false;
+                    String refreshed = refreshAfterRejection(authHeader, ae);
+                    if (refreshed != null && !refreshed.equals(authHeader)) {
+                        LOG.info("QwpQueryClient {}:{} rejected the token with {} on failover; retrying once with "
+                                + "a refreshed token", ep.host, ep.port, ae.getStatusCode());
+                        authHeader = refreshed;
+                        retryIdx = i;
+                        continue;
+                    }
+                }
                 throw ae;
             } catch (QwpIngressRoleRejectedException re) {
                 lastError = re;
@@ -1917,6 +2131,7 @@ public class QwpQueryClient implements QuietCloseable {
             spawnIoThread();
             hostTracker.recordSuccess(i);
             currentEndpointIndex = i;
+            isReconnectOnNextExecute = false;
             connected = true;
             return;
         }
@@ -1925,34 +2140,60 @@ public class QwpQueryClient implements QuietCloseable {
                     "no endpoint matches target=" + target + " on failover; last observed role="
                             + QwpServerInfo.roleName(lastMismatch.getRole()));
         }
-        throw new HttpClientException(
+        HttpClientException failure = new HttpClientException(
                 "all QWP endpoints unreachable on failover [count=" + total
                         + ", lastError=" + (lastError == null ? "<none>" : lastError.getMessage()) + ']');
+        failure.initCause(lastError);
+        throw failure;
+    }
+
+    /**
+     * Steps 1-2 of the one-retry-after-401 rule (design/qwp-token-provider-spec.md, section 8.2): tells the
+     * token provider that the token in {@code presentedHeader} was rejected, then resolves the header again.
+     * Returns the new header, or null when no credential could be obtained - the connect then ends with the
+     * rejection, carrying the provider's failure as a suppressed diagnostic.
+     */
+    private String refreshAfterRejection(String presentedHeader, QwpAuthFailedException rejection) {
+        if (presentedHeader != null && presentedHeader.startsWith("Bearer ")) {
+            try {
+                tokenProvider.onTokenRejected(presentedHeader.substring("Bearer ".length()),
+                        rejection.getStatusCode());
+            } catch (RuntimeException e) {
+                // The contract says it must not throw; a provider that does still gets its token re-pulled.
+                LOG.debug("token provider onTokenRejected threw {}", e.getClass().getName());
+            }
+        }
+        try {
+            return resolveAuthorizationHeader();
+        } catch (RuntimeException e) {
+            rejection.addSuppressed(e);
+            return null;
+        }
     }
 
     private String resolveAuthorizationHeader() {
         // With a token provider, query it once per connect()/reconnect (the caller resolves before the
         // endpoint walk) so a reconnect presents a freshly refreshed token; validateToken rejects a
         // null/empty/blank return, or one carrying a control or non-ASCII character, before it reaches
-        // the "Bearer " header. A provider that throws (a failed silent refresh, or not signed in yet)
-        // fails connect()/reconnect as a LineSenderException, preserving the provider failure as its cause.
+        // the "Bearer " header. A provider that throws (a failed silent refresh, or not signed in yet), or
+        // returns a token that fails validation, fails connect()/reconnect with the credential-unavailable
+        // failure class (design/qwp-token-provider-spec.md, section 8.1): a QwpCredentialUnavailableException
+        // whose message names the class and whose cause is the provider failure.
         if (tokenProvider != null) {
-            CharSequence pulled;
+            String token;
             try {
-                pulled = tokenProvider.getToken();
-            } catch (LineSenderException e) {
-                throw e;
+                CharSequence pulled = tokenProvider.getToken();
+                // snapshot before validating, for the reason HttpTokenProvider.validateToken gives: the
+                // concatenation below re-reads the sequence, and the provider may be reusing its buffer
+                token = pulled == null ? null : pulled.toString();
+                HttpTokenProvider.validateToken(token);
             } catch (RuntimeException e) {
-                throw new LineSenderException(
-                        e.getMessage() == null
+                throw new QwpCredentialUnavailableException(
+                        "credential-unavailable: " + (e.getMessage() == null
                                 ? "token provider failed to supply a credential"
-                                : e.getMessage(),
+                                : e.getMessage()),
                         e);
             }
-            // snapshot before validating, for the reason HttpTokenProvider.validateToken gives: the
-            // concatenation below re-reads the sequence, and the provider may be reusing its buffer
-            CharSequence token = pulled == null ? null : pulled.toString();
-            HttpTokenProvider.validateToken(token);
             return "Bearer " + token;
         }
         return authorizationHeader;
@@ -2015,6 +2256,11 @@ public class QwpQueryClient implements QuietCloseable {
         handle.start();
         ioThreadHandle = handle;
         ioThread = newIoThread;
+        // Pair the post-publication check with requestShutdown()'s flag-before-read ordering. Even if
+        // shutdown saw the old (or null) ioThread during a reconnect, this generation must stop too.
+        if (isShutdownRequested) {
+            newIoThread.shutdown();
+        }
     }
 
     private static final class Endpoint {

@@ -25,6 +25,8 @@
 package io.questdb.client.cutlass.qwp.client;
 
 import io.questdb.client.ClientTlsConfiguration;
+import io.questdb.client.ConnectionHealth;
+import io.questdb.client.HttpTokenProvider;
 import io.questdb.client.Sender;
 import io.questdb.client.SenderConnectionEvent;
 import io.questdb.client.SenderConnectionListener;
@@ -68,6 +70,7 @@ import io.questdb.client.std.Misc;
 import io.questdb.client.std.Numbers;
 import io.questdb.client.std.NumericException;
 import io.questdb.client.std.ObjList;
+import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.bytes.DirectByteSlice;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.TestOnly;
@@ -188,9 +191,10 @@ public class QwpWebSocketSender implements Sender {
     // fixed token or Basic credential; for an httpTokenProvider it pulls a freshly refreshed token,
     // so the initial connect and every reconnect re-handshake carry the current token. May be null
     // when no auth is configured. Evaluated once per (re)connect round in buildAndConnect, before the
-    // endpoint walk (not once per endpoint); a throwing provider is wrapped as
-    // QwpCredentialUnavailableException: the foreground/SYNC initial connect fails fast with the provider's
-    // own exception, while the running background drainer treats it as a transient outage and retries it
+    // endpoint walk (not once per endpoint), and once more after a refreshable 401; a throwing provider is
+    // wrapped as QwpCredentialUnavailableException: the OFF initial connect fails fast with the provider's own
+    // exception, the SYNC one too unless the failure is retryable (then it retries within the reconnect
+    // budget), while the running background drainer treats it as a transient outage and retries it
     // indefinitely (never bounded by the reconnect budget, never terminal) per store-and-forward Invariant B.
     private final Supplier<String> authorizationHeaderSupplier;
     private final int autoFlushBytes;
@@ -223,6 +227,10 @@ public class QwpWebSocketSender implements Sender {
     // work, and neither the foreground's reconnect nor close() can queue
     // behind a drainer's endpoint walk.
     private final ReentrantLock connectWalkLock = new ReentrantLock();
+    // Connection health of the FOREGROUND connection (design/qwp-token-provider-spec.md, section 8.4): rounds and
+    // upgrades from buildAndConnect, connection loss and terminal failure from the I/O loop, close from close().
+    // Background drainer walks never report here.
+    private final QwpConnectionHealthTracker healthTracker = new QwpConnectionHealthTracker();
     private final QwpHostHealthTracker hostTracker;
     // Per-table encoded body byte counts captured during flushPendingRows' combined
     // encode. flushPendingRowsSplit uses them both for preflight sizing and to walk
@@ -273,6 +281,9 @@ public class QwpWebSocketSender implements Sender {
     private volatile Runnable closeStartedHook;
     private boolean connected;
     private SenderConnectionDispatcher connectionDispatcher;
+    // A connect-string token_provider's registry lease (TokenProviderRegistry), released when this sender
+    // closes so the shared provider can linger and then stop. Null for any other credential.
+    private volatile QuietCloseable credentialLease;
     // Async-delivery sink for SenderConnectionEvent notifications. Default
     // installed at construction; the builder hook can swap before connect()
     // runs, and post-connect setConnectionListener() propagates to the live
@@ -336,9 +347,11 @@ public class QwpWebSocketSender implements Sender {
     // Keepalive PING cadence used by the I/O loop while
     // request_durable_ack=on AND there are pending durable-ack
     // confirmations. Default mirrors the loop's spec value; 0 or negative
-    // disables keepalive PINGs entirely.
+    // disables this PING (the idle keepalive PING is separate).
     private long durableAckKeepaliveIntervalMillis =
             CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS;
+    // Idle keepalive PING cadence for the I/O loop; 0 or negative disables it.
+    private long keepaliveIntervalMillis = CursorWebSocketSendLoop.DEFAULT_KEEPALIVE_INTERVAL_MILLIS;
     // Effective per-batch soft-flush threshold in raw column-buffer bytes.
     // Initially equals autoFlushBytes; lowered to fit under the server's
     // advertised X-QWP-Max-Batch-Size at handshake so the wire payload stays
@@ -888,7 +901,7 @@ public class QwpWebSocketSender implements Sender {
     /**
      * Master connect overload — also accepts the keepalive PING cadence
      * the I/O loop uses while waiting on STATUS_DURABLE_ACK frames.
-     * {@code 0} or negative disables the keepalive entirely (caller takes
+     * {@code 0} or negative disables this durable-ack PING (caller takes
      * responsibility for prodding the server).
      */
     public static QwpWebSocketSender connect(
@@ -1047,7 +1060,8 @@ public class QwpWebSocketSender implements Sender {
                 CursorWebSocketSendLoop.DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS,
                 DEFAULT_SYMBOL_DICT_RESET_ENABLED,
                 DEFAULT_SYMBOL_DICT_RESET_THRESHOLD_SYMBOLS,
-                DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS);
+                DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS,
+                CursorWebSocketSendLoop.DEFAULT_KEEPALIVE_INTERVAL_MILLIS);
     }
 
     /**
@@ -1105,7 +1119,8 @@ public class QwpWebSocketSender implements Sender {
                 catchUpCapGapMinEscalationWindowMillis,
                 DEFAULT_SYMBOL_DICT_RESET_ENABLED,
                 DEFAULT_SYMBOL_DICT_RESET_THRESHOLD_SYMBOLS,
-                DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS);
+                DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS,
+                CursorWebSocketSendLoop.DEFAULT_KEEPALIVE_INTERVAL_MILLIS);
     }
 
     // ------------------------------------------------------------------
@@ -1517,8 +1532,8 @@ public class QwpWebSocketSender implements Sender {
     ) {
         return connectWithCredentialSupplier(endpoints, tlsConfig, autoFlushRows, autoFlushBytes,
                 autoFlushIntervalNanos, fixedAuthHeader(authorizationHeader),
-                requestDurableAck, cursorEngine,
-                closeFlushTimeoutMillis, reconnectMaxDurationMillis,
+                requestDurableAck ? DurableAckTiers.REPLICATED | DurableAckTiers.LEGACY_TRUE : DurableAckTiers.NONE,
+                cursorEngine, closeFlushTimeoutMillis, reconnectMaxDurationMillis,
                 reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
                 initialConnectMode, errorHandler, errorInboxCapacity,
                 durableAckKeepaliveIntervalMillis, authTimeoutMs, connectTimeoutMs,
@@ -1526,7 +1541,7 @@ public class QwpWebSocketSender implements Sender {
                 maxFrameRejections, poisonMinEscalationWindowMillis,
                 catchUpCapGapMinEscalationWindowMillis,
                 symbolDictResetEnabled, symbolDictResetThresholdSymbols,
-                symbolDictResetMaxWaitMillis);
+                symbolDictResetMaxWaitMillis, CursorWebSocketSendLoop.DEFAULT_KEEPALIVE_INTERVAL_MILLIS);
     }
 
     /**
@@ -1536,7 +1551,7 @@ public class QwpWebSocketSender implements Sender {
      * long, long, long, long, Sender.InitialConnectMode, SenderErrorHandler, int, long, long, int,
      * SenderConnectionListener, int, int, long, long)}. Kept as its own overload, delegating to the master
      * below with the symbol-dictionary recycle knobs defaulted, so a caller compiled before those knobs'
-     * arity moved into the master keeps linking; {@code ExportedApiCompatibilityTest} pins it.
+     * arity moved into the master keeps linking.
      * <p>
      * Recycling requires a non-null engine rebuild factory installed via
      * {@link #setEngineRebuildFactory(EngineRebuildFactory)};
@@ -1579,7 +1594,8 @@ public class QwpWebSocketSender implements Sender {
                 catchUpCapGapMinEscalationWindowMillis,
                 DEFAULT_SYMBOL_DICT_RESET_ENABLED,
                 DEFAULT_SYMBOL_DICT_RESET_THRESHOLD_SYMBOLS,
-                DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS);
+                DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS,
+                CursorWebSocketSendLoop.DEFAULT_KEEPALIVE_INTERVAL_MILLIS);
     }
 
     public static QwpWebSocketSender connectWithCredentialSupplier(
@@ -1690,7 +1706,8 @@ public class QwpWebSocketSender implements Sender {
                 maxFrameRejections, poisonMinEscalationWindowMillis,
                 catchUpCapGapMinEscalationWindowMillis,
                 symbolDictResetEnabled, symbolDictResetThresholdSymbols,
-                symbolDictResetMaxWaitMillis);
+                symbolDictResetMaxWaitMillis,
+                CursorWebSocketSendLoop.DEFAULT_KEEPALIVE_INTERVAL_MILLIS);
     }
 
     /**
@@ -1699,7 +1716,8 @@ public class QwpWebSocketSender implements Sender {
      * recycle knobs ({@code symbol_dict_reset}, {@code symbol_dict_reset_threshold},
      * {@code symbol_dict_reset_max_wait_millis}): consecutive server-active
      * rejections of the same head-of-line frame, with no ack progress in
-     * between, before the loop escalates to a typed terminal.
+     * between, before the loop escalates to a typed terminal. Also takes the
+     * idle keepalive PING cadence ({@code keepalive_interval_millis}).
      * <p>
      * Named apart from {@code connect} for the reason given on
      * {@link #connectWithCredentialSupplier(List, ClientTlsConfiguration, int, int, long, Supplier,
@@ -1743,7 +1761,8 @@ public class QwpWebSocketSender implements Sender {
             long catchUpCapGapMinEscalationWindowMillis,
             boolean symbolDictResetEnabled,
             int symbolDictResetThresholdSymbols,
-            long symbolDictResetMaxWaitMillis
+            long symbolDictResetMaxWaitMillis,
+            long keepaliveIntervalMillis
     ) {
         if (symbolDictResetThresholdSymbols <= 0
                 || symbolDictResetThresholdSymbols > QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE / 2) {
@@ -1772,6 +1791,7 @@ public class QwpWebSocketSender implements Sender {
             sender.reconnectInitialBackoffMillis = reconnectInitialBackoffMillis;
             sender.reconnectMaxBackoffMillis = reconnectMaxBackoffMillis;
             sender.durableAckKeepaliveIntervalMillis = durableAckKeepaliveIntervalMillis;
+            sender.keepaliveIntervalMillis = keepaliveIntervalMillis;
             sender.maxFrameRejections = maxFrameRejections;
             sender.poisonMinEscalationWindowMillis = poisonMinEscalationWindowMillis;
             sender.catchUpCapGapMinEscalationWindowMillis = catchUpCapGapMinEscalationWindowMillis;
@@ -1873,6 +1893,22 @@ public class QwpWebSocketSender implements Sender {
      */
     public static Supplier<String> fixedAuthHeader(String header) {
         return header == null ? null : new FixedAuthHeader(header);
+    }
+
+    /**
+     * Wraps a token provider as a DYNAMIC {@code Authorization} header supplier: each {@code get()} pulls the
+     * provider's current token, snapshots it, validates it ({@link HttpTokenProvider#validateToken}) and returns
+     * {@code "Bearer " + token}. Unlike a bare lambda, the wrapper also carries the provider's
+     * {@link HttpTokenProvider#onTokenRejected} back-channel, so a {@code 401} on an upgrade that presented this
+     * credential tells the provider - a caching provider then refreshes early - before the connect walk pulls
+     * again and retries the same endpoint once with the new token (design/qwp-token-provider-spec.md, section
+     * 8.2).
+     *
+     * @param provider the token provider, or null when no credential is configured
+     * @return a dynamic supplier, or null when {@code provider} is null
+     */
+    public static Supplier<String> tokenProviderAuthHeader(HttpTokenProvider provider) {
+        return provider == null ? null : new TokenProviderAuthHeader(provider);
     }
 
     @Override
@@ -2188,6 +2224,7 @@ public class QwpWebSocketSender implements Sender {
     }
 
     private void close0(boolean[] restoreInterrupt) {
+        healthTracker.closed();
         Runnable hook = closeStartedHook;
         closeStartedHook = null;
         if (hook != null) {
@@ -2343,6 +2380,9 @@ public class QwpWebSocketSender implements Sender {
                 terminalError = captureCloseError(terminalError, e);
             }
         }
+        // Nothing pulls a credential any more (or, after a failed stop, the registry's linger outlasts the
+        // straggler), so the shared token provider may go.
+        releaseCredentialLease();
 
         // Always free resources the I/O thread never touches:
         // encoder and table buffers are user-thread-only.
@@ -2395,6 +2435,41 @@ public class QwpWebSocketSender implements Sender {
     @TestOnly
     public boolean isCloseCleanupComplete() {
         return closeCleanupComplete;
+    }
+
+    /**
+     * {@inheritDoc}
+     * <p>
+     * Tracks the foreground connection only; orphan-slot drainers report through
+     * {@link BackgroundDrainerListener} and the error handler.
+     */
+    @Override
+    public ConnectionHealth health() {
+        return healthTracker.snapshot();
+    }
+
+    /**
+     * Hands this sender the registry lease of the {@code token_provider} its credential comes from; the sender
+     * releases it when it closes. {@code Sender.LineSenderBuilder.build()} calls this right after connecting. A
+     * lease handed to a sender that is already closed is released at once.
+     */
+    public void setCredentialLease(QuietCloseable lease) {
+        this.credentialLease = lease;
+        if (closed) {
+            releaseCredentialLease();
+        }
+    }
+
+    private void releaseCredentialLease() {
+        QuietCloseable lease = credentialLease;
+        credentialLease = null;
+        if (lease != null) {
+            try {
+                lease.close();
+            } catch (Throwable e) {
+                LOG.error("Error releasing the token provider lease: {}", String.valueOf(e));
+            }
+        }
     }
 
     /**
@@ -4435,7 +4510,15 @@ public class QwpWebSocketSender implements Sender {
         }
         connectWalkLock.lock();
         try {
-            return connectWalk(ctx, cancellation);
+            WebSocketClient client = connectWalk(ctx, cancellation);
+            healthTracker.upgraded();
+            return client;
+        } catch (RuntimeException e) {
+            // One failed connect round. A walk that a close() aborted is not a failure of the connection.
+            if (!ctx.isAborted()) {
+                healthTracker.roundFailed(e);
+            }
+            throw e;
         } finally {
             connectWalkLock.unlock();
         }
@@ -4453,6 +4536,47 @@ public class QwpWebSocketSender implements Sender {
     private static void clearInFlight(CursorWebSocketSendLoop.ConnectCancellation cancellation) {
         if (cancellation != null) {
             cancellation.clear();
+        }
+    }
+
+    /**
+     * Steps 1-2 of the one-retry-after-401 rule (design/qwp-token-provider-spec.md, section 8.2): tells a
+     * provider-backed credential that {@code presentedHeader} was rejected - a caching provider refreshes early,
+     * waiting briefly for the fetch - and pulls the credential again. Returns the new header, or null when no
+     * credential could be obtained, in which case the round's outcome stays the rejection.
+     * <p>
+     * Both calls run caller-supplied provider code that may block, so on a cancellable walk this thread is
+     * published as being inside a credential pull, exactly like the pull before the walk: {@code close()} then
+     * breaks it with an interrupt.
+     */
+    private String refreshCredentialAfterRejection(
+            String presentedHeader,
+            QwpAuthFailedException rejection,
+            ReconnectSupplier ctx,
+            CursorWebSocketSendLoop.ConnectCancellation cancellation
+    ) {
+        final Supplier<String> supplier = authorizationHeaderSupplier;
+        if (cancellation != null) {
+            cancellation.publishCredentialPull(Thread.currentThread());
+            if (cancellation.isCancelled()) {
+                cancellation.clearCredentialPull();
+                throw new LineSenderException(ctx.abortMessage());
+            }
+        }
+        try {
+            if (supplier instanceof TokenProviderAuthHeader) {
+                ((TokenProviderAuthHeader) supplier).onRejected(presentedHeader, rejection.getStatusCode());
+            }
+            return supplier.get();
+        } catch (RuntimeException e) {
+            // No fresh credential to retry with. Keep the provider's failure as a diagnostic of the rejection
+            // the round ends with.
+            rejection.addSuppressed(e);
+            return null;
+        } finally {
+            if (cancellation != null) {
+                cancellation.clearCredentialPull();
+            }
         }
     }
 
@@ -4536,8 +4660,9 @@ public class QwpWebSocketSender implements Sender {
         // javadoc documents - NOT once per endpoint: a token-provider failure is cluster-wide (a failed silent
         // refresh, or not signed in), not a per-endpoint transport fault, so re-querying it per endpoint would
         // hammer the token endpoint with the same dead credential and mislabel the failure as "all endpoints
-        // unreachable". A throw here is wrapped as QwpCredentialUnavailableException (below): the
-        // foreground/SYNC initial connect unwraps it and fails fast with the provider's own message, while the
+        // unreachable". A throw here is wrapped as QwpCredentialUnavailableException (below): the OFF initial
+        // connect unwraps it and fails fast with the provider's own exception, and so does the SYNC one unless
+        // the provider classified the failure retryable, in which case SYNC retries it within its budget. The
         // running background drainer treats it as a transient outage and retries it indefinitely with capped
         // backoff (never bounded by the reconnect budget, never terminal), so even a persistent credential
         // outage keeps the buffered rows in store-and-forward rather than terminating the sender (Invariant B).
@@ -4554,17 +4679,17 @@ public class QwpWebSocketSender implements Sender {
                 throw new LineSenderException(ctx.abortMessage());
             }
         }
-        final String authHeader;
+        String authHeader;
         try {
             authHeader = authorizationHeaderSupplier == null ? null : authorizationHeaderSupplier.get();
         } catch (RuntimeException e) {
             // Tag the failure CLASS so each context applies the right policy: a credential we cannot acquire is
-            // not a transport outage. A foreground/SYNC connect unwraps this and rethrows the provider's own
-            // exception, so build() surfaces the provider's error directly rather than an internal wrapper. The
-            // running background drainer, by contrast, treats it as a transient outage and retries it
-            // indefinitely under Invariant B -- never bounding it by the reconnect budget, never latching a
-            // terminal -- so a recoverable credential outage never drops a producer store-and-forward promised
-            // to keep alive.
+            // not a transport outage. A foreground connect that fails startup on it unwraps this and rethrows the
+            // provider's own exception, so build() surfaces the provider's error directly rather than an internal
+            // wrapper; a SYNC connect retries a retryable one within its budget first. The running background
+            // drainer, by contrast, treats it as a transient outage and retries it indefinitely under Invariant B
+            // -- never bounding it by the reconnect budget, never latching a terminal -- so a recoverable
+            // credential outage never drops a producer store-and-forward promised to keep alive.
             throw new QwpCredentialUnavailableException(e);
         } finally {
             // Drop the marker as soon as the pull returns, so a later cancel() cannot interrupt this thread
@@ -4573,11 +4698,24 @@ public class QwpWebSocketSender implements Sender {
                 cancellation.clearCredentialPull();
             }
         }
+        // One retry after a 401 per round (design/qwp-token-provider-spec.md, section 8.2): when an upgrade that
+        // presented a DYNAMIC credential is rejected with a refreshable 401, the provider is told, the credential
+        // is pulled again and, if it changed, the SAME endpoint is retried at once. The retried attempt is not an
+        // endpoint failure: it records no health penalty, fires no event, and does not consume the round's pick.
+        // A static credential never gets it - re-presenting the same bytes cannot change the answer.
+        boolean isAuthRetryAvailable = hasDynamicCredential();
+        int retryIdx = -1;
         while (true) {
             if (ctx.isAborted()) {
                 throw new LineSenderException(ctx.abortMessage());
             }
-            int idx = background ? cursor.next() : hostTracker.pickNext();
+            int idx;
+            if (retryIdx >= 0) {
+                idx = retryIdx;
+                retryIdx = -1;
+            } else {
+                idx = background ? cursor.next() : hostTracker.pickNext();
+            }
             if (idx < 0) break;
             Endpoint ep = endpoints.get(idx);
             lastEndpoint = ep;
@@ -4649,12 +4787,26 @@ public class QwpWebSocketSender implements Sender {
                     continue;
                 }
                 if (classified instanceof QwpAuthFailedException) {
+                    QwpAuthFailedException rejection = (QwpAuthFailedException) classified;
+                    if (isAuthRetryAvailable && rejection.isTokenRefreshable()) {
+                        isAuthRetryAvailable = false;
+                        String refreshed = refreshCredentialAfterRejection(
+                                authHeader, rejection, ctx, cancellation);
+                        if (refreshed != null && !refreshed.equals(authHeader)) {
+                            LOG.info("{}:{} rejected the token with {}; retrying the same endpoint once with a "
+                                    + "refreshed token", ep.host, ep.port, rejection.getStatusCode());
+                            authHeader = refreshed;
+                            retryIdx = idx;
+                            continue;
+                        }
+                    }
                     // Auth is uniform across the cluster; we won't keep walking
                     // endpoints. Fire AUTH_FAILED before throwing so the user
-                    // listener observes the terminal classification at the
-                    // moment the I/O thread gives up, ahead of the producer
+                    // listener observes the classification of the round's final
+                    // outcome at the moment the walk gives up, ahead of the producer
                     // thread learning via LineSenderException on the next
-                    // API call.
+                    // API call. A 401 that earned the same-endpoint retry above
+                    // fires nothing: only the round's final outcome is reported.
                     if (!background) {
                         dispatchConnectionEvent(
                                 SenderConnectionEvent.Kind.AUTH_FAILED,
@@ -5376,6 +5528,7 @@ public class QwpWebSocketSender implements Sender {
                 errorDispatcher = new SenderErrorDispatcher(errorHandler, errorInboxCapacity);
             }
             cursorSendLoop.setErrorDispatcher(errorDispatcher);
+            cursorSendLoop.setKeepaliveIntervalMillis(keepaliveIntervalMillis);
             // Symmetric progress dispatcher: lazy-allocated mirror of the
             // error path. Wired before start() for the same reason -- the
             // I/O thread should never observe a null dispatcher between
@@ -5391,6 +5544,7 @@ public class QwpWebSocketSender implements Sender {
             // the loop no longer fires a terminal budget-exhaustion event -- it
             // retries indefinitely.)
             cursorSendLoop.setConnectionDispatcher(connectionDispatcher);
+            cursorSendLoop.setConnectionHealthTracker(healthTracker);
             // Seed the fresh loop's own hasEverConnected before it can observe
             // any endpoint-policy failure: without this, a symbol-dict
             // recycle's rebuilt loop starts believing it has never connected
@@ -6712,6 +6866,7 @@ public class QwpWebSocketSender implements Sender {
      */
     private void retireStoppedLoop() {
         cursorSendLoop.checkError();
+        healthTracker.connectionLost();
         hasLoopEverConnected |= cursorSendLoop.hasEverConnected();
         cursorSendLoop = null;
     }
@@ -7614,6 +7769,42 @@ public class QwpWebSocketSender implements Sender {
         @Override
         public String get() {
             return header;
+        }
+    }
+
+    /**
+     * A dynamic {@code Authorization} header backed by an {@link HttpTokenProvider}. See
+     * {@link #tokenProviderAuthHeader(HttpTokenProvider)}.
+     */
+    private static final class TokenProviderAuthHeader implements Supplier<String> {
+        private static final String BEARER_PREFIX = "Bearer ";
+        private final HttpTokenProvider provider;
+
+        private TokenProviderAuthHeader(HttpTokenProvider provider) {
+            this.provider = provider;
+        }
+
+        @Override
+        public String get() {
+            // Snapshot before validating: the concatenation below re-reads the sequence, and a provider is free
+            // to reuse a mutable buffer, so validating the live sequence checks bytes the header need not carry.
+            // See HttpTokenProvider.validateToken.
+            CharSequence pulled = provider.getToken();
+            String token = pulled == null ? null : pulled.toString();
+            HttpTokenProvider.validateToken(token);
+            return BEARER_PREFIX + token;
+        }
+
+        void onRejected(String presentedHeader, int httpStatus) {
+            if (presentedHeader == null || !presentedHeader.startsWith(BEARER_PREFIX)) {
+                return;
+            }
+            try {
+                provider.onTokenRejected(presentedHeader.substring(BEARER_PREFIX.length()), httpStatus);
+            } catch (RuntimeException e) {
+                // The contract says it must not throw; a provider that does still gets its token re-pulled.
+                LOG.debug("token provider onTokenRejected threw {}", e.getClass().getName());
+            }
         }
     }
 
