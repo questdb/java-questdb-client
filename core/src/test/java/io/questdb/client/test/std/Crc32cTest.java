@@ -166,10 +166,13 @@ public class Crc32cTest {
             int[] lengths = {
                     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 16, 17,
                     31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256,
-                    257, 1_023, 4_096
+                    257, 1_023, 4_096, 1 << 20
             };
             int[] seeds = {Crc32c.INIT, 0x1234_5678, -1};
-            int capacity = 4_096 + Long.BYTES - 1;
+            // The native side dispatches to the CPU's CRC32C instructions when
+            // present (crc32q / crc32cd); the Java table loop is the reference
+            // it must match byte for byte, including a long multi-word run.
+            int capacity = (1 << 20) + Long.BYTES - 1;
             long buf = Unsafe.malloc(capacity, MemoryTag.NATIVE_DEFAULT);
             try {
                 int value = 0x1357_9BDF;

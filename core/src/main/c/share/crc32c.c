@@ -361,6 +361,85 @@ static const uint32_t crc32c_table_7[256] = {
     0xe54c35a1u, 0xac704886u, 0x7734cfefu, 0x3e08b2c8u, 0xc451b7ccu, 0x8d6dcaebu, 0x56294d82u, 0x1f1530a5u
 };
 
+/*
+ * Hardware CRC-32C. The producer checksums every frame it appends (the whole
+ * payload, ~100 bytes per row), so the CRC is a per-row cost: measured at 21%
+ * of the producer thread's cycles with the table loop below. x86-64 SSE4.2
+ * (crc32q, every CPU since Nehalem/Bulldozer) and AArch64 CRC32 (ARMv8.1,
+ * every Apple Silicon and Graviton) compute the same reflected Castagnoli
+ * CRC one 64-bit word per instruction. Dispatched at runtime so the shipped
+ * library still runs on a CPU without the extension; the table loop stays
+ * as the fallback and the reference the hardware path is tested against.
+ */
+#if defined(__x86_64__) || defined(_M_X64)
+#  if defined(_MSC_VER)
+#    include <nmmintrin.h>
+#    include <intrin.h>
+#    define CRC32C_HW_ATTR
+static int crc32c_hw_available(void) {
+    int info[4];
+    __cpuid(info, 1);
+    return (info[2] & (1 << 20)) != 0; /* SSE4.2 */
+}
+#  else
+#    include <nmmintrin.h>
+#    define CRC32C_HW_ATTR __attribute__((target("sse4.2")))
+static int crc32c_hw_available(void) {
+    return __builtin_cpu_supports("sse4.2");
+}
+#  endif
+#  define CRC32C_HW 1
+CRC32C_HW_ATTR static uint32_t crc32c_hw(uint32_t crc, const uint8_t *buf, size_t n) {
+    uint64_t c = crc;
+    while (n >= 8) {
+        uint64_t w;
+        __builtin_memcpy(&w, buf, sizeof(w));
+        c = _mm_crc32_u64(c, w);
+        buf += 8;
+        n -= 8;
+    }
+    uint32_t c32 = (uint32_t) c;
+    while (n--) {
+        c32 = _mm_crc32_u8(c32, *buf++);
+    }
+    return c32;
+}
+#elif defined(__aarch64__) && !defined(_MSC_VER)
+#  include <arm_acle.h>
+#  if defined(__linux__)
+#    include <sys/auxv.h>
+#    ifndef HWCAP_CRC32
+#      define HWCAP_CRC32 (1 << 7)
+#    endif
+static int crc32c_hw_available(void) {
+    return (getauxval(AT_HWCAP) & HWCAP_CRC32) != 0;
+}
+#  else
+static int crc32c_hw_available(void) {
+    return 1; /* macOS arm64: every Apple Silicon implements ARMv8.1 CRC32 */
+}
+#  endif
+#  define CRC32C_HW 1
+__attribute__((target("+crc"))) static uint32_t crc32c_hw(uint32_t crc, const uint8_t *buf, size_t n) {
+    while (n >= 8) {
+        uint64_t w;
+        __builtin_memcpy(&w, buf, sizeof(w));
+        crc = __crc32cd(crc, w);
+        buf += 8;
+        n -= 8;
+    }
+    while (n--) {
+        crc = __crc32cb(crc, *buf++);
+    }
+    return crc;
+}
+#endif
+
+#ifdef CRC32C_HW
+/* 0 = unknown, 1 = hardware, 2 = tables. Benign race: every thread derives the same value. */
+static int crc32c_mode;
+#endif
+
 JNIEXPORT jint JNICALL Java_io_questdb_client_std_Crc32c_update
         (JNIEnv *e, jclass cl, jint seed, jlong addr, jlong len) {
     if (len <= 0) {
@@ -369,6 +448,17 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_std_Crc32c_update
     uint32_t crc = ~((uint32_t) seed);
     const uint8_t *buf = (const uint8_t *) (uintptr_t) addr;
     size_t n = (size_t) len;
+
+#ifdef CRC32C_HW
+    int mode = crc32c_mode;
+    if (mode == 0) {
+        mode = crc32c_hw_available() ? 1 : 2;
+        crc32c_mode = mode;
+    }
+    if (mode == 1) {
+        return (jint) ~crc32c_hw(crc, buf, n);
+    }
+#endif
 
     /*
      * Slice-by-8 main loop. Reads 8 bytes per iteration via a misaligned
