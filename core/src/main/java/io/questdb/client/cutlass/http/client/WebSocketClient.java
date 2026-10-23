@@ -518,6 +518,21 @@ public abstract class WebSocketClient implements QuietCloseable {
         sendBinary(dataPtr, length, defaultTimeout);
     }
 
+    // EXPERIMENT (local only): lets the caller assemble one binary frame's payload directly in
+    // the send buffer (no staging copy) and then send it.
+    public io.questdb.client.cutlass.qwp.client.QwpBufferWriter expBeginBinaryFrame() {
+        checkConnected();
+        sendBuffer.reset();
+        sendBuffer.beginFrame();
+        return sendBuffer;
+    }
+
+    public void expEndAndSendBinaryFrame() {
+        WebSocketSendBuffer.FrameInfo frame = sendBuffer.endBinaryFrame();
+        doSend(sendBuffer.getBufferPtr() + frame.offset, frame.length, defaultTimeout);
+        sendBuffer.reset();
+    }
+
     /**
      * Sends two native-memory slices as one binary frame with the default timeout.
      */

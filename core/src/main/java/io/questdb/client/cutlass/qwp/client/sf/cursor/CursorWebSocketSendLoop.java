@@ -33,6 +33,7 @@ import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.NativeBufferWriter;
 import io.questdb.client.cutlass.qwp.client.QwpAuthFailedException;
+import io.questdb.client.cutlass.qwp.client.QwpBufferWriter;
 import io.questdb.client.cutlass.qwp.client.QwpCredentialUnavailableException;
 import io.questdb.client.cutlass.qwp.client.QwpDurableAckMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpIngressRoleRejectedException;
@@ -149,6 +150,13 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      */
     public static final long DEFAULT_KEEPALIVE_INTERVAL_MILLIS = 0L;
     public static final long DEFAULT_PARK_NANOS = 50_000L; // 50us idle backoff
+    // EXPERIMENT (local only, depth 3): merge up to N consecutive published ring frames into one
+    // QWP message with merged table blocks before the send; 0 = off.
+    private static final int EXP_MERGE_MAX = Integer.getInteger("qdb.exp.mergeBlocks", 0);
+    private static final int EXP_MERGE_BYTES = Integer.getInteger("qdb.exp.mergeBytes", 64 * 1024);
+    public static final java.util.concurrent.atomic.AtomicLong EXP_BATCH_FRAMES = new java.util.concurrent.atomic.AtomicLong();
+    public static final java.util.concurrent.atomic.AtomicLong EXP_BATCH_SENDS = new java.util.concurrent.atomic.AtomicLong();
+    public static final java.util.concurrent.atomic.AtomicLong EXP_BLOCKS_MERGED = new java.util.concurrent.atomic.AtomicLong();
     /**
      * Default initial reconnect backoff (100 ms).
      */
@@ -536,6 +544,17 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // and would otherwise recycle in silence. See sendDictCatchUp.
     private long lastUncappedOversizeWarnNanos;
     private long nextWireSeq;
+    // EXPERIMENT (local only): a merged wire frame covers several ring frames (FSNs), so the
+    // linear fsnAtZero + wireSeq mapping gains an offset. expMergeExtra is the sum of
+    // (members - 1) over every wire frame sent on this connection; the ring below records,
+    // per merged wire frame, the cumulative extra THROUGH that wire sequence so an ack for
+    // wire seq w maps to the LAST FSN that w covered. Reset with nextWireSeq.
+    private final ExpFrameMerger expMerger = new ExpFrameMerger();
+    private long expMergeExtra;
+    private long[] expMapSeq = new long[64];
+    private long[] expMapExtra = new long[64];
+    private int expMapHead;
+    private int expMapSize;
     private volatile SenderProgressDispatcher progressDispatcher;
     // Frames sent during the post-reconnect catch-up window — i.e. frames
     // whose FSN completed a send on an earlier connection. A non-zero
@@ -2512,7 +2531,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             releasePendingEntry(pendingDurable.pollFirst());
         }
         if (highest != Long.MIN_VALUE) {
-            long fsn = fsnAtZero + highest;
+            long fsn = expFsnOf(highest);
             if (engine.acknowledge(fsn)) {
                 totalDurableTrimAdvances.incrementAndGet();
                 dispatchProgress(fsn);
@@ -2929,7 +2948,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      */
     private void snapshotReplayTarget() {
         if (hasEverConnected && nextWireSeq > 0L) {
-            long lastSentFsn = fsnAtZero + (nextWireSeq - 1L);
+            long lastSentFsn = expFsnOf(nextWireSeq - 1L);
             if (lastSentFsn > replayTargetFsn) {
                 replayTargetFsn = lastSentFsn;
             }
@@ -2961,6 +2980,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         long replayStart = engine.ackedFsn() + 1L;
         this.fsnAtZero = replayStart;
         this.nextWireSeq = 0L;
+        expResetMap();
         // snapshotReplayTarget froze the completed-send boundary when the
         // outage began. ACK progress can move replayStart past that boundary;
         // in that case no frame needs re-sending on this connection.
@@ -3007,6 +3027,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // handleServerRejection can tell "only the catch-up went out" from "the
         // head data frame went out".
         dataFrameSentThisConnection = false;
+        expResetMap();
         // Do not gate solely on isDeltaDictEnabled(): a recovered delta slot can
         // lose access to its side-file while its on-disk frames still start above
         // zero. hasReplayDictionaryDependency preserves that distinction while
@@ -3687,13 +3708,133 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         return any;
     }
 
+    // EXPERIMENT (local only): last FSN covered by wire sequence wireSeq on this connection.
+    // Entries superseded by a later merged frame at or below wireSeq are dropped (acks are
+    // cumulative and monotonic).
+    private long expFsnOf(long wireSeq) {
+        int cap = expMapSeq.length;
+        while (expMapSize > 1 && expMapSeq[(expMapHead + 1) % cap] <= wireSeq) {
+            expMapHead = (expMapHead + 1) % cap;
+            expMapSize--;
+        }
+        long extra = 0;
+        for (int i = 0; i < expMapSize; i++) {
+            int ix = (expMapHead + i) % cap;
+            if (expMapSeq[ix] <= wireSeq) {
+                extra = expMapExtra[ix];
+            } else {
+                break;
+            }
+        }
+        return fsnAtZero + wireSeq + extra;
+    }
+
+    private void expRecordMerged(long wireSeq, long extraThrough) {
+        int cap = expMapSeq.length;
+        if (expMapSize == cap) {
+            long[] ns = new long[cap * 2];
+            long[] ne = new long[cap * 2];
+            for (int i = 0; i < expMapSize; i++) {
+                int ix = (expMapHead + i) % cap;
+                ns[i] = expMapSeq[ix];
+                ne[i] = expMapExtra[ix];
+            }
+            expMapSeq = ns;
+            expMapExtra = ne;
+            expMapHead = 0;
+            cap = ns.length;
+        }
+        int ix = (expMapHead + expMapSize) % cap;
+        expMapSeq[ix] = wireSeq;
+        expMapExtra[ix] = extraThrough;
+        expMapSize++;
+    }
+
+    private void expResetMap() {
+        expMergeExtra = 0;
+        expMapHead = 0;
+        expMapSize = 0;
+    }
+
+    // EXPERIMENT (local only): sends the validated first frame together with the following
+    // fully published deferred-commit frames of the same segment as ONE merged QWP message
+    // (see ExpFrameMerger). The group ends at the first frame without FLAG_DEFER_COMMIT (it is
+    // the last member: its commit covers the merged rows), at EXP_MERGE_MAX members or at
+    // EXP_MERGE_BYTES input bytes. One wire sequence covers all members. Returns -1 when the
+    // first frame is not a plain QWP message (caller takes the normal path), 0 on a send
+    // failure (fail() already called), 1 when sent.
+    private int expSendMerged(long base, long frameAddr, int payloadLen, long frameEnd, int deltaStart) {
+        expMerger.reset();
+        if (!expMerger.add(frameAddr, payloadLen)) {
+            return -1;
+        }
+        if (deltaStart >= 0) {
+            accumulateSentDict(frameAddr, payloadLen, deltaStart);
+        }
+        long off = frameEnd;
+        while (expMerger.lastDeferred()
+                && expMerger.memberCount() < EXP_MERGE_MAX
+                && expMerger.memberBytes() < EXP_MERGE_BYTES) {
+            long pub = sendingSegment.publishedOffset();
+            if (off + MmapSegment.FRAME_HEADER_SIZE > pub) {
+                break;
+            }
+            int len = Unsafe.getUnsafe().getInt(base + off + 4);
+            if (len < 0) {
+                break;
+            }
+            long end = off + MmapSegment.FRAME_HEADER_SIZE + len;
+            if (end > pub) {
+                break;
+            }
+            long addr = base + off + MmapSegment.FRAME_HEADER_SIZE;
+            int ds = frameDeltaStart(addr, len);
+            if (ds > sentDictCount) {
+                break;
+            }
+            if (!expMerger.add(addr, len)) {
+                break;
+            }
+            if (ds >= 0) {
+                accumulateSentDict(addr, len, ds);
+            }
+            off = end;
+        }
+        int members = expMerger.memberCount();
+        try {
+            if (members == 1) {
+                client.sendBinary(frameAddr, payloadLen);
+            } else {
+                QwpBufferWriter w = client.expBeginBinaryFrame();
+                expMerger.write(w);
+                client.expEndAndSendBinaryFrame();
+            }
+        } catch (Throwable t) {
+            fail(t);
+            return 0;
+        }
+        dataFrameSentThisConnection = true;
+        lastFrameOrPingNanos = System.nanoTime();
+        sendOffset = off;
+        if (members > 1) {
+            expMergeExtra += members - 1;
+            expRecordMerged(nextWireSeq, expMergeExtra);
+            EXP_BLOCKS_MERGED.addAndGet(expMerger.blocksMerged());
+        }
+        nextWireSeq++;
+        counters.framesSent.addAndGet(members);
+        EXP_BATCH_SENDS.incrementAndGet();
+        EXP_BATCH_FRAMES.addAndGet(members);
+        return 1;
+    }
+
     /**
      * Returns true if at least one frame was sent (caller skips the park).
      * Bounded: sends at most one frame per call so the ACK side gets
      * scheduling fairness.
      */
     private boolean trySendOne() {
-        if (orphanSkipTipFsn >= 0 && fsnAtZero + nextWireSeq >= orphanSkipStartFsn) {
+        if (orphanSkipTipFsn >= 0 && fsnAtZero + nextWireSeq + expMergeExtra >= orphanSkipStartFsn) {
             // The send cursor reached the orphaned deferred tail. Its frames
             // belong to an aborted transaction and must never be transmitted
             // (a commit-bearing frame from this session would commit them --
@@ -3807,6 +3948,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                             + sentDictCount + "; cannot replay without corrupting data -- resend required"));
             return false;
         }
+        if (EXP_MERGE_MAX > 1 && orphanSkipTipFsn < 0 && replayTargetFsn < 0) {
+            int r = expSendMerged(base, frameAddr, payloadLen, frameEnd, deltaStart);
+            if (r >= 0) {
+                return r == 1;
+            }
+        }
         try {
             client.sendBinary(frameAddr, payloadLen);
         } catch (Throwable t) {
@@ -3832,7 +3979,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         }
         lastFrameOrPingNanos = System.nanoTime();
         sendOffset = frameEnd;
-        long fsnSent = fsnAtZero + nextWireSeq;
+        long fsnSent = fsnAtZero + nextWireSeq + expMergeExtra;
         nextWireSeq++;
         counters.framesSent.incrementAndGet();
         if (replayTargetFsn >= 0) {
@@ -4188,7 +4335,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                             wireSeq, highestSent);
                 }
                 counters.acks.incrementAndGet();
-                long okFsn = fsnAtZero + capped;
+                long okFsn = expFsnOf(capped);
                 if (okFsn > highestOkFsn) {
                     highestOkFsn = okFsn;
                 }
@@ -4220,8 +4367,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     drainPendingDurable();
                     return;
                 }
-                if (engine.acknowledge(fsnAtZero + capped)) {
-                    dispatchProgress(fsnAtZero + capped);
+                if (engine.acknowledge(okFsn)) {
+                    dispatchProgress(okFsn);
                 }
                 return;
             }
@@ -4395,7 +4542,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 LOG.warn("server NACK wire seq {} outside sent range [0, {}], clamping",
                         wireSeq, highestSent);
             }
-            long fsn = fsnAtZero + cappedSeq;
+            long fsn = expFsnOf(cappedSeq);
             if (fsn <= engine.ackedFsn()) {
                 // The clamped wire seq maps at or below the replay head, so this
                 // NACK is for a dictionary catch-up frame -- which occupies the
