@@ -10,9 +10,11 @@ import io.questdb.client.Sender;
  * {@code QuestDB} handle, created once and shared across threads, owns a pool
  * of senders that stay connected between uses. Take one with
  * {@link QuestDB#borrowSender()} -- a lease per use: {@code close()} returns
- * the sender to the pool (it does NOT disconnect or flush; rows ship on the
- * next auto-flush threshold or the pool's settle, or on an explicit
- * {@code flush()}).
+ * the sender to the pool (it does NOT disconnect) after shipping the lease's
+ * pending rows as one frame into the store-and-forward ring. That is
+ * publishing, not acknowledgement; call {@code drain()} to wait for the
+ * server. {@code flush_on_close=off} is the opt-in that keeps rows in the slot
+ * across leases until an auto-flush threshold or the housekeeper's settle.
  * Borrow one per producer thread, or once per batch, and close it when done.
  * <p>
  * A {@code Sender} is not thread-safe, so no two threads may share one -- the

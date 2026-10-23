@@ -1765,7 +1765,7 @@ public final class SenderPool implements AutoCloseable {
 
     /**
      * Ships rows left behind in idle slots. With flush on close off, the
-     * {@code QuestDB} facade's default, a pooled {@code close()} does not flush,
+     * opt-in, a pooled {@code close()} does not flush,
      * and auto-flush thresholds are only evaluated on append,
      * so a slot nobody borrows again would keep its last rows until the pool
      * closes. The housekeeper calls this on its settle cadence.

@@ -34,8 +34,10 @@ public class QuestDBExample {
              Query q = db.borrowQuery()) {
 
             // Ingest: borrow a Sender, write rows, close() returns it to the pool.
-            // Close releases, flush ships, drain waits: the rows go out on the next
-            // auto-flush threshold or the pool's settle. The WebSocket is NOT torn
+            // close() ships the lease's pending rows as one frame into the
+            // store-and-forward ring (published, not acknowledged; drain() waits
+            // for the server). flush_on_close=off is the opt-in that keeps rows in
+            // the slot across leases. The WebSocket is NOT torn
             // down here -- a real disconnect only happens at db.close().
             try (Sender sender = db.borrowSender()) {
                 sender.table("trades")

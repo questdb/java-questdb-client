@@ -32,7 +32,7 @@ try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;")) {
                 .doubleColumn("price", 2615.54)
                 .doubleColumn("amount", 0.00044)
                 .atNow();
-        // close() returns the Sender to the pool; rows ship once an auto-flush threshold trips (age, rows or bytes), or when the idle slot is settled.
+        // close() ships the lease's pending rows as one frame into the store-and-forward ring and returns the Sender to the pool.
     }
 }
 ```
@@ -98,15 +98,14 @@ snippets below borrow from its pools.
 
 ### Ingest Data
 
-Borrow a `Sender`, write rows, and close it. Close releases, flush ships, drain waits: `close()` returns the sender to
-the pool and ships the slot's pending rows once the oldest is older than `auto_flush_interval` (100 ms by default) or
-another auto-flush threshold trips, otherwise it only releases; rows left in the slot go out when an auto-flush
-threshold trips on a later append or `close()`, or when the pool's housekeeper settles the idle slot, typically within
-one `auto_flush_interval`. A lease that holds the slot without appending or closing, for example one that waits for input
-inside the `try` block, holds those rows back until it does: borrow once the data is in hand. Borrowing per
-message is the intended pattern and batches like a sender held for the whole run. Call `flush()` to ship now and
-`drain()` to wait for the server. The underlying connection is only torn down when the `QuestDB` handle itself is
-closed.
+Borrow a `Sender`, write rows, and close it. `close()` ships the lease's pending rows as one committing frame into the
+store-and-forward ring before it returns and hands the sender back to the pool. That is publishing, not
+acknowledgement: call `drain()` to wait for the server. Borrowing per message is the intended pattern. With
+`flush_on_close=off`, the opt-in, `close()` only releases the slot and the rows stay in it across leases; they ship when
+an auto-flush threshold trips on a later append or `close()`, or when the pool's housekeeper settles the idle slot,
+typically within one `auto_flush_interval` (100 ms by default). A lease that holds the slot without appending or
+closing, for example one that waits for input inside the `try` block, holds those rows back until it does: borrow once
+the data is in hand. The underlying connection is only torn down when the `QuestDB` handle itself is closed.
 
 ```java
 import io.questdb.client.Sender;
