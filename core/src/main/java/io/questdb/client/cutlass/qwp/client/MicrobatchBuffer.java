@@ -68,7 +68,6 @@ public class MicrobatchBuffer implements QuietCloseable {
     private int bufferPos;
     // Native memory buffer
     private long bufferPtr;
-    private long firstRowTimeNanos;
     // For waiting on recycle (user thread waits for I/O thread to finish)
     private volatile Thread recycleWaiter;
     // Row tracking
@@ -89,7 +88,6 @@ public class MicrobatchBuffer implements QuietCloseable {
         this.bufferPtr = Unsafe.malloc(initialCapacity, MemoryTag.NATIVE_ILP_RSS);
         this.bufferPos = 0;
         this.rowCount = 0;
-        this.firstRowTimeNanos = 0;
         this.batchId = nextBatchId.getAndIncrement();
     }
 
@@ -196,16 +194,6 @@ public class MicrobatchBuffer implements QuietCloseable {
     }
 
     /**
-     * Returns the age of the first row in nanoseconds, or 0 if no rows.
-     */
-    public long getAgeNanos() {
-        if (rowCount == 0) {
-            return 0;
-        }
-        return System.nanoTime() - firstRowTimeNanos;
-    }
-
-    /**
      * Returns the batch ID for this buffer.
      */
     public long getBatchId() {
@@ -256,14 +244,11 @@ public class MicrobatchBuffer implements QuietCloseable {
     }
 
     /**
-     * Increments the row count and records the first row time if this is the first row.
+     * Increments the row count.
      */
     public void incrementRowCount() {
         if (state != STATE_FILLING) {
             throw new IllegalStateException("Cannot increment row count when state is " + stateName(state));
-        }
-        if (rowCount == 0) {
-            firstRowTimeNanos = System.nanoTime();
         }
         rowCount++;
     }
@@ -348,7 +333,6 @@ public class MicrobatchBuffer implements QuietCloseable {
         }
         bufferPos = 0;
         rowCount = 0;
-        firstRowTimeNanos = 0;
         batchId = nextBatchId.getAndIncrement();
         recycleWaiter = null;
         state = STATE_FILLING;
