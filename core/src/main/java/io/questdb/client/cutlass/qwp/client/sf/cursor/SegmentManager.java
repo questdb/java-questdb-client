@@ -1050,7 +1050,7 @@ public final class SegmentManager implements QuietCloseable {
         long ringSegmentBytes = withinCap ? 0L : e.ring.totalSegmentBytes();
         boolean belowLivenessFloor = !withinCap && ringSegmentBytes < livenessFloorBytes;
         if (belowLivenessFloor) {
-            budget.charge(segmentSizeBytes);
+            budget.chargeBelowFloor(segmentSizeBytes, workerWakeup);
         }
         if (!withinCap && !belowLivenessFloor) {
             long now = System.nanoTime();

@@ -40,6 +40,7 @@ import java.io.File;
 import java.nio.file.Files;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * The two ways a ring gets its spare after a refusal: the pass whose own trim
@@ -84,6 +85,51 @@ public class SegmentManagerProvisionRetryTest {
                 Assert.assertEquals(0, budget.getSegmentBytes());
             } finally {
                 Unsafe.free(buf, FRAME_PAYLOAD, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    /**
+     * A cap under two segments refuses every spare, so each one takes the
+     * liveness-floor path. A create that keeps failing then releases the floor
+     * charge, and that release must not wake the manager that was refused a
+     * moment earlier: it would unpark itself out of its own retry timer and
+     * spin, one create attempt per loop pass instead of one per 10 ms.
+     */
+    @Test
+    public void testFailedFloorCreateDoesNotWakeItsOwnRetry() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            File dir = Files.createTempDirectory("qdb-segmgr-floor-spin").toFile();
+            AtomicLong attempts = new AtomicLong();
+            FilesFacade facade = new DelegatingFilesFacade() {
+                @Override
+                public boolean allocate(int fd, long size) {
+                    attempts.incrementAndGet();
+                    return false;
+                }
+            };
+            String path = new File(dir, "sf-0000000000000000.sfa").getPath();
+            SegmentBudget budget = new SegmentBudget(SEGMENT_SIZE + SEGMENT_SIZE / 2);
+            try (SegmentRing ring = new SegmentRing(MmapSegment.create(path, 0, SEGMENT_SIZE), SEGMENT_SIZE);
+                 SegmentManager manager = new SegmentManager(SEGMENT_SIZE, budget, facade, System::nanoTime)) {
+                manager.start();
+                manager.register(ring, dir.getPath());
+                Thread.sleep(300);
+                long n = attempts.get();
+                Assert.assertTrue("ring must still be waiting for a spare", ring.needsHotSpare());
+                Assert.assertTrue("expected about 30 create attempts in 300 ms on the retry timer, got " + n
+                        + ": the failed floor charge's release woke the worker itself", n < 100);
+                Assert.assertTrue("the retry timer must keep the create attempts coming, got " + n, n >= 5);
+                manager.deregister(ring);
+                Assert.assertTrue(manager.awaitRingQuiescence(ring));
+            } finally {
+                File[] files = dir.listFiles();
+                if (files != null) {
+                    for (File f : files) {
+                        f.delete();
+                    }
+                }
+                dir.delete();
             }
         });
     }

@@ -54,7 +54,7 @@ No open gaps.
 | trimmable head: `ackedFsn >= oldestTrimmableLastSeq` | `acknowledge` `:1023` | wakes when `seq >= oldestTrimmableLastSeq` (volatile threshold, no ring monitor on the ACK path) | 38c5d69d |
 | `oldestTrimmableLastSeq` | rotation `:1129`; `releasePinnedSegment` `:1657`; `switchIoPin` `:1878` (pin moved off a segment); worker's own removal `:1865`; recovery `:691` (pre-register) | each non-worker writer that can *increase* trimmability calls `wakeManager`; a pin being *added* cannot | — |
 | pending / failed trim | worker | `hasMoreTrimmable` → no park; failed unlink/barrier → `trimRetryAtNanos` timed | 98ac6ae4 |
-| budget room (spare refused) | `SegmentBudget.release` / `removeSideFileGauge` | `tryCharge(bytes, onRoom)` registers the manager; `wakeRefused` runs it | 15247811 |
+| budget room (spare refused) | `SegmentBudget.release` / `removeSideFileGauge` | `tryCharge(bytes, onRoom)` registers the manager; `wakeRefused` runs it. The liveness-floor charge withdraws the registration: a refused manager that provisions anyway and then releases (failed create) must not wake itself out of its 10 ms retry | 15247811, next commit |
 | failed spare create | worker | `provisionRetryDeadlineNanos` timed | — |
 | periodic data sync | clock | `nextDataSyncNanos` timed | — |
 | sync-before-rotation request | `appendOrFsn` `:1082` | `wakeManager`; the producer then polls at 50 µs in `CursorSendEngine.appendBlocking` `:972` (poll, see Residuals) | — |

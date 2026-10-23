@@ -110,6 +110,21 @@ public final class SegmentBudget {
         segmentBytes += bytes;
     }
 
+    /**
+     * The liveness-floor charge: {@code bytes} were just refused by
+     * {@link #tryCharge}, which registered {@code onRoom}, and the manager
+     * provisions anyway. Withdraw the registration: it no longer waits for
+     * room, and a release of its own (a failed create) must not wake it, or
+     * the worker spins through its retry timer.
+     */
+    synchronized void chargeBelowFloor(long bytes, Runnable onRoom) {
+        segmentBytes += bytes;
+        int i = refusedWakeups.indexOf(onRoom);
+        if (i >= 0) {
+            refusedWakeups.remove(i);
+        }
+    }
+
     synchronized void release(long bytes) {
         segmentBytes -= bytes;
         wakeRefused();
