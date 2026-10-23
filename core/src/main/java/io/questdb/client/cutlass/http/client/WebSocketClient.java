@@ -482,6 +482,21 @@ public abstract class WebSocketClient implements QuietCloseable {
         sendBuffer.reset();
     }
 
+    // EXPERIMENT (local only): the caller assembles one binary frame's payload
+    // directly in the send buffer, then expEndAndSendBinaryFrame masks and sends it.
+    public WebSocketSendBuffer expBeginBinaryFrame() {
+        checkConnected();
+        sendBuffer.reset();
+        sendBuffer.beginFrame();
+        return sendBuffer;
+    }
+
+    public void expEndAndSendBinaryFrame() {
+        WebSocketSendBuffer.FrameInfo frame = sendBuffer.endBinaryFrame();
+        doSend(sendBuffer.getBufferPtr() + frame.offset, frame.length, defaultTimeout);
+        sendBuffer.reset();
+    }
+
     /**
      * Sends two native-memory slices as one WebSocket binary frame. The slices
      * are copied directly into the WebSocket send buffer and masked there, so a

@@ -28,6 +28,7 @@ import io.questdb.client.LineSenderServerException;
 import io.questdb.client.SenderConnectionEvent;
 import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
+import io.questdb.client.cutlass.http.client.WebSocketSendBuffer;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
 import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
 import io.questdb.client.cutlass.line.LineSenderException;
@@ -149,6 +150,32 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      */
     public static final long DEFAULT_KEEPALIVE_INTERVAL_MILLIS = 0L;
     public static final long DEFAULT_PARK_NANOS = 50_000L; // 50us idle backoff
+    // EXPERIMENT (local only): merge up to this many consecutive published ring frames
+    // into ONE QWP frame on the wire (0/1 = off). Counters: ring frames / wire frames.
+    private static final int EXP_MERGE_FRAMES = Integer.getInteger("qdb.exp.mergeFrames", 0);
+    private static final int EXP_MERGE_BYTES = Integer.getInteger("qdb.exp.mergeBytes", 64 * 1024);
+    public static final AtomicLong EXP_BATCH_FRAMES = new AtomicLong();
+    public static final AtomicLong EXP_BATCH_SENDS = new AtomicLong();
+    // Wire seq -> FSN map for merged frames: expMergeSeq[i] is the wire seq of the i-th
+    // merged frame on this connection, expMergeCum[i] the cumulative count of extra ring
+    // frames (members beyond the first) consumed by merged frames up to and including it.
+    // fsn(wireSeq) = fsnAtZero + wireSeq + cum(largest merged seq <= wireSeq).
+    private long[] expMergeSeq = new long[1024];
+    private long[] expMergeCum = new long[1024];
+    private int expMergeCount;
+    // per-member scratch for the group being assembled
+    private final long[] expMemAddr = new long[Math.max(EXP_MERGE_FRAMES, 1)];
+    private final int[] expMemLen = new int[Math.max(EXP_MERGE_FRAMES, 1)];
+    private final byte[] expMemFlags = new byte[Math.max(EXP_MERGE_FRAMES, 1)];
+    private final int[] expMemTableCount = new int[Math.max(EXP_MERGE_FRAMES, 1)];
+    private final int[] expMemDeltaStart = new int[Math.max(EXP_MERGE_FRAMES, 1)];
+    private final int[] expMemDeltaCount = new int[Math.max(EXP_MERGE_FRAMES, 1)];
+    private final long[] expMemEntriesStart = new long[Math.max(EXP_MERGE_FRAMES, 1)];
+    private final long[] expMemTablesStart = new long[Math.max(EXP_MERGE_FRAMES, 1)];
+    // delta entry regions copied into the merged delta section, in order
+    private final long[] expRegionStart = new long[Math.max(EXP_MERGE_FRAMES, 1)];
+    private final long[] expRegionLen = new long[Math.max(EXP_MERGE_FRAMES, 1)];
+    private int expRegionCount;
     /**
      * Default initial reconnect backoff (100 ms).
      */
@@ -2512,7 +2539,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             releasePendingEntry(pendingDurable.pollFirst());
         }
         if (highest != Long.MIN_VALUE) {
-            long fsn = fsnAtZero + highest;
+            long fsn = fsnForWireSeq(highest);
             if (engine.acknowledge(fsn)) {
                 totalDurableTrimAdvances.incrementAndGet();
                 dispatchProgress(fsn);
@@ -2929,7 +2956,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      */
     private void snapshotReplayTarget() {
         if (hasEverConnected && nextWireSeq > 0L) {
-            long lastSentFsn = fsnAtZero + (nextWireSeq - 1L);
+            long lastSentFsn = fsnForWireSeq(nextWireSeq - 1L);
             if (lastSentFsn > replayTargetFsn) {
                 replayTargetFsn = lastSentFsn;
             }
@@ -2961,6 +2988,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         long replayStart = engine.ackedFsn() + 1L;
         this.fsnAtZero = replayStart;
         this.nextWireSeq = 0L;
+        expMergeCount = 0;
         // snapshotReplayTarget froze the completed-send boundary when the
         // outage began. ACK progress can move replayStart past that boundary;
         // in that case no frame needs re-sending on this connection.
@@ -3011,6 +3039,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // lose access to its side-file while its on-disk frames still start above
         // zero. hasReplayDictionaryDependency preserves that distinction while
         // keeping full-dictionary fallback catch-up-free across every reconnect.
+        expMergeCount = 0;
         if (client != null && sentDictCount > 0 && hasReplayDictionaryDependency) {
             this.nextWireSeq = 0L;
             // The catch-up may span several frames when the dictionary exceeds the
@@ -3633,6 +3662,244 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     @TestOnly
     public void setNextWireSeqForTest(long value) {
         nextWireSeq = value;
+        expMergeCount = 0;
+    }
+
+    // EXPERIMENT (local only): cumulative extra ring frames consumed by merged wire
+    // frames at or below wireSeq (binary search over the breakpoints).
+    private long expCumExtraAtOrBelow(long wireSeq) {
+        int lo = 0;
+        int hi = expMergeCount - 1;
+        int ans = -1;
+        while (lo <= hi) {
+            int mid = (lo + hi) >>> 1;
+            if (expMergeSeq[mid] <= wireSeq) {
+                ans = mid;
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        return ans < 0 ? 0L : expMergeCum[ans];
+    }
+
+    private void expRecordMerge(long wireSeq, int extra) {
+        if (expMergeCount == expMergeSeq.length) {
+            expMergeSeq = Arrays.copyOf(expMergeSeq, expMergeCount * 2);
+            expMergeCum = Arrays.copyOf(expMergeCum, expMergeCount * 2);
+        }
+        expMergeSeq[expMergeCount] = wireSeq;
+        expMergeCum[expMergeCount] = (expMergeCount == 0 ? 0L : expMergeCum[expMergeCount - 1]) + extra;
+        expMergeCount++;
+    }
+
+    // Highest FSN covered by the given wire seq (the last member of a merged frame).
+    private long fsnForWireSeq(long wireSeq) {
+        return fsnAtZero + wireSeq + expCumExtraAtOrBelow(wireSeq);
+    }
+
+    // FSN of the next ring frame the cursor will send.
+    private long nextFsnToSend() {
+        return fsnAtZero + nextWireSeq + (expMergeCount == 0 ? 0L : expMergeCum[expMergeCount - 1]);
+    }
+
+    /**
+     * EXPERIMENT (local only): parses one ring frame payload into member slot i.
+     * Returns false when the frame cannot take part in a merge (not a QWP v1
+     * message, compressed, inconsistent length, malformed delta section).
+     */
+    private boolean expParseMember(int i, long addr, int len) {
+        if (len < QwpConstants.HEADER_SIZE
+                || Unsafe.getUnsafe().getInt(addr) != QwpConstants.MAGIC_MESSAGE) {
+            return false;
+        }
+        byte flags = Unsafe.getUnsafe().getByte(addr + QwpConstants.HEADER_OFFSET_FLAGS);
+        if ((flags & QwpConstants.FLAG_ZSTD) != 0) {
+            return false;
+        }
+        int tableCount = Unsafe.getUnsafe().getShort(addr + 6) & 0xFFFF;
+        int payloadLength = Unsafe.getUnsafe().getInt(addr + 8);
+        if (payloadLength != len - QwpConstants.HEADER_SIZE) {
+            return false;
+        }
+        long p = addr + QwpConstants.HEADER_SIZE;
+        long limit = addr + len;
+        int ds = -1;
+        int dc = 0;
+        long es = p;
+        if ((flags & QwpConstants.FLAG_DELTA_SYMBOL_DICT) != 0) {
+            long v = readVarintAt(p, limit);
+            if (v < 0L) {
+                return false;
+            }
+            ds = (int) (v >>> 3);
+            p += v & 7L;
+            v = readVarintAt(p, limit);
+            if (v < 0L) {
+                return false;
+            }
+            dc = (int) (v >>> 3);
+            p += v & 7L;
+            es = p;
+            for (int k = 0; k < dc; k++) {
+                v = readVarintAt(p, limit);
+                if (v < 0L) {
+                    return false;
+                }
+                p += (v & 7L) + (v >>> 3);
+                if (p > limit) {
+                    return false;
+                }
+            }
+        }
+        expMemAddr[i] = addr;
+        expMemLen[i] = len;
+        expMemFlags[i] = flags;
+        expMemTableCount[i] = tableCount;
+        expMemDeltaStart[i] = ds;
+        expMemDeltaCount[i] = dc;
+        expMemEntriesStart[i] = es;
+        expMemTablesStart[i] = p;
+        return true;
+    }
+
+    /**
+     * EXPERIMENT (local only): merges the validated first frame plus the following
+     * fully published frames of the same segment into ONE QWP frame on the wire:
+     * one header (flags of the last member), one delta section covering the members'
+     * deltas, then every member's table blocks in order. Members are taken while they
+     * carry FLAG_DEFER_COMMIT; the first commit frame is included as the last member
+     * and closes the group. Returns 1 when a merged frame was sent, -1 when the send
+     * failed (fail() already called), 0 when the group has a single member (the
+     * caller then takes the normal single-frame path).
+     */
+    private int expTrySendMerged(long base, long firstAddr, int firstLen, long firstEnd, long pub) {
+        if (!expParseMember(0, firstAddr, firstLen)) {
+            return 0;
+        }
+        int n = 1;
+        long off = firstEnd;
+        int bytes = firstLen;
+        int totalTables = expMemTableCount[0];
+        byte baseFlags = (byte) (expMemFlags[0] & ~QwpConstants.FLAG_DEFER_COMMIT);
+        boolean hasDelta = (baseFlags & QwpConstants.FLAG_DELTA_SYMBOL_DICT) != 0;
+        int ms = expMemDeltaStart[0];
+        int me = ms + expMemDeltaCount[0];
+        expRegionCount = 0;
+        if (hasDelta && expMemDeltaCount[0] > 0) {
+            expRegionStart[0] = expMemEntriesStart[0];
+            expRegionLen[0] = expMemTablesStart[0] - expMemEntriesStart[0];
+            expRegionCount = 1;
+        }
+        byte lastFlags = expMemFlags[0];
+        while ((lastFlags & QwpConstants.FLAG_DEFER_COMMIT) != 0 && n < EXP_MERGE_FRAMES && bytes < EXP_MERGE_BYTES) {
+            if (off + MmapSegment.FRAME_HEADER_SIZE > pub) {
+                break;
+            }
+            int len = Unsafe.getUnsafe().getInt(base + off + 4);
+            if (len < 0) {
+                break;
+            }
+            long end = off + MmapSegment.FRAME_HEADER_SIZE + len;
+            if (end > pub) {
+                break;
+            }
+            long addr = base + off + MmapSegment.FRAME_HEADER_SIZE;
+            if (!expParseMember(n, addr, len)) {
+                break;
+            }
+            if ((byte) (expMemFlags[n] & ~QwpConstants.FLAG_DEFER_COMMIT) != baseFlags) {
+                break;
+            }
+            if (totalTables + expMemTableCount[n] > 0xFFFF) {
+                break;
+            }
+            if (hasDelta) {
+                int s = expMemDeltaStart[n];
+                int c = expMemDeltaCount[n];
+                int e = s + c;
+                if (s > sentDictCount) {
+                    break; // torn-dictionary guard: the single-frame path reports it
+                }
+                if (c == 0) {
+                    if (s > me) {
+                        break;
+                    }
+                } else if (s == me) {
+                    // contiguous extension (delta mode): append the entries
+                    expRegionStart[expRegionCount] = expMemEntriesStart[n];
+                    expRegionLen[expRegionCount] = expMemTablesStart[n] - expMemEntriesStart[n];
+                    expRegionCount++;
+                    me = e;
+                } else if (s == ms && e >= me) {
+                    // full re-send from the same start (full-dictionary mode): the
+                    // later dictionary is a superset, keep only this member's entries
+                    expRegionStart[0] = expMemEntriesStart[n];
+                    expRegionLen[0] = expMemTablesStart[n] - expMemEntriesStart[n];
+                    expRegionCount = 1;
+                    me = e;
+                } else {
+                    break;
+                }
+            }
+            n++;
+            off = end;
+            bytes += len;
+            totalTables += expMemTableCount[n - 1];
+            lastFlags = expMemFlags[n - 1];
+        }
+        if (n == 1) {
+            return 0;
+        }
+        long payloadLength = 0;
+        if (hasDelta) {
+            payloadLength += NativeBufferWriter.varintSize(ms) + NativeBufferWriter.varintSize(me - ms);
+            for (int i = 0; i < expRegionCount; i++) {
+                payloadLength += expRegionLen[i];
+            }
+        }
+        for (int i = 0; i < n; i++) {
+            payloadLength += expMemAddr[i] + expMemLen[i] - expMemTablesStart[i];
+        }
+        try {
+            WebSocketSendBuffer sb = client.expBeginBinaryFrame();
+            sb.putByte((byte) 'Q');
+            sb.putByte((byte) 'W');
+            sb.putByte((byte) 'P');
+            sb.putByte((byte) '1');
+            sb.putByte(Unsafe.getUnsafe().getByte(firstAddr + 4));
+            sb.putByte(lastFlags);
+            sb.putShort((short) totalTables);
+            sb.putInt((int) payloadLength);
+            if (hasDelta) {
+                sb.putVarint(ms);
+                sb.putVarint(me - ms);
+                for (int i = 0; i < expRegionCount; i++) {
+                    sb.putBlockOfBytes(expRegionStart[i], expRegionLen[i]);
+                }
+            }
+            for (int i = 0; i < n; i++) {
+                sb.putBlockOfBytes(expMemTablesStart[i], expMemAddr[i] + expMemLen[i] - expMemTablesStart[i]);
+            }
+            for (int i = 0; i < n; i++) {
+                if (expMemDeltaStart[i] >= 0) {
+                    accumulateSentDict(expMemAddr[i], expMemLen[i], expMemDeltaStart[i]);
+                }
+            }
+            client.expEndAndSendBinaryFrame();
+        } catch (Throwable t) {
+            fail(t);
+            return -1;
+        }
+        dataFrameSentThisConnection = true;
+        lastFrameOrPingNanos = System.nanoTime();
+        sendOffset = off;
+        expRecordMerge(nextWireSeq, n - 1);
+        nextWireSeq++;
+        counters.framesSent.addAndGet(n);
+        EXP_BATCH_SENDS.incrementAndGet();
+        EXP_BATCH_FRAMES.addAndGet(n);
+        return 1;
     }
 
     @TestOnly
@@ -3693,7 +3960,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * scheduling fairness.
      */
     private boolean trySendOne() {
-        if (orphanSkipTipFsn >= 0 && fsnAtZero + nextWireSeq >= orphanSkipStartFsn) {
+        if (orphanSkipTipFsn >= 0 && nextFsnToSend() >= orphanSkipStartFsn) {
             // The send cursor reached the orphaned deferred tail. Its frames
             // belong to an aborted transaction and must never be transmitted
             // (a commit-bearing frame from this session would commit them --
@@ -3807,6 +4074,15 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                             + sentDictCount + "; cannot replay without corrupting data -- resend required"));
             return false;
         }
+        if (EXP_MERGE_FRAMES > 1 && !durableAckMode && orphanSkipTipFsn < 0 && replayTargetFsn < 0) {
+            int merged = expTrySendMerged(base, frameAddr, payloadLen, frameEnd, pub);
+            if (merged != 0) {
+                return merged > 0;
+            }
+            // single-member group: count it so frames-per-send stays meaningful
+            EXP_BATCH_SENDS.incrementAndGet();
+            EXP_BATCH_FRAMES.incrementAndGet();
+        }
         try {
             client.sendBinary(frameAddr, payloadLen);
         } catch (Throwable t) {
@@ -3832,7 +4108,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         }
         lastFrameOrPingNanos = System.nanoTime();
         sendOffset = frameEnd;
-        long fsnSent = fsnAtZero + nextWireSeq;
+        long fsnSent = nextFsnToSend();
         nextWireSeq++;
         counters.framesSent.incrementAndGet();
         if (replayTargetFsn >= 0) {
@@ -4188,7 +4464,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                             wireSeq, highestSent);
                 }
                 counters.acks.incrementAndGet();
-                long okFsn = fsnAtZero + capped;
+                long okFsn = fsnForWireSeq(capped);
                 if (okFsn > highestOkFsn) {
                     highestOkFsn = okFsn;
                 }
@@ -4220,8 +4496,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     drainPendingDurable();
                     return;
                 }
-                if (engine.acknowledge(fsnAtZero + capped)) {
-                    dispatchProgress(fsnAtZero + capped);
+                if (engine.acknowledge(okFsn)) {
+                    dispatchProgress(okFsn);
                 }
                 return;
             }
@@ -4395,7 +4671,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 LOG.warn("server NACK wire seq {} outside sent range [0, {}], clamping",
                         wireSeq, highestSent);
             }
-            long fsn = fsnAtZero + cappedSeq;
+            long fsn = fsnForWireSeq(cappedSeq);
             if (fsn <= engine.ackedFsn()) {
                 // The clamped wire seq maps at or below the replay head, so this
                 // NACK is for a dictionary catch-up frame -- which occupies the
