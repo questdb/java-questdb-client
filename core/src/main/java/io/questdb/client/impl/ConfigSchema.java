@@ -132,7 +132,7 @@ public final class ConfigSchema {
         longRange("max_lifetime_ms", Side.POOL, OPEN, OPEN_MAX, false, false);
         longRange("housekeeper_interval_ms", Side.POOL, OPEN, OPEN_MAX, false, false);
         boolOnOff("lazy_connect", Side.POOL); // facade flag: tolerant non-blocking startup (async ingest + lazy reads)
-        boolOnOff("flush_on_close", Side.POOL); // pooled close() ships rows (on) or only releases the slot (off, default)
+        boolOnOff("flush_on_close", Side.POOL); // pooled close() ships rows (on, default) or only releases the slot (off)
         intRange("commit_rows", Side.POOL, OPEN, OPEN_MAX, false, false); // commit window: rows per server commit
         longRange("commit_interval_ms", Side.POOL, OPEN, OPEN_MAX, false, false); // commit window: age per server commit
 

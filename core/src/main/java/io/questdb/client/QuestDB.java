@@ -138,21 +138,21 @@ public interface QuestDB extends Closeable {
      * Borrows a {@link Sender} from the pool. The caller MUST call
      * {@link Sender#close()} on the returned instance to release it back to
      * the pool. Close releases, flush ships, drain waits: {@code close()} on a
-     * pooled Sender returns the slot and by default ships the slot's pending
-     * rows once the oldest is older than {@code auto_flush_interval} or another
-     * auto-flush threshold trips, otherwise it only releases; rows left in the
-     * slot go out when an auto-flush threshold trips on a later append or
-     * release, or when the housekeeper settles the idle slot, within about one
-     * {@code auto_flush_interval} of it going idle. A lease that holds the slot
-     * without appending or closing holds those rows back until it does. Call
-     * {@link Sender#flush()} to ship now and
+     * pooled Sender ships the lease's pending rows as one frame into the
+     * store-and-forward ring and returns the slot, so every row appended before
+     * {@code close()} is in the ring when it returns. Call
      * {@link Sender#drain(long)} to wait for the server. Set
-     * {@code flush_on_close=on} to have {@code close()} flush, as before 1.3.12.
-     * With the default, one frame carries the rows of every lease that closed
-     * since the last ship, so a server rejection of that frame discards those
-     * leases' rows together; the error is logged by the error handler and thrown
-     * by a later call on that slot. Call {@link Sender#flush()} before close, or
-     * set {@code flush_on_close=on}, when a lease's rows must not share a frame.
+     * {@code flush_on_close=off} to opt in to buffering across leases:
+     * {@code close()} then only releases the slot, and its rows go out when an
+     * auto-flush threshold trips on a later append or release, or when the
+     * housekeeper settles the idle slot, within about one
+     * {@code auto_flush_interval} of it going idle. A lease that holds the slot
+     * without appending or closing holds those rows back until it does. With
+     * {@code off}, one frame carries the rows of every lease that closed since
+     * the last ship, so a server rejection of that frame discards those leases'
+     * rows together; the error is logged by the error handler and thrown by a
+     * later call on that slot. With the default each lease ships its own frame,
+     * so a rejection covers only that lease's rows.
      * {@link Sender#reset()} on a pooled Sender discards only that lease's rows.
      * Note that in this client "flush" means published to the store-and-forward
      * ring, not acknowledged by the server. The free list is LIFO, so under

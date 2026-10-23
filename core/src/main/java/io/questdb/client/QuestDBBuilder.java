@@ -210,11 +210,11 @@ public final class QuestDBBuilder {
 
     /**
      * Whether {@code close()} on a borrowed sender flushes its rows before
-     * returning the slot. Off by default: close releases, flush ships, drain
-     * waits, and rows left in a slot ship within one auto-flush interval of
-     * the slot going idle, or at the next append or close on it after that
-     * interval. On restores the behaviour before 1.3.12, one frame and one WAL
-     * commit per close, which is the slow path for applications that borrow per message. In this
+     * returning the slot. On by default: close publishes the lease's pending
+     * rows as one frame into the store-and-forward ring, flush ships, drain
+     * waits. Off is the opt-in that keeps rows in the slot across leases: they
+     * ship within one auto-flush interval of the slot going idle, or at the
+     * next append or close on it after that interval. In this
      * client "flush" means published to the store-and-forward ring, not
      * acknowledged by the server; use {@link Sender#drain(long)} for that.
      * With {@code on} and no commit window every lease ships its own frame, so
@@ -290,7 +290,7 @@ public final class QuestDBBuilder {
         resolvePoolLong(maxLifetimeMillis, "max_lifetime_ms", view, DEFAULT_MAX_LIFETIME_MILLIS, this::maxLifetimeMillis);
         resolvePoolLong(housekeeperIntervalMillis, "housekeeper_interval_ms", view, DEFAULT_HOUSEKEEPER_INTERVAL_MILLIS, this::housekeeperIntervalMillis);
         if (flushOnClose == null) {
-            flushOnClose = view.getBool("flush_on_close", false);
+            flushOnClose = view.getBool("flush_on_close", true);
         }
         int windowRows = commitRows;
         if (windowRows == UNSET && view.has("commit_rows")) {

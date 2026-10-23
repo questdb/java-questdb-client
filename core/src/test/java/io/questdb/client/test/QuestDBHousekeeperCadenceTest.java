@@ -83,7 +83,7 @@ public class QuestDBHousekeeperCadenceTest {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
             try (QuestDB db = QuestDB.connect(QuestDBFlushOnCloseTest.config(server.getPort(),
-                    "housekeeper_interval_ms=" + Long.MAX_VALUE + ";"))) {
+                    "flush_on_close=off;housekeeper_interval_ms=" + Long.MAX_VALUE + ";"))) {
                 try (Sender s = db.borrowSender()) {
                     s.table("t").longColumn("v", 1L).atNow();
                 }

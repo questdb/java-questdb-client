@@ -58,7 +58,7 @@ public class QuestDBFlushOnCloseTest {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
             // settle cadence 60 s: nothing ships inside the test window
-            try (QuestDB db = QuestDB.connect(config(server.getPort(), "auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
+            try (QuestDB db = QuestDB.connect(config(server.getPort(), "flush_on_close=off;auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
                 appendThreeRowsInThreeLeases(db);
                 Thread.sleep(300);
                 Assert.assertEquals("three closes must not ship", 0, log.dataFrames());
@@ -79,7 +79,7 @@ public class QuestDBFlushOnCloseTest {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
             // auto_flush_bytes unset: the byte trigger sits at 90 percent of the 4 KiB cap (3686 bytes)
-            try (QuestDB db = QuestDB.connect(config(server.getPort(), "auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
+            try (QuestDB db = QuestDB.connect(config(server.getPort(), "flush_on_close=off;auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
                 appendThreeWideRowsAfterAWarmUp(db, log);
                 Sender delegate;
                 try (Sender s = db.borrowSender()) {
@@ -109,7 +109,7 @@ public class QuestDBFlushOnCloseTest {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
             // auto_flush_bytes unset: the byte trigger sits at 90 percent of the 4 KiB cap (3686 bytes)
-            try (QuestDB db = QuestDB.connect(config(server.getPort(), "auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
+            try (QuestDB db = QuestDB.connect(config(server.getPort(), "flush_on_close=off;auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
                 appendThreeWideRowsAfterAWarmUp(db, log);
                 Sender delegate = null;
                 boolean hasCloseThrown = false;
@@ -143,6 +143,23 @@ public class QuestDBFlushOnCloseTest {
     }
 
     @Test
+    public void testDefaultShipsOneFramePerClose() throws Exception {
+        FrameLog log = new FrameLog();
+        try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            try (QuestDB db = QuestDB.connect(config(server.getPort(), "housekeeper_interval_ms=60000;"))) {
+                appendThreeRowsInThreeLeases(db);
+                log.awaitDataFrames(3, 5_000);
+                Assert.assertEquals(3, log.dataFrames());
+                for (int i = 0; i < 3; i++) {
+                    Assert.assertFalse("no commit window: frames are not flagged", log.deferFlag(i));
+                }
+            }
+        }
+    }
+
+    @Test
     public void testFlushOnCloseShipsOneFramePerClose() throws Exception {
         FrameLog log = new FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
@@ -166,7 +183,7 @@ public class QuestDBFlushOnCloseTest {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
             QuestDB db = QuestDB.connect(config(server.getPort(),
-                    "housekeeper_interval_ms=60000;auto_flush_interval=60000;close_flush_timeout_millis=5000;"));
+                    "flush_on_close=off;housekeeper_interval_ms=60000;auto_flush_interval=60000;close_flush_timeout_millis=5000;"));
             appendThreeRowsInThreeLeases(db);
             db.close();
             log.awaitDataFrames(1, 5_000);
@@ -179,7 +196,7 @@ public class QuestDBFlushOnCloseTest {
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-            try (QuestDB db = QuestDB.connect(config(server.getPort(), "auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
+            try (QuestDB db = QuestDB.connect(config(server.getPort(), "flush_on_close=off;auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
                 try (Sender a = db.borrowSender()) {
                     a.table("t1").longColumn("v", 1L).atNow();
                 }
@@ -207,7 +224,7 @@ public class QuestDBFlushOnCloseTest {
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
             // auto_flush_bytes=off on purpose: defeat the cap-bound byte trigger so the batch outgrows the cap
             try (QuestDB db = QuestDB.connect(config(server.getPort(),
-                    "auto_flush_bytes=off;auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
+                    "flush_on_close=off;auto_flush_bytes=off;auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
                 // warm-up lease: proves the connection and the advertised cap are in place
                 // (initial_connect_retry=async learns the cap on the I/O thread)
                 try (Sender s = db.borrowSender()) {
@@ -258,7 +275,7 @@ public class QuestDBFlushOnCloseTest {
             // auto_flush_bytes=off: no byte trigger, so the sender never holds a row back
             // and the lease's explicit flush() meets the whole over-cap batch
             try (QuestDB db = QuestDB.connect(config(server.getPort(),
-                    "auto_flush_bytes=off;auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
+                    "flush_on_close=off;auto_flush_bytes=off;auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
                 appendThreeWideRowsAfterAWarmUp(db, log);
                 Sender delegate = null;
                 boolean hasCloseThrown = false;
@@ -295,7 +312,7 @@ public class QuestDBFlushOnCloseTest {
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-            try (QuestDB db = QuestDB.connect(config(server.getPort(), "auto_flush_interval=200;housekeeper_interval_ms=60000;"))) {
+            try (QuestDB db = QuestDB.connect(config(server.getPort(), "flush_on_close=off;auto_flush_interval=200;housekeeper_interval_ms=60000;"))) {
                 try (Sender s = db.borrowSender()) {
                     s.table("t").longColumn("v", 1L).atNow();
                 }
@@ -322,7 +339,7 @@ public class QuestDBFlushOnCloseTest {
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-            try (QuestDB db = QuestDB.connect(config(server.getPort(), "auto_flush_interval=200;housekeeper_interval_ms=60000;"))) {
+            try (QuestDB db = QuestDB.connect(config(server.getPort(), "flush_on_close=off;auto_flush_interval=200;housekeeper_interval_ms=60000;"))) {
                 try (Sender s = db.borrowSender()) {
                     s.table("t").longColumn("v", 1L).atNow();
                 }
@@ -345,7 +362,7 @@ public class QuestDBFlushOnCloseTest {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
             // auto_flush_bytes unset: the byte trigger sits at 90 percent of the 4 KiB cap (3686 bytes)
-            try (QuestDB db = QuestDB.connect(config(server.getPort(), "auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
+            try (QuestDB db = QuestDB.connect(config(server.getPort(), "flush_on_close=off;auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
                 // warm-up lease: the server learns late_table with kept_column
                 try (Sender s = db.borrowSender()) {
                     s.table("late_table").longColumn("kept_column", 1L).atNow();
@@ -399,7 +416,7 @@ public class QuestDBFlushOnCloseTest {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
             // auto_flush_bytes unset: the byte trigger sits at 90 percent of the 4 KiB cap (3686 bytes)
-            try (QuestDB db = QuestDB.connect(config(server.getPort(), "auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
+            try (QuestDB db = QuestDB.connect(config(server.getPort(), "flush_on_close=off;auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
                 appendThreeWideRowsAfterAWarmUp(db, log);
                 try (Sender s = db.borrowSender()) {
                     s.table("t").stringColumn("s", wideValue(1500)).atNow();
@@ -423,7 +440,7 @@ public class QuestDBFlushOnCloseTest {
             server.setAdvertisedMaxBatchSize(4 * 1024);
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-            try (QuestDB db = QuestDB.connect(config(server.getPort(), "auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
+            try (QuestDB db = QuestDB.connect(config(server.getPort(), "flush_on_close=off;auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
                 // warm-up lease: proves the connection and the advertised cap are in place
                 // (initial_connect_retry=async learns the cap on the I/O thread)
                 try (Sender s = db.borrowSender()) {
@@ -459,7 +476,7 @@ public class QuestDBFlushOnCloseTest {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
             // no auto_flush_interval: the settle cadence defaults to 100 ms, independent of the 60 s reap cadence
-            try (QuestDB db = QuestDB.connect(config(server.getPort(), "housekeeper_interval_ms=60000;"))) {
+            try (QuestDB db = QuestDB.connect(config(server.getPort(), "flush_on_close=off;housekeeper_interval_ms=60000;"))) {
                 appendThreeRowsInThreeLeases(db);
                 log.awaitDataFrames(1, 2_000);
                 Thread.sleep(300);
@@ -475,7 +492,7 @@ public class QuestDBFlushOnCloseTest {
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-            try (QuestDB db = QuestDB.connect(config(server.getPort(), "auto_flush_interval=100;housekeeper_interval_ms=60000;"))) {
+            try (QuestDB db = QuestDB.connect(config(server.getPort(), "flush_on_close=off;auto_flush_interval=100;housekeeper_interval_ms=60000;"))) {
                 appendThreeRowsInThreeLeases(db);
                 log.awaitDataFrames(1, 2_000);
                 Thread.sleep(300);
@@ -491,7 +508,7 @@ public class QuestDBFlushOnCloseTest {
         try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-            try (QuestDB db = QuestDB.connect(config(server.getPort(), "auto_flush_interval=60000;housekeeper_interval_ms=60000;")
+            try (QuestDB db = QuestDB.connect(config(server.getPort(), "flush_on_close=off;auto_flush_interval=60000;housekeeper_interval_ms=60000;")
                     + "reconnect_max_duration_millis=500;reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=50;")) {
                 try (Sender a = db.borrowSender()) {
                     a.table("t1").longColumn("v", 1L).atNow();       // a clean row
@@ -539,7 +556,7 @@ public class QuestDBFlushOnCloseTest {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
             try (QuestDB db = QuestDB.connect(config(server.getPort(),
-                    "auto_flush_rows=3;auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
+                    "flush_on_close=off;auto_flush_rows=3;auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
                 appendThreeRowsInThreeLeases(db);
                 log.awaitDataFrames(1, 5_000);
             }
@@ -554,7 +571,7 @@ public class QuestDBFlushOnCloseTest {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
             // settle 60 s, row threshold 1000: only the cap-bound byte trigger can ship inside the test
-            try (QuestDB db = QuestDB.connect(config(server.getPort(), "auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
+            try (QuestDB db = QuestDB.connect(config(server.getPort(), "flush_on_close=off;auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
                 String wide = wideValue(1000);
                 // initial_connect_retry=async: the cap is learned on the I/O thread's
                 // handshake, and rows appended before it carry no byte trigger. Keep

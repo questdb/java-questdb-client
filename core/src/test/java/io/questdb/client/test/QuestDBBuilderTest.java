@@ -263,7 +263,7 @@ public class QuestDBBuilderTest {
         QuestDBBuilder dflt = QuestDB.builder()
                 .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;");
         try (QuestDB ignored = dflt.build()) {
-            Assert.assertEquals("default is off", Boolean.FALSE, dflt.poolConfigSnapshotForTest().get("flush_on_close"));
+            Assert.assertEquals("default is on", Boolean.TRUE, dflt.poolConfigSnapshotForTest().get("flush_on_close"));
         }
         QuestDBBuilder t = QuestDB.builder()
                 .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=true;");
@@ -360,7 +360,7 @@ public class QuestDBBuilderTest {
     @Test
     public void testWindowWithoutFlushOnCloseIsRejected() {
         assertBuildRejected(
-                "ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;commit_rows=10;",
+                "ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=off;commit_rows=10;",
                 "flush_on_close");
         assertBuildRejected(
                 "ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=off;commit_interval_ms=10;",
