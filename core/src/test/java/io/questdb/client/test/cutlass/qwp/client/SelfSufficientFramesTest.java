@@ -589,8 +589,8 @@ public class SelfSufficientFramesTest {
         // the first split frame) has a tiny body, so delta + body1 fits the cap. The
         // second table has a big body: body2 alone fits the cap, but delta + body2 does
         // NOT. The real code splits and ships both frames; the un-advanced pre-flight
-        // would size the second frame WITH the delta and throw. Table order is
-        // insertion order (CharSequenceObjHashMap.keys()), so t1 is the delta frame.
+        // would size the second frame WITH the delta and throw. Tables ship in the
+        // order they first received a row since the last flush, so t1 is the delta frame.
         assertMemoryLeak(() -> {
             CapturingHandler handler = new CapturingHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(handler)) {

@@ -83,6 +83,9 @@ public class QwpTableBuffer implements QuietCloseable {
     private int[] heldValueCounts;
     private int inProgressColumnCount;
     private boolean isRowHeld;
+    // Set while the sender's pending-tables list holds this buffer, so the
+    // buffer is listed once. Producer thread only.
+    private boolean listedPending;
     private int rowCount;
     // Savepoint for rollbackToSavepoint(): the row count and column count at the
     // last markSavepoint(). reset(), retainInProgressRow() and retainHeldRow()
@@ -389,6 +392,13 @@ public class QwpTableBuffer implements QuietCloseable {
     }
 
     /**
+     * Returns true while the sender's pending-tables list holds this buffer.
+     */
+    public boolean isListedPending() {
+        return listedPending;
+    }
+
+    /**
      * Remembers the current row count and column count. A later
      * {@link #rollbackToSavepoint()} truncates the buffer back to this point.
      * Take it between rows, not while a row is in progress.
@@ -612,6 +622,13 @@ public class QwpTableBuffer implements QuietCloseable {
             columns.remove(i);
         }
         rebuildColumnAccessStructures();
+    }
+
+    /**
+     * Marks whether the sender's pending-tables list holds this buffer.
+     */
+    public void setListedPending(boolean listedPending) {
+        this.listedPending = listedPending;
     }
 
     private static void assertColumnType(CharSequence name, byte type, ColumnBuffer column) {

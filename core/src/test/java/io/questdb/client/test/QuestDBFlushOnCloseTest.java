@@ -346,14 +346,20 @@ public class QuestDBFlushOnCloseTest {
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
             // auto_flush_bytes unset: the byte trigger sits at 90 percent of the 4 KiB cap (3686 bytes)
             try (QuestDB db = QuestDB.connect(config(server.getPort(), "auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
-                // warm-up lease: the server learns late_table with kept_column, and late_table
-                // precedes t in the sender's tables, so its frame carries the batch's new
-                // symbols when the batch splits
+                // warm-up lease: the server learns late_table with kept_column
                 try (Sender s = db.borrowSender()) {
                     s.table("late_table").longColumn("kept_column", 1L).atNow();
                     s.flush();
                 }
                 log.awaitDataFrames(1, 5_000);
+                // The sender ships tables in the order they first received a row since its
+                // last flush, and a rolled-back row keeps that place. So late_table precedes
+                // t in the batch, and its frame carries the batch's new symbols when the
+                // batch splits.
+                try (Sender s = db.borrowSender()) {
+                    s.table("late_table").longColumn("kept_column", 0L).atNow();
+                    s.reset();
+                }
                 for (int i = 0; i < 3; i++) {
                     try (Sender s = db.borrowSender()) {
                         // 1.8 KB of new symbols and 1.5 KB of strings in all, below the trigger

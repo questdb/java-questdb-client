@@ -28,6 +28,7 @@ import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
+import io.questdb.client.cutlass.qwp.client.BatchTooLargeForCapException;
 import io.questdb.client.cutlass.qwp.client.MicrobatchBuffer;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
@@ -45,6 +46,7 @@ import org.junit.Test;
 import java.lang.reflect.Field;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
@@ -398,6 +400,58 @@ public class QwpWebSocketSenderTest {
     }
 
     @Test
+    public void testFailedFlushKeepsPendingTablesForTheRetry() throws Exception {
+        assertMemoryLeak(() -> {
+            QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+            try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+                server.setAdvertisedMaxBatchSize(4 * 1024);
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                // no row or byte trigger: the whole batch reaches the explicit flush(), whose split
+                // pre-flight rejects it before publishing anything
+                try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                        + ";auto_flush_rows=off;auto_flush_bytes=off;auto_flush_interval=60000;")) {
+                    // warm-up, so the cap is known
+                    sender.table("w").longColumn("v", 1).atNow();
+                    sender.flush();
+                    log.awaitDataFrames(1, 5_000);
+
+                    sender.table("alpha").longColumn("v", 2).atNow();
+                    sender.table("bravo").longColumn("v", 3).atNow();
+                    sender.markSavepoint();
+                    // three 1.5 KB rows take charlie_dropped's frame over the 4 KiB cap
+                    String wide = QuestDBFlushOnCloseTest.wideValue(1500);
+                    for (int i = 0; i < 3; i++) {
+                        sender.table("charlie_dropped").stringColumn("s", wide).atNow();
+                    }
+                    try {
+                        sender.flush();
+                        Assert.fail("the batch exceeds the 4 KiB cap");
+                    } catch (BatchTooLargeForCapException expected) {
+                        // thrown before anything was published
+                    }
+                    Assert.assertEquals("nothing shipped, nothing lost", 5, sender.pendingRowCount());
+
+                    sender.resetToSavepoint();
+                    Assert.assertEquals(2, sender.pendingRowCount());
+                    // the retry must re-collect the tables the failed flush collected
+                    sender.flush();
+                    log.awaitDataFrames(2, 5_000);
+                    Assert.assertEquals(2, log.tableCount(1));
+                    List<byte[]> frames = log.frames();
+                    byte[] frame1 = frames.get(1);
+                    Assert.assertTrue("frame 1 carries alpha", indexOf(frame1, "alpha") >= 0);
+                    Assert.assertTrue("frame 1 carries bravo", indexOf(frame1, "bravo") >= 0);
+                    for (int i = 0, n = frames.size(); i < n; i++) {
+                        Assert.assertEquals("frame " + i + " must not carry the dropped table",
+                                -1, indexOf(frames.get(i), "charlie_dropped"));
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
     public void testFlushAppendFailureDoesNotLeaveMicrobatchBufferInUse() throws Exception {
         assertMemoryLeak(() -> {
             try (TestWebSocketServer server = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
@@ -438,6 +492,46 @@ public class QwpWebSocketSenderTest {
                 // test. The bug under test is about microbatch buffer
                 // state, not about close() being lenient toward residual
                 // unflushed rows — swallow the predictable rethrow here.
+            }
+        });
+    }
+
+    @Test
+    public void testFlushShipsOnlyTablesWithPendingRows() throws Exception {
+        assertMemoryLeak(() -> {
+            QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+            try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                        + ";auto_flush_interval=60000;")) {
+                    sender.table("alpha").longColumn("v", 1).atNow();
+                    sender.table("bravo").longColumn("v", 2).atNow();
+                    sender.table("alpha").longColumn("v", 3).atNow();
+                    sender.flush();
+                    log.awaitDataFrames(1, 5_000);
+                    Assert.assertEquals(2, log.tableCount(0));
+                    byte[] frame0 = log.frames().get(0);
+                    int alphaAt = indexOf(frame0, "alpha");
+                    int bravoAt = indexOf(frame0, "bravo");
+                    Assert.assertTrue("frame 0 carries alpha", alphaAt >= 0);
+                    Assert.assertTrue("frame 0 carries bravo", bravoAt >= 0);
+                    Assert.assertTrue("tables ship in first-row order", alphaAt < bravoAt);
+
+                    sender.table("charlie").longColumn("v", 4).atNow();
+                    sender.flush();
+                    log.awaitDataFrames(2, 5_000);
+                    Assert.assertEquals("only charlie has rows", 1, log.tableCount(1));
+
+                    sender.table("bravo").longColumn("v", 5).atNow();
+                    sender.flush();
+                    log.awaitDataFrames(3, 5_000);
+                    Assert.assertEquals("only bravo has rows", 1, log.tableCount(2));
+                    byte[] frame2 = log.frames().get(2);
+                    Assert.assertTrue("frame 2 carries bravo", indexOf(frame2, "bravo") >= 0);
+                    Assert.assertEquals("frame 2 carries no alpha", -1, indexOf(frame2, "alpha"));
+                    Assert.assertEquals("frame 2 carries no charlie", -1, indexOf(frame2, "charlie"));
+                }
             }
         });
     }
@@ -946,6 +1040,20 @@ public class QwpWebSocketSenderTest {
         Field field = QwpWebSocketSender.class.getDeclaredField(fieldName);
         field.setAccessible(true);
         return (MicrobatchBuffer) field.get(sender);
+    }
+
+    private static int indexOf(byte[] frame, String ascii) {
+        int n = ascii.length();
+        for (int i = 0, last = frame.length - n; i <= last; i++) {
+            int j = 0;
+            while (j < n && frame[i + j] == (byte) ascii.charAt(j)) {
+                j++;
+            }
+            if (j == n) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     /**

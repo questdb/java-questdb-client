@@ -259,6 +259,12 @@ public class QwpWebSocketSender implements Sender {
     // splitFrameBodyBytes, which is what lets the split passes index them directly.
     private final ObjList<QwpTableBuffer> flushTableBuffers = new ObjList<>();
     private final ObjList<CharSequence> flushTableNames = new ObjList<>();
+    // The tables that received a row since the last successful flush, in first-row
+    // order, each listed once (QwpTableBuffer.isListedPending() guards the add).
+    // collectNonEmptyTables() walks this instead of every table the sender has seen.
+    // Cleared, together with the flags, only when a flush succeeds or finds nothing
+    // to ship, so a flush that throws before publishing leaves it for the retry.
+    private final ObjList<QwpTableBuffer> pendingTables = new ObjList<>();
     private final IntList splitFrameBodyBytes = new IntList();
     private final CharSequenceObjHashMap<QwpTableBuffer> tableBuffers;
     // null means plain text (no TLS)
@@ -1983,6 +1989,7 @@ public class QwpWebSocketSender implements Sender {
                 }
             }
             tableBuffers.clear();
+            pendingTables.clear();
         } catch (Throwable t) {
             LOG.error("Error closing encoder or table buffers: {}", String.valueOf(t));
             terminalError = captureCloseError(terminalError, t);
@@ -4840,6 +4847,13 @@ public class QwpWebSocketSender implements Sender {
         }
     }
 
+    private void clearPendingTables() {
+        for (int i = 0, n = pendingTables.size(); i < n; i++) {
+            pendingTables.getQuick(i).setListedPending(false);
+        }
+        pendingTables.setPos(0);
+    }
+
     private void clearSavepointAndRejection() {
         savepointBatchMaxSymbolId = -1;
         savepointPendingRowCount = 0;
@@ -4956,20 +4970,17 @@ public class QwpWebSocketSender implements Sender {
 
     /**
      * Collects the batch's non-empty tables into {@link #flushTableNames} /
-     * {@link #flushTableBuffers} and returns how many there are. One walk of the key
-     * list and one hash probe per table, for the whole flush.
+     * {@link #flushTableBuffers} and returns how many there are. One walk of
+     * {@link #pendingTables}, in first-row order, for the whole flush; a listed
+     * table whose rows were since discarded is skipped.
      */
-    private int collectNonEmptyTables(ObjList<CharSequence> keys) {
-        flushTableNames.clear();
-        flushTableBuffers.clear();
-        for (int i = 0, n = keys.size(); i < n; i++) {
-            CharSequence tableName = keys.getQuick(i);
-            if (tableName == null) {
-                continue;
-            }
-            QwpTableBuffer tableBuffer = tableBuffers.get(tableName);
-            if (tableBuffer != null && tableBuffer.getRowCount() > 0) {
-                flushTableNames.add(tableName);
+    private int collectNonEmptyTables() {
+        flushTableNames.setPos(0);
+        flushTableBuffers.setPos(0);
+        for (int i = 0, n = pendingTables.size(); i < n; i++) {
+            QwpTableBuffer tableBuffer = pendingTables.getQuick(i);
+            if (tableBuffer.getRowCount() > 0) {
+                flushTableNames.add(tableBuffer.getTableName());
                 flushTableBuffers.add(tableBuffer);
             }
         }
@@ -5446,9 +5457,9 @@ public class QwpWebSocketSender implements Sender {
         cachedTimestampColumn = null;
         cachedTimestampNanosColumn = null;
 
-        ObjList<CharSequence> keys = tableBuffers.keys();
-        int tableCount = collectNonEmptyTables(keys);
+        int tableCount = collectNonEmptyTables();
         if (tableCount == 0) {
+            clearPendingTables();
             pendingBytes = 0;
             currentTableBufferSnapshotBytes = currentTableBuffer == null
                     ? 0 : currentTableBuffer.getBufferedBytes();
@@ -5816,9 +5827,12 @@ public class QwpWebSocketSender implements Sender {
                 tableBuffer.reset();
             }
         }
-        // Drop the references; the next flush re-collects.
-        flushTableNames.clear();
-        flushTableBuffers.clear();
+        // The next row lists its table again; a held row's table is listed again below.
+        clearPendingTables();
+        // The next flush re-collects. setPos(0) rather than clear(), which fills the
+        // whole backing array.
+        flushTableNames.setPos(0);
+        flushTableBuffers.setPos(0);
         if (currentTableBuffer != null && currentTableBuffer.hasHeldRow()) {
             // autoFlushAfterRow shipped every row but the one it held back, which
             // stays buffered as the only pending row. currentBatchMaxSymbolId keeps
@@ -5827,6 +5841,9 @@ public class QwpWebSocketSender implements Sender {
             // that just shipped carried them, and advanceSentMaxSymbolId moved the
             // baseline past them.
             currentTableBuffer.retainHeldRow();
+            // The held row is still pending, so its table is listed again.
+            currentTableBuffer.setListedPending(true);
+            pendingTables.add(currentTableBuffer);
             long heldRowBytes = currentTableBuffer.getBufferedBytes();
             pendingRowCount = 1;
             pendingBytes = heldRowBytes;
@@ -7457,6 +7474,10 @@ public class QwpWebSocketSender implements Sender {
             firstPendingRowTimeNanos = System.nanoTime();
         }
         pendingRowCount++;
+        if (!currentTableBuffer.isListedPending()) {
+            currentTableBuffer.setListedPending(true);
+            pendingTables.add(currentTableBuffer);
+        }
         rowsAppended++;
 
         // Advance pendingBytes by the bytes the just-committed row added to
