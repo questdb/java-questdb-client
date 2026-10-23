@@ -905,6 +905,43 @@ public class QwpWebSocketSenderTest {
     }
 
     @Test
+    public void testSavepointCoversEveryTableTheSenderKnows() throws Exception {
+        assertMemoryLeak(() -> {
+            QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+            try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                        + ";auto_flush_rows=off;auto_flush_bytes=off;auto_flush_interval=60000;")) {
+                    sender.table("a").longColumn("v", 1).atNow();
+                    sender.table("b").longColumn("v", 2).atNow();
+                    sender.flush();
+                    log.awaitDataFrames(1, 5_000);
+
+                    sender.markSavepoint();
+                    sender.table("a").longColumn("v", 3).atNow();
+                    sender.table("b").longColumn("v", 4).atNow();
+                    sender.table("c").longColumn("w", 5).atNow();
+                    Assert.assertEquals(3, sender.pendingRowCount());
+                    sender.resetToSavepoint();
+
+                    Assert.assertEquals(0, sender.pendingRowCount());
+                    QwpTableBuffer c = ((QwpWebSocketSender) sender).getTableBuffer("c");
+                    Assert.assertEquals(0, c.getRowCount());
+                    // c's columns were created after the mark and the server never saw them
+                    Assert.assertEquals(0, c.getColumnCount());
+
+                    sender.table("a").longColumn("v", 6).atNow();
+                    sender.table("b").longColumn("v", 7).atNow();
+                    sender.flush();
+                    log.awaitDataFrames(2, 5_000);
+                    Assert.assertEquals(2, log.tableCount(1));
+                }
+            }
+        });
+    }
+
+    @Test
     public void testStringColumnAfterCloseThrows() throws Exception {
         assertMemoryLeak(() -> {
             QwpWebSocketSender sender = createUnconnectedSender();

@@ -266,6 +266,10 @@ public class QwpWebSocketSender implements Sender {
     // to ship, so a flush that throws before publishing leaves it for the retry.
     private final ObjList<QwpTableBuffer> pendingTables = new ObjList<>();
     private final IntList splitFrameBodyBytes = new IntList();
+    // Every buffer in tableBuffers, in creation order, so markSavepoint(), reset() and
+    // resetToSavepoint() walk a plain list instead of probing the hash map per table.
+    // Appended wherever a buffer is created, cleared with tableBuffers at close.
+    private final ObjList<QwpTableBuffer> tableBufferList = new ObjList<>();
     private final CharSequenceObjHashMap<QwpTableBuffer> tableBuffers;
     // null means plain text (no TLS)
     private final ClientTlsConfiguration tlsConfig;
@@ -1989,6 +1993,7 @@ public class QwpWebSocketSender implements Sender {
                 }
             }
             tableBuffers.clear();
+            tableBufferList.clear();
             pendingTables.clear();
         } catch (Throwable t) {
             LOG.error("Error closing encoder or table buffers: {}", String.valueOf(t));
@@ -2810,6 +2815,7 @@ public class QwpWebSocketSender implements Sender {
         if (buffer == null) {
             buffer = new QwpTableBuffer(tableName, this);
             tableBuffers.put(tableName, buffer);
+            tableBufferList.add(buffer);
         }
         currentTableBuffer = buffer;
         currentTableBufferSnapshotBytes = buffer.getBufferedBytes();
@@ -3289,12 +3295,8 @@ public class QwpWebSocketSender implements Sender {
 
     @Override
     public void markSavepoint() {
-        ObjList<CharSequence> keys = tableBuffers.keys();
-        for (int i = 0, n = keys.size(); i < n; i++) {
-            QwpTableBuffer buf = tableBuffers.get(keys.getQuick(i));
-            if (buf != null) {
-                buf.markSavepoint();
-            }
+        for (int i = 0, n = tableBufferList.size(); i < n; i++) {
+            tableBufferList.getQuick(i).markSavepoint();
         }
         savepointBatchMaxSymbolId = currentBatchMaxSymbolId;
         savepointPendingRowCount = pendingRowCount;
@@ -3381,12 +3383,8 @@ public class QwpWebSocketSender implements Sender {
     public void reset() {
         checkNotClosed();
         // Reset ALL table buffers, not just the current one
-        ObjList<CharSequence> keys = tableBuffers.keys();
-        for (int i = 0, n = keys.size(); i < n; i++) {
-            QwpTableBuffer buf = tableBuffers.get(keys.getQuick(i));
-            if (buf != null) {
-                buf.reset();
-            }
+        for (int i = 0, n = tableBufferList.size(); i < n; i++) {
+            tableBufferList.getQuick(i).reset();
         }
         discardPendingBatchState();
     }
@@ -3429,12 +3427,8 @@ public class QwpWebSocketSender implements Sender {
         // buffer's mark sits at "no rows, server-known columns", so the rollback
         // drops the column definitions the lease created that the server has not
         // seen, which reset() would keep and ship null-padded.
-        ObjList<CharSequence> keys = tableBuffers.keys();
-        for (int i = 0, n = keys.size(); i < n; i++) {
-            QwpTableBuffer buf = tableBuffers.get(keys.getQuick(i));
-            if (buf != null) {
-                buf.rollbackToSavepoint();
-            }
+        for (int i = 0, n = tableBufferList.size(); i < n; i++) {
+            tableBufferList.getQuick(i).rollbackToSavepoint();
         }
         if (savepointPendingRowCount == 0) {
             // No rows before the mark, or a flush since emptied it: every pending
@@ -3909,6 +3903,7 @@ public class QwpWebSocketSender implements Sender {
             currentTableName = tableName.toString();
             currentTableBuffer = new QwpTableBuffer(currentTableName, this);
             tableBuffers.put(currentTableName, currentTableBuffer);
+            tableBufferList.add(currentTableBuffer);
         }
         // Re-snap so sendRow()'s delta math is anchored to this table's
         // current byte count. The prior current table's bytes already match
