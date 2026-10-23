@@ -161,15 +161,18 @@ public class DeltaDictCatchUpTest {
         // gate (messageSize <= cap) by more than the minimal data-frame overhead. So
         // a symbol accepted onto the wire under cap C could exceed that budget and
         // trip a spurious "during catch-up" terminal, permanently hard-failing a
-        // running producer on its first transient reconnect. Concretely at cap=200:
-        // table("t").symbol("s", <173 chars>).atNow() encodes to 198 bytes (<=200,
-        // accepted), its dict entry is 2+173=175 bytes (> old budget 172 -> old
-        // terminal), while the real solo catch-up frame is 12+1+1+175=189 (<=200 ->
-        // fits). Unlike testCatchUpCapGapRetriesUntilBudgetThenLatches (a genuinely
-        // oversized entry on a shrunk cap, which MUST still terminate), this entry
-        // is legally shippable and must NOT terminate.
-        final int cap = 200;
-        final String nearCapSymbol = TestUtils.repeat("x", 173);
+        // running producer on its first transient reconnect. Unlike
+        // testCatchUpCapGapRetriesUntilBudgetThenLatches (a genuinely oversized entry
+        // on a shrunk cap, which MUST still terminate), this entry is legally
+        // shippable and must NOT terminate.
+        //
+        // In memory mode the producer's bound is its open record, which the sender
+        // sizes to the cap and whose header, wire margin and column chunks cost more
+        // than the catch-up frame's 12-byte header and two varints. At cap=400 the
+        // record takes a 250-char symbol (a 252-byte entry), and the solo catch-up
+        // frame is 12+1+2+252=267 bytes, within both the cap and the packing budget.
+        final int cap = 400;
+        final String nearCapSymbol = TestUtils.repeat("x", 250);
         assertMemoryLeak(() -> {
             CatchUpHandler handler = new CatchUpHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
@@ -216,10 +219,11 @@ public class DeltaDictCatchUpTest {
         // foreground sender must keep retrying without surfacing that cluster state to
         // the producer, even after the orphan drainer's 16-attempt quarantine budget.
         //
-        // Connection 1 advertises no cap, so the ~202-byte symbol registers and
+        // Connection 1 advertises no cap, so the ~502-byte symbol registers and
         // enters the sent-dictionary mirror. The handler then shrinks the
-        // advertised cap to 160 (catch-up budget 132) and drops the socket, so the
-        // reconnect's catch-up cannot re-ship the symbol. (One fixed cap can't do
+        // advertised cap to 400 (catch-up budget 372) and drops the socket, so the
+        // reconnect's catch-up cannot re-ship the symbol, while small rows still fit
+        // a 400-byte record. (One fixed cap can't do
         // this: the client refuses to SEND a single-table frame over the cap, and
         // that data frame is always larger than the bare catch-up entry.)
         assertMemoryLeak(() -> {
@@ -230,7 +234,7 @@ public class DeltaDictCatchUpTest {
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
-                String bigSymbol = TestUtils.repeat("x", 200); // ~202-byte dict entry
+                String bigSymbol = TestUtils.repeat("x", 500); // ~502-byte dict entry
                 // Zeroing the dwell makes the old faulty foreground policy terminal at
                 // its 16th cap gap. Reaching 20 handshakes therefore proves the live loop
                 // is no longer governed by the orphan budget.
@@ -262,7 +266,7 @@ public class DeltaDictCatchUpTest {
         // Connection 1 registers 40 ten-character symbols (~440 dictionary bytes),
         // then drops once the server has learned them all. On reconnect the fresh
         // server has an empty dictionary, so the I/O thread must replay all 40 as a
-        // catch-up -- but the server advertises a 160-byte batch cap, so the whole
+        // catch-up -- but the server advertises a 400-byte batch cap, so the whole
         // dictionary cannot fit in a single frame. The catch-up therefore splits
         // into several contiguous zero-table frames that the fresh server stitches
         // back into a complete, gap-free dictionary.
@@ -270,13 +274,13 @@ public class DeltaDictCatchUpTest {
         assertMemoryLeak(() -> {
             SplitCatchUpHandler handler = new SplitCatchUpHandler(symbolCount);
             try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
-                server.setAdvertisedMaxBatchSize(160); // small cap forces the catch-up to split
+                server.setAdvertisedMaxBatchSize(400); // small cap forces the catch-up to split
                 int port = server.getPort();
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
                 try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + port + ";")) {
-                    // One row per flush so each frame stays under the 160-byte cap; the
+                    // One row per flush so each frame stays under the 400-byte cap; the
                     // sent dictionary still accumulates all 40 symbols on connection 1.
                     for (int i = 0; i < symbolCount; i++) {
                         sender.table("t").symbol("s", symbolName(i)).longColumn("v", i).atNow();
@@ -323,7 +327,7 @@ public class DeltaDictCatchUpTest {
     }
 
     private static String symbolName(int i) {
-        // 10-char symbols so 40 of them clearly exceed the advertised 160-byte cap.
+        // 10-char symbols so 40 of them clearly exceed the advertised 400-byte cap.
         return "symbol" + (1000 + i);
     }
 
@@ -538,7 +542,7 @@ public class DeltaDictCatchUpTest {
                     // reconnect's catch-up budget can't fit it, then drop to force
                     // the reconnect. Setting the cap before the close (not from the
                     // test thread after it) removes the set-vs-reconnect race.
-                    server.setAdvertisedMaxBatchSize(160); // catch-up budget = 132
+                    server.setAdvertisedMaxBatchSize(400); // catch-up budget = 372
                     Thread.sleep(50);
                     client.close();
                 }

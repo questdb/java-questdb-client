@@ -27,7 +27,10 @@ package io.questdb.client.test.cutlass.qwp.client;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
+import io.questdb.client.test.tools.DelegatingFilesFacade;
+import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Assume;
 import org.junit.Test;
@@ -777,7 +780,9 @@ public class CloseDrainTest {
      * discard that batch and keep going -- commit, seal and DRAIN what an earlier
      * successful flush already published -- before rethrowTerminal surfaces the retained
      * batch's error. Letting the throw escape instead skips all three and abandons the
-     * earlier rows.
+     * earlier rows. Only the frame-per-flush path retains an over-cap batch (delta mode
+     * bounds every open record by the cap), so the sender runs on a full-dictionary
+     * engine, whose {@code .symbol-dict} cannot open.
      * <p>
      * The e2e sibling {@code QwpSenderOversizeRowInBatchTest} asserts a real server's row
      * count, which pins the COMMIT half: let the exception escape and those rows never
@@ -796,6 +801,7 @@ public class CloseDrainTest {
     @Test(timeout = 30_000L)
     public void testCloseDrainsEarlierRowsBeforeSurfacingRetainedBatchError() throws Exception {
         GatedAckHandler handler = new GatedAckHandler();
+        String sfDir = TestUtils.createTmpDir("qdb-close-drain-retained-");
         try (TestWebSocketServer server = new TestWebSocketServer(handler, false, "PRIMARY")) {
             // Small enough that a handful of modest rows cannot fit, while every
             // individual row stays far below it (so the per-row guard cannot fire).
@@ -803,12 +809,14 @@ public class CloseDrainTest {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
-            String cfg = "ws::addr=localhost:" + server.getPort()
-                    + ";auto_flush_rows=10000"
-                    + ";auto_flush_bytes=off"
-                    + ";auto_flush_interval=60000"
-                    + ";close_flush_timeout_millis=10000;";
-            QwpWebSocketSender sender = (QwpWebSocketSender) Sender.fromConfig(cfg);
+            CursorSendEngine engine = new CursorSendEngine(
+                    Paths.get(sfDir, "default").toString(), 4L * 1024 * 1024,
+                    CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                    new UnopenableDictFacade());
+            // auto_flush_rows=10000, auto_flush_bytes=off, no age trigger, close_flush_timeout_millis=10000
+            QwpWebSocketSender sender = QwpWebSocketSender.connect(
+                    "localhost", server.getPort(), null, 10_000, 0, 0L, null, false, engine, 10_000L);
+            Assert.assertFalse("setup: the full-dictionary frame path", sender.isDeltaDictEnabledForTest());
 
             CountDownLatch drainWaiting = new CountDownLatch(1);
             sender.setCloseDrainWaitingHook(() -> {
@@ -865,6 +873,8 @@ public class CloseDrainTest {
             Assert.assertTrue("the drain must have carried the earlier row's frame to the server"
                             + " and taken its ack [acksSent=" + handler.nextSeq.get() + ']',
                     handler.nextSeq.get() >= 1L);
+        } finally {
+            TestUtils.removeTmpDirRec(sfDir);
         }
     }
 
@@ -976,5 +986,16 @@ public class CloseDrainTest {
         bb.putLong(seq);
         bb.putShort((short) 0);
         return buf;
+    }
+
+    /**
+     * Refuses to create the symbol dictionary, leaving nothing at its path, so the
+     * engine runs in full-dictionary mode.
+     */
+    private static final class UnopenableDictFacade extends DelegatingFilesFacade {
+        @Override
+        public int openCleanRW(String path) {
+            return -1;
+        }
     }
 }

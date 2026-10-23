@@ -196,6 +196,14 @@ public final class QwoRecordWriter implements QuietCloseable {
     }
 
     /**
+     * Columns of block {@code block}: the first that many columns of the staged
+     * buffer the block was laid out from. Valid for {@code block < blockCount()}.
+     */
+    public int blockColumnCount(int block) {
+        return blocks.getQuick(block).colCount;
+    }
+
+    /**
      * Blocks laid out so far, including those not yet published.
      */
     public int blockCount() {
@@ -225,6 +233,13 @@ public final class QwoRecordWriter implements QuietCloseable {
 
     public int committedRowCount() {
         return committedRowCount;
+    }
+
+    /**
+     * Bytes reserved for dictionary entries right after the header.
+     */
+    public int dictCapacity() {
+        return dictCapacity;
     }
 
     /**

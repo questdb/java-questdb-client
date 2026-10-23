@@ -1057,11 +1057,15 @@ public final class CursorSendEngine implements QuietCloseable {
         // recreates a fresh sf-initial.sfa — would otherwise leave that
         // fresh empty file behind, the next scanner finds it, adopts the
         // slot again, and the cycle repeats forever (M6).
+        // A record still reserved in the active segment has no FSN, so the
+        // acked >= published test cannot see it; its committed rows exist
+        // only in that segment, so the slot is not drained while one is open.
         // Own try/catch so sabotaged/broken ring state cannot skip the
         // quiescence barrier below or the slot-lock release in finishClose.
         boolean drained = false;
         try {
             drained = sfDir != null
+                    && !ring.hasReservedRecord()
                     && (ring.publishedFsn() < 0
                     || ring.ackedFsn() >= ring.publishedFsn());
         } catch (Throwable ignored) {

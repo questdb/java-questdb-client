@@ -331,6 +331,25 @@ public class SymbolDictRecycleArmingTest {
     }
 
     @Test
+    public void testRecordFullSealInsideAtArms() throws Exception {
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = ackingServer()) {
+                server.setAdvertisedMaxBatchSize(4096);
+                // the second ~2.5 KB row does not fit the 4 KiB record the first is in,
+                // so its at() seals that record
+                String pad = TestUtils.repeat("x", 2500);
+                try (Sender sender = Sender.fromConfig(cfg(server) + "symbol_dict_reset_threshold=2;")) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    sender.table("t1").symbol("s", "a").stringColumn("p", pad).longColumn("v", 1L).atNow();
+                    Assert.assertFalse("nothing sealed yet", ws.isResetArmed());
+                    sender.table("t2").symbol("s", "b").stringColumn("p", pad).longColumn("v", 2L).atNow();
+                    Assert.assertTrue("the seal of a full record arms like a flush", ws.isResetArmed());
+                }
+            }
+        });
+    }
+
+    @Test
     public void testResetSymbolDictionaryOnNonWsSenderIsNoOp() throws Exception {
         assertMemoryLeak(() -> {
             // protocolVersion(2) skips the eager server-side settings detection
@@ -341,26 +360,6 @@ public class SymbolDictRecycleArmingTest {
                     .protocolVersion(2)
                     .build()) {
                 sender.resetSymbolDictionary();
-            }
-        });
-    }
-
-    @Test
-    public void testSplitFlushPathArms() throws Exception {
-        assertMemoryLeak(() -> {
-            try (TestWebSocketServer server = ackingServer()) {
-                server.setAdvertisedMaxBatchSize(150); // forces the two-table batch to split
-                // Padding inflates each table past half the cap, so the combined
-                // two-table message exceeds it while each single-table split frame fits.
-                String pad = TestUtils.repeat("x", 60);
-                try (Sender sender = Sender.fromConfig(cfg(server) + "symbol_dict_reset_threshold=2;")) {
-                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
-                    sender.table("t1").symbol("s", "a").stringColumn("p", pad).longColumn("v", 1L).atNow();
-                    sender.table("t2").symbol("s", "b").stringColumn("p", pad).longColumn("v", 2L).atNow();
-                    sender.flush();
-                    Assert.assertTrue("the split-flush path shares resetTableBuffersAfterFlush's tail",
-                            ws.isResetArmed());
-                }
             }
         });
     }

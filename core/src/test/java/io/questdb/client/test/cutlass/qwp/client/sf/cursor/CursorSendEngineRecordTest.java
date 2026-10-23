@@ -66,6 +66,33 @@ public class CursorSendEngineRecordTest {
     }
 
     @Test
+    public void testCloseWithAReservedRecordHoldingCommittedRowsKeepsTheSlot() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (QwoRecordWriter writer = new QwoRecordWriter();
+                 QwpTableBuffer tb = new QwpTableBuffer("trades")) {
+                try (CursorSendEngine engine = new CursorSendEngine(tmpDir, SEGMENT_SIZE)) {
+                    long off = engine.reserveRecordBlocking(RESERVATION);
+                    writer.open(engine.recordPayloadAddress(off), engine.reservedRecordCapacity(),
+                            QwpConstants.VERSION, 0, QwoFormat.DEFAULT_DICT_RESERVE);
+                    for (int r = 0; r < 3; r++) {
+                        appendRow(writer, tb, r);
+                    }
+                    writer.publish();
+                    Assert.assertTrue(engine.hasReservedRecord());
+                    Assert.assertEquals("an open record has no FSN yet", -1L, engine.publishedFsn());
+                }
+                // the close must not count the slot as drained and unlink it: the
+                // committed rows exist only in the open record
+                try (CursorSendEngine reopened = new CursorSendEngine(tmpDir, SEGMENT_SIZE)) {
+                    Assert.assertTrue(reopened.wasRecoveredFromDisk());
+                    Assert.assertEquals("recovery sealed the open record as the first frame", 0L, reopened.publishedFsn());
+                    Assert.assertFalse(reopened.hasReservedRecord());
+                }
+            }
+        });
+    }
+
+    @Test
     public void testRecordAccessorsDescribeTheReservation() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             try (CursorSendEngine engine = new CursorSendEngine(tmpDir, SEGMENT_SIZE)) {

@@ -221,6 +221,15 @@ public class QwpTableBuffer implements QuietCloseable {
     }
 
     /**
+     * Columns that existed when {@link #nextRow()} last committed a row. While a
+     * row is in progress, the columns at this index and above are the ones the
+     * row created.
+     */
+    public int getCommittedColumnCount() {
+        return committedColumnCount;
+    }
+
+    /**
      * Returns an existing column with the given name and type, or {@code null} if absent.
      * <p>
      * Uses the same sequential access optimization as {@link #getOrCreateColumn(CharSequence, byte, boolean)}.
@@ -633,6 +642,30 @@ public class QwpTableBuffer implements QuietCloseable {
             columns.remove(i);
         }
         rebuildColumnAccessStructures();
+    }
+
+    /**
+     * Closes and removes the columns at {@code columnCount} and above, keeping
+     * the ones before it. For a staging buffer with no row: the open-record
+     * sender calls it to drop the columns only discarded rows used, so later
+     * rows do not ship them null-padded.
+     */
+    public void truncateColumns(int columnCount) {
+        if (columns.size() <= columnCount) {
+            return;
+        }
+        for (int i = columns.size() - 1; i >= columnCount; i--) {
+            ColumnBuffer col = columns.getQuick(i);
+            if (col != null) {
+                col.close();
+            }
+            columns.remove(i);
+        }
+        rebuildColumnAccessStructures();
+        columnAccessCursor = 0;
+        inProgressColumnCount = 0;
+        committedColumnCount = columns.size();
+        savepointColumnCount = Math.min(savepointColumnCount, columnCount);
     }
 
     private static void assertColumnType(CharSequence name, byte type, ColumnBuffer column) {

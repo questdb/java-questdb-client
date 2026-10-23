@@ -795,7 +795,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * while a row is in progress. Any flush that ships the pending rows
      * empties the savepoint, so a later {@code resetToSavepoint()} discards
      * every pending row like {@link #reset()}. Pure bookkeeping: it runs no
-     * error check. Default no-op.
+     * error check. Default no-op. The WebSocket sender in delta mode marks by
+     * publishing the rows appended so far (see {@link #publishPending()}), so
+     * {@code reset()} keeps them as well.
      * <p>
      * A pooled sender ignores this call: the pool marks a savepoint when it
      * hands a slot to a borrower, and {@code resetToSavepoint()} on the pooled
@@ -813,6 +815,19 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      */
     default int pendingRowCount() {
         return 0;
+    }
+
+    /**
+     * Makes the rows appended so far recoverable in the store-and-forward ring
+     * without shipping them. The WebSocket QWP sender publishes its open record:
+     * the rows stay pending, {@link #resetToSavepoint()} and {@link #reset()} no
+     * longer discard them, and the next seal ({@link #flush()}, an auto-flush
+     * threshold, close) ships them. Every other transport, and a WebSocket sender
+     * that encodes a frame per flush, flushes. Call it between rows, not while a
+     * row is in progress.
+     */
+    default void publishPending() {
+        flush();
     }
 
     /**
@@ -865,7 +880,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * <br>
      * Supported by the HTTP, WebSocket and UDP transports; TCP does not support it. On a
      * pooled sender this discards only the rows appended through the current lease, see
-     * {@link #resetToSavepoint()}.
+     * {@link #resetToSavepoint()}. Rows the WebSocket sender has already published with
+     * {@link #publishPending()} are not discarded.
      *
      * @see #flush()
      */

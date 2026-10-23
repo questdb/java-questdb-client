@@ -26,7 +26,6 @@ package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
-import io.questdb.client.cutlass.qwp.client.BatchTooLargeForCapException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.test.QuestDBFlushOnCloseTest;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
@@ -48,8 +47,11 @@ import java.util.concurrent.TimeUnit;
  * at release ({@code checkError()}, {@code hasRowInProgress()} and
  * {@code pendingRowCount()}), the savepoint pair ({@code markSavepoint()} and
  * {@code resetToSavepoint()}) behind a lease's {@code reset()}, the deferred
- * flush of the commit window, the cap-bound byte trigger and the crossing row
- * the sender holds back when the cap rejects the auto-flushed batch.
+ * flush of the commit window and the cap-bound byte trigger. In memory mode the
+ * sender appends rows into an open record sized to the server's batch cap: a row
+ * the record cannot take seals the rows before it into a frame, and a row no
+ * record can take fails on its own {@code at()}, so no batch over the cap is ever
+ * retained.
  */
 public class SenderProbeMethodsTest {
 
@@ -70,43 +72,6 @@ public class SenderProbeMethodsTest {
                 Thread.sleep(2200);
                 sender.autoFlushIfDue();
                 Assert.assertEquals("older than the interval: shipped", 0, sender.pendingRowCount());
-                log.awaitDataFrames(1, 5_000);
-            }
-        }
-    }
-
-    @Test
-    public void testCheckErrorReportsARetainedOverCapBatchUntilReset() throws Exception {
-        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
-        try (TestWebSocketServer server = new TestWebSocketServer(log)) {
-            server.setAdvertisedMaxBatchSize(4 * 1024);
-            server.start();
-            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-            try (Sender sender = Sender.fromConfig(config(server.getPort()))) {
-                Assert.assertEquals("the cap is known once fromConfig returns", 4 * 1024, ((QwpWebSocketSender) sender).getServerMaxBatchSize());
-                String wide = QuestDBFlushOnCloseTest.wideValue(1000);
-                for (int i = 0; i < 6; i++) {
-                    sender.table("t").stringColumn("s", wide).atNow();
-                }
-                try {
-                    sender.flush();
-                    Assert.fail("six 1 KB rows do not fit a 4 KiB cap");
-                } catch (BatchTooLargeForCapException expected) {
-                    // retained for retry, as the message says
-                    Assert.assertTrue(expected.getMessage(), expected.getMessage().contains("call reset()"));
-                    Assert.assertFalse("the detail leaves out the standalone remedy", expected.getDetail().contains("reset()"));
-                    Assert.assertTrue(expected.getDetail(), expected.getDetail().endsWith("serverMaxBatchSize=4096]"));
-                }
-                try {
-                    sender.checkError();
-                    Assert.fail("the probe must report the retained batch");
-                } catch (BatchTooLargeForCapException expected) {
-                    // the pool retires a slot on this
-                }
-                sender.reset();
-                sender.checkError();                                   // cleared with the batch
-                sender.table("t").longColumn("v", 1L).atNow();
-                sender.flush();
                 log.awaitDataFrames(1, 5_000);
             }
         }
@@ -145,8 +110,8 @@ public class SenderProbeMethodsTest {
             server.setAdvertisedMaxBatchSize(4 * 1024);
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-            // transaction=on, which a commit window injects: the rows before the crossing
-            // row ship inside the open transaction, and only flush() commits it
+            // transaction=on, which a commit window injects: the rows the full record
+            // holds ship inside the open transaction, and only flush() commits it
             try (Sender sender = Sender.fromConfig(configWithoutAutoFlushBytes(server.getPort()) + "transaction=on;")) {
                 String wide = QuestDBFlushOnCloseTest.wideValue(1000);
                 for (int i = 0; i < 3; i++) {
@@ -159,7 +124,7 @@ public class SenderProbeMethodsTest {
                 Assert.assertTrue(sender.hasDeferredFrames());
                 sender.flush();
                 log.awaitDataFrames(2, 5_000);
-                Assert.assertFalse("flush() commits the transaction with the held row", log.deferFlag(1));
+                Assert.assertFalse("flush() commits the transaction with the crossing row", log.deferFlag(1));
                 Assert.assertEquals(0, log.commitFrames());
                 sender.checkError();
             }
@@ -179,128 +144,13 @@ public class SenderProbeMethodsTest {
                 for (int i = 0; i < 3; i++) {
                     sender.table("t").stringColumn("s", wide).atNow();
                 }
-                // the auto-flushed batch would be 4.5 KB, over the cap: the sender ships
-                // the three rows before the crossing row and keeps that row
+                // the 4 KiB record has no room for this 1.5 KB row: the sender seals the
+                // three rows before it into a frame and the row opens the next record
                 sender.table("t").stringColumn("s", QuestDBFlushOnCloseTest.wideValue(1500)).atNow();
                 Assert.assertEquals("only the crossing row stays buffered", 1, sender.pendingRowCount());
                 log.awaitDataFrames(1, 5_000);
                 sender.flush();
                 log.awaitDataFrames(2, 5_000);
-            }
-        }
-    }
-
-    @Test
-    public void testCrossingRowWhoseEarlierRowsStillExceedTheCapThrowsAndKeepsEveryRow() throws Exception {
-        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
-        try (TestWebSocketServer server = new TestWebSocketServer(log)) {
-            server.setAdvertisedMaxBatchSize(4 * 1024);
-            server.start();
-            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-            // auto_flush_bytes=off: only the row trigger fires, at the sixth row, when the
-            // five rows before it already exceed the cap
-            try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
-                    + ";auto_flush_bytes=off;auto_flush_rows=6;auto_flush_interval=60000;close_flush_timeout_millis=0;")) {
-                String wide = QuestDBFlushOnCloseTest.wideValue(1000);
-                for (int i = 0; i < 5; i++) {
-                    sender.table("t").stringColumn("s", wide).atNow();
-                }
-                BatchTooLargeForCapException rejection = null;
-                try {
-                    sender.table("t").stringColumn("s", wide).atNow();
-                    Assert.fail("the five rows before the crossing row still exceed the 4 KiB cap");
-                } catch (BatchTooLargeForCapException expected) {
-                    rejection = expected;
-                }
-                Assert.assertEquals("the crossing row goes back into the batch", 6, sender.pendingRowCount());
-                Thread.sleep(300);
-                Assert.assertEquals("nothing ships", 0, log.dataFrames());
-                try {
-                    sender.checkError();
-                    Assert.fail("the probe must report the retained batch");
-                } catch (BatchTooLargeForCapException expected) {
-                    Assert.assertSame("the probe reports the rejection of the whole batch", rejection, expected);
-                }
-                try {
-                    sender.flush();
-                    Assert.fail("the retained batch still exceeds the cap");
-                } catch (BatchTooLargeForCapException expected) {
-                    Assert.assertEquals("flush() encodes the same six rows", rejection.getMessage(), expected.getMessage());
-                }
-                sender.reset();
-            }
-        }
-    }
-
-    @Test
-    public void testCrossingRowWhoseOwnFrameExceedsTheCapThrowsAfterTheRowsBeforeItShip() throws Exception {
-        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
-        try (TestWebSocketServer server = new TestWebSocketServer(log)) {
-            server.setAdvertisedMaxBatchSize(4 * 1024);
-            server.start();
-            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-            // no auto_flush_bytes key: the byte trigger sits at 90% of the 4 KiB cap (3686 bytes)
-            try (Sender sender = Sender.fromConfig(configWithoutAutoFlushBytes(server.getPort()))) {
-                String wide = QuestDBFlushOnCloseTest.wideValue(1000);
-                for (int i = 0; i < 3; i++) {
-                    sender.table("t").stringColumn("s", wide).atNow();
-                }
-                // 4070 bytes pass the per-row guard, but the table name and schema take the
-                // row's own frame over the cap: the rows before it ship, and the row, alone
-                // over the byte trigger, fails its own flush
-                BatchTooLargeForCapException rejection = null;
-                try {
-                    sender.table("u").stringColumn("z", QuestDBFlushOnCloseTest.wideValue(4070)).atNow();
-                    Assert.fail("the row's own frame exceeds the 4 KiB cap");
-                } catch (BatchTooLargeForCapException expected) {
-                    rejection = expected;
-                }
-                log.awaitDataFrames(1, 5_000);
-                Assert.assertEquals("the three t rows ship as one frame with table t", 1, log.tableCount(0));
-                try {
-                    sender.checkError();
-                    Assert.fail("the probe must report the retained row");
-                } catch (BatchTooLargeForCapException expected) {
-                    Assert.assertSame(rejection, expected);
-                }
-                Assert.assertEquals("only the crossing row stays buffered", 1, sender.pendingRowCount());
-                sender.reset();
-                Assert.assertEquals(0, sender.pendingRowCount());
-                sender.checkError();
-            }
-        }
-    }
-
-    @Test
-    public void testCrossingRowWhoseOwnFrameExceedsTheCapFlushesAtOnceWithTheByteTriggerOff() throws Exception {
-        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
-        try (TestWebSocketServer server = new TestWebSocketServer(log)) {
-            server.setAdvertisedMaxBatchSize(4 * 1024);
-            server.start();
-            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-            try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
-                    + ";auto_flush_bytes=off;auto_flush_rows=4;auto_flush_interval=60000;close_flush_timeout_millis=0;")) {
-                String wide = QuestDBFlushOnCloseTest.wideValue(1000);
-                for (int i = 0; i < 3; i++) {
-                    sender.table("t").stringColumn("s", wide).atNow();
-                }
-                try {
-                    sender.table("u").stringColumn("z", QuestDBFlushOnCloseTest.wideValue(4070)).atNow();
-                    Assert.fail("the row's own frame exceeds the 4 KiB cap");
-                } catch (BatchTooLargeForCapException expected) {
-                    // the held row flushed at once and its own rejection reached this call
-                }
-                log.awaitDataFrames(1, 5_000);
-                Assert.assertEquals("only the crossing row stays buffered", 1, sender.pendingRowCount());
-                try {
-                    sender.checkError();
-                    Assert.fail("the probe must report the retained row");
-                } catch (BatchTooLargeForCapException expected) {
-                    // the pool retires a slot on this
-                }
-                sender.reset();
-                Assert.assertEquals(0, sender.pendingRowCount());
-                sender.checkError();
             }
         }
     }
@@ -430,8 +280,8 @@ public class SenderProbeMethodsTest {
                 for (int i = 0; i < 3; i++) {
                     sender.table("t").symbol("y", "a").stringColumn("s", wide).atNow();
                 }
-                // the held crossing row registers "b" before the frame of the three
-                // rows ahead of it ships
+                // the crossing row registers "b", which the full record has no room
+                // for: "b" goes into the next record's dictionary with the row
                 sender.table("t").symbol("y", "b").stringColumn("s", QuestDBFlushOnCloseTest.wideValue(1500)).atNow();
                 sender.flush();
                 sender.table("t").symbol("y", "b").atNow();
@@ -448,7 +298,33 @@ public class SenderProbeMethodsTest {
     }
 
     @Test
-    public void testResetToSavepointAfterAnOverCapFlushClearsTheProbeAndShipsTheEarlierRows() throws Exception {
+    public void testOverCapRowsShipInRecordSizedFramesAndCheckErrorStaysSilent() throws Exception {
+        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+        try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+            server.setAdvertisedMaxBatchSize(4 * 1024);
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            try (Sender sender = Sender.fromConfig(config(server.getPort()))) {
+                Assert.assertEquals("the cap is known once fromConfig returns", 4 * 1024, ((QwpWebSocketSender) sender).getServerMaxBatchSize());
+                String wide = QuestDBFlushOnCloseTest.wideValue(1000);
+                for (int i = 0; i < 6; i++) {
+                    sender.table("t").stringColumn("s", wide).atNow();
+                }
+                // six 1 KB rows do not fit one 4 KiB record: the record that filled was
+                // sealed, and flush() seals the rest
+                sender.flush();
+                Assert.assertEquals(0, sender.pendingRowCount());
+                sender.checkError();                                   // nothing is retained
+                log.awaitDataFrames(2, 5_000);
+                for (byte[] frame : log.frames()) {
+                    Assert.assertTrue("a record's frame fits the cap: " + frame.length, frame.length <= 4 * 1024);
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testResetToSavepointAfterARecordFilledInTheLeaseDropsOnlyTheUnshippedRows() throws Exception {
         QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.setAdvertisedMaxBatchSize(4 * 1024);
@@ -461,23 +337,17 @@ public class SenderProbeMethodsTest {
                 for (int i = 0; i < 6; i++) {
                     sender.table("t").stringColumn("s", wide).atNow();
                 }
-                try {
-                    sender.flush();
-                    Assert.fail("the lease's rows do not fit a 4 KiB cap");
-                } catch (BatchTooLargeForCapException expected) {
-                    // retained for retry
-                }
-                try {
-                    sender.checkError();
-                    Assert.fail("the probe must report the retained batch");
-                } catch (BatchTooLargeForCapException expected) {
-                    // the pool retires a slot on this
-                }
-                sender.resetToSavepoint();
-                sender.checkError();
-                Assert.assertEquals(1, sender.pendingRowCount());
-                sender.flush();
+                // the record that filled shipped the row before the mark with the
+                // lease rows it held, like any flush inside the lease
                 log.awaitDataFrames(1, 5_000);
+                int pending = sender.pendingRowCount();
+                Assert.assertTrue("rows after the sealed record are pending: " + pending, pending > 0 && pending < 6);
+                sender.checkError();                                   // nothing is retained
+                sender.resetToSavepoint();
+                Assert.assertEquals("the rows the seal did not ship are the lease's own and go", 0, sender.pendingRowCount());
+                sender.flush();
+                Thread.sleep(100);
+                Assert.assertEquals("nothing is left to ship", 1, log.dataFrames());
             }
         }
     }
@@ -514,28 +384,30 @@ public class SenderProbeMethodsTest {
     public void testResetToSavepointReclaimsTheSymbolIdsOfTheDroppedRows() throws Exception {
         QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
-            server.setAdvertisedMaxBatchSize(4 * 1024);
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
             try (Sender sender = Sender.fromConfig(config(server.getPort()))) {
                 sender.table("t").symbol("s", "a").atNow();
                 sender.markSavepoint();
-                String wide = QuestDBFlushOnCloseTest.wideValue(1000);
                 for (int i = 0; i < 6; i++) {
-                    sender.table("t").symbol("s", wide + i).atNow();
+                    sender.table("t").symbol("s", "dropped" + i).atNow();
                 }
-                try {
-                    sender.flush();
-                    Assert.fail("six wide symbols do not fit a 4 KiB cap");
-                } catch (BatchTooLargeForCapException expected) {
-                    // retained for retry
-                }
+                Assert.assertEquals(7, sender.pendingRowCount());
                 sender.resetToSavepoint();
+                Assert.assertEquals("the row before the mark stays", 1, sender.pendingRowCount());
                 sender.flush();
                 log.awaitDataFrames(1, 5_000);
+                // without the reclaim "b" would take id 7 and drag the dropped rows'
+                // ids 1..6 into its frame
                 sender.table("t").symbol("s", "b").atNow();
                 sender.flush();
                 log.awaitDataFrames(2, 5_000);
+                List<byte[]> frames = log.frames();
+                List<String> dict = new ArrayList<>();
+                for (byte[] frame : frames) {
+                    QwpWireTestUtils.accumulateDeltaDictionary(frame, dict, false);
+                }
+                Assert.assertEquals(Arrays.asList("a", "b"), dict);
                 sender.checkError();
             }
         }
@@ -556,33 +428,105 @@ public class SenderProbeMethodsTest {
     }
 
     @Test
-    public void testSingleRowWhoseOwnFrameExceedsTheCapThrowsAndStaysBuffered() throws Exception {
+    public void testRowOverTheFrameBoundFailsOnItsAtAfterTheRowsBeforeItShip() throws Exception {
+        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+        try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+            server.setAdvertisedMaxBatchSize(4 * 1024);
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            // no auto_flush_bytes key: the byte trigger sits at 90% of the 4 KiB cap (3686 bytes)
+            try (Sender sender = Sender.fromConfig(configWithoutAutoFlushBytes(server.getPort()))) {
+                String wide = QuestDBFlushOnCloseTest.wideValue(1000);
+                for (int i = 0; i < 3; i++) {
+                    sender.table("t").stringColumn("s", wide).atNow();
+                }
+                // 4070 bytes and the record's own overhead exceed a 4 KiB record: the
+                // sender seals the rows before it, a fresh record cannot take the row
+                // either, and the row fails on its own at()
+                assertRowTooLargeForTheFrameBound(sender, "u", "z", 4070);
+                log.awaitDataFrames(1, 5_000);
+                Assert.assertEquals("the three t rows ship as one frame with table t", 1, log.tableCount(0));
+                Assert.assertEquals("the failed row is not buffered", 0, sender.pendingRowCount());
+                sender.checkError();                                   // nothing is retained
+                sender.table("u").longColumn("v", 1L).atNow();
+                sender.flush();
+                log.awaitDataFrames(2, 5_000);
+            }
+        }
+    }
+
+    @Test
+    public void testRowOverTheFrameBoundFailsOnItsAtWithTheByteTriggerOff() throws Exception {
+        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+        try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+            server.setAdvertisedMaxBatchSize(4 * 1024);
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                    + ";auto_flush_bytes=off;auto_flush_rows=4;auto_flush_interval=60000;close_flush_timeout_millis=0;")) {
+                String wide = QuestDBFlushOnCloseTest.wideValue(1000);
+                for (int i = 0; i < 3; i++) {
+                    sender.table("t").stringColumn("s", wide).atNow();
+                }
+                // the bound is the record's, with or without a byte trigger: the fourth
+                // row neither reaches the row trigger nor stays behind
+                assertRowTooLargeForTheFrameBound(sender, "u", "z", 4070);
+                log.awaitDataFrames(1, 5_000);
+                Assert.assertEquals("the failed row is not buffered", 0, sender.pendingRowCount());
+                sender.checkError();                                   // the pool keeps the slot
+            }
+        }
+    }
+
+    @Test
+    public void testRowsOverTheCapWithTheByteTriggerOffShipInRecordSizedFrames() throws Exception {
+        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+        try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+            server.setAdvertisedMaxBatchSize(4 * 1024);
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            // auto_flush_bytes=off and a row trigger the rows never reach: only a full
+            // record seals, and it does so before the rows exceed the cap
+            try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                    + ";auto_flush_bytes=off;auto_flush_rows=6;auto_flush_interval=60000;close_flush_timeout_millis=0;")) {
+                String wide = QuestDBFlushOnCloseTest.wideValue(1000);
+                for (int i = 0; i < 6; i++) {
+                    sender.table("t").stringColumn("s", wide).atNow();
+                }
+                log.awaitDataFrames(1, 5_000);
+                int pending = sender.pendingRowCount();
+                Assert.assertTrue("the record that filled shipped, the rows after it are pending: " + pending,
+                        pending > 0 && pending < 6);
+                sender.checkError();
+                sender.flush();
+                log.awaitDataFrames(2, 5_000);
+                Assert.assertEquals(0, sender.pendingRowCount());
+                for (byte[] frame : log.frames()) {
+                    Assert.assertTrue("a record's frame fits the cap: " + frame.length, frame.length <= 4 * 1024);
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testSingleRowOverTheFrameBoundFailsOnItsAtAndLeavesNothingBuffered() throws Exception {
         QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.setAdvertisedMaxBatchSize(4 * 1024);
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
             try (Sender sender = Sender.fromConfig(configWithoutAutoFlushBytes(server.getPort()))) {
-                // the crossing row is the only pending row: no rows before it can ship,
-                // so the sender holds nothing back and the rejection reaches this call
-                BatchTooLargeForCapException rejection = null;
-                try {
-                    sender.table("u").stringColumn("z", QuestDBFlushOnCloseTest.wideValue(4070)).atNow();
-                    Assert.fail("the only pending row's own frame exceeds the 4 KiB cap");
-                } catch (BatchTooLargeForCapException expected) {
-                    rejection = expected;
-                }
-                Assert.assertEquals("the row stays buffered", 1, sender.pendingRowCount());
-                try {
-                    sender.checkError();
-                    Assert.fail("the probe must report the retained row");
-                } catch (BatchTooLargeForCapException expected) {
-                    Assert.assertSame(rejection, expected);
-                }
-                sender.reset();
+                // the only row: no record of the cap's size can hold it, so it fails
+                // on its own at() and nothing of it, its column included, stays behind
+                assertRowTooLargeForTheFrameBound(sender, "u", "z", 4070);
+                Assert.assertEquals("the row is not buffered", 0, sender.pendingRowCount());
+                Assert.assertFalse(sender.hasRowInProgress());
+                sender.checkError();                                   // nothing is retained
                 sender.table("u").longColumn("v", 1L).atNow();
                 sender.flush();
                 log.awaitDataFrames(1, 5_000);
+                Assert.assertTrue("the next row ships without the failed row's 4 KB column",
+                        log.frames().get(0).length < 200);
                 sender.checkError();
             }
         }
@@ -656,10 +600,23 @@ public class SenderProbeMethodsTest {
                 for (int i = 0; i < 20; i++) {
                     sender.table("t").stringColumn("s", value).atNow();
                 }
-                // 20 KB of rows against a 14.7 KB budget: the byte trigger shipped at least once
+                // 20 KB of rows against a 14.7 KB budget in 16 KiB records: the byte
+                // trigger or a full record shipped at least once
                 log.awaitDataFrames(1, 5_000);
                 Assert.assertTrue("rows left after the byte flush", sender.pendingRowCount() > 0 && sender.pendingRowCount() < 20);
             }
+        }
+    }
+
+    private static void assertRowTooLargeForTheFrameBound(Sender sender, String table, String column, int length) {
+        sender.table(table).stringColumn(column, QuestDBFlushOnCloseTest.wideValue(length));
+        try {
+            sender.atNow();
+            Assert.fail("a row no record can take must fail on its own at()");
+        } catch (LineSenderException expected) {
+            TestUtils.assertContains(expected.getMessage(), "row too large for the frame bound");
+            TestUtils.assertContains(expected.getMessage(), "serverMaxBatchSize=4096");
+            TestUtils.assertContains(expected.getMessage(), "http.recv.buffer.size");
         }
     }
 

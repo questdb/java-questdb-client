@@ -251,47 +251,44 @@ public class SelfSufficientFramesTest {
     }
 
     @Test
-    public void testSplitBatchShipsDeltaOnFirstFrameOnly() throws Exception {
-        // A single flush whose encoded size exceeds the server's batch cap is
-        // split into one frame per table (flushPendingRowsSplit). The FIRST split
-        // frame carries the whole batch's symbol-dict delta and advances the
-        // baseline; the remaining frames carry an EMPTY delta and only reference
-        // ids the first frame already registered. A regression that shipped each
-        // table's own symbols (wrong deltaStart) would dangle ids on the server.
+    public void testFullRecordSealsAndEachFrameShipsOnlyItsOwnNewSymbols() throws Exception {
+        // Delta mode bounds a frame by the open record it materialises, which the
+        // sender sizes to the server's batch cap: a row the record cannot take seals
+        // it and goes into the next one, so a batch over the cap never needs a split.
+        // Each frame carries only the symbols its own rows introduced, continuing the
+        // delta exactly where the previous frame stopped.
         assertMemoryLeak(() -> {
             CapturingHandler handler = new CapturingHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
-                server.setAdvertisedMaxBatchSize(150); // forces the two-table batch to split
+                server.setAdvertisedMaxBatchSize(4096);
                 int port = server.getPort();
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
-                // Padding inflates each table past half the cap, so the combined
-                // two-table message exceeds it while each single-table frame fits.
-                String pad = new String(new char[60]).replace('\0', 'x');
-                try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + port + ";")) {
-                    // Buffer TWO tables (symbols "a" id 0, "b" id 1), then ONE flush.
+                // two ~2.5 KB rows: the second does not fit the 4 KiB record the first is in
+                String pad = TestUtils.repeat("x", 2500);
+                try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + port
+                        + ";auto_flush_bytes=off;auto_flush_rows=1000000;auto_flush_interval=60000;")) {
                     sender.table("t1").symbol("s", "a").stringColumn("p", pad).longColumn("v", 1L).atNow();
                     sender.table("t2").symbol("s", "b").stringColumn("p", pad).longColumn("v", 2L).atNow();
+                    Assert.assertEquals("the second row sealed the first row's record", 1, sender.pendingRowCount());
                     sender.flush();
                     waitFor(() -> handler.batches.size() >= 2, 5_000);
                 }
 
-                Assert.assertEquals("the oversized two-table batch must split into 2 frames",
-                        2, handler.batches.size());
+                Assert.assertEquals("one frame per record", 2, handler.batches.size());
                 byte[] f1 = handler.batches.get(0);
                 byte[] f2 = handler.batches.get(1);
-
-                // First split frame ships the whole batch's dictionary (a + b).
-                Assert.assertEquals("first split frame deltaStart must be 0",
-                        0, readVarint(f1, DELTA_START_OFFSET));
-                Assert.assertEquals("first split frame ships both new symbols",
-                        2, readVarint(f1, DELTA_START_OFFSET + 1));
-                // Second split frame carries an empty delta above the advanced baseline.
-                Assert.assertEquals("second split frame deltaStart must be 2 (baseline advanced)",
-                        2, readVarint(f2, DELTA_START_OFFSET));
-                Assert.assertEquals("second split frame carries no new symbols",
-                        0, readVarint(f2, DELTA_START_OFFSET + 1));
+                Assert.assertTrue("a record's frame fits the cap", f1.length <= 4096 && f2.length <= 4096);
+                Assert.assertEquals("first frame deltaStart must be 0", 0, readVarint(f1, DELTA_START_OFFSET));
+                Assert.assertEquals("first frame ships only its own symbol", 1, readVarint(f1, DELTA_START_OFFSET + 1));
+                Assert.assertEquals("second frame continues the delta", 1, readVarint(f2, DELTA_START_OFFSET));
+                Assert.assertEquals("second frame ships only its own symbol", 1, readVarint(f2, DELTA_START_OFFSET + 1));
+                List<String> dictionary = new ArrayList<>();
+                for (byte[] frame : handler.batches) {
+                    QwpWireTestUtils.accumulateDeltaDictionary(frame, dictionary);
+                }
+                Assert.assertEquals(Arrays.asList("a", "b"), dictionary);
             }
         });
     }
@@ -381,74 +378,46 @@ public class SelfSufficientFramesTest {
     }
 
     @Test
-    public void testOversizedTableSplitStrandsNothing() throws Exception {
-        // Regression: flushPendingRowsSplit publishes each table's frame one at a
-        // time (all but the last deferred, i.e. appended but uncommitted). If a LATER
-        // table's frame exceeds the cap, the split must not have already published an
-        // earlier table's frame -- otherwise that prefix strands on the ring, a later
-        // commit delivers it as a partial batch, and resetTableBuffersAfterFlush
-        // discards every source row, all while flush() reported failure to the
-        // caller. The pre-flight size pass makes the split all-or-nothing: an
-        // oversized table throws BEFORE any frame is published. Pre-fix, the "small"
-        // table's frame was published and committed on close, so the server saw it.
+    public void testRowOverTheFrameBoundFailsAloneAndStrandsNothing() throws Exception {
+        // Delta mode enforces the frame bound on the row, at at(): a row no record of
+        // the cap's size can hold fails there, and nothing of it reaches the ring --
+        // not its values, not its symbols. The rows before it are unaffected: the
+        // record holding them is sealed while the sender tries a fresh record for the
+        // oversized row, so they ship exactly once. A retry of the same row fails the
+        // same way.
         assertMemoryLeak(() -> {
             CapturingHandler handler = new CapturingHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
-                server.setAdvertisedMaxBatchSize(200);
+                server.setAdvertisedMaxBatchSize(4096);
                 int port = server.getPort();
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
-                // auto_flush_bytes=off lets "big" accumulate PAST the cap (byte-based
-                // auto-flush is otherwise clamped to 90% of the cap and would flush
-                // first); the row/interval limits are set high so nothing auto-flushes
-                // during the test. Each row stays under the per-row guard (< cap), but
-                // 12 rows make "big"'s single frame exceed the cap, which no split can
-                // shrink. "small" (added first) fits; "big" (added second) does not, so
-                // the split hits it AFTER publishing "small" pre-fix.
-                String pad = new String(new char[40]).replace('\0', 'x');
+                String pad = TestUtils.repeat("x", 5000);
                 try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + port
                         + ";auto_flush_bytes=off;auto_flush_rows=1000000;auto_flush_interval=60000;")) {
                     sender.table("small").symbol("s", "a").longColumn("v", 1L).atNow();
-                    for (int i = 0; i < 12; i++) {
-                        sender.table("big").stringColumn("p", pad).longColumn("v", (long) i).atNow();
+                    for (int attempt = 0; attempt < 2; attempt++) {
+                        try {
+                            sender.table("big").symbol("s", "never-shipped").stringColumn("p", pad).longColumn("v", 2L).atNow();
+                            Assert.fail("a row over the frame bound must fail on its at()");
+                        } catch (LineSenderException e) {
+                            TestUtils.assertContains(e.getMessage(), "row too large for the frame bound");
+                            TestUtils.assertContains(e.getMessage(), "http.recv.buffer.size");
+                        }
+                        Assert.assertFalse(sender.hasRowInProgress());
+                        Assert.assertEquals("the failed row stays out of the record", 0, sender.pendingRowCount());
                     }
-                    try {
-                        sender.flush();
-                        Assert.fail("an oversized single-table split frame must throw");
-                    } catch (LineSenderException e) {
-                        Assert.assertTrue(e.getMessage(),
-                                e.getMessage().contains("too large for server batch cap"));
-                    }
-                    // Sender.flush() is retryable: a rejected flush must leave the
-                    // source rows intact. Repeating it under the same cap therefore
-                    // has to reject the same batch again. Before the fix, the first
-                    // failure reset every table buffer and this second flush was a
-                    // silent no-op -- the caller's rows had been lost.
-                    try {
-                        sender.flush();
-                        Assert.fail("retrying the retained oversized batch must throw again");
-                    } catch (LineSenderException e) {
-                        Assert.assertTrue(e.getMessage(),
-                                e.getMessage().contains("too large for server batch cap"));
-                    }
-                    // Explicit reset is the caller-controlled discard boundary and
-                    // prevents close() from making a third retry in this test.
-                    sender.reset();
-                    // close() drains the ring: pre-fix, the stranded "small" frame
-                    // would be sent (and committed) here.
+                    sender.flush();
+                    waitFor(() -> handler.batches.size() >= 1, 5_000);
                 }
 
-                // No DATA frame (tableCount > 0) may have reached the server: the
-                // oversized-table split published nothing. Pre-fix, "small" arrived.
-                long dataFrames = 0;
-                for (byte[] frame : handler.batches) {
-                    if (frame.length >= 8 && (((frame[6] & 0xFF) | ((frame[7] & 0xFF) << 8)) > 0)) {
-                        dataFrames++;
-                    }
-                }
-                Assert.assertEquals("an oversized-table split must publish NO data frame -- an "
-                                + "earlier table's frame must not strand on the ring", 0, dataFrames);
+                Assert.assertEquals("only the small row's frame ships", 1, handler.batches.size());
+                byte[] frame = handler.batches.get(0);
+                Assert.assertEquals(1, QwpWireTestUtils.tableCount(frame));
+                Assert.assertEquals("the failed row's symbol is not in the dictionary", 1, readVarint(frame, DELTA_START_OFFSET + 1));
+                Assert.assertFalse(containsUtf8(frame, "never-shipped"));
+                Assert.assertFalse(containsUtf8(frame, TestUtils.repeat("x", 100)));
             }
         });
     }
@@ -573,106 +542,52 @@ public class SelfSufficientFramesTest {
     }
 
     @Test
-    public void testSplitPreflightAdvancesBaselineSoLaterFramesArentSizedWithTheDelta() throws Exception {
-        // Regression for the split pre-flight baseline advance in flushPendingRowsSplit
-        // (the "Mirror advanceSentMaxSymbolId" step). Only the FIRST split frame ships
-        // the batch's symbol-dict delta; the rest ship an EMPTY delta and reference ids
-        // the first frame already registered. The pre-flight size pass must advance
-        // simBaseline after the first table so it STOPS adding combinedDeltaEntriesLen
-        // to the later frames' estimated sizes. Without that advance, a later table
-        // whose real (empty-delta) frame fits the cap is mis-estimated as still carrying
-        // the whole delta and wrongly rejected with "single table batch too large" --
-        // discarding a legitimately shippable batch (fail-closed data loss).
-        //
-        // Shape (memory mode, delta enabled): a LARGE combined delta (two ~64-char
-        // symbols) rides only the first split frame. The first table (added first, so
-        // the first split frame) has a tiny body, so delta + body1 fits the cap. The
-        // second table has a big body: body2 alone fits the cap, but delta + body2 does
-        // NOT. The real code splits and ships both frames; the un-advanced pre-flight
-        // would size the second frame WITH the delta and throw. Table order is
-        // insertion order (CharSequenceObjHashMap.keys()), so t1 is the delta frame.
+    public void testRowMovedToTheNextRecordShipsAnEmptyDeltaForSymbolsAlreadySealed() throws Exception {
+        // A row the full record cannot take goes into the next record, whose
+        // dictionary starts after every id the sealed record registered. A row that
+        // reuses one of those symbols therefore adds no entry: its frame carries an
+        // empty delta above the advanced baseline and is sized without it.
         assertMemoryLeak(() -> {
             CapturingHandler handler = new CapturingHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
-                server.setAdvertisedMaxBatchSize(200);
+                server.setAdvertisedMaxBatchSize(4096);
                 int port = server.getPort();
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
-                // Two long symbols => a large combined delta section (~130 bytes) that
-                // rides ONLY the first split frame. The symbol STRINGS live in the delta,
-                // not in either table body (the body carries only the varint global id).
-                String longSymA = new String(new char[64]).replace('\0', 'a');
-                String longSymB = new String(new char[64]).replace('\0', 'b');
-                String bigPad = new String(new char[100]).replace('\0', 'x');
-                // auto_flush off so both rows batch into one flush (byte-based auto-flush
-                // is otherwise clamped under the cap and would flush before the split).
+                String longSymA = TestUtils.repeat("a", 64);
+                String pad = TestUtils.repeat("x", 3000);
                 try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + port
                         + ";auto_flush_bytes=off;auto_flush_rows=1000000;auto_flush_interval=60000;")) {
-                    // t1 (added first -> first split frame): carries the whole delta but a
-                    // tiny body, so delta + body1 fits the 200-byte cap.
-                    sender.table("t1").symbol("s", longSymA).longColumn("v", 1L).atNow();
-                    // t2 (second split frame): empty delta but a big body. body2 alone
-                    // fits the cap; delta + body2 does NOT -- the mis-size the advance
-                    // prevents.
-                    sender.table("t2").symbol("s", longSymB).stringColumn("p", bigPad).longColumn("v", 2L).atNow();
-                    // Must NOT throw: with the baseline advanced, t2's frame is sized
-                    // WITHOUT the delta and fits. A broken advance throws "too large" here.
+                    sender.table("t1").symbol("s", longSymA).stringColumn("p", pad).longColumn("v", 1L).atNow();
+                    // the same symbol, and a body the first record has no room left for
+                    sender.table("t2").symbol("s", longSymA).stringColumn("p", pad).longColumn("v", 2L).atNow();
                     sender.flush();
                     waitFor(() -> handler.batches.size() >= 2, 5_000);
                 }
 
-                Assert.assertEquals("the batch must split into 2 frames, neither spuriously rejected",
-                        2, handler.batches.size());
+                Assert.assertEquals("one frame per record", 2, handler.batches.size());
                 byte[] f1 = handler.batches.get(0);
                 byte[] f2 = handler.batches.get(1);
-                // First split frame ships the whole delta (both new symbols, ids 0 and 1).
-                Assert.assertEquals("first split frame deltaStart must be 0",
-                        0, readVarint(f1, DELTA_START_OFFSET));
-                Assert.assertEquals("first split frame ships both new symbols",
-                        2, readVarint(f1, DELTA_START_OFFSET + 1));
-                // Second split frame carries an EMPTY delta above the advanced baseline --
-                // the whole point: it is not re-sized (or re-sent) with the delta.
-                Assert.assertEquals("second split frame deltaStart must be 2 (baseline advanced)",
-                        2, readVarint(f2, DELTA_START_OFFSET));
-                Assert.assertEquals("second split frame carries no new symbols",
-                        0, readVarint(f2, DELTA_START_OFFSET + 1));
+                Assert.assertEquals("first frame deltaStart must be 0", 0, readVarint(f1, DELTA_START_OFFSET));
+                Assert.assertEquals("first frame registers the symbol", 1, readVarint(f1, DELTA_START_OFFSET + 1));
+                Assert.assertEquals("second frame deltaStart must be 1 (baseline advanced)", 1, readVarint(f2, DELTA_START_OFFSET));
+                Assert.assertEquals("second frame carries no new symbols", 0, readVarint(f2, DELTA_START_OFFSET + 1));
             }
         });
     }
 
     @Test
     public void testFullDictFallbackGateStaysOffInDeltaMode() throws Exception {
-        // Pins the `!deltaDictEnabled` conjunct of the M1 fallback added in
-        // flushPendingRows (QwpWebSocketSender.java). The fallback's other three
-        // conjuncts -- messageSize > cap, splitFramesFit(cap, deltaBaseline) false,
-        // splitFramesFit(cap, currentBatchMaxSymbolId) true -- are ALSO satisfiable in
-        // plain delta mode, so only the explicit gate stops the fallback from firing
-        // where it must never run: publishDictionaryChunks puts dictionary-only frames
-        // on the ring BEFORE persistNewSymbolsBeforePublish's write-ahead persist runs,
-        // which is safe only in full-dict mode (no side-file, no ordering invariant to
-        // break). In delta mode it would invert the write-ahead: a crash between the
-        // dict-chunk frame and the persist would leave a frame on the ring referencing
-        // ids .symbol-dict cannot describe, quarantining the slot on recovery.
-        //
-        // Shape (memory mode, delta enabled, mirrors
-        // testSplitPreflightAdvancesBaselineSoLaterFramesArentSizedWithTheDelta): 8 new
-        // 48-char symbols (delta section 8 x 49 = 392 bytes) all registered by t1 with a
-        // tiny per-row body; t2 re-references the first symbol with a ~200-byte body. The
-        // combined frame (delta + both bodies) exceeds the 512 cap, and
-        // splitFramesFit(cap, deltaBaseline) is pessimistically false (t2's frame sized
-        // WITH the 392-byte delta overflows), which is exactly the shape that would (with
-        // the gate dropped) chunk the dictionary and then re-encode a combined frame that
-        // fits (delta collapses to empty once the baseline advances to id 7) -- publishing
-        // ONE dictionary-only frame (tableCount == 0) ahead of a single combined data
-        // frame. With the gate intact, the ordinary split runs instead: t1's frame (whole
-        // delta + tiny body) and t2's frame (empty delta + ~200-byte body) both fit 512
-        // alone, so flushPendingRowsSplit ships two DATA frames and no dictionary-only
-        // frame ever appears. The distinguishing assertion is therefore on tableCount, not
-        // just frame count: a gate-dropped fallback still produces 2 frames on this
-        // sizing, but the first one carries no table.
+        // The full-dictionary fallback of the frame path publishes dictionary-only
+        // chunk frames, which is safe only without a .symbol-dict write-ahead to
+        // order against. Delta mode must never produce one. It does not reach that
+        // path at all: every new entry lives in the dictionary region of the record
+        // whose rows use it, a region too small for the next row's symbols seals the
+        // record and the next record reserves a larger one, so every frame is a data
+        // frame and the dictionary arrives gap-free, each id once.
         assertMemoryLeak(() -> {
-            final int cap = 512;
+            final int cap = 4096;
             CapturingHandler handler = new CapturingHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
                 server.setAdvertisedMaxBatchSize(cap);
@@ -682,44 +597,33 @@ public class SelfSufficientFramesTest {
 
                 List<String> expected = new ArrayList<>();
                 String symPad = TestUtils.repeat("s", 46);
-                String rowPad = TestUtils.repeat("x", 200);
+                String rowPad = TestUtils.repeat("x", 2000);
                 try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + port
                         + ";auto_flush_bytes=off;auto_flush_rows=1000000;auto_flush_interval=60000;")) {
-                    // t1 (added first -> first split frame): registers all 8 new
-                    // 48-char symbols (ids 0..7), tiny per-row body.
+                    // 8 new 48-char symbols: more entry bytes than a 4 KiB record's
+                    // default dictionary region holds
                     for (int i = 0; i < 8; i++) {
                         String sym = String.format("%02d", i) + symPad;
                         expected.add(sym);
                         sender.table("t1").symbol("s", sym).longColumn("v", (long) i).atNow();
                     }
-                    // t2 (second split frame): re-references an existing symbol, no new
-                    // ids, but a ~200-byte body.
                     sender.table("t2").symbol("s", expected.get(0))
                             .stringColumn("p", rowPad).longColumn("v", 99L).atNow();
-                    // Must NOT throw and must NOT chunk the dictionary: the gate keeps
-                    // this batch on the ordinary (delta-carrying) split path.
                     sender.flush();
                     waitFor(() -> handler.batches.size() >= 2, 10_000);
                 }
 
-                Assert.assertEquals("the batch must split into exactly 2 frames",
-                        2, handler.batches.size());
+                Assert.assertTrue("the dictionary region filled and sealed at least once", handler.batches.size() >= 2);
+                List<String> dictionary = new ArrayList<>();
                 for (byte[] frame : handler.batches) {
                     Assert.assertTrue("every frame must be a DATA frame (tableCount > 0); a "
                                     + "tableCount == 0 frame means the dictionary was chunked "
-                                    + "in delta mode -- the fallback's delta-mode gate is off",
+                                    + "in delta mode",
                             QwpWireTestUtils.tableCount(frame) > 0);
+                    Assert.assertTrue("a record's frame fits the cap", frame.length <= cap);
+                    QwpWireTestUtils.accumulateDeltaDictionary(frame, dictionary);
                 }
-                byte[] f1 = handler.batches.get(0);
-                byte[] f2 = handler.batches.get(1);
-                Assert.assertEquals("first split frame deltaStart must be 0",
-                        0, readVarint(f1, DELTA_START_OFFSET));
-                Assert.assertEquals("first split frame ships all 8 new symbols",
-                        8, readVarint(f1, DELTA_START_OFFSET + 1));
-                Assert.assertEquals("second split frame deltaStart must be 8 (baseline advanced)",
-                        8, readVarint(f2, DELTA_START_OFFSET));
-                Assert.assertEquals("second split frame carries no new symbols",
-                        0, readVarint(f2, DELTA_START_OFFSET + 1));
+                Assert.assertEquals(expected, dictionary);
             }
         });
     }
@@ -1116,19 +1020,16 @@ public class SelfSufficientFramesTest {
 
     @Test
     public void testResetClearsTheBatchSymbolWatermarkSoDeltaModeCanFlushAgain() throws Exception {
-        // Delta mode is excluded from preRegisterDictionaryChunks (the write-ahead persist
-        // ordering forbids publishing before persistNewSymbolsBeforePublish runs), so a
-        // delta section that alone exceeds the cap still reaches the split pre-flight and
-        // throws. That rejection is documented as recoverable via reset(). It only IS
-        // recoverable if reset() also drops currentBatchMaxSymbolId: the delta spans
-        // [sentMaxSymbolId+1 .. currentBatchMaxSymbolId], so a watermark left at the
-        // discarded batch's tip makes even a single-row batch re-encode the whole
-        // abandoned range and throw identically -- a permanently unflushable sender.
+        // reset() must drop the batch symbol watermark with the rows that raised it:
+        // the next record's dictionary spans [sentMaxSymbolId+1 .. watermark], so a
+        // watermark left at the discarded rows' tip would make even a single-row
+        // record carry the whole abandoned range. reset() also reclaims the never-
+        // shipped ids, so the surviving row re-registers at id 0. (It would pass
+        // without the reclaim too, by reusing the already-registered id 0 -- see the
+        // sibling test for the case that would not.)
         assertMemoryLeak(() -> {
-            final int cap = 512;
             CapturingHandler handler = new CapturingHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
-                server.setAdvertisedMaxBatchSize(cap);
                 int port = server.getPort();
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
@@ -1136,33 +1037,16 @@ public class SelfSufficientFramesTest {
                 String symPad = TestUtils.repeat("s", 46);
                 try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + port
                         + ";auto_flush_bytes=off;auto_flush_rows=1000000;auto_flush_interval=60000;")) {
-                    // 40 x 48-byte symbols: a ~1.9 KB delta section against a 512-byte cap,
-                    // with per-row bodies far under the row guard.
+                    // 40 x 48-byte symbols, all in one open record that nothing published
                     for (int i = 0; i < 40; i++) {
                         sender.table("t").symbol("s", String.format("%02d", i) + symPad)
                                 .longColumn("v", (long) i).atNow();
                     }
-                    try {
-                        sender.flush();
-                        Assert.fail("a delta section over the cap must throw");
-                    } catch (LineSenderException e) {
-                        Assert.assertTrue(e.getMessage(),
-                                e.getMessage().contains("single table batch too large for server batch cap"));
-                        // The dictionary, not the body, is what does not fit -- so the
-                        // message must not prescribe reset()/smaller batches as the cure.
-                        Assert.assertTrue("an over-cap dictionary section must say so, and must not "
-                                        + "prescribe a remedy that cannot shrink it [msg=" + e.getMessage() + ']',
-                                e.getMessage().contains("the symbol dictionary section alone exceeds the cap"));
-                    }
-                    Assert.assertEquals("the rejection precedes every publish", 0, handler.batches.size());
-
-                    // The contract reset() is documented to honour: discard the retained
-                    // batch and KEEP the sender usable. reset() also reclaims the 40
-                    // never-shipped ids, so this row re-registers at id 0 and the next
-                    // frame's delta is one entry, trivially under cap. (It passed before
-                    // the reclaim too, by reusing the already-registered id 0 -- see the
-                    // sibling test for the case that did not.)
+                    Assert.assertEquals(40, sender.pendingRowCount());
                     sender.reset();
+                    Assert.assertEquals("reset() drops every unpublished row", 0, sender.pendingRowCount());
+                    Assert.assertEquals("nothing shipped before the reset", 0, handler.batches.size());
+
                     sender.table("t").symbol("s", "00" + symPad).longColumn("v", 0L).atNow();
                     sender.flush();
                     waitFor(() -> handler.batches.size() >= 1, 10_000);
@@ -1173,7 +1057,7 @@ public class SelfSufficientFramesTest {
                 Assert.assertEquals("the post-reset frame must re-register from id 0",
                         0, readVarint(frame, DELTA_START_OFFSET));
                 Assert.assertEquals("it carries only the one symbol the surviving row references, "
-                                + "not the discarded batch's 40",
+                                + "not the discarded rows' 40",
                         1, readVarint(frame, DELTA_START_OFFSET + 1));
             }
         });
@@ -1182,18 +1066,15 @@ public class SelfSufficientFramesTest {
     @Test
     public void testResetReclaimsUnsentSymbolIdsSoANewSymbolCanFlush() throws Exception {
         // The sibling above recovers because its post-reset row happens to reuse a
-        // symbol the discarded batch already registered. That is luck, not a
-        // contract: delta sections are anchored at sentMaxSymbolId+1, which only
-        // advances on a PUBLISH, so ids an abandoned batch registered sit forever
-        // between the watermark and the dictionary tip. A post-reset row carrying a
-        // NEW symbol lands above them all, and its section re-spans the whole
-        // abandoned range -- throwing identically, on every batch, forever. reset()
-        // now reclaims those never-shipped ids, so the new symbol starts at 0.
+        // symbol the discarded rows already registered. That is luck, not a contract:
+        // a record's dictionary starts at sentMaxSymbolId+1, which only advances at a
+        // seal, so ids discarded rows registered would sit between the watermark and
+        // the dictionary tip and a post-reset row carrying a NEW symbol would land
+        // above them all, dragging the whole abandoned range into its record. reset()
+        // reclaims those never-shipped ids, so the new symbol starts at 0.
         assertMemoryLeak(() -> {
-            final int cap = 512;
             CapturingHandler handler = new CapturingHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
-                server.setAdvertisedMaxBatchSize(cap);
                 int port = server.getPort();
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
@@ -1209,13 +1090,6 @@ public class SelfSufficientFramesTest {
                         sender.table("t").symbol("s", String.format("%02d", i) + symPad)
                                 .longColumn("v", (long) i).atNow();
                     }
-                    try {
-                        sender.flush();
-                        Assert.fail("a delta section over the cap must throw");
-                    } catch (LineSenderException e) {
-                        Assert.assertTrue(e.getMessage(),
-                                e.getMessage().contains("single table batch too large for server batch cap"));
-                    }
                     Assert.assertEquals("nothing shipped, so no id is on the wire yet",
                             0, handler.batches.size());
 
@@ -1225,7 +1099,7 @@ public class SelfSufficientFramesTest {
                             0, ws.getGlobalSymbolDictionaryForTest().size());
 
                     // A symbol none of the discarded rows used. Without the reclaim it
-                    // takes id 40 and drags [0..40] back into the section.
+                    // takes id 40 and drags [0..40] back into the record's dictionary.
                     sender.table("t").symbol("s", "brand-new" + symPad).longColumn("v", 99L).atNow();
                     sender.flush();
                     waitFor(() -> handler.batches.size() >= 1, 10_000);
@@ -1474,6 +1348,9 @@ public class SelfSufficientFramesTest {
         // escape skips sendCommitMessage, sealAndSwapBuffer AND drainOnClose --
         // abandoning every row an earlier successful flush already published. close()
         // therefore discards the retained batch, remembers the error, and runs the rest.
+        // Only the frame-per-flush path retains an over-cap batch (delta mode bounds
+        // every record by the cap), so this runs on a full-dictionary engine: its
+        // .symbol-dict cannot open.
         //
         // The observable is drainOnClose: with a server that never acks and a short
         // close budget, reaching step 3 produces a drain timeout. Remove the
@@ -1481,6 +1358,8 @@ public class SelfSufficientFramesTest {
         // because close() never gets there. Every other close() assertion in the suite
         // survives that mutation -- the sites all catch the parent LineSenderException,
         // so caught-inside and escaping are indistinguishable to them.
+        Path sfDir = temporaryFolder.newFolder("qwp-sf-retained-close").toPath();
+        String slot = sfDir.resolve("default").toString();
         assertMemoryLeak(() -> {
             NeverAckingHandler handler = new NeverAckingHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
@@ -1491,9 +1370,12 @@ public class SelfSufficientFramesTest {
 
                 String pad = new String(new char[40]).replace('\0', 'x');
                 boolean threw = false;
-                try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + port
-                        + ";auto_flush_bytes=off;auto_flush_rows=1000000;auto_flush_interval=60000"
-                        + ";close_flush_timeout_millis=250;")) {
+                CursorSendEngine engine = new CursorSendEngine(
+                        slot, 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                        CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, new UnopenableDictFacade());
+                try (QwpWebSocketSender sender = QwpWebSocketSender.connect(
+                        "localhost", port, null, 1_000_000, 0, 0L, null, false, engine, 250L)) {
+                    Assert.assertFalse("setup: the full-dictionary frame path", sender.isDeltaDictEnabledForTest());
                     // A batch that fits: published and sent, but never acked.
                     sender.table("small").symbol("s", "a").longColumn("v", 1L).atNow();
                     sender.flush();

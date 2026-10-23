@@ -37,10 +37,13 @@ import io.questdb.client.std.Decimal256;
 import io.questdb.client.std.Decimal64;
 import io.questdb.client.std.bytes.DirectByteSlice;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
+import io.questdb.client.test.tools.DelegatingFilesFacade;
+import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
 import java.lang.reflect.Field;
+import java.nio.file.Paths;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.concurrent.TimeUnit;
@@ -352,47 +355,12 @@ public class QwpWebSocketSenderTest {
 
     @Test
     public void testFlushAppendFailureDoesNotLeaveMicrobatchBufferInUse() throws Exception {
-        assertMemoryLeak(() -> {
-            try (TestWebSocketServer server = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
-            })) {
-                int port = server.getPort();
-                server.start();
-                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-
-                // Memory-only engine with the smallest viable segment budget (just
-                // enough for the header plus one minimal frame) and a 1 ns append
-                // deadline guarantees every appendBlocking() call trips the
-                // backpressure deadline and throws.
-                long minSegmentBytes = MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + 1;
-                CursorSendEngine engine = new CursorSendEngine(null, minSegmentBytes, minSegmentBytes, 1L);
-                try (QwpWebSocketSender sender = QwpWebSocketSender.connect(
-                        "localhost", port, null, Integer.MAX_VALUE, 0, 0L, null,
-                        false, engine, 0L)) {
-                    sender.table("t").longColumn("v", 1L).atNow();
-
-                    try {
-                        sender.flushAndGetSequence();
-                        Assert.fail("Expected LineSenderException");
-                    } catch (LineSenderException e) {
-                        Assert.assertTrue(e.getMessage().contains("cursor SF append failed"));
-                    }
-
-                    MicrobatchBuffer buffer0 = getMicrobatchBuffer(sender, "buffer0");
-                    MicrobatchBuffer buffer1 = getMicrobatchBuffer(sender, "buffer1");
-                    Assert.assertFalse(
-                            "failed append must not leave any buffer in use [buffer0="
-                                    + MicrobatchBuffer.stateName(buffer0.getState())
-                                    + ", buffer1=" + MicrobatchBuffer.stateName(buffer1.getState()) + "]",
-                            buffer0.isInUse() || buffer1.isInUse());
-                } catch (LineSenderException ignored) {
-                }
-                // close() drains pending rows, which appendBlocking still
-                // rejects because the engine is permanently wedged in this
-                // test. The bug under test is about microbatch buffer
-                // state, not about close() being lenient toward residual
-                // unflushed rows — swallow the predictable rethrow here.
-            }
-        });
+        String sfDir = TestUtils.createTmpDir("qdb-microbatch-append-");
+        try {
+            assertFlushAppendFailureDoesNotLeaveMicrobatchBufferInUse(Paths.get(sfDir, "default").toString());
+        } finally {
+            TestUtils.removeTmpDirRec(sfDir);
+        }
     }
 
     @Test
@@ -851,6 +819,53 @@ public class QwpWebSocketSenderTest {
         }
     }
 
+    private static void assertFlushAppendFailureDoesNotLeaveMicrobatchBufferInUse(String slot) throws Exception {
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
+            })) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                // The microbatch buffers belong to the frame-per-flush path, which only a
+                // full-dictionary engine keeps (delta mode appends rows into an open
+                // record): a slot whose .symbol-dict cannot open. The smallest viable
+                // segment budget (just enough for the header plus one minimal frame)
+                // and a 1 ns append deadline guarantee every appendBlocking() call
+                // trips the backpressure deadline and throws.
+                long minSegmentBytes = MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + 1;
+                CursorSendEngine engine = new CursorSendEngine(slot, minSegmentBytes, minSegmentBytes, 1L,
+                        new UnopenableDictFacade());
+                try (QwpWebSocketSender sender = QwpWebSocketSender.connect(
+                        "localhost", port, null, Integer.MAX_VALUE, 0, 0L, null,
+                        false, engine, 0L)) {
+                    sender.table("t").longColumn("v", 1L).atNow();
+
+                    try {
+                        sender.flushAndGetSequence();
+                        Assert.fail("Expected LineSenderException");
+                    } catch (LineSenderException e) {
+                        Assert.assertTrue(e.getMessage().contains("cursor SF append failed"));
+                    }
+
+                    MicrobatchBuffer buffer0 = getMicrobatchBuffer(sender, "buffer0");
+                    MicrobatchBuffer buffer1 = getMicrobatchBuffer(sender, "buffer1");
+                    Assert.assertFalse(
+                            "failed append must not leave any buffer in use [buffer0="
+                                    + MicrobatchBuffer.stateName(buffer0.getState())
+                                    + ", buffer1=" + MicrobatchBuffer.stateName(buffer1.getState()) + "]",
+                            buffer0.isInUse() || buffer1.isInUse());
+                } catch (LineSenderException ignored) {
+                }
+                // close() drains pending rows, which appendBlocking still
+                // rejects because the engine is permanently wedged in this
+                // test. The bug under test is about microbatch buffer
+                // state, not about close() being lenient toward residual
+                // unflushed rows — swallow the predictable rethrow here.
+            }
+        });
+    }
+
     @Test
     public void testIllegalTableNameIsEscapedInTheMessage() throws Exception {
         assertMemoryLeak(() -> {
@@ -889,4 +904,14 @@ public class QwpWebSocketSenderTest {
         return QwpWebSocketSender.createForTesting("localhost", 9000);
     }
 
+    /**
+     * Refuses to create the symbol dictionary, leaving nothing at its path, so the
+     * engine runs in full-dictionary mode.
+     */
+    private static final class UnopenableDictFacade extends DelegatingFilesFacade {
+        @Override
+        public int openCleanRW(String path) {
+            return -1;
+        }
+    }
 }
