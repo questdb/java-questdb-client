@@ -271,6 +271,39 @@ public class AckWaiterSignalTest {
         });
     }
 
+    /**
+     * A caller with a pending interrupt: parkNanos returns at once and leaves
+     * the flag set, so without consuming it the wait is a spin. Count the
+     * re-check passes through the ackedFsn read witness; a parked waiter makes
+     * a handful, a spinning one millions. The flag must be restored on return.
+     */
+    @Test
+    public void testAwaitAckedFsnDoesNotSpinWhenInterrupted() throws Exception {
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer silent = startedServer(new TestWebSocketServer.WebSocketServerHandler() {
+            })) {
+                QwpWebSocketSender sender = (QwpWebSocketSender) Sender.fromConfig(
+                        "ws::addr=localhost:" + silent.getPort() + ";close_flush_timeout_millis=0;");
+                try {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    long fsn = sender.flushAndGetSequence();
+                    AtomicLong reads = new AtomicLong();
+                    sender.setAckedFsnReadWitnessForTesting(reads::incrementAndGet);
+                    Thread.currentThread().interrupt();
+                    boolean acked = sender.awaitAckedFsn(fsn, 300);
+                    boolean flagRestored = Thread.interrupted();
+                    Assert.assertFalse(acked);
+                    Assert.assertTrue("interrupt flag must be restored on return", flagRestored);
+                    Assert.assertTrue("awaitAckedFsn re-checked " + reads.get() + " times in 300ms: it spun "
+                            + "instead of parking", reads.get() < 100L);
+                } finally {
+                    Thread.interrupted();
+                    sender.close();
+                }
+            }
+        });
+    }
+
     private static TestWebSocketServer startedServer(TestWebSocketServer.WebSocketServerHandler handler)
             throws Exception {
         TestWebSocketServer server = new TestWebSocketServer(handler);

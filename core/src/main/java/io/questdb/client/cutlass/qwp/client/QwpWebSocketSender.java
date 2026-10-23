@@ -1531,6 +1531,10 @@ public class QwpWebSocketSender implements Sender {
         // Registered before the first check: an ack that lands after a check
         // unparks us (or leaves the permit), one that landed before is seen by it.
         ackWaiters.add(me);
+        // A pending interrupt makes parkNanos return at once without clearing the
+        // flag, turning the wait into a full-core spin. Consume it, remember it,
+        // and restore it on the way out, as the close() drain does.
+        boolean interrupted = false;
         try {
             while (true) {
                 if (getAckedFsn() >= targetFsn) {
@@ -1541,10 +1545,14 @@ public class QwpWebSocketSender implements Sender {
                 if (remaining <= 0L) {
                     return false;
                 }
+                interrupted |= Thread.interrupted();
                 java.util.concurrent.locks.LockSupport.parkNanos(this, remaining);
             }
         } finally {
             ackWaiters.remove(me);
+            if (interrupted) {
+                me.interrupt();
+            }
         }
     }
 
