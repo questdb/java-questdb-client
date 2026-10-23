@@ -185,6 +185,9 @@ public class SegmentManagerAckWatermarkLagTest {
                 manager.start();
                 Thread worker = manager.getWorkerThreadForTesting();
                 Assert.assertNotNull(worker);
+                AtomicLong passes = new AtomicLong();
+                AtomicLong passesBeforeRegisterWake = new AtomicLong();
+                manager.setBeforeTrimSyncHook(passes::incrementAndGet);
                 manager.setAfterRegisterPublishHook(() -> {
                     // Persisted, then re-armed by a timed pass: only an armed worker parks untimed.
                     manager.wakeWorker();
@@ -193,16 +196,28 @@ public class SegmentManagerAckWatermarkLagTest {
                             && System.nanoTime() < deadline) {
                         LockSupport.parkNanos(1_000_000L);
                     }
+                    passesBeforeRegisterWake.set(passes.get());
                 });
                 manager.register(ring, tmpDir, watermark);
                 Assert.assertEquals("the worker did not service the entry inside register()", 9L, watermark.read());
-                Assert.assertEquals(Thread.State.WAITING, worker.getState());
+                // register() ends by waking the worker. Ack only after that pass has
+                // read the ACK and the worker has parked again: an ACK it reads would
+                // be persisted by the pass itself and mask a disarmed wake. A pass
+                // count is needed because a just-unparked thread still reports
+                // WAITING until it runs.
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                while ((passes.get() == passesBeforeRegisterWake.get() || worker.getState() != Thread.State.WAITING)
+                        && System.nanoTime() < deadline) {
+                    Thread.sleep(1);
+                }
+                Assert.assertEquals("the worker did not re-park after the register wake",
+                        Thread.State.WAITING, worker.getState());
 
                 for (int i = 0; i < 10; i++) {
                     Assert.assertTrue(ring.appendOrFsn(payload, 32) >= 0);
                 }
                 ring.acknowledge(19L);
-                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
                 while (watermark.read() != 19L && System.nanoTime() < deadline) {
                     Thread.sleep(1);
                 }
