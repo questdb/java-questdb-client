@@ -137,28 +137,25 @@ public final class QwoRecordReader {
 
     /**
      * Byte length of the {@link #dictCount()} committed entries, found by walking
-     * their varint lengths; -1 when the region lies outside the payload or the
-     * entries overrun it.
+     * their varint lengths; -1 when the region lies outside the payload, the
+     * count is negative or the entries overrun the region. Reads nothing past
+     * the region, so it is safe on untrusted memory.
      */
     public int dictEntriesLen() {
         int region = Unsafe.getUnsafe().getInt(addr + OFF_DICT_REGION);
         int cap = dictCapacity();
-        if (region < HEADER_SIZE || cap < 0 || (long) region + cap > len) {
+        int n = dictCount();
+        if (region < HEADER_SIZE || cap < 0 || (long) region + cap > len || n < 0) {
             return -1;
         }
         long start = addr + region;
         long limit = start + cap;
         long p = start;
-        for (int i = 0, n = dictCount(); i < n; i++) {
-            if (p >= limit) {
+        for (int i = 0; i < n; i++) {
+            p = boundedSkipString(p, limit);
+            if (p < 0) {
                 return -1;
             }
-            int strLen = readVarint(p);
-            long next = p + varintLength(p) + strLen;
-            if (strLen < 0 || next > limit) {
-                return -1;
-            }
-            p = next;
         }
         return (int) (p - start);
     }

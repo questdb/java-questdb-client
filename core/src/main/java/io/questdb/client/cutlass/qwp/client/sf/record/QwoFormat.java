@@ -230,6 +230,37 @@ public final class QwoFormat {
     }
 
     /**
+     * Returns the address after the {@code [varint len][bytes]} string at
+     * {@code addr}, or -1 when the varint is malformed or the string does not
+     * end at or before {@code limit}. Reads nothing at or past {@code limit}.
+     */
+    static long boundedSkipString(long addr, long limit) {
+        int n = boundedVarintLength(addr, limit);
+        if (n < 0) {
+            return -1;
+        }
+        int len = readVarint(addr);
+        if (len < 0 || len > limit - addr - n) {
+            return -1;
+        }
+        return addr + n + len;
+    }
+
+    /**
+     * Returns the encoded length, 1 to 5 bytes, of the varint at {@code addr},
+     * or -1 when none of its first 5 bytes below {@code limit} ends it. Reads
+     * nothing at or past {@code limit}.
+     */
+    static int boundedVarintLength(long addr, long limit) {
+        for (int n = 1; n <= 5 && addr + n <= limit; n++) {
+            if (Unsafe.getUnsafe().getByte(addr + n - 1) >= 0) {
+                return n;
+            }
+        }
+        return -1;
+    }
+
+    /**
      * Decodes an unsigned LEB128 varint of at most 5 bytes at {@code addr}.
      */
     static int readVarint(long addr) {
