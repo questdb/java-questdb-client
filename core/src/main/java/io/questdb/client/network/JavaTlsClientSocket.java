@@ -231,7 +231,10 @@ public final class JavaTlsClientSocket implements Socket {
                         if (output.position() != 0) {
                             return spilling ? drainUnwrapOutputBuffer(bufferPtr, bufferLen) : output.position();
                         }
-                        return 0;
+                        // The stream ended inside a record, which can now never complete:
+                        // report the disconnect. Returning 0 would read as "no data yet"
+                        // while the fd stays readable at EOF, spinning a readiness wait.
+                        return n < 0 ? n : 0;
                     case BUFFER_OVERFLOW:
                         if (output.position() != 0) {
                             // Output already has plaintext: hand it to the caller and let the
