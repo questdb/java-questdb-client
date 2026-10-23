@@ -64,8 +64,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * {@code [u32 STATE_SEALED][u32 usedBytes][usedBytes bytes]}
  * ({@link #sealReserved}); the record's own CRCs replace the frame CRC. A sealed
  * record counts as one frame. Recovery opens versions {@link #MIN_VERSION}
- * through {@link #VERSION} and seals an open record left by a crash when it
- * holds committed rows.
+ * through {@link #VERSION}. It only reports an open record left by a crash;
+ * {@link #sealRecoveredOpenRecord()} seals one that holds committed rows.
  * <p>
  * The mapping is sized at construction and never grows. When
  * {@link #tryAppend} returns -1 the caller must rotate to a fresh segment.
@@ -106,6 +106,11 @@ public final class MmapSegment implements QuietCloseable {
     // segment manager pre-creates spares before the producer knows the exact
     // baseSeq the new active will need.
     private long baseSeq;
+    // Bumped by the producer after each reserve, seal or abandon dirties bytes
+    // above publishedCursor (and by the recovery seal). syncPublished records
+    // the value it started from on success, so a later barrier knows whether
+    // anything changed since, even when publishedCursor did not move.
+    private volatile long dirtyMarks;
     // Highest published byte offset covered by a successful data barrier.
     // The manager writes this after msync+fsync; the producer reads it before
     // allowing rotation to seal the segment.
@@ -118,11 +123,22 @@ public final class MmapSegment implements QuietCloseable {
     // give one-sided fencing only — the writer is NOT synchronized on the
     // ring monitor. volatile is the cheapest correct fix.
     private volatile long frameCount;
+    // The open record openExisting found at the end of the recovered frames,
+    // as QwoValidator.validateOpen judged it. Only observed: the record is
+    // still open on disk and counted in tornTailBytes. Written by openExisting
+    // and sealRecoveredOpenRecord on the recovery path (single-threaded).
+    private boolean isRecoveredOpenRecordValid;
     private long mmapAddress;
     // publishedCursor: written by producer, read by consumer (I/O thread). Volatile
     // because the consumer must see writes in publication order — once the
     // producer bumps publishedCursor, every byte before it is fully written.
     private volatile long publishedCursor;
+    private int recoveredOpenRecordCapacity;
+    private String recoveredOpenRecordDetail;
+    // Envelope offset of the open record, -1 when openExisting found none.
+    private long recoveredOpenRecordOffset = -1L;
+    private int recoveredOpenRecordRows;
+    private int recoveredOpenRecordUsedBytes;
     // Number of failure-arm re-dirty passes performed by syncPublished.
     // Cold-path only; volatile so tests observing from another thread see it.
     private volatile long redirtyPasses;
@@ -135,12 +151,21 @@ public final class MmapSegment implements QuietCloseable {
     // committed rows although they sit above publishedCursor.
     private volatile long reservedCursor;
     // Envelope offset of the open record the producer is filling, -1 when none.
-    // Producer thread only.
-    private long reservedOffset = -1L;
+    // Written by the producer; volatile because syncPublished reads it to
+    // flush a reserved record on every barrier.
+    private volatile long reservedOffset = -1L;
     // Monotonic in-memory link to the segment that immediately follows this
     // one. SegmentRing publishes it before promoting the successor to active;
     // close deliberately retains it so a cursor can advance after head trim.
     private volatile MmapSegment successor;
+    // End of the furthest range a reserve, seal or abandon has dirtied above
+    // publishedCursor (a reservation's full extent). Monotonic; written by the
+    // producer before it bumps dirtyMarks, read by syncPublished, so the
+    // barrier still covers a seal's zeroed tail or an abandoned reservation
+    // once reservedCursor has moved back.
+    private volatile long syncHighWater;
+    // dirtyMarks as read at the start of the last successful barrier.
+    private volatile long syncedDirtyMarks;
     // Bytes between the last valid frame and the file end that look like an
     // attempted-but-invalid frame write (the suffix contains non-zero bytes).
     // Zero for fresh segments and for cleanly partially-filled
@@ -151,8 +176,10 @@ public final class MmapSegment implements QuietCloseable {
     // of real payloads. Ring recovery decides after the chain fully validates
     // whether to zero it (sanitizeTornTail on the resumed active or on a
     // proven-dead sealed suffix) or to fail closed leaving the bytes on disk
-    // for operator extraction. Final after construction.
-    private final long tornTailBytes;
+    // for operator extraction. An open record openExisting found counts as
+    // residue; sealRecoveredOpenRecord, the one recovery write, measures the
+    // tail again past the record it seals. Otherwise fixed after construction.
+    private long tornTailBytes;
     // Set once sanitizeTornTail has durably zeroed the observed residue.
     // Written and read only on the recovery path (single-threaded, before
     // the segment is published to producer/consumer threads).
@@ -170,6 +197,7 @@ public final class MmapSegment implements QuietCloseable {
         this.appendCursor = initialCursor;
         this.publishedCursor = initialCursor;
         this.reservedCursor = initialCursor;
+        this.syncHighWater = initialCursor;
         this.durableCursor = memoryBacked ? initialCursor : HEADER_SIZE;
         this.frameCount = frameCount;
         this.memoryBacked = memoryBacked;
@@ -389,13 +417,17 @@ public final class MmapSegment implements QuietCloseable {
      * partial fills (writer never attempted to write past the last valid
      * frame) do not log and report {@code 0}.
      * <p>
-     * QWO1 records are validated on the mapping once it exists. A sealed record
-     * that fails {@link QwoValidator#validateSealed} ends the recovered frames
-     * at its offset, the same as a frame with a bad CRC. An open record at the
-     * end of the frames, left by a crash before its seal, is sealed in place
-     * when it holds committed rows, and zeroed otherwise (no committed rows, or
-     * it fails {@link QwoValidator#validateOpen}). These are the only writes
-     * recovery makes to the file.
+     * QWO1 records are validated on the mapping once it exists, without
+     * writing to it. A sealed record that fails
+     * {@link QwoValidator#validateSealed} ends the recovered frames at its
+     * offset, the same as a frame with a bad CRC. An open record at the end of
+     * the frames, left by a crash before its seal, is judged by
+     * {@link QwoValidator#validateOpen} and reported
+     * ({@link #hasRecoverableOpenRecord()}, {@link #hasInvalidOpenRecord()},
+     * {@link #recoveredOpenRecordRows()}, {@link #recoveredOpenRecordDetail()}),
+     * but stays open on disk and counts as torn tail. Ring recovery calls
+     * {@link #sealRecoveredOpenRecord()} on the resumed active only; anywhere
+     * else the record is residue like any other.
      */
     public static MmapSegment openExisting(String path) {
         return openExisting(FilesFacade.INSTANCE, path);
@@ -490,7 +522,7 @@ public final class MmapSegment implements QuietCloseable {
                                 + "Investigate disk health or unexpected writer crash.",
                         path, scan.tornTailBytes, scan.lastGood, fileSize, scan.frameCount);
             }
-            return new MmapSegment(
+            MmapSegment segment = new MmapSegment(
                     ff,
                     path,
                     fd,
@@ -502,6 +534,13 @@ public final class MmapSegment implements QuietCloseable {
                     false,
                     scan.tornTailBytes
             );
+            segment.recoveredOpenRecordOffset = scan.openRecordOffset;
+            segment.recoveredOpenRecordCapacity = scan.openRecordCapacity;
+            segment.recoveredOpenRecordRows = scan.openRecordRows;
+            segment.recoveredOpenRecordUsedBytes = scan.openRecordUsedBytes;
+            segment.isRecoveredOpenRecordValid = scan.isOpenRecordValid;
+            segment.recoveredOpenRecordDetail = scan.openRecordDetail;
+            return segment;
         } catch (Throwable t) {
             if (addr != Files.FAILED_MMAP_ADDRESS) {
                 ff.munmap(addr, fileSize, MemoryTag.MMAP_DEFAULT);
@@ -515,15 +554,22 @@ public final class MmapSegment implements QuietCloseable {
      * Gives back the record reserved at {@code off}: zeroes the whole envelope
      * {@code [off, off + 8 + capacity)} and moves the append cursor back to
      * {@code off}, restoring the zero-fill invariant past the append cursor.
-     * Nothing was published, so the consumer never saw the record. Producer
-     * thread only.
+     * Nothing was published, so the consumer never saw the record, and the
+     * next {@link #syncPublished()} flushes the zeroed range. Producer thread
+     * only.
+     * <p>
+     * Abandon only a record that holds no committed rows: an earlier barrier
+     * may already have made those rows durable, and abandoning them loses
+     * them. The sender enforces this; the segment does not check it.
      *
      * @throws IllegalStateException when no record is reserved at {@code off}
      */
     public void abandonReserved(long off) {
         checkReserved(off);
-        Unsafe.getUnsafe().setMemory(mmapAddress + off, (long) FRAME_HEADER_SIZE + reservedCapacity, (byte) 0);
+        long end = off + FRAME_HEADER_SIZE + reservedCapacity;
+        Unsafe.getUnsafe().setMemory(mmapAddress + off, end - off, (byte) 0);
         appendCursor = off;
+        markDirty(end);
         reservedCursor = off;
         reservedOffset = -1L;
         reservedCapacity = 0;
@@ -632,10 +678,13 @@ public final class MmapSegment implements QuietCloseable {
      * library) never affects the barrier outcome; it only widens the
      * microseconds-scale window between the failed syscall and the re-dirty.
      * <p>
-     * The barrier also covers a reserved record up to {@code reservedCursor}:
-     * the producer commits rows inside it long before it is sealed and
-     * published. The record changes in place, so every barrier flushes all of
-     * it again while it stays reserved; the returned offset and
+     * The barrier also covers bytes above {@code publishedCursor} that the
+     * producer changed: a reserved record, whose committed rows live there
+     * long before it is sealed and published, and the full extent of a record
+     * since sealed (its zeroed tail) or abandoned. A reserved record changes in
+     * place, so every barrier flushes all of it again while it stays reserved;
+     * otherwise a barrier with nothing published and nothing changed since the
+     * last successful one returns at once. The returned offset and
      * {@link #isPublishedDurable()} still describe only the published bytes.
      *
      * @return the captured byte offset covered by the successful barrier
@@ -646,10 +695,16 @@ public final class MmapSegment implements QuietCloseable {
             durableCursor = published;
             return published;
         }
-        long end = Math.max(published, reservedCursor);
-        if (end <= durableCursor) {
+        // The producer stores the extent and the marks (markDirty) before
+        // reservedCursor and reservedOffset. Reading reservedOffset first, then
+        // the marks, then the extents means a barrier that sees a record
+        // reserved or released also sees the marks and the extent that left.
+        boolean isReserved = reservedOffset >= 0;
+        long marks = dirtyMarks;
+        if (published <= durableCursor && !isReserved && marks == syncedDirtyMarks) {
             return durableCursor;
         }
+        long end = Math.max(published, Math.max(reservedCursor, syncHighWater));
         long lockOffset = durableCursor & -Files.PAGE_SIZE;
         long lockAddr = mmapAddress + lockOffset;
         long lockLen = end - lockOffset;
@@ -670,6 +725,7 @@ public final class MmapSegment implements QuietCloseable {
             }
             durable = true;
             durableCursor = published;
+            syncedDirtyMarks = marks;
             return published;
         } finally {
             if (!durable) {
@@ -689,6 +745,19 @@ public final class MmapSegment implements QuietCloseable {
     }
 
     /**
+     * Records that the bytes up to {@code end} changed above publishedCursor:
+     * raises {@code syncHighWater}, then bumps {@code dirtyMarks}, so the next
+     * barrier covers them. Single writer (the producer, or recovery before the
+     * segment is shared).
+     */
+    private void markDirty(long end) {
+        if (end > syncHighWater) {
+            syncHighWater = end;
+        }
+        dirtyMarks = dirtyMarks + 1;
+    }
+
+    /**
      * Marks every page overlapping {@code [fromAddr, endAddr)} dirty again by
      * re-storing one word per page; kernel dirty tracking is value-blind, so
      * the store is a real dirtying event that forces the next writeback to
@@ -699,6 +768,18 @@ public final class MmapSegment implements QuietCloseable {
      * writing right now; an atomic add of zero dirties it without losing a
      * concurrent store.
      */
+    /**
+     * Seals the open record at {@code off} on the mapping: zeroes
+     * {@code [off + 8 + usedBytes, off + 8 + capacity)}, stores the length,
+     * then {@code STATE_SEALED}.
+     */
+    private void sealInPlace(long off, int capacity, int usedBytes) {
+        long payload = mmapAddress + off + FRAME_HEADER_SIZE;
+        Unsafe.getUnsafe().setMemory(payload + usedBytes, capacity - usedBytes, (byte) 0);
+        Unsafe.getUnsafe().putInt(mmapAddress + off + 4, usedBytes);
+        Unsafe.getUnsafe().putInt(mmapAddress + off, QwoFormat.STATE_SEALED);
+    }
+
     private void redirtyRange(long fromAddr, long publishedAddr, long endAddr) {
         for (long addr = fromAddr; addr < endAddr; addr += Files.PAGE_SIZE) {
             if (addr < publishedAddr) {
@@ -756,6 +837,32 @@ public final class MmapSegment implements QuietCloseable {
     }
 
     /**
+     * Why the open record {@link #openExisting} found failed
+     * {@link QwoValidator#validateOpen} (it names the block, table and column
+     * where one applies); null when there was none or it was valid.
+     */
+    public String recoveredOpenRecordDetail() {
+        return recoveredOpenRecordDetail;
+    }
+
+    /**
+     * Envelope offset of the open record {@link #openExisting} found at the end
+     * of the recovered frames; -1 when there was none or once
+     * {@link #sealRecoveredOpenRecord()} sealed it.
+     */
+    public long recoveredOpenRecordOffset() {
+        return recoveredOpenRecordOffset;
+    }
+
+    /**
+     * Committed rows in the open record {@link #openExisting} found; 0 when
+     * there was none or it failed validation.
+     */
+    public int recoveredOpenRecordRows() {
+        return recoveredOpenRecordRows;
+    }
+
+    /**
      * Reserves an open record of {@code payloadCapacity} payload bytes at the
      * append cursor: stores {@code [STATE_OPEN][payloadCapacity]} and moves the
      * append cursor past the reservation. The payload is zero (the invariant
@@ -784,9 +891,10 @@ public final class MmapSegment implements QuietCloseable {
         Unsafe.getUnsafe().putInt(mmapAddress + off, QwoFormat.STATE_OPEN);
         Unsafe.getUnsafe().putInt(mmapAddress + off + 4, payloadCapacity);
         appendCursor = off + FRAME_HEADER_SIZE + payloadCapacity;
-        reservedOffset = off;
-        reservedCapacity = payloadCapacity;
+        markDirty(appendCursor);
         reservedCursor = appendCursor;
+        reservedCapacity = payloadCapacity;
+        reservedOffset = off;
         return off;
     }
 
@@ -805,13 +913,72 @@ public final class MmapSegment implements QuietCloseable {
     }
 
     /**
+     * Seals the open record {@link #openExisting} found and judged recoverable
+     * ({@link #hasRecoverableOpenRecord()}), and is the one write recovery makes
+     * to a QWO1 record. It validates the record again, clears DEFER_COMMIT and
+     * fixes blockCount and usedBytes ({@link QwoValidator#finalizeForRecovery}),
+     * zeroes the tail past the validator's usedBytes, stores the length, then
+     * {@code STATE_SEALED}. The record then counts as a published frame, both
+     * cursors move to its end, and the torn tail is measured again past it
+     * (normally 0). The next {@link #syncPublished()} flushes it.
+     * <p>
+     * Only ring recovery calls this, and only on the segment it resumes as the
+     * active, after the chain has validated and before
+     * {@link #sanitizeTornTail()}. In any other member an open record is
+     * residue that fails closed like any torn tail.
+     *
+     * @return the record's envelope offset
+     * @throws IllegalStateException when there is no recoverable open record,
+     *                               appends have resumed, or the record changed since {@link #openExisting}
+     */
+    public long sealRecoveredOpenRecord() {
+        if (!hasRecoverableOpenRecord()) {
+            throw new IllegalStateException("no recoverable open record in " + path);
+        }
+        long off = recoveredOpenRecordOffset;
+        int capacity = recoveredOpenRecordCapacity;
+        if (appendCursor != off || reservedOffset >= 0) {
+            throw new IllegalStateException("appends resumed before the open record at offset " + off
+                    + " was sealed in " + path + " [appendCursor=" + appendCursor + ']');
+        }
+        long payload = mmapAddress + off + FRAME_HEADER_SIZE;
+        QwoValidator validator = new QwoValidator();
+        boolean isValid = validator.validateOpen(payload, capacity);
+        int rows = validator.committedRows();
+        int used = validator.usedBytes();
+        if (!isValid || rows != recoveredOpenRecordRows || used != recoveredOpenRecordUsedBytes) {
+            throw new IllegalStateException("open record at offset " + off + " in " + path
+                    + " changed since recovery [rows=" + rows + ", usedBytes=" + used
+                    + ", detail=" + validator.detail() + ']');
+        }
+        validator.finalizeForRecovery(payload);
+        sealInPlace(off, capacity, used);
+        appendCursor = off + FRAME_HEADER_SIZE + used;
+        frameCount = frameCount + 1;
+        publishedCursor = appendCursor;
+        markDirty(off + FRAME_HEADER_SIZE + capacity);
+        reservedCursor = appendCursor;
+        tornTailBytes = detectTornTail(mmapAddress, appendCursor, sizeBytes);
+        recoveredOpenRecordOffset = -1L;
+        recoveredOpenRecordCapacity = 0;
+        recoveredOpenRecordRows = 0;
+        recoveredOpenRecordUsedBytes = 0;
+        isRecoveredOpenRecordValid = false;
+        recoveredOpenRecordDetail = null;
+        LOG.info("SF segment {}: recovered {} committed rows from an open record at offset {} "
+                + "and sealed it at {} bytes", path, rows, off, used);
+        return off;
+    }
+
+    /**
      * Seals the record reserved at {@code off} at {@code usedBytes} payload
      * bytes: zeroes the unused tail {@code [off + 8 + usedBytes, off + 8 + capacity)},
      * then stores the length and, last, {@code STATE_SEALED}, so a crash at any
      * point leaves either an open record recovery can seal or a sealed one. The
      * append cursor moves back to the record's end and the record counts as a
      * frame; like a frame from {@code tryWrite}, it stays unpublished until
-     * {@code publishWritten}. Producer thread only.
+     * {@code publishWritten}. The next {@link #syncPublished()} flushes the
+     * whole former reservation, the zeroed tail included. Producer thread only.
      *
      * @throws IllegalStateException    when no record is reserved at {@code off}
      * @throws IllegalArgumentException when {@code usedBytes} is outside
@@ -823,13 +990,11 @@ public final class MmapSegment implements QuietCloseable {
             throw new IllegalArgumentException("usedBytes " + usedBytes
                     + " outside [" + QwoFormat.HEADER_SIZE + ", " + reservedCapacity + ']');
         }
-        long payload = mmapAddress + off + FRAME_HEADER_SIZE;
-        Unsafe.getUnsafe().setMemory(payload + usedBytes, reservedCapacity - usedBytes, (byte) 0);
-        Unsafe.getUnsafe().putInt(mmapAddress + off + 4, usedBytes);
-        Unsafe.getUnsafe().putInt(mmapAddress + off, QwoFormat.STATE_SEALED);
+        sealInPlace(off, reservedCapacity, usedBytes);
         appendCursor = off + FRAME_HEADER_SIZE + usedBytes;
         // Single writer, as in tryWrite; precedes the publishedCursor store.
         frameCount = frameCount + 1;
+        markDirty(off + FRAME_HEADER_SIZE + reservedCapacity);
         reservedCursor = appendCursor;
         reservedOffset = -1L;
         reservedCapacity = 0;
@@ -957,8 +1122,10 @@ public final class MmapSegment implements QuietCloseable {
      * recovery observes non-zero bytes past the bail-out point. {@code 0} for
      * fresh segments, memory-backed segments, and cleanly partially-filled
      * recovered segments. Operators / tests can read this to tell silent
-     * truncation (corruption) from a normal partial fill (no incident). This
-     * is the open-time observation and is never updated: a later
+     * truncation (corruption) from a normal partial fill (no incident). An
+     * open record left by a crash counts as residue. This is the open-time
+     * observation; only {@link #sealRecoveredOpenRecord()} measures it again,
+     * past the record it seals. A later
      * {@link #sanitizeTornTail()} zeroes the on-disk residue (after which a
      * re-open reports {@code 0}) but leaves this diagnostic intact. Sparse
      * holes read back as zeroes; an actual positioned-read failure aborts
@@ -998,6 +1165,11 @@ public final class MmapSegment implements QuietCloseable {
      * sanitization removes. A failed barrier throws and the caller fails
      * closed; the zeroes may still reach disk via the page cache, which is
      * safe: a retry either observes a clean tail or re-zeroes.
+     * <p>
+     * An open record {@link #openExisting} found is part of the residue. On
+     * the resumed active, seal a recoverable one with
+     * {@link #sealRecoveredOpenRecord()} first; otherwise this zeroes its
+     * committed rows with the rest.
      */
     public void sanitizeTornTail() {
         if (tornTailBytes == 0 || tornTailSanitized) {
@@ -1029,6 +1201,30 @@ public final class MmapSegment implements QuietCloseable {
      */
     public boolean hasUnsanitizedTornTail() {
         return tornTailBytes > 0 && !tornTailSanitized;
+    }
+
+    /**
+     * True when {@link #openExisting} found an open record at the end of the
+     * recovered frames and it failed {@link QwoValidator#validateOpen}; see
+     * {@link #recoveredOpenRecordDetail()}. The record is left on disk as torn
+     * tail. Stays true after {@link #sanitizeTornTail()} zeroes it, so the
+     * loss can still be reported.
+     */
+    public boolean hasInvalidOpenRecord() {
+        return recoveredOpenRecordOffset >= 0 && !isRecoveredOpenRecordValid;
+    }
+
+    /**
+     * True when {@link #openExisting} found a valid open record with committed
+     * rows at the end of the recovered frames and it is still on disk:
+     * {@link #sealRecoveredOpenRecord()} has not sealed it and
+     * {@link #sanitizeTornTail()} has not zeroed it.
+     */
+    public boolean hasRecoverableOpenRecord() {
+        return recoveredOpenRecordOffset >= 0
+                && isRecoveredOpenRecordValid
+                && recoveredOpenRecordRows > 0
+                && !tornTailSanitized;
     }
 
     /**
@@ -1160,21 +1356,19 @@ public final class MmapSegment implements QuietCloseable {
 
     /**
      * Validates the QWO1 records of a scanned segment on its mapping at
-     * {@code addr} and settles an open record the scan stopped at:
+     * {@code addr}, writing nothing:
      * <ul>
      *     <li>a sealed record that fails {@link QwoValidator#validateSealed}
      *     ends the recovered frames at its offset, leaving it and everything
      *     after it as a torn tail;</li>
-     *     <li>an open record at the end of the frames that passes
-     *     {@link QwoValidator#validateOpen} with committed rows is sealed in
-     *     place at the validator's usedBytes, after
-     *     {@link QwoValidator#finalizeForRecovery}, and counts as a frame;</li>
-     *     <li>an open record with no committed rows, or one that fails
-     *     validation, is zeroed in full.</li>
+     *     <li>an open record still at the end of the frames is judged by
+     *     {@link QwoValidator#validateOpen}, and the outcome is recorded in the
+     *     returned scan; the record stays outside the frames, so it counts as
+     *     torn tail. An open record behind an invalid sealed record is plain
+     *     torn tail.</li>
      * </ul>
-     * Returns the scan with the frame count, the boundary and the torn tail
-     * adjusted; the torn tail is measured again on the mapping whenever the
-     * boundary or the bytes after it changed.
+     * Returns the scan with the frame count and the boundary adjusted; the torn
+     * tail is measured again on the mapping when the boundary moved.
      */
     private static RecoveryScan validateRecordsAfterMap(String path, long addr, long fileSize, RecoveryScan scan) {
         if (!scan.sealedRecordSeen && scan.openRecordOffset < 0) {
@@ -1204,35 +1398,27 @@ public final class MmapSegment implements QuietCloseable {
                 pos += FRAME_HEADER_SIZE + len;
             }
         }
-        long off = scan.openRecordOffset;
-        if (off >= 0 && off == lastGood) {
-            int capacity = Unsafe.getUnsafe().getInt(addr + off + 4);
-            long payload = addr + off + FRAME_HEADER_SIZE;
-            boolean isValid = validator.validateOpen(payload, capacity);
-            int rows = validator.committedRows();
-            if (isValid && rows > 0) {
-                validator.finalizeForRecovery(payload);
-                int used = validator.usedBytes();
-                Unsafe.getUnsafe().setMemory(payload + used, capacity - used, (byte) 0);
-                Unsafe.getUnsafe().putInt(addr + off + 4, used);
-                Unsafe.getUnsafe().putInt(addr + off, QwoFormat.STATE_SEALED);
-                frameCount++;
-                lastGood = off + FRAME_HEADER_SIZE + used;
-                LOG.info("SF segment {}: recovered {} committed rows from an open record at offset {} "
-                        + "and sealed it at {} bytes", path, rows, off, used);
-            } else {
-                Unsafe.getUnsafe().setMemory(addr + off, (long) FRAME_HEADER_SIZE + capacity, (byte) 0);
-                if (!isValid) {
-                    String detail = validator.detail();
-                    LOG.error("SF segment {}: open record at offset {} (capacity {}) is invalid "
-                            + "and was discarded [{}]", path, off, capacity, detail);
-                }
-            }
-        }
-        long tornTailBytes = lastGood == scan.lastGood && off < 0
+        long tornTailBytes = lastGood == scan.lastGood
                 ? scan.tornTailBytes
                 : detectTornTail(addr, lastGood, fileSize);
-        return new RecoveryScan(scan.baseSeq, frameCount, lastGood, tornTailBytes, -1L, scan.sealedRecordSeen);
+        RecoveryScan result = new RecoveryScan(scan.baseSeq, frameCount, lastGood, tornTailBytes,
+                scan.openRecordOffset == lastGood ? lastGood : -1L, scan.sealedRecordSeen);
+        long off = result.openRecordOffset;
+        if (off >= 0) {
+            int capacity = Unsafe.getUnsafe().getInt(addr + off + 4);
+            boolean isValid = validator.validateOpen(addr + off + FRAME_HEADER_SIZE, capacity);
+            result.openRecordCapacity = capacity;
+            result.isOpenRecordValid = isValid;
+            result.openRecordRows = validator.committedRows();
+            result.openRecordUsedBytes = validator.usedBytes();
+            result.openRecordDetail = validator.detail();
+            if (!isValid) {
+                String detail = result.openRecordDetail;
+                LOG.error("SF segment {}: open record at offset {} (capacity {}) is invalid; "
+                        + "it is left on disk as torn tail [{}]", path, off, capacity, detail);
+            }
+        }
+        return result;
     }
 
     private static final class RecoveryReader implements QuietCloseable {
@@ -1353,6 +1539,12 @@ public final class MmapSegment implements QuietCloseable {
         private final long openRecordOffset;
         private final boolean sealedRecordSeen;
         private final long tornTailBytes;
+        // validateOpen's judgement of the open record, set after mmap.
+        private boolean isOpenRecordValid;
+        private int openRecordCapacity;
+        private String openRecordDetail;
+        private int openRecordRows;
+        private int openRecordUsedBytes;
 
         private RecoveryScan(long baseSeq, long frameCount, long lastGood, long tornTailBytes,
                              long openRecordOffset, boolean sealedRecordSeen) {

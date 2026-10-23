@@ -72,7 +72,8 @@ public class MmapSegmentRecordTest {
                 fillPattern(frame, 40, 3);
                 try (MmapSegment seg = MmapSegment.create(path, 0L, SEGMENT_SIZE)) {
                     long off = seg.reserveRecord(RESERVATION);
-                    writeRows(seg, off, writer, tb, 2, true);
+                    // the sender abandons only a record without committed rows
+                    writeRows(seg, off, writer, tb, 2, false);
                     seg.abandonReserved(off);
                     writer.abandon();
                     Assert.assertEquals(-1L, seg.reservedOffset());
@@ -90,6 +91,89 @@ public class MmapSegmentRecordTest {
                 }
             } finally {
                 Unsafe.free(frame, 40, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testBarrierCoversAnAbandonedReservation() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String path = tmpDir + "/barrier-abandon.sfa";
+            MsyncRecordingFacade ff = new MsyncRecordingFacade();
+            try (QwoRecordWriter writer = new QwoRecordWriter();
+                 QwpTableBuffer tb = new QwpTableBuffer("trades");
+                 MmapSegment seg = MmapSegment.create(ff, path, 0L, SEGMENT_SIZE)) {
+                long off = seg.reserveRecord(RESERVATION);
+                long reservedEnd = off + MmapSegment.FRAME_HEADER_SIZE + RESERVATION;
+                // the sender abandons only a record without committed rows
+                writeRows(seg, off, writer, tb, 1, false);
+                Assert.assertEquals(MmapSegment.HEADER_SIZE, seg.syncPublished());
+                Assert.assertEquals(1, ff.msyncCalls);
+                assertMsyncReaches(ff, seg, reservedEnd);
+
+                // that barrier wrote the record's bytes to disk: the zeroes replacing them must follow
+                writer.abandon();
+                seg.abandonReserved(off);
+                Assert.assertEquals(MmapSegment.HEADER_SIZE, seg.syncPublished());
+                Assert.assertEquals(2, ff.msyncCalls);
+                assertMsyncReaches(ff, seg, reservedEnd);
+                Assert.assertEquals(MmapSegment.HEADER_SIZE, seg.syncPublished());
+                Assert.assertEquals("nothing changed since the last barrier", 2, ff.msyncCalls);
+
+                // the same without a barrier while the record was reserved
+                Assert.assertEquals(off, seg.reserveRecord(RESERVATION));
+                seg.abandonReserved(off);
+                Assert.assertEquals(MmapSegment.HEADER_SIZE, seg.syncPublished());
+                Assert.assertEquals(3, ff.msyncCalls);
+                assertMsyncReaches(ff, seg, reservedEnd);
+                Assert.assertEquals(MmapSegment.HEADER_SIZE, seg.syncPublished());
+                Assert.assertEquals(3, ff.msyncCalls);
+            }
+        });
+    }
+
+    @Test
+    public void testBarrierCoversTheTailZeroedBySeal() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String path = tmpDir + "/barrier-seal.sfa";
+            MsyncRecordingFacade ff = new MsyncRecordingFacade();
+            long frame = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try (QwoRecordWriter writer = new QwoRecordWriter();
+                 QwpTableBuffer tb = new QwpTableBuffer("trades");
+                 MmapSegment seg = MmapSegment.create(ff, path, 0L, SEGMENT_SIZE)) {
+                fillPattern(frame, 16, 7);
+                long off = seg.reserveRecord(RESERVATION);
+                long reservedEnd = off + MmapSegment.FRAME_HEADER_SIZE + RESERVATION;
+                writeRows(seg, off, writer, tb, 3, true);
+                int committedUsed = writer.usedBytes();
+                // an uncommitted row in a new chunk past usedBytes, which the next barrier writes to disk
+                appendRow(writer, tb, 3);
+                Assert.assertTrue(writer.usedBytes() > committedUsed);
+                Assert.assertEquals(MmapSegment.HEADER_SIZE, seg.syncPublished());
+                Assert.assertEquals(1, ff.msyncCalls);
+                assertMsyncReaches(ff, seg, reservedEnd);
+
+                // the seal zeroes that row with the rest of the tail, and does not publish
+                int used = writer.seal(false);
+                Assert.assertEquals(committedUsed, used);
+                seg.sealReserved(off, used);
+                Assert.assertTrue(off + MmapSegment.FRAME_HEADER_SIZE + used < reservedEnd);
+                Assert.assertEquals(MmapSegment.HEADER_SIZE, seg.syncPublished());
+                Assert.assertEquals(2, ff.msyncCalls);
+                assertMsyncReaches(ff, seg, reservedEnd);
+                Assert.assertEquals(MmapSegment.HEADER_SIZE, seg.syncPublished());
+                Assert.assertEquals("nothing changed since the last barrier", 2, ff.msyncCalls);
+
+                // publishing the record (with a frame behind it) needs a barrier again
+                long frameOffset = seg.tryAppend(frame, 16);
+                Assert.assertEquals(off + MmapSegment.FRAME_HEADER_SIZE + used, frameOffset);
+                Assert.assertFalse(seg.isPublishedDurable());
+                Assert.assertEquals(seg.publishedOffset(), seg.syncPublished());
+                Assert.assertTrue(seg.isPublishedDurable());
+                Assert.assertEquals(3, ff.msyncCalls);
+                assertMsyncReaches(ff, seg, reservedEnd);
+            } finally {
+                Unsafe.free(frame, 16, MemoryTag.NATIVE_DEFAULT);
             }
         });
     }
@@ -117,14 +201,8 @@ public class MmapSegmentRecordTest {
                     Assert.assertEquals("an intact sealed record and the frame after it are recovered",
                             3L, seg.frameCount());
                     Assert.assertEquals(0L, seg.tornTailBytes());
-                    // flip a committed value byte: the row CRC no longer matches
-                    long payload = seg.payloadAddress(recordOffset);
-                    QwoRecordReader reader = new QwoRecordReader();
-                    reader.of(payload, Unsafe.getUnsafe().getInt(seg.address() + recordOffset + 4));
-                    int def = reader.columnDef(reader.firstBlock(), 0);
-                    long value = reader.chunkValuesAddr(reader.firstChunk(def), QwpConstants.TYPE_DOUBLE,
-                            reader.columnUsesBitmap(def));
-                    Unsafe.getUnsafe().putByte(value, (byte) (Unsafe.getUnsafe().getByte(value) ^ 0x40));
+                    flipCommittedValueByte(seg.payloadAddress(recordOffset),
+                            Unsafe.getUnsafe().getInt(seg.address() + recordOffset + 4));
                 }
                 try (MmapSegment seg = MmapSegment.openExisting(path)) {
                     Assert.assertEquals("recovery stops at the corrupt record", 1L, seg.frameCount());
@@ -136,6 +214,53 @@ public class MmapSegmentRecordTest {
                 }
             } finally {
                 Unsafe.free(frame, 40, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testInvalidOpenTailIsReportedNotZeroed() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String path = tmpDir + "/open-invalid.sfa";
+            long off = MmapSegment.HEADER_SIZE;
+            try (QwoRecordWriter writer = new QwoRecordWriter();
+                 QwpTableBuffer tb = new QwpTableBuffer("trades")) {
+                try (MmapSegment seg = MmapSegment.create(path, 0L, SEGMENT_SIZE)) {
+                    Assert.assertEquals(off, seg.reserveRecord(RESERVATION));
+                    writeRows(seg, off, writer, tb, 3, true);
+                    writer.abandon();
+                    // flip a committed value byte: the row CRC no longer matches
+                    flipCommittedValueByte(seg.payloadAddress(off), RESERVATION);
+                }
+            }
+            byte[] onDisk = readFile(path);
+            // openExisting only observes, so a second open sees exactly the same
+            for (int pass = 0; pass < 2; pass++) {
+                try (MmapSegment seg = MmapSegment.openExisting(path)) {
+                    Assert.assertTrue(seg.hasInvalidOpenRecord());
+                    Assert.assertFalse(seg.hasRecoverableOpenRecord());
+                    Assert.assertEquals(off, seg.recoveredOpenRecordOffset());
+                    Assert.assertEquals(0, seg.recoveredOpenRecordRows());
+                    TestUtils.assertContains(seg.recoveredOpenRecordDetail(), "block 0 (table 'trades') row crc mismatch");
+                    Assert.assertEquals(0L, seg.frameCount());
+                    Assert.assertEquals(off, seg.publishedOffset());
+                    Assert.assertEquals(SEGMENT_SIZE - off, seg.tornTailBytes());
+                    assertSealRefused(seg);
+                    assertMapping(seg.address(), onDisk);
+                }
+                Assert.assertArrayEquals(onDisk, readFile(path));
+            }
+            // ring recovery zeroes the resumed active's residue; the record stays reported
+            try (MmapSegment seg = MmapSegment.openExisting(path)) {
+                seg.sanitizeTornTail();
+                assertZero(seg.address(), off, SEGMENT_SIZE);
+                Assert.assertTrue(seg.hasInvalidOpenRecord());
+                Assert.assertNotNull(seg.recoveredOpenRecordDetail());
+            }
+            try (MmapSegment seg = MmapSegment.openExisting(path)) {
+                Assert.assertFalse(seg.hasInvalidOpenRecord());
+                Assert.assertEquals(-1L, seg.recoveredOpenRecordOffset());
+                Assert.assertEquals(0L, seg.tornTailBytes());
             }
         });
     }
@@ -205,13 +330,19 @@ public class MmapSegmentRecordTest {
                     writer.abandon();
                 }
                 try (MmapSegment seg = MmapSegment.openExisting(path)) {
-                    Assert.assertEquals(1L, seg.frameCount());
                     long off = MmapSegment.HEADER_SIZE;
+                    Assert.assertTrue(seg.hasRecoverableOpenRecord());
+                    Assert.assertEquals(2, seg.recoveredOpenRecordRows());
+                    Assert.assertEquals(0L, seg.frameCount());
+                    Assert.assertEquals(QwoFormat.STATE_OPEN, Unsafe.getUnsafe().getInt(seg.address() + off));
+
+                    Assert.assertEquals(off, seg.sealRecoveredOpenRecord());
+                    Assert.assertEquals(1L, seg.frameCount());
                     Assert.assertEquals(committedUsed, Unsafe.getUnsafe().getInt(seg.address() + off + 4));
                     assertSealed(seg, off, 2);
                     Assert.assertEquals(off + MmapSegment.FRAME_HEADER_SIZE + committedUsed, seg.publishedOffset());
                     Assert.assertEquals(0L, seg.tornTailBytes());
-                    // the uncommitted row's bytes past usedBytes are zeroed with the rest of the reservation
+                    // the uncommitted rows' bytes past usedBytes are zeroed with the rest of the reservation
                     assertZero(seg.address(), seg.publishedOffset(), SEGMENT_SIZE);
                 }
             }
@@ -222,11 +353,12 @@ public class MmapSegmentRecordTest {
     public void testOpenTailWithCommittedRowsIsSealedOnRecovery() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             String path = tmpDir + "/open-committed.sfa";
+            long off = MmapSegment.HEADER_SIZE;
             try (QwoRecordWriter writer = new QwoRecordWriter();
                  QwpTableBuffer tb = new QwpTableBuffer("trades")) {
                 int used;
                 try (MmapSegment seg = MmapSegment.create(path, 0L, SEGMENT_SIZE)) {
-                    long off = seg.reserveRecord(RESERVATION);
+                    Assert.assertEquals(off, seg.reserveRecord(RESERVATION));
                     writeRows(seg, off, writer, tb, 3, true);
                     used = writer.usedBytes();
                     // a seal(true) cut right after its flags store leaves DEFER_COMMIT behind
@@ -238,8 +370,20 @@ public class MmapSegmentRecordTest {
                     Assert.assertEquals(RESERVATION, Unsafe.getUnsafe().getInt(seg.address() + off + 4));
                     Assert.assertEquals(0L, seg.frameCount());
                 }
+                byte[] onDisk = readFile(path);
                 try (MmapSegment seg = MmapSegment.openExisting(path)) {
-                    long off = MmapSegment.HEADER_SIZE;
+                    // openExisting reports the record and leaves it open, as torn tail
+                    Assert.assertTrue(seg.hasRecoverableOpenRecord());
+                    Assert.assertFalse(seg.hasInvalidOpenRecord());
+                    Assert.assertEquals(off, seg.recoveredOpenRecordOffset());
+                    Assert.assertEquals(3, seg.recoveredOpenRecordRows());
+                    Assert.assertNull(seg.recoveredOpenRecordDetail());
+                    Assert.assertEquals(0L, seg.frameCount());
+                    Assert.assertEquals(off, seg.publishedOffset());
+                    Assert.assertEquals(SEGMENT_SIZE - off, seg.tornTailBytes());
+                    assertMapping(seg.address(), onDisk);
+
+                    Assert.assertEquals(off, seg.sealRecoveredOpenRecord());
                     Assert.assertEquals(1L, seg.frameCount());
                     Assert.assertEquals(QwoFormat.STATE_SEALED, Unsafe.getUnsafe().getInt(seg.address() + off));
                     Assert.assertEquals(used, Unsafe.getUnsafe().getInt(seg.address() + off + 4));
@@ -249,58 +393,62 @@ public class MmapSegmentRecordTest {
                     assertSealed(seg, off, 3);
                     Assert.assertEquals(off + MmapSegment.FRAME_HEADER_SIZE + used, seg.publishedOffset());
                     Assert.assertEquals(0L, seg.tornTailBytes());
+                    Assert.assertFalse(seg.hasUnsanitizedTornTail());
+                    Assert.assertFalse(seg.hasRecoverableOpenRecord());
+                    Assert.assertEquals(-1L, seg.recoveredOpenRecordOffset());
                     assertZero(seg.address(), seg.publishedOffset(), SEGMENT_SIZE);
+                    assertSealRefused(seg);
                 }
                 // the recovery seal is a fixed point: reopening changes nothing
                 try (MmapSegment seg = MmapSegment.openExisting(path)) {
                     Assert.assertEquals(1L, seg.frameCount());
-                    Assert.assertEquals(MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + used, seg.publishedOffset());
+                    Assert.assertEquals(off + MmapSegment.FRAME_HEADER_SIZE + used, seg.publishedOffset());
                     Assert.assertEquals(0L, seg.tornTailBytes());
+                    Assert.assertFalse(seg.hasRecoverableOpenRecord());
+                    Assert.assertEquals(-1L, seg.recoveredOpenRecordOffset());
                 }
             }
         });
     }
 
     @Test
-    public void testOpenTailWithoutCommittedRowsIsZeroed() throws Exception {
+    public void testOpenTailWithoutCommittedRowsIsReportedAsTornTail() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             String path = tmpDir + "/open-empty.sfa";
+            long off = MmapSegment.HEADER_SIZE;
             try (QwoRecordWriter writer = new QwoRecordWriter();
                  QwpTableBuffer tb = new QwpTableBuffer("trades")) {
                 try (MmapSegment seg = MmapSegment.create(path, 0L, SEGMENT_SIZE)) {
-                    long off = seg.reserveRecord(RESERVATION);
+                    Assert.assertEquals(off, seg.reserveRecord(RESERVATION));
                     writeRows(seg, off, writer, tb, 1, false);
                     Assert.assertTrue(writer.hasUncommittedRows());
                     Assert.assertFalse(writer.hasCommittedRows());
                     writer.abandon();
                 }
-                try (MmapSegment seg = MmapSegment.openExisting(path)) {
-                    Assert.assertEquals(0L, seg.frameCount());
-                    Assert.assertEquals(0L, seg.tornTailBytes());
-                    Assert.assertEquals(MmapSegment.HEADER_SIZE, seg.publishedOffset());
-                    Assert.assertEquals(SEGMENT_SIZE - MmapSegment.HEADER_SIZE - MmapSegment.FRAME_HEADER_SIZE,
-                            seg.capacityRemaining());
-                    assertZero(seg.address(), MmapSegment.HEADER_SIZE, SEGMENT_SIZE);
-                }
             }
+            byte[] onDisk = readFile(path);
+            try (MmapSegment seg = MmapSegment.openExisting(path)) {
+                Assert.assertEquals(0L, seg.frameCount());
+                Assert.assertFalse(seg.hasRecoverableOpenRecord());
+                Assert.assertFalse(seg.hasInvalidOpenRecord());
+                Assert.assertEquals(off, seg.recoveredOpenRecordOffset());
+                Assert.assertEquals(0, seg.recoveredOpenRecordRows());
+                Assert.assertNull(seg.recoveredOpenRecordDetail());
+                // the residue runs from the open record to the file end
+                Assert.assertEquals(SEGMENT_SIZE - off, seg.tornTailBytes());
+                Assert.assertEquals(off, seg.publishedOffset());
+                Assert.assertEquals(SEGMENT_SIZE - off - MmapSegment.FRAME_HEADER_SIZE, seg.capacityRemaining());
+                assertMapping(seg.address(), onDisk);
+                assertSealRefused(seg);
 
-            // an open record that fails validation has nothing recoverable either: it is zeroed the same way
-            String invalidPath = tmpDir + "/open-invalid.sfa";
-            try (QwoRecordWriter writer = new QwoRecordWriter();
-                 QwpTableBuffer tb = new QwpTableBuffer("trades")) {
-                try (MmapSegment seg = MmapSegment.create(invalidPath, 0L, SEGMENT_SIZE)) {
-                    long off = seg.reserveRecord(RESERVATION);
-                    writeRows(seg, off, writer, tb, 3, true);
-                    writer.abandon();
-                    long payload = seg.payloadAddress(off);
-                    Unsafe.getUnsafe().putInt(payload + QwoFormat.OFF_CAPACITY, RESERVATION - 1);
-                }
-                try (MmapSegment seg = MmapSegment.openExisting(invalidPath)) {
-                    Assert.assertEquals(0L, seg.frameCount());
-                    Assert.assertEquals(0L, seg.tornTailBytes());
-                    Assert.assertEquals(MmapSegment.HEADER_SIZE, seg.publishedOffset());
-                    assertZero(seg.address(), MmapSegment.HEADER_SIZE, SEGMENT_SIZE);
-                }
+                // ring recovery zeroes the resumed active's residue by policy
+                seg.sanitizeTornTail();
+                assertZero(seg.address(), off, SEGMENT_SIZE);
+            }
+            try (MmapSegment seg = MmapSegment.openExisting(path)) {
+                Assert.assertEquals(0L, seg.frameCount());
+                Assert.assertEquals(0L, seg.tornTailBytes());
+                Assert.assertEquals(-1L, seg.recoveredOpenRecordOffset());
             }
         });
     }
@@ -377,6 +525,44 @@ public class MmapSegmentRecordTest {
     }
 
     @Test
+    public void testSealRecoveredOpenRecordWithoutOneThrows() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String path = tmpDir + "/no-open.sfa";
+            String openPath = tmpDir + "/open-recoverable.sfa";
+            long frame = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try (QwoRecordWriter writer = new QwoRecordWriter();
+                 QwpTableBuffer tb = new QwpTableBuffer("trades")) {
+                fillPattern(frame, 16, 2);
+                try (MmapSegment seg = MmapSegment.create(path, 0L, SEGMENT_SIZE)) {
+                    Assert.assertEquals(-1L, seg.recoveredOpenRecordOffset());
+                    assertSealRefused(seg);
+                    Assert.assertEquals(MmapSegment.HEADER_SIZE, seg.tryAppend(frame, 16));
+                }
+                try (MmapSegment seg = MmapSegment.openExisting(path)) {
+                    Assert.assertFalse(seg.hasRecoverableOpenRecord());
+                    assertSealRefused(seg);
+                    Assert.assertEquals(1L, seg.frameCount());
+                }
+
+                try (MmapSegment seg = MmapSegment.create(openPath, 0L, SEGMENT_SIZE)) {
+                    long off = seg.reserveRecord(RESERVATION);
+                    writeRows(seg, off, writer, tb, 2, true);
+                    writer.abandon();
+                }
+                // sanitizing the tail zeroes the record, which is then no longer recoverable
+                try (MmapSegment seg = MmapSegment.openExisting(openPath)) {
+                    Assert.assertTrue(seg.hasRecoverableOpenRecord());
+                    seg.sanitizeTornTail();
+                    Assert.assertFalse(seg.hasRecoverableOpenRecord());
+                    assertSealRefused(seg);
+                }
+            } finally {
+                Unsafe.free(frame, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
     public void testSyncPublishedCoversReservation() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             String path = tmpDir + "/sync.sfa";
@@ -390,21 +576,19 @@ public class MmapSegmentRecordTest {
 
                 Assert.assertEquals(MmapSegment.HEADER_SIZE, seg.syncPublished());
                 Assert.assertEquals(1, ff.msyncCalls);
-                Assert.assertEquals(seg.address(), ff.lastMsyncAddr);
-                Assert.assertTrue("msync must reach the end of the reservation",
-                        ff.lastMsyncAddr + ff.lastMsyncLen >= seg.address() + reservedEnd);
+                assertMsyncReaches(ff, seg, reservedEnd);
 
-                // the open record keeps changing in place, so every barrier covers it again
                 appendRow(writer, tb, 2);
                 writer.publish();
-                seg.syncPublished();
-                Assert.assertEquals(2, ff.msyncCalls);
-                Assert.assertTrue(ff.lastMsyncAddr + ff.lastMsyncLen >= seg.address() + reservedEnd);
-
-                writer.abandon();
-                seg.abandonReserved(off);
                 Assert.assertEquals(MmapSegment.HEADER_SIZE, seg.syncPublished());
-                Assert.assertEquals("nothing reserved or published: the barrier is a no-op", 2, ff.msyncCalls);
+                Assert.assertEquals(2, ff.msyncCalls);
+                assertMsyncReaches(ff, seg, reservedEnd);
+
+                // the open record changes in place, so every barrier covers it again while it is reserved
+                Assert.assertEquals(MmapSegment.HEADER_SIZE, seg.syncPublished());
+                Assert.assertEquals(3, ff.msyncCalls);
+                assertMsyncReaches(ff, seg, reservedEnd);
+                Assert.assertTrue(seg.isPublishedDurable());
             }
         });
     }
@@ -445,6 +629,28 @@ public class MmapSegmentRecordTest {
         tb.clearStagedRow();
     }
 
+    private static void assertMapping(long base, byte[] expected) {
+        for (int p = 0; p < expected.length; p++) {
+            if (Unsafe.getUnsafe().getByte(base + p) != expected[p]) {
+                Assert.fail("mapping differs from the file at offset " + p);
+            }
+        }
+    }
+
+    private static void assertMsyncReaches(MsyncRecordingFacade ff, MmapSegment seg, long end) {
+        Assert.assertEquals(seg.address(), ff.lastMsyncAddr);
+        Assert.assertTrue("msync ends at " + ff.lastMsyncLen + ", below " + end, ff.lastMsyncLen >= end);
+    }
+
+    private static void assertSealRefused(MmapSegment seg) {
+        try {
+            seg.sealRecoveredOpenRecord();
+            Assert.fail("there is no recoverable open record to seal");
+        } catch (IllegalStateException expected) {
+            TestUtils.assertContains(expected.getMessage(), "no recoverable open record");
+        }
+    }
+
     private static void assertSealed(MmapSegment seg, long off, int rows) {
         Assert.assertEquals(QwoFormat.STATE_SEALED, Unsafe.getUnsafe().getInt(seg.address() + off));
         int len = Unsafe.getUnsafe().getInt(seg.address() + off + 4);
@@ -468,11 +674,28 @@ public class MmapSegmentRecordTest {
         }
     }
 
+    /**
+     * Flips a byte of the first committed value of the record's first column,
+     * so the row CRC no longer matches.
+     */
+    private static void flipCommittedValueByte(long payload, int len) {
+        QwoRecordReader reader = new QwoRecordReader();
+        reader.of(payload, len);
+        int def = reader.columnDef(reader.firstBlock(), 0);
+        long value = reader.chunkValuesAddr(reader.firstChunk(def), QwpConstants.TYPE_DOUBLE,
+                reader.columnUsesBitmap(def));
+        Unsafe.getUnsafe().putByte(value, (byte) (Unsafe.getUnsafe().getByte(value) ^ 0x40));
+    }
+
     private static void patchVersion(String path, int version) throws Exception {
         try (RandomAccessFile file = new RandomAccessFile(path, "rw")) {
             file.seek(4L);
             file.writeByte(version);
         }
+    }
+
+    private static byte[] readFile(String path) throws Exception {
+        return java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(path));
     }
 
     /**
