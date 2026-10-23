@@ -1790,6 +1790,30 @@ public class QwpTableBufferTest {
         });
     }
 
+    @Test
+    public void testTruncateColumnsNeedsAStagingBufferWithoutARow() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, true).addLong(1L);
+                table.getOrCreateColumn("b", QwpConstants.TYPE_LONG, true).addLong(2L);
+                table.nextRow();
+                boolean isRefused = false;
+                try {
+                    table.truncateColumns(1);
+                } catch (AssertionError expected) {
+                    isRefused = true;
+                    assertTrue(expected.getMessage(), expected.getMessage().contains("no row"));
+                }
+                assertTrue("a buffer holding a row must not lose columns under it", isRefused);
+                assertEquals(2, table.getColumnCount());
+                table.clearStagedRow();
+                table.truncateColumns(1);
+                assertEquals(1, table.getColumnCount());
+                assertEquals("a", table.getColumn(0).getName());
+            }
+        });
+    }
+
     private static void addSymbolUtf8(QwpTableBuffer.ColumnBuffer col, String value) {
         byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
         long ptr = copyToNative(bytes);

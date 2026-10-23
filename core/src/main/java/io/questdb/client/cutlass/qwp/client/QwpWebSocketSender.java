@@ -479,6 +479,12 @@ public class QwpWebSocketSender implements Sender {
     private long recordOffset = -1L;
     // When the open record was reserved (System.nanoTime()).
     private long recordOpenedAtNanos;
+    // Records opened over the sender's life, for tests.
+    private int recordOpens;
+    // Terminal latch: the engine refused to seal a record the writer had already
+    // sealed (see sealRecord). checkConnectionError() reports it on every later
+    // call; close() does not consult it, so it still drains what shipped.
+    private LineSenderException recordSealFailure;
     private long pendingBytes;
     // Set true by close() once the SF slot flock has been released (the normal
     // teardown path). Stays false if an I/O or manager worker did not stop and
@@ -1727,8 +1733,7 @@ public class QwpWebSocketSender implements Sender {
     public void cancelRow() {
         checkNotClosed();
         if (currentTableBuffer != null) {
-            currentTableBuffer.cancelCurrentRow();
-            currentTableBuffer.rollbackUncommittedColumns();
+            rollbackRow();
             if (useOpenRecord()) {
                 // The row never reached the record: hand the symbol ids it minted back.
                 reclaimSymbolIdsAboveRecord();
@@ -3387,6 +3392,24 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Records opened over the sender's life, the retries of a refused row
+     * included.
+     */
+    @TestOnly
+    public int recordOpensForTest() {
+        return recordOpens;
+    }
+
+    /**
+     * Payload bytes in use in the open record, header and dictionary reserve
+     * included; 0 while no record is open.
+     */
+    @TestOnly
+    public int recordUsedBytesForTest() {
+        return recordOffset >= 0 ? record.usedBytes() : 0;
+    }
+
+    /**
      * Test seam: installs the per-attempt WebSocket client factory override
      * consulted by {@code newWebSocketClient()} inside the connect walk.
      * Production code never sets it.
@@ -3754,6 +3777,16 @@ public class QwpWebSocketSender implements Sender {
     public void setLoopStartFaultForTesting(Runnable fault) {
         this.loopStartFault = fault;
     }
+
+    /**
+     * Lowers the open record's row limit per block (production:
+     * {@link QwoFormat#MAX_ROWS_PER_BLOCK}), so a test reaches it with few rows.
+     */
+    @TestOnly
+    public void setMaxRowsPerBlockForTest(int maxRowsPerBlock) {
+        record.setMaxRowsPerBlockForTest(maxRowsPerBlock);
+    }
+
 
     @TestOnly
     public void setRecycleDeferredCloseMaxWaitMillisForTesting(long millis) {
@@ -4853,6 +4886,10 @@ public class QwpWebSocketSender implements Sender {
             // that originally recorded the failure.
             error.fillInStackTrace();
             throw error;
+        }
+        LineSenderException sealFailure = recordSealFailure;
+        if (sealFailure != null) {
+            throw new LineSenderException(sealFailure).put("sender is terminal: an open record failed to seal");
         }
         // Poll the cursor I/O loop's terminalError too. Without this, a fatal
         // wire / server-rejection error recorded by the I/O thread would
@@ -6872,11 +6909,16 @@ public class QwpWebSocketSender implements Sender {
      * Appends the row {@code nextRow()} just committed in the staging buffer to
      * the open record, opening one when none is, and empties the staging buffer.
      * When the record cannot take the row, this seals it (abandons it when it
-     * holds no row) and retries the row once in a fresh record whose dictionary
-     * reserve covers the row's new symbols; a row the fresh record cannot take
-     * either fails with the row-too-large error. On any failure the row leaves
-     * the staging buffer with the columns it created and the symbol ids it
-     * minted, so the record and the next row see none of it.
+     * holds no row) and retries the row in a fresh record whose dictionary
+     * reserve covers the row's new symbols. A fresh record takes only the room
+     * left in the active segment, so when it refuses the row too while smaller
+     * than the frame bound, it is given back and the row gets a last try in a
+     * record of the whole frame bound, in a fresh segment when the room left is
+     * smaller. A row that a record of the whole frame bound cannot take fails
+     * with the row-too-large error, or the oversize-symbol error when one of its
+     * new symbols alone is larger than any dictionary region. On any failure the
+     * row leaves the staging buffer with the columns it created and the symbol
+     * ids it minted, so the record and the next row see none of it.
      *
      * @param columnsBeforeRow the staging buffer's column count before the row
      * @param rowBytes         the staged row's buffered bytes, for the error message
@@ -6885,18 +6927,18 @@ public class QwpWebSocketSender implements Sender {
         final QwpTableBuffer staged = currentTableBuffer;
         try {
             if (recordOffset < 0) {
-                openRecord();
+                openRecord(false);
             }
             if (record.appendStagedRow(staged, globalSymbolDictionary, currentBatchMaxSymbolId) == QwoRecordWriter.APPEND_NO_SPACE) {
-                nextDictReserve = retryDictReserve(rowBytes);
-                if (record.rowCount() > 0) {
-                    sealRecord(transactional);
-                } else {
-                    abandonRecord();
-                }
-                openRecord();
+                reopenRecordForRefusedRow(rowBytes, false);
                 if (record.appendStagedRow(staged, globalSymbolDictionary, currentBatchMaxSymbolId) == QwoRecordWriter.APPEND_NO_SPACE) {
-                    throw rowTooLargeForFrameBound(rowBytes);
+                    if (record.capacity() >= recordCapacityHint()) {
+                        throw refusedRowError(rowBytes);
+                    }
+                    reopenRecordForRefusedRow(rowBytes, true);
+                    if (record.appendStagedRow(staged, globalSymbolDictionary, currentBatchMaxSymbolId) == QwoRecordWriter.APPEND_NO_SPACE) {
+                        throw refusedRowError(rowBytes);
+                    }
                 }
             }
         } catch (Throwable t) {
@@ -7049,11 +7091,18 @@ public class QwpWebSocketSender implements Sender {
     /**
      * Reserves a record in the cursor ring, blocking like a frame append while
      * the ring is backpressured, and opens it with its dictionary continuing
-     * after {@code sentMaxSymbolId}. The dictionary reserve is the default, a
-     * thirty-second of the record and at most {@link QwoFormat#DEFAULT_DICT_RESERVE},
-     * or the larger {@link #nextDictReserve} a refused row asked for.
+     * after {@code sentMaxSymbolId}. The record takes the frame bound or the
+     * room left in the active segment, whichever is smaller; with
+     * {@code isFullCapacity} it takes the whole frame bound, and the ring
+     * rotates to a fresh segment when the room left is smaller. The dictionary
+     * reserve is the default, a thirty-second of the record and at most
+     * {@link QwoFormat#DEFAULT_DICT_RESERVE}, or the larger
+     * {@link #nextDictReserve} a refused row asked for. A reservation failure
+     * reports the I/O loop's terminal error when the loop has died, as a frame
+     * append does, and any other failure wrapped in a
+     * {@link LineSenderException}.
      */
-    private void openRecord() {
+    private void openRecord(boolean isFullCapacity) {
         int capacityHint = recordCapacityHint();
         if (capacityHint < QwoFormat.HEADER_SIZE) {
             throw new LineSenderException("frame bound below the record header: frameBound=").put(capacityHint)
@@ -7062,7 +7111,19 @@ public class QwpWebSocketSender implements Sender {
                     .put(", segmentPayloadCapacity=").put(cursorEngine.segmentPayloadCapacity())
                     .put("; raise http.recv.buffer.size on the server or sf_max_segment_bytes on the client");
         }
-        long offset = cursorEngine.reserveRecordBlocking(capacityHint);
+        long offset;
+        try {
+            offset = isFullCapacity
+                    ? cursorEngine.reserveRecordBlocking(capacityHint, capacityHint)
+                    : cursorEngine.reserveRecordBlocking(capacityHint);
+        } catch (Throwable t) {
+            // A dead I/O loop leaves the ring full, so its terminal error, not the
+            // backpressure deadline, is the cause to report (as in sealAndSwapBuffer).
+            if (cursorSendLoop != null) {
+                cursorSendLoop.checkError();
+            }
+            throw new LineSenderException("cursor SF record reservation failed", t);
+        }
         int capacity = cursorEngine.reservedRecordCapacity();
         int dictReserve = Math.min(capacity - QwoFormat.HEADER_SIZE,
                 Math.max(Math.min(QwoFormat.DEFAULT_DICT_RESERVE, capacity / 32), nextDictReserve));
@@ -7075,6 +7136,7 @@ public class QwpWebSocketSender implements Sender {
         }
         recordOffset = offset;
         recordOpenedAtNanos = System.nanoTime();
+        recordOpens++;
         nextDictReserve = 0;
     }
 
@@ -7413,6 +7475,48 @@ public class QwpWebSocketSender implements Sender {
                 Math.min(Integer.MAX_VALUE, cursorEngine.segmentPayloadCapacity()));
     }
 
+    /**
+     * The failure of a row that a record of the whole frame bound refused: the
+     * oversize-symbol error when the dictionary region refused it and one of
+     * the row's new symbols alone is larger than the biggest dictionary reserve
+     * such a record can have (all of it after the header), the row-too-large
+     * error otherwise.
+     */
+    private LineSenderException refusedRowError(long rowBytes) {
+        if (record.lastRefusedDictBytes() > 0) {
+            int largestSymbolBytes = 0;
+            for (int id = record.dictEndId() + 1; id <= currentBatchMaxSymbolId; id++) {
+                largestSymbolBytes = Math.max(largestSymbolBytes, QwoFormat.stringBytes(globalSymbolDictionary.getSymbol(id)));
+            }
+            if (largestSymbolBytes > record.capacity() - QwoFormat.HEADER_SIZE) {
+                return new LineSenderException("a single symbol value is too large for the frame bound;"
+                        + " use a varchar column or shorten it [symbolBytes=").put(largestSymbolBytes)
+                        .put(", frameBound=").put(record.capacity()).put(']');
+            }
+        }
+        return new LineSenderException("row too large for the frame bound: rowBytes=").put(rowBytes)
+                .put(", frameBound=").put(record.capacity())
+                .put(", serverMaxBatchSize=").put(serverMaxBatchSize)
+                .put(", segmentPayloadCapacity=").put(cursorEngine.segmentPayloadCapacity())
+                .put("; raise http.recv.buffer.size on the server or sf_max_segment_bytes on the client");
+    }
+
+    /**
+     * Closes the record that refused the staged row, sealing it when it holds
+     * rows and giving it back otherwise, and opens the next one, with the
+     * dictionary reserve the row needs and, when {@code isFullCapacity}, the
+     * whole frame bound.
+     */
+    private void reopenRecordForRefusedRow(long rowBytes, boolean isFullCapacity) {
+        nextDictReserve = retryDictReserve(rowBytes);
+        if (record.rowCount() > 0) {
+            sealRecord(transactional);
+        } else {
+            abandonRecord();
+        }
+        openRecord(isFullCapacity);
+    }
+
     private void resetSymbolDictStateForNewConnection() {
         // Runs on the foreground connect only -- NOT on the I/O thread's
         // reconnect/failover path. sentMaxSymbolId is deliberately left
@@ -7604,10 +7708,7 @@ public class QwpWebSocketSender implements Sender {
      * other columns go, so later rows do not ship them null-padded.
      */
     private void rollbackRecordToPublished() {
-        if (currentTableBuffer != null) {
-            currentTableBuffer.cancelCurrentRow();
-            currentTableBuffer.rollbackUncommittedColumns();
-        }
+        rollbackRow();
         boolean isOpen = recordOffset >= 0;
         if (isOpen) {
             record.rollback();
@@ -7638,19 +7739,25 @@ public class QwpWebSocketSender implements Sender {
         retainedBatchRejection = null;
     }
 
+    /**
+     * Drops the row in progress from the current table buffer, with the columns
+     * it created. In delta mode the buffer is a staging buffer holding no
+     * committed row, and it is emptied as after an appended row
+     * ({@link QwpTableBuffer#clearStagedRow()}): every column keeps its GEOHASH
+     * precision and DECIMAL scale, so a cancelled row cannot let a later value
+     * move the table into a block with another precision or scale. A buffer of
+     * the frame-per-flush path goes back to its committed rows.
+     */
     private void rollbackRow() {
-        if (currentTableBuffer != null) {
-            currentTableBuffer.cancelCurrentRow();
-            currentTableBuffer.rollbackUncommittedColumns();
+        QwpTableBuffer buf = currentTableBuffer;
+        if (buf != null) {
+            if (useOpenRecord()) {
+                buf.clearStagedRow();
+            } else {
+                buf.cancelCurrentRow();
+            }
+            buf.rollbackUncommittedColumns();
         }
-    }
-
-    private LineSenderException rowTooLargeForFrameBound(long rowBytes) {
-        return new LineSenderException("row too large for the frame bound: rowBytes=").put(rowBytes)
-                .put(", frameBound=").put(record.capacity())
-                .put(", serverMaxBatchSize=").put(serverMaxBatchSize)
-                .put(", segmentPayloadCapacity=").put(cursorEngine.segmentPayloadCapacity())
-                .put("; raise http.recv.buffer.size on the server or sf_max_segment_bytes on the client");
     }
 
     /**
@@ -7737,14 +7844,26 @@ public class QwpWebSocketSender implements Sender {
     /**
      * Publishes the open record's unpublished rows, then seals it into a frame:
      * the ring assigns its FSN and the I/O thread materialises and sends it. The
-     * record's dictionary entries become the new delta baseline.
+     * record's dictionary entries become the new delta baseline. When the engine
+     * refuses the seal, the writer is already closed and the ring's state is not
+     * known, so the failure latches the sender terminal ({@link #recordSealFailure})
+     * and no record stays open: every later call reports it and
+     * {@link #close()} still drains what shipped.
      */
     private void sealRecord(boolean deferCommit) {
         if (record.hasUncommittedRows()) {
             record.publish();
         }
         int usedBytes = record.seal(deferCommit);
-        long fsn = cursorEngine.sealRecord(recordOffset, usedBytes);
+        long fsn;
+        try {
+            fsn = cursorEngine.sealRecord(recordOffset, usedBytes);
+        } catch (Throwable t) {
+            recordOffset = -1L;
+            LineSenderException failure = new LineSenderException("cursor SF record seal failed", t);
+            recordSealFailure = failure;
+            throw failure;
+        }
         recordOffset = -1L;
         sentMaxSymbolId = record.dictEndId();
         hasDeferredMessages = deferCommit;

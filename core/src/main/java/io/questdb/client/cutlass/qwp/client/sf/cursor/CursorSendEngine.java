@@ -1905,7 +1905,20 @@ public final class CursorSendEngine implements QuietCloseable {
      *                              minimum reservation
      */
     public long reserveRecordBlocking(int maxPayloadCapacity) {
-        long off = ring.reserveRecord(maxPayloadCapacity);
+        return reserveRecordBlocking(maxPayloadCapacity, ring.defaultMinRecordCapacity(maxPayloadCapacity));
+    }
+
+    /**
+     * Reserves a record like {@link #reserveRecordBlocking(int)}, with the
+     * minimum reservation given: the ring rotates first when the room left in
+     * the active segment is below {@code minPayloadCapacity}. See
+     * {@link SegmentRing#reserveRecord(int, int)}. Producer thread only.
+     *
+     * @throws MmapSegmentException when even a fresh segment cannot hold the
+     *                              minimum reservation
+     */
+    public long reserveRecordBlocking(int maxPayloadCapacity, int minPayloadCapacity) {
+        long off = ring.reserveRecord(maxPayloadCapacity, minPayloadCapacity);
         if (off >= 0) {
             return off;
         }
@@ -1918,7 +1931,7 @@ public final class CursorSendEngine implements QuietCloseable {
         try {
             while (true) {
                 hasClearedInterrupt |= parkWhileBackpressured(deadlineNs);
-                off = ring.reserveRecord(maxPayloadCapacity);
+                off = ring.reserveRecord(maxPayloadCapacity, minPayloadCapacity);
                 if (off >= 0) {
                     return off;
                 }

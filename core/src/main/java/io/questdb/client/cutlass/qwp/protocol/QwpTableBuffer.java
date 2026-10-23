@@ -651,6 +651,7 @@ public class QwpTableBuffer implements QuietCloseable {
      * rows do not ship them null-padded.
      */
     public void truncateColumns(int columnCount) {
+        assert rowCount == 0 : "truncateColumns needs a staging buffer with no row [rows=" + rowCount + ']';
         if (columns.size() <= columnCount) {
             return;
         }

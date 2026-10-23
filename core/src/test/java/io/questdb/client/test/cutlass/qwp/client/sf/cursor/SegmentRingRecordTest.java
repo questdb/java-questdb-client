@@ -553,6 +553,92 @@ public class SegmentRingRecordTest {
         });
     }
 
+    @Test
+    public void testReserveWithAMinimumReturnsPayloadTooLargeWhenAFreshSegmentIsSmaller() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final int minimum = MIN_RESERVE + 1000;
+            final int fill = (int) (PAYLOAD_CAPACITY - MmapSegment.FRAME_HEADER_SIZE - (minimum - 100));
+            long big = Unsafe.malloc(fill, MemoryTag.NATIVE_DEFAULT);
+            try (SegmentRing ring = new SegmentRing(MmapSegment.create(tmpDir + "/0.sfa", 0L, SEGMENT_SIZE), SEGMENT_SIZE)) {
+                fillPattern(big, fill, 12);
+                Assert.assertEquals(0L, ring.appendOrFsn(big, fill));
+                Assert.assertEquals(minimum - 100, ring.getActive().capacityRemaining());
+                // a spare whose whole payload is below the asked minimum
+                MmapSegment small = MmapSegment.create(tmpDir + "/1.sfa", 1L,
+                        MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + minimum - 1);
+                ring.installHotSpare(small);
+                Assert.assertEquals(SegmentRing.PAYLOAD_TOO_LARGE, ring.reserveRecord(MIB, minimum));
+                Assert.assertFalse(ring.hasReservedRecord());
+                Assert.assertSame("the rotation stands, as for an oversized frame", small, ring.getActive());
+                Assert.assertEquals(minimum - 1, small.capacityRemaining());
+                Assert.assertEquals(0L, ring.publishedFsn());
+                // the default minimum still fits the small active
+                long off = ring.reserveRecord(MIB);
+                Assert.assertEquals(minimum - 1, ring.reservedCapacity());
+                ring.abandonRecord(off);
+            } finally {
+                Unsafe.free(big, fill, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testReserveWithAMinimumRotatesWhenTheRoomIsBelowIt() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // the room left sits above the default minimum reservation but below the asked minimum
+            final int room = MIN_RESERVE + 1000;
+            final int fill = (int) (PAYLOAD_CAPACITY - MmapSegment.FRAME_HEADER_SIZE - room);
+            long big = Unsafe.malloc(fill, MemoryTag.NATIVE_DEFAULT);
+            try (SegmentRing ring = new SegmentRing(MmapSegment.create(tmpDir + "/0.sfa", 0L, SEGMENT_SIZE), SEGMENT_SIZE)) {
+                fillPattern(big, fill, 13);
+                MmapSegment seg0 = ring.getActive();
+                Assert.assertEquals(0L, ring.appendOrFsn(big, fill));
+                Assert.assertEquals(room, seg0.capacityRemaining());
+
+                // the default minimum takes the room left in place
+                long off = ring.reserveRecord(MIB);
+                Assert.assertSame(seg0, ring.getActive());
+                Assert.assertEquals(room, ring.reservedCapacity());
+                ring.abandonRecord(off);
+                // so does a minimum the room covers, and one below the record header (clamped up to it)
+                off = ring.reserveRecord(MIB, room);
+                Assert.assertSame(seg0, ring.getActive());
+                Assert.assertEquals(room, ring.reservedCapacity());
+                ring.abandonRecord(off);
+                off = ring.reserveRecord(1000, 0);
+                Assert.assertSame(seg0, ring.getActive());
+                Assert.assertEquals(1000, ring.reservedCapacity());
+                ring.abandonRecord(off);
+
+                // a minimum above the room rotates; without a spare that is backpressure
+                Assert.assertEquals(SegmentRing.BACKPRESSURE_NO_SPARE, ring.reserveRecord(MIB, room + 1));
+                Assert.assertFalse(ring.hasReservedRecord());
+                Assert.assertSame(seg0, ring.getActive());
+                Assert.assertEquals(room, seg0.capacityRemaining());
+
+                MmapSegment spare = MmapSegment.create(tmpDir + "/1.sfa", 7L, SEGMENT_SIZE);
+                ring.installHotSpare(spare);
+                // a minimum above the segment payload is clamped to it, so a fresh segment satisfies it
+                off = ring.reserveRecord(MIB, Integer.MAX_VALUE);
+                Assert.assertEquals(MmapSegment.HEADER_SIZE, off);
+                Assert.assertSame(spare, ring.getActive());
+                Assert.assertEquals(PAYLOAD_CAPACITY, ring.reservedCapacity());
+                Assert.assertEquals(1, ring.getSealedSegments().size());
+                Assert.assertSame(seg0, ring.getSealedSegments().get(0));
+                Assert.assertEquals("a reservation consumes no FSN", 0L, ring.publishedFsn());
+                ring.abandonRecord(off);
+
+                // on a fresh active, a minimum clamped to the requested capacity fits in place
+                off = ring.reserveRecord(4096, 8192);
+                Assert.assertSame(spare, ring.getActive());
+                Assert.assertEquals(4096, ring.reservedCapacity());
+                ring.abandonRecord(off);
+            } finally {
+                Unsafe.free(big, fill, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
     private static void appendRow(QwoRecordWriter writer, QwpTableBuffer tb, int row) {
         tb.getOrCreateColumn("price", QwpConstants.TYPE_DOUBLE, true).addDouble(1.5 * row);
         tb.getOrCreateColumn("qty", QwpConstants.TYPE_LONG, true).addLong(100L + row);

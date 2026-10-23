@@ -115,11 +115,13 @@ public final class QwoRecordWriter implements QuietCloseable {
      * The row stays uncommitted until {@link #publish()}.
      *
      * @return {@link #APPEND_OK}, or {@link #APPEND_NO_SPACE} with the record
-     * unchanged when the dictionary region, the record or the block's row limit
+     * unchanged when the dictionary region, the record, the block's row limit or,
+     * for a row that needs a new block, the {@link QwoFormat#MAX_BLOCKS} limit
      * cannot take the row; {@link #lastRefusedDictBytes()} then tells whether the
      * dictionary region was the cause
      * @throws IllegalArgumentException when {@code staged} does not hold exactly
-     *                                  one row, or a SYMBOL column without a null bitmap holds a negative id
+     *                                  one row, a SYMBOL column without a null bitmap holds a negative id, or
+     *                                  a GEOHASH or DECIMAL column has no null bitmap
      */
     public int appendStagedRow(QwpTableBuffer staged, GlobalSymbolDictionary dict, int batchMaxSymbolId) {
         checkOpen();
@@ -140,6 +142,10 @@ public final class QwoRecordWriter implements QuietCloseable {
         BlockState block = existingBlock(staged);
         boolean isNewBlock = block == null;
         if (isNewBlock) {
+            if (blockCount == MAX_BLOCKS) {
+                // the header's blockCount and the frame's table count are u16
+                return APPEND_NO_SPACE;
+            }
             block = prepareBlock(staged);
         } else if (block.rowCount >= maxRowsPerBlock) {
             return APPEND_NO_SPACE;
@@ -718,6 +724,12 @@ public final class QwoRecordWriter implements QuietCloseable {
             }
             QwpTableBuffer.ColumnBuffer col = staged.getColumn(i);
             cs.of(col);
+            if (cs.prefixKind != PREFIX_NONE && !cs.hasBitmap) {
+                // a null in a column without a bitmap is a sentinel value, which would count as a
+                // value carrying no precision or scale; the sender creates these columns nullable
+                throw new IllegalArgumentException("column '" + col.getName()
+                        + "' needs a null bitmap: it is a GEOHASH or DECIMAL column [type=" + cs.type + ']');
+            }
             size += stringBytes(col.getName()) + COL_FIXED_SIZE;
         }
         block.descriptorSize = size;
@@ -754,6 +766,9 @@ public final class QwoRecordWriter implements QuietCloseable {
                 offsets + (long) Integer.BYTES * (rowCap + 1),
                 cs.chunkBytes
         );
+        // A column's first chunk holds one row, so it is full before its bytes can run out: no
+        // relocation rewrites the def's first-chunk offset, which the descriptor CRC covers.
+        assert cs.chunkLink != cs.defTail + COL_FIRST_CHUNK : "the first chunk of a column is never relocated";
         storeLink(cs.chunkLink, chunk);
         cs.chunk = chunk;
         cs.chunkRowCap = rowCap;
@@ -783,9 +798,11 @@ public final class QwoRecordWriter implements QuietCloseable {
      * store. The prefix bytes sit outside the descriptor CRC, so the store is
      * safe in a published descriptor, and it precedes the row word that commits
      * the column's first value. A rollback leaves it in place: the staged column
-     * keeps its precision or scale.
+     * keeps its precision or scale. The value is a one-byte varint: a GEOHASH
+     * precision is at most 60 and a DECIMAL scale at most 76.
      */
     private void storePrefix(ColumnState cs, int prefix) {
+        assert prefix >= 0 && prefix <= 0x7F : "prefix " + prefix + " needs a two-byte varint";
         int word = (cs.prefixKind & 0xFF)
                 | (prefix & 0x7F) << 8
                 | (cs.hasBitmap ? 1 : 0) << 24;

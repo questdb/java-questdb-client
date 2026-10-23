@@ -29,12 +29,16 @@ import io.questdb.client.cutlass.qwp.client.NativeBufferWriter;
 import io.questdb.client.cutlass.qwp.client.sf.record.QwoFormat;
 import io.questdb.client.cutlass.qwp.client.sf.record.QwoRecordReader;
 import io.questdb.client.cutlass.qwp.client.sf.record.QwoRecordWriter;
+import io.questdb.client.cutlass.qwp.client.sf.record.QwoValidator;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
 import io.questdb.client.std.Crc32c;
 import io.questdb.client.std.Decimal128;
+import io.questdb.client.std.Decimal256;
+import io.questdb.client.std.Decimal64;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
+import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -116,6 +120,50 @@ public class QwoRecordWriterTest {
                 Assert.assertEquals(0, reader.columnNameLen(tsDef));
                 long ts1 = reader.chunkValuesAddr(reader.nextChunk(reader.firstChunk(tsDef)), QwpConstants.TYPE_TIMESTAMP, true);
                 Assert.assertEquals(3_000_000L, Unsafe.getUnsafe().getLong(ts1 + 8));
+            }
+        });
+    }
+
+    @Test
+    public void testBlockCountStopsAtTheU16Limit() throws Exception {
+        assertMemoryLeak(() -> {
+            // the header's blockCount is a u16: 65535 blocks of one LONG column take about 4 MiB
+            final int capacity = 8 * 1024 * 1024;
+            long mem = Unsafe.malloc(capacity, MemoryTag.NATIVE_DEFAULT);
+            try (QwoRecordWriter writer = new QwoRecordWriter(); QwpTableBuffer tb = new QwpTableBuffer("t")) {
+                writer.open(mem, capacity, QwpConstants.VERSION, 0, QwoFormat.DEFAULT_DICT_RESERVE);
+                GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+                for (int i = 0; i < QwoFormat.MAX_BLOCKS; i++) {
+                    // a fresh column buffer matches no block, so every row opens one
+                    tb.truncateColumns(0);
+                    appendLong(writer, tb, dict, i);
+                }
+                Assert.assertEquals(QwoFormat.MAX_BLOCKS, writer.blockCount());
+                // the last block still takes rows
+                appendLong(writer, tb, dict, -1);
+                writer.publish();
+                Assert.assertEquals(QwoFormat.MAX_BLOCKS + 1, writer.rowCount());
+
+                int used = writer.usedBytes();
+                tb.truncateColumns(0);
+                stage(tb, t -> t.getOrCreateColumn("v", QwpConstants.TYPE_LONG, true).addLong(-2));
+                Assert.assertEquals("a row that needs one more block is refused",
+                        QwoRecordWriter.APPEND_NO_SPACE, writer.appendStagedRow(tb, dict, -1));
+                tb.clearStagedRow();
+                Assert.assertEquals(0, writer.lastRefusedDictBytes());
+                Assert.assertEquals(QwoFormat.MAX_BLOCKS, writer.blockCount());
+                Assert.assertEquals(used, writer.usedBytes());
+                Assert.assertFalse(writer.hasUncommittedRows());
+
+                int sealed = writer.seal(false);
+                QwoRecordReader reader = new QwoRecordReader();
+                reader.of(mem, sealed);
+                Assert.assertEquals("the header field did not wrap", QwoFormat.MAX_BLOCKS, reader.blockCount());
+                QwoValidator validator = new QwoValidator();
+                Assert.assertTrue(validator.detail(), validator.validateSealed(mem, sealed));
+                Assert.assertEquals(QwoFormat.MAX_BLOCKS + 1, validator.committedRows());
+            } finally {
+                Unsafe.free(mem, capacity, MemoryTag.NATIVE_DEFAULT);
             }
         });
     }
@@ -499,6 +547,98 @@ public class QwoRecordWriterTest {
     }
 
     @Test
+    public void testFirstChunkHoldsOneRowAndIsNeverRelocated() throws Exception {
+        withRecord((mem, writer) -> {
+            writer.open(mem, REGION, QwpConstants.VERSION, 0, QwoFormat.DEFAULT_DICT_RESERVE);
+            GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+            QwoRecordReader reader = new QwoRecordReader();
+            // after the first value, each value outgrows the bytes its chunk has left
+            final int[] lengths = {1, 300, 3000, 30, 9000};
+            try (QwpTableBuffer tb = new QwpTableBuffer("first")) {
+                int c0 = 0;
+                int c1 = 0;
+                boolean isRelocated = false;
+                for (int r = 0; r < lengths.length; r++) {
+                    StringBuilder sb = new StringBuilder();
+                    for (int i = 0; i < lengths[r]; i++) {
+                        sb.append((char) ('a' + r));
+                    }
+                    final String value = sb.toString();
+                    append(writer, tb, dict, -1, t -> t.getOrCreateColumn("s", QwpConstants.TYPE_VARCHAR, true).addString(value));
+                    writer.publish();
+                    reader.of(mem, REGION);
+                    int def = reader.columnDef(reader.firstBlock(), 0);
+                    if (r == 0) {
+                        c0 = reader.firstChunk(def);
+                    }
+                    Assert.assertEquals("row " + r, c0, reader.firstChunk(def));
+                    Assert.assertEquals(1, reader.chunkRowCap(c0));
+                    Assert.assertEquals("a", nameOf(reader.chunkBytesAddr(c0, true, 1), 1));
+                    if (r == 1) {
+                        c1 = reader.nextChunk(c0);
+                    } else if (r == 2) {
+                        isRelocated = reader.nextChunk(c0) != c1;
+                    }
+                }
+                Assert.assertTrue("the second chunk was relocated, the first never", isRelocated);
+            }
+        });
+    }
+
+    @Test
+    public void testGeohashAndDecimalColumnsWithoutABitmapAreRefused() throws Exception {
+        withRecord((mem, writer) -> {
+            writer.open(mem, REGION, QwpConstants.VERSION, 0, QwoFormat.DEFAULT_DICT_RESERVE);
+            GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+            final int used = writer.usedBytes();
+            final byte[] types = {
+                    QwpConstants.TYPE_GEOHASH, QwpConstants.TYPE_DECIMAL64, QwpConstants.TYPE_DECIMAL128, QwpConstants.TYPE_DECIMAL256
+            };
+            for (byte type : types) {
+                for (int pass = 0; pass < 2; pass++) {
+                    // a column without a bitmap stores a null as a sentinel value, which would carry no precision or scale
+                    final boolean hasBitmap = pass == 1;
+                    try (QwpTableBuffer tb = new QwpTableBuffer("prefixed")) {
+                        stage(tb, t -> {
+                            QwpTableBuffer.ColumnBuffer col = t.getOrCreateColumn("x", type, hasBitmap);
+                            switch (type) {
+                                case QwpConstants.TYPE_GEOHASH:
+                                    col.addGeoHash(5, 20);
+                                    break;
+                                case QwpConstants.TYPE_DECIMAL64:
+                                    col.addDecimal64(Decimal64.fromLong(1, 2));
+                                    break;
+                                case QwpConstants.TYPE_DECIMAL128:
+                                    col.addDecimal128(Decimal128.fromLong(1, 2));
+                                    break;
+                                default:
+                                    col.addDecimal256(Decimal256.fromLong(1, 2));
+                                    break;
+                            }
+                        });
+                        if (hasBitmap) {
+                            Assert.assertEquals(QwoRecordWriter.APPEND_OK, writer.appendStagedRow(tb, dict, -1));
+                            writer.rollback();
+                        } else {
+                            try {
+                                writer.appendStagedRow(tb, dict, -1);
+                                Assert.fail("type " + type + " without a null bitmap must be refused");
+                            } catch (IllegalArgumentException expected) {
+                                TestUtils.assertContains(expected.getMessage(), "column 'x'");
+                                TestUtils.assertContains(expected.getMessage(), "null bitmap");
+                            }
+                        }
+                        tb.clearStagedRow();
+                    }
+                    Assert.assertEquals(0, writer.blockCount());
+                    Assert.assertEquals(0, writer.rowCount());
+                    Assert.assertEquals(used, writer.usedBytes());
+                }
+            }
+        });
+    }
+
+    @Test
     public void testNewColumnAllocatesSecondBlockForSameTable() throws Exception {
         withRecord((mem, writer) -> {
             writer.open(mem, REGION, QwpConstants.VERSION, 0, QwoFormat.DEFAULT_DICT_RESERVE);
@@ -657,6 +797,35 @@ public class QwoRecordWriterTest {
                 }
                 Assert.assertEquals(6, row);
                 Assert.assertEquals(3, values);
+            }
+        });
+    }
+
+    @Test
+    public void testPrefixesUpToTheirLargestValuesTakeOneByte() throws Exception {
+        withRecord((mem, writer) -> {
+            writer.open(mem, REGION, QwpConstants.VERSION, 0, QwoFormat.DEFAULT_DICT_RESERVE);
+            GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+            try (QwpTableBuffer tb = new QwpTableBuffer("prefixes")) {
+                append(writer, tb, dict, -1, t -> {
+                    t.getOrCreateColumn("g", QwpConstants.TYPE_GEOHASH, true).addGeoHash(1, 60);
+                    t.getOrCreateColumn("d64", QwpConstants.TYPE_DECIMAL64, true).addDecimal64(Decimal64.fromLong(1, Decimal64.MAX_SCALE));
+                    t.getOrCreateColumn("d128", QwpConstants.TYPE_DECIMAL128, true).addDecimal128(Decimal128.fromLong(1, Decimal128.MAX_SCALE));
+                    t.getOrCreateColumn("d256", QwpConstants.TYPE_DECIMAL256, true).addDecimal256(Decimal256.fromLong(1, Decimal256.MAX_SCALE));
+                });
+                writer.publish();
+                QwoRecordReader reader = new QwoRecordReader();
+                reader.of(mem, REGION);
+                int b = reader.firstBlock();
+                final int[] expected = {60, Decimal64.MAX_SCALE, Decimal128.MAX_SCALE, Decimal256.MAX_SCALE};
+                for (int col = 0; col < expected.length; col++) {
+                    int def = reader.columnDef(b, col);
+                    Assert.assertEquals(expected[col], reader.prefix(def));
+                    // the largest precision and scale fit the one-byte varint form the writer stores
+                    long tail = reader.columnNameAddr(def) + reader.columnNameLen(def);
+                    Assert.assertEquals(expected[col], Unsafe.getUnsafe().getByte(tail + QwoFormat.COL_PREFIX));
+                    Assert.assertEquals(0, Unsafe.getUnsafe().getByte(tail + QwoFormat.COL_PREFIX + 1));
+                }
             }
         });
     }

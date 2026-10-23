@@ -223,8 +223,10 @@ public class QwoDifferentialTest {
                 QwpTableBuffer staged = h.table("trades");
                 QwpTableBuffer legacy = h.table("trades");
                 for (int r = 0; r < n; r++) {
+                    // every fourth row reuses a symbol an earlier frame confirmed: its id is below dictStartId
+                    String venue = h.dictStartId > 0 && r % 4 == 1 ? "sent" + r % h.dictStartId : "venue" + r % 5;
                     h.row(staged, legacy, rowOf(cols, new Object[]{
-                            r * 0.25, 3L * r, "venue" + r % 5, TS_BASE + 1_000_000L * r
+                            r * 0.25, 3L * r, venue, TS_BASE + 1_000_000L * r
                     }, h.dict));
                     h.publish();
                 }
@@ -275,6 +277,56 @@ public class QwoDifferentialTest {
                 } catch (Throwable t) {
                     throw new AssertionError("randomised schema failed [seed=" + seed + ']', t);
                 }
+            }
+        });
+    }
+
+    @Test
+    public void testRelocatedVariableSizeChunkMaterialisesLikeTheOracle() throws Exception {
+        withHarness(h -> {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < 500; i++) {
+                sb.append(ALPHABET[i % ALPHABET.length]);
+            }
+            final String longString = sb.toString();
+            final byte[] longBytes = new byte[500];
+            new Random(5).nextBytes(longBytes);
+            final byte[] types = {TYPE_VARCHAR, TYPE_BINARY};
+            QwoRecordReader open = new QwoRecordReader();
+            for (byte type : types) {
+                h.begin(1);
+                final Col[] cols = {new Col("v", type, 0)};
+                final Object[] values = type == TYPE_VARCHAR
+                        ? new Object[]{"a", "bb", longString}
+                        : new Object[]{new byte[]{1}, new byte[]{2, 3}, longBytes};
+                QwpTableBuffer staged = h.table("reloc");
+                QwpTableBuffer legacy = h.table("reloc");
+                // row 0 fills the 1-row first chunk, row 1 opens a 2-row chunk sized for short values
+                h.row(staged, legacy, rowOf(cols, new Object[]{values[0]}, h.dict));
+                h.row(staged, legacy, rowOf(cols, new Object[]{values[1]}, h.dict));
+                h.publish();
+                open.of(h.mem, REGION);
+                int def = open.columnDef(open.firstBlock(), 0);
+                int c0 = open.firstChunk(def);
+                int c0End = c0 + QwoFormat.C_DATA + QwoFormat.chunkDataBytes(type, 0, true, open.chunkRowCap(c0), open.chunkByteCap(c0));
+                int c1 = open.nextChunk(c0);
+                Assert.assertEquals("the chunks start out contiguous", c0End, c1);
+                Assert.assertEquals(2, open.chunkRowCap(c1));
+                Assert.assertTrue(open.chunkByteCap(c1) < 2 + 500);
+
+                // row 2's value outgrows the bytes the 2-row chunk has left: the chunk is relocated (R5)
+                h.row(staged, legacy, rowOf(cols, new Object[]{values[2]}, h.dict));
+                h.publish();
+                h.assertFrame();
+                QwoRecordReader sealed = h.reader;
+                def = sealed.columnDef(sealed.firstBlock(), 0);
+                Assert.assertEquals(c0, sealed.firstChunk(def));
+                int relocated = sealed.nextChunk(c0);
+                Assert.assertTrue("the relocated chunk lies past the dead copy at " + c1 + ": " + relocated, relocated > c1);
+                Assert.assertNotEquals("the column's chunks are no longer contiguous", c0End, relocated);
+                Assert.assertEquals(2, sealed.chunkRowCap(relocated));
+                Assert.assertTrue(sealed.chunkByteCap(relocated) >= 2 + 500);
+                Assert.assertEquals(0, sealed.nextChunk(relocated));
             }
         });
     }
@@ -671,7 +723,7 @@ public class QwoDifferentialTest {
             while (rowsLeft[t] == 0) {
                 t = (t + 1) % tableCount;
             }
-            Object[] values = randomRow(rnd, schemas[t], rowsDone[t], false);
+            Object[] values = randomRow(rnd, schemas[t], rowsDone[t], false, h.dictStartId);
             h.row(staged[t], legacy[t], rowOf(schemas[t], values, h.dict));
             rowsLeft[t]--;
             rowsDone[t]++;
@@ -682,7 +734,7 @@ public class QwoDifferentialTest {
         h.publish();
         for (int i = 0, n = rnd.nextInt(3); i < n; i++) {
             int t = rnd.nextInt(tableCount);
-            h.uncommittedRow(staged[t], rowOf(schemas[t], randomRow(rnd, schemas[t], rowsDone[t], true), h.dict));
+            h.uncommittedRow(staged[t], rowOf(schemas[t], randomRow(rnd, schemas[t], rowsDone[t], true, h.dictStartId), h.dict));
         }
         h.assertFrame();
     }
@@ -691,9 +743,11 @@ public class QwoDifferentialTest {
      * Values for one row: about 20% nulls, the designated timestamp never null.
      * An uncommitted row leaves GEOHASH and DECIMAL columns null so that a rolled
      * back value cannot hand a precision or scale to an otherwise all-null column
-     * (ruling R6 accepts that difference; the oracle does not pin it).
+     * (ruling R6 accepts that difference; the oracle does not pin it). A SYMBOL
+     * value is now and then one of the {@code confirmedSymbols} an earlier frame
+     * confirmed ({@link Harness#begin}), whose id lies below the record's dictStartId.
      */
-    private static Object[] randomRow(Random rnd, Col[] cols, int row, boolean isUncommitted) {
+    private static Object[] randomRow(Random rnd, Col[] cols, int row, boolean isUncommitted, int confirmedSymbols) {
         Object[] values = new Object[cols.length];
         for (int c = 0; c < cols.length; c++) {
             Col col = cols[c];
@@ -701,6 +755,8 @@ public class QwoDifferentialTest {
                     || col.type == TYPE_DECIMAL128 || col.type == TYPE_DECIMAL256;
             if (!col.isDesignated && (rnd.nextInt(5) == 0 || isUncommitted && hasPrefix)) {
                 values[c] = null;
+            } else if (col.type == TYPE_SYMBOL && confirmedSymbols > 0 && rnd.nextInt(4) == 0) {
+                values[c] = "sent" + rnd.nextInt(confirmedSymbols);
             } else {
                 values[c] = randomValue(rnd, col, row, 40);
             }

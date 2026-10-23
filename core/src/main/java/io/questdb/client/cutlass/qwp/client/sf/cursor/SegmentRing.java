@@ -1212,6 +1212,14 @@ public final class SegmentRing implements QuietCloseable {
         }
     }
 
+    /**
+     * The minimum reservation {@link #reserveRecord(int)} applies:
+     * {@code min(QwoFormat.MIN_RECORD_RESERVATION, segment payload capacity / 4, maxPayloadCapacity)}.
+     */
+    int defaultMinRecordCapacity(int maxPayloadCapacity) {
+        return (int) Math.min(Math.min(QwoFormat.MIN_RECORD_RESERVATION, segmentPayloadCapacity / 4), maxPayloadCapacity);
+    }
+
     void enablePeriodicSync() {
         periodicSyncEnabled = true;
         syncRequested = true;
@@ -1661,6 +1669,27 @@ public final class SegmentRing implements QuietCloseable {
      *                                  smaller than the record header
      */
     public long reserveRecord(int maxPayloadCapacity) {
+        return reserveRecord(maxPayloadCapacity, defaultMinRecordCapacity(maxPayloadCapacity));
+    }
+
+    /**
+     * Reserves an open QWO1 record as {@link #reserveRecord(int)} does, with
+     * the minimum reservation given: the ring rotates first when the room left
+     * is below {@code minPayloadCapacity}, clamped to
+     * {@code [QwoFormat.HEADER_SIZE, min(maxPayloadCapacity, segment payload capacity)]}.
+     * A minimum of {@code maxPayloadCapacity} asks for the full capacity, which
+     * a fresh segment of the ring's size always has; the sender asks so for a
+     * row that the room left in the active segment cannot hold.
+     *
+     * @return the envelope offset, {@link #BACKPRESSURE_NO_SPARE} when the
+     * ring must rotate but has no spare or must first wait for a barrier, or
+     * {@link #PAYLOAD_TOO_LARGE} when even a fresh segment cannot hold the
+     * minimum reservation
+     * @throws IllegalStateException    when a record is already reserved
+     * @throws IllegalArgumentException when {@code maxPayloadCapacity} is
+     *                                  smaller than the record header
+     */
+    public long reserveRecord(int maxPayloadCapacity, int minPayloadCapacity) {
         checkDurability();
         MmapSegment target = active;
         if (target.reservedOffset() >= 0) {
@@ -1669,8 +1698,8 @@ public final class SegmentRing implements QuietCloseable {
         if (maxPayloadCapacity < QwoFormat.HEADER_SIZE) {
             throw new IllegalArgumentException("record capacity below the record header: " + maxPayloadCapacity);
         }
-        long minReserve = Math.max(QwoFormat.HEADER_SIZE, Math.min(
-                Math.min(QwoFormat.MIN_RECORD_RESERVATION, segmentPayloadCapacity / 4), maxPayloadCapacity));
+        long minReserve = Math.max(QwoFormat.HEADER_SIZE,
+                Math.min(minPayloadCapacity, Math.min(maxPayloadCapacity, segmentPayloadCapacity)));
         long capacity = Math.min(maxPayloadCapacity, target.capacityRemaining());
         // version 1 active: rotation is added in Task 10
         if (capacity < minReserve) {
@@ -1685,6 +1714,7 @@ public final class SegmentRing implements QuietCloseable {
         }
         return target.reserveRecord((int) capacity);
     }
+
 
     /**
      * Payload capacity of the reserved record; 0 when none is reserved.

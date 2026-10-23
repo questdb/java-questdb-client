@@ -46,14 +46,15 @@ import static io.questdb.client.cutlass.qwp.client.sf.record.QwoFormat.*;
  * past the dictionary count and chunks past the committed rows are ignored.
  * Both read nothing outside {@code [payloadAddr, payloadAddr + bound)} and check:
  * <ul>
- *     <li>header: magic, version {@link QwpConstants#VERSION}, the header CRC,
+ *     <li>header: magic, a version from {@link QwoFormat#RECORD_VERSION_MIN} to
+ *     {@link QwoFormat#RECORD_VERSION_MAX}, the header CRC,
  *     flags with GORILLA and DELTA_SYMBOL_DICT set and nothing but them and
  *     DEFER_COMMIT, usedBytes in {@code [HEADER_SIZE, min(length, capacity)]};</li>
  *     <li>dictionary: the region inside {@code [HEADER_SIZE, bound)}, its
  *     dictCount entries parsing inside it, their CRC equal to dictWord's;</li>
  *     <li>blocks: firstBlock and every {@code D_NEXT} 0 or a descriptor inside
  *     {@code [HEADER_SIZE, bound)} whose {@code D_CRC} matches, no cycle, at most
- *     65535 of them, a row count in {@code [0, MAX_ROWS_PER_BLOCK]}; per column
+ *     {@link QwoFormat#MAX_BLOCKS} of them, a row count in {@code [0, MAX_ROWS_PER_BLOCK]}; per column
  *     def a known type, a bitmap byte of 0 or 1 and a prefix in range (none for
  *     other types, a GEOHASH precision of 1 to 60, a DECIMAL scale of 0 or
  *     more);</li>
@@ -61,8 +62,8 @@ import static io.questdb.client.cutlass.qwp.client.sf.record.QwoFormat.*;
  *     {@code [HEADER_SIZE, bound)}, acyclic, every rowCap in
  *     {@code [1, MAX_CHUNK_ROWS]}, covering the rows; variable-size offsets
  *     starting at 0, ascending and within the chunk's byteCap; a GEOHASH or
- *     DECIMAL column with a committed non-null value carries its precision or
- *     scale; the row CRC recomputed by {@link QwoCrc} over a
+ *     DECIMAL column with a committed value carries its precision or scale;
+ *     the row CRC recomputed by {@link QwoCrc} over a
  *     {@link QwoColumnCursor} walk equals the row word's.</li>
  * </ul>
  * A sealed record's bound is its usedBytes, and its blockCount must equal the
@@ -79,7 +80,6 @@ public final class QwoValidator {
     private static final int ALLOWED_FLAGS = QwpConstants.FLAG_DEFER_COMMIT
             | QwpConstants.FLAG_GORILLA
             | QwpConstants.FLAG_DELTA_SYMBOL_DICT;
-    private static final int MAX_BLOCKS = 0xFFFF;
     private static final int MAX_GEOHASH_PRECISION = 60;
     private static final int REQUIRED_FLAGS = QwpConstants.FLAG_GORILLA | QwpConstants.FLAG_DELTA_SYMBOL_DICT;
     private final IntList chunkByteCaps = new IntList();
@@ -459,7 +459,7 @@ public final class QwoValidator {
         }
         cursor.rewind();
         if (values > 0 && prefix < 0 && isPrefixType(type)) {
-            return fail(columnLabel(b, index, col, def) + " holds " + values + " non-null values but no "
+            return fail(columnLabel(b, index, col, def) + " holds " + values + " values but no "
                     + (type == QwpConstants.TYPE_GEOHASH ? "precision" : "scale"));
         }
         return true;
@@ -516,8 +516,8 @@ public final class QwoValidator {
             return fail("bad magic " + hex(magic));
         }
         int version = reader.version();
-        if (version != QwpConstants.VERSION) {
-            return fail("unsupported version " + version);
+        if (version < RECORD_VERSION_MIN || version > RECORD_VERSION_MAX) {
+            return fail("unsupported version " + version + ", accepted " + RECORD_VERSION_MIN + " to " + RECORD_VERSION_MAX);
         }
         int storedHeaderCrc = Unsafe.getUnsafe().getInt(addr + OFF_HEADER_CRC);
         int computedHeaderCrc = QwoFormat.headerCrc(addr);

@@ -610,6 +610,31 @@ public class QwoValidatorTest {
     }
 
     @Test
+    public void testRecordVersionOutsideTheAcceptedRangeIsInvalid() throws Exception {
+        withRecord((mem, writer, validator) -> {
+            // the record format owns its accepted versions; a wire protocol bump must not orphan records on disk
+            Assert.assertEquals(1, QwoFormat.RECORD_VERSION_MIN);
+            Assert.assertEquals(1, QwoFormat.RECORD_VERSION_MAX);
+            GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+            for (int version = QwoFormat.RECORD_VERSION_MIN - 1; version <= QwoFormat.RECORD_VERSION_MAX + 1; version++) {
+                Unsafe.getUnsafe().setMemory(mem, REGION, (byte) 0x5A);
+                writer.open(mem, REGION, (byte) version, 0, QwoFormat.DEFAULT_DICT_RESERVE);
+                try (QwpTableBuffer tb = new QwpTableBuffer("trades")) {
+                    appendTrade(writer, tb, dict, 0);
+                    writer.publish();
+                    if (version >= QwoFormat.RECORD_VERSION_MIN && version <= QwoFormat.RECORD_VERSION_MAX) {
+                        assertValid(validator.validateOpen(mem, REGION), validator);
+                        assertValid(validator.validateSealed(mem, writer.seal(false)), validator);
+                    } else {
+                        assertInvalid(validator.validateOpen(mem, REGION), validator, "unsupported version " + version);
+                        assertInvalid(validator.validateSealed(mem, writer.seal(false)), validator, "unsupported version " + version);
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
     public void testRecordWithNoCommittedRowsReportsZero() throws Exception {
         withRecord((mem, writer, validator) -> {
             writer.open(mem, REGION, VERSION, 0, QwoFormat.DEFAULT_DICT_RESERVE);

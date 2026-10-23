@@ -68,6 +68,7 @@ public final class QwoFormat {
     public static final int D_ROW_WORD = 12;
     public static final int HEADER_SIZE = 48;
     public static final int MAGIC_RECORD = 0x314F5751;
+    public static final int MAX_BLOCKS = 0xFFFF;
     public static final int MAX_CHUNK_ROWS = 4096;
     public static final int MAX_ROWS_PER_BLOCK = 1_000_000;
     public static final int MIN_RECORD_RESERVATION = 65536;
@@ -87,6 +88,8 @@ public final class QwoFormat {
     public static final byte PREFIX_DECIMAL = 2;
     public static final byte PREFIX_GEOHASH = 1;
     public static final byte PREFIX_NONE = 0;
+    public static final int RECORD_VERSION_MAX = 1;
+    public static final int RECORD_VERSION_MIN = 1;
     public static final int STATE_OPEN = 0x4E45504F;
     public static final int STATE_SEALED = 0x4C414553;
     public static final int WIRE_MARGIN_FIXED = 32;
