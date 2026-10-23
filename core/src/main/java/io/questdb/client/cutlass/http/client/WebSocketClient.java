@@ -652,13 +652,20 @@ public abstract class WebSocketClient implements QuietCloseable {
             growRecvBuffer();
         }
 
-        int n = socket.recv(recvBufPtr + recvPos, recvBufSize - recvPos);
+        int capacity = recvBufSize - recvPos;
+        int n = socket.recv(recvBufPtr + recvPos, capacity);
         if (n < 0) {
             throw new HttpClientException("peer disconnect [errno=").errno(nf.errno()).put(']');
         }
         if (n == 0) {
             recvDrained = true;
             return false; // No data available
+        }
+        if (n < capacity && !socket.hasBufferedInput()) {
+            // A short read emptied the receive queue: the next read would only
+            // return EAGAIN, so skip it. Bytes arriving later wake the next
+            // poll. (TLS keeps user-space records; hasBufferedInput covers them.)
+            recvDrained = true;
         }
         recvPos += n;
 
@@ -1125,17 +1132,24 @@ public abstract class WebSocketClient implements QuietCloseable {
         long startTime = System.nanoTime();
         recvDrained = false;
         while (len > 0) {
-            int remainingTimeout = getRemainingTimeOrThrow(timeout, startTime);
-            ioWait(remainingTimeout, IOOperation.WRITE);
+            // Send first: a socket with room (the common case for frames well
+            // under the send buffer) takes the bytes at once, and the
+            // readiness wait before every send -- an epoll_ctl plus an
+            // epoll_wait, two of the five syscalls a frame used to cost on the
+            // I/O thread -- only runs when the kernel actually pushed back.
             int sent = dieIfNegative(socket.send(ptr, len));
             while (socket.wantsTlsWrite()) {
-                remainingTimeout = getRemainingTimeOrThrow(timeout, startTime);
+                int remainingTimeout = getRemainingTimeOrThrow(timeout, startTime);
                 ioWait(remainingTimeout, IOOperation.WRITE);
                 dieIfNegative(socket.tlsIO(Socket.WRITE_FLAG));
             }
             if (sent > 0) {
                 ptr += sent;
                 len -= sent;
+            }
+            if (len > 0) {
+                int remainingTimeout = getRemainingTimeOrThrow(timeout, startTime);
+                ioWait(remainingTimeout, IOOperation.WRITE);
             }
         }
     }
