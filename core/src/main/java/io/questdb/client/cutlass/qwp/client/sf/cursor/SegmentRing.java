@@ -120,13 +120,6 @@ public final class SegmentRing implements QuietCloseable {
     // producer would otherwise hit BACKPRESSURE_NO_SPARE.
     private final long signalAtBytes;
     private volatile long ackedFsn = -1L;
-    // The ACK wake arm: the acked FSN at which the manager last went idle.
-    // Long.MIN_VALUE until a manager registers a watermark, so no ACK counts
-    // as "past it". acknowledge() wakes the manager on the first ACK past it.
-    // The manager deliberately leaves it stale while it persists the watermark
-    // on its WATERMARK_LAG_NANOS cadence, so later ACKs ring nothing; it is
-    // re-armed by a timed pass that finds no new ACK.
-    private volatile long persistedAckFsn = Long.MIN_VALUE;
     // Last FSN of the oldest sealed segment that is not I/O-pinned, or
     // Long.MAX_VALUE when there is none: the ACK at or past it completes a
     // trimmable segment. Re-derived under the monitor by every writer of the
@@ -1018,9 +1011,11 @@ public final class SegmentRing implements QuietCloseable {
         long before = ackedFsn;
         if (seq > before) {
             ackedFsn = seq;
-            // The manager does not poll: wake it when this ACK is the first past
-            // the persisted watermark or completes the oldest sealed segment.
-            if (before <= persistedAckFsn || seq >= oldestTrimmableLastSeq) {
+            // The manager does not poll: wake it only when this ACK completes
+            // the oldest sealed segment. The ack watermark is written by the
+            // I/O thread itself (CursorSendEngine.acknowledge), so an ACK
+            // inside the active segment is nothing the manager must see.
+            if (seq >= oldestTrimmableLastSeq) {
                 wakeManager();
             }
             signalAckState();
@@ -1730,14 +1725,6 @@ public final class SegmentRing implements QuietCloseable {
      */
     public void setManagerWakeup(Runnable wakeup) {
         this.managerWakeup = wakeup;
-    }
-
-    /**
-     * Manager-only: re-arms the ACK wake at {@code fsn}, the current acked
-     * FSN at the moment the manager goes idle; see {@link #acknowledge}.
-     */
-    public void setPersistedAckFsn(long fsn) {
-        this.persistedAckFsn = fsn;
     }
 
     /**

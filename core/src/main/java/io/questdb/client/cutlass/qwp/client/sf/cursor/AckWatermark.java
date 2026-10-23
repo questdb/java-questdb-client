@@ -237,8 +237,10 @@ public final class AckWatermark implements QuietCloseable {
      * has been stored. The next {@link #sync()} makes the complete update
      * durable before any covered segment is deleted.
      * <p>
-     * Caller responsibility: monotonic ordering. The manager's tick loop only
-     * calls this when {@code fsn} has advanced past the last write.
+     * Caller responsibility: monotonic ordering and a single writer. The
+     * engine's I/O thread calls this on every ACK advance; {@link #sync()}
+     * may run concurrently on the manager thread -- a record torn by that
+     * race fails its CRC and recovery falls back to the other slot.
      */
     public void write(long fsn) {
         if (closed) return;

@@ -163,6 +163,7 @@ public class SegmentManagerUnlinkFailureTest {
                 ring.installHotSpare(MmapSegment.create(activePath, 1L, segmentSize));
                 Assert.assertEquals(1L, ring.appendOrFsn(payload, 32));
                 ring.acknowledge(0L);
+                watermark.write(0L); // what CursorSendEngine.acknowledge does on the I/O thread
                 byte[] original = java.nio.file.Files.readAllBytes(Paths.get(failedPath));
 
                 FailingFilesFacade facade = new FailingFilesFacade(failedPath, null, null);

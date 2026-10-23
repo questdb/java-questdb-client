@@ -65,15 +65,6 @@ public final class SegmentManager implements QuietCloseable {
      */
     public static final long PROVISION_RETRY_NANOS = 10_000_000L; // 10 ms
     public static final long UNLIMITED_TOTAL_BYTES = Long.MAX_VALUE;
-    /**
-     * Upper bound on how far the mmap ack watermark trails {@code ackedFsn}
-     * while ACKs keep landing inside the active segment. The first such ACK
-     * wakes the worker; writing the watermark disarms the ACK wake, so later
-     * ACKs ring nothing while the worker re-parks on this cadence. A timed
-     * pass that finds no new ACK re-arms the wake and parks without a
-     * timeout. A crash replays at most this much already-acked data.
-     */
-    public static final long WATERMARK_LAG_NANOS = 1_000_000L; // 1 ms
     private static final int ENTRY_DEREGISTERED = 3;
     private static final int ENTRY_DEREGISTERED_IN_SERVICE = 2;
     private static final int ENTRY_IN_SERVICE = 1;
@@ -147,7 +138,6 @@ public final class SegmentManager implements QuietCloseable {
     // Test seam: runs in register() right after the new entry became visible to
     // the worker. Null in production; tests use it to let the worker service the
     // entry before register() finishes.
-    private volatile Runnable afterRegisterPublishHook;
     // Test seam: runs after a deferred ring-pass cleanup returns. Null in
     // production; public sender/pool lifecycle tests use it to observe exact
     // callback completion without sleeps or polling.
@@ -660,10 +650,10 @@ public final class SegmentManager implements QuietCloseable {
     }
 
     /**
-     * Same as {@link #register(SegmentRing, String)} but also wires an
-     * {@link AckWatermark} the manager will keep up to date on every
-     * tick. The watermark is owned by the caller (typically
-     * {@link CursorSendEngine}); the manager only writes through it
+     * Same as {@link #register(SegmentRing, String)} but also wires the
+     * {@link AckWatermark} the manager syncs before it unlinks a trimmed
+     * segment. The watermark is owned and written by the caller (typically
+     * {@link CursorSendEngine}, on every ACK); the manager only syncs it
      * and never closes it. {@code null} watermark falls back to the
      * legacy behaviour: no on-disk watermark, recovery seeds from
      * {@code lowestSurvivingBaseSeq - 1}.
@@ -713,12 +703,6 @@ public final class SegmentManager implements QuietCloseable {
         // the in-flight mmap. Memory-mode rings have no dir; nothing to scan.
         long minNextGeneration = dir == null ? -1L : scanMaxGeneration(dir) + 1L;
         RingEntry e = new RingEntry(ring, dir, watermark, sideFileBytes, syncIntervalNanos, ticks.getAsLong());
-        if (watermark != null) {
-            // The first ACK wakes the worker to persist it. Seeded before the entry
-            // is visible: from then on the worker owns the mark, and a store after
-            // publication could undo a wake the worker has already armed.
-            ring.setPersistedAckFsn(-1L);
-        }
         // ObjList.add either throws before storing e or makes the entry visible.
         // Once visible, only non-throwing state commits may remain, so the gauge
         // (whose list can also throw on growth) is added first and withdrawn if
@@ -742,10 +726,6 @@ public final class SegmentManager implements QuietCloseable {
             if (syncIntervalNanos > 0L) {
                 ring.enablePeriodicSync();
             }
-        }
-        Runnable publishHook = afterRegisterPublishHook;
-        if (publishHook != null) {
-            publishHook.run();
         }
         ring.setManagerWakeup(workerWakeup);
         // Nudge the worker so it picks up the new ring on its very next
@@ -808,11 +788,6 @@ public final class SegmentManager implements QuietCloseable {
             throw new IllegalArgumentException("ring is not registered");
         }
         return serviceRing(selected);
-    }
-
-    @TestOnly
-    public void setAfterRegisterPublishHook(Runnable hook) {
-        this.afterRegisterPublishHook = hook;
     }
 
     @TestOnly
@@ -1192,25 +1167,6 @@ public final class SegmentManager implements QuietCloseable {
         int pendingCount = e.ring.pendingTrimCount();
         MmapSegment first = pendingCount == 0 ? e.ring.firstTrimmable() : null;
         if (pendingCount == 0 && first == null) {
-            // Preserve the cheap mmap-only watermark cadence for ACKs that do
-            // not yet cover a complete, unpinned sealed segment.
-            synchronized (lock) {
-                if (e.isRegistered() && e.watermark != null) {
-                    long currentAck = e.ring.ackedFsn();
-                    if (currentAck > e.lastPersistedAck) {
-                        e.watermark.write(currentAck);
-                        e.lastPersistedAck = currentAck;
-                        // Stay disarmed: the worker re-parks on
-                        // WATERMARK_LAG_NANOS, so later ACKs need not wake it.
-                        e.ackWakeArmed = false;
-                    } else if (!e.ackWakeArmed) {
-                        // A timed pass found no new ACK: re-arm so the next
-                        // one wakes the worker, then park without a timeout.
-                        e.ring.setPersistedAckFsn(currentAck);
-                        e.ackWakeArmed = true;
-                    }
-                }
-            }
             return false;
         }
 
@@ -1257,9 +1213,12 @@ public final class SegmentManager implements QuietCloseable {
             return false;
         }
 
-        // Every attempt repeats the cheap covering barrier. Besides keeping
-        // the latest cumulative ACK durable, this preserves the same strict
-        // pre-unlink/post-unlink directory ordering on pending retries.
+        // Every attempt repeats the cheap covering barrier. The I/O thread
+        // writes the watermark on every ACK, so the sync makes the ACKs this
+        // trim relies on durable (an ACK racing the msync is at worst torn
+        // into the record recovery's max() clamp discards), and it preserves
+        // the same strict pre-unlink/post-unlink directory ordering on
+        // pending retries.
         if (e.watermark == null) {
             if (!e.missingWatermarkLogged) {
                 e.missingWatermarkLogged = true;
@@ -1273,14 +1232,6 @@ public final class SegmentManager implements QuietCloseable {
                 return false;
             }
             durableAck = e.ring.ackedFsn();
-            if (durableAck > e.lastPersistedAck) {
-                e.watermark.write(durableAck);
-                e.lastPersistedAck = durableAck;
-                // Re-arm here rather than poll: a failed barrier below must
-                // leave the worker parked until its trim retry, not ticking.
-                e.ring.setPersistedAckFsn(durableAck);
-                e.ackWakeArmed = true;
-            }
         }
         try {
             e.watermark.sync();
@@ -1482,11 +1433,10 @@ public final class SegmentManager implements QuietCloseable {
                 }
                 // Event-driven idle: every state change the worker services
                 // wakes it (register/deregister, rotation, high-water publish,
-                // the first ACK past the watermark, an ACK that completes a
-                // sealed segment, budget room after a refused spare). Timed
-                // work: periodic sync, a failed spare create's retry,
-                // a failed trim's retry, and re-persisting the watermark while
-                // the ACK wake is disarmed. Otherwise park indefinitely.
+                // an ACK that completes a sealed segment, budget room after a
+                // refused spare). Timed work: periodic sync, a failed spare
+                // create's retry, a failed trim's retry. Otherwise park
+                // indefinitely.
                 long parkNanos = Long.MAX_VALUE;
                 if (!hasMoreTrimmable) {
                     long now = ticks.getAsLong();
@@ -1500,15 +1450,6 @@ public final class SegmentManager implements QuietCloseable {
                         }
                         if (e.trimRetryDelayNanos != 0L) {
                             parkNanos = Math.min(parkNanos, Math.max(0L, e.trimRetryAtNanos - now));
-                        }
-                        // Disarmed: nothing wakes us for ACKs, so poll on the
-                        // watermark cadence. Armed: Dekker with
-                        // SegmentRing.acknowledge -- it writes ackedFsn then
-                        // reads persistedAckFsn; we wrote persistedAckFsn (in
-                        // serviceRing) and read ackedFsn here, so an ACK that
-                        // raced the re-arm is seen by one side or the other.
-                        if (e.watermark != null && (!e.ackWakeArmed || e.ring.ackedFsn() > e.lastPersistedAck)) {
-                            parkNanos = Math.min(parkNanos, WATERMARK_LAG_NANOS);
                         }
                     }
                 }
@@ -1581,21 +1522,10 @@ public final class SegmentManager implements QuietCloseable {
         final LongSupplier sideFileBytes;
         final long syncIntervalNanos;
         // Engine-owned ack watermark for this slot, or null in memory
-        // mode and for callers that didn't supply one. Manager-thread
-        // only after register; never closed here (owner closes).
+        // mode and for callers that didn't supply one. The owner's I/O
+        // thread writes it; the worker only syncs it before a trim and
+        // never closes it.
         final AckWatermark watermark;
-        // Highest FSN this entry has written to its watermark. Manager-
-        // thread only -- no concurrent access. Initialized to -1 so the
-        // first observed acked FSN (>= 0) triggers the first write.
-        // Survives across multiple serviceRing ticks and avoids a
-        // write-storm when ackedFsn is steady.
-        long lastPersistedAck = -1L;
-        // Whether the ring's persistedAckFsn equals lastPersistedAck, i.e.
-        // the next ACK wakes the worker. Writing the watermark clears it and
-        // the worker then polls on WATERMARK_LAG_NANOS; a timed pass that
-        // finds no new ACK sets it again. Manager-thread only. Starts true:
-        // register seeds persistedAckFsn to -1, matching lastPersistedAck.
-        boolean ackWakeArmed = true;
         // Prevents a legacy disk registration without a watermark from
         // flooding the log on every manager tick.
         boolean missingWatermarkLogged;

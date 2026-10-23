@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentBudget;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
@@ -39,19 +40,13 @@ import org.junit.Before;
 import org.junit.Test;
 
 import java.nio.file.Paths;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.LockSupport;
 
 /**
- * ACKs that land inside the active segment never complete a sealed segment, so
- * nothing but the watermark cadence brings the manager back. The on-disk
- * watermark must still catch up on its own: after a crash, recovery replays
- * everything above it as duplicates. Regression for the event-driven worker.
- * <p>
- * The converse bound: while ACKs keep streaming in, the worker must run on the
- * {@link SegmentManager#WATERMARK_LAG_NANOS} cadence, not once per ACK, and
- * must go back to an untimed park once the stream stops.
+ * The ack watermark is written by the I/O thread on every ACK, so an ACK that
+ * lands inside the active segment is visible in the mmap the moment
+ * {@link CursorSendEngine#acknowledge} returns and costs the segment manager
+ * nothing: no wake, no timed pass, no state to re-arm.
  */
 public class SegmentManagerAckWatermarkLagTest {
     private String tmpDir;
@@ -83,161 +78,39 @@ public class SegmentManagerAckWatermarkLagTest {
         Files.remove(tmpDir);
     }
 
-    @Test(timeout = 20_000L)
-    public void testAcksInsideActiveSegmentReachWatermarkWithoutOtherActivity() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            long segmentSize = MmapSegment.HEADER_SIZE + 64 * (MmapSegment.FRAME_HEADER_SIZE + 32L);
-            MmapSegment initial = MmapSegment.create(tmpDir + "/sf-0000000000000000.sfa", 0L, segmentSize);
-            SegmentRing ring = new SegmentRing(initial, segmentSize);
-            AckWatermark watermark = AckWatermark.open(tmpDir);
-            Assert.assertNotNull(watermark);
-            long payload = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
-            try (SegmentManager manager = new SegmentManager(segmentSize, new SegmentBudget(segmentSize * 8))) {
-                manager.register(ring, tmpDir, watermark);
-                manager.start();
-                // Three rounds: the first ACK after a fully persisted watermark
-                // must wake a worker that is parked without a timeout, every time.
-                for (int round = 0; round < 3; round++) {
-                    for (int i = 0; i < 10; i++) {
-                        Assert.assertTrue(ring.appendOrFsn(payload, 32) >= 0);
-                    }
-                    long acked = round * 10 + 9;
-                    ring.acknowledge(acked);
-                    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-                    while (watermark.read() != acked && System.nanoTime() < deadline) {
-                        Thread.sleep(1);
-                    }
-                    Assert.assertEquals("watermark did not catch up with ACKs in round " + round,
-                            acked, watermark.read());
-                }
-            } finally {
-                Unsafe.free(payload, 32, MemoryTag.NATIVE_DEFAULT);
-                watermark.close();
-                ring.close();
-            }
-        });
-    }
-
     /**
-     * The round-0 case above with the startup race removed: register seeds the
-     * ring's persisted-ACK mark so that the very first ACK wakes the worker.
-     * Wait until the worker is parked without a timeout before acking, so the
-     * register wake cannot service the ACK by accident.
+     * The manager is never started, so nothing but the acknowledging thread
+     * can have written the watermark.
      */
     @Test(timeout = 20_000L)
-    public void testFirstAckAfterRegisterWakesParkedWorker() throws Exception {
+    public void testAckWritesWatermarkBeforeReturning() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             long segmentSize = MmapSegment.HEADER_SIZE + 64 * (MmapSegment.FRAME_HEADER_SIZE + 32L);
-            MmapSegment initial = MmapSegment.create(tmpDir + "/sf-0000000000000000.sfa", 0L, segmentSize);
-            SegmentRing ring = new SegmentRing(initial, segmentSize);
-            AckWatermark watermark = AckWatermark.open(tmpDir);
-            Assert.assertNotNull(watermark);
             long payload = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
-            try (SegmentManager manager = new SegmentManager(segmentSize, new SegmentBudget(segmentSize * 8))) {
-                manager.register(ring, tmpDir, watermark);
-                manager.start();
-                Thread worker = manager.getWorkerThreadForTesting();
-                Assert.assertNotNull(worker);
-                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-                while (worker.getState() != Thread.State.WAITING && System.nanoTime() < deadline) {
-                    Thread.sleep(1);
-                }
-                Assert.assertEquals("worker must park without a timeout once the register wake is serviced",
-                        Thread.State.WAITING, worker.getState());
+            try (SegmentManager manager = new SegmentManager(segmentSize, new SegmentBudget(segmentSize * 8));
+                 CursorSendEngine engine = new CursorSendEngine(tmpDir, segmentSize, manager);
+                 AckWatermark probe = AckWatermark.open(tmpDir)) {
+                Assert.assertNotNull(probe);
                 for (int i = 0; i < 10; i++) {
-                    Assert.assertTrue(ring.appendOrFsn(payload, 32) >= 0);
+                    engine.appendBlocking(payload, 32);
                 }
-                ring.acknowledge(9L);
-                deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
-                while (watermark.read() != 9L && System.nanoTime() < deadline) {
-                    Thread.sleep(1);
-                }
-                Assert.assertEquals("the first ACK after register did not wake the parked worker",
-                        9L, watermark.read());
+                Assert.assertTrue(engine.acknowledge(9L));
+                Assert.assertEquals(9L, probe.read());
+                Assert.assertFalse("re-ack must be a no-op", engine.acknowledge(9L));
+                Assert.assertFalse("clamped at publishedFsn, already acked", engine.acknowledge(100L));
+                Assert.assertEquals(9L, probe.read());
             } finally {
                 Unsafe.free(payload, 32, MemoryTag.NATIVE_DEFAULT);
-                watermark.close();
-                ring.close();
-            }
-        });
-    }
-
-    /**
-     * A recovered ring (acked before register) on a running worker: the worker
-     * services the entry and arms the ACK wake before register() returns.
-     * register() must not overwrite that arm, or later ACKs inside the active
-     * segment wake nothing and the watermark stops.
-     */
-    @Test(timeout = 20_000L)
-    public void testRegisterKeepsAckWakeArmedByAnEarlyWorkerPass() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            long segmentSize = MmapSegment.HEADER_SIZE + 64 * (MmapSegment.FRAME_HEADER_SIZE + 32L);
-            MmapSegment initial = MmapSegment.create(tmpDir + "/sf-0000000000000000.sfa", 0L, segmentSize);
-            SegmentRing ring = new SegmentRing(initial, segmentSize);
-            AckWatermark watermark = AckWatermark.open(tmpDir);
-            Assert.assertNotNull(watermark);
-            long payload = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
-            try (SegmentManager manager = new SegmentManager(segmentSize, new SegmentBudget(segmentSize * 8))) {
-                for (int i = 0; i < 10; i++) {
-                    Assert.assertTrue(ring.appendOrFsn(payload, 32) >= 0);
-                }
-                ring.acknowledge(9L);
-                manager.start();
-                Thread worker = manager.getWorkerThreadForTesting();
-                Assert.assertNotNull(worker);
-                AtomicLong passes = new AtomicLong();
-                AtomicLong passesBeforeRegisterWake = new AtomicLong();
-                manager.setBeforeTrimSyncHook(passes::incrementAndGet);
-                manager.setAfterRegisterPublishHook(() -> {
-                    // Persisted, then re-armed by a timed pass: only an armed worker parks untimed.
-                    manager.wakeWorker();
-                    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-                    while ((watermark.read() != 9L || worker.getState() != Thread.State.WAITING)
-                            && System.nanoTime() < deadline) {
-                        LockSupport.parkNanos(1_000_000L);
-                    }
-                    passesBeforeRegisterWake.set(passes.get());
-                });
-                manager.register(ring, tmpDir, watermark);
-                Assert.assertEquals("the worker did not service the entry inside register()", 9L, watermark.read());
-                // register() ends by waking the worker. Ack only after that pass has
-                // read the ACK and the worker has parked again: an ACK it reads would
-                // be persisted by the pass itself and mask a disarmed wake. A pass
-                // count is needed because a just-unparked thread still reports
-                // WAITING until it runs.
-                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-                while ((passes.get() == passesBeforeRegisterWake.get() || worker.getState() != Thread.State.WAITING)
-                        && System.nanoTime() < deadline) {
-                    Thread.sleep(1);
-                }
-                Assert.assertEquals("the worker did not re-park after the register wake",
-                        Thread.State.WAITING, worker.getState());
-
-                for (int i = 0; i < 10; i++) {
-                    Assert.assertTrue(ring.appendOrFsn(payload, 32) >= 0);
-                }
-                ring.acknowledge(19L);
-                deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-                while (watermark.read() != 19L && System.nanoTime() < deadline) {
-                    Thread.sleep(1);
-                }
-                Assert.assertEquals("an ACK after register did not wake the armed worker", 19L, watermark.read());
-            } finally {
-                Unsafe.free(payload, 32, MemoryTag.NATIVE_DEFAULT);
-                watermark.close();
-                ring.close();
             }
         });
     }
 
     @Test(timeout = 30_000L)
-    public void testStreamingAcksWakeWorkerOnWatermarkCadenceNotPerAck() throws Exception {
+    public void testStreamingAcksInsideActiveSegmentNeverWakeWorker() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final int acks = 20_000;
-            final long spacingNanos = 20_000L; // 50k ACK/s
-            // Segment large enough that every frame lands in the active
-            // segment below the hot-spare high-water mark: no rotation, no
-            // trim, nothing but ACKs reaches the worker.
+            // Every frame lands in the active segment below the hot-spare
+            // high-water mark: no rotation, no trim, nothing for the worker.
             long segmentSize = MmapSegment.HEADER_SIZE + (acks * 2L + 64) * (MmapSegment.FRAME_HEADER_SIZE + 32L);
             MmapSegment initial = MmapSegment.create(tmpDir + "/sf-0000000000000000.sfa", 0L, segmentSize);
             SegmentRing ring = new SegmentRing(initial, segmentSize);
@@ -246,8 +119,6 @@ public class SegmentManagerAckWatermarkLagTest {
             long payload = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
             AtomicLong passes = new AtomicLong();
             try (SegmentManager manager = new SegmentManager(segmentSize, new SegmentBudget(segmentSize * 8))) {
-                // Runs once per serviceRing pass, i.e. once per worker wake or
-                // timed park expiry for this ring.
                 manager.setBeforeTrimSyncHook(passes::incrementAndGet);
                 manager.register(ring, tmpDir, watermark);
                 manager.start();
@@ -256,34 +127,11 @@ public class SegmentManagerAckWatermarkLagTest {
                 }
                 Thread.sleep(50); // let the register wake settle
                 passes.set(0);
-
-                long start = System.nanoTime();
-                long next = start;
-                for (int seq = 0; seq < acks; ) {
-                    if (System.nanoTime() - next >= 0) {
-                        ring.acknowledge(seq++);
-                        next += spacingNanos;
-                    }
+                for (int seq = 0; seq < acks; seq++) {
+                    ring.acknowledge(seq);
                 }
-                long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
-
-                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-                while (watermark.read() != acks - 1 && System.nanoTime() < deadline) {
-                    Thread.sleep(1);
-                }
-                Assert.assertEquals("watermark did not catch up after the ACK stream", acks - 1, watermark.read());
-                long streamPasses = passes.get();
-                // One wake for the first ACK, then at most one pass per
-                // WATERMARK_LAG_NANOS; x2 leaves room for scheduler jitter.
-                long bound = elapsedMillis * 2 + 16;
-                Assert.assertTrue("worker ran " + streamPasses + " passes for " + acks + " ACKs over "
-                        + elapsedMillis + " ms; bound " + bound, streamPasses <= bound);
-
-                // Once the stream stops the worker re-arms the ACK wake and
-                // parks without a timeout: no further passes while idle.
                 Thread.sleep(100);
-                long idlePasses = passes.get() - streamPasses;
-                Assert.assertTrue("worker kept ticking while idle: " + idlePasses + " passes", idlePasses <= 2);
+                Assert.assertEquals("worker ran for ACKs inside the active segment", 0L, passes.get());
             } finally {
                 Unsafe.free(payload, 32, MemoryTag.NATIVE_DEFAULT);
                 watermark.close();

@@ -7,7 +7,7 @@ file is that enumeration. Any new writer of a listed input must add itself
 here and ring the listed doorbell; any new input to a park predicate must add
 a row.
 
-Line numbers are as of 3362671f.
+Line numbers are as of 3362671f; the ACK-watermark row was removed after it (see Consumer B).
 
 ## Doorbells
 
@@ -58,17 +58,19 @@ No open gaps.
 | failed spare create | worker | `provisionRetryDeadlineNanos` timed | — |
 | periodic data sync | clock | `nextDataSyncNanos` timed | — |
 | sync-before-rotation request | `appendOrFsn` `:1082` | `wakeManager`; the producer then polls at 50 µs in `CursorSendEngine.appendBlocking` `:972` (poll, see Residuals) | — |
-| ACK watermark: `ackedFsn > lastPersistedAck` | `acknowledge` `:1023` | wakes iff `before <= persistedAckFsn` (armed); disarmed → `WATERMARK_LAG_NANOS` timed; Dekker at `:1510` | 39ac01e9, 779a99bc, 1304f71d |
 | `running` | `close` `:335` | `unpark` | — |
 | durability failure | `servicePeriodicSync` | producer throws on next append; sync retry timed | — |
 
-No open gaps. The ACK-watermark row is the one that took four commits: its
-state is three variables in two objects under two different disciplines —
-`SegmentRing.persistedAckFsn` (volatile, read by the ACK path), and
-`RingEntry.ackWakeArmed` + `RingEntry.lastPersistedAck` (manager lock) — with
-the invariant "`ackWakeArmed` ⇔ `persistedAckFsn == lastPersistedAck`"
-maintained by hand at three sites (`:720`, `:1209-1210`, `:1281-1282`). See
-Recommendation.
+No open gaps. The ACK watermark is no longer a manager input: the I/O thread
+writes it in `CursorSendEngine.acknowledge` (a store into the mmap, no
+syscall), and the worker only `sync()`s it before unlinking a trimmed segment.
+That removed the row that took four commits (39ac01e9, 779a99bc, 1304f71d,
+3362671f): `SegmentRing.persistedAckFsn`, `RingEntry.ackWakeArmed`,
+`RingEntry.lastPersistedAck`, `WATERMARK_LAG_NANOS` and the Dekker between
+them. A `write` racing the worker's msync can leave one torn record on disk;
+the record fails its CRC and recovery takes the other slot, then the
+`max(lowestBase - 1, watermark)` clamp — the watermark was always a
+discardable optimization under that clamp.
 
 ## Consumer C — ack waiters
 
@@ -114,23 +116,19 @@ Predicate: `getAckedFsn() >= target`, or a terminal: connection error, durabilit
 2. The worker's doorbell is a one-bit park permit. Any contended j.u.c lock
    the worker blocks on between servicing and `park` (an SLF4J appender lock
    behind its LOG calls is the only candidate found) consumes a pending
-   permit. In disk mode the `ackedFsn > lastPersistedAck` timed park covers
-   it; in memory mode an ACK that completed a sealed segment during that
-   window is trimmed one segment late. Cheap guard if wanted: skip the park
-   when `firstTrimmable() != null`.
+   permit. An ACK that completed a sealed segment during that window is
+   trimmed one segment late. Cheap guard if wanted: skip the park when
+   `firstTrimmable() != null`.
 3. `CursorSendEngine.appendOrFsn(addr, len, spinDeadline)` (`:991`) has no
    callers in `core/src/main`.
 4. `BackgroundDrainer` `:1264` polls `POLL_NANOS`; not the foreground path.
 
 ## Recommendation
 
-Collapse the ACK-watermark arm state to one variable owned by the worker:
-`SegmentRing.ackWakeMark` (volatile long), `Long.MAX_VALUE` = disarmed,
-otherwise the FSN the mark was armed at. `acknowledge` wakes iff
-`before <= ackWakeMark`; `ackWakeArmed` becomes `mark != MAX_VALUE`;
-`lastPersistedAck` stays as plain watermark bookkeeping. That removes the
-cross-object invariant that 779a99bc, 1304f71d and 3362671f were each
-repairing, and makes the register seed a single store with no ordering story.
-Model it in `design/tla` next to `IdleWait` before changing it: IdleWait is
-the only wake path on this branch whose bug was found mechanically rather
-than by a reviewer probe.
+Keep moving state to the thread that produces it instead of adding wake
+protocols for it. Done: the ACK watermark (above). Next: the producer creates
+its own next segment at rotation (removes `needsHotSpare`, the high-water
+backup wake, the provision retry, the liveness floor and the budget's refused
+list), then the worker becomes a queue of blocking disk work (trim unlink +
+directory fsync, periodic sync) whose park-if-empty is lost-wake-free by
+construction.

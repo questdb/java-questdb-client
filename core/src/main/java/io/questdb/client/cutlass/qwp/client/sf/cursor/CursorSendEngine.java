@@ -905,7 +905,16 @@ public final class CursorSendEngine implements QuietCloseable {
      * at publishedFsn).
      */
     public boolean acknowledge(long seq) {
-        return ring.acknowledge(seq);
+        if (!ring.acknowledge(seq)) {
+            return false;
+        }
+        // Single writer of the watermark: a store into the mmap, no syscall.
+        // The manager msyncs it before it unlinks a trimmed segment, and a
+        // crash replays only what landed after the last store.
+        if (watermark != null) {
+            watermark.write(ring.ackedFsn());
+        }
+        return true;
     }
 
     /**
@@ -1255,9 +1264,10 @@ public final class CursorSendEngine implements QuietCloseable {
         }
         // On a fully-drained close, persist the final acked FSN through the
         // still-mapped watermark BEFORE closing the ring/watermark and BEFORE
-        // unlinking any segment file. The manager persists the watermark only
-        // on its own tick, so it may lag the final ack. If any part of this
-        // covering barrier fails, retain the ring, watermark and slot flock:
+        // unlinking any segment file. The I/O thread wrote it on every ACK
+        // but only the manager's trim syncs it, so it may not be durable yet.
+        // If any part of this covering barrier fails, retain the ring,
+        // watermark and slot flock:
         // publishing the slot would let a successor recover acknowledged
         // residue from a stale durable watermark. The shared retry driver owns
         // convergence after the one-shot public close reports the failure.
@@ -1287,9 +1297,9 @@ public final class CursorSendEngine implements QuietCloseable {
                 ring.close();
             } catch (Throwable ignored) {
             }
-            // Close the watermark mmap/fd after the manager (which
-            // writes through it) is gone but before the slot lock is
-            // released. On fully-drained close, also unlink the file
+            // Close the watermark mmap/fd after the I/O loop (which writes
+            // it) and the manager (which syncs it) are gone but before the
+            // slot lock is released. On fully-drained close, also unlink the file
             // -- a stale watermark with no segments behind it would
             // confuse a future recovery cycle if (it wouldn't actually
             // confuse current recovery, which only reads the watermark
