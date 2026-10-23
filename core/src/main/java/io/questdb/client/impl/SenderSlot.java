@@ -67,14 +67,14 @@ final class SenderSlot {
     // longer matches. Volatile so a stale handle on another thread observes
     // the latest value without taking the pool lock.
     private volatile long generation;
-    private volatile long idleSinceMillis;
+    private volatile long idleSinceNanos;
 
     SenderSlot(Sender delegate, SenderPool pool, int slotIndex) {
         this.delegate = delegate;
         this.pool = pool;
         this.slotIndex = slotIndex;
         this.createdAtMillis = System.currentTimeMillis();
-        this.idleSinceMillis = this.createdAtMillis;
+        this.idleSinceNanos = System.nanoTime();
     }
 
     /**
@@ -98,8 +98,8 @@ final class SenderSlot {
         return generation;
     }
 
-    long idleSinceMillis() {
-        return idleSinceMillis;
+    long idleSinceNanos() {
+        return idleSinceNanos;
     }
 
     /**
@@ -125,8 +125,8 @@ final class SenderSlot {
         groupOpenedAtNanos = Long.MIN_VALUE;
     }
 
-    void markIdleAt(long nowMillis) {
-        idleSinceMillis = nowMillis;
+    void markIdleAt(long nowNanos) {
+        idleSinceNanos = nowNanos;
     }
 
     SenderPool pool() {

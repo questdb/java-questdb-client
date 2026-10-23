@@ -1526,7 +1526,7 @@ public class QwpWebSocketSender implements Sender {
         if (currentTableBuffer != null && currentTableBuffer.hasInProgressRow()) {
             return;
         }
-        if (shouldAutoFlush()) {
+        if (shouldAutoFlush(false)) {
             flushPendingRows(transactional);
         }
     }
@@ -3321,6 +3321,11 @@ public class QwpWebSocketSender implements Sender {
     }
 
     @Override
+    public long pendingBatchStartNanos() {
+        return firstPendingRowTimeNanos;
+    }
+
+    @Override
     public int pendingRowCount() {
         return pendingRowCount;
     }
@@ -4165,7 +4170,7 @@ public class QwpWebSocketSender implements Sender {
             // lease. Flush it at once when it reaches the same 90 percent budget the
             // default byte trigger uses.
             int cap = serverMaxBatchSize;
-            if (shouldAutoFlush() || (cap > 0 && getPendingBytes() >= byteBudgetForCap(cap))) {
+            if (shouldAutoFlush(false) || (cap > 0 && getPendingBytes() >= byteBudgetForCap(cap))) {
                 flushPendingRows(transactional);
             }
         }
@@ -4955,8 +4960,10 @@ public class QwpWebSocketSender implements Sender {
      * list and one hash probe per table, for the whole flush.
      */
     private int collectNonEmptyTables(ObjList<CharSequence> keys) {
-        flushTableNames.clear();
-        flushTableBuffers.clear();
+        // setPos(0), not clear(): clear() fills the whole backing array on
+        // every flush; the entries are overwritten before they are read.
+        flushTableNames.setPos(0);
+        flushTableBuffers.setPos(0);
         for (int i = 0, n = keys.size(); i < n; i++) {
             CharSequence tableName = keys.getQuick(i);
             if (tableName == null) {
@@ -5811,9 +5818,9 @@ public class QwpWebSocketSender implements Sender {
                 tableBuffer.reset();
             }
         }
-        // Drop the references; the next flush re-collects.
-        flushTableNames.clear();
-        flushTableBuffers.clear();
+        // Forget the references; the next flush re-collects and overwrites.
+        flushTableNames.setPos(0);
+        flushTableBuffers.setPos(0);
         if (currentTableBuffer != null && currentTableBuffer.hasHeldRow()) {
             // autoFlushAfterRow shipped every row but the one it held back, which
             // stays buffered as the only pending row. currentBatchMaxSymbolId keeps
@@ -7463,7 +7470,7 @@ public class QwpWebSocketSender implements Sender {
         pendingBytes += bufferedNow - currentTableBufferSnapshotBytes;
         currentTableBufferSnapshotBytes = bufferedNow;
 
-        if (shouldAutoFlush()) {
+        if (shouldAutoFlush(true)) {
             autoFlushAfterRow();
         }
     }
@@ -7471,7 +7478,7 @@ public class QwpWebSocketSender implements Sender {
     /**
      * Checks if any auto-flush threshold is exceeded.
      */
-    private boolean shouldAutoFlush() {
+    private boolean shouldAutoFlush(boolean perRow) {
         if (pendingRowCount <= 0) {
             return false;
         }
@@ -7482,6 +7489,17 @@ public class QwpWebSocketSender implements Sender {
             return true;
         }
         if (autoFlushIntervalNanos > 0) {
+            if (perRow) {
+                // The first pending row stamped the clock a moment ago (age
+                // zero by construction). Past 16 pending rows the check runs
+                // on every 16th row only: a slow producer never gets past 16
+                // and is checked on every row, a fast one overshoots the age
+                // bound by at most 16 rows' time. Release and housekeeper
+                // checks pass perRow=false and always read the clock.
+                if (pendingRowCount == 1 || (pendingRowCount > 16 && (pendingRowCount & 15) != 0)) {
+                    return false;
+                }
+            }
             long ageNanos = System.nanoTime() - firstPendingRowTimeNanos;
             return ageNanos >= autoFlushIntervalNanos;
         }

@@ -279,14 +279,19 @@ class QwpColumnWriter {
         }
     }
 
-    private void writeTableHeader(String tableName, int rowCount, QwpColumnDef[] columns) {
-        buffer.putString(tableName);
+    private void putEncoded(byte[] bytes) {
+        int n = bytes.length;
+        buffer.ensureCapacity(n);
+        Unsafe.getUnsafe().copyMemory(bytes, Unsafe.BYTE_OFFSET, null, buffer.getWriteAddress(), n);
+        buffer.skip(n);
+    }
+
+    private void writeTableHeader(QwpTableBuffer tableBuffer, int rowCount) {
+        // Names and column definitions are pre-encoded on the table buffer; a
+        // frame copies them instead of re-encoding the strings.
+        putEncoded(tableBuffer.getEncodedTableName());
         buffer.putVarint(rowCount);
-        buffer.putVarint(columns.length);
-        for (QwpColumnDef col : columns) {
-            buffer.putString(col.getName());
-            buffer.putByte(col.getWireTypeCode());
-        }
+        putEncoded(tableBuffer.getEncodedColumnDefs());
     }
 
     private void writeTimestampColumn(long addr, int count, boolean useGorilla) {
@@ -343,7 +348,7 @@ class QwpColumnWriter {
     ) {
         QwpColumnDef[] columnDefs = tableBuffer.getColumnDefs();
 
-        writeTableHeader(tableBuffer.getTableName(), rowCount, columnDefs);
+        writeTableHeader(tableBuffer, rowCount);
 
         for (int i = 0; i < tableBuffer.getColumnCount(); i++) {
             QwpTableBuffer.ColumnBuffer col = tableBuffer.getColumn(i);

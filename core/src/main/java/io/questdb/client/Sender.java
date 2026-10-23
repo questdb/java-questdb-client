@@ -805,6 +805,16 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     }
 
     /**
+     * Pool support: {@code System.nanoTime()} taken when the first row of the
+     * pending batch was appended, or 0 when nothing is pending. A release uses
+     * it as "now" for its window and idle bookkeeping instead of reading the
+     * clock again; the staleness is bounded by the lease's own duration.
+     */
+    default long pendingBatchStartNanos() {
+        return 0L;
+    }
+
+    /**
      * Number of rows appended with {@link #at}/{@link #atNow()} that have not
      * been shipped to the server yet. Only the WebSocket QWP transport counts
      * pending rows; other transports return {@code 0}.

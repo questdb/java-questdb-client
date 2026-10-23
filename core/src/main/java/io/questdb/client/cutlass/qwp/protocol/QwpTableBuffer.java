@@ -66,6 +66,11 @@ public class QwpTableBuffer implements QuietCloseable {
     private final QwpWebSocketSender sender;
     private final String tableName;
     private QwpColumnDef[] cachedColumnDefs;
+    // Wire form of the table name and of the column definitions (count varint,
+    // then per column: name length varint, UTF-8 name, type byte), cached so a
+    // frame copies them instead of re-encoding the strings.
+    private final byte[] encodedTableName;
+    private byte[] encodedColumnDefs;
     private int columnAccessCursor; // tracks expected next column index
     private boolean columnDefsCacheValid;
     private int committedColumnCount; // columns that existed at last nextRow()
@@ -101,6 +106,7 @@ public class QwpTableBuffer implements QuietCloseable {
      */
     public QwpTableBuffer(String tableName, QwpWebSocketSender sender) {
         this.tableName = tableName;
+        this.encodedTableName = encodeName(tableName);
         this.sender = sender;
         this.columns = new ObjList<>();
         this.columnNameToIndex = new LowerCaseCharSequenceIntHashMap();
@@ -194,9 +200,69 @@ public class QwpTableBuffer implements QuietCloseable {
                 ColumnBuffer col = columns.get(i);
                 cachedColumnDefs[i] = new QwpColumnDef(col.name, col.type);
             }
+            encodedColumnDefs = encodeColumnDefs(cachedColumnDefs);
             columnDefsCacheValid = true;
         }
         return cachedColumnDefs;
+    }
+
+    /**
+     * Wire form of the column definitions, valid after {@link #getColumnDefs()}.
+     */
+    public byte[] getEncodedColumnDefs() {
+        getColumnDefs();
+        return encodedColumnDefs;
+    }
+
+    /**
+     * Wire form of the table name: length varint, then UTF-8 bytes.
+     */
+    public byte[] getEncodedTableName() {
+        return encodedTableName;
+    }
+
+    private static byte[] encodeColumnDefs(QwpColumnDef[] defs) {
+        byte[][] names = new byte[defs.length][];
+        int size = varintSize(defs.length);
+        for (int i = 0; i < defs.length; i++) {
+            names[i] = defs[i].getName().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            size += varintSize(names[i].length) + names[i].length + 1;
+        }
+        byte[] out = new byte[size];
+        int pos = putVarint(out, 0, defs.length);
+        for (int i = 0; i < defs.length; i++) {
+            pos = putVarint(out, pos, names[i].length);
+            System.arraycopy(names[i], 0, out, pos, names[i].length);
+            pos += names[i].length;
+            out[pos++] = defs[i].getWireTypeCode();
+        }
+        return out;
+    }
+
+    private static byte[] encodeName(String name) {
+        byte[] utf8 = name.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] out = new byte[varintSize(utf8.length) + utf8.length];
+        int pos = putVarint(out, 0, utf8.length);
+        System.arraycopy(utf8, 0, out, pos, utf8.length);
+        return out;
+    }
+
+    private static int putVarint(byte[] dst, int pos, long value) {
+        while (value > 0x7F) {
+            dst[pos++] = (byte) ((value & 0x7F) | 0x80);
+            value >>>= 7;
+        }
+        dst[pos++] = (byte) value;
+        return pos;
+    }
+
+    private static int varintSize(long value) {
+        int n = 1;
+        while (value > 0x7F) {
+            value >>>= 7;
+            n++;
+        }
+        return n;
     }
 
     /**
@@ -1686,6 +1752,9 @@ public class QwpTableBuffer implements QuietCloseable {
         }
 
         public void reset() {
+            // Capture before clearing: only markNull sets bits, so a batch
+            // without nulls leaves the bitmap all-zero and skips the memset.
+            boolean hadNulls = hasNulls;
             size = 0;
             valueCount = 0;
             hasNulls = false;
@@ -1702,10 +1771,13 @@ public class QwpTableBuffer implements QuietCloseable {
             if (stringData != null) {
                 stringData.truncate();
             }
-            if (nullBufPtr != 0) {
+            if (nullBufPtr != 0 && hadNulls) {
                 Vect.memset(nullBufPtr, (long) nullBufCapRows >>> 3, 0);
             }
-            if (symbolDict != null) {
+            // The local dictionary is populated only without a sender (local
+            // ids); with global ids it stays empty, and clearing an empty map
+            // fills three arrays on every flush for nothing.
+            if (symbolDict != null && symbolList.size() > 0) {
                 symbolDict.clear();
                 symbolList.clear();
             }
@@ -1836,7 +1908,7 @@ public class QwpTableBuffer implements QuietCloseable {
                 geohashPrecision = -1;
                 maxGlobalSymbolId = -1;
                 storeGlobalSymbolIdsOnly = false;
-                if (symbolDict != null) {
+                if (symbolDict != null && symbolList.size() > 0) {
                     symbolDict.clear();
                     symbolList.clear();
                 }
@@ -2079,7 +2151,7 @@ public class QwpTableBuffer implements QuietCloseable {
             geohashPrecision = -1;
             maxGlobalSymbolId = -1;
             storeGlobalSymbolIdsOnly = false;
-            if (symbolDict != null) {
+            if (symbolDict != null && symbolList.size() > 0) {
                 symbolDict.clear();
                 symbolList.clear();
             }

@@ -216,6 +216,7 @@ public final class PooledSender implements Sender {
         BatchTooLargeForCapException capRejection = null;
         int droppedLeaseRows = 0;
         int pendingRowsAtRetire = 0;
+        long nowNanos = 0L;
         try {
             // live(), not delegate(): re-validate the generation right before
             // touching the delegate, narrowing the duplicate-close race.
@@ -230,7 +231,9 @@ public final class PooledSender implements Sender {
                     // Pool shutting down: ship here so a failure reaches the caller.
                     delegate.flush();
                 } else {
-                    ship(pool, delegate);
+                    // Read before the ship resets the delegate's stamp.
+                    nowNanos = nowNanos(delegate);
+                    ship(pool, delegate, nowNanos);
                 }
                 recycle = true;
             } catch (RuntimeException e) {
@@ -264,7 +267,7 @@ public final class PooledSender implements Sender {
             }
         } finally {
             if (recycle) {
-                pool.giveBack(this);
+                pool.giveBack(this, nowNanos);
             } else {
                 // The probe, the cancel or the ship threw: the delegate has
                 // latched an error, the flush failed, or the generation went
@@ -598,10 +601,20 @@ public final class PooledSender implements Sender {
      *       auto-flush threshold trips.</li>
      * </ul>
      */
-    private void ship(SenderPool pool, Sender delegate) {
+    /**
+     * "Now" for release-time bookkeeping: the delegate's first-pending-row
+     * stamp when it has one, taken earlier in this lease and so stale by at
+     * most the lease's duration, else a fresh clock read.
+     */
+    private static long nowNanos(Sender delegate) {
+        long stamp = delegate.pendingBatchStartNanos();
+        return stamp != 0L ? stamp : System.nanoTime();
+    }
+
+    private void ship(SenderPool pool, Sender delegate, long nowNanos) {
         if (pool.hasCommitWindow()) {
             boolean closes = slot.windowCloses(delegate.rowsAppended(), delegate.hasDeferredFrames(),
-                    System.nanoTime(), pool.commitRows(), pool.commitIntervalNanos());
+                    nowNanos, pool.commitRows(), pool.commitIntervalNanos());
             if (closes) {
                 delegate.flush();
                 slot.markCommitted(delegate.rowsAppended());
