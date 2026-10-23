@@ -39,6 +39,9 @@ import io.questdb.client.cutlass.qwp.client.QwpIngressRoleRejectedException;
 import io.questdb.client.cutlass.qwp.client.QwpRoleMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpVersionMismatchException;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
+import io.questdb.client.cutlass.qwp.client.sf.record.QwoFormat;
+import io.questdb.client.cutlass.qwp.client.sf.record.QwoMaterializer;
+import io.questdb.client.cutlass.qwp.client.sf.record.QwoRecordReader;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
 import io.questdb.client.std.CharSequenceLongHashMap;
@@ -272,6 +275,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * Throttle "reconnect attempt N failed" WARN logs to one per 5 s.
      */
     private static final long RECONNECT_LOG_THROTTLE_NANOS = 5_000_000_000L;
+    private static final int RECORD_FRAME_SCRATCH_CAPACITY = 64 * 1024;
     // Test seam: when true, recovery mirror seeding throws immediately AFTER
     // ensureSentDictCapacity has grown (and therefore taken ownership of) the mirror,
     // standing in for the copyRecoveredSymbolSuffix-adjacent failure that leaves a
@@ -330,6 +334,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private final ReconnectFactory reconnectFactory;
     private final long reconnectInitialBackoffMillis;
     private final long reconnectMaxBackoffMillis;
+    // Header view of the sealed QWO1 record trySendOne is about to send. I/O-thread-only.
+    private final QwoRecordReader recordReader = new QwoRecordReader();
     private final WebSocketResponse response = new WebSocketResponse();
     private final ResponseHandler responseHandler = new ResponseHandler();
     private final CountDownLatch shutdownLatch = new CountDownLatch(1);
@@ -390,6 +396,15 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private long catchUpFrameAddr;
     private int catchUpFrameCapacity;
     private int catchUpFrameGrowthCount;
+    // A sealed QWO1 record goes out as the QWP frame the legacy encoder builds for
+    // the same rows: trySendOne materialises it into recordFrameScratch and sends
+    // that. Both own native memory, so the first record creates them (a loop that
+    // never sends a record allocates nothing, and a constructor that throws has
+    // nothing to free); after that the scratch only grows, amortised. Like the
+    // catch-up buffer they are I/O-thread-owned and freed on the I/O thread's exit
+    // path, or by close() when the loop never ran.
+    private NativeBufferWriter recordFrameScratch;
+    private QwoMaterializer recordMaterializer;
     // Orphan-policy cap-gap attempts -- catch-ups that reached a node and found an entry
     // too large for its batch cap -- with no intervening successful catch-up or unrelated
     // reconnect state (see MAX_CATCHUP_CAP_GAP_ATTEMPTS for the full budget accounting).
@@ -1506,6 +1521,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         }
         if (loopNeverRan) {
             freeCatchUpFrameBuffer();
+            freeRecordFrameBuffers();
         }
     }
 
@@ -2749,6 +2765,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 releaseSentDictBytes();
             }
             freeCatchUpFrameBuffer();
+            freeRecordFrameBuffers();
             shutdownLatch.countDown();
             Runnable closeCallback = delegatedClose;
             if (closeCallback != null) {
@@ -3077,8 +3094,24 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         if (encodedCount < 0L) {
             return; // malformed -- never happens for frames we encoded
         }
-        long deltaCount = encodedCount >>> 3;
         p += encodedCount & 7L;
+        accumulateSentDictEntries(p, (int) (limit - p), deltaStart, encodedCount >>> 3);
+    }
+
+    /**
+     * Copies the part of a just-sent frame's dictionary delta that extends past
+     * the mirror's tip into the mirror. Shared by plain QWP frames
+     * ({@link #accumulateSentDict}) and sealed QWO1 records, whose header holds
+     * the range and whose dictionary region holds the entries.
+     *
+     * @param entriesAddr address of the delta's first {@code [len varint][utf8]} entry
+     * @param entriesLen  bytes the entry walk may read from {@code entriesAddr}
+     * @param deltaStart  the delta's first id
+     * @param deltaCount  the number of entries in the delta
+     */
+    private void accumulateSentDictEntries(long entriesAddr, int entriesLen, int deltaStart, long deltaCount) {
+        long p = entriesAddr;
+        long limit = entriesAddr + entriesLen;
         // The mirror holds ids [0, sentDictCount). Accumulate ONLY the part of this
         // frame's delta [deltaStart, deltaStart+deltaCount) that extends past the
         // tip -- ids [sentDictCount, deltaStart+deltaCount). Cases:
@@ -3675,6 +3708,57 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         }
     }
 
+    private void freeRecordFrameBuffers() {
+        if (recordMaterializer != null) {
+            recordMaterializer.close();
+            recordMaterializer = null;
+        }
+        if (recordFrameScratch != null) {
+            recordFrameScratch.close();
+            recordFrameScratch = null;
+        }
+    }
+
+    /**
+     * Materialises the sealed record in {@link #recordReader} into
+     * {@link #recordFrameScratch} as one QWP frame, starting at the scratch's
+     * first byte.
+     *
+     * @param entriesLen the record's dictionary entry bytes, already measured
+     * @return the frame's size, or -1 after latching a terminal for a record
+     * whose dictionary header is inconsistent
+     */
+    private int materializeRecord(int entriesLen) {
+        if (entriesLen < 0 || recordReader.dictStartId() < 0) {
+            // Recovery validated every sealed record and the producer seals only what
+            // its writer built, so this is a corrupted ring, not a transient: a replay
+            // would read the same bytes. Latch, like the torn-dictionary guard.
+            recordFatal(new LineSenderException(
+                    "store-and-forward record at offset " + sendOffset + " in segment baseSeq="
+                            + sendingSegment.baseSeq() + " has a malformed symbol dictionary [dictStartId="
+                            + recordReader.dictStartId() + ", dictCount=" + recordReader.dictCount()
+                            + "]; cannot send it -- resend required"));
+            return -1;
+        }
+        try {
+            if (recordMaterializer == null) {
+                recordMaterializer = new QwoMaterializer();
+            }
+            if (recordFrameScratch == null) {
+                recordFrameScratch = new NativeBufferWriter(RECORD_FRAME_SCRATCH_CAPACITY);
+            }
+            recordFrameScratch.reset();
+            return recordMaterializer.write(recordReader, recordFrameScratch);
+        } catch (Throwable t) {
+            // Latch for the reason ensureSentDictCapacity does: a bare throw unwinds to
+            // ioLoop -> fail() -> connectLoop, which reconnects and replays this record,
+            // which fails the same way -- a reconnect livelock instead of a loud failure.
+            // recordFatal flips running=false so the loop winds down.
+            recordFatal(t);
+            throw t;
+        }
+    }
+
     private boolean tryReceiveAcks() {
         boolean any = false;
         try {
@@ -3782,6 +3866,17 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             return false; // payload not fully published yet
         }
         long frameAddr = base + sendOffset + MmapSegment.FRAME_HEADER_SIZE;
+        // A sealed QWO1 record is not itself a wire message. Its header carries the
+        // dictionary range the materialised frame registers, so the guard and the
+        // mirror below treat it exactly like a delta frame starting at dictStartId.
+        boolean isRecord = QwoFormat.isRecordPayload(frameAddr, payloadLen);
+        int deltaStart;
+        if (isRecord) {
+            recordReader.of(frameAddr, payloadLen);
+            deltaStart = recordReader.dictStartId();
+        } else {
+            deltaStart = frameDeltaStart(frameAddr, payloadLen);
+        }
         // Torn-dictionary guard. sentDictCount is this loop's model of how many ids the
         // CURRENT server has been told about. A frame whose delta starts ABOVE that
         // coverage references ids the server was never given, and the server now rejects
@@ -3799,7 +3894,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // A gap here therefore means genuine loss: a host/power crash tore the
         // unsynced .symbol-dict below the ids the surviving frames still reference
         // (SF is process-crash but not host-crash durable).
-        int deltaStart = frameDeltaStart(frameAddr, payloadLen);
         if (deltaStart > sentDictCount) {
             recordFatal(new LineSenderException(
                     "recovered store-and-forward symbol dictionary is incomplete (likely a host crash): "
@@ -3807,8 +3901,19 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                             + sentDictCount + "; cannot replay without corrupting data -- resend required"));
             return false;
         }
+        long sendAddr = frameAddr;
+        int sendLen = payloadLen;
+        int recordEntriesLen = 0;
+        if (isRecord) {
+            recordEntriesLen = recordReader.dictEntriesLen();
+            sendLen = materializeRecord(recordEntriesLen);
+            if (sendLen < 0) {
+                return false;
+            }
+            sendAddr = recordFrameScratch.getBufferPtr();
+        }
         try {
-            client.sendBinary(frameAddr, payloadLen);
+            client.sendBinary(sendAddr, sendLen);
         } catch (Throwable t) {
             fail(t);
             return false;
@@ -3818,16 +3923,19 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // key their poison-strike vs pre-send decision off this, not off nextWireSeq
         // (which the catch-up advances).
         dataFrameSentThisConnection = true;
-        if (deltaStart >= 0) {
-            // Mirror the symbols this frame just registered on the server, so a later
-            // reconnect can rebuild the whole dictionary and the guard above keeps an
-            // accurate view of the server's coverage. Idempotent on replay: a frame
-            // whose delta we already hold advances nothing.
-            //
-            // Ungated (see the constructor): this is the ONLY thing that advances
-            // sentDictCount from the frames themselves, so gating it while leaving the
-            // guard ungated froze the coverage at 0 and terminal'd a slot that replays
-            // perfectly from id 0.
+        // Mirror the symbols this frame just registered on the server, so a later
+        // reconnect can rebuild the whole dictionary and the guard above keeps an
+        // accurate view of the server's coverage. Idempotent on replay: a frame
+        // whose delta we already hold advances nothing.
+        //
+        // Ungated (see the constructor): this is the ONLY thing that advances
+        // sentDictCount from the frames themselves, so gating it while leaving the
+        // guard ungated froze the coverage at 0 and terminal'd a slot that replays
+        // perfectly from id 0.
+        if (isRecord) {
+            accumulateSentDictEntries(recordReader.dictEntriesAddr(), recordEntriesLen,
+                    deltaStart, recordReader.dictCount());
+        } else if (deltaStart >= 0) {
             accumulateSentDict(frameAddr, payloadLen, deltaStart);
         }
         lastFrameOrPingNanos = System.nanoTime();

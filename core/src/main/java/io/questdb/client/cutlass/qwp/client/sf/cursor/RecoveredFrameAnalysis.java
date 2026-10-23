@@ -25,6 +25,8 @@
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
+import io.questdb.client.cutlass.qwp.client.sf.record.QwoFormat;
+import io.questdb.client.cutlass.qwp.client.sf.record.QwoRecordReader;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.QuietCloseable;
@@ -37,12 +39,17 @@ import io.questdb.client.std.str.Utf8s;
  * symbol suffix into the same pass. Running state is checkpointed only at a
  * commit-bearing frame, so a deferred orphan tail can be scanned without ever
  * leaking its metadata or symbols into the committed result.
+ * <p>
+ * A sealed QWO1 record folds like the QWP frame it materialises into: its
+ * header's flags decide the commit boundary, and its header's dictionary range
+ * with the entries in its dictionary region extend the symbol suffix.
  */
 final class RecoveredFrameAnalysis implements QuietCloseable {
 
     private static final int MAX_RAW_BYTES = Integer.MAX_VALUE - 8;
     private final long ackedFsn;
     private final int baseline;
+    private final QwoRecordReader recordReader = new QwoRecordReader();
     private long committedBoundaryFsn = -1L;
     private long committedCoverage;
     private boolean committedGap;
@@ -78,17 +85,25 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
         boolean isQwp = payloadLen >= QwpConstants.HEADER_SIZE
                 && payloadLen > QwpConstants.HEADER_OFFSET_FLAGS
                 && Unsafe.getUnsafe().getInt(payload) == QwpConstants.MAGIC_MESSAGE;
-        byte flags = isQwp
-                ? Unsafe.getUnsafe().getByte(payload + QwpConstants.HEADER_OFFSET_FLAGS)
-                : 0;
-        if (isQwp && (flags & QwpConstants.FLAG_DELTA_SYMBOL_DICT) != 0) {
-            foldDelta(fsn, payload + QwpConstants.HEADER_SIZE, payload + payloadLen);
+        boolean isQwo = !isQwp && QwoFormat.isRecordPayload(payload, payloadLen);
+        byte flags = 0;
+        if (isQwp) {
+            flags = Unsafe.getUnsafe().getByte(payload + QwpConstants.HEADER_OFFSET_FLAGS);
+            if ((flags & QwpConstants.FLAG_DELTA_SYMBOL_DICT) != 0) {
+                foldDelta(fsn, payload + QwpConstants.HEADER_SIZE, payload + payloadLen);
+            }
+        } else if (isQwo) {
+            // The record's flags are the header flags of the frame it materialises into,
+            // and that frame always carries a delta section.
+            recordReader.of(payload, payloadLen);
+            flags = recordReader.flags();
+            foldRecord(fsn);
         }
 
-        // Only a positively identified deferred QWP frame can belong to an
-        // uncommitted tail. Short, foreign or otherwise non-QWP payloads remain
-        // retirement barriers.
-        if (!isQwp || (flags & QwpConstants.FLAG_DEFER_COMMIT) == 0) {
+        // Only a positively identified deferred QWP frame or QWO1 record can belong
+        // to an uncommitted tail. Short, foreign or otherwise unrecognised payloads
+        // remain retirement barriers.
+        if (!(isQwp || isQwo) || (flags & QwpConstants.FLAG_DEFER_COMMIT) == 0) {
             committedBoundaryFsn = fsn;
             committedCoverage = runningCoverage;
             committedGap = runningGap;
@@ -234,7 +249,7 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
     /**
      * Appends one contiguous run of {@code count} wire entries -- {@code [len][utf8]}
      * repeated, exactly as a delta section carries them -- in a single copy. Callers
-     * pass a whole frame's new-symbol suffix at once; see {@link #foldDelta} for why
+     * pass a whole frame's new-symbol suffix at once; see {@link #foldEntries} for why
      * that suffix is always contiguous.
      */
     private void appendRaw(long addr, int len, int count) {
@@ -275,8 +290,16 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
             return;
         }
         int countLen = (int) (encodedCount & 7L);
-        long deltaCount = encodedCount >>> 3;
         p += countLen;
+        foldEntries(fsn, deltaStart, encodedCount >>> 3, p, limit);
+    }
+
+    /**
+     * Folds the delta range {@code [deltaStart, deltaStart + deltaCount)} whose
+     * entries start at {@code p}, bounded by {@code limit}: the part of
+     * {@link #foldDelta} after its two varints, shared with {@link #foldRecord}.
+     */
+    private void foldEntries(long fsn, long deltaStart, long deltaCount, long p, long limit) {
         long deltaEnd = deltaCount > Long.MAX_VALUE - deltaStart
                 ? Long.MAX_VALUE
                 : deltaStart + deltaCount;
@@ -362,6 +385,26 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
         if (deltaEnd > runningCoverage) {
             runningCoverage = deltaEnd;
         }
+    }
+
+    /**
+     * Folds the dictionary of the sealed record in {@link #recordReader}: the
+     * range from its header, the entries from its dictionary region.
+     */
+    private void foldRecord(long fsn) {
+        long deltaStart = recordReader.dictStartId();
+        int entriesLen = recordReader.dictEntriesLen();
+        if (deltaStart < 0L || entriesLen < 0) {
+            // Unreachable for a record recovery validated; fail clean like a
+            // malformed delta section.
+            markGap(fsn);
+            return;
+        }
+        if (deltaStart > runningMaxDeltaStart) {
+            runningMaxDeltaStart = deltaStart;
+        }
+        long entries = recordReader.dictEntriesAddr();
+        foldEntries(fsn, deltaStart, recordReader.dictCount(), entries, entries + entriesLen);
     }
 
     private void markGap(long fsn) {
