@@ -904,6 +904,70 @@ public class QwpTableBufferTest {
     }
 
     @Test
+    public void testEncodedColumnDefsTrackTheSchema() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false).addLong(1);
+                table.getOrCreateColumn("b", QwpConstants.TYPE_VARCHAR, true).addString("x");
+                table.nextRow();
+
+                byte[] before = table.getEncodedColumnDefs();
+                assertArrayEquals(new byte[]{
+                        2,
+                        1, 'a', QwpConstants.TYPE_LONG,
+                        1, 'b', QwpConstants.TYPE_VARCHAR
+                }, before);
+
+                table.getOrCreateColumn("c", QwpConstants.TYPE_DOUBLE, false).addDouble(1.5);
+                assertArrayEquals(new byte[]{
+                        3,
+                        1, 'a', QwpConstants.TYPE_LONG,
+                        1, 'b', QwpConstants.TYPE_VARCHAR,
+                        1, 'c', QwpConstants.TYPE_DOUBLE
+                }, table.getEncodedColumnDefs());
+                assertArrayEquals(new byte[]{
+                        2,
+                        1, 'a', QwpConstants.TYPE_LONG,
+                        1, 'b', QwpConstants.TYPE_VARCHAR
+                }, before);
+            }
+        });
+    }
+
+    @Test
+    public void testEncodedColumnNameLengthCountsUtf8Bytes() throws Exception {
+        assertMemoryLeak(() -> {
+            StringBuilder name = new StringBuilder();
+            for (int i = 0; i < 100; i++) {
+                name.append('ö');
+            }
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                table.getOrCreateColumn(name.toString(), QwpConstants.TYPE_LONG, false).addLong(1);
+                table.nextRow();
+
+                byte[] encoded = table.getEncodedColumnDefs();
+                assertEquals(1 + 2 + 200 + 1, encoded.length);
+                assertEquals(1, encoded[0]);
+                assertEquals((byte) 0xC8, encoded[1]);
+                assertEquals(0x01, encoded[2]);
+                assertEquals(QwpConstants.TYPE_LONG, encoded[encoded.length - 1]);
+            }
+        });
+    }
+
+    @Test
+    public void testEncodedTableNameIsUtf8LengthThenBytes() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("tëst")) {
+                assertArrayEquals(
+                        new byte[]{5, 't', (byte) 0xC3, (byte) 0xAB, 's', 't'},
+                        table.getEncodedTableName()
+                );
+            }
+        });
+    }
+
+    @Test
     public void testGetExistingColumnReturnsNullWithoutCreatingColumn() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpTableBuffer table = new QwpTableBuffer("test")) {
