@@ -126,16 +126,13 @@ public class SegmentManagerAckWatermarkLagTest {
                 for (int i = 0; i < acks; i++) {
                     Assert.assertTrue(ring.appendOrFsn(payload, 32) >= 0);
                 }
-                // Let the register wake's pass finish (it installs the spare) and
-                // the worker park before counting, so a slow spare create cannot
-                // be mistaken for an ACK-driven pass.
+                // Let the register wake's pass finish and the worker park before
+                // counting, so that pass cannot be mistaken for an ACK-driven one.
                 Thread worker = manager.getWorkerThreadForTesting();
                 long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
-                while ((ring.needsHotSpare() || worker.getState() != Thread.State.WAITING)
-                        && System.nanoTime() < deadline) {
+                while (worker.getState() != Thread.State.WAITING && System.nanoTime() < deadline) {
                     Thread.sleep(1);
                 }
-                Assert.assertFalse(ring.needsHotSpare());
                 Assert.assertEquals(Thread.State.WAITING, worker.getState());
                 passes.set(0);
                 for (int seq = 0; seq < acks; seq++) {

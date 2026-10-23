@@ -42,7 +42,7 @@ public class SegmentManagerPinnedTrimTest {
                 Assert.assertNotNull(pinned);
                 Assert.assertTrue(ring.acknowledge(0L));
 
-                ring.installHotSpare(MmapSegment.createInMemory(1L, segmentSize));
+                QueueSegmentSource.install(ring, MmapSegment.createInMemory(1L, segmentSize));
                 Assert.assertEquals(1L, ring.appendOrFsn(payload, 1));
                 Assert.assertSame(pinned, ring.firstSealed());
 

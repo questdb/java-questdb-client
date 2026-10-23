@@ -38,16 +38,15 @@ import org.junit.Before;
 import org.junit.Test;
 
 import java.nio.file.Paths;
-import java.util.concurrent.TimeUnit;
 
 /**
  * Regression for P-C8: the {@code sf_max_total_bytes} cap check compared
  * {@code .sfa} segment bytes only, while the {@code .symbol-dict} side-file
  * is lifetime-monotonic on symbol-heavy workloads -- so a producer could
- * fill the SF filesystem while the cap reported headroom. The manager now
- * reads a per-slot side-file gauge at the provisioning cap check. The two
+ * fill the SF filesystem while the cap reported headroom. The budget now
+ * reads a per-slot side-file gauge at the rotation's cap check. The two
  * tests differ ONLY in the gauge, proving the gauge alone flips the
- * provisioning decision.
+ * decision.
  */
 public class SegmentManagerSideFileCapTest {
 
@@ -73,10 +72,10 @@ public class SegmentManagerSideFileCapTest {
             // Cap = 3 segments. The slot holds 2 recovered segments plus a
             // side-file gauge reporting one further segment's worth of
             // dictionary bytes: 2 x seg (segments) + 1 x seg (side-file)
-            // + 1 x seg (the spare under consideration) > cap, so the
-            // manager must refuse to provision. Pre-fix the gauge was
-            // invisible and the manager provisioned a third .sfa, taking
-            // real disk usage past the cap by the side-file's size.
+            // + 1 x seg (the rotation's segment) > cap, so the rotation
+            // must be refused. Pre-fix the gauge was invisible and a third
+            // .sfa was created, taking real disk usage past the cap by the
+            // side-file's size.
             long cap = 3 * SEGMENT_SIZE;
             prepopulate(slotDir, 2);
             SegmentRing ring = SegmentRing.openExisting(slotDir, SEGMENT_SIZE);
@@ -84,17 +83,15 @@ public class SegmentManagerSideFileCapTest {
 
             SegmentManager manager = new SegmentManager(SEGMENT_SIZE, new SegmentBudget(cap));
             try (SegmentManager ignored = manager) {
-                manager.start();
                 manager.register(ring, slotDir, null, 0L, () -> SEGMENT_SIZE);
                 Assert.assertEquals("accounted bytes must be segments + side-file gauge",
                         3 * SEGMENT_SIZE, manager.getCapAccountedBytesForTesting());
-                Thread.sleep(100);
+                Assert.assertEquals("side-file bytes must count against sf_max_total_bytes -- "
+                                + "pre-fix the cap check saw only .sfa bytes and created a "
+                                + "segment past the cap",
+                        SegmentRing.BACKPRESSURE_NO_SPARE, fillActiveAndRotate(ring));
             }
-
-            Assert.assertEquals("side-file bytes must count against sf_max_total_bytes -- "
-                            + "pre-fix the cap check saw only .sfa bytes and provisioned "
-                            + "past the cap",
-                    2, countSfaFiles(slotDir));
+            Assert.assertEquals(2, countSfaFiles(slotDir));
             ring.close();
         });
     }
@@ -102,10 +99,10 @@ public class SegmentManagerSideFileCapTest {
     @Test
     public void testControlWithoutSideFileGaugeProvisionsToTheCap() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            // Identical setup, no gauge: 2 x seg + 1 x seg spare == cap
-            // (not above it), so the manager provisions exactly one spare
-            // and then stops. Pins that the refusal in the sibling test is
-            // caused by the gauge alone.
+            // Identical setup, no gauge: 2 x seg + 1 x seg == cap (not above
+            // it), so exactly one rotation fits and the next is refused.
+            // Pins that the refusal in the sibling test is caused by the
+            // gauge alone.
             long cap = 3 * SEGMENT_SIZE;
             prepopulate(slotDir, 2);
             SegmentRing ring = SegmentRing.openExisting(slotDir, SEGMENT_SIZE);
@@ -113,19 +110,14 @@ public class SegmentManagerSideFileCapTest {
 
             SegmentManager manager = new SegmentManager(SEGMENT_SIZE, new SegmentBudget(cap));
             try (SegmentManager ignored = manager) {
-                manager.start();
                 manager.register(ring, slotDir, null, 0L, null);
-                // Poll instead of a fixed sleep: this is a must-provision assertion, and
-                // a flat 100ms sleep flakes on a loaded CI box where the worker's 1ms tick
-                // gets delayed past the sleep window. Bound the poll with a deadline so a
-                // genuine regression still fails instead of hanging.
-                long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-                while (countSfaFiles(slotDir) != 3 && System.nanoTime() < deadlineNanos) {
-                    Thread.sleep(5);
-                }
+                Assert.assertTrue("without the gauge the rotation must fit under the cap",
+                        fillActiveAndRotate(ring) >= 0);
+                Assert.assertEquals(3, countSfaFiles(slotDir));
+                Assert.assertEquals("the cap is now full",
+                        SegmentRing.BACKPRESSURE_NO_SPARE, fillActiveAndRotate(ring));
             }
-
-            Assert.assertEquals("without the gauge the manager must fill the cap exactly",
+            Assert.assertEquals("without the gauge the producer must fill the cap exactly",
                     3, countSfaFiles(slotDir));
             ring.close();
         });
@@ -136,12 +128,12 @@ public class SegmentManagerSideFileCapTest {
         TestUtils.assertMemoryLeak(() -> {
             // The dictionary is lifetime-monotonic and no trim reclaims it, so a
             // side-file that alone eats the cap used to hold the ring at ONE
-            // segment forever: no spare, no rotation, and no ack could ever free
-            // the shortfall -- a permanent stall that survived restarts, while
-            // the disk-full warning pointed at a trim that cannot help. The cap
-            // must still guarantee each ring its minimum working set (the active
-            // segment plus one spare) and exceed itself by the dictionary's
-            // overshoot instead.
+            // segment forever: no rotation, and no ack could ever free the
+            // shortfall -- a permanent stall that survived restarts, while the
+            // disk-full warning pointed at a trim that cannot help. The cap
+            // must still guarantee each ring its minimum working set (the
+            // active segment plus the one it rotates into) and exceed itself
+            // by the dictionary's overshoot instead.
             long cap = 3 * SEGMENT_SIZE;
             prepopulate(slotDir, 1);
             SegmentRing ring = SegmentRing.openExisting(slotDir, SEGMENT_SIZE);
@@ -149,33 +141,44 @@ public class SegmentManagerSideFileCapTest {
 
             SegmentManager manager = new SegmentManager(SEGMENT_SIZE, new SegmentBudget(cap));
             try (SegmentManager ignored = manager) {
-                manager.start();
                 // 10 segments' worth of dictionary against a 3-segment cap: no
-                // arithmetic makes this fit, so only the floor can provision.
+                // arithmetic makes this fit, so only the floor can allow it.
                 manager.register(ring, slotDir, null, 0L, () -> 10 * SEGMENT_SIZE);
-                long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-                while (countSfaFiles(slotDir) < 2 && System.nanoTime() < deadlineNanos) {
-                    Thread.sleep(5);
-                }
-                Assert.assertEquals("a ring below its minimum working set must be provisioned "
-                                + "even when non-reclaimable side-file bytes have eaten the cap",
-                        2, countSfaFiles(slotDir));
+                Assert.assertTrue("a ring below its minimum working set must rotate even when "
+                                + "non-reclaimable side-file bytes have eaten the cap",
+                        fillActiveAndRotate(ring) >= 0);
+                Assert.assertEquals(2, countSfaFiles(slotDir));
                 // ...and the floor is a floor, not a bypass: once the working set
                 // is whole, the cap governs again.
-                Thread.sleep(100);
-                Assert.assertEquals("the floor must not license unbounded provisioning past the cap",
-                        2, countSfaFiles(slotDir));
+                Assert.assertEquals("the floor must not license unbounded creation past the cap",
+                        SegmentRing.BACKPRESSURE_NO_SPARE, fillActiveAndRotate(ring));
+                Assert.assertEquals(2, countSfaFiles(slotDir));
             }
             ring.close();
         });
     }
 
     /**
-     * Pre-populates {@code dir} with {@code n} valid {@code .sfa} segment
-     * files, each containing one frame so {@link SegmentRing#openExisting}
-     * doesn't filter them as empty orphans. Each segment's baseSeq is
-     * positioned so the contiguity check in {@code openExisting} passes.
+     * Appends 16 KiB frames until the active segment is full and the next
+     * append needs a rotation; returns that append's result (the new FSN,
+     * or BACKPRESSURE_NO_SPARE when the rotation was refused).
      */
+    private static long fillActiveAndRotate(SegmentRing ring) {
+        int len = 16 * 1024;
+        long buf = Unsafe.malloc(len, MemoryTag.NATIVE_DEFAULT);
+        try {
+            MmapSegment active = ring.getActive();
+            while (true) {
+                long fsn = ring.appendOrFsn(buf, len);
+                if (fsn < 0 || ring.getActive() != active) {
+                    return fsn;
+                }
+            }
+        } finally {
+            Unsafe.free(buf, len, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
     private static void prepopulate(String dir, int n) {
         long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
         try {

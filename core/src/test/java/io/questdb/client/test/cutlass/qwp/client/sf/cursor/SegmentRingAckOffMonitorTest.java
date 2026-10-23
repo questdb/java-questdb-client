@@ -73,7 +73,7 @@ public class SegmentRingAckOffMonitorTest {
             Assert.assertNotNull("legacy slot must recover", ring);
             long payload = Unsafe.malloc(PAYLOAD, MemoryTag.NATIVE_DEFAULT);
             try {
-                ring.installHotSpare(MmapSegment.create(tmpDir + "/sf-0000000000000004.sfa", 4L, SEGMENT_SIZE));
+                QueueSegmentSource.install(ring, MmapSegment.create(tmpDir + "/sf-0000000000000004.sfa", 4L, SEGMENT_SIZE));
                 // Fill the active: seqs 1..3. The next append rotates.
                 for (int i = 0; i < 3; i++) {
                     Assert.assertTrue(ring.appendOrFsn(payload, PAYLOAD) >= 0);

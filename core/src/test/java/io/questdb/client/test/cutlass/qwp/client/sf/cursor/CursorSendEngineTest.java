@@ -1099,10 +1099,10 @@ public class CursorSendEngineTest {
     }
 
     private static void poisonRegisterGeneration(SegmentManager manager) throws Exception {
-        // register() advances fileGeneration before publishing the ring. Nulling
-        // it forces a deterministic constructor failure after the ring and
+        // register() publishes the ring into `rings` last. Nulling the list
+        // forces a deterministic constructor failure after the ring and
         // watermark exist, without adding a production test hook.
-        Field f = SegmentManager.class.getDeclaredField("fileGeneration");
+        Field f = SegmentManager.class.getDeclaredField("rings");
         f.setAccessible(true);
         f.set(manager, null);
     }

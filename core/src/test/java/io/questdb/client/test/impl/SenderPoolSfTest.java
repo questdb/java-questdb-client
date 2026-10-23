@@ -1635,7 +1635,7 @@ public class SenderPoolSfTest {
                 AtomicReference<Throwable> hookErr = new AtomicReference<>();
                 AtomicReference<CursorSendEngine> engineRef = new AtomicReference<>();
                 manager.setAfterRingCleanupHook(cleanupFinished::countDown);
-                manager.setBeforeInstallSyncHook(() -> {
+                manager.setBeforeTrimSyncHook(() -> {
                     if (!fired.compareAndSet(false, true)) {
                         return;
                     }
@@ -1694,7 +1694,7 @@ public class SenderPoolSfTest {
                 } finally {
                     releaseWorker.countDown();
                     manager.setAfterRingCleanupHook(null);
-                    manager.setBeforeInstallSyncHook(null);
+                    manager.setBeforeTrimSyncHook(null);
                     // The 50 ms timeout above is only for forcing the slot-
                     // retirement path under test. Restore a normal teardown
                     // budget before closing the recovered sender: otherwise a

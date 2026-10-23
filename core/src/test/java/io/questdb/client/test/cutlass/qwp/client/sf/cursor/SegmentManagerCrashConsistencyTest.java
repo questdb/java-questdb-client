@@ -64,10 +64,10 @@ public class SegmentManagerCrashConsistencyTest {
             ring = new SegmentRing(MmapSegment.create(root + "/sf-0.sfa", 0, segmentSize), segmentSize);
             Assert.assertEquals(0L, ring.appendOrFsn(payload, 1));
             for (int i = 1; i <= sealedCount; i++) {
-                ring.installHotSpare(MmapSegment.create(root + "/sf-" + i + ".sfa", i, segmentSize));
+                QueueSegmentSource.install(ring, MmapSegment.create(root + "/sf-" + i + ".sfa", i, segmentSize));
                 Assert.assertEquals(i, ring.appendOrFsn(payload, 1));
             }
-            ring.installHotSpare(MmapSegment.create(root + "/sf-" + (sealedCount + 1) + ".sfa",
+            QueueSegmentSource.install(ring, MmapSegment.create(root + "/sf-" + (sealedCount + 1) + ".sfa",
                     sealedCount + 1L, segmentSize));
             Assert.assertTrue(ring.acknowledge(sealedCount - 1L));
             success = true;

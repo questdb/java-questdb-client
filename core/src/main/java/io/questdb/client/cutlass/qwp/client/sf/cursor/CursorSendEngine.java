@@ -984,8 +984,8 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
-     * User-thread append path. Spins briefly while waiting for the segment
-     * manager to provision a hot spare; if backpressure persists past
+     * User-thread append path. Spins briefly while backpressured (budget
+     * exhausted, periodic-sync barrier pending); if backpressure persists past
      * {@code spinDeadlineNanos}, returns {@link SegmentRing#BACKPRESSURE_NO_SPARE}
      * so the caller can decide whether to {@code parkNanos} or surface the
      * pressure to the user.

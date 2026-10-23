@@ -124,12 +124,12 @@ public class SegmentRingTest {
                     // Active is now full. Without a spare, append must report backpressure.
                     assertEquals(SegmentRing.BACKPRESSURE_NO_SPARE,
                             ring.appendOrFsn(buf, 100));
-                    assertTrue("ring should be asking for a spare", ring.needsHotSpare());
+                    assertTrue("ring has no segment to rotate into", QueueSegmentSource.isEmpty(ring));
 
                     // Manager installs a fresh spare with the right baseSeq.
                     MmapSegment spare = MmapSegment.create(tmpDir + "/seg1.sfa",
                             ring.nextSeqHint(), segSize);
-                    ring.installHotSpare(spare);
+                    QueueSegmentSource.install(ring, spare);
 
                     // Now the same append succeeds, and FSN keeps incrementing across
                     // segment boundaries (no reset to 0 in the new segment).
@@ -137,8 +137,8 @@ public class SegmentRingTest {
                     // didn't burn an FSN, so this one is FSN 2.
                     assertEquals(2, ring.appendOrFsn(buf, 100));
                     assertEquals(2, ring.publishedFsn());
-                    // After the rotation succeeded, ring should ask for the next spare.
-                    assertTrue(ring.needsHotSpare());
+                    // The rotation consumed the queued segment.
+                    assertTrue(QueueSegmentSource.isEmpty(ring));
                 }
             } finally {
                 Unsafe.free(buf, 100, MemoryTag.NATIVE_DEFAULT);
@@ -158,7 +158,7 @@ public class SegmentRingTest {
                     fillPattern(buf, 101, 0);
                     assertEquals(0, ring.appendOrFsn(buf, 100));
                     MmapSegment spare = MmapSegment.create(tmpDir + "/seg1.sfa", 1, segSize);
-                    ring.installHotSpare(spare);
+                    QueueSegmentSource.install(ring, spare);
                     // A payload that no segment can hold must not seal the active and
                     // consume the spare: that rotation publishes nothing, so nothing
                     // wakes the I/O thread to trim the sealed segment, and every retry
@@ -167,7 +167,7 @@ public class SegmentRingTest {
                         assertEquals(SegmentRing.PAYLOAD_TOO_LARGE, ring.appendOrFsn(buf, 101));
                     }
                     assertSame(seg0, ring.getActive());
-                    assertSame(spare, ring.getHotSpareForTesting());
+                    assertSame(spare, QueueSegmentSource.peek(ring));
                     assertEquals(0, ring.getSealedSegments().size());
                     assertEquals(0, ring.publishedFsn());
                     assertEquals(1, ring.appendOrFsn(buf, 100));
@@ -196,7 +196,7 @@ public class SegmentRingTest {
                     assertEquals(0, ring.appendOrFsn(buf, 64));    // active full
                     // Manager guessed baseSeq=999 long before the active filled.
                     MmapSegment lateSpare = MmapSegment.create(tmpDir + "/lateseg.sfa", 999, segSize);
-                    ring.installHotSpare(lateSpare);
+                    QueueSegmentSource.install(ring, lateSpare);
                     // Rotation must rebase the spare to baseSeq=1 (the actual nextSeq).
                     assertEquals(1, ring.appendOrFsn(buf, 64));
                     assertEquals(1, ring.publishedFsn());
@@ -204,67 +204,6 @@ public class SegmentRingTest {
                 }
             } finally {
                 Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
-            }
-        });
-    }
-
-    @Test
-    public void testRotationRearmsHighWaterBackupWakeup() throws Exception {
-        // The producer-thread flag that gates the high-water backup wakeup is
-        // per-active. Rotation must reset it so the new active can fire the
-        // backup again if the rotation-time wakeup didn't get a fresh spare
-        // installed in time. Pre-fix the flag stayed sticky-true after the
-        // first set, so on every active past the first the backup branch was
-        // a dead path.
-        TestUtils.assertMemoryLeak(() -> {
-            // 4 100-byte frames per segment. signalAtBytes is 75% of segSize,
-            // and HEADER (24) + 3 frames (3*108 = 324) lands publishedOffset
-            // at 348, just past the 342-byte threshold.
-            long segSize = MmapSegment.HEADER_SIZE
-                    + 4 * (MmapSegment.FRAME_HEADER_SIZE + 100);
-            long buf = Unsafe.malloc(100, MemoryTag.NATIVE_DEFAULT);
-            try {
-                MmapSegment seg0 = MmapSegment.create(tmpDir + "/wseg0.sfa", 0, segSize);
-                try (SegmentRing ring = new SegmentRing(seg0, segSize)) {
-                    int[] wakeups = {0};
-                    ring.setManagerWakeup(() -> wakeups[0]++);
-                    fillPattern(buf, 100, 0);
-
-                    // First active: two frames stay below high-water.
-                    assertEquals(0, ring.appendOrFsn(buf, 100));
-                    assertEquals(1, ring.appendOrFsn(buf, 100));
-                    assertEquals("no wakeup before high-water", 0, wakeups[0]);
-                    // Third frame crosses 75%: backup branch fires once.
-                    assertEquals(2, ring.appendOrFsn(buf, 100));
-                    assertEquals("backup signal fires on high-water crossing", 1, wakeups[0]);
-                    // Fourth frame fills the active. Still same active, so the
-                    // backup branch must coalesce and not fire again.
-                    assertEquals(3, ring.appendOrFsn(buf, 100));
-                    assertEquals("backup signal coalesces within an active", 1, wakeups[0]);
-                    // Active is full and there is still no spare.
-                    assertEquals(SegmentRing.BACKPRESSURE_NO_SPARE,
-                            ring.appendOrFsn(buf, 100));
-                    assertEquals("backpressure does not fire wakeup", 1, wakeups[0]);
-
-                    // Install spare, then retry. The retry triggers rotation,
-                    // which fires the wakeup unconditionally.
-                    ring.installHotSpare(MmapSegment.create(
-                            tmpDir + "/wseg1.sfa", ring.nextSeqHint(), segSize));
-                    assertEquals(4, ring.appendOrFsn(buf, 100));
-                    assertEquals("rotation fires wakeup", 2, wakeups[0]);
-
-                    // New active. Two frames keep publishedOffset below the
-                    // high-water mark (the rotated frame counts as the first).
-                    assertEquals(5, ring.appendOrFsn(buf, 100));
-                    assertEquals(2, wakeups[0]);
-                    // Third frame on the new active crosses 75% again. Without
-                    // rotation re-arming the per-active flag, this assertion
-                    // catches the regression: pre-fix wakeups stayed at 2.
-                    assertEquals(6, ring.appendOrFsn(buf, 100));
-                    assertEquals("backup signal re-arms on the new active", 3, wakeups[0]);
-                }
-            } finally {
-                Unsafe.free(buf, 100, MemoryTag.NATIVE_DEFAULT);
             }
         });
     }
@@ -294,7 +233,7 @@ public class SegmentRingTest {
                             // fill the active until it is full
                         }
                         assertEquals(SegmentRing.BACKPRESSURE_NO_SPARE, r);
-                        ring.installHotSpare(MmapSegment.create(
+                        QueueSegmentSource.install(ring, MmapSegment.create(
                                 tmpDir + "/c" + (i + 1) + ".sfa", ring.nextSeqHint(), segSize));
                         assertTrue("retry must rotate", ring.appendOrFsn(buf, 16) >= 0);
                     }
@@ -341,10 +280,10 @@ public class SegmentRingTest {
                     // Fill seg0 (FSN 0..3).
                     for (int i = 0; i < 4; i++) ring.appendOrFsn(buf, 16);
                     // Spare for seg1 (FSN 4..7).
-                    ring.installHotSpare(MmapSegment.create(tmpDir + "/t1.sfa", 4, segSize));
+                    QueueSegmentSource.install(ring, MmapSegment.create(tmpDir + "/t1.sfa", 4, segSize));
                     for (int i = 0; i < 4; i++) ring.appendOrFsn(buf, 16);
                     // Spare for seg2 (FSN 8..11).
-                    ring.installHotSpare(MmapSegment.create(tmpDir + "/t2.sfa", 8, segSize));
+                    QueueSegmentSource.install(ring, MmapSegment.create(tmpDir + "/t2.sfa", 8, segSize));
                     for (int i = 0; i < 4; i++) ring.appendOrFsn(buf, 16);
 
                     // No acks yet — nothing to trim.
@@ -466,7 +405,7 @@ public class SegmentRingTest {
                     assertEquals(2, ring.nextSeqHint());
                     assertEquals(2, ring.appendOrFsn(buf, 16));
                     assertEquals(3, ring.appendOrFsn(buf, 16));
-                    ring.installHotSpare(MmapSegment.create(tmpDir + "/r1.sfa", 4, segSize));
+                    QueueSegmentSource.install(ring, MmapSegment.create(tmpDir + "/r1.sfa", 4, segSize));
                     assertEquals("append must rotate into the spare",
                             4, ring.appendOrFsn(buf, 16));
                     assertEquals(1, ring.getSealedSegments().size());
@@ -1201,63 +1140,7 @@ public class SegmentRingTest {
     }
 
     /**
-     * The I/O thread sends a frame as soon as its bytes lie below
-     * {@link MmapSegment#publishedOffset()}, and the server can ACK it before
-     * {@code appendOrFsn} returns. Because {@code acknowledge} clamps at
-     * {@code publishedFsn}, the ring must publish a frame's FSN no later than its bytes:
-     * an ACK clamped below a frame the I/O thread could already send is consumed and
-     * lost, and the server's cumulative ACKs never re-deliver it once the producer goes
-     * quiet. Losing the final frame's ACK this way would stall close() and drain()
-     * until their timeout.
-     * <p>
-     * The high-water manager wakeup runs inside {@code appendOrFsn} once the appended
-     * frame's bytes are visible, so it observes the ring exactly where an I/O-thread
-     * ACK can race the publication: the wakeup plays the I/O thread and ACKs the
-     * newest frame visible to it.
-     */
-    @Test
-    public void testAckOfFrameVisibleDuringAppendIsNotClampedAway() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            final int payloadLen = 32;
-            final long frameSize = MmapSegment.FRAME_HEADER_SIZE + payloadLen;
-            final long segSize = 64 * 1024;
-            long buf = Unsafe.malloc(payloadLen, MemoryTag.NATIVE_DEFAULT);
-            try {
-                fillPattern(buf, payloadLen, 0);
-                try (SegmentRing ring = new SegmentRing(MmapSegment.createInMemory(0L, segSize), segSize)) {
-                    final long[] newestVisibleAtWakeup = {-1L};
-                    final long[] ackedAtWakeup = {-1L};
-                    final int[] wakeups = {0};
-                    ring.setManagerWakeup(() -> {
-                        MmapSegment active = ring.getActive();
-                        long newestVisible = active.baseSeq()
-                                + (active.publishedOffset() - MmapSegment.HEADER_SIZE) / frameSize - 1L;
-                        ring.acknowledge(newestVisible);
-                        newestVisibleAtWakeup[0] = newestVisible;
-                        ackedAtWakeup[0] = ring.ackedFsn();
-                        wakeups[0]++;
-                    });
-                    long fsn;
-                    do {
-                        fsn = ring.appendOrFsn(buf, payloadLen);
-                        assertTrue("setup: append must succeed, got " + fsn, fsn >= 0);
-                    } while (wakeups[0] == 0);
-
-                    assertEquals("setup: the high-water wakeup fires once per active", 1, wakeups[0]);
-                    assertEquals("setup: the frame appended by the waking call is visible to the I/O thread",
-                            fsn, newestVisibleAtWakeup[0]);
-                    assertEquals("an ACK for a frame the I/O thread could already send must not be clamped away",
-                            fsn, ackedAtWakeup[0]);
-                    assertEquals(fsn, ring.ackedFsn());
-                }
-            } finally {
-                Unsafe.free(buf, payloadLen, MemoryTag.NATIVE_DEFAULT);
-            }
-        });
-    }
-
-    /**
-     * Concurrent form of {@link #testAckOfFrameVisibleDuringAppendIsNotClampedAway}: an
+     * An
      * observer thread plays the I/O thread against a producer that appends across many
      * rotations, ACKing each frame the moment its bytes become visible below
      * {@link MmapSegment#publishedOffset()}. Every such ACK must land; none may be
@@ -1308,7 +1191,7 @@ public class SegmentRingTest {
                         for (long i = 0; i < frameCount && failure.get() == null; i++) {
                             long fsn;
                             while ((fsn = ring.appendOrFsn(buf, payloadLen)) == SegmentRing.BACKPRESSURE_NO_SPARE) {
-                                ring.installHotSpare(MmapSegment.createInMemory(ring.nextSeqHint(), segSize));
+                                QueueSegmentSource.install(ring, MmapSegment.createInMemory(ring.nextSeqHint(), segSize));
                             }
                             assertEquals(i, fsn);
                         }
@@ -1358,7 +1241,7 @@ public class SegmentRingTest {
                         MmapSegment spare = MmapSegment.create(
                                 tmpDir + "/seg-" + String.format("%04d", i + 1) + ".sfa",
                                 ring.nextSeqHint(), segSize);
-                        ring.installHotSpare(spare);
+                        QueueSegmentSource.install(ring, spare);
                     }
                     // After the loop we have `sealedCount` sealed segments and one
                     // active (containing nothing yet — its base = sealedCount).
@@ -1422,7 +1305,7 @@ public class SegmentRingTest {
                     // Build sealed: [seg0, seg1, seg2, seg3]; active = seg4.
                     for (int i = 0; i < 4; i++) {
                         ring.appendOrFsn(buf, 16);
-                        ring.installHotSpare(MmapSegment.create(
+                        QueueSegmentSource.install(ring, MmapSegment.create(
                                 tmpDir + "/t-" + (i + 1) + ".sfa", ring.nextSeqHint(), segSize));
                     }
                     MmapSegment seg0Snapshot = ring.firstSealed();
@@ -1457,7 +1340,7 @@ public class SegmentRingTest {
                     fillPattern(buf, 16, 0);
                     for (int i = 0; i < 3; i++) {
                         assertEquals(i, ring.appendOrFsn(buf, 16));
-                        ring.installHotSpare(MmapSegment.create(
+                        QueueSegmentSource.install(ring, MmapSegment.create(
                                 tmpDir + "/race-" + (i + 1) + ".sfa",
                                 ring.nextSeqHint(), segSize));
                     }
@@ -1689,7 +1572,7 @@ public class SegmentRingTest {
                     try (SegmentRing ring = new SegmentRing(initial, segSize)) {
                         for (int i = 0; i < 2 * sealedCount; i++) {
                             assertEquals(i, ring.appendOrFsn(buf, 1));
-                            ring.installHotSpare(MmapSegment.createInMemory(ring.nextSeqHint(), segSize));
+                            QueueSegmentSource.install(ring, MmapSegment.createInMemory(ring.nextSeqHint(), segSize));
                         }
                         assertEquals(2L * sealedCount, ring.appendOrFsn(buf, 1));
                         ring.acknowledge(sealedCount - 1L);
@@ -1836,8 +1719,8 @@ public class SegmentRingTest {
                     assertNull(ring.findSegmentContaining(0));
 
                     for (int i = 0; i < 12; i++) {
-                        if (ring.needsHotSpare()) {
-                            ring.installHotSpare(
+                        if (QueueSegmentSource.isEmpty(ring)) {
+                            QueueSegmentSource.install(ring, 
                                     MmapSegment.createInMemory(ring.nextSeqHint(), segSize));
                         }
                         assertEquals(i, ring.appendOrFsn(buf, 8));
@@ -1899,7 +1782,7 @@ public class SegmentRingTest {
                 try (SegmentRing ring = new SegmentRing(initial, segSize)) {
                     for (int i = 0; i < 34; i++) {
                         assertEquals(i, ring.appendOrFsn(buf, 1));
-                        ring.installHotSpare(
+                        QueueSegmentSource.install(ring, 
                                 MmapSegment.createInMemory(ring.nextSeqHint(), segSize));
                     }
                     // Sealed: FSNs 0..32, one frame each; active: [33].

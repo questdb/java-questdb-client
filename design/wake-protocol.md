@@ -47,21 +47,24 @@ No open gaps.
 | Input | Writer | Doorbell / cover | Fixed by |
 |---|---|---|---|
 | `rings` | `register` `:761` | `wakeWorker` (after the entry is visible) | — |
-| `rings` | `deregister` `:623` | none needed (nothing to service); `budget.release` wakes refused siblings | — |
-| `ring.needsHotSpare()` | rotation `appendOrFsn` `:1142` | `managerWakeup.run()` | — |
-| `ring.needsHotSpare()` | high-water backup `appendOrFsn` `:1175` (once per active) | `managerWakeup.run()` | — |
-| `ring.needsHotSpare()` | recovered ring opened with no spare | `register` wake | — |
+| `rings` | `deregister` `:623` | none needed (nothing to service) | — |
 | trimmable head: `ackedFsn >= oldestTrimmableLastSeq` | `acknowledge` `:1023` | wakes when `seq >= oldestTrimmableLastSeq` (volatile threshold, no ring monitor on the ACK path) | 38c5d69d |
 | `oldestTrimmableLastSeq` | rotation `:1129`; `releasePinnedSegment` `:1657`; `switchIoPin` `:1878` (pin moved off a segment); worker's own removal `:1865`; recovery `:691` (pre-register) | each non-worker writer that can *increase* trimmability calls `wakeManager`; a pin being *added* cannot | — |
 | pending / failed trim | worker | `hasMoreTrimmable` → no park; failed unlink/barrier → `trimRetryAtNanos` timed | 98ac6ae4 |
-| budget room (spare refused) | `SegmentBudget.release` / `removeSideFileGauge` | `tryCharge(bytes, onRoom)` registers the manager; `wakeRefused` runs it. The liveness-floor charge withdraws the registration: a refused manager that provisions anyway and then releases (failed create) must not wake itself out of its 10 ms retry | 15247811, next commit |
-| failed spare create | worker | `provisionRetryDeadlineNanos` timed | — |
 | periodic data sync | clock | `nextDataSyncNanos` timed | — |
 | sync-before-rotation request | `appendOrFsn` `:1082` | `wakeManager`; the producer then polls at 50 µs in `CursorSendEngine.appendBlocking` `:972` (poll, see Residuals) | — |
 | `running` | `close` `:335` | `unpark` | — |
 | durability failure | `servicePeriodicSync` | producer throws on next append; sync retry timed | — |
 
-No open gaps. The ACK watermark is no longer a manager input: the I/O thread
+No open gaps. Spare provisioning is no longer a manager input either: the
+producer creates its next segment itself at rotation (`SegmentProvisioner`,
+called from `appendOrFsn`), which removed `needsHotSpare`, the high-water
+backup wake, the provision-retry timer, the liveness-floor charge and the
+budget's refused-wake list (f37967c4's bug class). A refused producer retries
+on its own 50 µs backpressure poll; a failed create is retried by the same
+poll after `CREATE_RETRY_NANOS`.
+
+The ACK watermark is no longer a manager input: the I/O thread
 writes it in `CursorSendEngine.acknowledge` (a store into the mmap, no
 syscall), and the worker only `sync()`s it before unlinking a trimmed segment.
 That removed the row that took four commits (39ac01e9, 779a99bc, 1304f71d,
@@ -110,10 +113,10 @@ Predicate: `getAckedFsn() >= target`, or a terminal: connection error, durabilit
 
 ## Residuals (known, bounded)
 
-1. Producer backpressure (`appendBlocking` `:972`) polls at 50 µs for the
-   spare install (`installHotSpare` `:1469`), the sync-request clear
+1. Producer backpressure (`appendBlocking` `:972`) polls at 50 µs for budget
+   room (a trim's `release`), the create retry, the sync-request clear
    (`:1205`) and the durability latch (`:1275`); bounded by the 30 s append
-   deadline. Converting it to a park needs those three writers to ring it.
+   deadline. Converting it to a park needs those writers to ring it.
    `maybeBlockForStarvedReset` (`:5972`, 2 s bound) and
    `awaitDeferredEngineClose` (`:5684`, 30 s bound) are the same shape; the
    first could register with `AckWaiters` instead.
@@ -130,9 +133,8 @@ Predicate: `getAckedFsn() >= target`, or a terminal: connection error, durabilit
 ## Recommendation
 
 Keep moving state to the thread that produces it instead of adding wake
-protocols for it. Done: the ACK watermark (above). Next: the producer creates
-its own next segment at rotation (removes `needsHotSpare`, the high-water
-backup wake, the provision retry, the liveness floor and the budget's refused
-list), then the worker becomes a queue of blocking disk work (trim unlink +
-directory fsync, periodic sync) whose park-if-empty is lost-wake-free by
-construction.
+protocols for it. Done: the ACK watermark and spare provisioning (above).
+Next: the worker becomes a queue of blocking disk work (trim unlink +
+directory fsync, periodic sync, sync-before-rotation) whose park-if-empty is
+lost-wake-free by construction, and the producer's backpressure poll becomes
+a park rung by the trim's release.

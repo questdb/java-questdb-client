@@ -281,7 +281,7 @@ public class SlotLockReleasedContractTest {
             boolean managerClosed = false;
             try {
                 manager.setAfterRingCleanupHook(cleanupFinished::countDown);
-                manager.setBeforeInstallSyncHook(() -> {
+                manager.setBeforeTrimSyncHook(() -> {
                     if (!fired.compareAndSet(false, true)) return;
                     workerBlocked.countDown();
                     try {
@@ -345,7 +345,7 @@ public class SlotLockReleasedContractTest {
                 }
             } finally {
                 manager.setAfterRingCleanupHook(null);
-                manager.setBeforeInstallSyncHook(null);
+                manager.setBeforeTrimSyncHook(null);
                 releaseWorker.countDown();
                 if (wss != null) {
                     try {

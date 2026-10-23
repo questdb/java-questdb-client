@@ -58,8 +58,8 @@ public class SegmentManagerSharedBudgetTest {
         TestUtils.assertMemoryLeak(() -> {
             // Producers on four managers race for one budget while acks trim behind
             // them. tryCharge must never let the budget exceed its capacity by more
-            // than the minimum working sets the managers grant unconditionally, and
-            // once every ring is deregistered nothing may remain charged.
+            // than the minimum working sets the provisioners grant unconditionally,
+            // and once every ring is deregistered nothing may remain charged.
             final int ringCount = 4;
             final SegmentBudget budget = new SegmentBudget(6 * SEGMENT_SIZE);
             final long bound = budget.getCapacityBytes() + ringCount * 2 * SEGMENT_SIZE;
@@ -163,9 +163,9 @@ public class SegmentManagerSharedBudgetTest {
                 Assert.assertEquals(4 * SEGMENT_SIZE, budget.getSegmentBytes());
 
                 // A ring on ANOTHER manager finds the budget spent. It still gets its
-                // minimum working set -- the active segment plus one spare, four
-                // frames -- but nothing beyond: a private budget of the same size
-                // would have let it grow to four segments of its own.
+                // minimum working set -- the active segment plus the one it rotates
+                // into, four frames -- but nothing beyond: a private budget of the
+                // same size would have let it grow to four segments of its own.
                 siblingManager.register(sibling, null);
                 appendFrames(sibling, buf, 4);
                 assertCapped(sibling, buf);
@@ -177,9 +177,7 @@ public class SegmentManagerSharedBudgetTest {
                 // the room they leave -- up to the whole budget, and no further.
                 busyManager.deregister(busy);
                 Assert.assertTrue(busyManager.awaitRingQuiescence(busy));
-                Assert.assertTrue("the sibling must get a spare once the budget has room",
-                        waitFor(() -> !sibling.needsHotSpare()));
-                Assert.assertEquals(3 * SEGMENT_SIZE, budget.getSegmentBytes());
+                Assert.assertEquals(2 * SEGMENT_SIZE, budget.getSegmentBytes());
                 appendFrames(sibling, buf, 4);
                 assertCapped(sibling, buf);
                 Assert.assertEquals(4 * SEGMENT_SIZE, sibling.totalSegmentBytes());
@@ -195,13 +193,12 @@ public class SegmentManagerSharedBudgetTest {
     }
 
     /**
-     * Room another manager frees must wake a manager the budget refused, not
-     * wait for a timer. The starved manager's clock runs backwards, which
-     * stretches any timer-driven provision retry to about ten seconds; only the
-     * wake can deliver the spare within the deadline.
+     * Room another manager frees is taken by a refused producer on its very
+     * next append: no wake, no timer, nothing for the starved ring's manager
+     * to do (its clock runs backwards so no timed pass can help).
      */
     @Test
-    public void testSiblingDeregisterWakesRefusedManager() throws Exception {
+    public void testSiblingDeregisterFreesRoomForRefusedProducer() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             SegmentBudget budget = new SegmentBudget(4 * SEGMENT_SIZE);
             AtomicLong clock = new AtomicLong();
@@ -221,11 +218,8 @@ public class SegmentManagerSharedBudgetTest {
                 assertCapped(starved, buf);
 
                 busyManager.deregister(busy);
-                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
-                while (starved.needsHotSpare() && System.nanoTime() < deadline) {
-                    Thread.sleep(1);
-                }
-                Assert.assertFalse("freed budget did not wake the refused manager", starved.needsHotSpare());
+                Assert.assertTrue("freed budget must let the refused producer rotate at once",
+                        starved.appendOrFsn(buf, FRAME_PAYLOAD) >= 0);
                 Assert.assertTrue(busyManager.awaitRingQuiescence(busy));
                 starvedManager.deregister(starved);
                 Assert.assertTrue(starvedManager.awaitRingQuiescence(starved));
@@ -249,10 +243,7 @@ public class SegmentManagerSharedBudgetTest {
         }
     }
 
-    private static void assertCapped(SegmentRing ring, long buf) throws InterruptedException {
-        // Ample time for a manager worker to (wrongly) provision past the budget.
-        Thread.sleep(100);
-        Assert.assertTrue("the budget must refuse this ring another spare", ring.needsHotSpare());
+    private static void assertCapped(SegmentRing ring, long buf) {
         Assert.assertEquals(SegmentRing.BACKPRESSURE_NO_SPARE, ring.appendOrFsn(buf, FRAME_PAYLOAD));
     }
 

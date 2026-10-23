@@ -265,10 +265,9 @@ public class SymbolDictRecycleTest {
                     // rebuilt slot's structure instead: exactly the well-known set of state
                     // files a brand-new (never-recovered) slot has, nothing left over from
                     // the outgoing epoch's segments.
-                    // The hot spare is provisioned by the segment-manager worker, so await it.
                     List<String> freshSlotFiles = Arrays.asList(
                             ".ack-watermark", ".lock", ".lock.pid", ".symbol-dict",
-                            "sf-0000000000000000.sfa", "sf-initial.sfa", "sf-manifest.bin");
+                            "sf-initial.sfa", "sf-manifest.bin");
                     Assert.assertEquals("post-recycle slot must contain exactly a fresh engine's "
                                     + "own state files",
                             freshSlotFiles, awaitDir(slot, freshSlotFiles));

@@ -110,14 +110,12 @@ public class SegmentManagerTrimDeregisterRaceTest {
                     // provision a spare; wait for that spare so the next
                     // append can rotate.
                     ring.appendOrFsn(buf, 32);
-                    awaitSpare(ring, "after seg0 fill");
                     // Rotate: seg0 joins sealedSegments, the spare becomes
                     // active. Worker auto-wakes again to provision the next
                     // spare; whether that completes before we install the
                     // hook does not matter for the test (the hook fires only
                     // on a worker tick we trigger explicitly below).
                     ring.appendOrFsn(buf, 32);
-                    awaitSpare(ring, "after rotation");
                     // FSN 0 acked: seg0 (baseSeq=0, lastSeq=0) is now
                     // trimmable. Acknowledge does NOT wake the worker, so the
                     // trim does not happen until we wakeWorker() below.
@@ -208,16 +206,6 @@ public class SegmentManagerTrimDeregisterRaceTest {
             if (s == Thread.State.TIMED_WAITING || s == Thread.State.WAITING) return;
             if (System.nanoTime() > deadline) {
                 throw new AssertionError("worker did not park within 5 s; state=" + s);
-            }
-            io.questdb.client.std.Compat.onSpinWait();
-        }
-    }
-
-    private static void awaitSpare(SegmentRing ring, String where) {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-        while (ring.needsHotSpare()) {
-            if (System.nanoTime() > deadline) {
-                throw new AssertionError("spare never installed " + where);
             }
             io.questdb.client.std.Compat.onSpinWait();
         }

@@ -42,26 +42,11 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Concurrent regression for the {@code SegmentManager} worker race vs
- * ring deregister/close.
- * <p>
- * The manager's worker loop snapshots {@code rings} under a lock, then
- * services each ring outside the lock. If a user thread calls
- * {@code deregister(ring)} + {@code ring.close()} between the snapshot
- * and {@code installHotSpare}, the manager:
- * <ul>
- *   <li>creates a new {@code MmapSegment} (mmap + fd + on-disk file)</li>
- *   <li>calls {@code ring.installHotSpare(spare)} on the closed ring —
- *       which sees {@code hotSpare == null} (just zeroed by close) and
- *       silently accepts the install</li>
- * </ul>
- * The spare's mmap + fd are now permanently leaked: nothing will ever
- * close them because {@code close()} already ran.
- * <p>
- * Detection: after the manager has joined, reflect into each closed
- * ring's {@code hotSpare} field. A non-null value means a spare was
- * installed AFTER {@code close()} zeroed the field — i.e. exactly the
- * leak path. We close any survivors so the test itself doesn't leak.
+ * Concurrent regressions for the {@code SegmentManager} worker vs ring
+ * deregister/close: the worker snapshots {@code rings} under a lock, then
+ * services each ring outside it, so a deregister that lands mid-pass must be
+ * observed by the pass and by close()'s bounded join. The worker is parked
+ * mid-pass through the {@code beforeTrimSyncHook} seam.
  */
 public class SegmentManagerCloseRaceTest {
 
@@ -81,121 +66,6 @@ public class SegmentManagerCloseRaceTest {
         if (tmpDir == null) return;
         cleanupRecursively(tmpDir);
         Files.remove(tmpDir);
-    }
-
-    @Test
-    public void testManagerDoesNotInstallSpareIntoClosedRing() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            // Aggressive 1us poll so the worker is almost always running
-            // serviceRing — maximizes overlap with concurrent deregister/close.
-            SegmentManager manager = new SegmentManager(SEGMENT_SIZE, new SegmentBudget(Long.MAX_VALUE));
-            manager.start();
-
-            SegmentRing[] rings = new SegmentRing[ITERATIONS];
-            try {
-                for (int i = 0; i < ITERATIONS; i++) {
-                    String slot = tmpDir + "/slot-" + i;
-                    Assert.assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
-                    MmapSegment initial = MmapSegment.create(
-                            slot + "/sf-initial.sfa", 0L, SEGMENT_SIZE);
-                    rings[i] = new SegmentRing(initial, SEGMENT_SIZE);
-                    manager.register(rings[i], slot);
-                    // Immediately deregister + close. The manager may be mid-
-                    // serviceRing for this very ring, having already created a
-                    // spare and not yet installed it — that's the race window.
-                    manager.deregister(rings[i]);
-                    rings[i].close();
-                }
-            } finally {
-                // join the worker so any in-flight serviceRing finishes
-                // BEFORE we inspect the rings — otherwise a later install
-                // could escape detection.
-                manager.close();
-            }
-
-            int leaked = 0;
-            for (int i = 0; i < ITERATIONS; i++) {
-                Object hs = rings[i].getHotSpareForTesting();
-                if (hs != null) {
-                    leaked++;
-                    // Don't leak in the test: close the survivor.
-                    ((MmapSegment) hs).close();
-                }
-            }
-
-            Assert.assertEquals(
-                    "SegmentManager installed hot spares into closed rings — "
-                            + "spare mmap/fd permanently leaked",
-                    0, leaked);
-        });
-    }
-
-    @Test(timeout = 15_000L)
-    public void testCloseDoesNotFreePathScratchWhenWorkerStillAlive() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            long segSize = MmapSegment.HEADER_SIZE + (MmapSegment.FRAME_HEADER_SIZE + 32);
-            String slot = tmpDir + "/timeout-slot";
-            Assert.assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
-            MmapSegment initial = MmapSegment.create(slot + "/sf-initial.sfa", 0L, segSize);
-            SegmentRing ring = new SegmentRing(initial, segSize);
-            SegmentManager manager = new SegmentManager(segSize);
-            CountDownLatch workerBlocked = new CountDownLatch(1);
-            CountDownLatch releaseWorker = new CountDownLatch(1);
-            AtomicBoolean fired = new AtomicBoolean();
-            AtomicReference<Throwable> hookErr = new AtomicReference<>();
-            boolean managerClosed = false;
-            try {
-                manager.register(ring, slot);
-                manager.setBeforeInstallSyncHook(() -> {
-                    if (!fired.compareAndSet(false, true)) return;
-                    workerBlocked.countDown();
-                    try {
-                        if (!releaseWorker.await(10, TimeUnit.SECONDS)) {
-                            hookErr.compareAndSet(null,
-                                    new AssertionError("timed out waiting for test to release worker"));
-                        }
-                    } catch (Throwable t) {
-                        hookErr.compareAndSet(null, t);
-                    }
-                });
-                manager.start();
-                Assert.assertTrue("worker did not reach install hook",
-                        workerBlocked.await(5, TimeUnit.SECONDS));
-                Assert.assertTrue("precondition: path scratch should be allocated",
-                        readPathScratchImpl(manager) != 0L);
-
-                manager.setWorkerJoinTimeoutMillis(50L);
-                Thread.currentThread().interrupt();
-                manager.close();
-                Assert.assertTrue("close should preserve interrupted status",
-                        Thread.interrupted());
-                Thread worker = readWorkerThread(manager);
-                Assert.assertTrue("worker should still be tracked after incomplete close",
-                        worker != null && worker.isAlive());
-                Assert.assertTrue("path scratch was freed while worker was still alive",
-                        readPathScratchImpl(manager) != 0L);
-
-                releaseWorker.countDown();
-                manager.setWorkerJoinTimeoutMillis(TimeUnit.SECONDS.toMillis(60));
-                manager.close();
-                managerClosed = true;
-                Assert.assertNull("successful close should clear workerThread",
-                        readWorkerThread(manager));
-                Assert.assertEquals("successful close should free path scratch",
-                        0L, readPathScratchImpl(manager));
-                if (hookErr.get() != null) {
-                    throw new AssertionError("install hook failed", hookErr.get());
-                }
-            } finally {
-                manager.setBeforeInstallSyncHook(null);
-                releaseWorker.countDown();
-                if (!managerClosed) {
-                    Thread.interrupted();
-                    manager.close();
-                }
-                ring.close();
-            }
-        });
     }
 
     /**
@@ -247,7 +117,15 @@ public class SegmentManagerCloseRaceTest {
                             slots[i] + "/sf-initial.sfa", 0L, segSize);
                     rings[i] = new SegmentRing(initial, segSize);
                 }
-                manager.setBeforeInstallSyncHook(() -> {
+                manager.setBeforeTrimSyncHook(() -> {
+                    try {
+                        Object ring = readInServiceRing(manager);
+                        if (ring != null) {
+                            serviced.add(ring);
+                        }
+                    } catch (Throwable t) {
+                        hookErr.compareAndSet(null, t);
+                    }
                     if (!fired.compareAndSet(false, true)) return;
                     workerBlocked.countDown();
                     try {
@@ -259,24 +137,13 @@ public class SegmentManagerCloseRaceTest {
                         hookErr.compareAndSet(null, t);
                     }
                 });
-                manager.setBeforeTrimSyncHook(() -> {
-                    try {
-                        Object ring = readInServiceRing(manager);
-                        if (ring != null) {
-                            serviced.add(ring);
-                        }
-                    } catch (Throwable t) {
-                        hookErr.compareAndSet(null, t);
-                    }
-                });
                 // Register all three BEFORE start: the worker's first snapshot
-                // is [A, B, C] and every fresh ring wants a hot spare, so the
-                // install hook parks the worker inside A's pass.
+                // is [A, B, C], so the hook parks the worker inside A's pass.
                 manager.register(rings[0], slots[0]);
                 manager.register(rings[1], slots[1]);
                 manager.register(rings[2], slots[2]);
                 manager.start();
-                Assert.assertTrue("worker did not reach A's install pass",
+                Assert.assertTrue("worker did not reach A's pass",
                         workerBlocked.await(5, TimeUnit.SECONDS));
 
                 // B is deregistered while its snapshot entry is still ahead of
@@ -307,10 +174,6 @@ public class SegmentManagerCloseRaceTest {
                                 + "be releasing the ring/watermark/slot lock, so a stale snapshot "
                                 + "entry must be skipped at claim time",
                         serviced.contains(rings[1]));
-                // Defense in depth: nothing may have been installed into the
-                // deregistered ring either.
-                Assert.assertNull("no hot spare may be installed into a deregistered ring",
-                        readHotSpare(rings[1]));
 
                 manager.close();
                 managerClosed = true;
@@ -318,7 +181,7 @@ public class SegmentManagerCloseRaceTest {
                     throw new AssertionError("worker-side hook failed", hookErr.get());
                 }
             } finally {
-                manager.setBeforeInstallSyncHook(null);
+                manager.setBeforeTrimSyncHook(null);
                 manager.setBeforeTrimSyncHook(null);
                 releaseWorker.countDown();
                 if (!managerClosed) {
@@ -329,89 +192,6 @@ public class SegmentManagerCloseRaceTest {
                         ring.close();
                     }
                 }
-            }
-        });
-    }
-
-    /**
-     * Pins the scratch-handoff half of the timed-out-close contract in
-     * isolation: after {@code close()} gives up on the bounded join and hands
-     * {@code pathScratch} ownership to the worker, the WORKER's exit block
-     * alone must free the native buffer — with no retried {@code close()}
-     * ever running. The sibling test
-     * ({@link #testCloseDoesNotFreePathScratchWhenWorkerStillAlive}) retries
-     * {@code close()} before asserting the free, so a regression that dropped
-     * the worker-side free (leaving reclaim to a retry nobody is required to
-     * make) would stay green there: production owners do NOT retry — a
-     * timed-out close returns to the pool and the worker is the only thread
-     * left that can reclaim the allocation.
-     */
-    @Test(timeout = 15_000L)
-    public void testWorkerAloneFreesPathScratchAfterTimedOutClose() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            long segSize = MmapSegment.HEADER_SIZE + (MmapSegment.FRAME_HEADER_SIZE + 32);
-            String slot = tmpDir + "/worker-frees-scratch-slot";
-            Assert.assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
-            MmapSegment initial = MmapSegment.create(slot + "/sf-initial.sfa", 0L, segSize);
-            SegmentRing ring = new SegmentRing(initial, segSize);
-            SegmentManager manager = new SegmentManager(segSize);
-            CountDownLatch workerBlocked = new CountDownLatch(1);
-            CountDownLatch releaseWorker = new CountDownLatch(1);
-            AtomicBoolean fired = new AtomicBoolean();
-            AtomicReference<Throwable> hookErr = new AtomicReference<>();
-            try {
-                manager.register(ring, slot);
-                manager.setBeforeInstallSyncHook(() -> {
-                    if (!fired.compareAndSet(false, true)) return;
-                    workerBlocked.countDown();
-                    try {
-                        if (!releaseWorker.await(10, TimeUnit.SECONDS)) {
-                            hookErr.compareAndSet(null,
-                                    new AssertionError("timed out waiting for test to release worker"));
-                        }
-                    } catch (Throwable t) {
-                        hookErr.compareAndSet(null, t);
-                    }
-                });
-                manager.start();
-                Assert.assertTrue("worker did not reach install hook",
-                        workerBlocked.await(5, TimeUnit.SECONDS));
-
-                // Timed-out close: hands scratch ownership to the worker and
-                // returns. This is the last close() call this test makes.
-                manager.setWorkerJoinTimeoutMillis(50L);
-                manager.close();
-                Thread worker = readWorkerThread(manager);
-                Assert.assertTrue("worker must still be live after the timed-out close",
-                        worker != null && worker.isAlive());
-                Assert.assertTrue("scratch must still be allocated while the worker may use it",
-                        readPathScratchImpl(manager) != 0L);
-
-                // Release the pass. running=false already, so the worker
-                // finishes the pass and exits — its exit block must free the
-                // handed-over scratch buffer without ANY further caller action.
-                releaseWorker.countDown();
-                worker.join(TimeUnit.SECONDS.toMillis(10));
-                Assert.assertFalse("worker never exited after release", worker.isAlive());
-                Assert.assertEquals(
-                        "worker exit block must free the handed-over path scratch — no retried "
-                                + "close() runs in production after a timed-out close, so leaving "
-                                + "the free to a retry leaks the native buffer for the process "
-                                + "lifetime",
-                        0L, readPathScratchImpl(manager));
-
-                // Reap the dead thread for tidiness; must not double-free.
-                manager.close();
-                Assert.assertNull("retried close must reap the exited worker",
-                        readWorkerThread(manager));
-                if (hookErr.get() != null) {
-                    throw new AssertionError("install hook failed", hookErr.get());
-                }
-            } finally {
-                manager.setBeforeInstallSyncHook(null);
-                releaseWorker.countDown();
-                manager.close();
-                ring.close();
             }
         });
     }
@@ -452,7 +232,7 @@ public class SegmentManagerCloseRaceTest {
                         manager.deferUntilWorkerExit(cleanupRan::countDown));
 
                 manager.register(ring, slot);
-                manager.setBeforeInstallSyncHook(() -> {
+                manager.setBeforeTrimSyncHook(() -> {
                     if (!fired.compareAndSet(false, true)) return;
                     workerBlocked.countDown();
                     try {
@@ -497,7 +277,7 @@ public class SegmentManagerCloseRaceTest {
                     throw new AssertionError("install hook failed", hookErr.get());
                 }
             } finally {
-                manager.setBeforeInstallSyncHook(null);
+                manager.setBeforeTrimSyncHook(null);
                 releaseWorker.countDown();
                 if (!managerClosed) {
                     Thread.interrupted();
@@ -534,7 +314,7 @@ public class SegmentManagerCloseRaceTest {
             boolean managerClosed = false;
             try {
                 manager.register(ring, slot);
-                manager.setBeforeInstallSyncHook(() -> {
+                manager.setBeforeTrimSyncHook(() -> {
                     if (!fired.compareAndSet(false, true)) return;
                     workerBlocked.countDown();
                     try {
@@ -572,7 +352,7 @@ public class SegmentManagerCloseRaceTest {
                     throw new AssertionError("install hook failed", hookErr.get());
                 }
             } finally {
-                manager.setBeforeInstallSyncHook(null);
+                manager.setBeforeTrimSyncHook(null);
                 releaseWorker.countDown();
                 if (!managerClosed) {
                     Thread.interrupted();
@@ -602,7 +382,7 @@ public class SegmentManagerCloseRaceTest {
             boolean managerClosed = false;
             try {
                 manager.register(ring, slot);
-                manager.setBeforeInstallSyncHook(() -> {
+                manager.setBeforeTrimSyncHook(() -> {
                     if (!fired.compareAndSet(false, true)) return;
                     workerBlocked.countDown();
                     try {
@@ -651,7 +431,7 @@ public class SegmentManagerCloseRaceTest {
                     throw new AssertionError("install hook failed", hookErr.get());
                 }
             } finally {
-                manager.setBeforeInstallSyncHook(null);
+                manager.setBeforeTrimSyncHook(null);
                 releaseWorker.countDown();
                 if (!managerClosed) {
                     Thread.interrupted();
@@ -683,10 +463,6 @@ public class SegmentManagerCloseRaceTest {
         } finally {
             Files.findClose(find);
         }
-    }
-
-    private static Object readHotSpare(SegmentRing ring) {
-        return ring.getHotSpareForTesting();
     }
 
     private static Object readInServiceRing(SegmentManager manager) {
@@ -789,10 +565,6 @@ public class SegmentManagerCloseRaceTest {
                 worker.join(TimeUnit.SECONDS.toMillis(5));
                 Assert.assertFalse("worker must be dead after the second join reaped it",
                         worker.isAlive());
-                Assert.assertEquals(
-                        "close() must free the path scratch itself after the second join "
-                                + "confirmed termination (no handoff on this branch)",
-                        0L, readPathScratchImpl(manager));
                 if (err.get() != null) {
                     throw new AssertionError("async participant failed", err.get());
                 }
@@ -806,10 +578,6 @@ public class SegmentManagerCloseRaceTest {
                 ring.close();
             }
         });
-    }
-
-    private static long readPathScratchImpl(SegmentManager manager) {
-        return manager.isPathScratchAllocatedForTesting() ? 1L : 0L;
     }
 
     private static Thread readWorkerThread(SegmentManager manager) {

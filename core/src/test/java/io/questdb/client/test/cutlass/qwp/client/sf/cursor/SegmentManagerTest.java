@@ -94,26 +94,28 @@ public class SegmentManagerTest {
                  SegmentManager manager = new SegmentManager(segSize)) {
                 for (int i = 0; i < sealedCount; i++) {
                     assertEquals(i, busyRing.appendOrFsn(buf, 1));
-                    busyRing.installHotSpare(MmapSegment.createInMemory(busyRing.nextSeqHint(), segSize));
+                    QueueSegmentSource.install(busyRing, MmapSegment.createInMemory(busyRing.nextSeqHint(), segSize));
                 }
                 assertEquals(sealedCount, busyRing.appendOrFsn(buf, 1));
-                busyRing.installHotSpare(MmapSegment.createInMemory(busyRing.nextSeqHint(), segSize));
+                QueueSegmentSource.install(busyRing, MmapSegment.createInMemory(busyRing.nextSeqHint(), segSize));
                 busyRing.acknowledge(sealedCount - 1L);
 
                 manager.register(busyRing, null);
                 manager.register(siblingRing, null);
-                manager.setBeforeInstallSyncHook(() -> {
-                    try {
-                        assertEquals("the busy ring must stop at the 64-segment quantum before sibling service",
-                                64, busyRing.getSealedSegments().size());
-                    } catch (Throwable t) {
-                        failure.compareAndSet(null, t);
-                    } finally {
-                        siblingInstall.countDown();
-                    }
-                });
                 manager.setBeforeTrimSyncHook(() -> {
-                    if (trimPass.incrementAndGet() == 4) {
+                    int pass = trimPass.incrementAndGet();
+                    if (pass == 2) {
+                        // The sibling's turn, right after the busy ring's first quantum.
+                        try {
+                            assertEquals("the busy ring must stop at the 64-segment quantum before sibling service",
+                                    64, busyRing.getSealedSegments().size());
+                        } catch (Throwable t) {
+                            failure.compareAndSet(null, t);
+                        } finally {
+                            siblingInstall.countDown();
+                        }
+                    }
+                    if (pass == 4) {
                         try {
                             assertEquals("the next fair pass must fully drain the busy ring",
                                     0, busyRing.getSealedSegments().size());
@@ -125,7 +127,7 @@ public class SegmentManagerTest {
                     }
                 });
                 manager.start();
-                assertTrue("manager did not reach sibling spare provisioning",
+                assertTrue("manager did not reach the sibling ring",
                         siblingInstall.await(10, TimeUnit.SECONDS));
                 assertTrue("manager parked instead of immediately rescheduling the remaining ACK batch",
                         busyDrained.await(10, TimeUnit.SECONDS));
@@ -134,24 +136,6 @@ public class SegmentManagerTest {
                 }
             } finally {
                 Unsafe.free(buf, 1, MemoryTag.NATIVE_DEFAULT);
-            }
-        });
-    }
-
-    @Test
-    public void testManagerProvisionsSpareWithinPollingTick() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            long segSize = MmapSegment.HEADER_SIZE
-                    + 4 * (MmapSegment.FRAME_HEADER_SIZE + 32);
-            MmapSegment seg0 = MmapSegment.create(tmpDir + "/0000000000000000.sfa", 0, segSize);
-            try (SegmentRing ring = new SegmentRing(seg0, segSize);
-                 SegmentManager mgr = new SegmentManager(segSize)) {
-                mgr.start();
-                mgr.register(ring, tmpDir);
-
-                // Wait for the manager to install a spare. Should happen within ~ms.
-                assertTrue("manager should install hot spare within 2 seconds",
-                        waitFor(() -> !ring.needsHotSpare(), 2000));
             }
         });
     }
@@ -181,7 +165,7 @@ public class SegmentManagerTest {
                         // BACKPRESSURE_NO_SPARE — wait for the manager to catch up.
                         if (System.nanoTime() > deadline) {
                             throw new AssertionError(
-                                    "stuck waiting for spare at i=" + i + ", needsSpare=" + ring.needsHotSpare());
+                                    "stuck waiting for a segment at i=" + i);
                         }
                         io.questdb.client.std.Compat.onSpinWait();
                     }
@@ -210,8 +194,6 @@ public class SegmentManagerTest {
 
                 // Fill seg0 (2 frames) and force rotation by appending a third.
                 for (int i = 0; i < 2; i++) ring.appendOrFsn(buf, 32);
-                // Wait for the spare for seg1 to land.
-                assertTrue(waitFor(() -> !ring.needsHotSpare(), 2000));
                 ring.appendOrFsn(buf, 32);                 // FSN 2, rotates active to seg1
 
                 assertTrue("seg0 should still exist before ack", Files.exists(seg0Path));
@@ -251,8 +233,6 @@ public class SegmentManagerTest {
 
                 // Fill seg0 (2 frames) and force rotation by appending a third.
                 for (int i = 0; i < 2; i++) ring.appendOrFsn(buf, 32);
-                assertTrue("spare must land before rotation",
-                        waitFor(() -> !ring.needsHotSpare(), 2000));
                 ring.appendOrFsn(buf, 32); // FSN 2, rotates active to the spare
 
                 MmapSegment spare = ring.getActive();
@@ -276,7 +256,7 @@ public class SegmentManagerTest {
                     + 2 * (MmapSegment.FRAME_HEADER_SIZE + 64);
             // Cap = 3 segments total. The ring's initial active counts toward
             // the cap (counted at register-time), so this leaves headroom for
-            // exactly 2 manager-provisioned spares before backpressure kicks in.
+            // exactly 2 rotations before backpressure kicks in.
             long cap = 3 * segSize;
             MmapSegment seg0 = MmapSegment.create(tmpDir + "/0000000000000000.sfa", 0, segSize);
             long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
@@ -288,151 +268,29 @@ public class SegmentManagerTest {
                 // register seeds totalBytes = 1*segSize (initial active).
                 mgr.register(ring, tmpDir, watermark);
 
-                // Manager provisions spare 1 → totalBytes = 2*segSize.
-                assertTrue(waitFor(() -> !ring.needsHotSpare(), 2000));
-                // Fill initial (becomes sealed), rotate to spare 1.
+                // Fill initial (becomes sealed), rotate into segment 2 → 2*segSize.
                 ring.appendOrFsn(buf, 64);
                 ring.appendOrFsn(buf, 64);
-                ring.appendOrFsn(buf, 64); // forces rotation
-                // Manager provisions spare 2 → totalBytes = 3*segSize. At cap.
-                assertTrue(waitFor(() -> !ring.needsHotSpare(), 2000));
-                // Fill spare 1 (becomes sealed), rotate to spare 2.
+                assertEquals(2L, ring.appendOrFsn(buf, 64)); // rotation 1
+                assertEquals(2 * segSize, mgr.getTotalBytesForTesting());
+                // Fill segment 2, rotate into segment 3 → 3*segSize. At cap.
                 ring.appendOrFsn(buf, 64);
-                ring.appendOrFsn(buf, 64); // forces rotation again
-                // Manager would provision spare 3 → would be 4*segSize > cap. Refused.
-                // The ring should sit in needsHotSpare=true indefinitely.
-                // Verify: after ample time, still no spare.
-                Thread.sleep(150);
-                assertTrue("manager must respect cap and not provision spare 3", ring.needsHotSpare());
-                // Producer's appendOrFsn must report backpressure.
-                ring.appendOrFsn(buf, 64); // fills the second-to-last slot of spare 2
-                ring.appendOrFsn(buf, 64); // fills the last slot, spare 2 now full
+                assertEquals(4L, ring.appendOrFsn(buf, 64)); // rotation 2
+                assertEquals(3 * segSize, mgr.getTotalBytesForTesting());
+                // Fill segment 3. The next rotation would make 4*segSize > cap:
+                // refused, and the producer is backpressured.
+                ring.appendOrFsn(buf, 64);
                 assertEquals(SegmentRing.BACKPRESSURE_NO_SPARE, ring.appendOrFsn(buf, 64));
+                assertEquals(3 * segSize, mgr.getTotalBytesForTesting());
 
-                // Now ACK enough frames to make the oldest sealed segment trimmable.
-                // The initial held FSN 0..1 (2 frames). ACK frame 1 → initial trims.
+                // ACK the initial segment's frames (FSN 0..1): the manager trims it
+                // and the once-stuck producer's rotation now fits under the cap.
                 ring.acknowledge(1L);
-                // The manager should trim → totalBytes drops by 1*segSize → headroom
-                // for one more spare → spare 3 gets installed.
-                assertTrue("manager must provision a spare once trim freed space",
-                        waitFor(() -> !ring.needsHotSpare(), 2000));
-                // And the once-stuck producer's append now succeeds.
-                assertNotEquals(SegmentRing.BACKPRESSURE_NO_SPARE,
-                        ring.appendOrFsn(buf, 64));
+                assertTrue("the rotation must succeed once trim freed space",
+                        waitFor(() -> ring.appendOrFsn(buf, 64) >= 0, 2000));
+                assertEquals(3 * segSize, mgr.getTotalBytesForTesting());
             } finally {
                 Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
-            }
-        });
-    }
-
-    @Test
-    public void testFirstSpareLandsBeforeFirstPoll() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            // The worker never polls, so the first spare can only arrive via a
-            // wakeup. register() unparks the worker after publishing the new ring,
-            // so the worker re-iterates and provisions the spare even when
-            // its first loop snapshot ran before register() acquired `lock`.
-            // The spare must therefore land within seconds of register(),
-            // not minutes -- the 5s park is never reached.
-            //
-            // The append below is incidental to the contract under test; it
-            // does NOT cross the SegmentRing high-water mark for this 4-frame
-            // segment (HEADER_SIZE 24 + FRAME_HEADER_SIZE 8 + 16 = 48 vs
-            // signalAtBytes = (120 >> 2) * 3 = 90), so no producer-side wakeup
-            // fires. The rotation/high-water wakeup paths are covered by
-            // testRotationWakeupTriggersImmediateSparePrep, and the
-            // deterministic register-after-park case is covered by
-            // testRegisterAfterWorkerParkedWakesWorker.
-            long segSize = MmapSegment.HEADER_SIZE
-                    + 4 * (MmapSegment.FRAME_HEADER_SIZE + 16);
-            MmapSegment seg0 = MmapSegment.create(tmpDir + "/0000000000000000.sfa", 0, segSize);
-            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
-            try (SegmentRing ring = new SegmentRing(seg0, segSize);
-                 SegmentManager mgr = new SegmentManager(segSize)) {
-                mgr.start();
-                mgr.register(ring, tmpDir);
-                long t0 = System.nanoTime();
-                ring.appendOrFsn(buf, 16);
-                // 2s is the budget used across the other manager tests; it
-                // tolerates the slower file-open + truncate + mmap that runs
-                // under JaCoCo coverage instrumentation while still being
-                // orders of magnitude below the 5s poll interval.
-                assertTrue("first spare must land without waiting for the 5s poll tick",
-                        waitFor(() -> !ring.needsHotSpare(), 2000));
-                long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
-                assertTrue("spare arrived in " + elapsedMs + "ms -- should be <<5000ms",
-                        elapsedMs < 4000);
-            } finally {
-                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
-            }
-        });
-    }
-
-    @Test
-    public void testRegisterAfterWorkerParkedWakesWorker() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            // Deterministic version of testFirstSpareLandsBeforeFirstPoll:
-            // sleep between start() and register() long enough for the worker
-            // to definitely complete its first (empty) iteration and enter
-            // parkNanos. Without register()'s wakeWorker() the spare would
-            // not land for the full 5s poll interval; with it the spare lands
-            // promptly because register() unparks the worker out of its park.
-            // No append at all, so no producer-side wakeup can mask a missing
-            // register-side wakeup.
-            long segSize = MmapSegment.HEADER_SIZE
-                    + 4 * (MmapSegment.FRAME_HEADER_SIZE + 16);
-            MmapSegment seg0 = MmapSegment.create(tmpDir + "/0000000000000000.sfa", 0, segSize);
-            try (SegmentRing ring = new SegmentRing(seg0, segSize);
-                 SegmentManager mgr = new SegmentManager(segSize)) {
-                mgr.start();
-                // Give the worker plenty of time to enter workerLoop, snapshot
-                // an empty rings list, and reach parkNanos. 250ms is far more
-                // than the OS scheduling + thread startup cost on any sane
-                // CI runner, and still well below the 5s poll interval.
-                Thread.sleep(250);
-                long t0 = System.nanoTime();
-                mgr.register(ring, tmpDir);
-                assertTrue("register must wake a worker that has already parked",
-                        waitFor(() -> !ring.needsHotSpare(), 2000));
-                long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
-                assertTrue("spare arrived in " + elapsedMs + "ms -- should be <<5000ms",
-                        elapsedMs < 4000);
-            }
-        });
-    }
-
-    @Test
-    public void testRotationWakeupTriggersImmediateSparePrep() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            // Segment small enough that one frame fills it; verifies that the
-            // post-rotation wakeup runs before the next 5s poll.
-            long segSize = MmapSegment.HEADER_SIZE
-                    + (MmapSegment.FRAME_HEADER_SIZE + 16);
-            MmapSegment seg0 = MmapSegment.create(tmpDir + "/0000000000000000.sfa", 0, segSize);
-            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
-            try (SegmentRing ring = new SegmentRing(seg0, segSize);
-                 SegmentManager mgr = new SegmentManager(segSize)) {
-                mgr.start();
-                mgr.register(ring, tmpDir);
-                // First spare via high-water signal on the very first append.
-                // 2000ms budget: same wakeup-vs-poll rationale as
-                // testProducerWakeupBeatsThePollInterval -- still 2.5x below
-                // the 5s poll, but tolerant of CI scheduling jitter.
-                ring.appendOrFsn(buf, 16);
-                assertTrue(waitFor(() -> !ring.needsHotSpare(), 2_000));
-                // Now active is full → next append rotates → consumes the spare →
-                // hotSpare goes back to null → rotation-time wakeup runs →
-                // manager promptly provisions the next spare.
-                long beforeRotate = System.nanoTime();
-                long fsn = ring.appendOrFsn(buf, 16);
-                assertEquals(1, fsn);
-                assertTrue("rotation-time wakeup must trigger spare 2 well before 5s poll",
-                        waitFor(() -> !ring.needsHotSpare(), 2_000));
-                long elapsedMs = (System.nanoTime() - beforeRotate) / 1_000_000L;
-                assertTrue("spare 2 arrived in " + elapsedMs + "ms — should be <<5000ms",
-                        elapsedMs < 4_000);
-            } finally {
-                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
             }
         });
     }
@@ -470,12 +328,7 @@ public class SegmentManagerTest {
                 mgr.register(ringB, dirB);
                 mgr.register(ringC, dirC);
 
-                assertTrue("ringA spare", waitFor(() -> !ringA.needsHotSpare(), 2000));
-                assertTrue("ringB spare", waitFor(() -> !ringB.needsHotSpare(), 2000));
-                assertTrue("ringC spare", waitFor(() -> !ringC.needsHotSpare(), 2000));
-
-                // Deregister B. After deregister, B's spare-installation pipeline
-                // halts — but B still owns whatever spare the manager already gave it.
+                // Deregister B; A and C stay registered until close.
                 mgr.deregister(ringB);
             } finally {
                 Files.remove(dirA);

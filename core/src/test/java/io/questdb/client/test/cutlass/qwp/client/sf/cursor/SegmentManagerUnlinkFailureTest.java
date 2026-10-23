@@ -121,10 +121,10 @@ public class SegmentManagerUnlinkFailureTest {
             try {
                 fill(payload, 32, (byte) 0x11);
                 Assert.assertEquals(0L, ring.appendOrFsn(payload, 32));
-                ring.installHotSpare(MmapSegment.create(dir + "/sf-0000000000000001.sfa", 1L, segmentSize));
+                QueueSegmentSource.install(ring, MmapSegment.create(dir + "/sf-0000000000000001.sfa", 1L, segmentSize));
                 Assert.assertEquals(1L, ring.appendOrFsn(payload, 32));
                 // A spare is already in place, so provisioning schedules no retry of its own.
-                ring.installHotSpare(MmapSegment.create(dir + "/sf-0000000000000002.sfa", 2L, segmentSize));
+                QueueSegmentSource.install(ring, MmapSegment.create(dir + "/sf-0000000000000002.sfa", 2L, segmentSize));
                 ring.acknowledge(0L);
                 FailingFilesFacade facade = new FailingFilesFacade(failedPath, null, null);
                 try (SegmentManager manager = new SegmentManager(segmentSize, segmentSize * 8, facade)) {
@@ -160,8 +160,11 @@ public class SegmentManagerUnlinkFailureTest {
             try {
                 fill(payload, 32, (byte) 0x11);
                 Assert.assertEquals(0L, ring.appendOrFsn(payload, 32));
-                ring.installHotSpare(MmapSegment.create(activePath, 1L, segmentSize));
+                QueueSegmentSource.install(ring, MmapSegment.create(activePath, 1L, segmentSize));
                 Assert.assertEquals(1L, ring.appendOrFsn(payload, 32));
+                // Hand-fed segments end here: the successor below must come from
+                // the manager's provisioner, named past the generations on disk.
+                ring.setSegmentSource(null);
                 ring.acknowledge(0L);
                 watermark.write(0L); // what CursorSendEngine.acknowledge does on the I/O thread
                 byte[] original = java.nio.file.Files.readAllBytes(Paths.get(failedPath));

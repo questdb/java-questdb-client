@@ -112,7 +112,7 @@ public class CursorSendEngineSlotReacquisitionTest {
                     cleanupCount.incrementAndGet();
                     cleanupFinished.countDown();
                 });
-                manager.setBeforeInstallSyncHook(() -> {
+                manager.setBeforeTrimSyncHook(() -> {
                     if (!fired.compareAndSet(false, true)) return;
                     workerBlocked.countDown();
                     try {
@@ -186,7 +186,7 @@ public class CursorSendEngineSlotReacquisitionTest {
                 }
             } finally {
                 manager.setAfterRingCleanupHook(null);
-                manager.setBeforeInstallSyncHook(null);
+                manager.setBeforeTrimSyncHook(null);
                 releaseWorker.countDown();
                 if (!managerClosed) {
                     manager.close();
@@ -229,17 +229,10 @@ public class CursorSendEngineSlotReacquisitionTest {
             SegmentManager manager = engine.getManagerForTesting();
             long buf = Unsafe.malloc(payloadLen, MemoryTag.NATIVE_DEFAULT);
             try {
-                // Phase 1: let the worker finish the initial spare install so
-                // the hook below can only fire on the rotation-triggered pass.
+                // Phase 1: the ring is registered; the hook below fires on the
+                // next worker pass, which the rotation below triggers.
                 SegmentRing ring = engine.getRingForTesting();
-                long deadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
-                while (ring.needsHotSpare()) {
-                    if (System.nanoTime() > deadlineNs) {
-                        throw new AssertionError("manager worker never installed the initial hot spare");
-                    }
-                    Thread.sleep(1);
-                }
-                manager.setBeforeInstallSyncHook(() -> {
+                manager.setBeforeTrimSyncHook(() -> {
                     if (!fired.compareAndSet(false, true)) return;
                     workerBlocked.countDown();
                     try {
@@ -253,8 +246,8 @@ public class CursorSendEngineSlotReacquisitionTest {
                 });
 
                 // Phase 2: one frame fills the active segment exactly; the
-                // second forces rotation onto the spare. needsHotSpare() is
-                // true again, so the worker's next tick parks in the hook.
+                // second forces a rotation, which wakes the worker, whose
+                // next pass parks in the hook.
                 Unsafe.getUnsafe().putLong(buf, 0L);
                 Assert.assertEquals(0L, engine.appendBlocking(buf, payloadLen));
                 Assert.assertEquals(1L, engine.appendBlocking(buf, payloadLen));
@@ -298,7 +291,7 @@ public class CursorSendEngineSlotReacquisitionTest {
                 }
             } finally {
                 Unsafe.free(buf, payloadLen, MemoryTag.NATIVE_DEFAULT);
-                manager.setBeforeInstallSyncHook(null);
+                manager.setBeforeTrimSyncHook(null);
                 releaseWorker.countDown();
                 manager.setWorkerJoinTimeoutMillis(TimeUnit.SECONDS.toMillis(60));
                 try {
@@ -339,14 +332,7 @@ public class CursorSendEngineSlotReacquisitionTest {
                 // can only fire on the rotation-triggered pass (see
                 // testOwnedEngineCloseRetainsSlotWhileWorkerIsMidServicePass).
                 SegmentRing ring = engine.getRingForTesting();
-                long deadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
-                while (ring.needsHotSpare()) {
-                    if (System.nanoTime() > deadlineNs) {
-                        throw new AssertionError("manager worker never installed the initial hot spare");
-                    }
-                    Thread.sleep(1);
-                }
-                manager.setBeforeInstallSyncHook(() -> {
+                manager.setBeforeTrimSyncHook(() -> {
                     if (!fired.compareAndSet(false, true)) return;
                     workerBlocked.countDown();
                     try {
@@ -409,7 +395,7 @@ public class CursorSendEngineSlotReacquisitionTest {
                 }
             } finally {
                 Unsafe.free(buf, payloadLen, MemoryTag.NATIVE_DEFAULT);
-                manager.setBeforeInstallSyncHook(null);
+                manager.setBeforeTrimSyncHook(null);
                 releaseWorker.countDown();
                 manager.setWorkerJoinTimeoutMillis(TimeUnit.SECONDS.toMillis(60));
                 try {
@@ -451,14 +437,7 @@ public class CursorSendEngineSlotReacquisitionTest {
                 // can only fire on the rotation-triggered pass (see
                 // testOwnedEngineCloseRetainsSlotWhileWorkerIsMidServicePass).
                 SegmentRing ring = engine.getRingForTesting();
-                long deadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
-                while (ring.needsHotSpare()) {
-                    if (System.nanoTime() > deadlineNs) {
-                        throw new AssertionError("manager worker never installed the initial hot spare");
-                    }
-                    Thread.sleep(1);
-                }
-                manager.setBeforeInstallSyncHook(() -> {
+                manager.setBeforeTrimSyncHook(() -> {
                     if (!fired.compareAndSet(false, true)) return;
                     workerBlocked.countDown();
                     try {
@@ -522,7 +501,7 @@ public class CursorSendEngineSlotReacquisitionTest {
                 }
             } finally {
                 Unsafe.free(buf, payloadLen, MemoryTag.NATIVE_DEFAULT);
-                manager.setBeforeInstallSyncHook(null);
+                manager.setBeforeTrimSyncHook(null);
                 manager.setBeforeExitCleanupRegistrationHook(null);
                 releaseWorker.countDown();
                 manager.setWorkerJoinTimeoutMillis(TimeUnit.SECONDS.toMillis(60));
@@ -567,14 +546,7 @@ public class CursorSendEngineSlotReacquisitionTest {
                 // Phase 1: wait out the initial spare install so the park hook
                 // can only fire on the rotation-triggered pass.
                 SegmentRing ring = engine.getRingForTesting();
-                long deadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
-                while (ring.needsHotSpare()) {
-                    if (System.nanoTime() > deadlineNs) {
-                        throw new AssertionError("manager worker never installed the initial hot spare");
-                    }
-                    Thread.sleep(1);
-                }
-                manager.setBeforeInstallSyncHook(() -> {
+                manager.setBeforeTrimSyncHook(() -> {
                     if (!fired.compareAndSet(false, true)) return;
                     workerBlocked.countDown();
                     try {
@@ -674,7 +646,7 @@ public class CursorSendEngineSlotReacquisitionTest {
                 }
             } finally {
                 Unsafe.free(buf, payloadLen, MemoryTag.NATIVE_DEFAULT);
-                manager.setBeforeInstallSyncHook(null);
+                manager.setBeforeTrimSyncHook(null);
                 engine.setBeforeFlockReleaseHook(null);
                 releaseWorker.countDown();
                 releaseFinishClose.countDown();
@@ -716,14 +688,7 @@ public class CursorSendEngineSlotReacquisitionTest {
                 // Phase 1: wait out the initial spare install so the park hook
                 // can only fire on the rotation-triggered pass.
                 SegmentRing ring = engine.getRingForTesting();
-                long deadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
-                while (ring.needsHotSpare()) {
-                    if (System.nanoTime() > deadlineNs) {
-                        throw new AssertionError("manager worker never installed the initial hot spare");
-                    }
-                    Thread.sleep(1);
-                }
-                manager.setBeforeInstallSyncHook(() -> {
+                manager.setBeforeTrimSyncHook(() -> {
                     if (!fired.compareAndSet(false, true)) return;
                     workerBlocked.countDown();
                     try {
@@ -772,7 +737,7 @@ public class CursorSendEngineSlotReacquisitionTest {
                 }
             } finally {
                 Unsafe.free(buf, payloadLen, MemoryTag.NATIVE_DEFAULT);
-                manager.setBeforeInstallSyncHook(null);
+                manager.setBeforeTrimSyncHook(null);
                 releaseWorker.countDown();
                 manager.setWorkerJoinTimeoutMillis(TimeUnit.SECONDS.toMillis(60));
                 try {
