@@ -142,6 +142,10 @@ public final class SegmentManager implements QuietCloseable {
     // prefix here until the post-unlink directory barrier succeeds avoids both
     // per-pass allocation and publishing logical removal before it is durable.
     private final MmapSegment[] trimBatch = new MmapSegment[MAX_TRIMS_PER_RING_PASS];
+    // Test seam: runs in register() right after the new entry became visible to
+    // the worker. Null in production; tests use it to let the worker service the
+    // entry before register() finishes.
+    private volatile Runnable afterRegisterPublishHook;
     // Test seam: runs after a deferred ring-pass cleanup returns. Null in
     // production; public sender/pool lifecycle tests use it to observe exact
     // callback completion without sleeps or polling.
@@ -708,6 +712,12 @@ public final class SegmentManager implements QuietCloseable {
         long minNextGeneration = dir == null ? -1L : scanMaxGeneration(dir) + 1L;
         Runnable managerWakeup = this::wakeWorker;
         RingEntry e = new RingEntry(ring, dir, watermark, sideFileBytes, syncIntervalNanos, ticks.getAsLong());
+        if (watermark != null) {
+            // The first ACK wakes the worker to persist it. Seeded before the entry
+            // is visible: from then on the worker owns the mark, and a store after
+            // publication could undo a wake the worker has already armed.
+            ring.setPersistedAckFsn(-1L);
+        }
         // ObjList.add either throws before storing e or makes the entry visible.
         // Once visible, only non-throwing state commits may remain, so the gauge
         // (whose list can also throw on growth) is added first and withdrawn if
@@ -732,8 +742,9 @@ public final class SegmentManager implements QuietCloseable {
                 ring.enablePeriodicSync();
             }
         }
-        if (watermark != null) {
-            ring.setPersistedAckFsn(-1L); // the first ACK wakes the worker to persist it
+        Runnable publishHook = afterRegisterPublishHook;
+        if (publishHook != null) {
+            publishHook.run();
         }
         ring.setManagerWakeup(managerWakeup);
         // Nudge the worker so it picks up the new ring on its very next
@@ -796,6 +807,11 @@ public final class SegmentManager implements QuietCloseable {
             throw new IllegalArgumentException("ring is not registered");
         }
         return serviceRing(selected);
+    }
+
+    @TestOnly
+    public void setAfterRegisterPublishHook(Runnable hook) {
+        this.afterRegisterPublishHook = hook;
     }
 
     @TestOnly

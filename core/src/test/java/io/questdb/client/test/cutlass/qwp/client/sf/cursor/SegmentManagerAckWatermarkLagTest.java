@@ -41,6 +41,7 @@ import org.junit.Test;
 import java.nio.file.Paths;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.LockSupport;
 
 /**
  * ACKs that land inside the active segment never complete a sealed segment, so
@@ -153,6 +154,59 @@ public class SegmentManagerAckWatermarkLagTest {
                 }
                 Assert.assertEquals("the first ACK after register did not wake the parked worker",
                         9L, watermark.read());
+            } finally {
+                Unsafe.free(payload, 32, MemoryTag.NATIVE_DEFAULT);
+                watermark.close();
+                ring.close();
+            }
+        });
+    }
+
+    /**
+     * A recovered ring (acked before register) on a running worker: the worker
+     * services the entry and arms the ACK wake before register() returns.
+     * register() must not overwrite that arm, or later ACKs inside the active
+     * segment wake nothing and the watermark stops.
+     */
+    @Test(timeout = 20_000L)
+    public void testRegisterKeepsAckWakeArmedByAnEarlyWorkerPass() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segmentSize = MmapSegment.HEADER_SIZE + 64 * (MmapSegment.FRAME_HEADER_SIZE + 32L);
+            MmapSegment initial = MmapSegment.create(tmpDir + "/sf-0000000000000000.sfa", 0L, segmentSize);
+            SegmentRing ring = new SegmentRing(initial, segmentSize);
+            AckWatermark watermark = AckWatermark.open(tmpDir);
+            Assert.assertNotNull(watermark);
+            long payload = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
+            try (SegmentManager manager = new SegmentManager(segmentSize, new SegmentBudget(segmentSize * 8))) {
+                for (int i = 0; i < 10; i++) {
+                    Assert.assertTrue(ring.appendOrFsn(payload, 32) >= 0);
+                }
+                ring.acknowledge(9L);
+                manager.start();
+                Thread worker = manager.getWorkerThreadForTesting();
+                Assert.assertNotNull(worker);
+                manager.setAfterRegisterPublishHook(() -> {
+                    // Persisted, then re-armed by a timed pass: only an armed worker parks untimed.
+                    manager.wakeWorker();
+                    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                    while ((watermark.read() != 9L || worker.getState() != Thread.State.WAITING)
+                            && System.nanoTime() < deadline) {
+                        LockSupport.parkNanos(1_000_000L);
+                    }
+                });
+                manager.register(ring, tmpDir, watermark);
+                Assert.assertEquals("the worker did not service the entry inside register()", 9L, watermark.read());
+                Assert.assertEquals(Thread.State.WAITING, worker.getState());
+
+                for (int i = 0; i < 10; i++) {
+                    Assert.assertTrue(ring.appendOrFsn(payload, 32) >= 0);
+                }
+                ring.acknowledge(19L);
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                while (watermark.read() != 19L && System.nanoTime() < deadline) {
+                    Thread.sleep(1);
+                }
+                Assert.assertEquals("an ACK after register did not wake the armed worker", 19L, watermark.read());
             } finally {
                 Unsafe.free(payload, 32, MemoryTag.NATIVE_DEFAULT);
                 watermark.close();
