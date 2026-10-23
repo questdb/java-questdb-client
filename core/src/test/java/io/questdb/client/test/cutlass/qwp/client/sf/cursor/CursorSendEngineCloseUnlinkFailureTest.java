@@ -47,20 +47,22 @@ import java.util.Set;
 /**
  * Regression for the close-time segment cleanup on a fully-drained slot.
  * <p>
- * {@code CursorSendEngine.finishClose} unlinks the acknowledged {@code .sfa}
- * files and then removes the ack watermark. When the unlink fails (transient
- * I/O error, permission problem), the residual segment files hold rows the
- * server already acknowledged. If the watermark does not cover them, a
- * successor engine on the same slot seeds recovery from {@code lowestBase - 1}
- * and replays every acknowledged row — duplicates on a non-DEDUP table.
+ * {@code CursorSendEngine.finishClose} syncs the ack watermark, unlinks the
+ * acknowledged {@code .sfa} files and then removes the watermark. When the
+ * unlink fails (transient I/O error, permission problem), the residual segment
+ * files hold rows the server already acknowledged. If the watermark does not
+ * cover them, a successor engine on the same slot seeds recovery from
+ * {@code lowestBase - 1} and replays every acknowledged row — duplicates on a
+ * non-DEDUP table. The final ACK wrote the watermark; this guards that close
+ * keeps it ahead of the residue.
  * <p>
  * The test injects the unlink failure by dropping write permission on the
  * slot directory (POSIX: unlink requires a writable parent directory), so it
  * is skipped on Windows and when permissions are not enforced (root).
  * The shared {@link SegmentManager} is deliberately never started: no worker
- * thread exists, so no manager tick can persist the watermark behind the
- * test's back, and the close-path quiescence barrier is trivially satisfied —
- * fully deterministic, no timing coordination needed.
+ * thread exists, so no trim can run behind the test's back, and the
+ * close-path quiescence barrier is trivially satisfied — fully deterministic,
+ * no timing coordination needed.
  */
 public class CursorSendEngineCloseUnlinkFailureTest {
 

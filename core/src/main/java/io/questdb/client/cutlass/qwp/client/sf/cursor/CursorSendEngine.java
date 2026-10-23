@@ -162,8 +162,9 @@ public final class CursorSendEngine implements QuietCloseable {
     // disk mode fails construction unless the watermark is usable because
     // segment-derived recovery cannot distinguish acknowledged residue from
     // replayable frames. Lifetime tied to the engine: opened in the
-    // constructor, closed by {@link #close()}. The segment manager writes
-    // through this on every tick where ackedFsn has advanced.
+    // constructor, closed by {@link #close()}. Written by the I/O thread on
+    // every ACK advance ({@link #acknowledge}); the segment manager only
+    // syncs it before a trim.
     private final AckWatermark watermark;
     // Engine-owned per-slot symbol dictionary file (disk mode only; {@code null}
     // in memory mode and if open() failed). Enables delta-encoded SF frames:
@@ -449,22 +450,6 @@ public final class CursorSendEngine implements QuietCloseable {
                 // not exist on disk if earlier segments have been trimmed,
                 // causing it to fall through to the active segment's tip
                 // and skip the unacked sealed segments entirely.
-                //
-                // Then check the persisted ack watermark. If present and
-                // larger than the segment-derived seed, prefer it: it
-                // captures durable-acks that landed inside the lowest
-                // surviving sealed segment before the previous sender
-                // crashed. Without this, those already-acked frames would
-                // be re-replayed on reconnect, producing row-level
-                // duplicates unless the target table dedupes them.
-                // max(lowestBase - 1, watermark) absorbs both write
-                // orderings of the manager's "persist then trim" tick:
-                //   - persist crashed before trim: segments still on disk
-                //     are >= lowest, watermark is correct; max picks
-                //     watermark.
-                //   - trim ran before persist: segments are gone (so
-                //     lowestBase is higher than watermark), watermark is
-                //     stale; max picks lowestBase - 1.
                 MmapSegment first = recovered.firstSealed();
                 long lowestBase = first != null
                         ? first.baseSeq()
@@ -475,15 +460,14 @@ public final class CursorSendEngine implements QuietCloseable {
                 // surviving sealed segment -- without it, those frames
                 // get re-replayed across process restart, producing
                 // row-level duplicates unless the target table dedupes
-                // them. max(lowestBase - 1, watermark) absorbs both
-                // write orderings of the manager's "persist then trim"
-                // tick:
-                //   - persist crashed before trim: segments still on
-                //     disk are >= lowest, watermark is correct; max
-                //     picks watermark.
-                //   - trim ran before persist: segments are gone (so
-                //     lowestBase is higher than watermark), watermark
-                //     is stale; max picks lowestBase - 1.
+                // them. max(lowestBase - 1, watermark) absorbs a watermark
+                // that is behind the trim (the I/O thread writes it per ACK,
+                // the manager syncs it before unlinking; a crash between the
+                // two, or a torn record, leaves it stale or invalid):
+                //   - watermark durable, segments still on disk: max picks
+                //     the watermark.
+                //   - segments gone, watermark stale: lowestBase is higher
+                //     than the watermark; max picks lowestBase - 1.
                 // Segment-derived state cannot tell whether frames in the
                 // lowest surviving segment were acknowledged. Starting
                 // without the watermark would therefore expose acknowledged
@@ -1274,20 +1258,18 @@ public final class CursorSendEngine implements QuietCloseable {
                 throw e;
             }
         }
-        // On a fully-drained close, persist the final acked FSN through the
-        // still-mapped watermark BEFORE closing the ring/watermark and BEFORE
-        // unlinking any segment file. The I/O thread wrote it on every ACK
-        // but only the manager's trim syncs it, so it may not be durable yet.
-        // If any part of this covering barrier fails, retain the ring,
-        // watermark and slot flock:
+        // On a fully-drained close, make the final acked FSN durable through
+        // the still-mapped watermark BEFORE closing the ring/watermark and
+        // BEFORE unlinking any segment file. The I/O thread wrote it on the
+        // final ACK but only the manager's trim syncs it, so it may not be
+        // durable yet. If any part of this covering barrier fails, retain the
+        // ring, watermark and slot flock:
         // publishing the slot would let a successor recover acknowledged
         // residue from a stale durable watermark. The shared retry driver owns
         // convergence after the one-shot public close reports the failure.
         if (fullyDrained && watermark != null) {
             try {
-                long finalAckedFsn = ring.ackedFsn();
-                if (finalAckedFsn >= 0) {
-                    watermark.write(finalAckedFsn);
+                if (ring.ackedFsn() >= 0) {
                     watermark.sync();
                     if (filesFacade.fsyncDir(sfDir) != 0) {
                         throw new IllegalStateException(

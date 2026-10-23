@@ -135,9 +135,6 @@ public final class SegmentManager implements QuietCloseable {
     private final MmapSegment[] trimBatch = new MmapSegment[MAX_TRIMS_PER_RING_PASS];
     // Handed to each ring (spare needed, ACK wake) and to the budget (room after a refusal).
     private final Runnable workerWakeup = this::wakeWorker;
-    // Test seam: runs in register() right after the new entry became visible to
-    // the worker. Null in production; tests use it to let the worker service the
-    // entry before register() finishes.
     // Test seam: runs after a deferred ring-pass cleanup returns. Null in
     // production; public sender/pool lifecycle tests use it to observe exact
     // callback completion without sleeps or polling.
@@ -164,8 +161,7 @@ public final class SegmentManager implements QuietCloseable {
     // synchronized(lock) entry. Null in production; only
     // SegmentManagerTrimDeregisterRaceTest installs it, to deterministically
     // inject a deregister(ring) call into the exact race window that the
-    // entry-state check inside the trim block closes for watermark writes and
-    // budget accounting.
+    // entry-state check inside the trim block closes for budget accounting.
     private volatile Runnable beforeTrimSyncHook;
     // Test seam invoked exactly when a retry transition/recovery is logged.
     // Null in production; persistent-failure tests use it to prove log bounds
@@ -1213,12 +1209,14 @@ public final class SegmentManager implements QuietCloseable {
             return false;
         }
 
-        // Every attempt repeats the cheap covering barrier. The I/O thread
-        // writes the watermark on every ACK, so the sync makes the ACKs this
-        // trim relies on durable (an ACK racing the msync is at worst torn
-        // into the record recovery's max() clamp discards), and it preserves
-        // the same strict pre-unlink/post-unlink directory ordering on
-        // pending retries.
+        // Every attempt repeats the cheap covering barrier. The trim itself
+        // is protected by the fsync'd manifest head, not by the watermark:
+        // recovery skips files below the head and seeds at least headBase-1.
+        // The sync only makes the watermark the I/O thread has written so far
+        // (possibly one ACK behind durableAck, or torn by a racing write)
+        // as durable as it can be, so recovery replays fewer duplicates, and
+        // it preserves the same strict pre-unlink/post-unlink directory
+        // ordering on pending retries.
         if (e.watermark == null) {
             if (!e.missingWatermarkLogged) {
                 e.missingWatermarkLogged = true;

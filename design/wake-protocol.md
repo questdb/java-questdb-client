@@ -67,10 +67,14 @@ syscall), and the worker only `sync()`s it before unlinking a trimmed segment.
 That removed the row that took four commits (39ac01e9, 779a99bc, 1304f71d,
 3362671f): `SegmentRing.persistedAckFsn`, `RingEntry.ackWakeArmed`,
 `RingEntry.lastPersistedAck`, `WATERMARK_LAG_NANOS` and the Dekker between
-them. A `write` racing the worker's msync can leave one torn record on disk;
-the record fails its CRC and recovery takes the other slot, then the
-`max(lowestBase - 1, watermark)` clamp — the watermark was always a
-discardable optimization under that clamp.
+them. A `write` racing the worker's msync can tear one or both on-disk
+records; a torn record fails its CRC and recovery takes the other slot or
+the segment-derived seed, then the `max(lowestBase - 1, watermark)` clamp.
+The trim itself is protected by the fsync'd manifest head, not the watermark.
+A watermark that is too *high* (host crash after a trim msync with the data
+pages still dirty) is rejected at recovery and must be overwritten there
+(c86689f2): nothing else writes it until the next ACK, which during an outage
+is never.
 
 ## Consumer C — ack waiters
 
