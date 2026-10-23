@@ -227,6 +227,50 @@ public class AckWaiterSignalTest {
         });
     }
 
+    /**
+     * close() with the drain skipped against a server that never acks: the
+     * loop goes down and no ack can ever reach the waiter. It must throw
+     * "Sender is closed" from the loop's close signal, not sleep to its
+     * own deadline and return false.
+     */
+    @Test
+    public void testAwaitAckedFsnWakesOnClose() throws Exception {
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer silent = startedServer(new TestWebSocketServer.WebSocketServerHandler() {
+            })) {
+                QwpWebSocketSender sender = (QwpWebSocketSender) Sender.fromConfig(
+                        "ws::addr=localhost:" + silent.getPort() + ";close_flush_timeout_millis=0;");
+                sender.table("t").longColumn("v", 1L).atNow();
+                long fsn = sender.flushAndGetSequence();
+                AtomicReference<Throwable> outcome = new AtomicReference<>();
+                AtomicLong elapsedMs = new AtomicLong(-1L);
+                Thread waiter = new Thread(() -> {
+                    long t0 = System.nanoTime();
+                    try {
+                        sender.awaitAckedFsn(fsn, 20_000);
+                    } catch (Throwable t) {
+                        outcome.set(t);
+                    } finally {
+                        elapsedMs.set((System.nanoTime() - t0) / 1_000_000L);
+                    }
+                });
+                waiter.start();
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                while (waiter.getState() != Thread.State.TIMED_WAITING && System.nanoTime() < deadline) {
+                    Thread.sleep(1);
+                }
+                Assert.assertEquals(Thread.State.TIMED_WAITING, waiter.getState());
+                sender.close();
+                waiter.join(5_000);
+                Assert.assertFalse("waiter still parked " + elapsedMs.get() + "ms after close()", waiter.isAlive());
+                Throwable t = outcome.get();
+                Assert.assertTrue("expected 'Sender is closed', got " + t,
+                        t instanceof LineSenderException && t.getMessage().contains("Sender is closed"));
+                Assert.assertTrue("waiter returned only after " + elapsedMs.get() + "ms", elapsedMs.get() < 2000L);
+            }
+        });
+    }
+
     private static TestWebSocketServer startedServer(TestWebSocketServer.WebSocketServerHandler handler)
             throws Exception {
         TestWebSocketServer server = new TestWebSocketServer(handler);

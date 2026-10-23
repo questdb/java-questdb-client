@@ -576,7 +576,7 @@ public class QwpWebSocketSender implements Sender {
     // cause on every later table()/flush-family call; close() still works
     // normally. Every other recycle failure is transient and resumable (see
     // recycleResume), never latched here.
-    private Throwable recycleFailure;
+    private volatile Throwable recycleFailure;
     // Resumable recycle: a transient failure mid-recycle no
     // longer latches the sender terminal. CLOSE_LOOP = step 2 failed, the
     // old loop is still dying and the old engine/dictionary are intact.
@@ -1563,6 +1563,17 @@ public class QwpWebSocketSender implements Sender {
             engine.checkDurability();
         }
         checkConnectionError();
+        checkRecycleFailure();
+        if (closed) {
+            // close() keeps acking through its drain, so a waiter whose target the
+            // drain reaches still returns true. Once the loop is down no ack can
+            // ever land: throw as the entry check would, instead of sleeping to
+            // the deadline. The loop signals the waiters after clearing running.
+            CursorWebSocketSendLoop loop = cursorSendLoop;
+            if (loop == null || !loop.isRunning()) {
+                throw new LineSenderException("Sender is closed");
+            }
+        }
     }
 
     /**
@@ -5893,6 +5904,7 @@ public class QwpWebSocketSender implements Sender {
                         + "frames: the outgoing engine's fully-drained close contract "
                         + "was breached");
         recycleFailure = breach;
+        ackWaiters.signal(); // parked monitor threads re-check the latch
         recycleResume = RecycleResume.NONE;
         try {
             rebuilt.close(recycleSlotLock == null);
