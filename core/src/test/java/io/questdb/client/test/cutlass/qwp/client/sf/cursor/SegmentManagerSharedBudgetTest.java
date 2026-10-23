@@ -28,6 +28,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentBudget;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
+import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.tools.TestUtils;
@@ -36,6 +37,7 @@ import org.junit.Test;
 
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 
@@ -186,6 +188,47 @@ public class SegmentManagerSharedBudgetTest {
                 siblingManager.deregister(sibling);
                 Assert.assertTrue(siblingManager.awaitRingQuiescence(sibling));
                 Assert.assertEquals(0, budget.getSegmentBytes());
+            } finally {
+                Unsafe.free(buf, FRAME_PAYLOAD, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    /**
+     * Room another manager frees must wake a manager the budget refused, not
+     * wait for a timer. The starved manager's clock runs backwards, which
+     * stretches any timer-driven provision retry to about ten seconds; only the
+     * wake can deliver the spare within the deadline.
+     */
+    @Test
+    public void testSiblingDeregisterWakesRefusedManager() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            SegmentBudget budget = new SegmentBudget(4 * SEGMENT_SIZE);
+            AtomicLong clock = new AtomicLong();
+            long buf = Unsafe.malloc(FRAME_PAYLOAD, MemoryTag.NATIVE_DEFAULT);
+            try (SegmentRing busy = newRing();
+                 SegmentRing starved = newRing();
+                 SegmentManager busyManager = new SegmentManager(SEGMENT_SIZE, budget);
+                 SegmentManager starvedManager = new SegmentManager(SEGMENT_SIZE, budget, FilesFacade.INSTANCE,
+                         () -> clock.addAndGet(-TimeUnit.SECONDS.toNanos(10)))) {
+                busyManager.start();
+                starvedManager.start();
+                busyManager.register(busy, null);
+                appendFrames(busy, buf, 8);
+                assertCapped(busy, buf);
+                starvedManager.register(starved, null);
+                appendFrames(starved, buf, 4);
+                assertCapped(starved, buf);
+
+                busyManager.deregister(busy);
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+                while (starved.needsHotSpare() && System.nanoTime() < deadline) {
+                    Thread.sleep(1);
+                }
+                Assert.assertFalse("freed budget did not wake the refused manager", starved.needsHotSpare());
+                Assert.assertTrue(busyManager.awaitRingQuiescence(busy));
+                starvedManager.deregister(starved);
+                Assert.assertTrue(starvedManager.awaitRingQuiescence(starved));
             } finally {
                 Unsafe.free(buf, FRAME_PAYLOAD, MemoryTag.NATIVE_DEFAULT);
             }

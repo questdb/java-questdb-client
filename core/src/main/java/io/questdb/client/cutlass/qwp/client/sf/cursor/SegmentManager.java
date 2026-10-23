@@ -58,10 +58,10 @@ public final class SegmentManager implements QuietCloseable {
 
     public static final long DISK_FULL_LOG_THROTTLE_NANOS = 30_000_000_000L; // 30 s
     /**
-     * Retry cadence after a failed hot-spare provisioning attempt (disk full,
-     * budget exhausted, I/O error). Nothing else wakes the worker for that
-     * ring until its next rotation or ACK, so the retry needs its own timer.
-     * A wake from SegmentBudget.release() would make it fully event-driven.
+     * Retry cadence after a failed hot-spare create (disk full, I/O error).
+     * Nothing announces that the disk recovered, so the retry needs its own
+     * timer. A budget refusal needs none: the budget wakes the worker when
+     * room appears.
      */
     public static final long PROVISION_RETRY_NANOS = 10_000_000L; // 10 ms
     public static final long UNLIMITED_TOTAL_BYTES = Long.MAX_VALUE;
@@ -142,6 +142,8 @@ public final class SegmentManager implements QuietCloseable {
     // prefix here until the post-unlink directory barrier succeeds avoids both
     // per-pass allocation and publishing logical removal before it is durable.
     private final MmapSegment[] trimBatch = new MmapSegment[MAX_TRIMS_PER_RING_PASS];
+    // Handed to each ring (spare needed, ACK wake) and to the budget (room after a refusal).
+    private final Runnable workerWakeup = this::wakeWorker;
     // Test seam: runs in register() right after the new entry became visible to
     // the worker. Null in production; tests use it to let the worker service the
     // entry before register() finishes.
@@ -199,9 +201,9 @@ public final class SegmentManager implements QuietCloseable {
     // array. Guarded by lock and consumed on worker-loop exit outside lock.
     private Runnable ownedEngineExitCleanup;
     private long lastDiskFullLogNs;
-    // Worker-local: when a hot-spare provisioning attempt fails (disk full, budget
-    // exhausted, I/O error) the worker schedules its own retry here instead of
-    // relying on a tick. Reset every pass; Long.MAX_VALUE = nothing to retry.
+    // Worker-local: when a hot-spare create fails (disk full, I/O error) the
+    // worker schedules its own retry here instead of relying on a tick. Reset
+    // every pass; Long.MAX_VALUE = nothing to retry.
     private long provisionRetryDeadlineNanos = Long.MAX_VALUE;
     private volatile boolean running;
     // pathScratch free-exactly-once coordination between a timed-out close()
@@ -710,7 +712,6 @@ public final class SegmentManager implements QuietCloseable {
         // user's existing active file out from under the I/O loop, scrambling
         // the in-flight mmap. Memory-mode rings have no dir; nothing to scan.
         long minNextGeneration = dir == null ? -1L : scanMaxGeneration(dir) + 1L;
-        Runnable managerWakeup = this::wakeWorker;
         RingEntry e = new RingEntry(ring, dir, watermark, sideFileBytes, syncIntervalNanos, ticks.getAsLong());
         if (watermark != null) {
             // The first ACK wakes the worker to persist it. Seeded before the entry
@@ -746,7 +747,7 @@ public final class SegmentManager implements QuietCloseable {
         if (publishHook != null) {
             publishHook.run();
         }
-        ring.setManagerWakeup(managerWakeup);
+        ring.setManagerWakeup(workerWakeup);
         // Nudge the worker so it picks up the new ring on its very next
         // iteration. Without this, register-after-start has a race window:
         // start() schedules the worker thread, and if that thread reaches
@@ -1010,16 +1011,16 @@ public final class SegmentManager implements QuietCloseable {
         //    under the disk-total cap. Cap check is per attempt; if we're
         //    capped here, the ring stays in BACKPRESSURE_NO_SPARE until trim
         //    (step 2) frees space, which is retried below in this same pass.
-        //    Logged at most once per DISK_FULL_LOG_THROTTLE_NANOS so a
-        //    sustained-disk-full state doesn't drown the log.
+        //    Room freed elsewhere (a sibling ring or manager, a deregister)
+        //    wakes this worker through the budget. Logged at most once per
+        //    DISK_FULL_LOG_THROTTLE_NANOS so a sustained-disk-full state
+        //    doesn't drown the log.
         boolean capped = e.ring.needsHotSpare() && provisionSpare(e, memoryMode);
         boolean hasMoreTrimmable = trimAcked(e, memoryMode);
         // The trim may have just released the bytes the spare was refused
-        // for: retry once in this pass rather than parking on the retry
-        // timer. The timer remains the fallback for room freed elsewhere (a
-        // sibling ring or manager, a deregister) and for a failed create.
-        if (capped && provisionSpare(e, memoryMode)) {
-            scheduleProvisionRetry();
+        // for: retry once in this pass rather than waiting for the wake.
+        if (capped) {
+            provisionSpare(e, memoryMode);
         }
         return hasMoreTrimmable;
     }
@@ -1037,7 +1038,7 @@ public final class SegmentManager implements QuietCloseable {
         // share the budget both see room for its last segment and both take
         // it. Installing the spare keeps the charge; every other outcome
         // below releases it.
-        boolean withinCap = budget.tryCharge(segmentSizeBytes);
+        boolean withinCap = budget.tryCharge(segmentSizeBytes, workerWakeup);
         // Liveness floor. Refusing on segment bytes is productive -- an ack
         // trims a sealed segment and the shortfall clears. Refusing on
         // side-file bytes is not: the dictionary never shrinks, so a ring
@@ -1482,7 +1483,8 @@ public final class SegmentManager implements QuietCloseable {
                 // Event-driven idle: every state change the worker services
                 // wakes it (register/deregister, rotation, high-water publish,
                 // the first ACK past the watermark, an ACK that completes a
-                // sealed segment). Timed work: periodic sync, a provision retry,
+                // sealed segment, budget room after a refused spare). Timed
+                // work: periodic sync, a failed spare create's retry,
                 // a failed trim's retry, and re-persisting the watermark while
                 // the ACK wake is disarmed. Otherwise park indefinitely.
                 long parkNanos = Long.MAX_VALUE;

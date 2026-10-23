@@ -46,14 +46,21 @@ import java.util.function.LongSupplier;
  * plus one spare -- is provisioned past the cap, so a budget shared by
  * {@code n} rings can be exceeded by up to {@code n} such working sets.
  * <p>
+ * A manager refused a spare is woken when room appears, so a ring starved by
+ * the segments of other rings resumes as soon as one of them trims or leaves.
+ * <p>
  * Thread-safe. All state is guarded by this object's monitor, a leaf lock:
- * managers call in while holding their own lock, and nothing here calls back
- * into a manager. Side-file gauges are read under the monitor, so they must
- * be wait-free and must not throw.
+ * managers call in while holding their own lock, and the only call back into
+ * a manager is a refused manager's wake, which takes no lock. Side-file gauges
+ * are read under the monitor, so they must be wait-free and must not throw.
  */
 public final class SegmentBudget {
 
     private final long capacityBytes;
+    // Wakes of managers refused by tryCharge since room last appeared. Run and
+    // cleared by every call that frees room; refusal and registration are one
+    // step under the monitor, so a release cannot slip between them.
+    private final ObjList<Runnable> refusedWakeups = new ObjList<>();
     // Live gauges of each charged slot's .symbol-dict side-file bytes. Read on
     // every cap check rather than folded into segmentBytes: a dictionary
     // grows out-of-band on producer threads, so an incremental mirror would
@@ -105,6 +112,7 @@ public final class SegmentBudget {
 
     synchronized void release(long bytes) {
         segmentBytes -= bytes;
+        wakeRefused();
     }
 
     // Identity, not equals(): each registration hands in its own gauge instance.
@@ -112,6 +120,7 @@ public final class SegmentBudget {
         for (int i = 0, n = sideFileGauges.size(); i < n; i++) {
             if (sideFileGauges.getQuick(i) == gauge) {
                 sideFileGauges.remove(i);
+                wakeRefused();
                 return;
             }
         }
@@ -121,10 +130,14 @@ public final class SegmentBudget {
      * Charges {@code bytes} if they fit under the capacity together with
      * everything already charged and the live side-file bytes. Check and charge
      * are one atomic step, so managers sharing the budget can never both take
-     * its last free segment.
+     * its last free segment. On refusal, {@code onRoom} runs once the next time
+     * room appears (a release or a removed gauge); it must not block or throw.
      */
-    synchronized boolean tryCharge(long bytes) {
+    synchronized boolean tryCharge(long bytes, Runnable onRoom) {
         if (segmentBytes + sideFileBytes() + bytes > capacityBytes) {
+            if (refusedWakeups.indexOf(onRoom) < 0) {
+                refusedWakeups.add(onRoom);
+            }
             return false;
         }
         segmentBytes += bytes;
@@ -137,5 +150,12 @@ public final class SegmentBudget {
             total += sideFileGauges.getQuick(i).getAsLong();
         }
         return total;
+    }
+
+    private void wakeRefused() {
+        for (int i = 0, n = refusedWakeups.size(); i < n; i++) {
+            refusedWakeups.getQuick(i).run();
+        }
+        refusedWakeups.clear();
     }
 }
