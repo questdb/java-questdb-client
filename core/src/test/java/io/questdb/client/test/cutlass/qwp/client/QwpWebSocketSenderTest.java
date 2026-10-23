@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
@@ -36,6 +37,7 @@ import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.Decimal256;
 import io.questdb.client.std.Decimal64;
 import io.questdb.client.std.bytes.DirectByteSlice;
+import io.questdb.client.test.QuestDBFlushOnCloseTest;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
 import org.junit.Test;
@@ -52,6 +54,51 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  * These tests focus on state management and API validation without requiring a live server.
  */
 public class QwpWebSocketSenderTest {
+
+    @Test
+    public void testAgeCheckRunsOnRowsTwoToSixteenThenEverySixteenth() throws Exception {
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = new TestWebSocketServer(new QuestDBFlushOnCloseTest.FrameLog())) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                        + ";auto_flush_rows=off;auto_flush_bytes=off;auto_flush_interval=200;")) {
+                    // 17 rows appended at once; the first row's age is below the interval
+                    for (int i = 1; i <= 17; i++) {
+                        sender.table("t").longColumn("v", i).atNow();
+                    }
+                    Assert.assertEquals(17, sender.pendingRowCount());
+                    Thread.sleep(500);
+
+                    // past 16 pending rows only every sixteenth row reads the clock
+                    sender.table("t").longColumn("v", 18).atNow();
+                    Assert.assertEquals(18, sender.pendingRowCount());
+                    for (int i = 19; i <= 31; i++) {
+                        sender.table("t").longColumn("v", i).atNow();
+                    }
+                    Assert.assertEquals(31, sender.pendingRowCount());
+                    sender.table("t").longColumn("v", 32).atNow();
+                    Assert.assertEquals(0, sender.pendingRowCount());
+
+                    // rows 2 to 16 are always checked
+                    sender.table("t").longColumn("v", 1).atNow();
+                    Assert.assertEquals(1, sender.pendingRowCount());
+                    Thread.sleep(500);
+                    sender.table("t").longColumn("v", 2).atNow();
+                    Assert.assertEquals(0, sender.pendingRowCount());
+
+                    // the release path always reads the clock
+                    for (int i = 1; i <= 17; i++) {
+                        sender.table("t").longColumn("v", i).atNow();
+                    }
+                    Assert.assertEquals(17, sender.pendingRowCount());
+                    Thread.sleep(500);
+                    sender.autoFlushIfDue();
+                    Assert.assertEquals(0, sender.pendingRowCount());
+                }
+            }
+        });
+    }
 
     @Test
     public void testApplyServerBatchSizeLimit_advertisedClampsLargerConfigured() throws Exception {
