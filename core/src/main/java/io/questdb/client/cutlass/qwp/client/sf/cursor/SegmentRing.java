@@ -1715,7 +1715,6 @@ public final class SegmentRing implements QuietCloseable {
         return target.reserveRecord((int) capacity);
     }
 
-
     /**
      * Payload capacity of the reserved record; 0 when none is reserved.
      */

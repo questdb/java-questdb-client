@@ -51,6 +51,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
@@ -410,19 +411,81 @@ public class QwpOpenRecordSenderTest {
     }
 
     @Test
+    public void testRecordSealFailureOnAnIllegalArgumentSkipsTheCommitAtClose() throws Exception {
+        assertMemoryLeak(() -> {
+            QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+            try (TestWebSocketServer server = startServer(log);
+                 Oracle oracle = new Oracle()) {
+                QwpWebSocketSender sender = (QwpWebSocketSender) Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                        + ";auto_flush_bytes=off;auto_flush_rows=1000000;auto_flush_interval=60000;close_flush_timeout_millis=5000;");
+                try {
+                    // a transaction in progress: the first record is sealed, its commit deferred
+                    sender.setDeferCommit(true);
+                    QwpTableBuffer t = oracle.block("t");
+                    longRow(sender, t, "v", 1);
+                    sender.flush();
+                    log.awaitDataFrames(1, 5_000);
+                    Assert.assertArrayEquals(oracle.frame(-1, true), dataFrame(log, 0));
+                    Assert.assertTrue(sender.hasDeferredMessagesForTesting());
+
+                    // swap the second record's reservation for one smaller than its rows: the engine's
+                    // seal throws an IllegalArgumentException before it clears the reservation, which
+                    // the ring then keeps
+                    sender.table("t").longColumn("v", 2).at(TS_BASE + 2, ChronoUnit.MICROS);
+                    CursorSendEngine engine = sender.getCursorEngineForTesting();
+                    long reserved = engine.getRingForTesting().getActive().reservedOffset();
+                    engine.abandonRecord(reserved);
+                    Assert.assertEquals(reserved, engine.getRingForTesting().reserveRecord(QwoFormat.HEADER_SIZE));
+                    LineSenderException sealFailure = null;
+                    try {
+                        sender.flush();
+                        Assert.fail("the seal must fail");
+                    } catch (LineSenderException expected) {
+                        sealFailure = expected;
+                        TestUtils.assertContains(expected.getMessage(), "seal");
+                        Assert.assertTrue(String.valueOf(expected.getCause()), expected.getCause() instanceof IllegalArgumentException);
+                    }
+                    try {
+                        sender.table("t").longColumn("v", 3).at(TS_BASE + 3, ChronoUnit.MICROS);
+                        Assert.fail("the sender is terminal");
+                    } catch (LineSenderException expected) {
+                        TestUtils.assertContains(expected.getMessage(), "terminal");
+                        Assert.assertSame(sealFailure, expected.getCause());
+                    }
+                } finally {
+                    // the transaction ends: close() would send the commit message, which the ring would
+                    // refuse ("record reserved") and which would commit the first record of a transaction
+                    // whose last record was lost; close() skips it and drains
+                    sender.setDeferCommit(false);
+                    sender.close();
+                }
+                Assert.assertEquals("only the first record shipped, and no commit message followed", 1, log.frames().size());
+            }
+        });
+    }
+
+    @Test
     public void testReservationTimeoutWithADeadLoopReportsTheLoopsError() throws Exception {
         assertMemoryLeak(() -> {
             NackOnDemandHandler handler = new NackOnDemandHandler();
             try (TestWebSocketServer server = startServer(handler)) {
                 // two 128 KiB segments and no acks: the ring fills after a few records
-                CursorSendEngine engine = new CursorSendEngine(null, 128 * 1024, 256L * 1024, TimeUnit.SECONDS.toNanos(2));
+                CursorSendEngine engine = new CursorSendEngine(null, 128 * 1024, 256L * 1024, TimeUnit.SECONDS.toNanos(5));
                 QwpWebSocketSender sender = QwpWebSocketSender.connect("localhost", server.getPort(), null,
                         1_000_000, 0, 0L, null, false, engine, 0L);
+                AtomicReference<Throwable> killerFailure = new AtomicReference<>();
                 Thread killer = new Thread(() -> {
                     // once the producer waits for ring space, the server rejects the first frame and the I/O loop dies
-                    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
-                    while (engine.getCountersForTesting().backpressureStalls.get() == 0 && System.nanoTime() < deadline) {
+                    // (nack() does nothing before a frame reached the server, so wait for that too)
+                    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+                    while ((engine.getCountersForTesting().backpressureStalls.get() == 0 || !handler.hasClient())
+                            && System.nanoTime() < deadline) {
                         LockSupport.parkNanos(1_000_000);
+                    }
+                    if (engine.getCountersForTesting().backpressureStalls.get() == 0 || !handler.hasClient()) {
+                        killerFailure.set(new AssertionError("no stall or no frame at the server within 10 s [stalls="
+                                + engine.getCountersForTesting().backpressureStalls.get() + ", client=" + handler.hasClient() + ']'));
+                        return;
                     }
                     handler.nack();
                 });
@@ -441,6 +504,10 @@ public class QwpOpenRecordSenderTest {
                         }
                     }
                     killer.join(30_000);
+                    Throwable killerError = killerFailure.get();
+                    if (killerError != null) {
+                        throw new AssertionError(killerError.getMessage(), killerError);
+                    }
                     Assert.assertNotNull("the ring never filled", failure);
                     Assert.assertTrue("the producer waited for ring space", engine.getCountersForTesting().backpressureStalls.get() > 0);
                     for (Throwable t = failure; t != null; t = t.getCause()) {
@@ -571,6 +638,69 @@ public class QwpOpenRecordSenderTest {
                 Assert.assertArrayEquals(first.frame(-1, false), dataFrame(log, 0));
                 Assert.assertArrayEquals(second.frame(-1, false), dataFrame(log, 1));
                 Assert.assertEquals(2, ws.recordOpensForTest());
+            }
+        });
+    }
+
+    @Test
+    public void testRowLargerThanRoomLeftAfterASealedRecordShipsThroughAFullCapacityRecord() throws Exception {
+        assertMemoryLeak(() -> {
+            QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+            // a 60 KiB cap keeps every frame within the test server's 64 KiB receive buffer
+            try (TestWebSocketServer server = startServer(log, 60 * 1024);
+                 Oracle small = new Oracle();
+                 Oracle big = new Oracle()) {
+                // 128 KiB segments: the default minimum reservation is a quarter of one, below the cap
+                CursorSendEngine engine = new CursorSendEngine(null, 128 * 1024, 64L * 1024 * 1024,
+                        CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS);
+                try (QwpWebSocketSender sender = QwpWebSocketSender.connect("localhost", server.getPort(), null,
+                        1_000_000, 0, 0L, null, false, engine, 5_000L)) {
+                    SegmentRing ring = engine.getRingForTesting();
+                    final long defaultMinimum = Math.min(QwoFormat.MIN_RECORD_RESERVATION, engine.segmentPayloadCapacity() / 4);
+                    final int rowBytes = 50 * 1024;
+                    // fill the active segment with sealed records until the room left is below the row
+                    final String filler = TestUtils.repeat("f", 20 * 1024);
+                    int fillers = 0;
+                    while (ring.getActive().capacityRemaining() >= rowBytes) {
+                        sender.table("fill").stringColumn("s", filler).at(TS_BASE + fillers, ChronoUnit.MICROS);
+                        sender.flush();
+                        fillers++;
+                    }
+                    // the first record takes a small row, so the room it leaves once sealed is
+                    // still at least the default minimum but below the big row
+                    final String little = TestUtils.repeat("l", 4 * 1024);
+                    long room = ring.getActive().capacityRemaining();
+                    Assert.assertTrue("room left " + room, room >= defaultMinimum + 5 * 1024 && room < rowBytes);
+                    sender.table("small").stringColumn("s", little).at(TS_BASE, ChronoUnit.MICROS);
+                    Assert.assertEquals(1, sender.pendingRowCount());
+                    MmapSegment filled = ring.getActive();
+                    int opens = sender.recordOpensForTest();
+
+                    // the big row is under the cap but neither the first record nor the room left once it
+                    // is sealed holds it. Trace: the first record refuses and, holding rows, is sealed
+                    // (frame 1, no open); the short retry record opens (+1) and refuses, and is given
+                    // back; the full-capacity record opens (+1) in a fresh segment and takes the row
+                    final String large = TestUtils.repeat("b", rowBytes);
+                    sender.table("big").stringColumn("s", large).at(TS_BASE + 1, ChronoUnit.MICROS);
+                    Assert.assertEquals("the short retry record, then a full-capacity one",
+                            opens + 2, sender.recordOpensForTest());
+                    Assert.assertNotSame("the full-capacity reservation rotated the active segment", filled, ring.getActive());
+                    Assert.assertEquals("the small row's record was sealed", 1, sender.pendingRowCount());
+                    sender.flush();
+                    log.awaitDataFrames(fillers + 2, 5_000);
+
+                    QwpTableBuffer s = small.block("small");
+                    s.getOrCreateColumn("s", QwpConstants.TYPE_VARCHAR, true).addString(little);
+                    s.getOrCreateDesignatedTimestampColumn(QwpConstants.TYPE_TIMESTAMP).addLong(TS_BASE);
+                    s.nextRow();
+                    QwpTableBuffer b = big.block("big");
+                    b.getOrCreateColumn("s", QwpConstants.TYPE_VARCHAR, true).addString(large);
+                    b.getOrCreateDesignatedTimestampColumn(QwpConstants.TYPE_TIMESTAMP).addLong(TS_BASE + 1);
+                    b.nextRow();
+                    Assert.assertArrayEquals(small.frame(-1, false), dataFrame(log, fillers));
+                    Assert.assertArrayEquals(big.frame(-1, false), dataFrame(log, fillers + 1));
+                    Assert.assertEquals(fillers + 2, log.dataFrames());
+                }
             }
         });
     }
@@ -841,6 +971,10 @@ public class QwpOpenRecordSenderTest {
         @Override
         public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
             this.client = client;
+        }
+
+        synchronized boolean hasClient() {
+            return client != null;
         }
 
         synchronized void nack() {

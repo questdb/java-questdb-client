@@ -483,8 +483,9 @@ public class QwpWebSocketSender implements Sender {
     private int recordOpens;
     // Terminal latch: the engine refused to seal a record the writer had already
     // sealed (see sealRecord). checkConnectionError() reports it on every later
-    // call; close() does not consult it, so it still drains what shipped.
-    private LineSenderException recordSealFailure;
+    // call; close() skips the commit message while it is set but still drains
+    // what shipped. Volatile: the monitor thread reads it through awaitAckedFsn.
+    private volatile LineSenderException recordSealFailure;
     private long pendingBytes;
     // Set true by close() once the SF slot flock has been released (the normal
     // teardown path). Stays false if an I/O or manager worker did not stop and
@@ -1914,7 +1915,12 @@ public class QwpWebSocketSender implements Sender {
                     // must still run. rethrowTerminal below surfaces it.
                     terminalError = captureCloseError(terminalError, t);
                 }
-                if (!deferCommit && hasDeferredMessages) {
+                // A latched seal failure leaves the ring with a live reservation (the
+                // engine can throw before it clears it), so a commit message would be
+                // refused ("record reserved") and would commit the earlier deferred
+                // records of a transaction whose last record was lost. Skip it; the
+                // drain below still waits for what shipped.
+                if (!deferCommit && hasDeferredMessages && recordSealFailure == null) {
                     sendCommitMessage();
                 }
                 if (activeBuffer != null && activeBuffer.hasData()) {
@@ -3786,7 +3792,6 @@ public class QwpWebSocketSender implements Sender {
     public void setMaxRowsPerBlockForTest(int maxRowsPerBlock) {
         record.setMaxRowsPerBlockForTest(maxRowsPerBlock);
     }
-
 
     @TestOnly
     public void setRecycleDeferredCloseMaxWaitMillisForTesting(long millis) {
@@ -7494,7 +7499,9 @@ public class QwpWebSocketSender implements Sender {
                         .put(", frameBound=").put(record.capacity()).put(']');
             }
         }
+        int rowDictBytes = rowDictBytes();
         return new LineSenderException("row too large for the frame bound: rowBytes=").put(rowBytes)
+                .put(", rowDictBytes=").put(rowDictBytes)
                 .put(", frameBound=").put(record.capacity())
                 .put(", serverMaxBatchSize=").put(serverMaxBatchSize)
                 .put(", segmentPayloadCapacity=").put(cursorEngine.segmentPayloadCapacity())
@@ -7552,14 +7559,7 @@ public class QwpWebSocketSender implements Sender {
      */
     private int retryDictReserve(long rowBytes) {
         int dictNeed = record.lastRefusedDictBytes();
-        int rowDictBytes = dictNeed;
-        if (dictNeed == 0) {
-            long need = 0;
-            for (int id = record.dictEndId() + 1; id <= currentBatchMaxSymbolId; id++) {
-                need += QwoFormat.stringBytes(globalSymbolDictionary.getSymbol(id));
-            }
-            rowDictBytes = (int) Math.min(Integer.MAX_VALUE, need);
-        }
+        int rowDictBytes = rowDictBytes();
         int reserve = dictNeed > 0
                 ? Math.min(2 * record.dictCapacity(), record.capacity() / 2)
                 : record.dictCapacity();
@@ -7758,6 +7758,23 @@ public class QwpWebSocketSender implements Sender {
             }
             buf.rollbackUncommittedColumns();
         }
+    }
+
+    /**
+     * Dictionary bytes the staged row needs: what the dictionary region refused
+     * when it refused the row, otherwise the text of the symbols the row added
+     * past the record's dictionary end.
+     */
+    private int rowDictBytes() {
+        int refused = record.lastRefusedDictBytes();
+        if (refused > 0) {
+            return refused;
+        }
+        long need = 0;
+        for (int id = record.dictEndId() + 1; id <= currentBatchMaxSymbolId; id++) {
+            need += QwoFormat.stringBytes(globalSymbolDictionary.getSymbol(id));
+        }
+        return (int) Math.min(Integer.MAX_VALUE, need);
     }
 
     /**
