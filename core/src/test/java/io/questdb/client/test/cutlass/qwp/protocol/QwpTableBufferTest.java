@@ -1465,6 +1465,91 @@ public class QwpTableBufferTest {
     }
 
     @Test
+    public void testResetAfterACancelledNullRowLeavesNoStaleBit() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                QwpTableBuffer.ColumnBuffer col = table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, true);
+                col.addLong(1L);
+                table.nextRow();
+                col.addNull();
+                table.cancelCurrentRow();
+                table.reset();
+
+                col.addLong(1L);
+                table.nextRow();
+                col.addLong(2L);
+                table.nextRow();
+                col.addNull();
+                table.nextRow();
+
+                assertFalse(col.isNull(0));
+                assertFalse(col.isNull(1));
+                assertTrue(col.isNull(2));
+                int[] header = readNullHeader(table);
+                assertEquals(1, header[0]);
+                assertEquals(0b100, header[1]);
+            }
+        });
+    }
+
+    @Test
+    public void testResetAfterNullsBeyondTheInitialBitmapCapacityClearsEveryBit() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                QwpTableBuffer.ColumnBuffer col = table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, true);
+                for (int i = 0; i < 100; i++) {
+                    if (i == 90) {
+                        col.addNull();
+                    } else {
+                        col.addLong(i);
+                    }
+                    table.nextRow();
+                }
+                assertTrue(col.isNull(90));
+                table.reset();
+
+                for (int i = 0; i < 100; i++) {
+                    col.addLong(i);
+                    table.nextRow();
+                }
+
+                assertFalse(col.isNull(90));
+                assertEquals(100, col.getValueCount());
+                assertEquals(0, readNullHeader(table)[0]);
+            }
+        });
+    }
+
+    @Test
+    public void testResetAfterNullsClearsTheBitmapForTheNextBatch() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                QwpTableBuffer.ColumnBuffer col = table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, true);
+                col.addNull();
+                table.nextRow();
+                col.addLong(1L);
+                table.nextRow();
+                assertTrue(col.isNull(0));
+                table.reset();
+
+                col.addLong(1L);
+                table.nextRow();
+                col.addLong(2L);
+                table.nextRow();
+                col.addNull();
+                table.nextRow();
+
+                assertFalse(col.isNull(0));
+                assertFalse(col.isNull(1));
+                assertTrue(col.isNull(2));
+                int[] header = readNullHeader(table);
+                assertEquals(1, header[0]);
+                assertEquals(0b100, header[1]);
+            }
+        });
+    }
+
+    @Test
     public void testResetAndClearDropTheHeldRow() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpTableBuffer table = new QwpTableBuffer("t")) {
@@ -1485,6 +1570,27 @@ public class QwpTableBufferTest {
     }
 
     @Test
+    public void testResetKeepsAnEmptyLocalDictionaryAndClearsAPopulatedOne() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                QwpTableBuffer.ColumnBuffer col = table.getOrCreateColumn("sym", QwpConstants.TYPE_SYMBOL, true);
+                col.addSymbolWithGlobalId("a", 7);
+                table.nextRow();
+                table.reset();
+                assertEquals(0, col.getSymbolDictionarySize());
+                assertEquals(-1, col.getMaxGlobalSymbolId());
+
+                col.addSymbol("x");
+                table.nextRow();
+                assertEquals(1, col.getSymbolDictionarySize());
+                table.reset();
+                assertEquals(0, col.getSymbolDictionarySize());
+                assertFalse(col.hasSymbol("x"));
+            }
+        });
+    }
+
+    @Test
     public void testResetMovesTheSavepointToTheEmptyBuffer() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpTableBuffer table = new QwpTableBuffer("t")) {
@@ -1497,6 +1603,31 @@ public class QwpTableBufferTest {
                 table.rollbackToSavepoint();
                 assertEquals("reset() emptied the savepoint", 0, table.getRowCount());
                 assertEquals("columns the server already knows stay", 1, table.getColumnCount());
+            }
+        });
+    }
+
+    @Test
+    public void testResetWithoutNullsThenANullInTheNextBatch() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                QwpTableBuffer.ColumnBuffer col = table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, true);
+                col.addLong(1L);
+                table.nextRow();
+                col.addLong(2L);
+                table.nextRow();
+                table.reset();
+
+                col.addLong(1L);
+                table.nextRow();
+                col.addNull();
+                table.nextRow();
+
+                assertFalse(col.isNull(0));
+                assertTrue(col.isNull(1));
+                int[] header = readNullHeader(table);
+                assertEquals(1, header[0]);
+                assertEquals(0b10, header[1]);
             }
         });
     }
@@ -1921,5 +2052,41 @@ public class QwpTableBufferTest {
             }
         }
         return result;
+    }
+
+    /**
+     * Encodes a single-column table and returns {null-header marker, first bitmap byte
+     * or 0 when the marker is 0}.
+     */
+    private static int[] readNullHeader(QwpTableBuffer table) {
+        try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder()) {
+            encoder.encode(table);
+            long ptr = encoder.getBuffer().getBufferPtr() + 12;
+            long[] pos = {ptr};
+            long nameLen = readVarint(pos);
+            pos[0] += nameLen;
+            readVarint(pos); // row count
+            long colCount = readVarint(pos);
+            for (long c = 0; c < colCount; c++) {
+                long len = readVarint(pos);
+                pos[0] += len + 1; // name + type byte
+            }
+            int marker = Unsafe.getUnsafe().getByte(pos[0]) & 0xFF;
+            int bitmap = marker == 1 ? Unsafe.getUnsafe().getByte(pos[0] + 1) & 0xFF : 0;
+            return new int[]{marker, bitmap};
+        }
+    }
+
+    private static long readVarint(long[] pos) {
+        long value = 0;
+        int shift = 0;
+        while (true) {
+            int b = Unsafe.getUnsafe().getByte(pos[0]++) & 0xFF;
+            value |= (long) (b & 0x7F) << shift;
+            if ((b & 0x80) == 0) {
+                return value;
+            }
+            shift += 7;
+        }
     }
 }

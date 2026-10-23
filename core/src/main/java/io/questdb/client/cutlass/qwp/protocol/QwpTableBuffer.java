@@ -1685,9 +1685,18 @@ public class QwpTableBuffer implements QuietCloseable {
             return (Unsafe.getUnsafe().getLong(longAddr) & (1L << bitIndex)) != 0;
         }
 
+        /**
+         * Resets the column for the next batch. Work is proportional to what the column held:
+         * a bit is set in the null bitmap only while {@code hasNulls} is true ({@code markNull}
+         * is the only setter; {@code truncateTo}, the retain paths and
+         * {@code ensureNullBitmapCapacity} clear what they shrink or grow), so the bitmap is
+         * zeroed only after a batch with nulls. The local symbol dictionary is populated only
+         * without a sender (global ids leave it empty), so it is cleared only when non-empty.
+         */
         public void reset() {
             size = 0;
             valueCount = 0;
+            boolean hadNulls = hasNulls;
             hasNulls = false;
             if (dataBuffer != null) {
                 dataBuffer.truncate();
@@ -1702,10 +1711,10 @@ public class QwpTableBuffer implements QuietCloseable {
             if (stringData != null) {
                 stringData.truncate();
             }
-            if (nullBufPtr != 0) {
+            if (nullBufPtr != 0 && hadNulls) {
                 Vect.memset(nullBufPtr, (long) nullBufCapRows >>> 3, 0);
             }
-            if (symbolDict != null) {
+            if (symbolDict != null && symbolList.size() > 0) {
                 symbolDict.clear();
                 symbolList.clear();
             }
@@ -1836,7 +1845,7 @@ public class QwpTableBuffer implements QuietCloseable {
                 geohashPrecision = -1;
                 maxGlobalSymbolId = -1;
                 storeGlobalSymbolIdsOnly = false;
-                if (symbolDict != null) {
+                if (symbolDict != null && symbolList.size() > 0) {
                     symbolDict.clear();
                     symbolList.clear();
                 }
@@ -2079,7 +2088,7 @@ public class QwpTableBuffer implements QuietCloseable {
             geohashPrecision = -1;
             maxGlobalSymbolId = -1;
             storeGlobalSymbolIdsOnly = false;
-            if (symbolDict != null) {
+            if (symbolDict != null && symbolList.size() > 0) {
                 symbolDict.clear();
                 symbolList.clear();
             }
