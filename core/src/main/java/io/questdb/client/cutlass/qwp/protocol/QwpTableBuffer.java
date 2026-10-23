@@ -1480,8 +1480,11 @@ public class QwpTableBuffer implements QuietCloseable {
             if (stringData != null) {
                 stringData.truncate();
             }
-            if (nullBufPtr != 0) {
-                Vect.memset(nullBufPtr, (long) nullBufCapRows >>> 3, 0);
+            if (nullBufPtr != 0 && size > 0) {
+                // Only the words this batch touched, and through the intrinsic:
+                // Vect.memset is a JNI call, and one per column per flush was
+                // 15% of the producer's time at one row per flush.
+                Unsafe.getUnsafe().setMemory(nullBufPtr, ((long) ((size + 63) >>> 6)) << 3, (byte) 0);
             }
             if (symbolDict != null) {
                 symbolDict.clear();

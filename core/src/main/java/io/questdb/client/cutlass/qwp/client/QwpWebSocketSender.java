@@ -7191,7 +7191,9 @@ public class QwpWebSocketSender implements Sender {
 
         if (pendingRowCount == 0) {
             firstPendingRowTimeNanos = System.nanoTime();
-            intervalCheckCountdown = 0;
+            // The first row's age is zero by construction: its interval check
+            // would re-read the clock just taken. First read at row 2.
+            intervalCheckCountdown = 2;
         }
         pendingRowCount++;
 
