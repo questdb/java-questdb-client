@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderProgressHandler;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderProgressDispatcher;
 import org.junit.Assert;
 import org.junit.Test;
@@ -190,6 +191,33 @@ public class SenderProgressDispatcherTest {
     }
 
     @Test
+    public void testHandlerInstalledAfterSkippedOffersDelivers() throws Exception {
+        // Offers skipped under the no-op default must not be lost: once a
+        // real handler is installed, the newest watermark reaches it.
+        AtomicLong last = new AtomicLong(-1);
+        CountDownLatch gotNewest = new CountDownLatch(1);
+        try (SenderProgressDispatcher d = new SenderProgressDispatcher(
+                DefaultSenderProgressHandler.INSTANCE, 4, "late-handler-progress-test")) {
+            for (int i = 1; i <= 1000; i++) {
+                Assert.assertTrue(d.offer(i));
+            }
+            Assert.assertNull("no-op handler must not start the dispatcher thread",
+                    d.getWorkerThreadForTesting());
+            d.setHandler(fsn -> {
+                last.set(fsn);
+                if (fsn == 1001) {
+                    gotNewest.countDown();
+                }
+            });
+            Assert.assertTrue(d.offer(1001));
+            Assert.assertTrue("real handler must receive the newest watermark",
+                    gotNewest.await(1, TimeUnit.SECONDS));
+            Assert.assertEquals(1001L, last.get());
+            Assert.assertNotNull(d.getWorkerThreadForTesting());
+        }
+    }
+
+    @Test
     public void testHandlerThrowDoesNotKillDispatcher() throws Exception {
         // A handler that throws on the first call must not poison the
         // dispatcher; subsequent offers must still deliver.
@@ -234,6 +262,24 @@ public class SenderProgressDispatcherTest {
             }
             Assert.assertNotNull("dispatcher thread must exist after first offer", spawned);
             Assert.assertTrue("dispatcher must be a daemon", spawned.isDaemon());
+        }
+    }
+
+    @Test
+    public void testNoOpHandlerDoesNotStartDispatcherThread() {
+        // The vast majority of senders never install a progress handler.
+        // For them an ACK must cost nothing on the dispatcher path: no
+        // thread start, no unpark.
+        try (SenderProgressDispatcher d = new SenderProgressDispatcher(
+                DefaultSenderProgressHandler.INSTANCE, 4, "noop-progress-test")) {
+            for (int i = 0; i < 1000; i++) {
+                Assert.assertTrue(d.offer(i));
+            }
+            Assert.assertNull("no-op handler must not start the dispatcher thread",
+                    d.getWorkerThreadForTesting());
+            Assert.assertNull(findThreadByName("noop-progress-test"));
+            Assert.assertEquals(0L, d.getTotalDelivered());
+            Assert.assertEquals(0L, d.getDroppedNotifications());
         }
     }
 

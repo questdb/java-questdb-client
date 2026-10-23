@@ -180,7 +180,7 @@ public class SymbolDictRecycleCrashWindowsTest {
      */
     private static final List<String> FRESH_REBUILD_FILES = Arrays.asList(
             ".ack-watermark", ".lock", ".lock.pid", ".symbol-dict",
-            "sf-0000000000000000.sfa", "sf-initial.sfa", "sf-manifest.bin");
+            "sf-initial.sfa", "sf-manifest.bin");
 
     /** The reusable lock pair: never removed by any close() in this suite, and {@code .lock} is range-locked on Windows while a sender holds the slot. */
     private static final List<String> LOCK_FILES = Arrays.asList(".lock", ".lock.pid");
@@ -357,14 +357,6 @@ public class SymbolDictRecycleCrashWindowsTest {
                     Assert.assertFalse(ws.isResetArmed());
                     Assert.assertEquals(1, ws.getSymbolDictEpoch());
 
-                    // The manager worker provisions the fresh engine's hot-spare
-                    // segment asynchronously and links its file under the final
-                    // name BEFORE sizing or stamping it, so a name-level wait can
-                    // still snapshot an empty or zero-magic spare that recovery
-                    // hard-fails on. Wait for the ring to report the spare
-                    // installed (only after create + header sync), then pin the
-                    // resulting file set.
-                    awaitHotSpareInstalled(ws.getCursorEngineForTesting());
                     awaitExactFileSet(slot, FRESH_REBUILD_FILES);
 
                     // The true pre-first-flush crash image, frozen before the
@@ -608,23 +600,6 @@ public class SymbolDictRecycleCrashWindowsTest {
         Assert.assertEquals("slot dir must settle to its steady-state file set "
                         + "before it can be snapshotted",
                 expected, listDir(dir));
-    }
-
-    /**
-     * Polls (5s deadline) until the engine's ring reports an installed hot
-     * spare. The segment manager links the spare's file under its final name
-     * before pre-allocating and stamping it, so a directory listing settles
-     * before the file is readable; {@code installHotSpare} runs only after
-     * create + header sync, which is the barrier a byte-level snapshot needs.
-     */
-    private static void awaitHotSpareInstalled(CursorSendEngine engine) throws InterruptedException {
-        SegmentRing ring = engine.getRingForTesting();
-        long deadline = System.currentTimeMillis() + 5_000;
-        while (System.currentTimeMillis() < deadline && ring.getHotSpareForTesting() == null) {
-            Thread.sleep(20);
-        }
-        Assert.assertNotNull("the manager worker must install the rebuilt engine's hot spare "
-                + "before the slot can be snapshotted", ring.getHotSpareForTesting());
     }
 
     /**

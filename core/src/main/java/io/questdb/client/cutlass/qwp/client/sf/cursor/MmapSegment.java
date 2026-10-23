@@ -88,10 +88,9 @@ public final class MmapSegment implements QuietCloseable {
     // appendCursor: written only by the producer thread, never read by anyone else
     // — it's the reservation cursor. Plain field is fine.
     private long appendCursor;
-    // baseSeq: provisional at create time, finalized by rebaseSeq() at rotation
-    // time. Mutable to support the cursor engine's hot-spare design — the
-    // segment manager pre-creates spares before the producer knows the exact
-    // baseSeq the new active will need.
+    // baseSeq: final when the producer creates the segment at rotation;
+    // rebaseSeq() exists for a segment created ahead of its rotation (tests,
+    // and files an older client left behind) whose base was a guess.
     private long baseSeq;
     // Highest published byte offset covered by a successful data barrier.
     // The manager writes this after msync+fsync; the producer reads it before

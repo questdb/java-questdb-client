@@ -162,8 +162,9 @@ public final class CursorSendEngine implements QuietCloseable {
     // disk mode fails construction unless the watermark is usable because
     // segment-derived recovery cannot distinguish acknowledged residue from
     // replayable frames. Lifetime tied to the engine: opened in the
-    // constructor, closed by {@link #close()}. The segment manager writes
-    // through this on every tick where ackedFsn has advanced.
+    // constructor, closed by {@link #close()}. Written by the I/O thread on
+    // every ACK advance ({@link #acknowledge}); the segment manager only
+    // syncs it before a trim.
     private final AckWatermark watermark;
     // Engine-owned per-slot symbol dictionary file (disk mode only; {@code null}
     // in memory mode and if open() failed). Enables delta-encoded SF frames:
@@ -195,6 +196,10 @@ public final class CursorSendEngine implements QuietCloseable {
     // isCloseCompleted() from pool threads re-probing a retired slot (see the
     // getter for why it must not synchronize).
     private volatile boolean closeCompleted;
+    // Rings the I/O loop's doorbell after a frame is published, so the loop
+    // can block instead of polling publishedFsn().
+    // Installed by CursorWebSocketSendLoop; null until a loop attaches.
+    private volatile Runnable ioWakeup;
     // Invoked after closeCompleted publishes a confirmed flock release. Used
     // by an owning sender pool to wake capacity-starved borrowers immediately.
     private volatile Runnable slotLockReleaseListener;
@@ -372,7 +377,7 @@ public final class CursorSendEngine implements QuietCloseable {
         }
         if (ownsManager && manager == null) {
             manager = new SegmentManager(
-                    segmentSizeBytes, SegmentManager.DEFAULT_POLL_NANOS, budget);
+                    segmentSizeBytes, budget);
         }
         SlotLock acquiredLock = null;
         if (!memoryMode) {
@@ -445,22 +450,6 @@ public final class CursorSendEngine implements QuietCloseable {
                 // not exist on disk if earlier segments have been trimmed,
                 // causing it to fall through to the active segment's tip
                 // and skip the unacked sealed segments entirely.
-                //
-                // Then check the persisted ack watermark. If present and
-                // larger than the segment-derived seed, prefer it: it
-                // captures durable-acks that landed inside the lowest
-                // surviving sealed segment before the previous sender
-                // crashed. Without this, those already-acked frames would
-                // be re-replayed on reconnect, producing row-level
-                // duplicates unless the target table dedupes them.
-                // max(lowestBase - 1, watermark) absorbs both write
-                // orderings of the manager's "persist then trim" tick:
-                //   - persist crashed before trim: segments still on disk
-                //     are >= lowest, watermark is correct; max picks
-                //     watermark.
-                //   - trim ran before persist: segments are gone (so
-                //     lowestBase is higher than watermark), watermark is
-                //     stale; max picks lowestBase - 1.
                 MmapSegment first = recovered.firstSealed();
                 long lowestBase = first != null
                         ? first.baseSeq()
@@ -471,15 +460,14 @@ public final class CursorSendEngine implements QuietCloseable {
                 // surviving sealed segment -- without it, those frames
                 // get re-replayed across process restart, producing
                 // row-level duplicates unless the target table dedupes
-                // them. max(lowestBase - 1, watermark) absorbs both
-                // write orderings of the manager's "persist then trim"
-                // tick:
-                //   - persist crashed before trim: segments still on
-                //     disk are >= lowest, watermark is correct; max
-                //     picks watermark.
-                //   - trim ran before persist: segments are gone (so
-                //     lowestBase is higher than watermark), watermark
-                //     is stale; max picks lowestBase - 1.
+                // them. max(lowestBase - 1, watermark) absorbs a watermark
+                // that is behind the trim (the I/O thread writes it per ACK,
+                // the manager syncs it before unlinking; a crash between the
+                // two, or a torn record, leaves it stale or invalid):
+                //   - watermark durable, segments still on disk: max picks
+                //     the watermark.
+                //   - segments gone, watermark stale: lowestBase is higher
+                //     than the watermark; max picks lowestBase - 1.
                 // Segment-derived state cannot tell whether frames in the
                 // lowest surviving segment were acknowledged. Starting
                 // without the watermark would therefore expose acknowledged
@@ -526,20 +514,32 @@ public final class CursorSendEngine implements QuietCloseable {
                 }
                 long baseSeed = lowestBase - 1;
                 long watermarkFsn = watermarkInProgress.read();
-                // Reject watermarks past publishedFsn: a correctly
-                // operating prior session cannot have produced one, so
-                // a value above the on-disk frame ceiling is corruption
-                // (torn write on a non-atomic filesystem, hardware
-                // fault, manual edit). Trusting it would seed ackedFsn
+                // Reject watermarks past publishedFsn. A host crash in MEMORY
+                // or PERIODIC durability produces one routinely: a trim
+                // msyncs the watermark while the segment data pages it
+                // covers are still dirty. Trusting it would seed ackedFsn
                 // = publishedFsn after ring.acknowledge clamps it, and
                 // the cursor would position past every un-acked frame
                 // -- silent data loss. Fall back to the segment-derived
                 // seed so the un-acked tail still replays.
                 long publishedFsn = recovered.publishedFsn();
                 long candidate = Math.max(watermarkFsn, baseSeed);
-                long seed = candidate > publishedFsn ? baseSeed : candidate;
+                boolean rejected = candidate > publishedFsn;
+                long seed = rejected ? baseSeed : candidate;
                 if (seed >= 0) {
                     recovered.acknowledge(seed);
+                }
+                // Bring the file in line with the seed now: the I/O thread
+                // writes it only on the next ACK advance, which during an
+                // outage may be never, and a rejected value left on disk
+                // would be accepted by a later recovery once new frames push
+                // publishedFsn past it. Durable in the rejected case so a
+                // host crash cannot resurrect it.
+                if (seed != watermarkFsn) {
+                    watermarkInProgress.write(seed);
+                    if (rejected) {
+                        watermarkInProgress.sync();
+                    }
                 }
                 // Fold the whole recovered ring once. The result checkpoints all
                 // running metadata and raw symbol bytes at each commit-bearing
@@ -901,7 +901,25 @@ public final class CursorSendEngine implements QuietCloseable {
      * at publishedFsn).
      */
     public boolean acknowledge(long seq) {
-        return ring.acknowledge(seq);
+        if (!ring.acknowledge(seq)) {
+            return false;
+        }
+        // Single writer of the watermark: a store into the mmap, no syscall.
+        // The manager msyncs it before it unlinks a trimmed segment, and a
+        // crash replays only what landed after the last store.
+        if (watermark != null) {
+            watermark.write(ring.ackedFsn());
+        }
+        return true;
+    }
+
+    /**
+     * Installs the callback run after every ack advance -- from any caller of
+     * {@link #acknowledge}, including the orphan-tail retirement self-ack --
+     * and after a durability failure is latched. See {@link AckWaiters}.
+     */
+    public void setAckStateListener(Runnable listener) {
+        ring.setAckStateListener(listener);
     }
 
     /**
@@ -934,7 +952,7 @@ public final class CursorSendEngine implements QuietCloseable {
      */
     public long appendBlocking(long payloadAddr, int payloadLen) {
         long fsn = ring.appendOrFsn(payloadAddr, payloadLen);
-        if (fsn >= 0) return fsn;
+        if (fsn >= 0) return published(fsn);
         if (fsn == SegmentRing.PAYLOAD_TOO_LARGE) {
             throw new MmapSegmentException("payload too large for segment");
         }
@@ -958,7 +976,7 @@ public final class CursorSendEngine implements QuietCloseable {
             }
             LockSupport.parkNanos(50_000L); // 50 µs
             fsn = ring.appendOrFsn(payloadAddr, payloadLen);
-            if (fsn >= 0) return fsn;
+            if (fsn >= 0) return published(fsn);
             if (fsn == SegmentRing.PAYLOAD_TOO_LARGE) {
                 throw new MmapSegmentException("payload too large for segment");
             }
@@ -966,8 +984,8 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
-     * User-thread append path. Spins briefly while waiting for the segment
-     * manager to provision a hot spare; if backpressure persists past
+     * User-thread append path. Spins briefly while backpressured (budget
+     * exhausted, periodic-sync barrier pending); if backpressure persists past
      * {@code spinDeadlineNanos}, returns {@link SegmentRing#BACKPRESSURE_NO_SPARE}
      * so the caller can decide whether to {@code parkNanos} or surface the
      * pressure to the user.
@@ -978,7 +996,7 @@ public final class CursorSendEngine implements QuietCloseable {
     public long appendOrFsn(long payloadAddr, int payloadLen, long spinDeadlineNanos) {
         long fsn = ring.appendOrFsn(payloadAddr, payloadLen);
         if (fsn >= 0) {
-            return fsn;
+            return published(fsn);
         }
         if (fsn == SegmentRing.PAYLOAD_TOO_LARGE) {
             return fsn;
@@ -989,11 +1007,30 @@ public final class CursorSendEngine implements QuietCloseable {
         while (System.nanoTime() < spinDeadlineNanos) {
             Compat.onSpinWait();
             fsn = ring.appendOrFsn(payloadAddr, payloadLen);
-            if (fsn >= 0 || fsn == SegmentRing.PAYLOAD_TOO_LARGE) {
+            if (fsn >= 0) {
+                return published(fsn);
+            }
+            if (fsn == SegmentRing.PAYLOAD_TOO_LARGE) {
                 return fsn;
             }
         }
         return SegmentRing.BACKPRESSURE_NO_SPARE;
+    }
+
+    /**
+     * Callback run after every successful append; every producer path goes
+     * through the append methods, so this is the single wake point.
+     */
+    public void setIoWakeup(Runnable wakeup) {
+        this.ioWakeup = wakeup;
+    }
+
+    private long published(long fsn) {
+        Runnable w = ioWakeup;
+        if (w != null) {
+            w.run();
+        }
+        return fsn;
     }
 
     public void checkDurability() {
@@ -1221,19 +1258,18 @@ public final class CursorSendEngine implements QuietCloseable {
                 throw e;
             }
         }
-        // On a fully-drained close, persist the final acked FSN through the
-        // still-mapped watermark BEFORE closing the ring/watermark and BEFORE
-        // unlinking any segment file. The manager persists the watermark only
-        // on its own tick, so it may lag the final ack. If any part of this
-        // covering barrier fails, retain the ring, watermark and slot flock:
+        // On a fully-drained close, make the final acked FSN durable through
+        // the still-mapped watermark BEFORE closing the ring/watermark and
+        // BEFORE unlinking any segment file. The I/O thread wrote it on the
+        // final ACK but only the manager's trim syncs it, so it may not be
+        // durable yet. If any part of this covering barrier fails, retain the
+        // ring, watermark and slot flock:
         // publishing the slot would let a successor recover acknowledged
         // residue from a stale durable watermark. The shared retry driver owns
         // convergence after the one-shot public close reports the failure.
         if (fullyDrained && watermark != null) {
             try {
-                long finalAckedFsn = ring.ackedFsn();
-                if (finalAckedFsn >= 0) {
-                    watermark.write(finalAckedFsn);
+                if (ring.ackedFsn() >= 0) {
                     watermark.sync();
                     if (filesFacade.fsyncDir(sfDir) != 0) {
                         throw new IllegalStateException(
@@ -1255,9 +1291,9 @@ public final class CursorSendEngine implements QuietCloseable {
                 ring.close();
             } catch (Throwable ignored) {
             }
-            // Close the watermark mmap/fd after the manager (which
-            // writes through it) is gone but before the slot lock is
-            // released. On fully-drained close, also unlink the file
+            // Close the watermark mmap/fd after the I/O loop (which writes
+            // it) and the manager (which syncs it) are gone but before the
+            // slot lock is released. On fully-drained close, also unlink the file
             // -- a stale watermark with no segments behind it would
             // confuse a future recovery cycle if (it wouldn't actually
             // confuse current recovery, which only reads the watermark
@@ -1839,6 +1875,15 @@ public final class CursorSendEngine implements QuietCloseable {
      */
     public long publishedFsn() {
         return ring.publishedFsn();
+    }
+
+    /**
+     * I/O thread accessor: changes after every completed publish (FSN and
+     * bytes). The idle re-check in the I/O loop keys on this, see
+     * {@link SegmentRing#publishStamp()}.
+     */
+    public long publishStamp() {
+        return ring.publishStamp();
     }
 
     /**

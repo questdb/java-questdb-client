@@ -1311,8 +1311,8 @@ public class SenderPoolSfTest {
                     AtomicReference<Throwable> hookErr = new AtomicReference<>();
                     try {
                         // Park the manager worker inside a service pass for
-                        // the delegate's ring. The trim-sync point is reached
-                        // on every ~1ms tick, so this wedges deterministically.
+                        // the delegate's ring. The worker is event-driven, so
+                        // wake it explicitly; the hook sits in every pass.
                         manager.setBeforeTrimSyncHook(() -> {
                             if (!fired.compareAndSet(false, true)) return;
                             workerBlocked.countDown();
@@ -1325,6 +1325,7 @@ public class SenderPoolSfTest {
                                 hookErr.compareAndSet(null, t);
                             }
                         });
+                        manager.wakeWorker();
                         Assert.assertTrue("manager worker never entered a service pass",
                                 workerBlocked.await(5, TimeUnit.SECONDS));
 
@@ -1626,7 +1627,7 @@ public class SenderPoolSfTest {
 
                 long segSize = io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment.HEADER_SIZE
                         + io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment.FRAME_HEADER_SIZE + 32L;
-                SegmentManager manager = new SegmentManager(segSize, TimeUnit.SECONDS.toNanos(60));
+                SegmentManager manager = new SegmentManager(segSize);
                 CountDownLatch cleanupFinished = new CountDownLatch(1);
                 CountDownLatch workerBlocked = new CountDownLatch(1);
                 CountDownLatch releaseWorker = new CountDownLatch(1);
@@ -1634,7 +1635,7 @@ public class SenderPoolSfTest {
                 AtomicReference<Throwable> hookErr = new AtomicReference<>();
                 AtomicReference<CursorSendEngine> engineRef = new AtomicReference<>();
                 manager.setAfterRingCleanupHook(cleanupFinished::countDown);
-                manager.setBeforeInstallSyncHook(() -> {
+                manager.setBeforeTrimSyncHook(() -> {
                     if (!fired.compareAndSet(false, true)) {
                         return;
                     }
@@ -1693,7 +1694,7 @@ public class SenderPoolSfTest {
                 } finally {
                     releaseWorker.countDown();
                     manager.setAfterRingCleanupHook(null);
-                    manager.setBeforeInstallSyncHook(null);
+                    manager.setBeforeTrimSyncHook(null);
                     // The 50 ms timeout above is only for forcing the slot-
                     // retirement path under test. Restore a normal teardown
                     // budget before closing the recovered sender: otherwise a
@@ -4620,6 +4621,7 @@ public class SenderPoolSfTest {
                                     hookErr.compareAndSet(null, t);
                                 }
                             });
+                            manager.wakeWorker();
                             if (!workerBlocked.await(5, TimeUnit.SECONDS)) {
                                 throw new AssertionError("recovery manager never entered a service pass");
                             }

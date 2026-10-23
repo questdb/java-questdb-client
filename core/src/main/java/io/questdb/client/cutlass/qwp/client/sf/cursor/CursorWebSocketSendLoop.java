@@ -61,13 +61,13 @@ import java.util.concurrent.locks.LockSupport;
 /**
  * The cursor-engine I/O loop. Owns one I/O thread that:
  * <ol>
- *   <li>Polls {@link CursorSendEngine#publishedFsn()} and walks newly-published
- *       frames from the engine's segments, sending each as one WebSocket
- *       binary frame to the server.</li>
- *   <li>Polls the WebSocket for server ACK frames; on each ACK with
- *       cumulative wire sequence {@code N}, calls
- *       {@code engine.acknowledge(fsnAtZero + N)} so the segment manager
- *       can trim fully-acked segments.</li>
+ *   <li>Walks newly-published frames (past {@link CursorSendEngine#publishedFsn()})
+ *       from the engine's segments, sending each as one WebSocket binary frame
+ *       to the server.</li>
+ *   <li>Receives server ACK frames; on each ACK with cumulative wire sequence
+ *       {@code N}, calls {@code engine.acknowledge(fsnAtZero + N)} so the
+ *       segment manager can trim fully-acked segments and the engine's
+ *       ack-state listener wakes any ack waiters.</li>
  *   <li>On wire failure, runs the configured reconnect policy: capped
  *       exponential backoff with jitter, retried indefinitely (Invariant B --
  *       a store-and-forward drainer never gives up on a wall-clock budget).
@@ -79,9 +79,14 @@ import java.util.concurrent.locks.LockSupport;
  *       has ever come up). On reconnect success, repositions the cursor at
  *       {@code ackedFsn+1} and replays.</li>
  * </ol>
- * No locks on the steady-state path. The producer thread (user) writes
- * into the engine; this thread reads. {@code engine.publishedFsn()} is
- * the volatile publish barrier.
+ * No locks and no polling on the steady-state path. The producer thread (user)
+ * writes into the engine; this thread reads. {@code engine.publishedFsn()} is
+ * the volatile publish barrier. With nothing to send and nothing on the wire
+ * the thread blocks in one poll(2) on the socket and a doorbell
+ * ({@link WebSocketClient#awaitReadableOrWake}); the engine rings the
+ * doorbell when it publishes while the loop is parked ({@link CursorSendEngine#setIoWakeup}),
+ * inbound bytes end the wait on their own, and the only timers are the PING
+ * deadlines. An idle connection therefore costs no CPU.
  * <p>
  * Errors are reported via {@link #getTerminalError()}; the I/O thread sets it
  * and exits. Producers polling {@link #checkError()} surface the failure.
@@ -148,7 +153,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * disables it. Opt-in: off by default, {@code 30000} suits an AWS ALB.
      */
     public static final long DEFAULT_KEEPALIVE_INTERVAL_MILLIS = 0L;
-    public static final long DEFAULT_PARK_NANOS = 50_000L; // 50us idle backoff
+    // Connect-gate and close-race sleeps only; the idle path blocks in awaitIdle().
+    private static final long PARK_NANOS = 50_000L;
     /**
      * Default initial reconnect backoff (100 ms).
      */
@@ -307,7 +313,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private final long catchUpCapGapMinEscalationWindowNanos;
     private final CatchUpCapGapPolicy catchUpCapGapPolicy;
     private final CursorSendEngine engine;
-    private final long parkNanos;
     private final ReconnectPolicy reconnectPolicy;
     // FIFO of OK-acked batches awaiting durable-upload confirmation. Used only
     // when durableAckMode is true. Each entry binds a wireSeq to the per-table
@@ -487,6 +492,22 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // is why a revoked token surfaced to operators as "sf_max_total_bytes too small".
     private volatile Throwable lastReconnectError;
     private volatile Thread ioThread;
+    // Run on every ack advance, on a terminal latch and on close(): the Sender
+    // installs AckWaiters::signal so threads waiting for acks never poll.
+    private volatile Runnable ackProgressListener;
+    // True while the I/O thread is committed to blocking in awaitIdle(). The
+    // engine's publish hook rings the doorbell only when this is set, so a busy
+    // loop costs the producer no syscall per flush. Dekker-ordered with the
+    // publishStamp re-check in ioLoop: the I/O thread sets the flag BEFORE its
+    // final publishStamp read, the producer completes the publish (FSN, bytes,
+    // stamp) BEFORE reading the flag, so a publish that misses the flag is seen
+    // by the re-check and vice versa.
+    private volatile boolean ioParked;
+    // I/O-thread-only. Set by swapClient(): a reconnect rewinds the send cursor
+    // to ackedFsn+1, which creates sendable work from inside the I/O thread --
+    // no producer publish and no inbound byte will announce it. The loop treats
+    // the recycle as work done, so it never blocks on a cursor it just rewound.
+    private boolean recycledThisIteration;
     // Typed marker for a ROTATING-credential auth terminal (401/403): set (before the
     // terminalError latch, so a checkError() caller that observes the latch is guaranteed to
     // observe this marker too) when a mid-drain reconnect sweep on an ORPHAN drainer whose
@@ -646,11 +667,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * performs its fail-fast policy before constructing this loop.
      */
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero, long parkNanos,
+                                   long fsnAtZero,
                                    ReconnectFactory reconnectFactory,
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis) {
-        this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
+        this(client, engine, fsnAtZero, reconnectFactory,
                 reconnectInitialBackoffMillis,
                 reconnectMaxBackoffMillis, false);
     }
@@ -665,12 +686,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * a server should not emit them when the client did not opt in).
      */
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero, long parkNanos,
+                                   long fsnAtZero,
                                    ReconnectFactory reconnectFactory,
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis,
                                    boolean durableAckMode) {
-        this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
+        this(client, engine, fsnAtZero, reconnectFactory,
                 reconnectInitialBackoffMillis,
                 reconnectMaxBackoffMillis, durableAckMode,
                 DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS);
@@ -684,13 +705,13 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * data, or by accepting indefinite waits on idle connections).
      */
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero, long parkNanos,
+                                   long fsnAtZero,
                                    ReconnectFactory reconnectFactory,
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis,
                                    boolean durableAckMode,
                                    long durableAckKeepaliveIntervalMillis) {
-        this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
+        this(client, engine, fsnAtZero, reconnectFactory,
                 reconnectInitialBackoffMillis,
                 reconnectMaxBackoffMillis, durableAckMode,
                 durableAckKeepaliveIntervalMillis, DEFAULT_MAX_HEAD_FRAME_REJECTIONS);
@@ -706,14 +727,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * strike-count escalation.
      */
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero, long parkNanos,
+                                   long fsnAtZero,
                                    ReconnectFactory reconnectFactory,
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis,
                                    boolean durableAckMode,
                                    long durableAckKeepaliveIntervalMillis,
                                    int maxHeadFrameRejections) {
-        this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
+        this(client, engine, fsnAtZero, reconnectFactory,
                 reconnectInitialBackoffMillis,
                 reconnectMaxBackoffMillis, durableAckMode,
                 durableAckKeepaliveIntervalMillis, maxHeadFrameRejections, 0L);
@@ -726,7 +747,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * the policy-aware master constructor.
      */
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero, long parkNanos,
+                                   long fsnAtZero,
                                    ReconnectFactory reconnectFactory,
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis,
@@ -734,7 +755,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                                    long durableAckKeepaliveIntervalMillis,
                                    int maxHeadFrameRejections,
                                    long poisonMinEscalationWindowMillis) {
-        this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
+        this(client, engine, fsnAtZero, reconnectFactory,
                 reconnectInitialBackoffMillis,
                 reconnectMaxBackoffMillis, durableAckMode,
                 durableAckKeepaliveIntervalMillis, maxHeadFrameRejections,
@@ -759,7 +780,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * {@link CatchUpCapGapPolicy#TERMINAL_AFTER_SETTLE_BUDGET}.
      */
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero, long parkNanos,
+                                   long fsnAtZero,
                                    ReconnectFactory reconnectFactory,
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis,
@@ -768,7 +789,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                                    int maxHeadFrameRejections,
                                    long poisonMinEscalationWindowMillis,
                                    long catchUpCapGapMinEscalationWindowMillis) {
-        this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
+        this(client, engine, fsnAtZero, reconnectFactory,
                 reconnectInitialBackoffMillis,
                 reconnectMaxBackoffMillis, durableAckMode,
                 durableAckKeepaliveIntervalMillis, maxHeadFrameRejections,
@@ -782,7 +803,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * and maps it onto the {@link CatchUpCapGapPolicy} this constructor takes.
      */
     private CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero, long parkNanos,
+                                   long fsnAtZero,
                                    ReconnectFactory reconnectFactory,
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis,
@@ -945,7 +966,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // (ensureSentDictCapacity), and releaseSentDictBytes frees only what the loop owns.
         this.fsnAtZero = fsnAtZero;
         this.externalFsnBase = externalFsnBase;
-        this.parkNanos = parkNanos;
         this.reconnectFactory = reconnectFactory;
         this.reconnectInitialBackoffMillis = reconnectInitialBackoffMillis;
         this.reconnectMaxBackoffMillis = reconnectMaxBackoffMillis;
@@ -982,11 +1002,81 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
-     * The policy-aware constructor as released in 1.3.x: equivalent to the overload
-     * below with {@code externalFsnBase = 0L}, the value every caller outside a
-     * symbol-dictionary recycle passes. Kept so callers compiled against a released
-     * jar keep linking.
+     * The 1.3.x constructors, with the {@code parkNanos} the loop no longer
+     * uses. Kept so callers compiled against a released jar keep linking.
+     *
+     * @deprecated use the overload without {@code parkNanos}.
      */
+    @Deprecated
+    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
+                                   long fsnAtZero, long parkNanos,
+                                   ReconnectFactory reconnectFactory,
+                                   long reconnectInitialBackoffMillis,
+                                   long reconnectMaxBackoffMillis) {
+        this(client, engine, fsnAtZero, reconnectFactory, reconnectInitialBackoffMillis, reconnectMaxBackoffMillis);
+    }
+
+    @Deprecated
+    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
+                                   long fsnAtZero, long parkNanos,
+                                   ReconnectFactory reconnectFactory,
+                                   long reconnectInitialBackoffMillis,
+                                   long reconnectMaxBackoffMillis,
+                                   boolean durableAckMode) {
+        this(client, engine, fsnAtZero, reconnectFactory, reconnectInitialBackoffMillis, reconnectMaxBackoffMillis, durableAckMode);
+    }
+
+    @Deprecated
+    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
+                                   long fsnAtZero, long parkNanos,
+                                   ReconnectFactory reconnectFactory,
+                                   long reconnectInitialBackoffMillis,
+                                   long reconnectMaxBackoffMillis,
+                                   boolean durableAckMode,
+                                   long durableAckKeepaliveIntervalMillis) {
+        this(client, engine, fsnAtZero, reconnectFactory, reconnectInitialBackoffMillis, reconnectMaxBackoffMillis, durableAckMode, durableAckKeepaliveIntervalMillis);
+    }
+
+    @Deprecated
+    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
+                                   long fsnAtZero, long parkNanos,
+                                   ReconnectFactory reconnectFactory,
+                                   long reconnectInitialBackoffMillis,
+                                   long reconnectMaxBackoffMillis,
+                                   boolean durableAckMode,
+                                   long durableAckKeepaliveIntervalMillis,
+                                   int maxHeadFrameRejections) {
+        this(client, engine, fsnAtZero, reconnectFactory, reconnectInitialBackoffMillis, reconnectMaxBackoffMillis, durableAckMode, durableAckKeepaliveIntervalMillis, maxHeadFrameRejections);
+    }
+
+    @Deprecated
+    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
+                                   long fsnAtZero, long parkNanos,
+                                   ReconnectFactory reconnectFactory,
+                                   long reconnectInitialBackoffMillis,
+                                   long reconnectMaxBackoffMillis,
+                                   boolean durableAckMode,
+                                   long durableAckKeepaliveIntervalMillis,
+                                   int maxHeadFrameRejections,
+                                   long poisonMinEscalationWindowMillis) {
+        this(client, engine, fsnAtZero, reconnectFactory, reconnectInitialBackoffMillis, reconnectMaxBackoffMillis, durableAckMode, durableAckKeepaliveIntervalMillis, maxHeadFrameRejections, poisonMinEscalationWindowMillis);
+    }
+
+    @Deprecated
+    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
+                                   long fsnAtZero, long parkNanos,
+                                   ReconnectFactory reconnectFactory,
+                                   long reconnectInitialBackoffMillis,
+                                   long reconnectMaxBackoffMillis,
+                                   boolean durableAckMode,
+                                   long durableAckKeepaliveIntervalMillis,
+                                   int maxHeadFrameRejections,
+                                   long poisonMinEscalationWindowMillis,
+                                   long catchUpCapGapMinEscalationWindowMillis) {
+        this(client, engine, fsnAtZero, reconnectFactory, reconnectInitialBackoffMillis, reconnectMaxBackoffMillis, durableAckMode, durableAckKeepaliveIntervalMillis, maxHeadFrameRejections, poisonMinEscalationWindowMillis, catchUpCapGapMinEscalationWindowMillis);
+    }
+
+    @Deprecated
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
                                    long fsnAtZero, long parkNanos,
                                    ReconnectFactory reconnectFactory,
@@ -998,7 +1088,27 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                                    long poisonMinEscalationWindowMillis,
                                    long catchUpCapGapMinEscalationWindowMillis,
                                    ReconnectPolicy reconnectPolicy) {
-        this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
+        this(client, engine, fsnAtZero, reconnectFactory, reconnectInitialBackoffMillis, reconnectMaxBackoffMillis, durableAckMode, durableAckKeepaliveIntervalMillis, maxHeadFrameRejections, poisonMinEscalationWindowMillis, catchUpCapGapMinEscalationWindowMillis, reconnectPolicy);
+    }
+
+    /**
+     * The policy-aware constructor as released in 1.3.x: equivalent to the overload
+     * below with {@code externalFsnBase = 0L}, the value every caller outside a
+     * symbol-dictionary recycle passes. Kept so callers compiled against a released
+     * jar keep linking.
+     */
+    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
+                                   long fsnAtZero,
+                                   ReconnectFactory reconnectFactory,
+                                   long reconnectInitialBackoffMillis,
+                                   long reconnectMaxBackoffMillis,
+                                   boolean durableAckMode,
+                                   long durableAckKeepaliveIntervalMillis,
+                                   int maxHeadFrameRejections,
+                                   long poisonMinEscalationWindowMillis,
+                                   long catchUpCapGapMinEscalationWindowMillis,
+                                   ReconnectPolicy reconnectPolicy) {
+        this(client, engine, fsnAtZero, reconnectFactory,
                 reconnectInitialBackoffMillis,
                 reconnectMaxBackoffMillis, durableAckMode,
                 durableAckKeepaliveIntervalMillis, maxHeadFrameRejections,
@@ -1018,7 +1128,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * unless the caller is replacing an engine a symbol-dict recycle rebuilt.
      */
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero, long parkNanos,
+                                   long fsnAtZero,
                                    ReconnectFactory reconnectFactory,
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis,
@@ -1029,7 +1139,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                                    long catchUpCapGapMinEscalationWindowMillis,
                                    ReconnectPolicy reconnectPolicy,
                                    long externalFsnBase) {
-        this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
+        this(client, engine, fsnAtZero, reconnectFactory,
                 reconnectInitialBackoffMillis,
                 reconnectMaxBackoffMillis, durableAckMode,
                 durableAckKeepaliveIntervalMillis, maxHeadFrameRejections,
@@ -1366,8 +1476,15 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // that free never happens and a seeded (recovery / orphan-drain) mirror
         // would leak. Capture that here; free it below, after client teardown.
         boolean loopNeverRan = t == null;
+        // The engine's wake hook is deliberately left in place: a replacement
+        // loop over the same engine (connection recycle) may already have
+        // installed its own, and a stale hook into a closed loop is a no-op
+        // (wakeIo() finds a null or closed client).
         if (t != null) {
             LockSupport.unpark(t);
+            // The I/O thread may be blocked in the transport wait, not a park.
+            wakeIo();
+            signalAckProgress();
             // Only await the shutdown latch if the I/O thread actually ran.
             // If start() failed after assigning ioThread but before t.start()
             // succeeded (e.g. native stack OOM), ioLoop never ran and its
@@ -1839,6 +1956,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         }
         Thread t = new Thread(this::ioLoop, "qdb-cursor-ws-io");
         t.setDaemon(true);
+        engine.setIoWakeup(this::wakeIoIfParked);
         try {
             t.start();
         } catch (Throwable th) {
@@ -1976,7 +2094,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             if (connectGate == CONNECT_GATE_STOP_CLAIMED) {
                 // close() is running or imminent and unparks this thread.
                 while (running) {
-                    LockSupport.parkNanos(parkNanos);
+                    LockSupport.parkNanos(PARK_NANOS);
                 }
                 return;
             }
@@ -2495,6 +2613,22 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         }
     }
 
+    private void signalAckProgress() {
+        Runnable l = ackProgressListener;
+        if (l != null) {
+            l.run();
+        }
+    }
+
+    /**
+     * Installs the callback run on a terminal latch and on {@link #close()}.
+     * Ack advances signal from the engine ({@link CursorSendEngine#setAckStateListener}),
+     * which also covers acks the loop never sees; see {@link AckWaiters}.
+     */
+    public void setAckProgressListener(Runnable listener) {
+        this.ackProgressListener = listener;
+    }
+
     /**
      * Pop every head entry whose tables are all covered by the durable
      * watermarks and call {@link CursorSendEngine#acknowledge} once with
@@ -2663,10 +2797,20 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             // keepalive clock here rather than pinging on the first idle pass.
             lastFrameOrPingNanos = System.nanoTime();
             while (running) {
+                // Snapshot before the send attempt: a publish after this point is
+                // caught by the re-check below, so the idle decision cannot race it.
+                long publishedBeforeWork = engine.publishStamp();
                 boolean didWork = trySendOne();
                 // 1. Try to send next frame(s).
                 // 2. Try to receive ACKs.
                 if (tryReceiveAcks()) {
+                    didWork = true;
+                }
+                // A reconnect anywhere in this iteration (inside trySendOne,
+                // tryReceiveAcks or a previous awaitIdle) repositioned the cursor:
+                // go straight back to trySendOne instead of blocking.
+                if (recycledThisIteration) {
+                    recycledThisIteration = false;
                     didWork = true;
                 }
                 // 3. In durable-ack mode, prod the server with a keepalive
@@ -2685,8 +2829,21 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 if (!didWork && running && keepaliveIntervalNanos > 0L) {
                     sendPingIfDue(keepaliveIntervalNanos);
                 }
-                if (!didWork && running) {
-                    LockSupport.parkNanos(parkNanos);
+                // 5. Nothing to do: block until the socket has bytes (an ACK),
+                //    a producer publishes a frame (engine rings the doorbell via
+                //    setIoWakeup), close() rings it, or the next PING is due.
+                //    No spinning: an idle connection costs zero CPU. A PING that
+                //    failed in 3/4 reconnected and rewound the cursor, which set
+                //    recycledThisIteration again: go back to trySendOne instead.
+                if (!didWork && running && !recycledThisIteration) {
+                    ioParked = true;
+                    try {
+                        if (engine.publishStamp() == publishedBeforeWork) {
+                            awaitIdle();
+                        }
+                    } finally {
+                        ioParked = false;
+                    }
                 }
             }
         } catch (Throwable t) {
@@ -2848,6 +3005,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             terminalError = t instanceof LineSenderException
                     ? (LineSenderException) t
                     : new LineSenderException("I/O thread failed: " + t.getMessage(), t);
+            // A producer waiting for acks must see the terminal now, not at its deadline.
+            signalAckProgress();
             // Tell the async dispatcher which SenderError IS the terminal, so
             // close() can distinguish "the custom handler owns THIS terminal"
             // from "the custom handler saw some earlier DROP_AND_CONTINUE".
@@ -2887,6 +3046,74 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         if (segment != null) {
             engine.releasePinnedSegment(segment);
             sendingSegment = null;
+        }
+    }
+
+    /**
+     * Blocks the I/O thread until there is something to do: socket readable,
+     * doorbell rung, or the earliest PING deadline (none = no timeout). The
+     * doorbell is stateful, so a wake that landed before this call returns
+     * immediately.
+     */
+    private void awaitIdle() {
+        WebSocketClient c = client;
+        if (c == null) {
+            // close() racing the final iterations: running is already false.
+            LockSupport.parkNanos(PARK_NANOS);
+            return;
+        }
+        try {
+            c.awaitReadableOrWake(idleTimeoutMillis());
+        } catch (Throwable t) {
+            fail(t);
+        }
+    }
+
+    /**
+     * Milliseconds until the next PING is due, or -1 when no PING is
+     * configured (or none is pending), i.e. wait without a timeout.
+     */
+    private int idleTimeoutMillis() {
+        long sinceLastNanos = System.nanoTime() - lastFrameOrPingNanos;
+        long remainingNanos = Long.MAX_VALUE;
+        if (keepaliveIntervalNanos > 0L) {
+            remainingNanos = keepaliveIntervalNanos - sinceLastNanos;
+        }
+        if (durableAckMode && durableAckKeepaliveIntervalNanos > 0L && !pendingDurable.isEmpty()) {
+            remainingNanos = Math.min(remainingNanos, durableAckKeepaliveIntervalNanos - sinceLastNanos);
+        }
+        if (remainingNanos == Long.MAX_VALUE) {
+            return -1;
+        }
+        if (remainingNanos <= 0L) {
+            return 0;
+        }
+        // Round up so a due PING is never missed by a sub-millisecond early wake.
+        long millis = (remainingNanos + 999_999L) / 1_000_000L;
+        return (int) Math.min(Integer.MAX_VALUE, millis);
+    }
+
+    /**
+     * Rings the current transport's doorbell so a blocked {@link #awaitIdle}
+     * returns. Called by the engine after every publish and by close().
+     * Safe from any thread; a wake aimed at a connection being swapped is
+     * harmless, because the loop re-reads the engine on every iteration.
+     */
+    public void wakeIo() {
+        WebSocketClient c = client;
+        if (c != null) {
+            c.wake();
+        }
+    }
+
+    /**
+     * The engine's publish hook: rings the doorbell only when the I/O thread is
+     * parked (or about to park), see {@link #ioParked}. A busy loop picks the
+     * frame up on its next iteration without any syscall from the producer.
+     */
+    private void wakeIoIfParked() {
+        if (ioParked) {
+            wakeIo();
         }
     }
 
@@ -2945,6 +3172,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private void swapClient(WebSocketClient newClient) {
         WebSocketClient old = this.client;
         this.client = newClient;
+        recycledThisIteration = true;
         this.lastReconnectError = null;
         if (old != null) {
             try {

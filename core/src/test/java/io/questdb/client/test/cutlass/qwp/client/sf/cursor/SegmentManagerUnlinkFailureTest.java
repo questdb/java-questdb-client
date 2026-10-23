@@ -79,7 +79,7 @@ public class SegmentManagerUnlinkFailureTest {
             byte[] originalHigher = java.nio.file.Files.readAllBytes(Paths.get(higherPath));
             FailingFilesFacade facade = new FailingFilesFacade(null, dir, lowerName);
             try (SegmentManager manager = new SegmentManager(
-                    segmentSize, TimeUnit.SECONDS.toNanos(60), segmentSize * 4, facade)) {
+                    segmentSize, segmentSize * 4, facade)) {
                 try {
                     manager.register(ring, dir);
                     Assert.fail("register accepted a partially enumerated SF directory");
@@ -95,6 +95,49 @@ public class SegmentManagerUnlinkFailureTest {
                 Assert.assertArrayEquals("partial enumeration changed the unseen higher generation",
                         originalHigher, java.nio.file.Files.readAllBytes(Paths.get(higherPath)));
             } finally {
+                ring.close();
+            }
+        });
+    }
+
+    /**
+     * A failed trim schedules its own retry: with no ACK, append or
+     * {@code wakeWorker()} after the failure, the worker must still come back
+     * on the retry backoff rather than park indefinitely.
+     */
+    @Test(timeout = 15_000L)
+    public void testFailedUnlinkIsRetriedWithoutExternalWakeup() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segmentSize = MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + 32L;
+            String dir = tmpDir + "/unlink-idle";
+            Assert.assertEquals(0, Files.mkdir(dir, Files.DIR_MODE_DEFAULT));
+            String failedPath = dir + "/sf-0000000000000000.sfa";
+            MmapSegment initial = MmapSegment.create(failedPath, 0L, segmentSize);
+            SegmentRing ring = new SegmentRing(initial, segmentSize);
+            AckWatermark watermark = AckWatermark.open(dir);
+            Assert.assertNotNull(watermark);
+            watermark.write(-1L);
+            long payload = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
+            try {
+                fill(payload, 32, (byte) 0x11);
+                Assert.assertEquals(0L, ring.appendOrFsn(payload, 32));
+                QueueSegmentSource.install(ring, MmapSegment.create(dir + "/sf-0000000000000001.sfa", 1L, segmentSize));
+                Assert.assertEquals(1L, ring.appendOrFsn(payload, 32));
+                // A spare is already in place, so provisioning schedules no retry of its own.
+                QueueSegmentSource.install(ring, MmapSegment.create(dir + "/sf-0000000000000002.sfa", 2L, segmentSize));
+                ring.acknowledge(0L);
+                FailingFilesFacade facade = new FailingFilesFacade(failedPath, null, null);
+                try (SegmentManager manager = new SegmentManager(segmentSize, segmentSize * 8, facade)) {
+                    manager.register(ring, dir, watermark);
+                    manager.start();
+                    Assert.assertTrue("manager never attempted the injected unlink",
+                            facade.removeAttempted.await(5, TimeUnit.SECONDS));
+                    Assert.assertTrue("manager never retried the failed unlink on its own",
+                            facade.removeRetried.await(5, TimeUnit.SECONDS));
+                }
+            } finally {
+                Unsafe.free(payload, 32, MemoryTag.NATIVE_DEFAULT);
+                watermark.close();
                 ring.close();
             }
         });
@@ -117,15 +160,19 @@ public class SegmentManagerUnlinkFailureTest {
             try {
                 fill(payload, 32, (byte) 0x11);
                 Assert.assertEquals(0L, ring.appendOrFsn(payload, 32));
-                ring.installHotSpare(MmapSegment.create(activePath, 1L, segmentSize));
+                QueueSegmentSource.install(ring, MmapSegment.create(activePath, 1L, segmentSize));
                 Assert.assertEquals(1L, ring.appendOrFsn(payload, 32));
+                // Hand-fed segments end here: the successor below must come from
+                // the manager's provisioner, named past the generations on disk.
+                ring.setSegmentSource(null);
                 ring.acknowledge(0L);
+                watermark.write(0L); // what CursorSendEngine.acknowledge does on the I/O thread
                 byte[] original = java.nio.file.Files.readAllBytes(Paths.get(failedPath));
 
                 FailingFilesFacade facade = new FailingFilesFacade(failedPath, null, null);
                 AtomicLong ticks = new AtomicLong();
                 try (SegmentManager manager = new SegmentManager(
-                        segmentSize, TimeUnit.SECONDS.toNanos(60), segmentSize * 8, facade, ticks::get)) {
+                        segmentSize, segmentSize * 8, facade, ticks::get)) {
                     manager.register(ring, dir, watermark);
                     manager.start();
                     Assert.assertTrue("manager never attempted the injected unlink",
@@ -164,7 +211,7 @@ public class SegmentManagerUnlinkFailureTest {
 
                 facade.allowUnlink();
                 try (SegmentManager retryManager = new SegmentManager(
-                        segmentSize, TimeUnit.SECONDS.toNanos(60), segmentSize * 8, facade)) {
+                        segmentSize, segmentSize * 8, facade)) {
                     retryManager.register(ring, dir, watermark);
                     retryManager.start();
                     retryManager.wakeWorker();

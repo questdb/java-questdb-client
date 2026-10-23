@@ -101,7 +101,6 @@ public class CursorSendEngineClosePartialEnumerationTest {
             Assert.assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
             SegmentManager manager = new SegmentManager(
                     segSize,
-                    SegmentManager.DEFAULT_POLL_NANOS,
                     segSize * 4L,
                     faultFacade,
                     System::nanoTime);

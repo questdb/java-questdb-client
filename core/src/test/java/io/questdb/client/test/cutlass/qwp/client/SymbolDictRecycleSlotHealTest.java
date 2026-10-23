@@ -489,7 +489,7 @@ public class SymbolDictRecycleSlotHealTest {
     private static void prepareFullyAckedLeftoverSlot(String slot) throws Exception {
         Path slotPath = Paths.get(slot);
         long payload = Unsafe.malloc(PAYLOAD_BYTES, MemoryTag.NATIVE_DEFAULT);
-        SegmentManager manager = new SegmentManager(SEGMENT_BYTES, TimeUnit.SECONDS.toNanos(60));
+        SegmentManager manager = new SegmentManager(SEGMENT_BYTES);
         CursorSendEngine pred = null;
         boolean slotDirReadOnly = false;
         try {
@@ -561,7 +561,7 @@ public class SymbolDictRecycleSlotHealTest {
      */
     static void prepareUnackedLeftoverSlot(String slot) {
         long payload = Unsafe.malloc(PAYLOAD_BYTES, MemoryTag.NATIVE_DEFAULT);
-        SegmentManager manager = new SegmentManager(SEGMENT_BYTES, TimeUnit.SECONDS.toNanos(60));
+        SegmentManager manager = new SegmentManager(SEGMENT_BYTES);
         CursorSendEngine pred = null;
         try {
             fill(payload, PAYLOAD_BYTES, (byte) 0x44);

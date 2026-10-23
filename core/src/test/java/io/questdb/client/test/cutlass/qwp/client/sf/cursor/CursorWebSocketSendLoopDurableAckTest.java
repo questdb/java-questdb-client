@@ -664,7 +664,7 @@ public class CursorWebSocketSendLoopDurableAckTest {
 
     private CursorWebSocketSendLoop newDefaultLoop(CursorSendEngine engine) {
         return new CursorWebSocketSendLoop(
-                null, engine, 0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                null, engine, 0L,
                 () -> {
                     throw new UnsupportedOperationException("test loop is never started");
                 },
@@ -673,7 +673,7 @@ public class CursorWebSocketSendLoopDurableAckTest {
 
     private CursorWebSocketSendLoop newDurableLoop(CursorSendEngine engine) {
         return new CursorWebSocketSendLoop(
-                null, engine, 0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                null, engine, 0L,
                 () -> {
                     throw new UnsupportedOperationException("test loop is never started");
                 },

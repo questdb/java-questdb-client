@@ -59,8 +59,11 @@ import java.util.concurrent.locks.LockSupport;
  *
  * <h2>Lifecycle</h2>
  * The dispatcher thread is started lazily on the first successful
- * {@link #offer}, so workloads that never receive acks (none in practice) pay
- * zero thread cost. {@link #close()} is idempotent.
+ * {@link #offer} made while a real handler is installed. With the no-op
+ * {@link DefaultSenderProgressHandler} (the common case: nobody called
+ * {@code setProgressHandler}) an offer only records the watermark, so acks
+ * cost no thread, no unpark and no syscall; installing a handler later
+ * delivers the newest recorded watermark. {@link #close()} is idempotent.
  *
  * <h2>Exception safety</h2>
  * Any {@link Throwable} thrown by the handler is caught and logged. The
@@ -70,9 +73,6 @@ public final class SenderProgressDispatcher implements QuietCloseable {
 
     public static final int DEFAULT_CAPACITY = 256;
     private static final long DRAIN_DEADLINE_NANOS = 100_000_000L; // 100 ms
-    // Park interval used when the mailbox is idle. Bounded so a missed unpark
-    // (e.g. from a future code path) cannot wedge the dispatcher.
-    private static final long IDLE_PARK_NANOS = 100_000_000L; // 100 ms
     private static final Logger LOG = LoggerFactory.getLogger(SenderProgressDispatcher.class);
     // Sentinel for "no value ever offered". Real FSNs are non-negative, so
     // Long.MIN_VALUE is unambiguous and the dispatcher's "deliver if greater
@@ -152,9 +152,11 @@ public final class SenderProgressDispatcher implements QuietCloseable {
 
     /**
      * Watermark advances overwritten before the handler observed them, since
-     * startup. Computed as {@code totalOffered - totalDelivered}; a small
-     * non-zero value typically reflects a single in-flight advance, while a
-     * persistently growing value signals a handler slower than the ack rate.
+     * startup. Offers made while the no-op default handler was installed are
+     * not counted: there was no handler to observe them. Computed as
+     * {@code totalOffered - totalDelivered}; a small non-zero value typically
+     * reflects a single in-flight advance, while a persistently growing value
+     * signals a handler slower than the ack rate.
      * Useful as an ops signal when handler latency matters.
      */
     public long getDroppedNotifications() {
@@ -184,7 +186,15 @@ public final class SenderProgressDispatcher implements QuietCloseable {
      * Callable both before and after {@link #offer(long) start of dispatch}.
      */
     public void setHandler(SenderProgressHandler handler) {
-        this.handler = handler != null ? handler : DefaultSenderProgressHandler.INSTANCE;
+        SenderProgressHandler h = handler != null ? handler : DefaultSenderProgressHandler.INSTANCE;
+        this.handler = h;
+        // Watermarks offered under the no-op default were skipped (see
+        // offer()); hand the newest one to the real handler now. The
+        // volatile handler write above / latestFsn read below pair with the
+        // reverse order in offer(), so a concurrent offer cannot be lost.
+        if (h != DefaultSenderProgressHandler.INSTANCE && latestFsn != EMPTY) {
+            wakeDispatcher();
+        }
     }
 
     /**
@@ -201,8 +211,19 @@ public final class SenderProgressDispatcher implements QuietCloseable {
         if (closed) {
             return false;
         }
-        totalOffered.incrementAndGet();
         latestFsn = ackedFsn;
+        if (handler == DefaultSenderProgressHandler.INSTANCE) {
+            // No-op handler installed: nothing to deliver, so no thread
+            // start and no unpark. The value stays in the slot for a
+            // handler installed later (see setHandler()).
+            return true;
+        }
+        totalOffered.incrementAndGet();
+        wakeDispatcher();
+        return true;
+    }
+
+    private void wakeDispatcher() {
         Thread t = dispatcherThread;
         if (t == null) {
             startDispatcherIfNeeded();
@@ -211,7 +232,6 @@ public final class SenderProgressDispatcher implements QuietCloseable {
         if (t != null) {
             LockSupport.unpark(t);
         }
-        return true;
     }
 
     private void dispatchLoop() {
@@ -237,9 +257,11 @@ public final class SenderProgressDispatcher implements QuietCloseable {
             if (closed) {
                 return;
             }
-            // No new value; park until the producer unparks us or the idle
-            // tick fires. Spurious wakeups loop back to the top and re-check.
-            LockSupport.parkNanos(this, IDLE_PARK_NANOS);
+            // No new value; park until offer() or close() unparks us. Both write
+            // their state (latestFsn / closed) before the unpark and this loop
+            // re-reads it before parking, so no wake can be lost.
+            // Spurious wakeups loop back to the top and re-check.
+            LockSupport.park(this);
         }
     }
 

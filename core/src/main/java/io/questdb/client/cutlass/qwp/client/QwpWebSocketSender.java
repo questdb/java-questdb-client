@@ -41,6 +41,7 @@ import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWaiters;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerListener;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerPool;
@@ -312,6 +313,8 @@ public class QwpWebSocketSender implements Sender {
     // symbolDictEpoch.
     private volatile CursorSendEngine cursorEngine;
     private volatile CursorWebSocketSendLoop cursorSendLoop;
+    // Threads parked for ack progress; outlives the loops and engines a recycle swaps.
+    private final AckWaiters ackWaiters = new AckWaiters();
     // Sender-lifetime observability counters (see CursorSendCounters). Every
     // loop generation and every attached engine adopts this instance before
     // use, so the getTotal* accessors survive a symbol-dictionary recycle
@@ -573,7 +576,7 @@ public class QwpWebSocketSender implements Sender {
     // cause on every later table()/flush-family call; close() still works
     // normally. Every other recycle failure is transient and resumable (see
     // recycleResume), never latched here.
-    private Throwable recycleFailure;
+    private volatile Throwable recycleFailure;
     // Resumable recycle: a transient failure mid-recycle no
     // longer latches the sender terminal. CLOSE_LOOP = step 2 failed, the
     // old loop is still dying and the old engine/dictionary are intact.
@@ -1484,15 +1487,17 @@ public class QwpWebSocketSender implements Sender {
 
     /**
      * Blocks until {@link #getAckedFsn()} {@code >= targetFsn}, or until
-     * {@code timeoutMillis} elapses. Polls on a 50us park; surfaces I/O loop
-     * errors synchronously via {@code cursorSendLoop.checkError()}.
+     * {@code timeoutMillis} elapses. Parks in {@link AckWaiters}: the I/O
+     * thread wakes it on every ack advance, terminal error and loop close;
+     * I/O loop errors surface synchronously via {@code checkError()}.
      * <p>
-     * Every pass re-reads the epoch base and the cursor engine through
+     * Every wake re-reads the epoch base and the cursor engine through
      * {@link #getAckedFsn()} (base first, then engine, clamped to the durable
      * watermark), so a symbol-dictionary recycle that swaps the engine while a
-     * monitor thread is parked here is observed on the next pass instead of
+     * monitor thread is parked here is observed on the next wake instead of
      * pinning the wait to the engine it started on. While the engine is null
      * mid-swap the durable watermark stands in, as in {@link #getAckedFsn()}.
+     * Any number of threads may wait at once.
      * <p>
      * Useful for tests and user code that need to confirm a specific publish
      * has been server-acknowledged. Pair with {@link #flushAndGetSequence()} to
@@ -1522,14 +1527,33 @@ public class QwpWebSocketSender implements Sender {
             return false;
         }
         long deadlineNanos = System.nanoTime() + timeoutMillis * 1_000_000L;
-        while (getAckedFsn() < targetFsn) {
-            checkAwaitAckedFsnErrors();
-            if (System.nanoTime() >= deadlineNanos) {
-                return false;
+        Thread me = Thread.currentThread();
+        // Registered before the first check: an ack that lands after a check
+        // unparks us (or leaves the permit), one that landed before is seen by it.
+        ackWaiters.add(me);
+        // A pending interrupt makes parkNanos return at once without clearing the
+        // flag, turning the wait into a full-core spin. Consume it, remember it,
+        // and restore it on the way out, as the close() drain does.
+        boolean interrupted = false;
+        try {
+            while (true) {
+                if (getAckedFsn() >= targetFsn) {
+                    return true;
+                }
+                checkAwaitAckedFsnErrors();
+                long remaining = deadlineNanos - System.nanoTime();
+                if (remaining <= 0L) {
+                    return false;
+                }
+                interrupted |= Thread.interrupted();
+                java.util.concurrent.locks.LockSupport.parkNanos(this, remaining);
             }
-            java.util.concurrent.locks.LockSupport.parkNanos(50_000L);
+        } finally {
+            ackWaiters.remove(me);
+            if (interrupted) {
+                me.interrupt();
+            }
         }
-        return true;
     }
 
     /**
@@ -1547,6 +1571,17 @@ public class QwpWebSocketSender implements Sender {
             engine.checkDurability();
         }
         checkConnectionError();
+        checkRecycleFailure();
+        if (closed) {
+            // close() keeps acking through its drain, so a waiter whose target the
+            // drain reaches still returns true. Once the loop is down no ack can
+            // ever land: throw as the entry check would, instead of sleeping to
+            // the deadline. The loop signals the waiters after clearing running.
+            CursorWebSocketSendLoop loop = cursorSendLoop;
+            if (loop == null || !loop.isRunning()) {
+                throw new LineSenderException("Sender is closed");
+            }
+        }
     }
 
     /**
@@ -3372,6 +3407,9 @@ public class QwpWebSocketSender implements Sender {
         if (cursorEngine != null) {
             throw new LineSenderException("CursorSendEngine is already attached");
         }
+        if (engine != null) {
+            engine.setAckStateListener(ackWaiters::signal);
+        }
         this.cursorEngine = engine;
         this.ownsCursorEngine = takeOwnership && engine != null;
         // Delta encoding is available in memory-mode (in-process catch-up) and in
@@ -3406,6 +3444,7 @@ public class QwpWebSocketSender implements Sender {
     @TestOnly
     public void setCursorSendLoopForTesting(CursorWebSocketSendLoop loop) {
         cursorSendLoop = loop;
+        loop.setAckProgressListener(ackWaiters::signal);
         if (connectionDispatcher == null) {
             connectionDispatcher = new SenderConnectionDispatcher(
                     connectionListener, connectionListenerInboxCapacity);
@@ -4870,46 +4909,55 @@ public class QwpWebSocketSender implements Sender {
         long deadlineNanos = System.nanoTime() + closeFlushTimeoutMillis * 1_000_000L;
         restoreInterrupt[0] |= Thread.interrupted();
         try {
-            while (cursorEngine.ackedFsn() < target) {
-                // PoolHousekeeper.stop() escalates to interrupt when this close runs past its join budget. A carried
-                // interrupt makes parkNanos return immediately without clearing the flag, turning the remainder of a
-                // close drain (up to 60s by default) into a full-core spin. Consume any later interrupt before the
-                // next paced wait, remember it, and restore the flag once the whole close exits.
-                if (Thread.interrupted()) {
-                    restoreInterrupt[0] = true;
-                }
-                // Stop on a latched terminal (acks will never reach target);
-                // surface it only when no other channel already delivered it.
-                if (errorOwnedByCustomHandler) {
-                    if (cursorSendLoop.getTerminalError() != null) {
-                        return;
+            Thread me = Thread.currentThread();
+            ackWaiters.add(me); // once per drain, see AckWaiters
+            try {
+                while (true) {
+                    if (cursorEngine.ackedFsn() >= target) {
+                        break;
                     }
-                } else {
-                    cursorSendLoop.checkError();
+                    // PoolHousekeeper.stop() escalates to interrupt when this close runs past its join budget. A carried
+                    // interrupt makes parkNanos return immediately without clearing the flag, turning the remainder of a
+                    // close drain (up to 60s by default) into a full-core spin. Consume any later interrupt before the
+                    // next paced wait, remember it, and restore the flag once the whole close exits.
+                    if (Thread.interrupted()) {
+                        restoreInterrupt[0] = true;
+                    }
+                    // Stop on a latched terminal (acks will never reach target);
+                    // surface it only when no other channel already delivered it.
+                    if (errorOwnedByCustomHandler) {
+                        if (cursorSendLoop.getTerminalError() != null) {
+                            return;
+                        }
+                    } else {
+                        cursorSendLoop.checkError();
+                    }
+                    if (System.nanoTime() >= deadlineNanos) {
+                        long acked = cursorEngine.ackedFsn();
+                        long externalTarget = fsnEpochBase + target;
+                        long externalAcked = fsnEpochBase + acked;
+                        // Name the outage the I/O thread is riding out, when there is one. A
+                        // foreground sender now retries endpoint-policy rejections indefinitely,
+                        // so a revoked token reaches the operator HERE, and blaming timeout
+                        // tuning for what is actually an auth failure would misdirect them.
+                        CursorWebSocketSendLoop loop = cursorSendLoop;
+                        Throwable outage = loop == null ? null : loop.lastReconnectError();
+                        LOG.warn("close() drain timed out after {}ms [target={} acked={}], pending data may be lost{}",
+                                closeFlushTimeoutMillis, externalTarget, externalAcked,
+                                outage == null ? "" : "; wire is not draining: " + outage.getMessage());
+                        throw new LineSenderException("close() drain timed out after ")
+                                .put(closeFlushTimeoutMillis).put(" ms [targetFsn=")
+                                .put(externalTarget).put(", ackedFsn=").put(externalAcked)
+                                .put("] - server did not acknowledge ")
+                                .put(target - acked)
+                                .put(outage == null
+                                        ? " pending batches; data may be lost (use larger closeFlushTimeoutMillis or smaller batches)"
+                                        : " pending batches; the wire is not draining: " + outage.getMessage());
+                    }
+                    java.util.concurrent.locks.LockSupport.parkNanos(this, deadlineNanos - System.nanoTime());
                 }
-                if (System.nanoTime() >= deadlineNanos) {
-                    long acked = cursorEngine.ackedFsn();
-                    long externalTarget = fsnEpochBase + target;
-                    long externalAcked = fsnEpochBase + acked;
-                    // Name the outage the I/O thread is riding out, when there is one. A
-                    // foreground sender now retries endpoint-policy rejections indefinitely,
-                    // so a revoked token reaches the operator HERE, and blaming timeout
-                    // tuning for what is actually an auth failure would misdirect them.
-                    CursorWebSocketSendLoop loop = cursorSendLoop;
-                    Throwable outage = loop == null ? null : loop.lastReconnectError();
-                    LOG.warn("close() drain timed out after {}ms [target={} acked={}], pending data may be lost{}",
-                            closeFlushTimeoutMillis, externalTarget, externalAcked,
-                            outage == null ? "" : "; wire is not draining: " + outage.getMessage());
-                    throw new LineSenderException("close() drain timed out after ")
-                            .put(closeFlushTimeoutMillis).put(" ms [targetFsn=")
-                            .put(externalTarget).put(", ackedFsn=").put(externalAcked)
-                            .put("] - server did not acknowledge ")
-                            .put(target - acked)
-                            .put(outage == null
-                                    ? " pending batches; data may be lost (use larger closeFlushTimeoutMillis or smaller batches)"
-                                    : " pending batches; the wire is not draining: " + outage.getMessage());
-                }
-                java.util.concurrent.locks.LockSupport.parkNanos(50_000L);
+            } finally {
+                ackWaiters.remove(me);
             }
         } finally {
             // Close the last-iteration race: an interrupt can land after the loop observes its final ACK but
@@ -5024,7 +5072,7 @@ public class QwpWebSocketSender implements Sender {
         try {
             cursorSendLoop = new CursorWebSocketSendLoop(
                     client, cursorEngine,
-                    0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                    0L,
                     reconnectFactory,
                     reconnectInitialBackoffMillis,
                     reconnectMaxBackoffMillis,
@@ -5035,6 +5083,7 @@ public class QwpWebSocketSender implements Sender {
                     catchUpCapGapMinEscalationWindowMillis,
                     CursorWebSocketSendLoop.ReconnectPolicy.FOREGROUND,
                     fsnEpochBase);
+            cursorSendLoop.setAckProgressListener(ackWaiters::signal);
             // Sender-lifetime counters: adopted before start(), like the
             // dispatchers, so the fresh loop keeps counting where the recycle's
             // outgoing loop stopped.
@@ -5801,6 +5850,7 @@ public class QwpWebSocketSender implements Sender {
         // again on its first append (SymbolDictRecycleHealingTest).
         deltaDictEnabled = rebuilt.isDeltaDictEnabled();
         rebuilt.adoptCounters(counters);
+        rebuilt.setAckStateListener(ackWaiters::signal);
         cursorEngine = rebuilt;
         ownsCursorEngine = true;
         cursorEngine.setSlotLockReleaseListener(this::onSlotLockReleased);
@@ -5862,6 +5912,7 @@ public class QwpWebSocketSender implements Sender {
                         + "frames: the outgoing engine's fully-drained close contract "
                         + "was breached");
         recycleFailure = breach;
+        ackWaiters.signal(); // parked monitor threads re-check the latch
         recycleResume = RecycleResume.NONE;
         try {
             rebuilt.close(recycleSlotLock == null);

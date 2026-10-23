@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.test.tools.TestWebSocketClient;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.Sender;
 import io.questdb.client.SenderConnectionEvent;
@@ -165,7 +166,6 @@ public class SlotLockReleasedContractTest {
         });
     }
 
-
     /**
      * Leak path: when {@code close()} cannot wind the I/O loop down it bails
      * out via the {@code !ioThreadStopped} early-return and must leave the slot
@@ -206,6 +206,9 @@ public class SlotLockReleasedContractTest {
                     setField(loop, "running", Boolean.FALSE);
                     if (realIo != null) {
                         LockSupport.unpark(realIo);
+                        // The idle I/O thread blocks in the transport wait, not a park:
+                        // ring its doorbell the way close() does.
+                        loop.wakeIo();
                         realIo.join(TimeUnit.SECONDS.toMillis(5));
                         Assert.assertFalse("real I/O thread must have stopped", realIo.isAlive());
                     }
@@ -267,7 +270,7 @@ public class SlotLockReleasedContractTest {
             Assert.assertEquals(0, Files.mkdir(tmpDir, Files.DIR_MODE_DEFAULT));
             String slot = tmpDir + "/slot";
             long segSize = MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + 32L;
-            SegmentManager manager = new SegmentManager(segSize, TimeUnit.SECONDS.toNanos(60));
+            SegmentManager manager = new SegmentManager(segSize);
             CountDownLatch cleanupFinished = new CountDownLatch(1);
             CountDownLatch workerBlocked = new CountDownLatch(1);
             CountDownLatch releaseWorker = new CountDownLatch(1);
@@ -278,7 +281,7 @@ public class SlotLockReleasedContractTest {
             boolean managerClosed = false;
             try {
                 manager.setAfterRingCleanupHook(cleanupFinished::countDown);
-                manager.setBeforeInstallSyncHook(() -> {
+                manager.setBeforeTrimSyncHook(() -> {
                     if (!fired.compareAndSet(false, true)) return;
                     workerBlocked.countDown();
                     try {
@@ -342,7 +345,7 @@ public class SlotLockReleasedContractTest {
                 }
             } finally {
                 manager.setAfterRingCleanupHook(null);
-                manager.setBeforeInstallSyncHook(null);
+                manager.setBeforeTrimSyncHook(null);
                 releaseWorker.countDown();
                 if (wss != null) {
                     try {
@@ -410,7 +413,7 @@ public class SlotLockReleasedContractTest {
                 };
                 loop = new CursorWebSocketSendLoop(
                         null /* async-initial-connect: the I/O thread drives the connect */,
-                        engine, 0L, 1_000L,
+                        engine, 0L,
                         stuckConnect,
                         100L, 5_000L, false);
                 loop.start();
@@ -542,7 +545,7 @@ public class SlotLockReleasedContractTest {
                     return loopClient;
                 };
                 loop = new CursorWebSocketSendLoop(
-                        null, engine, 0L, 1_000L, stuckConnect,
+                        null, engine, 0L, stuckConnect,
                         100L, 5_000L, false);
                 loop.start();
                 Assert.assertTrue("I/O thread never reached the connect factory",
@@ -702,7 +705,7 @@ public class SlotLockReleasedContractTest {
      * to the loop by the stuck-connect factory; the loop's exit path closes
      * it (close is idempotent via the superclass).
      */
-    private static final class StubWebSocketClient extends WebSocketClient {
+    private static final class StubWebSocketClient extends TestWebSocketClient {
         private final AtomicBoolean isClosed = new AtomicBoolean();
 
         StubWebSocketClient() {
