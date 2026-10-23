@@ -374,6 +374,11 @@ public class QwpWebSocketSender implements Sender {
     private SenderErrorHandler errorHandler = DefaultSenderErrorHandler.INSTANCE;
     private int errorInboxCapacity = SenderErrorDispatcher.DEFAULT_CAPACITY;
     private long firstPendingRowTimeNanos;
+    // Rows to skip before the next auto_flush_interval clock read. The read is
+    // a vDSO call per row otherwise -- 27% of the producer's cycles at 17M
+    // rows/s -- while the interval only matters for a batch that is NOT
+    // filling fast. See shouldAutoFlush().
+    private int intervalCheckCountdown;
     // Additive offset applied to every user-visible FSN this sender reports
     // (flushAndGetSequence, awaitAckedFsn's target, getAckedFsn, drain's
     // watermark, and every FSN the I/O loop surfaces through the progress
@@ -7186,6 +7191,7 @@ public class QwpWebSocketSender implements Sender {
 
         if (pendingRowCount == 0) {
             firstPendingRowTimeNanos = System.nanoTime();
+            intervalCheckCountdown = 0;
         }
         pendingRowCount++;
 
@@ -7217,10 +7223,32 @@ public class QwpWebSocketSender implements Sender {
             return true;
         }
         if (autoFlushIntervalNanos > 0) {
+            // Rate-adaptive clock sampling. Rows 1, 2, 4, 8 of a batch read the
+            // clock, then every 8th row at most. A batch filling at a steady
+            // rate is still flushed by the row that crosses the interval: the
+            // sampling tightens to every row as the deadline nears. Only a rate
+            // that collapses mid-batch can overshoot, by at most 7 slow rows.
+            if (--intervalCheckCountdown > 0) {
+                return false;
+            }
             long ageNanos = System.nanoTime() - firstPendingRowTimeNanos;
-            return ageNanos >= autoFlushIntervalNanos;
+            if (ageNanos >= autoFlushIntervalNanos) {
+                return true;
+            }
+            intervalCheckCountdown = rowsUntilNextIntervalCheck(ageNanos);
         }
         return false;
+    }
+
+    private int rowsUntilNextIntervalCheck(long ageNanos) {
+        // Too young to estimate the rate: double the rows between reads.
+        if (ageNanos < (autoFlushIntervalNanos >> 6)) {
+            return (int) Math.min(pendingRowCount, 8L);
+        }
+        // Rows this batch gains before the interval at its observed rate; take
+        // an eighth so the check is exact to within 1/8 of the time left.
+        double rowsUntilDue = pendingRowCount * ((double) (autoFlushIntervalNanos - ageNanos) / ageNanos);
+        return (int) Math.max(1L, Math.min((long) (rowsUntilDue / 8), 8L));
     }
 
     private long toMicros(long value, ChronoUnit unit) {
