@@ -158,6 +158,7 @@ class RecordingSender implements Sender {
         if (pendingRows > 0 || deferredFramesOpen) {
             flushCount.incrementAndGet();
         }
+        pendingBatchStartNanos = 0L;
         pendingRows = 0;
         savepointRows = 0;
         deferredFramesOpen = false;
@@ -174,6 +175,7 @@ class RecordingSender implements Sender {
         if (!hadRows) {
             return -1L;                       // nothing pending: the real sender publishes nothing
         }
+        pendingBatchStartNanos = 0L;
         pendingRows = 0;
         savepointRows = 0;
         deferredFramesOpen = true;

@@ -280,9 +280,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     void atNow();
 
     /**
-     * Runs the same row, byte and age thresholds every append runs and ships the pending rows
-     * when one trips. At a pooled release the age threshold is the one that usually trips, which
-     * lets a pool ship rows a lease left behind once they are older than
+     * Runs the row, byte and age thresholds and ships the pending rows when one trips.
+     * An append checks the age only while up to 16 rows are pending and on every 16th append
+     * after that; this call always checks it. At a pooled release the age threshold is the one
+     * that usually trips, which lets a pool ship rows a lease left behind once they are older than
      * {@code auto_flush_interval}. It does nothing while a row is in progress.
      * Only the WebSocket QWP transport implements it.
      */
@@ -805,11 +806,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     }
 
     /**
-     * {@link System#nanoTime()} of the first row of the pending batch, 0 when
-     * nothing is pending. A pool release uses it as "now" instead of reading
-     * the clock.
+     * {@link System#nanoTime()} reading taken when the first row of the pending batch
+     * was appended, 0 when nothing is pending. It is not a row timestamp.
+     * A pool release uses it as "now" instead of reading the clock.
+     * Only the WebSocket QWP transport reports it; the other transports return 0
+     * even with rows pending.
      *
-     * @return the first pending row's timestamp in nanoseconds, or 0
+     * @return the {@code System.nanoTime()} reading of the first pending row's append, or 0
      */
     default long pendingBatchStartNanos() {
         return 0L;
@@ -1559,6 +1562,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * <strong>Important:</strong>This option does not cause the Sender to flush the buffer at regular intervals.
          * Auto-flushing is only triggered when calling {@link #atNow()}, {@link #at(Instant)} or {@link #at(long, ChronoUnit)}.
          * The Sender will not flush the buffer if no new rows are added even if the auto-flush interval has elapsed.
+         * <p>
+         * On the WebSocket transport the age check runs on every append while up to 16 rows are pending,
+         * and on every 16th append after that. A producer that stops appending mid-batch with more than
+         * 16 rows pending is therefore checked again only at rows 32, 48 and so on.
+         * The interval bound is exact for a slow producer, which never has more than 16 rows pending,
+         * and a fast producer overshoots it by at most the time of 16 rows.
+         * Pooled releases and the pool housekeeper always check the age.
          * <p>
          * This is only used when communicating over HTTP and WebSocket transport, and it's illegal to call this method when
          * communicating over TCP or UDP transport.

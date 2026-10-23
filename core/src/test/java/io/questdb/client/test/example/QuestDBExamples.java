@@ -113,8 +113,8 @@ public class QuestDBExamples {
                     .doubleColumn("price", 42_500.50)
                     .longColumn("size", 100)
                     .atNow();
-            // close() returns the sender to the pool; the pool ships the row on its next settle,
-            // or call flush() to ship now.
+            // close() ships the row as one frame into the store-and-forward ring and returns
+            // the sender to the pool.
         }
     }
 

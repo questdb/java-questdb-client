@@ -99,7 +99,7 @@ snippets below borrow from its pools.
 ### Ingest Data
 
 Borrow a `Sender`, write rows, and close it. `close()` ships the lease's pending rows as one committing frame into the
-store-and-forward ring before it returns and hands the sender back to the pool. That is publishing, not
+store-and-forward ring (with a commit window the frame is flagged defer-commit instead) before it returns and hands the sender back to the pool. That is publishing, not
 acknowledgement: call `drain()` to wait for the server. Borrowing per message is the intended pattern. With
 `flush_on_close=off`, the opt-in, `close()` only releases the slot and the rows stay in it across leases; they ship when
 an auto-flush threshold trips on a later append or `close()`, or when the pool's housekeeper settles the idle slot,
@@ -125,7 +125,7 @@ try (Sender sender = db.borrowSender()) {
 The sender buffers rows and sends them in batches. For high throughput, write many rows on one borrowed sender and
 flush per batch rather than per row: each flush has a fixed cost, so batching raises throughput. By default a pooled
 `close()` ships the lease's pending rows as one frame into the store-and-forward ring, so the final partial batch is in
-the ring when `close()` returns. If you borrow per message, that is one frame per message; to commit once per window
+the ring when `close()` returns. If you borrow per message, that is one frame per message. Without a commit window every pooled `close()` is one server commit, which bounds throughput for borrow-per-row; `commit_rows` and `commit_interval_ms` lift that bound. To commit once per window
 instead of once per close, set a commit window (`commit_rows`, `commit_interval_ms`, which requires `flush_on_close=on`):
 every close ships one frame flagged defer-commit, the server appends it, and the pool commits once per window. A rejected
 frame then rolls back the whole open group, so every lease since the last commit loses its rows.
@@ -680,7 +680,7 @@ schema::key1=value1;key2=value2;
 | `query_pool_min`         | `1`     | Minimum query connections kept warm (`0` under `lazy_connect`)                 |
 | `query_pool_max`         | `4`     | Maximum query connections                                                      |
 | `acquire_timeout_ms`     | `5000`  | How long `borrowSender()`/`borrowQuery()` waits for a free slot                |
-| `idle_timeout_ms`        | `60000` | How long a pooled connection may stay idle before it is reaped                 |
+| `idle_timeout_ms`        | `60000` | How long a pooled connection may stay idle before it is reaped. A released slot's idle clock starts at the first row of the released lease's batch, not at the release, so a lease held longer than this leaves its slot reap-eligible on the next housekeeper tick when the pool is above `sender_pool_min`. Nothing is lost, because a slot with unshipped rows is never reaped; the cost is one reconnect on a later borrow. With `flush_on_close=off` the mark can be the first row of an earlier lease's batch, bounded by `auto_flush_interval` while the interval trigger is on |
 | `max_lifetime_ms`        | `1800000` | Maximum lifetime of a pooled connection before it is recycled                |
 | `flush_on_close`         | `on`    | `on` makes a pooled `close()` flush before releasing (one frame and one commit per close); `off` is the opt-in that only releases the slot and buffers rows across leases until an auto-flush threshold or the housekeeper settle ships them. Note: "flush" means published to the store-and-forward ring, not acknowledged. Close-time errors are wrapped; the delegate's error is the cause; only `LineSenderServerException` keeps its type, so code that catches another `LineSenderException` subclass around a pooled `close()` must look at `getCause()`; with `on` and no commit window each lease ships its own frame, so a server rejection cannot discard other leases' rows; with `off` leases share frames and a rejection covers all of them; with a commit window a rejection rolls back the whole open group, every lease since the last commit |
 | `commit_rows`            | _(unset)_ | Commit window: with `flush_on_close=on`, closes ship frames flagged defer-commit and the server commits once per window of this many rows. Acks arrive at the commit; `drain()` after `flush()` |

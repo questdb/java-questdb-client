@@ -50,7 +50,7 @@ import java.time.temporal.ChronoUnit;
  * <p>
  * Behaviour difference from a raw Sender: {@link #close()} returns the slot to
  * the pool after flushing the lease's pending rows as one frame into the
- * store-and-forward ring (flush_on_close=on, the default). With
+ * store-and-forward ring ({@code flush_on_close=on}, the default). With
  * {@code flush_on_close=off}, the opt-in, close only releases the slot: the
  * rows ship once the oldest is older than {@code auto_flush_interval} or
  * another auto-flush threshold trips, otherwise they wait for a later append
@@ -195,10 +195,19 @@ public final class PooledSender implements Sender {
      * With a commit window ({@link SenderPool#setCommitWindow}) and
      * {@code flush_on_close=on}, each close ships a deferred frame; the close
      * that fills the window (rows appended or age of the open group) flushes
-     * instead, which commits the group. Without {@code flush_on_close}, only
+     * instead, which commits the group. With {@code flush_on_close=off}, only
      * the release that closes the window ships: it flushes, committing the
-     * group. The window's age is measured from the first release that found
-     * work. A failed ship retires the slot and throws the wrapper described above.
+     * group. The group opens at the first-row stamp of the lease whose release
+     * found work. Each later release is measured by its own first-row stamp
+     * against that opening. A failed ship retires the slot and throws the wrapper described above.
+     * <p>
+     * The idle clock of the released slot is marked at the first row of the released
+     * lease's batch, not at the release. A lease held longer than {@code idle_timeout_ms}
+     * therefore leaves its slot eligible for the reaper on the next housekeeper tick when the
+     * pool is above {@code sender_pool_min}. Nothing is lost, because a slot with unshipped rows
+     * is never reaped; the cost is one reconnect on a later borrow. With
+     * {@code flush_on_close=off} the mark can be the first row of an earlier lease's batch,
+     * which {@code auto_flush_interval} bounds while the interval trigger is on.
      * <p>
      * Close-time errors are wrapped: the delegate's error is the cause. A latched
      * {@link LineSenderServerException} is rethrown as a new one carrying the same

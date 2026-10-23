@@ -157,7 +157,9 @@ final class SenderSlot {
      * Whether the commit window should close at this release. Rows in the
      * window are counted from appends, so the answer does not depend on
      * whether rows shipped at close or by auto-flush. The first release that
-     * finds work after a commit opens the group's clock.
+     * finds work after a commit opens the group's clock, at the first-row stamp
+     * of that lease. Later releases pass their own first-row stamps and are
+     * measured against that opening.
      */
     boolean windowCloses(long rowsAppended, boolean deferredOpen, long nowNanos, int commitRows, long commitIntervalNanos) {
         long inWindow = rowsAppended - rowsAppendedAtLastCommit;

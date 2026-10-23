@@ -262,8 +262,13 @@ public class QwpWebSocketSender implements Sender {
     // The tables that received a row since the last successful flush, in first-row
     // order, each listed once (QwpTableBuffer.isListedPending() guards the add).
     // collectNonEmptyTables() walks this instead of every table the sender has seen.
-    // Cleared, together with the flags, only when a flush succeeds or finds nothing
+    // Cleared, together with the flags, when a flush succeeds or finds nothing
     // to ship, so a flush that throws before publishing leaves it for the retry.
+    // The close-path over-cap discard and the close walk clear it too.
+    // reset() and resetToSavepoint() leave the list and the flags alone: a rolled-back
+    // row keeps its table's place, and collectNonEmptyTables() skips zero-row tables.
+    // QuestDBFlushOnCloseTest.testResetAfterACrossingRowAloneInItsTableDropsTheColumnItAdded
+    // relies on that.
     private final ObjList<QwpTableBuffer> pendingTables = new ObjList<>();
     private final IntList splitFrameBodyBytes = new IntList();
     // Every buffer in tableBuffers, in creation order, so markSavepoint(), reset() and

@@ -137,7 +137,7 @@ public interface QuestDB extends Closeable {
     /**
      * Borrows a {@link Sender} from the pool. The caller MUST call
      * {@link Sender#close()} on the returned instance to release it back to
-     * the pool. Close releases, flush ships, drain waits: {@code close()} on a
+     * the pool. Close ships, drain waits: {@code close()} on a
      * pooled Sender ships the lease's pending rows as one frame into the
      * store-and-forward ring and returns the slot, so every row appended before
      * {@code close()} is in the ring when it returns. Call

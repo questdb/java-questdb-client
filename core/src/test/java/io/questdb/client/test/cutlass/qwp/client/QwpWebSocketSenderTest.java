@@ -64,13 +64,13 @@ public class QwpWebSocketSenderTest {
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
                 try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
-                        + ";auto_flush_rows=off;auto_flush_bytes=off;auto_flush_interval=200;")) {
+                        + ";auto_flush_rows=off;auto_flush_bytes=off;auto_flush_interval=1000;")) {
                     // 17 rows appended at once; the first row's age is below the interval
                     for (int i = 1; i <= 17; i++) {
                         sender.table("t").longColumn("v", i).atNow();
                     }
                     Assert.assertEquals(17, sender.pendingRowCount());
-                    Thread.sleep(500);
+                    Thread.sleep(1500);
 
                     // past 16 pending rows only every sixteenth row reads the clock
                     sender.table("t").longColumn("v", 18).atNow();
@@ -85,7 +85,7 @@ public class QwpWebSocketSenderTest {
                     // rows 2 to 16 are always checked
                     sender.table("t").longColumn("v", 1).atNow();
                     Assert.assertEquals(1, sender.pendingRowCount());
-                    Thread.sleep(500);
+                    Thread.sleep(1500);
                     sender.table("t").longColumn("v", 2).atNow();
                     Assert.assertEquals(0, sender.pendingRowCount());
 
@@ -94,7 +94,7 @@ public class QwpWebSocketSenderTest {
                         sender.table("t").longColumn("v", i).atNow();
                     }
                     Assert.assertEquals(17, sender.pendingRowCount());
-                    Thread.sleep(500);
+                    Thread.sleep(1500);
                     sender.autoFlushIfDue();
                     Assert.assertEquals(0, sender.pendingRowCount());
                 }
@@ -531,6 +531,18 @@ public class QwpWebSocketSenderTest {
                     Assert.assertTrue("frame 2 carries bravo", indexOf(frame2, "bravo") >= 0);
                     Assert.assertEquals("frame 2 carries no alpha", -1, indexOf(frame2, "alpha"));
                     Assert.assertEquals("frame 2 carries no charlie", -1, indexOf(frame2, "charlie"));
+
+                    sender.table("charlie").longColumn("v", 6).atNow();
+                    sender.table("bravo").longColumn("v", 7).atNow();
+                    sender.flush();
+                    log.awaitDataFrames(4, 5_000);
+                    Assert.assertEquals(2, log.tableCount(3));
+                    byte[] frame3 = log.frames().get(3);
+                    int charlieAt = indexOf(frame3, "charlie");
+                    int bravoAt3 = indexOf(frame3, "bravo");
+                    Assert.assertTrue("frame 3 carries charlie", charlieAt >= 0);
+                    Assert.assertTrue("frame 3 carries bravo", bravoAt3 >= 0);
+                    Assert.assertTrue("tables ship in first-row order, not map order", charlieAt < bravoAt3);
                 }
             }
         });
@@ -926,6 +938,8 @@ public class QwpWebSocketSenderTest {
                     sender.resetToSavepoint();
 
                     Assert.assertEquals(0, sender.pendingRowCount());
+                    Assert.assertEquals(0, ((QwpWebSocketSender) sender).getTableBuffer("a").getRowCount());
+                    Assert.assertEquals(0, ((QwpWebSocketSender) sender).getTableBuffer("b").getRowCount());
                     QwpTableBuffer c = ((QwpWebSocketSender) sender).getTableBuffer("c");
                     Assert.assertEquals(0, c.getRowCount());
                     // c's columns were created after the mark and the server never saw them
