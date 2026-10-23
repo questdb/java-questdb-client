@@ -332,6 +332,81 @@ public class QwpOpenRecordRecoveryTest {
     }
 
     @Test
+    public void testPersistFailureThenFullDictionaryFramesRecoverEveryRowAndSymbolOnce() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpOpenRecordSenderTest.Oracle first = new QwpOpenRecordSenderTest.Oracle();
+                 QwpOpenRecordSenderTest.Oracle second = new QwpOpenRecordSenderTest.Oracle();
+                 QwpOpenRecordSenderTest.Oracle third = new QwpOpenRecordSenderTest.Oracle();
+                 QwpOpenRecordSenderTest.Oracle fourth = new QwpOpenRecordSenderTest.Oracle()) {
+                // Phase 1, nothing acknowledged: the first record's persist fails at its seal, the
+                // sender switches, and two frame-path flushes mint new ids inside their own full
+                // dictionaries. Then the process crashes.
+                try (TestWebSocketServer server = startServer(new SilentHandler())) {
+                    FullDiskDictFacade ff = new FullDiskDictFacade();
+                    QwpWebSocketSender sender = connectOnDictFacade(server.getPort(), ff);
+                    ff.isArmed = true;
+                    QwpTableBuffer t1 = first.block("t");
+                    symbolRow(sender, first, t1, "a", 1);
+                    symbolRow(sender, first, t1, "b", 2);
+                    sender.flush();
+                    ff.isArmed = false;
+                    Assert.assertFalse("setup: the failed persist switched the sender", sender.isDeltaDictEnabledForTest());
+                    Assert.assertEquals("setup: the side file holds none of the record's entries",
+                            0, sender.getPersistedSymbolsForTest().size());
+                    for (String s : new String[]{"a", "b"}) {
+                        second.dict.getOrAddSymbol(s);
+                        third.dict.getOrAddSymbol(s);
+                    }
+                    QwpTableBuffer t2 = second.block("t");
+                    symbolRow(sender, second, t2, "c", 3);
+                    symbolRow(sender, second, t2, "d", 4);
+                    sender.flush();
+                    for (String s : new String[]{"c", "d"}) {
+                        third.dict.getOrAddSymbol(s);
+                    }
+                    symbolRow(sender, third, third.block("t"), "e", 5);
+                    sender.flush();
+                    Assert.assertEquals("setup: one record and two full-dictionary frames on the ring",
+                            2L, sender.getCursorEngineForTesting().publishedFsn());
+                    sender.crashForTest();
+                }
+
+                // Phase 2: recovery replays the record and both full-dictionary frames. A
+                // full-dictionary frame carries the whole dictionary in a delta section from id 0, so
+                // the recovery fold sees every id it defines: the slot keeps its side file (it holds
+                // a record), the heal writes all five ids back, and a symbol the recovered sender
+                // mints takes the id after them instead of colliding with c.
+                QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+                try (TestWebSocketServer server = startServer(log);
+                     QwpWebSocketSender recovered = (QwpWebSocketSender) Sender.fromConfig(config(server.getPort(), 5_000))) {
+                    log.awaitDataFrames(3, 5_000);
+                    Assert.assertArrayEquals("the record", first.frame(-1, false), dataFrame(log, 0));
+                    Assert.assertArrayEquals("the first full-dictionary frame", second.frame(-1, false), dataFrame(log, 1));
+                    Assert.assertArrayEquals("the second full-dictionary frame", third.frame(-1, false), dataFrame(log, 2));
+                    Assert.assertTrue("the slot holds a record, so it recovers in delta mode",
+                            recovered.isDeltaDictEnabledForTest());
+                    Assert.assertEquals("the recovered side file holds every id the replayed frames define",
+                            Arrays.asList("a", "b", "c", "d", "e"), toList(recovered.getPersistedSymbolsForTest()));
+                    for (String s : new String[]{"a", "b", "c", "d", "e"}) {
+                        fourth.dict.getOrAddSymbol(s);
+                    }
+                    symbolRow(recovered, fourth, fourth.block("t"), "f", 6);
+                    recovered.flush();
+                    log.awaitDataFrames(4, 5_000);
+                    Assert.assertArrayEquals("f takes id 5, after every id the replayed frames define",
+                            fourth.frame(4, false), dataFrame(log, 3));
+                    List<String> dictionary = new ArrayList<>();
+                    for (byte[] frame : log.frames()) {
+                        QwpWireTestUtils.accumulateDeltaDictionary(frame, dictionary);
+                    }
+                    Assert.assertEquals(Arrays.asList("a", "b", "c", "d", "e", "f"), dictionary);
+                }
+                Assert.assertEquals("every row ships exactly once", 4, log.dataFrames());
+            }
+        });
+    }
+
+    @Test
     public void testPersistSkipsTheEntriesTheSideFileAlreadyHolds() throws Exception {
         assertMemoryLeak(() -> {
             QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
