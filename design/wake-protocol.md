@@ -85,7 +85,7 @@ Predicate: `getAckedFsn() >= target`, or a terminal: connection error, durabilit
 | `recycleFailure` | `latchRecycleBreach` `:5895` (producer thread; plain field `:579`) | **none**, and not in the loop predicate — Open 2 | — |
 | `closed` | `close()` `:1741` | **none**, and not in the loop predicate; `loop.close` `:1487` signals but the waiter re-parks on the same predicate — Open 1 | — |
 
-## Open (found by the independent audit, not yet fixed)
+## Fixed after the independent audit (98b00346, next commit)
 
 1. **`awaitAckedFsn` cannot see `close()`.** A monitor thread in
    `awaitAckedFsn(T, 60_000)` while the producer closes with the drain skipped
