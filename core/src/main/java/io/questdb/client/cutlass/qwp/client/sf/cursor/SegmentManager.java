@@ -991,157 +991,177 @@ public final class SegmentManager implements QuietCloseable {
         }
 
         // 1. Provision a hot spare if the ring needs one AND we have headroom
-        //    under the disk-total cap. Cap check is per-tick; if we're capped
-        //    here, the ring stays in BACKPRESSURE_NO_SPARE until trim (step 2)
-        //    on this or a subsequent tick frees space. Logged at most once per
-        //    DISK_FULL_LOG_THROTTLE_NANOS so a sustained-disk-full state
-        //    doesn't drown the log.
-        if (e.ring.needsHotSpare()) {
-            // Charge the spare BEFORE provisioning it, as one atomic check-and-
-            // charge against everything else on the budget, live side-file bytes
-            // included. A snapshot-then-commit check would let two managers that
-            // share the budget both see room for its last segment and both take
-            // it. Installing the spare keeps the charge; every other outcome
-            // below releases it.
-            boolean withinCap = budget.tryCharge(segmentSizeBytes);
-            // Liveness floor. Refusing on segment bytes is productive -- an ack
-            // trims a sealed segment and the shortfall clears. Refusing on
-            // side-file bytes is not: the dictionary never shrinks, so a ring
-            // held below its minimum working set by them would never rotate
-            // again, on this run or any later one. Nor is refusing on the
-            // segments of OTHER rings that share the budget: their acks may
-            // never come (a sibling whose connection is down). Provision anyway
-            // while this ring is under the floor, and charge it honestly.
-            long ringSegmentBytes = withinCap ? 0L : e.ring.totalSegmentBytes();
-            boolean belowLivenessFloor = !withinCap && ringSegmentBytes < livenessFloorBytes;
-            if (belowLivenessFloor) {
-                budget.charge(segmentSizeBytes);
+        //    under the disk-total cap. Cap check is per attempt; if we're
+        //    capped here, the ring stays in BACKPRESSURE_NO_SPARE until trim
+        //    (step 2) frees space, which is retried below in this same pass.
+        //    Logged at most once per DISK_FULL_LOG_THROTTLE_NANOS so a
+        //    sustained-disk-full state doesn't drown the log.
+        boolean capped = e.ring.needsHotSpare() && provisionSpare(e, memoryMode);
+        boolean hasMoreTrimmable = trimAcked(e, memoryMode);
+        // The trim may have just released the bytes the spare was refused
+        // for: retry once in this pass rather than parking on the retry
+        // timer. The timer remains the fallback for room freed elsewhere (a
+        // sibling ring or manager, a deregister) and for a failed create.
+        if (capped && provisionSpare(e, memoryMode)) {
+            scheduleProvisionRetry();
+        }
+        return hasMoreTrimmable;
+    }
+
+    /**
+     * Provisions a hot spare for a ring that needs one. Returns {@code true}
+     * only when the budget refused the charge (nothing provisioned, nothing
+     * charged); a failed create returns {@code false} after arming the retry
+     * timer itself.
+     */
+    private boolean provisionSpare(RingEntry e, boolean memoryMode) {
+        // Charge the spare BEFORE provisioning it, as one atomic check-and-
+        // charge against everything else on the budget, live side-file bytes
+        // included. A snapshot-then-commit check would let two managers that
+        // share the budget both see room for its last segment and both take
+        // it. Installing the spare keeps the charge; every other outcome
+        // below releases it.
+        boolean withinCap = budget.tryCharge(segmentSizeBytes);
+        // Liveness floor. Refusing on segment bytes is productive -- an ack
+        // trims a sealed segment and the shortfall clears. Refusing on
+        // side-file bytes is not: the dictionary never shrinks, so a ring
+        // held below its minimum working set by them would never rotate
+        // again, on this run or any later one. Nor is refusing on the
+        // segments of OTHER rings that share the budget: their acks may
+        // never come (a sibling whose connection is down). Provision anyway
+        // while this ring is under the floor, and charge it honestly.
+        long ringSegmentBytes = withinCap ? 0L : e.ring.totalSegmentBytes();
+        boolean belowLivenessFloor = !withinCap && ringSegmentBytes < livenessFloorBytes;
+        if (belowLivenessFloor) {
+            budget.charge(segmentSizeBytes);
+        }
+        if (!withinCap && !belowLivenessFloor) {
+            long now = System.nanoTime();
+            if (now - lastDiskFullLogNs >= DISK_FULL_LOG_THROTTLE_NANOS) {
+                long sideFileBytes = budget.getSideFileBytes();
+                LOG.warn("SF {}: cannot provision spare in {} "
+                                + "(totalBytes={}, sideFileBytes={}, cap={}, segmentSize={}). "
+                                + "Producer is backpressured until ACK-driven trim frees segment "
+                                + "space; side-file bytes are not reclaimed by trim.",
+                        memoryMode ? "memory cap reached" : "disk-full",
+                        memoryMode ? "<memory>" : e.dir, budget.getSegmentBytes() + sideFileBytes,
+                        sideFileBytes, budget.getCapacityBytes(), segmentSizeBytes);
+                lastDiskFullLogNs = now;
             }
-            if (!withinCap && !belowLivenessFloor) {
+            return true;
+        } else {
+            if (belowLivenessFloor) {
+                // Exceeding a configured cap is worth saying out loud, and
+                // saying WHY: the operator's remedy is to raise
+                // sf_max_total_bytes, or shrink the symbol dictionary or the
+                // number of senders sharing the budget, never to wait for a
+                // trim.
                 long now = System.nanoTime();
                 if (now - lastDiskFullLogNs >= DISK_FULL_LOG_THROTTLE_NANOS) {
                     long sideFileBytes = budget.getSideFileBytes();
-                    LOG.warn("SF {}: cannot provision spare in {} "
-                                    + "(totalBytes={}, sideFileBytes={}, cap={}, segmentSize={}). "
-                                    + "Producer is backpressured until ACK-driven trim frees segment "
-                                    + "space; side-file bytes are not reclaimed by trim.",
-                            memoryMode ? "memory cap reached" : "disk-full",
+                    LOG.warn("SF {}: provisioning past sf_max_total_bytes to keep the slot "
+                                    + "usable (totalBytes={}, sideFileBytes={}, cap={}, "
+                                    + "segmentSize={}, ringSegmentBytes={}, minWorkingSet={}). "
+                                    + "The rest of the budget -- symbol dictionaries, which trim "
+                                    + "cannot reclaim, and the segments of other senders sharing "
+                                    + "it -- leaves no room for this slot's active segment plus "
+                                    + "one spare; raise sf_max_total_bytes, or reduce symbol "
+                                    + "cardinality or the number of pooled senders.",
                             memoryMode ? "<memory>" : e.dir, budget.getSegmentBytes() + sideFileBytes,
-                            sideFileBytes, budget.getCapacityBytes(), segmentSizeBytes);
+                            sideFileBytes, budget.getCapacityBytes(), segmentSizeBytes,
+                            ringSegmentBytes, livenessFloorBytes);
                     lastDiskFullLogNs = now;
                 }
+            }
+            MmapSegment spare = null;
+            String path = null;
+            boolean installed = false;
+            try {
+                // Null if the ring closed between this tick's snapshot and now:
+                // close() nulls it under the ring's own monitor with no
+                // coordination with the manager thread. A closed ring rejects
+                // installHotSpare regardless, so there is nothing to provision
+                // this tick; skip cleanly rather than provision a spare that will
+                // be abandoned.
+                MmapSegment active = e.ring.getActive();
+                if (active != null) {
+                    // baseSeq is provisional -- SegmentRing.appendOrFsn calls
+                    // rebaseSeq() at rotation time to pin the real value. We
+                    // pass the manager's best guess (nextSeqHint at this
+                    // instant), which is fine since it's overwritten anyway.
+                    if (memoryMode) {
+                        spare = MmapSegment.createInMemory(e.ring.nextSeqHint(), segmentSizeBytes);
+                    } else {
+                        path = nextSparePath(e.dir);
+                        // Native path bytes (NUL-terminated) live in pathScratch
+                        // from the call above. Hand them straight to MmapSegment.create
+                        // via its long-ptr overload, bypassing the byte[] + native
+                        // malloc that the String overload would incur on every
+                        // rotation.
+                        spare = MmapSegment.create(filesFacade,
+                                pathScratch.ptr(), path,
+                                e.ring.nextSeqHint(), segmentSizeBytes, true);
+                    }
+                    Runnable installHook = beforeInstallSyncHook;
+                    if (installHook != null) {
+                        installHook.run();
+                    }
+                    if (!memoryMode) {
+                        spare.syncHeader();
+                        if (filesFacade.fsyncDir(e.dir) != 0) {
+                            throw new MmapSegmentException(
+                                    "could not sync hot-spare directory " + e.dir);
+                        }
+                    }
+                    // Install under the manager lock, gated on the entry
+                    // still being registered. If `e.ring` was deregistered
+                    // since the charge above, abandoning the spare here is
+                    // the only way to keep the budget consistent:
+                    // deregister already released ring.totalSegmentBytes()
+                    // (without the spare, since it wasn't installed yet), so
+                    // installing now would keep the spare's charge with no
+                    // future releaser. By holding `lock` across the
+                    // registration check AND installHotSpare, deregister is
+                    // forced to either observe the spare in the ring (and
+                    // release it) or run before installation (so no install
+                    // happens and the !installed path releases the charge).
+                    synchronized (lock) {
+                        if (e.isRegistered()) {
+                            e.ring.installHotSpare(spare);
+                            installed = true;
+                        }
+                    }
+                }
+            } catch (Throwable t) {
+                LOG.warn("Failed to provision hot spare in {} (will retry next tick)",
+                        memoryMode ? "<memory>" : e.dir, t);
+            }
+            if (!installed) {
                 scheduleProvisionRetry();
-            } else {
-                if (belowLivenessFloor) {
-                    // Exceeding a configured cap is worth saying out loud, and
-                    // saying WHY: the operator's remedy is to raise
-                    // sf_max_total_bytes, or shrink the symbol dictionary or the
-                    // number of senders sharing the budget, never to wait for a
-                    // trim.
-                    long now = System.nanoTime();
-                    if (now - lastDiskFullLogNs >= DISK_FULL_LOG_THROTTLE_NANOS) {
-                        long sideFileBytes = budget.getSideFileBytes();
-                        LOG.warn("SF {}: provisioning past sf_max_total_bytes to keep the slot "
-                                        + "usable (totalBytes={}, sideFileBytes={}, cap={}, "
-                                        + "segmentSize={}, ringSegmentBytes={}, minWorkingSet={}). "
-                                        + "The rest of the budget -- symbol dictionaries, which trim "
-                                        + "cannot reclaim, and the segments of other senders sharing "
-                                        + "it -- leaves no room for this slot's active segment plus "
-                                        + "one spare; raise sf_max_total_bytes, or reduce symbol "
-                                        + "cardinality or the number of pooled senders.",
-                                memoryMode ? "<memory>" : e.dir, budget.getSegmentBytes() + sideFileBytes,
-                                sideFileBytes, budget.getCapacityBytes(), segmentSizeBytes,
-                                ringSegmentBytes, livenessFloorBytes);
-                        lastDiskFullLogNs = now;
+                budget.release(segmentSizeBytes);
+                if (spare != null) {
+                    try {
+                        spare.close();
+                    } catch (Throwable ignored) {
                     }
                 }
-                MmapSegment spare = null;
-                String path = null;
-                boolean installed = false;
-                try {
-                    // Null if the ring closed between this tick's snapshot and now:
-                    // close() nulls it under the ring's own monitor with no
-                    // coordination with the manager thread. A closed ring rejects
-                    // installHotSpare regardless, so there is nothing to provision
-                    // this tick; skip cleanly rather than provision a spare that will
-                    // be abandoned.
-                    MmapSegment active = e.ring.getActive();
-                    if (active != null) {
-                        // baseSeq is provisional -- SegmentRing.appendOrFsn calls
-                        // rebaseSeq() at rotation time to pin the real value. We
-                        // pass the manager's best guess (nextSeqHint at this
-                        // instant), which is fine since it's overwritten anyway.
-                        if (memoryMode) {
-                            spare = MmapSegment.createInMemory(e.ring.nextSeqHint(), segmentSizeBytes);
-                        } else {
-                            path = nextSparePath(e.dir);
-                            // Native path bytes (NUL-terminated) live in pathScratch
-                            // from the call above. Hand them straight to MmapSegment.create
-                            // via its long-ptr overload, bypassing the byte[] + native
-                            // malloc that the String overload would incur on every
-                            // rotation.
-                            spare = MmapSegment.create(filesFacade,
-                                    pathScratch.ptr(), path,
-                                    e.ring.nextSeqHint(), segmentSizeBytes, true);
-                        }
-                        Runnable installHook = beforeInstallSyncHook;
-                        if (installHook != null) {
-                            installHook.run();
-                        }
-                        if (!memoryMode) {
-                            spare.syncHeader();
-                            if (filesFacade.fsyncDir(e.dir) != 0) {
-                                throw new MmapSegmentException(
-                                        "could not sync hot-spare directory " + e.dir);
-                            }
-                        }
-                        // Install under the manager lock, gated on the entry
-                        // still being registered. If `e.ring` was deregistered
-                        // since the charge above, abandoning the spare here is
-                        // the only way to keep the budget consistent:
-                        // deregister already released ring.totalSegmentBytes()
-                        // (without the spare, since it wasn't installed yet), so
-                        // installing now would keep the spare's charge with no
-                        // future releaser. By holding `lock` across the
-                        // registration check AND installHotSpare, deregister is
-                        // forced to either observe the spare in the ring (and
-                        // release it) or run before installation (so no install
-                        // happens and the !installed path releases the charge).
-                        synchronized (lock) {
-                            if (e.isRegistered()) {
-                                e.ring.installHotSpare(spare);
-                                installed = true;
-                            }
-                        }
-                    }
-                } catch (Throwable t) {
-                    LOG.warn("Failed to provision hot spare in {} (will retry next tick)",
-                            memoryMode ? "<memory>" : e.dir, t);
-                }
-                if (!installed) {
-                    scheduleProvisionRetry();
-                    budget.release(segmentSizeBytes);
-                    if (spare != null) {
-                        try {
-                            spare.close();
-                        } catch (Throwable ignored) {
-                        }
-                    }
-                    // Only remove the file when the spare object exists, i.e.
-                    // MmapSegment.create succeeded and ownership is ours but
-                    // installation was rejected (ring deregistered/closed).
-                    // When create() itself threw, its catch already removed
-                    // anything it put on disk -- and with exclusive create
-                    // (O_EXCL) a failure can also mean the path was ALREADY
-                    // occupied by a file some other lifecycle owns, which a
-                    // blanket unlink here would destroy.
-                    if (path != null && spare != null) {
-                        filesFacade.remove(path);
-                    }
+                // Only remove the file when the spare object exists, i.e.
+                // MmapSegment.create succeeded and ownership is ours but
+                // installation was rejected (ring deregistered/closed).
+                // When create() itself threw, its catch already removed
+                // anything it put on disk -- and with exclusive create
+                // (O_EXCL) a failure can also mean the path was ALREADY
+                // occupied by a file some other lifecycle owns, which a
+                // blanket unlink here would destroy.
+                if (path != null && spare != null) {
+                    filesFacade.remove(path);
                 }
             }
         }
+        return false;
+    }
 
+    private boolean trimAcked(RingEntry e, boolean memoryMode) {
         // 2. Trim fully ACKed segments. The ring first transfers one bounded,
         //    unpinned prefix out of live traversal and into hidden pending
         //    ownership. Only then may this worker unmap it. Disk mode keeps the
