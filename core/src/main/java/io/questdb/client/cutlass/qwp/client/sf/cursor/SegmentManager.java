@@ -585,6 +585,12 @@ public final class SegmentManager implements QuietCloseable {
         if (syncIntervalNanos > 0L && dir == null) {
             throw new IllegalArgumentException("periodic sync requires a segment directory");
         }
+        if (ring.maxBytesPerSegment() != segmentSizeBytes) {
+            // The ring's oversized-payload check assumes the segments this
+            // manager's provisioner creates are maxBytesPerSegment large.
+            throw new IllegalArgumentException("ring segment size " + ring.maxBytesPerSegment()
+                    + " does not match the manager's " + segmentSizeBytes);
+        }
         // Account for bytes the ring already owns when it joins. A recovered
         // ring (post-restart, orphan adoption) can come up at-or-above the cap;
         // without this seed, the budget stays at 0 and the per-tick cap check
@@ -592,10 +598,10 @@ public final class SegmentManager implements QuietCloseable {
         // top of the recovered set, effectively doubling the documented cap.
         long ringBytes = ring.totalSegmentBytes();
         // Start the file-generation counter past whatever's already on disk in
-        // this slot. Without this, on recovery the first rotation would mint
-        // sf-0000000000000000.sfa — and openCleanRW would truncate the user's
-        // existing active file out from under the I/O loop, scrambling the
-        // in-flight mmap. Memory-mode rings have no dir; nothing to scan.
+        // this slot, or on recovery the first rotation would try to create
+        // sf-0000000000000000.sfa, collide with the recovered active (O_EXCL
+        // refuses it) and backpressure the producer on every retry.
+        // Memory-mode rings have no dir; nothing to scan.
         if (!ring.hasSegmentSource()) {
             long firstGeneration = dir == null ? 0L : scanMaxGeneration(dir) + 1L;
             ring.setSegmentSource(new SegmentProvisioner(ring, dir, firstGeneration, segmentSizeBytes, budget, filesFacade));

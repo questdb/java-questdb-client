@@ -1047,7 +1047,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private static final int DEFAULT_MAXIMUM_BUFFER_CAPACITY = 100 * 1024 * 1024;
         private static final int DEFAULT_MAX_BACKGROUND_DRAINERS = 4;
         private static final int DEFAULT_MAX_BACKOFF_MILLIS = 1_000;
-        // Default ceiling on cursor-allocated bytes (active + spare + sealed).
+        // Default ceiling on cursor-allocated bytes (active + sealed segments).
         // RAM is precious; if you're not persisting to disk, you don't get
         // to balloon. Memory mode = 128 MiB (32 segments at default size).
         private static final long DEFAULT_MAX_BYTES_MEMORY = 128L * 1024 * 1024;
@@ -2962,8 +2962,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
-         * Hard cap on cursor-allocated bytes: active + spare + sealed
-         * segments, plus the symbol-dictionary side-file with {@code sf_dir}.
+         * Hard cap on cursor-allocated bytes: active + sealed segments, plus
+         * the symbol-dictionary side-file with {@code sf_dir}.
          * When the cap is reached, the producer's {@code Sender.flush()}
          * blocks until ACK-driven trim frees space; if the cap is exhausted
          * past the configured deadline (default 30 s), {@code flush()} throws.
@@ -2992,7 +2992,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * every other sender built on it, instead of to a private budget of
          * {@code sf_max_total_bytes}. Together those senders never hold more
          * than the budget's capacity, except that each is always granted its
-         * minimum working set: the active segment plus one spare. This
+         * minimum working set: the active segment plus the one it rotates
+         * into. This
          * sender's own {@code sf_max_total_bytes} then caps only the
          * background orphan drainers it starts. The connection pool behind
          * {@link QuestDB} builds every sender this way. WebSocket transport

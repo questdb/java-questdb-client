@@ -169,6 +169,54 @@ public class SegmentProvisionerTest {
         });
     }
 
+    /**
+     * The floor path with a failing create: the charge past the cap is
+     * released and the retry waits for the timer like any other failure.
+     * (The manager-era version of this spun at one attempt per loop pass.)
+     */
+    @Test
+    public void testFailedCreateUnderTheFloorIsRetriedOnTimer() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            File dir = java.nio.file.Files.createTempDirectory("qdb-provisioner-floor-fail").toFile();
+            AtomicLong attempts = new AtomicLong();
+            FilesFacade facade = new DelegatingFilesFacade() {
+                @Override
+                public boolean allocate(int fd, long size) {
+                    attempts.incrementAndGet();
+                    return false;
+                }
+            };
+            String path = new File(dir, "sf-0000000000000000.sfa").getPath();
+            // Below two segments: every create goes through the floor charge.
+            SegmentBudget budget = new SegmentBudget(SEGMENT_SIZE + SEGMENT_SIZE / 2);
+            long buf = Unsafe.malloc(FRAME_PAYLOAD, MemoryTag.NATIVE_DEFAULT);
+            try (SegmentRing ring = new SegmentRing(MmapSegment.create(path, 0, SEGMENT_SIZE), SEGMENT_SIZE);
+                 SegmentManager manager = new SegmentManager(SEGMENT_SIZE, budget, facade, System::nanoTime)) {
+                manager.register(ring, dir.getPath());
+                Assert.assertEquals(0L, ring.appendOrFsn(buf, FRAME_PAYLOAD));
+                Assert.assertEquals(1L, ring.appendOrFsn(buf, FRAME_PAYLOAD));
+                long end = System.nanoTime() + 300_000_000L;
+                while (System.nanoTime() < end) {
+                    Assert.assertEquals(SegmentRing.BACKPRESSURE_NO_SPARE, ring.appendOrFsn(buf, FRAME_PAYLOAD));
+                    Assert.assertEquals("a failed floor create must release its charge", SEGMENT_SIZE, budget.getSegmentBytes());
+                    java.util.concurrent.locks.LockSupport.parkNanos(50_000L);
+                }
+                long n = attempts.get();
+                Assert.assertTrue("expected about 30 create attempts in 300 ms, got " + n, n >= 5 && n < 100);
+                manager.deregister(ring);
+            } finally {
+                Unsafe.free(buf, FRAME_PAYLOAD, MemoryTag.NATIVE_DEFAULT);
+                File[] files = dir.listFiles();
+                if (files != null) {
+                    for (File f : files) {
+                        f.delete();
+                    }
+                }
+                dir.delete();
+            }
+        });
+    }
+
     /** Disk mode: the file is generation-named past what the slot already holds, with the final base. */
     @Test
     public void testDiskRotationNamesFilePastExistingGenerations() throws Exception {

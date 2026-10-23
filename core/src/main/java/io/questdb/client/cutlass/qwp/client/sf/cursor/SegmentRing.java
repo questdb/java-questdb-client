@@ -124,8 +124,6 @@ public final class SegmentRing implements QuietCloseable {
     // read by I/O thread via getActive(). Volatile so the I/O thread sees
     // rotations promptly and never observes a torn reference.
     private volatile MmapSegment active;
-    // Set to true by close().
-    private boolean closed;
     // Latest periodic data-barrier failure. The manager latches it and the
     // producer observes it before its next append; the manager clears it
     // again once a subsequent periodic sync pass succeeds, so a transient
@@ -816,11 +814,11 @@ public final class SegmentRing implements QuietCloseable {
      *       the one rotation actually exposed);</li>
      *   <li>a clean empty segment.</li>
      * </ol>
-     * Multiple equivalent empties at the same base are NOT an error: a fresh
-     * start or a rotation crash routinely leaves both the initial/promoted
-     * segment and a segment an older client pre-created as a hot spare, with
-     * the same provisional baseSeq. They are interchangeable blanks — pick one deterministically
-     * and let the extras cleanup discard the rest. Bricking startup on this
+     * Multiple equivalent empties at the same base are NOT an error: a crash
+     * between a rotation's create and its manifest commit, a create whose
+     * cleanup unlink failed, or a hot spare an older client pre-created all
+     * leave a second blank at the same base. They are interchangeable — pick
+     * one deterministically and let the extras cleanup discard the rest. Bricking startup on this
      * state would turn every "kill -9 shortly after start" into a manual
      * repair.
      */
@@ -1248,7 +1246,6 @@ public final class SegmentRing implements QuietCloseable {
         // The monitor serializes against drainTrimmable / nextSealedAfter
         // / firstSealed / findSegmentContaining, so they don't iterate
         // half-freed state.
-        closed = true;
         ioPinnedSegment = null;
         if (active != null) {
             active.close();
@@ -1720,6 +1717,11 @@ public final class SegmentRing implements QuietCloseable {
      * reverse the contribution at deregister time. Synchronized against
      * rotation so we never read a half-resized sealed list.
      */
+    /** Live segments: the active plus every sealed one, including those hidden for a pending trim. */
+    public synchronized int liveSegmentCount() {
+        return (active != null ? 1 : 0) + (sealedSegments.size() - sealedHead) + pendingTrims.size();
+    }
+
     public synchronized long totalSegmentBytes() {
         long total = 0L;
         MmapSegment a = active;

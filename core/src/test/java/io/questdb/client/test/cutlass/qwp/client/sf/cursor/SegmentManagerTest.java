@@ -45,6 +45,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
 public class SegmentManagerTest {
@@ -171,6 +172,33 @@ public class SegmentManagerTest {
                     }
                     assertEquals(i, fsn);
                 }
+            } finally {
+                Unsafe.free(buf, 32, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    /**
+     * A recovered ring can hold trimmable segments the moment it registers,
+     * with no append, ACK or pin release to follow: register itself must wake
+     * a worker that is already parked.
+     */
+    @Test
+    public void testRegisterWakesParkedWorkerForRecoveredTrimmableRing() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE + 2 * (MmapSegment.FRAME_HEADER_SIZE + 32);
+            long buf = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
+            try (SegmentRing ring = new SegmentRing(MmapSegment.createInMemory(0, segSize), segSize);
+                 SegmentManager mgr = new SegmentManager(segSize)) {
+                QueueSegmentSource.install(ring, MmapSegment.createInMemory(2, segSize));
+                for (int i = 0; i < 3; i++) ring.appendOrFsn(buf, 32); // seals the first segment
+                ring.acknowledge(1L);
+                assertNotNull(ring.firstSealed());
+                mgr.start();
+                Thread.sleep(100); // the worker parks on an empty ring list
+                mgr.register(ring, null);
+                assertTrue("register must wake the parked worker to trim the recovered ring",
+                        waitFor(() -> ring.firstSealed() == null, 2000));
             } finally {
                 Unsafe.free(buf, 32, MemoryTag.NATIVE_DEFAULT);
             }

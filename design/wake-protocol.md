@@ -59,8 +59,9 @@ No open gaps.
 No open gaps. Spare provisioning is no longer a manager input either: the
 producer creates its next segment itself at rotation (`SegmentProvisioner`,
 called from `appendOrFsn`), which removed `needsHotSpare`, the high-water
-backup wake, the provision-retry timer, the liveness-floor charge and the
-budget's refused-wake list (f37967c4's bug class). A refused producer retries
+backup wake, the provision-retry timer and the budget's refused-wake list
+(f37967c4's bug class). The liveness floor itself survives as one branch in
+the provisioner, with no wake to withdraw. A refused producer retries
 on its own 50 µs backpressure poll; a failed create is retried by the same
 poll after `CREATE_RETRY_NANOS`.
 

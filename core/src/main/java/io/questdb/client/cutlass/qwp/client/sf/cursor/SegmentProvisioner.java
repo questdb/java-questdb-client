@@ -66,7 +66,6 @@ public final class SegmentProvisioner implements SegmentSource {
     // null = memory mode
     private final String dir;
     private final FilesFacade ff;
-    private final long floorBytes;
     private final SegmentRing ring;
     private final long segmentSizeBytes;
     private long lastLogNs;
@@ -87,12 +86,6 @@ public final class SegmentProvisioner implements SegmentSource {
         this.segmentSizeBytes = segmentSizeBytes;
         this.budget = budget;
         this.ff = ff;
-        // Clamp: segmentSizeBytes is user-supplied and only bounded below, so
-        // a pathological value would wrap the product negative and make the
-        // floor test trivially false.
-        this.floorBytes = segmentSizeBytes > Long.MAX_VALUE / MIN_LIVE_SEGMENTS
-                ? Long.MAX_VALUE
-                : segmentSizeBytes * MIN_LIVE_SEGMENTS;
     }
 
     @Override
@@ -124,7 +117,8 @@ public final class SegmentProvisioner implements SegmentSource {
             return null;
         }
         if (!budget.tryCharge(segmentSizeBytes)) {
-            if (ring.totalSegmentBytes() >= floorBytes) {
+            // O(1): this runs on every 50 us backpressure poll while the cap refuses.
+            if (ring.liveSegmentCount() >= MIN_LIVE_SEGMENTS) {
                 if (now - lastLogNs >= LOG_THROTTLE_NANOS) {
                     lastLogNs = now;
                     long sideFileBytes = budget.getSideFileBytes();
