@@ -43,6 +43,11 @@ public class OffHeapAppendMemory implements ArrayBufferAppender, QuietCloseable 
 
     private static final int DEFAULT_INITIAL_CAPACITY = 128;
     private long appendAddress;
+    // Running total of appended bytes, shared by every memory of one owner (a
+    // table buffer's columns): the owner reads its buffered bytes in O(1)
+    // instead of walking its columns on every row. Every change of
+    // appendAddress adjusts it by the same delta.
+    private final long[] bytesCell;
     private long capacity;
     private long pageAddress;
 
@@ -51,9 +56,14 @@ public class OffHeapAppendMemory implements ArrayBufferAppender, QuietCloseable 
     }
 
     public OffHeapAppendMemory(long initialCapacity) {
+        this(initialCapacity, new long[1]);
+    }
+
+    public OffHeapAppendMemory(long initialCapacity, long[] bytesCell) {
         this.capacity = Math.max(initialCapacity, 8);
         this.pageAddress = Unsafe.malloc(this.capacity, MemoryTag.NATIVE_ILP_RSS);
         this.appendAddress = pageAddress;
+        this.bytesCell = bytesCell;
     }
 
     /**
@@ -66,6 +76,7 @@ public class OffHeapAppendMemory implements ArrayBufferAppender, QuietCloseable 
     @Override
     public void close() {
         if (pageAddress != 0) {
+            bytesCell[0] -= appendAddress - pageAddress;
             Unsafe.free(pageAddress, capacity, MemoryTag.NATIVE_ILP_RSS);
             pageAddress = 0;
             appendAddress = 0;
@@ -86,6 +97,7 @@ public class OffHeapAppendMemory implements ArrayBufferAppender, QuietCloseable 
      */
     public void jumpTo(long offset) {
         assert offset >= 0 && offset <= getAppendOffset();
+        bytesCell[0] += offset - (appendAddress - pageAddress);
         appendAddress = pageAddress + offset;
     }
 
@@ -104,6 +116,7 @@ public class OffHeapAppendMemory implements ArrayBufferAppender, QuietCloseable 
         ensureCapacity(1);
         Unsafe.getUnsafe().putByte(appendAddress, value);
         appendAddress++;
+        bytesCell[0]++;
     }
 
     /**
@@ -118,6 +131,7 @@ public class OffHeapAppendMemory implements ArrayBufferAppender, QuietCloseable 
         Unsafe.getUnsafe().copyMemory(
                 value, Unsafe.BYTE_OFFSET + offset, null, appendAddress, len);
         appendAddress += len;
+        bytesCell[0] += len;
     }
 
     public void putBlockOfBytes(long from, long len) {
@@ -127,36 +141,42 @@ public class OffHeapAppendMemory implements ArrayBufferAppender, QuietCloseable 
         ensureCapacity(len);
         Vect.memcpy(appendAddress, from, len);
         appendAddress += len;
+        bytesCell[0] += len;
     }
 
     public void putDouble(double value) {
         ensureCapacity(8);
         Unsafe.getUnsafe().putDouble(appendAddress, value);
         appendAddress += 8;
+        bytesCell[0] += 8;
     }
 
     public void putFloat(float value) {
         ensureCapacity(4);
         Unsafe.getUnsafe().putFloat(appendAddress, value);
         appendAddress += 4;
+        bytesCell[0] += 4;
     }
 
     public void putInt(int value) {
         ensureCapacity(4);
         Unsafe.getUnsafe().putInt(appendAddress, value);
         appendAddress += 4;
+        bytesCell[0] += 4;
     }
 
     public void putLong(long value) {
         ensureCapacity(8);
         Unsafe.getUnsafe().putLong(appendAddress, value);
         appendAddress += 8;
+        bytesCell[0] += 8;
     }
 
     public void putShort(short value) {
         ensureCapacity(2);
         Unsafe.getUnsafe().putShort(appendAddress, value);
         appendAddress += 2;
+        bytesCell[0] += 2;
     }
 
     /**
@@ -169,6 +189,7 @@ public class OffHeapAppendMemory implements ArrayBufferAppender, QuietCloseable 
         }
         int len = value.length();
         ensureCapacity((long) len * 4); // worst case: all supplementary chars
+        long start = appendAddress;
         for (int i = 0; i < len; i++) {
             char c = value.charAt(i);
             if (c < 0x80) {
@@ -196,6 +217,7 @@ public class OffHeapAppendMemory implements ArrayBufferAppender, QuietCloseable 
                 Unsafe.getUnsafe().putByte(appendAddress++, (byte) (0x80 | (c & 0x3F)));
             }
         }
+        bytesCell[0] += appendAddress - start;
     }
 
     /**
@@ -204,12 +226,14 @@ public class OffHeapAppendMemory implements ArrayBufferAppender, QuietCloseable 
     public void skip(long bytes) {
         ensureCapacity(bytes);
         appendAddress += bytes;
+        bytesCell[0] += bytes;
     }
 
     /**
      * Resets the append position to 0 without freeing memory.
      */
     public void truncate() {
+        bytesCell[0] -= appendAddress - pageAddress;
         appendAddress = pageAddress;
     }
 

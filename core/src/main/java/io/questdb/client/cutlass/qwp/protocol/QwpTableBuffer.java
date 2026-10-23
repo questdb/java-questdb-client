@@ -71,6 +71,11 @@ public class QwpTableBuffer implements QuietCloseable {
     private int committedColumnCount; // columns that existed at last nextRow()
     private ColumnBuffer[] fastColumns; // plain array for O(1) sequential access
     private int inProgressColumnCount;
+    // Bytes appended across every column's off-heap memories, kept by the
+    // memories themselves (see OffHeapAppendMemory.bytesCell). Array columns
+    // keep their data in Java arrays, so a table that has one walks instead.
+    private final long[] bufferedBytesCell = new long[1];
+    private int arrayColumnCount;
     private int rowCount;
 
     public QwpTableBuffer(String tableName) {
@@ -144,6 +149,15 @@ public class QwpTableBuffer implements QuietCloseable {
      * This queries actual buffer sizes, not estimates.
      */
     public long getBufferedBytes() {
+        if (arrayColumnCount > 0) {
+            return walkBufferedBytes();
+        }
+        assert bufferedBytesCell[0] == walkBufferedBytes()
+                : "buffered-byte accounting drift: " + bufferedBytesCell[0] + " vs " + walkBufferedBytes();
+        return bufferedBytesCell[0];
+    }
+
+    private long walkBufferedBytes() {
         long bytes = 0;
         for (int i = 0, n = columns.size(); i < n; i++) {
             bytes += fastColumns[i].getBufferedBytes();
@@ -289,18 +303,18 @@ public class QwpTableBuffer implements QuietCloseable {
      * @return the new total buffered bytes across all columns
      */
     public long nextRow(long snapshotBytes, long maxRowBytes) {
-        // Ensure all columns have the same row count; sum the buffered bytes in
-        // the same pass so the caller does not need a second O(columns) walk to
-        // account the row (sendRow used to call getBufferedBytes() again here).
-        long bytes = 0;
-        for (int i = 0, n = columns.size(); i < n; i++) {
-            ColumnBuffer col = fastColumns[i];
-            // If column wasn't set for this row, add a null
-            while (col.size < rowCount + 1) {
-                col.addNull();
+        int n = columns.size();
+        if (inProgressColumnCount != n) {
+            // Some column was not written this row: pad it with nulls. A fully
+            // written row -- the common case -- skips the walk entirely.
+            for (int i = 0; i < n; i++) {
+                ColumnBuffer col = fastColumns[i];
+                while (col.size < rowCount + 1) {
+                    col.addNull();
+                }
             }
-            bytes += col.getBufferedBytes();
         }
+        long bytes = getBufferedBytes();
         long rowBytes = bytes - snapshotBytes;
         if (rowBytes > maxRowBytes) {
             throw new LineSenderException("row too large for server batch cap")
@@ -401,7 +415,10 @@ public class QwpTableBuffer implements QuietCloseable {
                     " (max " + MAX_COLUMNS_PER_TABLE + ")"
             );
         }
-        ColumnBuffer col = new ColumnBuffer(Chars.toString(name), type, useNullBitmap);
+        ColumnBuffer col = new ColumnBuffer(Chars.toString(name), type, useNullBitmap, bufferedBytesCell);
+        if (type == TYPE_DOUBLE_ARRAY || type == TYPE_LONG_ARRAY) {
+            arrayColumnCount++;
+        }
         try {
             col.sender = sender;
             int index = columns.size();
@@ -623,6 +640,7 @@ public class QwpTableBuffer implements QuietCloseable {
         private static final long DOUBLE_ARRAY_BASE_OFFSET = Unsafe.getUnsafe().arrayBaseOffset(double[].class);
         final int elemSize;
         final String name;
+        private final long[] bytesCell;
         final byte type;
         final boolean useNullBitmap;
         private final Decimal256 rescaleTemp = new Decimal256();
@@ -661,6 +679,11 @@ public class QwpTableBuffer implements QuietCloseable {
         private int valueCount;   // Actual stored values (excludes nulls)
 
         public ColumnBuffer(String name, byte type, boolean useNullBitmap) {
+            this(name, type, useNullBitmap, new long[1]);
+        }
+
+        public ColumnBuffer(String name, byte type, boolean useNullBitmap, long[] bytesCell) {
+            this.bytesCell = bytesCell;
             this.name = name;
             this.type = type;
             this.useNullBitmap = useNullBitmap;
@@ -1248,7 +1271,7 @@ public class QwpTableBuffer implements QuietCloseable {
                     int localIdx = getOrAddLocalSymbol(value);
                     dataBuffer.putInt(localIdx);
                     if (auxBuffer == null) {
-                        auxBuffer = new OffHeapAppendMemory(64);
+                        auxBuffer = new OffHeapAppendMemory(64, bytesCell);
                     }
                     auxBuffer.putInt(globalId);
                     if (globalId > maxGlobalSymbolId) {
@@ -1646,16 +1669,16 @@ public class QwpTableBuffer implements QuietCloseable {
             switch (type) {
                 case TYPE_BOOLEAN:
                 case TYPE_BYTE:
-                    dataBuffer = new OffHeapAppendMemory(16);
+                    dataBuffer = new OffHeapAppendMemory(16, bytesCell);
                     break;
                 case TYPE_SHORT:
                 case TYPE_CHAR:
-                    dataBuffer = new OffHeapAppendMemory(32);
+                    dataBuffer = new OffHeapAppendMemory(32, bytesCell);
                     break;
                 case TYPE_INT:
                 case TYPE_IPv4:
                 case TYPE_FLOAT:
-                    dataBuffer = new OffHeapAppendMemory(64);
+                    dataBuffer = new OffHeapAppendMemory(64, bytesCell);
                     break;
                 case TYPE_GEOHASH:
                 case TYPE_LONG:
@@ -1664,22 +1687,22 @@ public class QwpTableBuffer implements QuietCloseable {
                 case TYPE_DATE:
                 case TYPE_DECIMAL64:
                 case TYPE_DOUBLE:
-                    dataBuffer = new OffHeapAppendMemory(128);
+                    dataBuffer = new OffHeapAppendMemory(128, bytesCell);
                     break;
                 case TYPE_UUID:
                 case TYPE_DECIMAL128:
-                    dataBuffer = new OffHeapAppendMemory(256);
+                    dataBuffer = new OffHeapAppendMemory(256, bytesCell);
                     break;
                 case TYPE_LONG256:
                 case TYPE_DECIMAL256:
-                    dataBuffer = new OffHeapAppendMemory(512);
+                    dataBuffer = new OffHeapAppendMemory(512, bytesCell);
                     break;
                 case TYPE_VARCHAR:
                 case TYPE_BINARY:
-                    stringOffsets = new OffHeapAppendMemory(64);
+                    stringOffsets = new OffHeapAppendMemory(64, bytesCell);
                     try {
                         stringOffsets.putInt(0); // seed initial 0 offset
-                        stringData = new OffHeapAppendMemory(256);
+                        stringData = new OffHeapAppendMemory(256, bytesCell);
                     } catch (Throwable t) {
                         stringOffsets.close();
                         stringOffsets = null;
@@ -1687,7 +1710,7 @@ public class QwpTableBuffer implements QuietCloseable {
                     }
                     break;
                 case TYPE_SYMBOL:
-                    dataBuffer = new OffHeapAppendMemory(64);
+                    dataBuffer = new OffHeapAppendMemory(64, bytesCell);
                     symbolDict = new CharSequenceIntHashMap();
                     symbolList = new ObjList<>();
                     break;
