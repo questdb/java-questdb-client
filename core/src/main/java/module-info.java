@@ -72,6 +72,7 @@ open module io.questdb.client {
     exports io.questdb.client.cutlass.line.udp;
     exports io.questdb.client.cutlass.qwp.client;
     exports io.questdb.client.cutlass.qwp.client.sf.cursor;
+    exports io.questdb.client.cutlass.qwp.client.sf.record;
     exports io.questdb.client.cutlass.qwp.protocol;
     exports io.questdb.client.cutlass.qwp.websocket;
 

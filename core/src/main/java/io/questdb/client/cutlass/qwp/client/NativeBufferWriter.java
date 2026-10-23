@@ -77,6 +77,31 @@ public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
     }
 
     /**
+     * Writes the UTF-8 encoding of {@code s} (no length prefix) at native address
+     * {@code addr} and returns the address just past the last byte. The caller must
+     * have room for {@link #utf8Length(CharSequence)} bytes.
+     */
+    public static long writeUtf8(long addr, CharSequence s) {
+        if (s == null) {
+            return addr;
+        }
+        int charLen = s.length();
+        int i = 0;
+        for (; i < charLen; i++) {
+            char c = s.charAt(i);
+            if (c >= 0x80) {
+                break;
+            }
+            Unsafe.getUnsafe().putByte(addr++, (byte) c);
+        }
+        if (i < charLen) {
+            int utf8Len = Utf8s.utf8Bytes(s, i, charLen);
+            addr += Utf8s.strCpyUtf8(s, i, addr, utf8Len);
+        }
+        return addr;
+    }
+
+    /**
      * Writes {@code value} as an unsigned LEB128 varint directly at native address
      * {@code addr} and returns the address just past the last byte. The canonical
      * raw-address varint writer shared by the SF cursor's persisted dictionary and
@@ -297,28 +322,10 @@ public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
             return;
         }
 
-        int charLen = value.length();
-        ensureCapacity(charLen);
-
-        // Single-pass: try ASCII encoding
+        int utf8Len = utf8Length(value);
+        ensureCapacity(utf8Len);
         long addr = bufferPtr + position;
-        int i = 0;
-        for (; i < charLen; i++) {
-            char c = value.charAt(i);
-            if (c >= 0x80) {
-                break;
-            }
-            Unsafe.getUnsafe().putByte(addr++, (byte) c);
-        }
-
-        if (i == charLen) {
-            // All ASCII — done in a single pass
-            position += charLen;
-        } else {
-            int utf8Len = Utf8s.utf8Bytes(value, i, charLen);
-            ensureCapacity(i + utf8Len);
-            position += i + Utf8s.strCpyUtf8(value, i, bufferPtr + position + i, utf8Len);
-        }
+        position += (int) (writeUtf8(addr, value) - addr);
     }
 
     /**
