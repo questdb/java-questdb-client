@@ -1065,6 +1065,14 @@ public final class SegmentRing implements QuietCloseable {
             if (spare == null) {
                 return BACKPRESSURE_NO_SPARE;
             }
+            // Reject before rotating: the spare is empty, so this is exactly the
+            // check its tryWrite below would make. Rotating first would seal the
+            // active and consume the spare without publishing a frame, so nothing
+            // wakes the I/O thread to move its pin off the sealed segment, and each
+            // retried flush of the same oversized batch would strand one more.
+            if (payloadLen > spare.capacityRemaining()) {
+                return PAYLOAD_TOO_LARGE;
+            }
             // Periodic mode must make the predecessor's complete published
             // range durable before the manifest can name its successor. The
             // manager performs the barrier; the producer uses the existing

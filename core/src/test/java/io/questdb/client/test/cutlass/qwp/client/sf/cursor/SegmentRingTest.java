@@ -147,6 +147,39 @@ public class SegmentRingTest {
     }
 
     @Test
+    public void testOversizedAppendLeavesActiveAndSpareUntouched() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Sized so one 100-byte payload fits and fills the segment.
+            long segSize = MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + 100;
+            long buf = Unsafe.malloc(101, MemoryTag.NATIVE_DEFAULT);
+            try {
+                MmapSegment seg0 = MmapSegment.create(tmpDir + "/seg0.sfa", 0, segSize);
+                try (SegmentRing ring = new SegmentRing(seg0, segSize)) {
+                    fillPattern(buf, 101, 0);
+                    assertEquals(0, ring.appendOrFsn(buf, 100));
+                    MmapSegment spare = MmapSegment.create(tmpDir + "/seg1.sfa", 1, segSize);
+                    ring.installHotSpare(spare);
+                    // A payload that no segment can hold must not seal the active and
+                    // consume the spare: that rotation publishes nothing, so nothing
+                    // wakes the I/O thread to trim the sealed segment, and every retry
+                    // of the same batch would strand another one.
+                    for (int i = 0; i < 3; i++) {
+                        assertEquals(SegmentRing.PAYLOAD_TOO_LARGE, ring.appendOrFsn(buf, 101));
+                    }
+                    assertSame(seg0, ring.getActive());
+                    assertSame(spare, ring.getHotSpareForTesting());
+                    assertEquals(0, ring.getSealedSegments().size());
+                    assertEquals(0, ring.publishedFsn());
+                    assertEquals(1, ring.appendOrFsn(buf, 100));
+                    assertSame(spare, ring.getActive());
+                }
+            } finally {
+                Unsafe.free(buf, 101, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
     public void testRotationRebasesSpareToCorrectFsnRegardlessOfManagerGuess() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             // The segment manager's pre-creation baseSeq is provisional — the ring
