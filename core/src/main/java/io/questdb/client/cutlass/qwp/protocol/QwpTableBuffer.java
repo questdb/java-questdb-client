@@ -80,6 +80,10 @@ public class QwpTableBuffer implements QuietCloseable {
     private int[] heldValueCounts;
     private int inProgressColumnCount;
     private boolean isRowHeld;
+    // The open-record writer's handle on this table: the index of the table's
+    // current block in the record opened at epoch qwoEpoch, or -1 for none.
+    private int qwoBlock = -1;
+    private long qwoEpoch = -1;
     private int rowCount;
     // Savepoint for rollbackToSavepoint(): the row count and column count at the
     // last markSavepoint(). reset(), retainInProgressRow() and retainHeldRow()
@@ -151,6 +155,23 @@ public class QwpTableBuffer implements QuietCloseable {
         savepointColumnCount = 0;
         columnDefsCacheValid = false;
         cachedColumnDefs = null;
+    }
+
+    /**
+     * Empties a one-row staging buffer after the open-record writer has copied
+     * its row: the row count goes back to 0 and every column drops its value
+     * (see {@link ColumnBuffer#clearStagedRow()}) but keeps its definition,
+     * decimal scale, geohash precision and symbol mode. The savepoint row count
+     * goes back to 0 with it.
+     */
+    public void clearStagedRow() {
+        for (int i = 0, n = columns.size(); i < n; i++) {
+            fastColumns[i].clearStagedRow();
+        }
+        columnAccessCursor = 0;
+        inProgressColumnCount = 0;
+        rowCount = 0;
+        savepointRowCount = 0;
     }
 
     @Override
@@ -443,6 +464,29 @@ public class QwpTableBuffer implements QuietCloseable {
         }
         rowCount++;
         committedColumnCount = columns.size();
+    }
+
+    /**
+     * Index of this table's current block in the open record opened at
+     * {@link #qwoEpoch()}, or -1 when it has none.
+     */
+    public int qwoBlock() {
+        return qwoBlock;
+    }
+
+    public void qwoBlock(int block) {
+        this.qwoBlock = block;
+    }
+
+    /**
+     * Epoch of the open record {@link #qwoBlock()} refers to, or -1.
+     */
+    public long qwoEpoch() {
+        return qwoEpoch;
+    }
+
+    public void qwoEpoch(long epoch) {
+        this.qwoEpoch = epoch;
     }
 
     /**
@@ -1500,6 +1544,39 @@ public class QwpTableBuffer implements QuietCloseable {
             size++;
         }
 
+        /**
+         * Drops the values of a one-row staging buffer: rewinds the data, aux,
+         * string and array storage (string offsets re-seeded with 0) and clears
+         * the row's null bit. Keeps the decimal scale, geohash precision, symbol
+         * mode and local symbol dictionary, which describe the column rather
+         * than the row.
+         */
+        public void clearStagedRow() {
+            if (dataBuffer != null) {
+                dataBuffer.truncate();
+            }
+            if (auxBuffer != null) {
+                auxBuffer.truncate();
+            }
+            if (stringOffsets != null) {
+                stringOffsets.truncate();
+                stringOffsets.putInt(0);
+            }
+            if (stringData != null) {
+                stringData.truncate();
+            }
+            if (nullBufPtr != 0) {
+                for (long i = 0, n = ((long) Math.min(size, nullBufCapRows) + 63) >>> 6; i < n; i++) {
+                    Unsafe.getUnsafe().putLong(nullBufPtr + i * Long.BYTES, 0L);
+                }
+            }
+            arrayShapeOffset = 0;
+            arrayDataOffset = 0;
+            hasNulls = false;
+            size = 0;
+            valueCount = 0;
+        }
+
         @Override
         public void close() {
             if (dataBuffer != null) {
@@ -1616,6 +1693,10 @@ public class QwpTableBuffer implements QuietCloseable {
 
         public int getMaxGlobalSymbolId() {
             return maxGlobalSymbolId;
+        }
+
+        public String getName() {
+            return name;
         }
 
         /**

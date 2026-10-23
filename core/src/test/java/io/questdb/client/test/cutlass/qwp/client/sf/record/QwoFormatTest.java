@@ -47,6 +47,61 @@ public class QwoFormatTest {
     }
 
     @Test
+    public void testDescriptorCrcSkipsMutableFields() {
+        long d = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
+        try {
+            Unsafe.getUnsafe().setMemory(d, 64, (byte) 0x33);
+            Unsafe.getUnsafe().putShort(d + QwoFormat.D_COL_COUNT, (short) 2);
+            Unsafe.getUnsafe().putShort(d + QwoFormat.D_FLAGS, (short) 0);
+            long p = d + QwoFormat.D_NAME;
+            p += QwoFormat.putString(p, "tbl");
+            long def0 = p;
+            p += QwoFormat.putString(p, "a");
+            Unsafe.getUnsafe().putByte(p++, QwpConstants.TYPE_LONG);
+            long prefix0 = p;
+            p += 3;
+            Unsafe.getUnsafe().putByte(p++, (byte) 1);
+            Unsafe.getUnsafe().putInt(p, 1234);
+            p += 4;
+            p += QwoFormat.putString(p, "");
+            Unsafe.getUnsafe().putByte(p++, QwpConstants.TYPE_TIMESTAMP);
+            long prefix1 = p;
+            p += 3;
+            Unsafe.getUnsafe().putByte(p++, (byte) 1);
+            Unsafe.getUnsafe().putInt(p, 5678);
+            long end = p + 4;
+
+            int expected = Crc32c.updateUnsafe(Crc32c.INIT, d + QwoFormat.D_COL_COUNT, 4);
+            expected = Crc32c.updateUnsafe(expected, d + QwoFormat.D_NAME, prefix0 - (d + QwoFormat.D_NAME));
+            expected = Crc32c.updateUnsafe(expected, prefix0 + 3, prefix1 - (prefix0 + 3));
+            expected = Crc32c.updateUnsafe(expected, prefix1 + 3, end - (prefix1 + 3));
+            int crc = QwoFormat.descriptorCrc(d);
+            Assert.assertEquals(expected, crc);
+
+            long[] unchanged = {
+                    d + QwoFormat.D_CRC, d + QwoFormat.D_NEXT + 2, d + QwoFormat.D_ROW_WORD + 5,
+                    prefix0, prefix0 + 1, prefix0 + 2, prefix1, prefix1 + 2
+            };
+            for (long a : unchanged) {
+                flip(a);
+                Assert.assertEquals(crc, QwoFormat.descriptorCrc(d));
+                flip(a);
+            }
+            long[] changed = {
+                    d + QwoFormat.D_FLAGS, d + QwoFormat.D_NAME + 1, def0 + 1, prefix0 - 1, prefix0 + 3,
+                    prefix0 + 5, prefix1 - 1, end - 1
+            };
+            for (long a : changed) {
+                flip(a);
+                Assert.assertNotEquals(crc, QwoFormat.descriptorCrc(d));
+                flip(a);
+            }
+        } finally {
+            Unsafe.free(d, 64, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    @Test
     public void testHeaderCrcSkipsItsOwnField() {
         long p = Unsafe.malloc(QwoFormat.HEADER_SIZE, MemoryTag.NATIVE_DEFAULT);
         try {
@@ -54,14 +109,24 @@ public class QwoFormatTest {
                 Unsafe.getUnsafe().putByte(p + i, (byte) (i * 7 + 1));
             }
             int crc = QwoFormat.headerCrc(p);
-            Assert.assertEquals(
-                    Crc32c.updateUnsafe(Crc32c.updateUnsafe(Crc32c.INIT, p, 12), p + 16, 32),
-                    crc
-            );
-            Unsafe.getUnsafe().putByte(p + 13, (byte) ~Unsafe.getUnsafe().getByte(p + 13));
-            Assert.assertEquals(crc, QwoFormat.headerCrc(p));
-            Unsafe.getUnsafe().putByte(p + 20, (byte) ~Unsafe.getUnsafe().getByte(p + 20));
-            Assert.assertNotEquals(crc, QwoFormat.headerCrc(p));
+            int expected = Crc32c.updateUnsafe(Crc32c.INIT, p, 5);
+            expected = Crc32c.updateUnsafe(expected, p + 8, 4);
+            expected = Crc32c.updateUnsafe(expected, p + 20, 12);
+            expected = Crc32c.updateUnsafe(expected, p + 44, 4);
+            Assert.assertEquals(expected, crc);
+            // flags, blockCount, the CRC itself, firstBlock, dictWord and usedBytes change after open()
+            int[] unchanged = {5, 6, 13, 16, 32, 40};
+            for (int off : unchanged) {
+                flip(p + off);
+                Assert.assertEquals("offset " + off, crc, QwoFormat.headerCrc(p));
+                flip(p + off);
+            }
+            int[] changed = {2, 9, 20, 28, 44};
+            for (int off : changed) {
+                flip(p + off);
+                Assert.assertNotEquals("offset " + off, crc, QwoFormat.headerCrc(p));
+                flip(p + off);
+            }
         } finally {
             Unsafe.free(p, QwoFormat.HEADER_SIZE, MemoryTag.NATIVE_DEFAULT);
         }
@@ -145,5 +210,9 @@ public class QwoFormatTest {
         Assert.assertEquals(8, QwoFormat.valueWidth(QwpConstants.TYPE_GEOHASH, 60));
         Assert.assertTrue(QwoFormat.isVariableSize(QwpConstants.TYPE_VARCHAR));
         Assert.assertFalse(QwoFormat.isVariableSize(QwpConstants.TYPE_LONG));
+    }
+
+    private static void flip(long addr) {
+        Unsafe.getUnsafe().putByte(addr, (byte) ~Unsafe.getUnsafe().getByte(addr));
     }
 }

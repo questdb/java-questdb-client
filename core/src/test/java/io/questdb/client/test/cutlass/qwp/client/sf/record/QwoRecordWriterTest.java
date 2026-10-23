@@ -1,0 +1,964 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.client.test.cutlass.qwp.client.sf.record;
+
+import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
+import io.questdb.client.cutlass.qwp.client.NativeBufferWriter;
+import io.questdb.client.cutlass.qwp.client.sf.record.QwoFormat;
+import io.questdb.client.cutlass.qwp.client.sf.record.QwoRecordReader;
+import io.questdb.client.cutlass.qwp.client.sf.record.QwoRecordWriter;
+import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
+import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
+import io.questdb.client.std.Crc32c;
+import io.questdb.client.std.Decimal128;
+import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.Unsafe;
+import org.junit.Assert;
+import org.junit.Test;
+
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.function.Consumer;
+
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
+
+public class QwoRecordWriterTest {
+
+    private static final int REGION = 256 * 1024;
+
+    @Test
+    public void testAppendFourFixedColumnsAcrossThreeReleasesPublishesCounts() throws Exception {
+        withRecord((mem, writer) -> {
+            writer.open(mem, REGION, QwpConstants.VERSION, 0, QwoFormat.DEFAULT_DICT_RESERVE);
+            Assert.assertTrue(writer.isOpen());
+            QwoRecordReader reader = new QwoRecordReader();
+            GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+            try (QwpTableBuffer tb = new QwpTableBuffer("trades")) {
+                int lastUsed = writer.usedBytes();
+                for (int r = 0; r < 3; r++) {
+                    final int row = r;
+                    append(writer, tb, dict, -1, t -> {
+                        t.getOrCreateColumn("price", QwpConstants.TYPE_DOUBLE, true).addDouble(1.5 * (row + 1));
+                        t.getOrCreateColumn("qty", QwpConstants.TYPE_LONG, true).addLong(100 + row);
+                        t.getOrCreateColumn("venue", QwpConstants.TYPE_INT, true).addInt(7 * row);
+                        t.getOrCreateDesignatedTimestampColumn(QwpConstants.TYPE_TIMESTAMP).addLong(1_000_000L * (row + 1));
+                    });
+                    Assert.assertEquals(r + 1, writer.rowCount());
+                    Assert.assertTrue(writer.hasUncommittedRows());
+                    writer.publish();
+                    Assert.assertFalse(writer.hasUncommittedRows());
+                    Assert.assertEquals(r + 1, writer.committedRowCount());
+
+                    reader.of(mem, REGION);
+                    Assert.assertEquals(1, reader.blockCount());
+                    int b = reader.firstBlock();
+                    Assert.assertEquals(r + 1, reader.rowCount(b));
+                    Assert.assertEquals(r + 1, QwoFormat.rowCountOf(Unsafe.getUnsafe().getLong(mem + b + QwoFormat.D_ROW_WORD)));
+                    Assert.assertEquals(0, reader.nextBlock(b));
+                    Assert.assertEquals(writer.usedBytes(), reader.usedBytes());
+                    if (r < 2) {
+                        // rows 0 and 1 allocate the descriptor, then the 1-row and the 2-row chunks
+                        Assert.assertTrue(reader.usedBytes() > lastUsed);
+                    } else {
+                        // row 2 fills the free slots of the 2-row chunks
+                        Assert.assertEquals(lastUsed, reader.usedBytes());
+                    }
+                    lastUsed = reader.usedBytes();
+                }
+                Assert.assertEquals(1, writer.blockCount());
+                Assert.assertEquals(0, tb.qwoBlock());
+                Assert.assertEquals(writer.epoch(), tb.qwoEpoch());
+
+                int b = reader.firstBlock();
+                Assert.assertEquals("trades", nameOf(reader.tableNameAddr(b), reader.tableNameLen(b)));
+                Assert.assertEquals(4, reader.colCount(b));
+                Assert.assertEquals(Unsafe.getUnsafe().getInt(mem + b + QwoFormat.D_CRC), QwoFormat.descriptorCrc(mem + b));
+                for (int col = 0; col < 4; col++) {
+                    int def = reader.columnDef(b, col);
+                    int c0 = reader.firstChunk(def);
+                    Assert.assertEquals(1, reader.chunkRowCap(c0));
+                    int c1 = reader.nextChunk(c0);
+                    Assert.assertEquals(2, reader.chunkRowCap(c1));
+                    Assert.assertEquals(0, reader.nextChunk(c1));
+                }
+                int priceDef = reader.columnDef(b, 0);
+                Assert.assertEquals(QwpConstants.TYPE_DOUBLE, reader.columnType(priceDef));
+                Assert.assertTrue(reader.columnUsesBitmap(priceDef));
+                int c0 = reader.firstChunk(priceDef);
+                int c1 = reader.nextChunk(c0);
+                Assert.assertEquals(1.5, Unsafe.getUnsafe().getDouble(reader.chunkValuesAddr(c0, QwpConstants.TYPE_DOUBLE, true)), 0.0);
+                long v1 = reader.chunkValuesAddr(c1, QwpConstants.TYPE_DOUBLE, true);
+                Assert.assertEquals(3.0, Unsafe.getUnsafe().getDouble(v1), 0.0);
+                Assert.assertEquals(4.5, Unsafe.getUnsafe().getDouble(v1 + 8), 0.0);
+                int tsDef = reader.columnDef(b, 3);
+                Assert.assertEquals(0, reader.columnNameLen(tsDef));
+                long ts1 = reader.chunkValuesAddr(reader.nextChunk(reader.firstChunk(tsDef)), QwpConstants.TYPE_TIMESTAMP, true);
+                Assert.assertEquals(3_000_000L, Unsafe.getUnsafe().getLong(ts1 + 8));
+            }
+        });
+    }
+
+    @Test
+    public void testBlockRowLimitSeals() throws Exception {
+        withRecord((mem, writer) -> {
+            writer.setMaxRowsPerBlockForTest(3);
+            writer.open(mem, REGION, QwpConstants.VERSION, 0, QwoFormat.DEFAULT_DICT_RESERVE);
+            GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+            try (QwpTableBuffer tb = new QwpTableBuffer("t"); QwpTableBuffer other = new QwpTableBuffer("u")) {
+                for (int r = 0; r < 3; r++) {
+                    final long v = r;
+                    append(writer, tb, dict, -1, t -> t.getOrCreateColumn("v", QwpConstants.TYPE_LONG, true).addLong(v));
+                }
+                writer.publish();
+                int used = writer.usedBytes();
+                stage(tb, t -> t.getOrCreateColumn("v", QwpConstants.TYPE_LONG, true).addLong(3));
+                Assert.assertEquals(QwoRecordWriter.APPEND_NO_SPACE, writer.appendStagedRow(tb, dict, -1));
+                Assert.assertEquals(0, writer.lastRefusedDictBytes());
+                Assert.assertEquals(3, writer.rowCount());
+                Assert.assertEquals(used, writer.usedBytes());
+                Assert.assertFalse(writer.hasUncommittedRows());
+                tb.clearStagedRow();
+
+                // another table still gets its own block
+                append(writer, other, dict, -1, t -> t.getOrCreateColumn("v", QwpConstants.TYPE_LONG, true).addLong(9));
+                Assert.assertEquals(2, writer.blockCount());
+                Assert.assertEquals(4, writer.rowCount());
+            }
+        });
+    }
+
+    @Test
+    public void testChunksShrinkWhenTheRecordRunsShort() throws Exception {
+        withRecord((mem, writer) -> {
+            final int capacity = 60 * 1024;
+            writer.open(mem, capacity, QwpConstants.VERSION, 0, capacity / 32);
+            GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < 4096; i++) {
+                sb.append((char) ('a' + i % 26));
+            }
+            final String wide = sb.toString();
+            final String narrow = "12345678";
+            ArrayList<String> expected = new ArrayList<>();
+            try (QwpTableBuffer tb = new QwpTableBuffer("shrink")) {
+                for (int pass = 0; pass < 2; pass++) {
+                    final String value = pass == 0 ? wide : narrow;
+                    while (true) {
+                        stage(tb, t -> t.getOrCreateColumn("s", QwpConstants.TYPE_VARCHAR, true).addString(value));
+                        int result = writer.appendStagedRow(tb, dict, -1);
+                        tb.clearStagedRow();
+                        if (result == QwoRecordWriter.APPEND_NO_SPACE) {
+                            break;
+                        }
+                        expected.add(value);
+                        writer.publish();
+                        Assert.assertTrue(
+                                writer.usedBytes() + QwoFormat.WIRE_MARGIN_FIXED + QwoFormat.WIRE_MARGIN_PER_BLOCK <= capacity
+                        );
+                    }
+                }
+                Assert.assertTrue(expected.size() > 15);
+                Assert.assertTrue("no narrow row fitted", expected.contains(narrow));
+
+                QwoRecordReader reader = new QwoRecordReader();
+                reader.of(mem, capacity);
+                int b = reader.firstBlock();
+                Assert.assertEquals(expected.size(), reader.rowCount(b));
+                int chunk = reader.firstChunk(reader.columnDef(b, 0));
+                int row = 0;
+                boolean isShrunk = false;
+                int previousCap = 0;
+                while (chunk != 0) {
+                    int cap = reader.chunkRowCap(chunk);
+                    if (previousCap > 0 && cap != Math.min(2 * previousCap, QwoFormat.MAX_CHUNK_ROWS) && cap != previousCap) {
+                        isShrunk = true;
+                    }
+                    previousCap = cap;
+                    long offsets = reader.chunkOffsetsAddr(chunk, true);
+                    long bytes = reader.chunkBytesAddr(chunk, true, cap);
+                    for (int i = 0; i < cap && row < expected.size(); i++, row++) {
+                        int start = Unsafe.getUnsafe().getInt(offsets + 4L * i);
+                        int end = Unsafe.getUnsafe().getInt(offsets + 4L * (i + 1));
+                        Assert.assertEquals("row " + row, expected.get(row), nameOf(bytes + start, end - start));
+                    }
+                    chunk = reader.nextChunk(chunk);
+                }
+                Assert.assertEquals(expected.size(), row);
+                Assert.assertTrue("no chunk was shrunk", isShrunk);
+            }
+        });
+    }
+
+    @Test
+    public void testColumnDefsFollowStagedBufferOrder() throws Exception {
+        withRecord((mem, writer) -> {
+            writer.open(mem, REGION, QwpConstants.VERSION, 0, QwoFormat.DEFAULT_DICT_RESERVE);
+            GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+            try (QwpTableBuffer tb = new QwpTableBuffer("ordered")) {
+                append(writer, tb, dict, -1, t -> {
+                    t.getOrCreateColumn("b", QwpConstants.TYPE_VARCHAR, true).addString("bee");
+                    t.getOrCreateColumn("a", QwpConstants.TYPE_LONG, true).addLong(1);
+                    t.getOrCreateColumn("flag", QwpConstants.TYPE_BOOLEAN, false).addBoolean(true);
+                    t.getOrCreateDesignatedTimestampColumn(QwpConstants.TYPE_TIMESTAMP_NANOS).addLong(5);
+                });
+                writer.publish();
+                QwoRecordReader reader = new QwoRecordReader();
+                reader.of(mem, REGION);
+                int b = reader.firstBlock();
+                Assert.assertEquals(4, reader.colCount(b));
+                String[] names = {"b", "a", "flag", ""};
+                byte[] types = {QwpConstants.TYPE_VARCHAR, QwpConstants.TYPE_LONG, QwpConstants.TYPE_BOOLEAN, QwpConstants.TYPE_TIMESTAMP_NANOS};
+                boolean[] bitmaps = {true, true, false, true};
+                for (int col = 0; col < 4; col++) {
+                    int def = reader.columnDef(b, col);
+                    Assert.assertEquals(names[col], nameOf(reader.columnNameAddr(def), reader.columnNameLen(def)));
+                    Assert.assertEquals(types[col], reader.columnType(def));
+                    Assert.assertEquals(bitmaps[col], reader.columnUsesBitmap(def));
+                    Assert.assertEquals(QwoFormat.PREFIX_NONE, reader.prefixKind(def));
+                    Assert.assertEquals(-1, reader.prefix(def));
+                    if (col < 3) {
+                        Assert.assertEquals(reader.columnDef(b, col + 1), reader.nextColumnDef(def));
+                    }
+                }
+                // the descriptor CRC is stored at publish and ignores the row word and D_NEXT
+                int stored = Unsafe.getUnsafe().getInt(mem + b + QwoFormat.D_CRC);
+                Assert.assertEquals(stored, QwoFormat.descriptorCrc(mem + b));
+                append(writer, tb, dict, -1, t -> {
+                    t.getOrCreateColumn("b", QwpConstants.TYPE_VARCHAR, true).addString("second");
+                    t.getOrCreateColumn("a", QwpConstants.TYPE_LONG, true).addLong(2);
+                    t.getOrCreateColumn("flag", QwpConstants.TYPE_BOOLEAN, false).addBoolean(false);
+                    t.getOrCreateDesignatedTimestampColumn(QwpConstants.TYPE_TIMESTAMP_NANOS).addLong(6);
+                });
+                writer.publish();
+                Assert.assertEquals(2, reader.rowCount(b));
+                Assert.assertEquals(stored, Unsafe.getUnsafe().getInt(mem + b + QwoFormat.D_CRC));
+                Assert.assertEquals(stored, QwoFormat.descriptorCrc(mem + b));
+                // BOOLEAN values are bit-packed: row 0 true, row 1 false, in two chunks
+                int flagDef = reader.columnDef(b, 2);
+                int f0 = reader.firstChunk(flagDef);
+                Assert.assertEquals(1, Unsafe.getUnsafe().getByte(reader.chunkValuesAddr(f0, QwpConstants.TYPE_BOOLEAN, false)) & 1);
+                int f1 = reader.nextChunk(f0);
+                Assert.assertEquals(0, Unsafe.getUnsafe().getByte(reader.chunkValuesAddr(f1, QwpConstants.TYPE_BOOLEAN, false)) & 1);
+            }
+        });
+    }
+
+    @Test
+    public void testCrcStreamMatchesReferenceOverRows() throws Exception {
+        withRecord((mem, writer) -> {
+            GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+            for (int i = 0; i <= 300; i++) {
+                dict.getOrAddSymbol("v" + i);
+            }
+            writer.open(mem, REGION, QwpConstants.VERSION, 0, QwoFormat.DEFAULT_DICT_RESERVE);
+            final Double[] doubles = {1.5, null, -2.25, 4.0, null};
+            final boolean[] flags = {true, false, true, true, false};
+            final String[] strings = {"x", "", null, "hello world", "ü€"};
+            final int[] symbols = {0, 1, -1, 0, 300};
+            final long[] geohashes = {0xABC, -1, 0x123, 0xFFF, 0x001};
+            final long[][] decimals = {{1, 2}, null, {0, -5}, {-1, 77}, {3, 4}};
+            final long[][] arrays = {{1, 2, 3}, null, {}, {7}, null};
+            final byte[] bytes = {1, 2, 3, 4, 5};
+            QwoRecordReader reader = new QwoRecordReader();
+            try (
+                    QwpTableBuffer tb = new QwpTableBuffer("mixed");
+                    NativeBufferWriter ref = new NativeBufferWriter()
+            ) {
+                int batchMax = -1;
+                for (int r = 0; r < 5; r++) {
+                    final int row = r;
+                    if (symbols[r] > batchMax) {
+                        batchMax = symbols[r];
+                    }
+                    stage(tb, t -> {
+                        if (doubles[row] != null) {
+                            t.getOrCreateColumn("d", QwpConstants.TYPE_DOUBLE, true).addDouble(doubles[row]);
+                        }
+                        t.getOrCreateColumn("flag", QwpConstants.TYPE_BOOLEAN, false).addBoolean(flags[row]);
+                        if (strings[row] != null) {
+                            t.getOrCreateColumn("s", QwpConstants.TYPE_VARCHAR, true).addString(strings[row]);
+                        }
+                        if (symbols[row] >= 0) {
+                            t.getOrCreateColumn("sym", QwpConstants.TYPE_SYMBOL, true)
+                                    .addSymbolWithGlobalId("v" + symbols[row], symbols[row]);
+                        }
+                        if (geohashes[row] >= 0) {
+                            t.getOrCreateColumn("g", QwpConstants.TYPE_GEOHASH, true).addGeoHash(geohashes[row], 12);
+                        }
+                        if (decimals[row] != null) {
+                            t.getOrCreateColumn("dec", QwpConstants.TYPE_DECIMAL128, true)
+                                    .addDecimal128(new Decimal128(decimals[row][0], decimals[row][1], 2));
+                        }
+                        if (arrays[row] != null) {
+                            t.getOrCreateColumn("arr", QwpConstants.TYPE_LONG_ARRAY, true).addLongArray(arrays[row]);
+                        }
+                        t.getOrCreateColumn("b", QwpConstants.TYPE_BYTE, false).addByte(bytes[row]);
+                        t.getOrCreateDesignatedTimestampColumn(QwpConstants.TYPE_TIMESTAMP).addLong(1000L * (row + 1));
+                    });
+                    Assert.assertEquals(QwoRecordWriter.APPEND_OK, writer.appendStagedRow(tb, dict, batchMax));
+                    tb.clearStagedRow();
+
+                    // reference stream, independent of the writer
+                    if (doubles[r] != null) {
+                        ref.putByte((byte) 1);
+                        ref.putDouble(doubles[r]);
+                    } else {
+                        ref.putByte((byte) 0);
+                    }
+                    ref.putByte(flags[r] ? (byte) 1 : (byte) 0);
+                    if (strings[r] != null) {
+                        byte[] utf8 = strings[r].getBytes(StandardCharsets.UTF_8);
+                        ref.putByte((byte) 1);
+                        ref.putInt(utf8.length);
+                        for (byte x : utf8) {
+                            ref.putByte(x);
+                        }
+                    } else {
+                        ref.putByte((byte) 0);
+                    }
+                    if (symbols[r] >= 0) {
+                        ref.putByte((byte) 1);
+                        ref.putVarint(symbols[r]);
+                    } else {
+                        ref.putByte((byte) 0);
+                    }
+                    if (geohashes[r] >= 0) {
+                        ref.putByte((byte) 1);
+                        ref.putByte((byte) geohashes[r]);
+                        ref.putByte((byte) (geohashes[r] >>> 8));
+                    } else {
+                        ref.putByte((byte) 0);
+                    }
+                    if (decimals[r] != null) {
+                        ref.putByte((byte) 1);
+                        ref.putLong(decimals[r][1]);
+                        ref.putLong(decimals[r][0]);
+                    } else {
+                        ref.putByte((byte) 0);
+                    }
+                    if (arrays[r] != null) {
+                        ref.putByte((byte) 1);
+                        ref.putInt(1 + 4 + 8 * arrays[r].length);
+                        ref.putByte((byte) 1);
+                        ref.putInt(arrays[r].length);
+                        for (long x : arrays[r]) {
+                            ref.putLong(x);
+                        }
+                    } else {
+                        ref.putByte((byte) 0);
+                    }
+                    ref.putByte(bytes[r]);
+                    ref.putByte((byte) 1);
+                    ref.putLong(1000L * (r + 1));
+
+                    if (r == 1 || r == 4) {
+                        writer.publish();
+                        reader.of(mem, REGION);
+                        int b = reader.firstBlock();
+                        Assert.assertEquals(r + 1, reader.rowCount(b));
+                        long word = Unsafe.getUnsafe().getLong(mem + b + QwoFormat.D_ROW_WORD);
+                        Assert.assertEquals(
+                                "row crc after " + (r + 1) + " rows",
+                                Crc32c.updateUnsafe(Crc32c.INIT, ref.getBufferPtr(), ref.getPosition()),
+                                QwoFormat.crcOf(word)
+                        );
+                    }
+                }
+                Assert.assertEquals(1, writer.blockCount());
+                int b = reader.firstBlock();
+                int geoDef = reader.columnDef(b, 4);
+                Assert.assertEquals(QwpConstants.TYPE_GEOHASH, reader.columnType(geoDef));
+                Assert.assertEquals(QwoFormat.PREFIX_GEOHASH, reader.prefixKind(geoDef));
+                Assert.assertEquals(12, reader.prefix(geoDef));
+                int decDef = reader.columnDef(b, 5);
+                Assert.assertEquals(QwoFormat.PREFIX_DECIMAL, reader.prefixKind(decDef));
+                Assert.assertEquals(2, reader.prefix(decDef));
+                Assert.assertEquals(301, reader.dictCount());
+                Assert.assertEquals(300, writer.dictEndId());
+            }
+        });
+    }
+
+    @Test
+    public void testDictionaryEntriesAppendedOnceInIdOrder() throws Exception {
+        withRecord((mem, writer) -> {
+            writer.open(mem, REGION, QwpConstants.VERSION, 0, QwoFormat.DEFAULT_DICT_RESERVE);
+            Assert.assertEquals(0, writer.dictStartId());
+            Assert.assertEquals(-1, writer.dictEndId());
+            GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+            QwoRecordReader reader = new QwoRecordReader();
+            try (QwpTableBuffer tb = new QwpTableBuffer("syms")) {
+                final int alpha = dict.getOrAddSymbol("alpha");
+                final int beta = dict.getOrAddSymbol("beta");
+                append(writer, tb, dict, beta, t -> {
+                    t.getOrCreateColumn("s", QwpConstants.TYPE_SYMBOL, true).addSymbolWithGlobalId("alpha", alpha);
+                    t.getOrCreateColumn("s2", QwpConstants.TYPE_SYMBOL, true).addSymbolWithGlobalId("beta", beta);
+                });
+                Assert.assertEquals(1, writer.dictEndId());
+                Assert.assertEquals(-1, writer.committedDictEndId());
+                writer.publish();
+                Assert.assertEquals(1, writer.committedDictEndId());
+                final int gamma = dict.getOrAddSymbol("gamma");
+                append(writer, tb, dict, gamma, t -> {
+                    t.getOrCreateColumn("s", QwpConstants.TYPE_SYMBOL, true).addSymbolWithGlobalId("alpha", alpha);
+                    t.getOrCreateColumn("s2", QwpConstants.TYPE_SYMBOL, true).addSymbolWithGlobalId("gamma", gamma);
+                });
+                // a row that mints nothing registers nothing
+                append(writer, tb, dict, gamma, t -> {
+                    t.getOrCreateColumn("s", QwpConstants.TYPE_SYMBOL, true).addSymbolWithGlobalId("beta", beta);
+                    t.getOrCreateColumn("s2", QwpConstants.TYPE_SYMBOL, true).addSymbolWithGlobalId("alpha", alpha);
+                });
+                writer.publish();
+                Assert.assertEquals(2, writer.dictEndId());
+
+                reader.of(mem, REGION);
+                Assert.assertEquals(0, reader.dictStartId());
+                Assert.assertEquals(3, reader.dictCount());
+                Assert.assertEquals(QwoFormat.HEADER_SIZE, reader.dictEntriesAddr() - mem);
+                long expected = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
+                try {
+                    int n = QwoFormat.putString(expected, "alpha");
+                    n += QwoFormat.putString(expected + n, "beta");
+                    n += QwoFormat.putString(expected + n, "gamma");
+                    Assert.assertEquals(n, reader.dictEntriesLen());
+                    for (int i = 0; i < n; i++) {
+                        Assert.assertEquals(Unsafe.getUnsafe().getByte(expected + i), Unsafe.getUnsafe().getByte(reader.dictEntriesAddr() + i));
+                    }
+                    long dictWord = Unsafe.getUnsafe().getLong(mem + QwoFormat.OFF_DICT_WORD);
+                    Assert.assertEquals(3, (int) (dictWord >>> 32));
+                    Assert.assertEquals(Crc32c.updateUnsafe(Crc32c.INIT, expected, n), (int) dictWord);
+                } finally {
+                    Unsafe.free(expected, 64, MemoryTag.NATIVE_DEFAULT);
+                }
+                // symbol values are varint global ids
+                int b = reader.firstBlock();
+                int s2 = reader.columnDef(b, 1);
+                int c0 = reader.firstChunk(s2);
+                Assert.assertEquals(beta, Unsafe.getUnsafe().getByte(reader.chunkValuesAddr(c0, QwpConstants.TYPE_SYMBOL, true)));
+                long v1 = reader.chunkValuesAddr(reader.nextChunk(c0), QwpConstants.TYPE_SYMBOL, true);
+                Assert.assertEquals(gamma, Unsafe.getUnsafe().getByte(v1));
+                Assert.assertEquals(alpha, Unsafe.getUnsafe().getByte(v1 + 1));
+            }
+        });
+    }
+
+    @Test
+    public void testDictionaryRegionFullReportsBytesNeeded() throws Exception {
+        withRecord((mem, writer) -> {
+            writer.open(mem, REGION, QwpConstants.VERSION, 5, 32);
+            GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+            for (int i = 0; i < 5; i++) {
+                dict.getOrAddSymbol("old" + i);
+            }
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < 100; i++) {
+                sb.append((char) ('a' + i % 26));
+            }
+            final String big = sb.toString();
+            final int id = dict.getOrAddSymbol(big);
+            Assert.assertEquals(5, id);
+            try (QwpTableBuffer tb = new QwpTableBuffer("t"); QwpTableBuffer other = new QwpTableBuffer("u")) {
+                int used = writer.usedBytes();
+                stage(tb, t -> t.getOrCreateColumn("s", QwpConstants.TYPE_SYMBOL, true).addSymbolWithGlobalId(big, id));
+                Assert.assertEquals(QwoRecordWriter.APPEND_NO_SPACE, writer.appendStagedRow(tb, dict, id));
+                Assert.assertEquals(QwoFormat.stringBytes(big), writer.lastRefusedDictBytes());
+                Assert.assertEquals(101, writer.lastRefusedDictBytes());
+                Assert.assertEquals(0, writer.rowCount());
+                Assert.assertEquals(0, writer.blockCount());
+                Assert.assertEquals(used, writer.usedBytes());
+                Assert.assertEquals(4, writer.dictEndId());
+                tb.clearStagedRow();
+
+                append(writer, other, dict, 4, t -> t.getOrCreateColumn("v", QwpConstants.TYPE_LONG, true).addLong(1));
+                Assert.assertEquals(0, writer.lastRefusedDictBytes());
+                Assert.assertEquals(4, writer.dictEndId());
+            }
+        });
+    }
+
+    @Test
+    public void testNewColumnAllocatesSecondBlockForSameTable() throws Exception {
+        withRecord((mem, writer) -> {
+            writer.open(mem, REGION, QwpConstants.VERSION, 0, QwoFormat.DEFAULT_DICT_RESERVE);
+            GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+            try (QwpTableBuffer tb = new QwpTableBuffer("evolving")) {
+                for (int r = 0; r < 3; r++) {
+                    final long v = r;
+                    append(writer, tb, dict, -1, t -> {
+                        t.getOrCreateColumn("a", QwpConstants.TYPE_LONG, true).addLong(v);
+                        t.getOrCreateDesignatedTimestampColumn(QwpConstants.TYPE_TIMESTAMP).addLong(v);
+                    });
+                }
+                writer.publish();
+                append(writer, tb, dict, -1, t -> {
+                    t.getOrCreateColumn("a", QwpConstants.TYPE_LONG, true).addLong(3);
+                    t.getOrCreateColumn("b", QwpConstants.TYPE_DOUBLE, true).addDouble(0.5);
+                    t.getOrCreateDesignatedTimestampColumn(QwpConstants.TYPE_TIMESTAMP).addLong(3);
+                });
+                Assert.assertEquals(2, writer.blockCount());
+                Assert.assertEquals(1, tb.qwoBlock());
+                writer.publish();
+
+                QwoRecordReader reader = new QwoRecordReader();
+                reader.of(mem, REGION);
+                Assert.assertEquals(2, reader.blockCount());
+                int b0 = reader.firstBlock();
+                int b1 = reader.nextBlock(b0);
+                Assert.assertEquals(3, reader.rowCount(b0));
+                Assert.assertEquals(2, reader.colCount(b0));
+                Assert.assertEquals(1, reader.rowCount(b1));
+                Assert.assertEquals(3, reader.colCount(b1));
+                Assert.assertEquals(0, reader.nextBlock(b1));
+                Assert.assertEquals("evolving", nameOf(reader.tableNameAddr(b1), reader.tableNameLen(b1)));
+                Assert.assertEquals(Unsafe.getUnsafe().getInt(mem + b1 + QwoFormat.D_CRC), QwoFormat.descriptorCrc(mem + b1));
+                int tsDef = reader.columnDef(b1, 1);
+                Assert.assertEquals("", nameOf(reader.columnNameAddr(tsDef), reader.columnNameLen(tsDef)));
+                int bDef = reader.columnDef(b1, 2);
+                Assert.assertEquals("b", nameOf(reader.columnNameAddr(bDef), reader.columnNameLen(bDef)));
+                Assert.assertEquals(0.5, Unsafe.getUnsafe().getDouble(reader.chunkValuesAddr(reader.firstChunk(bDef), QwpConstants.TYPE_DOUBLE, true)), 0.0);
+
+                // the next row with the same columns lands in the second block
+                append(writer, tb, dict, -1, t -> {
+                    t.getOrCreateColumn("a", QwpConstants.TYPE_LONG, true).addLong(4);
+                    t.getOrCreateDesignatedTimestampColumn(QwpConstants.TYPE_TIMESTAMP).addLong(4);
+                });
+                writer.publish();
+                Assert.assertEquals(2, writer.blockCount());
+                Assert.assertEquals(2, reader.rowCount(b1));
+            }
+        });
+    }
+
+    @Test
+    public void testNoSpaceLeavesRecordUnchanged() throws Exception {
+        withRecord((mem, writer) -> {
+            final int capacity = 64 * 1024;
+            writer.open(mem, capacity, QwpConstants.VERSION, 0, capacity / 32);
+            GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < 4096; i++) {
+                sb.append((char) ('a' + i % 26));
+            }
+            final String wide = sb.toString();
+            byte[] before = new byte[capacity];
+            try (QwpTableBuffer tb = new QwpTableBuffer("wide")) {
+                int appended = 0;
+                while (true) {
+                    final long ts = appended;
+                    stage(tb, t -> {
+                        t.getOrCreateColumn("s", QwpConstants.TYPE_VARCHAR, true).addString(wide);
+                        t.getOrCreateDesignatedTimestampColumn(QwpConstants.TYPE_TIMESTAMP).addLong(ts);
+                    });
+                    int used = writer.usedBytes();
+                    int rows = writer.rowCount();
+                    for (int i = 0; i < capacity; i++) {
+                        before[i] = Unsafe.getUnsafe().getByte(mem + i);
+                    }
+                    int result = writer.appendStagedRow(tb, dict, -1);
+                    tb.clearStagedRow();
+                    if (result == QwoRecordWriter.APPEND_NO_SPACE) {
+                        Assert.assertEquals(used, writer.usedBytes());
+                        Assert.assertEquals(rows, writer.rowCount());
+                        Assert.assertEquals(0, writer.lastRefusedDictBytes());
+                        for (int i = 0; i < capacity; i++) {
+                            if (before[i] != Unsafe.getUnsafe().getByte(mem + i)) {
+                                Assert.fail("refused append changed byte " + i);
+                            }
+                        }
+                        break;
+                    }
+                    Assert.assertEquals(QwoRecordWriter.APPEND_OK, result);
+                    appended++;
+                    writer.publish();
+                    Assert.assertTrue(
+                            writer.usedBytes() + QwoFormat.WIRE_MARGIN_FIXED + QwoFormat.WIRE_MARGIN_PER_BLOCK * writer.blockCount() <= capacity
+                    );
+                }
+                Assert.assertTrue("appended " + appended, appended >= 10);
+                Assert.assertEquals(appended, writer.committedRowCount());
+                QwoRecordReader reader = new QwoRecordReader();
+                reader.of(mem, capacity);
+                Assert.assertEquals(appended, reader.rowCount(reader.firstBlock()));
+            }
+        });
+    }
+
+    @Test
+    public void testNullsSetBitmapBitsAndSkipValues() throws Exception {
+        withRecord((mem, writer) -> {
+            writer.open(mem, REGION, QwpConstants.VERSION, 0, QwoFormat.DEFAULT_DICT_RESERVE);
+            GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+            final boolean[] isNull = {true, false, false, true, false, true};
+            try (QwpTableBuffer tb = new QwpTableBuffer("sparse")) {
+                for (int r = 0; r < isNull.length; r++) {
+                    final int row = r;
+                    append(writer, tb, dict, -1, t -> {
+                        if (!isNull[row]) {
+                            t.getOrCreateColumn("d", QwpConstants.TYPE_DOUBLE, true).addDouble(row * 10.0);
+                        } else if (row == 0) {
+                            // an explicit null; later null rows are padded by nextRow()
+                            t.getOrCreateColumn("d", QwpConstants.TYPE_DOUBLE, true).addNull();
+                        }
+                        t.getOrCreateDesignatedTimestampColumn(QwpConstants.TYPE_TIMESTAMP).addLong(row);
+                    });
+                    if (r == 2) {
+                        writer.publish();
+                    }
+                }
+                writer.publish();
+                QwoRecordReader reader = new QwoRecordReader();
+                reader.of(mem, REGION);
+                int b = reader.firstBlock();
+                Assert.assertEquals(6, reader.rowCount(b));
+                Assert.assertEquals(1, reader.blockCount());
+                int def = reader.columnDef(b, 0);
+                Assert.assertEquals(QwpConstants.TYPE_DOUBLE, reader.columnType(def));
+                Assert.assertTrue(reader.columnUsesBitmap(def));
+                int chunk = reader.firstChunk(def);
+                int row = 0;
+                int values = 0;
+                while (chunk != 0) {
+                    int cap = reader.chunkRowCap(chunk);
+                    long bitmap = reader.chunkBitmapAddr(chunk, true);
+                    long vals = reader.chunkValuesAddr(chunk, QwpConstants.TYPE_DOUBLE, true);
+                    int slot = 0;
+                    for (int i = 0; i < cap && row < 6; i++, row++) {
+                        boolean bit = (Unsafe.getUnsafe().getByte(bitmap + (i >>> 3)) & (1 << (i & 7))) != 0;
+                        Assert.assertEquals("row " + row, isNull[row], bit);
+                        if (!bit) {
+                            Assert.assertEquals(row * 10.0, Unsafe.getUnsafe().getDouble(vals + 8L * slot), 0.0);
+                            slot++;
+                            values++;
+                        }
+                    }
+                    chunk = reader.nextChunk(chunk);
+                }
+                Assert.assertEquals(6, row);
+                Assert.assertEquals(3, values);
+            }
+        });
+    }
+
+    @Test
+    public void testRelocatedChunkIsRelinkedAtPublish() throws Exception {
+        withRecord((mem, writer) -> {
+            writer.open(mem, REGION, QwpConstants.VERSION, 0, QwoFormat.DEFAULT_DICT_RESERVE);
+            GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < 100; i++) {
+                sb.append((char) ('A' + i % 26));
+            }
+            final String[] values = {"a", "bb", sb.toString()};
+            QwoRecordReader reader = new QwoRecordReader();
+            try (QwpTableBuffer tb = new QwpTableBuffer("reloc")) {
+                append(writer, tb, dict, -1, t -> t.getOrCreateColumn("s", QwpConstants.TYPE_VARCHAR, true).addString(values[0]));
+                append(writer, tb, dict, -1, t -> t.getOrCreateColumn("s", QwpConstants.TYPE_VARCHAR, true).addString(values[1]));
+                writer.publish();
+                reader.of(mem, REGION);
+                int b = reader.firstBlock();
+                int def = reader.columnDef(b, 0);
+                int c0 = reader.firstChunk(def);
+                int oldC1 = reader.nextChunk(c0);
+                Assert.assertEquals(2, reader.chunkRowCap(oldC1));
+                int oldByteCap = reader.chunkByteCap(oldC1);
+                Assert.assertTrue(oldByteCap < 2 + 100);
+
+                append(writer, tb, dict, -1, t -> t.getOrCreateColumn("s", QwpConstants.TYPE_VARCHAR, true).addString(values[2]));
+                // not published yet: the published chain still ends in the old chunk
+                Assert.assertEquals(oldC1, reader.nextChunk(c0));
+                Assert.assertEquals(2, reader.rowCount(b));
+                writer.publish();
+
+                Assert.assertEquals(3, reader.rowCount(b));
+                Assert.assertEquals(c0, reader.firstChunk(def));
+                int newC1 = reader.nextChunk(c0);
+                Assert.assertNotEquals(oldC1, newC1);
+                Assert.assertTrue(newC1 > oldC1);
+                Assert.assertEquals(2, reader.chunkRowCap(newC1));
+                Assert.assertEquals(0, reader.nextChunk(newC1));
+                Assert.assertTrue(reader.chunkByteCap(newC1) >= 2 + 100);
+
+                long offsets = reader.chunkOffsetsAddr(newC1, true);
+                long bytesAddr = reader.chunkBytesAddr(newC1, true, reader.chunkRowCap(newC1));
+                Assert.assertEquals(0, Unsafe.getUnsafe().getInt(offsets));
+                Assert.assertEquals(2, Unsafe.getUnsafe().getInt(offsets + 4));
+                Assert.assertEquals(102, Unsafe.getUnsafe().getInt(offsets + 8));
+                Assert.assertEquals("bb", nameOf(bytesAddr, 2));
+                Assert.assertEquals(values[2], nameOf(bytesAddr + 2, 100));
+                Assert.assertEquals("a", nameOf(reader.chunkBytesAddr(c0, true, 1), 1));
+            }
+        });
+    }
+
+    @Test
+    public void testRollbackDropsUncommittedRowsAndChunks() throws Exception {
+        withRecord((mem, writer) -> {
+            writer.open(mem, REGION, QwpConstants.VERSION, 0, QwoFormat.DEFAULT_DICT_RESERVE);
+            GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+            try (QwpTableBuffer tb = new QwpTableBuffer("rb"); QwpTableBuffer late = new QwpTableBuffer("late")) {
+                appendLong(writer, tb, dict, 0);
+                appendLong(writer, tb, dict, 1);
+                writer.publish();
+                int published = writer.usedBytes();
+                QwoRecordReader reader = new QwoRecordReader();
+                reader.of(mem, REGION);
+                Assert.assertEquals(published, reader.usedBytes());
+
+                appendLong(writer, tb, dict, 2);
+                appendLong(writer, tb, dict, 3);
+                appendLong(writer, tb, dict, 4);
+                // a table first seen after the publish gets a block that rollback forgets
+                appendLongTo(writer, late, dict, 99);
+                Assert.assertEquals(6, writer.rowCount());
+                Assert.assertEquals(2, writer.blockCount());
+                Assert.assertTrue(writer.usedBytes() > published);
+                Assert.assertTrue(writer.hasUncommittedRows());
+
+                writer.rollback();
+                Assert.assertEquals(2, writer.rowCount());
+                Assert.assertEquals(2, writer.committedRowCount());
+                Assert.assertEquals(1, writer.blockCount());
+                Assert.assertEquals(published, writer.usedBytes());
+                Assert.assertFalse(writer.hasUncommittedRows());
+                Assert.assertTrue(writer.hasCommittedRows());
+                Assert.assertEquals(-1, late.qwoBlock());
+                Assert.assertEquals(0, tb.qwoBlock());
+
+                // row 2 reuses the free slot of the 2-row chunk, row 3 allocates where the rolled-back chunk was
+                appendLong(writer, tb, dict, 100);
+                Assert.assertEquals(published, writer.usedBytes());
+                appendLong(writer, tb, dict, 101);
+                writer.publish();
+
+                reader.of(mem, REGION);
+                Assert.assertEquals(1, reader.blockCount());
+                int b = reader.firstBlock();
+                Assert.assertEquals(4, reader.rowCount(b));
+                int def = reader.columnDef(b, 0);
+                int c0 = reader.firstChunk(def);
+                int c1 = reader.nextChunk(c0);
+                int c2 = reader.nextChunk(c1);
+                Assert.assertEquals(published, c2);
+                Assert.assertEquals(4, reader.chunkRowCap(c2));
+                Assert.assertEquals(0, Unsafe.getUnsafe().getLong(reader.chunkValuesAddr(c0, QwpConstants.TYPE_LONG, true)));
+                long v1 = reader.chunkValuesAddr(c1, QwpConstants.TYPE_LONG, true);
+                Assert.assertEquals(1, Unsafe.getUnsafe().getLong(v1));
+                Assert.assertEquals(100, Unsafe.getUnsafe().getLong(v1 + 8));
+                Assert.assertEquals(101, Unsafe.getUnsafe().getLong(reader.chunkValuesAddr(c2, QwpConstants.TYPE_LONG, true)));
+
+                // the forgotten table gets a fresh block again
+                appendLongTo(writer, late, dict, 7);
+                Assert.assertEquals(1, late.qwoBlock());
+                Assert.assertEquals(2, writer.blockCount());
+            }
+        });
+    }
+
+    @Test
+    public void testSealWritesFlagsUsedBytesAndZeroesTail() throws Exception {
+        withRecord((mem, writer) -> {
+            writer.open(mem, REGION, QwpConstants.VERSION, 0, QwoFormat.DEFAULT_DICT_RESERVE);
+            QwoRecordReader reader = new QwoRecordReader();
+            reader.of(mem, REGION);
+            Assert.assertEquals(QwoFormat.MAGIC_RECORD, Unsafe.getUnsafe().getInt(mem));
+            Assert.assertEquals(QwpConstants.VERSION, reader.version());
+            Assert.assertEquals(QwpConstants.FLAG_GORILLA | QwpConstants.FLAG_DELTA_SYMBOL_DICT, reader.flags());
+            Assert.assertEquals(REGION, reader.capacity());
+            int headerCrc = Unsafe.getUnsafe().getInt(mem + QwoFormat.OFF_HEADER_CRC);
+            Assert.assertEquals(QwoFormat.headerCrc(mem), headerCrc);
+
+            GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+            try (QwpTableBuffer tb = new QwpTableBuffer("s")) {
+                appendLong(writer, tb, dict, 1);
+                appendLong(writer, tb, dict, 2);
+                writer.publish();
+                int committed = writer.usedBytes();
+                // unpublished rows are not part of the sealed record; row 3 allocates a 4-row chunk
+                appendLong(writer, tb, dict, 3);
+                appendLong(writer, tb, dict, 4);
+                Assert.assertTrue(writer.usedBytes() > committed);
+
+                int used = writer.seal(true);
+                Assert.assertFalse(writer.isOpen());
+                Assert.assertEquals(committed, used);
+                Assert.assertEquals(2, writer.rowCount());
+                reader.of(mem, used);
+                Assert.assertEquals(
+                        QwpConstants.FLAG_DEFER_COMMIT | QwpConstants.FLAG_GORILLA | QwpConstants.FLAG_DELTA_SYMBOL_DICT,
+                        reader.flags()
+                );
+                Assert.assertEquals(used, reader.usedBytes());
+                Assert.assertEquals(1, reader.blockCount());
+                Assert.assertEquals(2, reader.rowCount(reader.firstBlock()));
+                for (int i = used; i < REGION; i++) {
+                    if (Unsafe.getUnsafe().getByte(mem + i) != 0) {
+                        Assert.fail("non-zero byte at " + i);
+                    }
+                }
+                // the header CRC covers only fields fixed at open, so neither publish nor seal rewrote it
+                Assert.assertEquals(headerCrc, Unsafe.getUnsafe().getInt(mem + QwoFormat.OFF_HEADER_CRC));
+                Assert.assertEquals(QwoFormat.headerCrc(mem), headerCrc);
+
+                // a second record over the same memory, sealed without the flag
+                long epoch = writer.epoch();
+                writer.open(mem, REGION, QwpConstants.VERSION, 0, QwoFormat.DEFAULT_DICT_RESERVE);
+                Assert.assertEquals(epoch + 1, writer.epoch());
+                Assert.assertEquals(0, writer.rowCount());
+                appendLong(writer, tb, dict, 5);
+                Assert.assertEquals(0, tb.qwoBlock());
+                writer.publish();
+                writer.seal(false);
+                reader.of(mem, REGION);
+                Assert.assertEquals(QwpConstants.FLAG_GORILLA | QwpConstants.FLAG_DELTA_SYMBOL_DICT, reader.flags());
+                Assert.assertEquals(1, reader.rowCount(reader.firstBlock()));
+            }
+        });
+    }
+
+    @Test
+    public void testVariableSizeChunkRebaseState() throws Exception {
+        withRecord((mem, writer) -> {
+            writer.open(mem, REGION, QwpConstants.VERSION, 0, QwoFormat.DEFAULT_DICT_RESERVE);
+            GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+            final int rows = 40;
+            final String[] values = new String[rows];
+            long total = 0;
+            for (int r = 0; r < rows; r++) {
+                if (r % 7 == 3) {
+                    continue;
+                }
+                int len = (r * 37) % 101;
+                StringBuilder sb = new StringBuilder();
+                for (int i = 0; i < len; i++) {
+                    sb.append((char) ('a' + (r + i) % 26));
+                }
+                values[r] = sb.toString();
+                total += len;
+            }
+            try (QwpTableBuffer tb = new QwpTableBuffer("vs")) {
+                for (int r = 0; r < rows; r++) {
+                    final int row = r;
+                    append(writer, tb, dict, -1, t -> {
+                        if (values[row] != null) {
+                            t.getOrCreateColumn("s", QwpConstants.TYPE_VARCHAR, true).addString(values[row]);
+                        }
+                        t.getOrCreateColumn("n", QwpConstants.TYPE_LONG, true).addLong(row);
+                    });
+                    if (r % 5 == 4) {
+                        writer.publish();
+                    }
+                }
+                QwoRecordReader reader = new QwoRecordReader();
+                reader.of(mem, REGION);
+                int b = reader.firstBlock();
+                Assert.assertEquals(rows, reader.rowCount(b));
+                int def = reader.columnDef(b, 0);
+                Assert.assertEquals(QwpConstants.TYPE_VARCHAR, reader.columnType(def));
+                int chunk = reader.firstChunk(def);
+                int row = 0;
+                long sum = 0;
+                int chunks = 0;
+                while (chunk != 0) {
+                    int cap = reader.chunkRowCap(chunk);
+                    long bitmap = reader.chunkBitmapAddr(chunk, true);
+                    long offsets = reader.chunkOffsetsAddr(chunk, true);
+                    long bytes = reader.chunkBytesAddr(chunk, true, cap);
+                    Assert.assertEquals(0, Unsafe.getUnsafe().getInt(offsets));
+                    int slot = 0;
+                    for (int i = 0; i < cap && row < rows; i++, row++) {
+                        boolean isNull = (Unsafe.getUnsafe().getByte(bitmap + (i >>> 3)) & (1 << (i & 7))) != 0;
+                        Assert.assertEquals("row " + row, values[row] == null, isNull);
+                        if (!isNull) {
+                            int start = Unsafe.getUnsafe().getInt(offsets + 4L * slot);
+                            int end = Unsafe.getUnsafe().getInt(offsets + 4L * (slot + 1));
+                            Assert.assertTrue(end <= reader.chunkByteCap(chunk));
+                            Assert.assertEquals("row " + row, values[row], nameOf(bytes + start, end - start));
+                            slot++;
+                        }
+                    }
+                    sum += Unsafe.getUnsafe().getInt(offsets + 4L * slot);
+                    chunks++;
+                    chunk = reader.nextChunk(chunk);
+                }
+                Assert.assertEquals(rows, row);
+                Assert.assertEquals(total, sum);
+                Assert.assertTrue(chunks > 3);
+            }
+        });
+    }
+
+    private static void append(
+            QwoRecordWriter writer,
+            QwpTableBuffer tb,
+            GlobalSymbolDictionary dict,
+            int batchMaxSymbolId,
+            Consumer<QwpTableBuffer> row
+    ) {
+        stage(tb, row);
+        Assert.assertEquals(QwoRecordWriter.APPEND_OK, writer.appendStagedRow(tb, dict, batchMaxSymbolId));
+        tb.clearStagedRow();
+        Assert.assertEquals(0, tb.getRowCount());
+    }
+
+    private static void appendLong(QwoRecordWriter writer, QwpTableBuffer tb, GlobalSymbolDictionary dict, long value) {
+        append(writer, tb, dict, -1, t -> t.getOrCreateColumn("v", QwpConstants.TYPE_LONG, true).addLong(value));
+    }
+
+    private static void appendLongTo(QwoRecordWriter writer, QwpTableBuffer tb, GlobalSymbolDictionary dict, long value) {
+        append(writer, tb, dict, -1, t -> t.getOrCreateColumn("w", QwpConstants.TYPE_LONG, true).addLong(value));
+    }
+
+    private static String nameOf(long addr, int len) {
+        byte[] b = new byte[len];
+        for (int i = 0; i < len; i++) {
+            b[i] = Unsafe.getUnsafe().getByte(addr + i);
+        }
+        return new String(b, StandardCharsets.UTF_8);
+    }
+
+    private static void stage(QwpTableBuffer tb, Consumer<QwpTableBuffer> row) {
+        row.accept(tb);
+        tb.nextRow();
+        Assert.assertEquals(1, tb.getRowCount());
+    }
+
+    private static void withRecord(RecordCode code) throws Exception {
+        assertMemoryLeak(() -> {
+            long mem = Unsafe.malloc(REGION, MemoryTag.NATIVE_DEFAULT);
+            try (QwoRecordWriter writer = new QwoRecordWriter()) {
+                // garbage, so nothing relies on zeroed memory
+                Unsafe.getUnsafe().setMemory(mem, REGION, (byte) 0x5A);
+                code.run(mem, writer);
+            } finally {
+                Unsafe.free(mem, REGION, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @FunctionalInterface
+    private interface RecordCode {
+        void run(long mem, QwoRecordWriter writer) throws Exception;
+    }
+}

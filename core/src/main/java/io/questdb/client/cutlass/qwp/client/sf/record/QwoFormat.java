@@ -37,7 +37,11 @@ import io.questdb.client.std.Unsafe;
  * <p>
  * Descriptor: after {@code D_NAME}'s varint-prefixed table name come
  * {@code colCount} column defs, each
- * {@code [varint nameLen][name][u8 type][u8 prefixKind][u8 prefix0][u8 prefix1][u8 bitmap][u32 firstChunkOffset]}.
+ * {@code [varint nameLen][name][u8 type][u8 prefixKind][u8 prefix0][u8 prefix1][u8 bitmap][u32 firstChunkOffset]};
+ * the {@code COL_*} offsets are relative to the type byte that follows the name.
+ * {@code prefixKind} stays {@link #PREFIX_NONE} until the GEOHASH precision or
+ * DECIMAL scale is known; the writer then stores the kind, the varint value and
+ * the unchanged bitmap byte with one 4-byte store.
  * <p>
  * Chunk data after {@code C_DATA}: a bitmap of {@code ceil(rowCap/8)} bytes when
  * the column uses one, then the values (fixed: {@code rowCap * width}; BOOLEAN:
@@ -45,6 +49,12 @@ import io.questdb.client.std.Unsafe;
  * {@code (rowCap + 1) * 4} offsets followed by {@code byteCap} bytes).
  */
 public final class QwoFormat {
+    public static final int COL_BITMAP = 4;
+    public static final int COL_FIRST_CHUNK = 5;
+    public static final int COL_FIXED_SIZE = 9;
+    public static final int COL_PREFIX = 2;
+    public static final int COL_PREFIX_KIND = 1;
+    public static final int COL_TYPE = 0;
     public static final int C_BYTE_CAP = 8;
     public static final int C_DATA = 12;
     public static final int C_NEXT = 0;
@@ -111,15 +121,41 @@ public final class QwoFormat {
     }
 
     /**
-     * CRC32C over the header bytes {@code [0,12)} and {@code [16,48)}, skipping
-     * the CRC field itself.
+     * CRC32C over the descriptor at {@code descAddr}, excluding the fields that
+     * change after the descriptor is first published: {@code D_CRC} itself,
+     * {@code D_NEXT}, {@code D_ROW_WORD} and the three prefix bytes
+     * ({@code prefixKind}, {@code prefix0}, {@code prefix1}) of every column def.
+     * It covers {@code D_COL_COUNT}, {@code D_FLAGS}, the table name and, per
+     * column def, the name, the type, the bitmap byte and the first chunk offset.
+     * The caller guarantees the descriptor lies in readable memory.
+     */
+    public static int descriptorCrc(long descAddr) {
+        int colCount = Unsafe.getUnsafe().getShort(descAddr + D_COL_COUNT) & 0xFFFF;
+        int crc = Crc32c.updateUnsafe(Crc32c.INIT, descAddr + D_COL_COUNT, D_ROW_WORD - D_COL_COUNT);
+        long segment = descAddr + D_NAME;
+        long p = skipString(segment);
+        for (int i = 0; i < colCount; i++) {
+            p = skipString(p) + COL_PREFIX_KIND;
+            crc = Crc32c.updateUnsafe(crc, segment, p - segment);
+            segment = p + (COL_BITMAP - COL_PREFIX_KIND);
+            p = segment + (COL_FIXED_SIZE - COL_BITMAP);
+        }
+        return Crc32c.updateUnsafe(crc, segment, p - segment);
+    }
+
+    /**
+     * CRC32C over the header fields {@code open()} writes and nothing changes
+     * later: magic and version {@code [0,5)}, capacity {@code [8,12)}, the
+     * dictionary region, its capacity and the start id {@code [20,32)}, and the
+     * reserved word {@code [44,48)}. It excludes the flags (the seal may add
+     * DEFER_COMMIT), blockCount, the CRC itself, firstBlock, dictWord and
+     * usedBytes, so the CRC is stored once at open and never again.
      */
     public static int headerCrc(long payloadAddr) {
-        return Crc32c.updateUnsafe(
-                Crc32c.updateUnsafe(Crc32c.INIT, payloadAddr, OFF_HEADER_CRC),
-                payloadAddr + OFF_FIRST_BLOCK,
-                HEADER_SIZE - OFF_FIRST_BLOCK
-        );
+        int crc = Crc32c.updateUnsafe(Crc32c.INIT, payloadAddr, OFF_FLAGS);
+        crc = Crc32c.updateUnsafe(crc, payloadAddr + OFF_CAPACITY, OFF_HEADER_CRC - OFF_CAPACITY);
+        crc = Crc32c.updateUnsafe(crc, payloadAddr + OFF_DICT_REGION, OFF_DICT_WORD - OFF_DICT_REGION);
+        return Crc32c.updateUnsafe(crc, payloadAddr + OFF_RESERVED, HEADER_SIZE - OFF_RESERVED);
     }
 
     public static boolean isRecordPayload(long payloadAddr, int payloadLen) {
@@ -191,5 +227,38 @@ public final class QwoFormat {
             default:
                 throw new IllegalArgumentException("not a fixed-size type: " + type);
         }
+    }
+
+    /**
+     * Decodes an unsigned LEB128 varint of at most 5 bytes at {@code addr}.
+     */
+    static int readVarint(long addr) {
+        int value = 0;
+        for (int i = 0; i < 5; i++) {
+            byte b = Unsafe.getUnsafe().getByte(addr + i);
+            value |= (b & 0x7F) << (7 * i);
+            if (b >= 0) {
+                break;
+            }
+        }
+        return value;
+    }
+
+    /**
+     * Returns the address after the {@code [varint len][bytes]} string at {@code addr}.
+     */
+    static long skipString(long addr) {
+        return addr + varintLength(addr) + readVarint(addr);
+    }
+
+    /**
+     * Returns the encoded length, 1 to 5 bytes, of the varint at {@code addr}.
+     */
+    static int varintLength(long addr) {
+        int n = 1;
+        while (n < 5 && Unsafe.getUnsafe().getByte(addr + n - 1) < 0) {
+            n++;
+        }
+        return n;
     }
 }
