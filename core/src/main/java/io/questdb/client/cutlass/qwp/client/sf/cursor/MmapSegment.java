@@ -633,6 +633,24 @@ public final class MmapSegment implements QuietCloseable {
         }
     }
 
+    /**
+     * True when the last successful {@link #syncPublished()} left nothing for
+     * the next one to flush: every published byte is durable, no record is
+     * reserved, and no reserve, seal or abandon has changed bytes above the
+     * published cursor since. Stricter than {@link #isPublishedDurable()},
+     * which ignores those changes; the ring gates rotation and the periodic
+     * barrier's proven-durable prefix on this, so an abandoned record's zeroes
+     * reach the disk before its segment is sealed. Reads reservedOffset before
+     * dirtyMarks, as the barrier does, and syncedDirtyMarks before
+     * durableCursor, the reverse of the order the barrier writes them, so a
+     * caller that sees a barrier's marks also sees its durable cursor.
+     */
+    public boolean isDurable() {
+        return reservedOffset < 0
+                && dirtyMarks == syncedDirtyMarks
+                && durableCursor >= publishedCursor;
+    }
+
     public boolean isFull() {
         return capacityRemaining() <= 0;
     }
@@ -693,6 +711,7 @@ public final class MmapSegment implements QuietCloseable {
         long published = publishedCursor;
         if (memoryBacked) {
             durableCursor = published;
+            syncedDirtyMarks = dirtyMarks;
             return published;
         }
         // The producer stores the extent and the marks (markDirty) before
@@ -768,6 +787,17 @@ public final class MmapSegment implements QuietCloseable {
      * writing right now; an atomic add of zero dirties it without losing a
      * concurrent store.
      */
+    private void redirtyRange(long fromAddr, long publishedAddr, long endAddr) {
+        for (long addr = fromAddr; addr < endAddr; addr += Files.PAGE_SIZE) {
+            if (addr < publishedAddr) {
+                Unsafe.getUnsafe().putByte(addr, Unsafe.getUnsafe().getByte(addr));
+            } else {
+                Unsafe.getUnsafe().getAndAddInt(null, addr, 0);
+            }
+        }
+        redirtyPasses++;
+    }
+
     /**
      * Seals the open record at {@code off} on the mapping: zeroes
      * {@code [off + 8 + usedBytes, off + 8 + capacity)}, stores the length,
@@ -778,17 +808,6 @@ public final class MmapSegment implements QuietCloseable {
         Unsafe.getUnsafe().setMemory(payload + usedBytes, capacity - usedBytes, (byte) 0);
         Unsafe.getUnsafe().putInt(mmapAddress + off + 4, usedBytes);
         Unsafe.getUnsafe().putInt(mmapAddress + off, QwoFormat.STATE_SEALED);
-    }
-
-    private void redirtyRange(long fromAddr, long publishedAddr, long endAddr) {
-        for (long addr = fromAddr; addr < endAddr; addr += Files.PAGE_SIZE) {
-            if (addr < publishedAddr) {
-                Unsafe.getUnsafe().putByte(addr, Unsafe.getUnsafe().getByte(addr));
-            } else {
-                Unsafe.getUnsafe().getAndAddInt(null, addr, 0);
-            }
-        }
-        redirtyPasses++;
     }
 
     @TestOnly

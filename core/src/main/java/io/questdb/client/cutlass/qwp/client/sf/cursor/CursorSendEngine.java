@@ -85,12 +85,12 @@ public final class CursorSendEngine implements QuietCloseable {
             DEFAULT_FLOCK_RELEASE_RETRY_THREAD_FACTORY;
     private final long appendDeadlineNanos;
     // Sender-lifetime observability counters; only backpressureStalls is used
-    // here: one increment per blocking appendBlocking call that had to wait
-    // for the manager (or for ACKs), not one per spin-park. Producer-thread
-    // writer; any thread may read it. A fresh instance by default;
-    // QwpWebSocketSender hands every engine it attaches its own shared
-    // instance via adoptCounters(), so a symbol-dictionary recycle's rebuilt
-    // engine keeps counting where the outgoing one stopped.
+    // here: one increment per blocking appendBlocking or reserveRecordBlocking
+    // call that had to wait for the manager (or for ACKs), not one per
+    // spin-park. Producer-thread writer; any thread may read it. A fresh
+    // instance by default; QwpWebSocketSender hands every engine it attaches
+    // its own shared instance via adoptCounters(), so a symbol-dictionary
+    // recycle's rebuilt engine keeps counting where the outgoing one stopped.
     private CursorSendCounters counters = new CursorSendCounters();
     // Constructed before an owned manager acquires its native path scratch, so
     // callback allocation failure cannot orphan manager resources. A timed-out
@@ -885,6 +885,15 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
+     * Gives back the record reserved at {@code envelopeOffset}; see
+     * {@link SegmentRing#abandonRecord(long)}. Only for a record without
+     * committed rows. Producer thread only.
+     */
+    public void abandonRecord(long envelopeOffset) {
+        ring.abandonRecord(envelopeOffset);
+    }
+
+    /**
      * I/O thread accessor: highest FSN safe to send.
      */
     public long ackedFsn() {
@@ -944,26 +953,8 @@ public final class CursorSendEngine implements QuietCloseable {
         long deadlineNs = System.nanoTime() + appendDeadlineNanos;
         boolean hasClearedInterrupt = false;
         try {
-            // parkNanos returns at once while the interrupt flag is set, so the wait
-            // clears the flag before each park and restores it on exit.
             while (true) {
-                long now = System.nanoTime();
-                if (now >= deadlineNs) {
-                    throw new io.questdb.client.cutlass.line.LineSenderException(
-                            "cursor ring backpressured for ").put(appendDeadlineNanos / 1_000_000L)
-                            .put(" ms - wire path is not draining (server slow / disconnected, "
-                                    + "periodic disk sync is slow, or sf_max_total_bytes is too small)");
-                }
-                if (now - lastBackpressureLogNs >= BACKPRESSURE_LOG_THROTTLE_NANOS) {
-                    lastBackpressureLogNs = now;
-                    LOG.warn("cursor producer backpressured ({} stalls so far); waiting for I/O or periodic disk sync; "
-                                    + "will throw after {} ms",
-                            counters.backpressureStalls.get(), appendDeadlineNanos / 1_000_000L);
-                }
-                if (Thread.interrupted()) {
-                    hasClearedInterrupt = true;
-                }
-                LockSupport.parkNanos(50_000L); // 50 µs
+                hasClearedInterrupt |= parkWhileBackpressured(deadlineNs);
                 fsn = ring.appendOrFsn(payloadAddr, payloadLen);
                 if (fsn >= 0) return fsn;
                 if (fsn == SegmentRing.PAYLOAD_TOO_LARGE) {
@@ -1479,6 +1470,34 @@ public final class CursorSendEngine implements QuietCloseable {
         return this::completeDeferredClose;
     }
 
+    /**
+     * One wait step of a blocking producer call under backpressure: throws
+     * the backpressure {@link io.questdb.client.cutlass.line.LineSenderException}
+     * once {@code deadlineNs} has passed, logs the throttled WARN, then parks
+     * 50 us. {@code parkNanos} returns at once while the interrupt flag is
+     * set, so the step clears the flag first; it returns whether it did, and
+     * the caller restores the flag on exit.
+     */
+    private boolean parkWhileBackpressured(long deadlineNs) {
+        long now = System.nanoTime();
+        if (now >= deadlineNs) {
+            throw new io.questdb.client.cutlass.line.LineSenderException(
+                    "cursor ring backpressured for ").put(appendDeadlineNanos / 1_000_000L)
+                    .put(" ms - wire path is not draining (server slow / disconnected, "
+                            + "periodic disk sync is slow, or sf_max_total_bytes is too small)");
+        }
+        if (now - lastBackpressureLogNs >= BACKPRESSURE_LOG_THROTTLE_NANOS) {
+            lastBackpressureLogNs = now;
+            long stalls = counters.backpressureStalls.get();
+            LOG.warn("cursor producer backpressured ({} stalls so far); waiting for I/O or periodic disk sync; "
+                            + "will throw after {} ms",
+                    stalls, appendDeadlineNanos / 1_000_000L);
+        }
+        boolean hasClearedInterrupt = Thread.interrupted();
+        LockSupport.parkNanos(50_000L); // 50 us
+        return hasClearedInterrupt;
+    }
+
     private boolean retryFlockReleaseIfReady() {
         if (closeCompleted) {
             return true;
@@ -1808,8 +1827,8 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
-     * Number of times {@link #appendBlocking} hit
-     * {@link SegmentRing#BACKPRESSURE_NO_SPARE} on its first attempt and
+     * Number of times {@link #appendBlocking} or {@link #reserveRecordBlocking}
+     * hit {@link SegmentRing#BACKPRESSURE_NO_SPARE} on its first attempt and
      * had to wait for the segment manager (or for ACKs) to free space.
      * One increment per blocking-call, not per spin-park. Cumulative, and
      * carried across a symbol-dictionary recycle once the owning sender has
@@ -1817,6 +1836,14 @@ public final class CursorSendEngine implements QuietCloseable {
      */
     public long getTotalBackpressureStalls() {
         return counters.backpressureStalls.get();
+    }
+
+    /**
+     * True while a record is reserved in the active segment; see
+     * {@link SegmentRing#hasReservedRecord()}. Producer thread only.
+     */
+    public boolean hasReservedRecord() {
+        return ring.hasReservedRecord();
     }
 
     /**
@@ -1854,6 +1881,93 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
+     * Address of the payload of the record reserved at
+     * {@code envelopeOffset}, where the producer writes it. A reserved
+     * record always lies in the active segment. Producer thread only.
+     */
+    public long recordPayloadAddress(long envelopeOffset) {
+        return ring.getActive().payloadAddress(envelopeOffset);
+    }
+
+    /**
+     * Reserves a record of up to {@code maxPayloadCapacity} payload bytes and
+     * returns its envelope offset, blocking like {@link #appendBlocking} while
+     * the ring is backpressured: the first miss counts one stall, the wait
+     * parks 50 us at a time, and once {@code appendDeadlineNanos} passes it
+     * throws the same {@link io.questdb.client.cutlass.line.LineSenderException}.
+     * See {@link SegmentRing#reserveRecord(int)}. Producer thread only.
+     *
+     * @throws MmapSegmentException when even a fresh segment cannot hold the
+     *                              minimum reservation
+     */
+    public long reserveRecordBlocking(int maxPayloadCapacity) {
+        long off = ring.reserveRecord(maxPayloadCapacity);
+        if (off >= 0) {
+            return off;
+        }
+        if (off == SegmentRing.PAYLOAD_TOO_LARGE) {
+            throw new MmapSegmentException("record reservation too large for segment");
+        }
+        counters.backpressureStalls.incrementAndGet();
+        long deadlineNs = System.nanoTime() + appendDeadlineNanos;
+        boolean hasClearedInterrupt = false;
+        try {
+            while (true) {
+                hasClearedInterrupt |= parkWhileBackpressured(deadlineNs);
+                off = ring.reserveRecord(maxPayloadCapacity);
+                if (off >= 0) {
+                    return off;
+                }
+                if (off == SegmentRing.PAYLOAD_TOO_LARGE) {
+                    throw new MmapSegmentException("record reservation too large for segment");
+                }
+            }
+        } finally {
+            if (hasClearedInterrupt) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    /**
+     * Reserves a record like {@link #reserveRecordBlocking}, but spins only
+     * until {@code spinDeadlineNanos} while backpressured, as
+     * {@link #appendOrFsn(long, int, long)} does. Returns the envelope offset,
+     * {@link SegmentRing#BACKPRESSURE_NO_SPARE} when the spin ran out, or
+     * {@link SegmentRing#PAYLOAD_TOO_LARGE}.
+     */
+    public long reserveRecordOrFsn(int maxPayloadCapacity, long spinDeadlineNanos) {
+        long off = ring.reserveRecord(maxPayloadCapacity);
+        if (off >= 0 || off == SegmentRing.PAYLOAD_TOO_LARGE) {
+            return off;
+        }
+        while (System.nanoTime() < spinDeadlineNanos) {
+            Compat.onSpinWait();
+            off = ring.reserveRecord(maxPayloadCapacity);
+            if (off >= 0 || off == SegmentRing.PAYLOAD_TOO_LARGE) {
+                return off;
+            }
+        }
+        return SegmentRing.BACKPRESSURE_NO_SPARE;
+    }
+
+    /**
+     * Payload capacity of the reserved record; 0 when none is reserved.
+     */
+    public int reservedRecordCapacity() {
+        return ring.reservedCapacity();
+    }
+
+    /**
+     * Seals the record reserved at {@code envelopeOffset} at {@code usedBytes}
+     * payload bytes, publishes it and returns its FSN; see
+     * {@link SegmentRing#sealRecord(long, int)}. Producer thread only.
+     */
+    public long sealRecord(long envelopeOffset, int usedBytes) {
+        return ring.sealRecord(envelopeOffset, usedBytes);
+    }
+
+    /**
      * I/O thread accessor: sealed segments waiting to drain. Direct view —
      * NOT thread-safe under producer-thread rotation. The I/O loop should
      * use {@link #sealedSegmentsSnapshot(MmapSegment[])} instead.
@@ -1869,6 +1983,14 @@ public final class CursorSendEngine implements QuietCloseable {
      */
     public int sealedSegmentsSnapshot(MmapSegment[] target) {
         return ring.snapshotSealedSegments(target);
+    }
+
+    /**
+     * Payload bytes one record can take in a fresh segment: the configured
+     * segment size less the segment header and one frame envelope.
+     */
+    public long segmentPayloadCapacity() {
+        return segmentSizeBytes - MmapSegment.HEADER_SIZE - MmapSegment.FRAME_HEADER_SIZE;
     }
 
     /**

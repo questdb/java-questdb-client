@@ -24,6 +24,8 @@
 
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.sf.record.QwoFormat;
+import io.questdb.client.cutlass.qwp.client.sf.record.QwoValidator;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.ObjList;
@@ -41,7 +43,9 @@ import java.util.IdentityHashMap;
  * oldest sealed segments. Built for the cursor engine's split-brain threading:
  * <ul>
  *   <li><b>Producer thread</b> (single user thread): {@link #appendOrFsn},
- *       {@link #installHotSpare}, {@link #publishedFsn}.</li>
+ *       the record path ({@link #reserveRecord}, {@link #sealRecord},
+ *       {@link #abandonRecord}), {@link #installHotSpare},
+ *       {@link #publishedFsn}.</li>
  *   <li><b>I/O thread</b>: {@link #publishedFsn} (read-only), {@link #acknowledge}
  *       (single writer), and one pinned segment cursor for native reads.</li>
  *   <li><b>Segment manager</b>: polls {@link #needsHotSpare}, hands new
@@ -58,6 +62,14 @@ import java.util.IdentityHashMap;
  * available. The caller (engine) is expected to spin-park until the segment
  * manager catches up, OR until {@link #acknowledge} advances {@link #ackedFsn}
  * far enough that the segment manager can recycle a sealed segment.
+ * {@link #reserveRecord} reports the same sentinels when the record does not
+ * fit in the active segment and no rotation is possible.
+ * <p>
+ * <b>Records:</b> the producer reserves a QWO1 record in the active segment,
+ * fills it in place and seals it later, which assigns its FSN exactly as
+ * {@link #appendOrFsn} assigns a frame's; or it abandons the record. While a
+ * record is reserved nothing else is appended and the ring never rotates, so
+ * a sealed segment never holds an open record.
  */
 public final class SegmentRing implements QuietCloseable {
 
@@ -97,13 +109,17 @@ public final class SegmentRing implements QuietCloseable {
     // looks at sealedSegments after observing a higher ackedFsn, by which
     // point the producer thread's add to sealedSegments has retired.
     private final ObjList<MmapSegment> sealedSegments = new ObjList<>();
+    // Payload bytes one record could take in a fresh segment of
+    // maxBytesPerSegment: the segment less its header and one envelope.
+    private final long segmentPayloadCapacity;
     // Logical head of sealedSegments. Head removal nulls one entry and advances
     // this index; occasional compaction bounds unused prefix slots.
     private int sealedHead;
     // Frontier index into sealedSegments: every sealed segment in
     // [sealedHead, firstNonDurableSealed) has been proven durable by an earlier
-    // periodic pass and never needs re-scanning -- publishedCursor is frozen at
-    // seal and durableCursor only advances, so durability never regresses. The
+    // periodic pass and never needs re-scanning -- publishedCursor and the
+    // record dirty marks are frozen at seal and durableCursor only advances,
+    // so durability (MmapSegment.isDurable) never regresses. The
     // periodic sync (copyPendingSyncSegments) skips this proven-durable prefix,
     // keeping the steady-state copy-under-monitor O(1) instead of O(live-sealed)
     // work that would otherwise grow with a producer-outpaces-drain backlog.
@@ -178,6 +194,7 @@ public final class SegmentRing implements QuietCloseable {
         // 3/4 of capacity gives the manager a full quarter-segment of producer
         // runway before backpressure kicks in. Long math, no float, no alloc.
         this.signalAtBytes = (maxBytesPerSegment >> 2) * 3;
+        this.segmentPayloadCapacity = maxBytesPerSegment - MmapSegment.HEADER_SIZE - MmapSegment.FRAME_HEADER_SIZE;
         this.nextSeq = initialActive.baseSeq() + initialActive.frameCount();
         this.publishedFsn = nextSeq - 1;
     }
@@ -351,7 +368,13 @@ public final class SegmentRing implements QuietCloseable {
             for (int i = 0, n = all.size(); i < n; i++) {
                 MmapSegment segment = all.get(i);
                 requiresManifest |= segment.manifestRequired();
-                if (segment.frameCount() > 0) {
+                // A recoverable open record holds committed rows, so a
+                // segment holding nothing else is data, not a torn empty.
+                // Only the active can hold one: the chain checks below place
+                // it, recovery seals it there before sanitizing the active,
+                // and checkSealedMembersForOpenRecords fails closed on it
+                // anywhere else in the chain.
+                if (segment.frameCount() > 0 || segment.hasRecoverableOpenRecord()) {
                     data.add(segment);
                 }
             }
@@ -398,7 +421,9 @@ public final class SegmentRing implements QuietCloseable {
                             // segment whose frame[0] failed: bytes were written to
                             // it, so it is not an untouched spare. Its header IS
                             // readable, so its position is provable -- refuse only
-                            // when it really sat below the chain head.
+                            // when it really sat below the chain head. That covers
+                            // a segment holding only an invalid or row-less open
+                            // record; one with a recoverable record is in data.
                             if (segment.frameCount() == 0
                                     && segment.tornTailBytes() > 0
                                     && segment.baseSeq() < legacyChainStart) {
@@ -417,6 +442,7 @@ public final class SegmentRing implements QuietCloseable {
                     active = chain.get(chain.size() - 1);
                     headBase = chain.get(0).baseSeq();
                     activeBase = active.baseSeq();
+                    checkSealedMembersForOpenRecords(chain);
                     // Legacy sealed members carrying pre-manifest torn
                     // residue: contiguity just proved their frame accounting
                     // complete, so the residue is dead bytes. Zero it now
@@ -596,7 +622,10 @@ public final class SegmentRing implements QuietCloseable {
                 // surfaced; the restart then proves the chain clean. A tear
                 // that DID cost frames never gets here: the contiguity or
                 // boundary checks above throw first, with every byte left
-                // on disk for operator extraction.
+                // on disk for operator extraction. An open record that
+                // could hold committed rows fails closed first, before this
+                // sanitize could zero it.
+                checkSealedMembersForOpenRecords(chain);
                 sanitizeSealedResidue(chain, true);
                 for (int i = 0, n = chain.size(); i < n; i++) {
                     chain.get(i).markManifestRequired();
@@ -657,6 +686,15 @@ public final class SegmentRing implements QuietCloseable {
             // cannot cross the tear, and preserving the bytes would trade
             // the two hazards above for data no recovery path can use (see
             // sanitizeTornTail).
+            //
+            // A crash before the active's open record was sealed leaves the
+            // record in that residue. Seal it first when it holds committed
+            // rows: it then counts as the active's last frame, takes the next
+            // FSN, and the sanitize below zeroes only what lies past it. An
+            // invalid or row-less open record stays residue and is zeroed.
+            if (active.hasRecoverableOpenRecord()) {
+                active.sealRecoveredOpenRecord();
+            }
             active.sanitizeTornTail();
             for (int i = 1, n = chain.size(); i < n; i++) {
                 chain.get(i - 1).linkSuccessor(chain.get(i));
@@ -719,10 +757,36 @@ public final class SegmentRing implements QuietCloseable {
     }
 
     /**
+     * Fails recovery closed when a sealed member of {@code chain} (every
+     * element but the last, the active) holds an open record that is
+     * recoverable or failed validation. The ring seals or abandons a record
+     * before it rotates, so such a record never belonged to the chain, yet it
+     * may hold committed rows: {@code sanitizeSealedResidue} would zero them
+     * as dead residue. The check runs before that sanitize, so the bytes stay
+     * on disk for operator extraction. A valid open record without committed
+     * rows carries nothing and is left to the sanitize.
+     */
+    private static void checkSealedMembersForOpenRecords(ObjList<MmapSegment> chain) {
+        for (int i = 0, n = chain.size() - 1; i < n; i++) {
+            MmapSegment sealed = chain.get(i);
+            if (sealed.hasRecoverableOpenRecord() || sealed.hasInvalidOpenRecord()) {
+                throw new SfRecoveryException("open record at offset " + sealed.recoveredOpenRecordOffset()
+                        + " in sealed SF segment " + sealed.path() + " ("
+                        + (sealed.hasRecoverableOpenRecord()
+                        ? sealed.recoveredOpenRecordRows() + " committed rows"
+                        : "invalid: " + sealed.recoveredOpenRecordDetail())
+                        + "); only the active segment may hold one, so the segment is left on disk as found");
+            }
+        }
+    }
+
+    /**
      * Picks the clean (untorn) empty segment to reuse as a legacy slot's
      * initial active, preferring {@code sf-initial.sfa}. Returns {@code null}
      * when no clean empty exists; torn empties are never reused here because
-     * their bytes are quarantine evidence, not blank space.
+     * their bytes are quarantine evidence, not blank space. A segment holding
+     * only a recoverable open record never gets here: recovery counts it as
+     * data. One holding only an invalid or row-less open record is torn.
      */
     private static MmapSegment chooseEmptyInitial(ObjList<MmapSegment> all, String sfDir) {
         String initialPath = sfDir + "/sf-initial.sfa";
@@ -816,8 +880,9 @@ public final class SegmentRing implements QuietCloseable {
      * <ol>
      *   <li>a segment with recovered frames (the durable chain tail);</li>
      *   <li>an empty segment with a torn tail (the promoted active whose
-     *       first frame write was cut short — an attempted write marks it as
-     *       the one rotation actually exposed);</li>
+     *       first frame write was cut short, or whose first record was not
+     *       sealed before the crash — an attempted write marks it as the one
+     *       rotation actually exposed);</li>
      *   <li>a clean empty segment.</li>
      * </ol>
      * Multiple equivalent empties at the same base are NOT an error: a fresh
@@ -848,6 +913,17 @@ public final class SegmentRing implements QuietCloseable {
             }
         }
         return tornEmpty != null ? tornEmpty : cleanEmpty;
+    }
+
+    /**
+     * True when the record reserved at {@code envelopeOffset} in
+     * {@code segment} validates as an open record with committed rows. Cold:
+     * {@link #abandonRecord} asserts it, and validation allocates.
+     */
+    private static boolean hasCommittedRows(MmapSegment segment, long envelopeOffset) {
+        QwoValidator validator = new QwoValidator();
+        return validator.validateOpen(segment.payloadAddress(envelopeOffset), segment.reservedCapacity())
+                && validator.committedRows() > 0;
     }
 
     private static void validateContiguous(ObjList<MmapSegment> segments) {
@@ -959,6 +1035,24 @@ public final class SegmentRing implements QuietCloseable {
     }
 
     /**
+     * Gives back the record reserved at {@code envelopeOffset}: the active
+     * segment zeroes its envelope and moves its append cursor back, so the
+     * next frame or record reuses the space. The record never had an FSN.
+     * The caller abandons only a record without committed rows, which an
+     * earlier barrier may already have made durable (the sender enforces it);
+     * with assertions enabled the ring checks it before touching the record.
+     * Producer thread only.
+     *
+     * @throws IllegalStateException when no record is reserved at {@code envelopeOffset}
+     */
+    public void abandonRecord(long envelopeOffset) {
+        MmapSegment target = active;
+        assert target.reservedOffset() != envelopeOffset || !hasCommittedRows(target, envelopeOffset)
+                : "record at offset " + envelopeOffset + " holds committed rows and must be sealed, not abandoned";
+        target.abandonReserved(envelopeOffset);
+    }
+
+    /**
      * Highest FSN that the server has ACK'd. Read by the segment manager to
      * decide which sealed segments are safe to munmap + unlink.
      */
@@ -977,8 +1071,9 @@ public final class SegmentRing implements QuietCloseable {
      * the producer has actually written. If we didn't clamp, the segment
      * manager could trim segments the I/O thread is still iterating and SEGV
      * the JVM on the next {@code Unsafe.getInt} of an unmapped region. The
-     * clamp never drops a legitimate ACK: {@link #appendOrFsn} publishes a
-     * frame's FSN before the I/O thread can see, and send, the frame.
+     * clamp never drops a legitimate ACK: {@link #appendOrFsn} and
+     * {@link #sealRecord} publish a frame's FSN before the I/O thread can see,
+     * and send, the frame.
      *
      * @return {@code true} if the watermark advanced, {@code false} on
      *         no-op (idempotent re-ack or clamped). Callers wishing to fire
@@ -1012,113 +1107,23 @@ public final class SegmentRing implements QuietCloseable {
     public long appendOrFsn(long payloadAddr, int payloadLen) {
         checkDurability();
         MmapSegment target = active;
+        if (target.reservedOffset() >= 0) {
+            throw new IllegalStateException("record reserved");
+        }
         boolean rotated = false;
         if (target.tryWrite(payloadAddr, payloadLen) == -1L) {
             // Active is full. Try to rotate.
-            MmapSegment spare = hotSpare;
-            if (spare == null) {
+            target = rotateActive();
+            if (target == null) {
                 return BACKPRESSURE_NO_SPARE;
             }
-            // Periodic mode must make the predecessor's complete published
-            // range durable before the manifest can name its successor. The
-            // manager performs the barrier; the producer uses the existing
-            // backpressure path while it waits.
-            MmapSegment previous = target;
-            if (requestSyncBeforeRotation(previous)) {
-                wakeManager();
-                return BACKPRESSURE_NO_SPARE;
-            }
-            // Pin the spare's baseSeq to whatever the active's nextSeq actually
-            // is right now. This is the right moment because (a) the active is
-            // full, so its frameCount is stable, and (b) the spare hasn't been
-            // appended to yet (rebaseSeq enforces that). The segment manager's
-            // earlier guess at baseSeq is irrelevant.
-            long actualBase = previous.baseSeq() + previous.frameCount();
-            spare.rebaseSeq(actualBase);
-            if (manifest != null) {
-                // Make the spare's rebased identity durable BEFORE the manifest
-                // references it. Without this barrier an OS crash could leave a
-                // durable manifest pointing at baseSeq=actualBase while the
-                // spare's on-disk header still carries the manager's
-                // provisional guess -- recovery would then find no segment at
-                // the committed active boundary and fail a startup that lost
-                // nothing. One msync per rotation, amortized over a whole
-                // segment of appends; runs outside the monitor because the
-                // spare is not yet visible to any other thread.
-                //
-                // MEMORY mode deliberately does not sync the predecessor's
-                // data pages. PERIODIC mode reached this point only after the
-                // manager covered the predecessor's complete published range.
-                spare.syncHeader();
-            }
-            // Publish the successor before the volatile active promotion. The
-            // same monitor protects the sealed list and nextSealedAfter's trim
-            // fallback, while the volatile link also remains readable from a
-            // current segment after the manager removes and closes it.
-            synchronized (this) {
-                if (manifest != null) {
-                    // Inside the monitor: serialized with the trim path's
-                    // advanceManifestHeadPast so neither writer publishes a
-                    // boundary computed from a state the other has already
-                    // moved past (SfManifest additionally clamps monotonic).
-                    // BEFORE any ring mutation: if the manifest fsync throws,
-                    // the rotation never happened -- previous stays active,
-                    // the spare stays installed, and the producer's retry
-                    // re-runs this block from a consistent state.
-                    long headBase = sealedHead < sealedSegments.size()
-                            ? sealedSegments.get(sealedHead).baseSeq()
-                            : previous.baseSeq();
-                    manifest.update(headBase, actualBase);
-                }
-                previous.linkSuccessor(spare);
-                sealedSegments.add(previous);
-                active = spare;
-            }
-            hotSpare = null;
-            // Fresh active just consumed the spare → ask the manager to start
-            // making the next one immediately, before this segment fills.
-            // The flag is per-active and tracks whether the backup-signal
-            // branch has fired for the *current* active. Rotation installs a
-            // new active, so the flag resets here to re-arm the backup branch.
-            // Plain field reset is safe (producer-only state).
-            wakeupRequestedForActive = false;
-            Runnable wakeup = managerWakeup;
-            if (wakeup != null) {
-                wakeup.run();
-            }
-            target = spare;
             if (target.tryWrite(payloadAddr, payloadLen) == -1L) {
                 // Doesn't fit even in a fresh segment -- payload is genuinely too big.
                 return PAYLOAD_TOO_LARGE;
             }
             rotated = true;
         }
-        long fsn = nextSeq++;
-        // The frame is fully written but not yet visible to the I/O thread.
-        // Publish its FSN first and its bytes second. The I/O thread sends a
-        // frame the moment it lies below publishedOffset(), and the server can
-        // ACK it before this method returns; acknowledge() clamps at
-        // publishedFsn, so an FSN published after the bytes could clamp that
-        // ACK away. Server ACKs are cumulative and nothing re-delivers a lost
-        // one, so losing the last frame's ACK would stall close() and drain()
-        // until their timeouts. publishedFsn may run one frame ahead of
-        // publishedOffset() for an instant, but never behind it.
-        publishedFsn = fsn;
-        target.publishWritten();
-        if (!rotated
-                && !wakeupRequestedForActive
-                && hotSpare == null
-                && managerWakeup != null
-                && target.publishedOffset() >= signalAtBytes) {
-            // Backup signal: we're past the high-water mark and still don't
-            // have a spare (manager hasn't caught up yet, or this is the very
-            // first active and rotation hasn't fired the on-rotation wakeup).
-            // Fire once per active segment, after the frame is fully published
-            // so the wakeup never delays its send.
-            wakeupRequestedForActive = true;
-            managerWakeup.run();
-        }
-        return fsn;
+        return publishAppended(target, rotated);
     }
 
     public void checkDurability() {
@@ -1145,6 +1150,10 @@ public final class SegmentRing implements QuietCloseable {
     }
 
     synchronized void clearSyncRequestIfActiveDurable() {
+        // isPublishedDurable, not isDurable: an active holding a reserved
+        // record is never isDurable, so the request would stay set and every
+        // manager tick would run a barrier. A rotation that still finds the
+        // active not durable requests again.
         if (active != null && active.isPublishedDurable()) {
             syncRequested = false;
         }
@@ -1188,7 +1197,10 @@ public final class SegmentRing implements QuietCloseable {
             i = sealedHead;
         }
         int n = sealedSegments.size();
-        while (i < n && sealedSegments.get(i).isPublishedDurable()) {
+        // isDurable, not isPublishedDurable: a sealed segment is proven
+        // durable only once no bytes a record seal or abandon changed remain
+        // unflushed either.
+        while (i < n && sealedSegments.get(i).isDurable()) {
             i++;
         }
         firstNonDurableSealed = i;
@@ -1390,6 +1402,15 @@ public final class SegmentRing implements QuietCloseable {
     }
 
     /**
+     * True while a record is reserved in the active segment: until it is
+     * sealed or abandoned, {@link #appendOrFsn} and {@link #reserveRecord}
+     * refuse and the ring does not rotate. Producer thread only.
+     */
+    public boolean hasReservedRecord() {
+        return active.reservedOffset() >= 0;
+    }
+
+    /**
      * Segment manager pre-creates the next segment and parks it here. The
      * producer consumes the spare on its next rotation. Throws if a spare
      * is already installed (the manager should have polled {@link #needsHotSpare}
@@ -1478,16 +1499,17 @@ public final class SegmentRing implements QuietCloseable {
     }
 
     /**
-     * The next FSN that {@link #appendOrFsn} will assign. Useful for the
-     * segment manager to know what {@code baseSeq} the next spare should use.
+     * The next FSN that {@link #appendOrFsn} or {@link #sealRecord} will
+     * assign. Useful for the segment manager to know what {@code baseSeq}
+     * the next spare should use.
      */
     public long nextSeqHint() {
         return nextSeq;
     }
 
     /**
-     * Highest FSN whose frame is fully written. {@link #appendOrFsn} publishes it
-     * before the frame's bytes become visible below
+     * Highest FSN whose frame is fully written. {@link #appendOrFsn} and
+     * {@link #sealRecord} publish it before the frame's bytes become visible below
      * {@link MmapSegment#publishedOffset()}, so it covers every frame the I/O
      * thread can send: it may run one frame ahead of the visible bytes for an
      * instant, never behind them. Returns -1 when nothing has been appended yet.
@@ -1577,8 +1599,15 @@ public final class SegmentRing implements QuietCloseable {
         releasePinnedSegment(expected);
     }
 
+    /**
+     * In periodic mode, asks the manager for a barrier and returns true while
+     * {@code previous} is not durable. {@link MmapSegment#isDurable()}, not
+     * {@link MmapSegment#isPublishedDurable()}: a record abandoned since the
+     * last barrier left zeroes above the published bytes that the barrier
+     * must write over the record's flushed bytes before the segment is sealed.
+     */
     private synchronized boolean requestSyncBeforeRotation(MmapSegment previous) {
-        if (periodicSyncEnabled && !previous.isPublishedDurable()) {
+        if (periodicSyncEnabled && !previous.isDurable()) {
             syncRequested = true;
             return true;
         }
@@ -1609,6 +1638,75 @@ public final class SegmentRing implements QuietCloseable {
         }
         removeSealedHead();
         return true;
+    }
+
+    /**
+     * Reserves an open QWO1 record in the active segment and returns its
+     * envelope offset; the producer fills it at
+     * {@link MmapSegment#payloadAddress(long)} and ends it with
+     * {@link #sealRecord} or {@link #abandonRecord}. The record takes
+     * {@code min(maxPayloadCapacity, room left)} payload bytes. When that is
+     * below the minimum reservation,
+     * {@code min(QwoFormat.MIN_RECORD_RESERVATION, segment payload capacity / 4, maxPayloadCapacity)}
+     * (never below the record header), the ring first rotates exactly as
+     * {@link #appendOrFsn} does. The reservation consumes no FSN and stays
+     * invisible to the I/O thread. Producer thread only.
+     *
+     * @return the envelope offset, {@link #BACKPRESSURE_NO_SPARE} when the
+     * ring must rotate but has no spare or must first wait for a barrier, or
+     * {@link #PAYLOAD_TOO_LARGE} when even a fresh segment cannot hold the
+     * minimum reservation
+     * @throws IllegalStateException    when a record is already reserved
+     * @throws IllegalArgumentException when {@code maxPayloadCapacity} is
+     *                                  smaller than the record header
+     */
+    public long reserveRecord(int maxPayloadCapacity) {
+        checkDurability();
+        MmapSegment target = active;
+        if (target.reservedOffset() >= 0) {
+            throw new IllegalStateException("record reserved");
+        }
+        if (maxPayloadCapacity < QwoFormat.HEADER_SIZE) {
+            throw new IllegalArgumentException("record capacity below the record header: " + maxPayloadCapacity);
+        }
+        long minReserve = Math.max(QwoFormat.HEADER_SIZE, Math.min(
+                Math.min(QwoFormat.MIN_RECORD_RESERVATION, segmentPayloadCapacity / 4), maxPayloadCapacity));
+        long capacity = Math.min(maxPayloadCapacity, target.capacityRemaining());
+        // version 1 active: rotation is added in Task 10
+        if (capacity < minReserve) {
+            target = rotateActive();
+            if (target == null) {
+                return BACKPRESSURE_NO_SPARE;
+            }
+            capacity = Math.min(maxPayloadCapacity, target.capacityRemaining());
+            if (capacity < minReserve) {
+                return PAYLOAD_TOO_LARGE;
+            }
+        }
+        return target.reserveRecord((int) capacity);
+    }
+
+    /**
+     * Payload capacity of the reserved record; 0 when none is reserved.
+     */
+    public int reservedCapacity() {
+        return active.reservedCapacity();
+    }
+
+    /**
+     * Seals the record reserved at {@code envelopeOffset} at {@code usedBytes}
+     * payload bytes and publishes it: the record becomes the active segment's
+     * next frame and takes the next FSN, exactly as a frame from
+     * {@link #appendOrFsn}, which this returns. Producer thread only.
+     *
+     * @throws IllegalStateException    when no record is reserved at {@code envelopeOffset}
+     * @throws IllegalArgumentException when {@code usedBytes} is outside
+     *                                  {@code [QwoFormat.HEADER_SIZE, reservedCapacity()]}
+     */
+    public long sealRecord(long envelopeOffset, int usedBytes) {
+        MmapSegment target = active;
+        target.sealReserved(envelopeOffset, usedBytes);
+        return publishAppended(target, false);
     }
 
     /**
@@ -1772,6 +1870,41 @@ public final class SegmentRing implements QuietCloseable {
         }
     }
 
+    /**
+     * The FSN tail shared by {@link #appendOrFsn} and {@link #sealRecord}:
+     * assigns the next FSN to the frame or record {@code target} just wrote,
+     * publishes the FSN, then the bytes, and fires the backup spare signal.
+     */
+    private long publishAppended(MmapSegment target, boolean rotated) {
+        long fsn = nextSeq++;
+        // The frame (or sealed record) is fully written but not yet visible
+        // to the I/O thread. Publish its FSN first and its bytes second. The
+        // I/O thread sends a frame the moment it lies below publishedOffset(),
+        // and the server can ACK it before this method returns;
+        // acknowledge() clamps at publishedFsn, so an FSN published after the
+        // bytes could clamp that ACK away. Server ACKs are cumulative and
+        // nothing re-delivers a lost one, so losing the last frame's ACK
+        // would stall close() and drain() until their timeouts. publishedFsn
+        // may run one frame ahead of publishedOffset() for an instant, but
+        // never behind it.
+        publishedFsn = fsn;
+        target.publishWritten();
+        if (!rotated
+                && !wakeupRequestedForActive
+                && hotSpare == null
+                && managerWakeup != null
+                && target.publishedOffset() >= signalAtBytes) {
+            // Backup signal: we're past the high-water mark and still don't
+            // have a spare (manager hasn't caught up yet, or this is the very
+            // first active and rotation hasn't fired the on-rotation wakeup).
+            // Fire once per active segment, after the frame is fully published
+            // so the wakeup never delays its send.
+            wakeupRequestedForActive = true;
+            managerWakeup.run();
+        }
+        return fsn;
+    }
+
     private void removeSealedHead() {
         sealedSegments.setQuick(sealedHead++, null);
         // If the removed head WAS the frontier (a non-durable but already-ACKed
@@ -1788,6 +1921,92 @@ public final class SegmentRing implements QuietCloseable {
         } else if (sealedHead >= 64 && sealedHead >= size - sealedHead) {
             compactSealedSegments();
         }
+    }
+
+    /**
+     * Rotates the active segment into the hot spare: rebases the spare to the
+     * active's next FSN, durably names it in the manifest, links it, seals the
+     * active into the sealed list and promotes the spare. Shared by
+     * {@link #appendOrFsn} and {@link #reserveRecord}; the caller has checked
+     * that no record is reserved. Returns the new active, or {@code null} for
+     * backpressure: no spare is installed, or periodic mode must first make
+     * the active durable ({@link #requestSyncBeforeRotation}).
+     */
+    private MmapSegment rotateActive() {
+        MmapSegment spare = hotSpare;
+        if (spare == null) {
+            return null;
+        }
+        // Periodic mode must make the predecessor durable before the
+        // manifest can name its successor: its complete published range and
+        // any bytes a record seal or abandon changed above it. The manager
+        // performs the barrier; the producer uses the existing backpressure
+        // path while it waits.
+        MmapSegment previous = active;
+        if (requestSyncBeforeRotation(previous)) {
+            wakeManager();
+            return null;
+        }
+        // Pin the spare's baseSeq to whatever the active's nextSeq actually
+        // is right now. This is the right moment because (a) the active is
+        // full and holds no reserved record, so its frameCount is stable,
+        // and (b) the spare hasn't been appended to yet (rebaseSeq enforces
+        // that). The segment manager's earlier guess at baseSeq is
+        // irrelevant.
+        long actualBase = previous.baseSeq() + previous.frameCount();
+        spare.rebaseSeq(actualBase);
+        if (manifest != null) {
+            // Make the spare's rebased identity durable BEFORE the manifest
+            // references it. Without this barrier an OS crash could leave a
+            // durable manifest pointing at baseSeq=actualBase while the
+            // spare's on-disk header still carries the manager's
+            // provisional guess -- recovery would then find no segment at
+            // the committed active boundary and fail a startup that lost
+            // nothing. One msync per rotation, amortized over a whole
+            // segment of appends; runs outside the monitor because the
+            // spare is not yet visible to any other thread.
+            //
+            // MEMORY mode deliberately does not sync the predecessor's
+            // data pages. PERIODIC mode reached this point only after the
+            // manager covered the predecessor's complete published range.
+            spare.syncHeader();
+        }
+        // Publish the successor before the volatile active promotion. The
+        // same monitor protects the sealed list and nextSealedAfter's trim
+        // fallback, while the volatile link also remains readable from a
+        // current segment after the manager removes and closes it.
+        synchronized (this) {
+            if (manifest != null) {
+                // Inside the monitor: serialized with the trim path's
+                // advanceManifestHeadPast so neither writer publishes a
+                // boundary computed from a state the other has already
+                // moved past (SfManifest additionally clamps monotonic).
+                // BEFORE any ring mutation: if the manifest fsync throws,
+                // the rotation never happened -- previous stays active,
+                // the spare stays installed, and the producer's retry
+                // re-runs this block from a consistent state.
+                long headBase = sealedHead < sealedSegments.size()
+                        ? sealedSegments.get(sealedHead).baseSeq()
+                        : previous.baseSeq();
+                manifest.update(headBase, actualBase);
+            }
+            previous.linkSuccessor(spare);
+            sealedSegments.add(previous);
+            active = spare;
+        }
+        hotSpare = null;
+        // Fresh active just consumed the spare → ask the manager to start
+        // making the next one immediately, before this segment fills.
+        // The flag is per-active and tracks whether the backup-signal
+        // branch has fired for the *current* active. Rotation installs a
+        // new active, so the flag resets here to re-arm the backup branch.
+        // Plain field reset is safe (producer-only state).
+        wakeupRequestedForActive = false;
+        Runnable wakeup = managerWakeup;
+        if (wakeup != null) {
+            wakeup.run();
+        }
+        return spare;
     }
 
     private void switchIoPin(MmapSegment segment) {
