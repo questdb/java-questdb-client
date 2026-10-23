@@ -699,7 +699,7 @@ public class CursorSendEngineSlotReacquisitionTest {
                 });
 
                 // Phase 2: rotate; the rotation wakes the worker, whose next pass
-                // re-enters the (in-memory) install pass and parks.
+                // parks in the hook.
                 Unsafe.getUnsafe().putLong(buf, 0L);
                 Assert.assertEquals(0L, engine.appendBlocking(buf, payloadLen));
                 Assert.assertEquals(1L, engine.appendBlocking(buf, payloadLen));
