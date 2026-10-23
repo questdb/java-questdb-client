@@ -667,6 +667,56 @@ public class CursorSendEngineTest {
         });
     }
 
+    /**
+     * A watermark rejected as past publishedFsn (a host crash in MEMORY
+     * durability leaves one after a trim msync) must be overwritten at
+     * recovery. Nothing else writes it until the next ACK advance, which
+     * during an outage is never, and once new frames push publishedFsn past
+     * the stale value a later recovery would accept it and skip them.
+     */
+    @Test(timeout = 60_000L)
+    public void testRejectedWatermarkIsOverwrittenAtRecovery() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE + 4 * (MmapSegment.FRAME_HEADER_SIZE + 64);
+            long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.getUnsafe().setMemory(buf, 64, (byte) 0);
+            try {
+                // Session 1: three 4-frame segments, ACK 3 so the first one is trimmed.
+                try (CursorSendEngine e = new CursorSendEngine(tmpDir, segSize)) {
+                    for (int i = 0; i < 12; i++) {
+                        e.appendBlocking(buf, 64);
+                    }
+                    assertTrue(e.acknowledge(3L));
+                    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+                    while (Files.exists(tmpDir + "/sf-initial.sfa") && System.nanoTime() < deadline) {
+                        LockSupport.parkNanos(1_000_000L);
+                    }
+                    assertFalse("trim did not happen", Files.exists(tmpDir + "/sf-initial.sfa"));
+                }
+                try (AckWatermark w = AckWatermark.open(tmpDir)) {
+                    assertNotNull(w);
+                    w.write(100L);
+                }
+                // Session 2: 100 > publishedFsn 11 is rejected, seed is 3. The
+                // server is unreachable: frames up to 120 are appended, none acked.
+                try (CursorSendEngine e = new CursorSendEngine(tmpDir, segSize)) {
+                    assertEquals(3L, e.ackedFsn());
+                    assertEquals(11L, e.publishedFsn());
+                    while (e.publishedFsn() < 120L) {
+                        e.appendBlocking(buf, 64);
+                    }
+                }
+                // Session 3: nothing above FSN 3 was ever acknowledged.
+                try (CursorSendEngine e = new CursorSendEngine(tmpDir, segSize)) {
+                    assertEquals(120L, e.publishedFsn());
+                    assertEquals("frames 12..100 were never acknowledged", 3L, e.ackedFsn());
+                }
+            } finally {
+                Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
     @Test(timeout = 30_000L)
     public void testManagerPersistedWatermarkSurvivesRestart() throws Exception {
         // Positive twin of testRecoveryAdvancesAckedFsnPastWatermark. That test

@@ -530,20 +530,32 @@ public final class CursorSendEngine implements QuietCloseable {
                 }
                 long baseSeed = lowestBase - 1;
                 long watermarkFsn = watermarkInProgress.read();
-                // Reject watermarks past publishedFsn: a correctly
-                // operating prior session cannot have produced one, so
-                // a value above the on-disk frame ceiling is corruption
-                // (torn write on a non-atomic filesystem, hardware
-                // fault, manual edit). Trusting it would seed ackedFsn
+                // Reject watermarks past publishedFsn. A host crash in MEMORY
+                // or PERIODIC durability produces one routinely: a trim
+                // msyncs the watermark while the segment data pages it
+                // covers are still dirty. Trusting it would seed ackedFsn
                 // = publishedFsn after ring.acknowledge clamps it, and
                 // the cursor would position past every un-acked frame
                 // -- silent data loss. Fall back to the segment-derived
                 // seed so the un-acked tail still replays.
                 long publishedFsn = recovered.publishedFsn();
                 long candidate = Math.max(watermarkFsn, baseSeed);
-                long seed = candidate > publishedFsn ? baseSeed : candidate;
+                boolean rejected = candidate > publishedFsn;
+                long seed = rejected ? baseSeed : candidate;
                 if (seed >= 0) {
                     recovered.acknowledge(seed);
+                }
+                // Bring the file in line with the seed now: the I/O thread
+                // writes it only on the next ACK advance, which during an
+                // outage may be never, and a rejected value left on disk
+                // would be accepted by a later recovery once new frames push
+                // publishedFsn past it. Durable in the rejected case so a
+                // host crash cannot resurrect it.
+                if (seed != watermarkFsn) {
+                    watermarkInProgress.write(seed);
+                    if (rejected) {
+                        watermarkInProgress.sync();
+                    }
                 }
                 // Fold the whole recovered ring once. The result checkpoints all
                 // running metadata and raw symbol bytes at each commit-bearing
