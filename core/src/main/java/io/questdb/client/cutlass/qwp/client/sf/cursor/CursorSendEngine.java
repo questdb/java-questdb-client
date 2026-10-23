@@ -129,6 +129,11 @@ public final class CursorSendEngine implements QuietCloseable {
     // covers them. Read by the sender's close-time drain to avoid waiting on
     // acks that cannot arrive.
     private long recoveredCommitBoundaryFsn = -1L;
+    // What recovery could not keep, for the owner to report as DATA_LOSS once:
+    // the open record a crash left in the resumed active segment failed
+    // validation, so the ring zeroed it with the rest of the torn tail. Null
+    // when recovery lost nothing.
+    private String recoveredDataLossDetail;
     // Highest symbol id any recovered delta frame references, or -1 for
     // fresh/memory rings (and recovered rings with no symbol-bearing frame). A
     // resuming producer seeds its dictionary baseline from the persisted
@@ -195,6 +200,9 @@ public final class CursorSendEngine implements QuietCloseable {
     // isCloseCompleted() from pool threads re-probing a retired slot (see the
     // getter for why it must not synchronize).
     private volatile boolean closeCompleted;
+    // Set by crashForTest(): close() then never counts the slot drained, so it
+    // keeps every segment file as a process crash would.
+    private volatile boolean isCrashedForTest;
     // Invoked after closeCompleted publishes a confirmed flock release. Used
     // by an owning sender pool to wake capacity-starved borrowers immediately.
     private volatile Runnable slotLockReleaseListener;
@@ -436,6 +444,17 @@ public final class CursorSendEngine implements QuietCloseable {
                     && recovery.status() == SegmentRing.RecoveryStatus.RECOVERED;
             if (recovered != null) {
                 ringInProgress = recovered;
+                // The resumed active is the one segment where an open record that failed
+                // validation survives recovery's checks (a sealed member fails closed), and
+                // the active's torn-tail sanitize has just zeroed it. MmapSegment logged the
+                // validator's verdict; the owner reports the loss.
+                MmapSegment recoveredActive = recovered.getActive();
+                if (recoveredActive.hasInvalidOpenRecord()) {
+                    recoveredDataLossDetail = "store-and-forward slot " + sfDir + ": the open record at offset "
+                            + recoveredActive.recoveredOpenRecordOffset() + " of segment " + recoveredActive.path()
+                            + " failed validation after a crash, so recovery discarded its rows ["
+                            + recoveredActive.recoveredOpenRecordDetail() + ']';
+                }
                 // Seed ackedFsn to one below the lowest segment's baseSeq.
                 // We don't know what was actually acked before the prior
                 // session crashed, but anything trimmed off the ring's
@@ -638,10 +657,19 @@ public final class CursorSendEngine implements QuietCloseable {
                 // dictionary. The recoveredMaxSymbolId >= size guard means this never
                 // fires for a slot whose dictionary is intact, nor for an empty slot
                 // (recoveredMaxSymbolId == -1). Single-threaded; before the I/O loop.
+                //
+                // A slot holding a committed QWO1 record was written in delta mode, so its
+                // dictionary is its own. Its first record (deltaStart 0) persists its
+                // entries only at its seal: a crash with that record open leaves exactly
+                // the shape above -- a dictionary short of every recovered id and no
+                // delta starting above 0 -- and discarding it would drop this delta slot
+                // into full-dictionary mode for no reason. Keep it; the sender's
+                // healPersistedDictionary writes the record's entries back.
                 this.recoveredMaxSymbolDeltaStart = recoveredFrameAnalysisInProgress.maxDeltaStart();
                 if (persistedDictInProgress != null
                         && recoveredMaxSymbolId >= persistedDictInProgress.size()
-                        && recoveredMaxSymbolDeltaStart == 0L) {
+                        && recoveredMaxSymbolDeltaStart == 0L
+                        && !recoveredFrameAnalysisInProgress.hasRecord()) {
                     // Only a NON-EMPTY discarded dictionary can desynchronise the fold. The
                     // first fold was keyed to this very size, so when it is 0 the re-fold
                     // below recomputes the identical baseline-0 result -- a no-op. The guard
@@ -655,8 +683,8 @@ public final class CursorSendEngine implements QuietCloseable {
                     persistedDictInProgress = null;
                     // Unlink it, do not merely stop using it. Closing alone left the
                     // file on disk, and full-dict mode never creates or appends it
-                    // (persistNewSymbolsBeforePublish returns early on
-                    // !deltaDictEnabled), so the survivor was STICKY -- it outlived
+                    // (only a delta-mode record's seal persists symbols), so the
+                    // survivor was STICKY -- it outlived
                     // this session unchanged and every later restart re-read it.
                     //
                     // That is a cross-generation trap. The discard's own guard
@@ -1060,11 +1088,13 @@ public final class CursorSendEngine implements QuietCloseable {
         // A record still reserved in the active segment has no FSN, so the
         // acked >= published test cannot see it; its committed rows exist
         // only in that segment, so the slot is not drained while one is open.
+        // A crash simulated by crashForTest() is never drained either.
         // Own try/catch so sabotaged/broken ring state cannot skip the
         // quiescence barrier below or the slot-lock release in finishClose.
         boolean drained = false;
         try {
-            drained = sfDir != null
+            drained = !isCrashedForTest
+                    && sfDir != null
                     && !ring.hasReservedRecord()
                     && (ring.publishedFsn() < 0
                     || ring.ackedFsn() >= ring.publishedFsn());
@@ -1198,6 +1228,18 @@ public final class CursorSendEngine implements QuietCloseable {
             return;
         }
         finishClose(fullyDrained);
+    }
+
+    /**
+     * Closes the engine as a process crash leaves the slot: every segment file
+     * stays on disk even when everything published was acknowledged, and an
+     * open record stays as it is. A new engine on the slot then recovers
+     * exactly what the ring holds.
+     */
+    @TestOnly
+    public void crashForTest() {
+        isCrashedForTest = true;
+        close();
     }
 
     /**
@@ -2040,6 +2082,17 @@ public final class CursorSendEngine implements QuietCloseable {
      */
     public long recoveredCommitBoundaryFsn() {
         return recoveredCommitBoundaryFsn;
+    }
+
+    /**
+     * Why recovery discarded rows a crash left in the slot, for the owner to
+     * report once as {@code DATA_LOSS}: the open record in the resumed active
+     * segment failed validation, so the ring zeroed it with the torn tail. Names
+     * the slot, the record's envelope offset, its segment and the validator's
+     * detail. Null when recovery lost nothing, and for fresh and memory engines.
+     */
+    public String recoveredDataLossDetail() {
+        return recoveredDataLossDetail;
     }
 
     /**

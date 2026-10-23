@@ -53,6 +53,8 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
     private long committedBoundaryFsn = -1L;
     private long committedCoverage;
     private boolean committedGap;
+    // A committed frame is a QWO1 record: the slot was written in delta mode.
+    private boolean committedHasRecord;
     private long committedMaxDeltaEnd;
     private long committedMaxDeltaStart;
     private int committedRawCount;
@@ -63,6 +65,7 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
     // overwritten by an uncommitted tail and must not be published. See finish().
     private boolean hasRewoundSinceCommit;
     private boolean runningGap;
+    private boolean runningHasRecord;
     private boolean runningUnackedGap;
     private long runningMaxDeltaEnd;
     private long runningMaxDeltaStart;
@@ -107,6 +110,7 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
             committedBoundaryFsn = fsn;
             committedCoverage = runningCoverage;
             committedGap = runningGap;
+            committedHasRecord = runningHasRecord;
             committedMaxDeltaEnd = runningMaxDeltaEnd;
             committedMaxDeltaStart = runningMaxDeltaStart;
             committedRawLen = runningRawLen;
@@ -160,6 +164,16 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
 
     long framesVisited() {
         return framesVisited;
+    }
+
+    /**
+     * Whether a committed frame of the recovered ring is a QWO1 record. Only a
+     * sender in delta mode writes records, so such a slot's {@code .symbol-dict}
+     * is its own, even when the first record's entries never reached it: the
+     * persist runs at the seal, and a crash can leave the record open.
+     */
+    boolean hasRecord() {
+        return committedHasRecord;
     }
 
     /**
@@ -392,6 +406,7 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
      * range from its header, the entries from its dictionary region.
      */
     private void foldRecord(long fsn) {
+        runningHasRecord = true;
         long deltaStart = recordReader.dictStartId();
         int entriesLen = recordReader.dictEntriesLen();
         if (deltaStart < 0L || entriesLen < 0) {

@@ -944,69 +944,6 @@ public class DeltaDictRecoveryTest {
     }
 
     @Test
-    public void testPersistFailureSurfacesAsLineSenderException() throws Exception {
-        // A dictionary write that fails mid-flush -- a full disk, an exhausted quota --
-        // must reach the caller as a LineSenderException, like every other flush-path
-        // failure. PersistedSymbolDict throws a low-level IllegalStateException when it
-        // cannot grow its append window; persistNewSymbolsBeforePublish wraps it.
-        // Without the wrap the raw IllegalStateException sails straight past every
-        // user's `catch (LineSenderException)` around flush() and takes the application
-        // down.
-        //
-        // The fault is a REFUSED ff.allocate on the mmap append window, with the facade
-        // opting into isMmapAllowed(): that is both the real shape of ENOSPC here and
-        // the path production actually runs. A facade that inherits the default
-        // isMmapAllowed() (this == INSTANCE -> false) silently swaps the dictionary onto
-        // the positioned-write fallback, which production never executes -- so a
-        // short-write fault would prove this translation on dead code.
-        //
-        // Nothing could reach the translation at all before: PersistedSymbolDict has
-        // facade-aware overloads, but CursorSendEngine called only the
-        // FilesFacade.INSTANCE ones, so no test could inject a dictionary I/O fault
-        // through the real producer path. The engine now takes a FilesFacade for exactly
-        // this, and the sender is built on that engine directly -- the same
-        // QwpWebSocketSender.connect(..., CursorSendEngine) entry point Sender.build uses.
-        assertMemoryLeak(() -> {
-            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
-                int port = silent.getPort();
-                silent.start();
-                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
-
-                String slot = Paths.get(sfDir, "default").toString();
-                Assert.assertEquals(0, io.questdb.client.std.Files.mkdir(sfDir,
-                        io.questdb.client.std.Files.DIR_MODE_DEFAULT));
-                FullDiskDictFacade ff = new FullDiskDictFacade();
-                // The engine owns the dictionary; the fault facade reaches only it, so the
-                // segment files still write normally and the ONLY failure is the persist.
-                CursorSendEngine engine = new CursorSendEngine(
-                        slot, 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
-                        CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, ff);
-                Sender sender = QwpWebSocketSender.connect(
-                        "localhost", port, null, 0, 0, 0L, null, false, engine);
-                try {
-                    ff.armed = true; // the next dictionary append cannot grow its window
-                    sender.table("m").symbol("s", "boom").longColumn("v", 1L).atNow();
-                    try {
-                        sender.flush();
-                        Assert.fail("a short write to the symbol dictionary must fail the flush");
-                    } catch (LineSenderException expected) {
-                        Assert.assertTrue("the persist failure must be reported as a sender error, "
-                                        + "not leak a raw IllegalStateException: " + expected.getMessage(),
-                                expected.getMessage().contains("failed to persist symbol dictionary before publish"));
-                    }
-                } finally {
-                    try {
-                        sender.close();
-                    } catch (LineSenderException ignored) {
-                        // close() re-flushes the still-buffered row; the facade has disarmed, so
-                        // this normally succeeds. Either way it is not what we assert.
-                    }
-                }
-            }
-        });
-    }
-
-    @Test
     public void testReconstructingFixtureResetsAckSequencePerConnection() throws Exception {
         assertMemoryLeak(() -> {
             DictReconstructingHandler handler = new DictReconstructingHandler();
@@ -1031,157 +968,53 @@ public class DeltaDictRecoveryTest {
     }
 
     @Test
-    public void testFailedPublishDoesNotDuplicatePersistedSymbols() throws Exception {
-        // Regression: persistNewSymbolsBeforePublish is a write-ahead -- it runs
-        // BEFORE the frame is published (sealAndSwapBuffer -> appendBlocking). If
-        // publish fails (here PAYLOAD_TOO_LARGE, a frame bigger than the SF
-        // segment; a backpressure deadline in production), the frame's symbols are
-        // already on disk but sentMaxSymbolId is NOT advanced and the rows stay
-        // buffered -- so a retry re-runs the persist. Keying the persist range off
-        // pd.size() (not sentMaxSymbolId+1) makes it idempotent. Before that fix,
-        // the retry appended the symbol a SECOND time, breaking the dense
-        // id->position invariant; on recovery every later global id shifts by one
-        // and symbol column values are silently misattributed.
+    public void testRowTooLargeForTheSegmentLeavesTheDictionaryDense() throws Exception {
+        // The persisted dictionary must stay dense: position i is symbol id i. A row
+        // larger than any record a segment can hold fails on its own at(), before
+        // anything seals, so nothing of it reaches .symbol-dict, and the id it minted
+        // is handed back. Retrying it fails the same way. A later row with the same
+        // symbol takes that id again, and its record's seal persists the symbol once.
         assertMemoryLeak(() -> {
             try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
                 int port = silent.getPort();
                 silent.start();
                 Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
 
-                // Small segment; a heavily padded row's frame cannot fit, so
-                // appendBlocking throws PAYLOAD_TOO_LARGE deterministically -- no
-                // backpressure timing needed. The server never acks (SilentHandler).
-                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";sf_max_segment_bytes=1024;";
-                String pad = TestUtils.repeat("x", 2000); // frame >> 1024-byte segment
-                Sender sender = Sender.fromConfig(cfg);
-                try {
-                    // Buffer ONE new-symbol row, then flush it TWICE. Each flush
-                    // runs the write-ahead persist and then fails to publish; the
-                    // failed flush leaves the row buffered, so the second flush is
-                    // the retry that (pre-fix) duplicated the persisted symbol.
-                    sender.table("m").symbol("s", "s0").stringColumn("p", pad).longColumn("v", 1L).atNow();
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";sf_max_segment_bytes=1024"
+                        + ";close_flush_timeout_millis=0;";
+                String pad = TestUtils.repeat("x", 2000); // row >> 1024-byte segment
+                try (Sender sender = Sender.fromConfig(cfg)) {
                     for (int attempt = 0; attempt < 2; attempt++) {
                         try {
-                            sender.flush();
-                            Assert.fail("oversized frame must fail to publish");
+                            sender.table("m").symbol("s", "s0").stringColumn("p", pad).longColumn("v", 1L).atNow();
+                            Assert.fail("a row larger than any record must fail on its at()");
                         } catch (LineSenderException expected) {
-                            // frame too large -- expected on every attempt
+                            TestUtils.assertContains(expected.getMessage(), "row too large for the frame bound");
                         }
+                        Assert.assertEquals("nothing of the failed row was persisted",
+                                0, ((QwpWebSocketSender) sender).getPersistedSymbolsForTest().size());
                     }
-
-                    // The persisted dictionary must hold "s0" EXACTLY ONCE.
-                    // Pre-fix, the retry duplicated it (size == 2).
+                    sender.table("m").symbol("s", "s0").longColumn("v", 2L).atNow();
+                    sender.flush();
                     ObjList<String> persisted = ((QwpWebSocketSender) sender).getPersistedSymbolsForTest();
-                    Assert.assertNotNull(persisted);
-                    Assert.assertEquals("failed-publish retry must not duplicate the persisted symbol",
-                            1, persisted.size());
+                    Assert.assertEquals("the seal persists the symbol exactly once", 1, persisted.size());
                     Assert.assertEquals("s0", persisted.getQuick(0));
-                } finally {
-                    try {
-                        sender.close();
-                    } catch (LineSenderException ignored) {
-                        // close() re-flushes the still-buffered oversized row and
-                        // fails again (PAYLOAD_TOO_LARGE); expected here and not
-                        // what we assert. close() still runs its resource cleanup,
-                        // so no native memory leaks.
-                    }
                 }
             }
         });
     }
 
     @Test
-    public void testFailedPublishThenNewSymbolPersistsSuffixWithoutDuplicating() throws Exception {
-        // Regression for the re-encode (else) branch of persistNewSymbolsBeforePublish.
-        // After a failed publish leaves the durable dictionary size ahead of the wire
-        // baseline (pd.size() > sentMaxSymbolId+1), a later flush that introduces a NEW
-        // symbol cannot reuse the frame's already-encoded fast-path bytes -- it
-        // re-encodes just the [pd.size() .. currentBatchMaxSymbolId] suffix via
-        // appendSymbols. Keying that off pd.size() (not sentMaxSymbolId+1) keeps it
-        // idempotent: the already-persisted prefix is NOT re-appended.
-        assertMemoryLeak(() -> {
-            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
-                int port = silent.getPort();
-                silent.start();
-                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
-                // Small segment: any frame carrying the padded row fails to publish with
-                // PAYLOAD_TOO_LARGE deterministically (no backpressure timing).
-                //
-                // The auto-flush knobs pin WHERE that failure surfaces. The failed flush
-                // below leaves its row buffered and does NOT restart the auto-flush clock
-                // (resetTableBuffersAfterFlush runs only after a successful publish), so
-                // the row keeps ageing against the WebSocket transport's 100 ms
-                // auto_flush_interval default. Once the first flush takes longer than that
-                // -- routine on a loaded CI host, where segment provisioning plus the
-                // backpressure spin cost ~105 ms -- the NEXT row commit auto-flushes inside
-                // atNow() and throws from there instead of from the flush() this test
-                // brackets. The batch and the branch under test are identical either way;
-                // only the throw site moves, so parking the thresholds costs no coverage.
-                // (WebSocket rejects auto_flush=off outright, hence the large finite
-                // interval.)
-                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
-                        + ";sf_max_segment_bytes=1024"
-                        + ";auto_flush_bytes=off;auto_flush_rows=1000000;auto_flush_interval=60000;";
-                String pad = TestUtils.repeat("x", 2000); // frame >> 1024-byte segment
-                Sender sender = Sender.fromConfig(cfg);
-                try {
-                    // Flush 1: s0 is persisted (write-ahead) before the oversized frame
-                    // fails to publish. pd.size()=1, sentMaxSymbolId stays -1.
-                    sender.table("m").symbol("s", "s0").stringColumn("p", pad).longColumn("v", 1L).atNow();
-                    try {
-                        sender.flush();
-                        Assert.fail("oversized frame must fail to publish");
-                    } catch (LineSenderException expected) {
-                    }
-
-                    // Add a NEW symbol s1 (id 1). The failed s0 row is still buffered, so
-                    // the batch is {s0, s1} and the durable size (1) has run ahead of the
-                    // wire baseline (-1) -- the state that selects the appendSymbols branch.
-                    sender.table("m").symbol("s", "s1").stringColumn("p", pad).longColumn("v", 2L).atNow();
-                    try {
-                        sender.flush();
-                        Assert.fail("oversized frame must fail to publish");
-                    } catch (LineSenderException expected) {
-                    }
-
-                    // The else branch persisted ONLY s1 (the suffix). The dictionary holds
-                    // s0, s1 exactly once each. Pre-fix (appendSymbols from
-                    // sentMaxSymbolId+1) re-appended s0, giving size 3.
-                    ObjList<String> persisted = ((QwpWebSocketSender) sender).getPersistedSymbolsForTest();
-                    Assert.assertNotNull(persisted);
-                    Assert.assertEquals("re-encode suffix must not duplicate the persisted prefix",
-                            2, persisted.size());
-                    Assert.assertEquals("s0", persisted.getQuick(0));
-                    Assert.assertEquals("s1", persisted.getQuick(1));
-                } finally {
-                    try {
-                        sender.close();
-                    } catch (LineSenderException ignored) {
-                        // close() re-flushes the still-buffered oversized rows and fails
-                        // again (PAYLOAD_TOO_LARGE); expected, resources still released.
-                    }
-                }
-            }
-        });
-    }
-
-    @Test
-    public void testRecoveryAfterFailedPublishReplaysGapFree() throws Exception {
-        // M3 end-to-end: chains a failed publish -> fresh-process recovery -> replay.
-        // A failed publish persists the frame's symbol (write-ahead) but does NOT
-        // record the frame, so the persisted dictionary becomes a strict SUPERSET of
-        // the recorded frames' references. A recovering sender must still replay
-        // gap-free: it re-registers the whole (superset) dictionary via the catch-up
-        // -- including the symbol whose frame never reached disk -- so the fresh
-        // server reconstructs a complete, gap-free dictionary. The sibling
-        // testFailedPublishDoesNotDuplicatePersistedSymbols proves the dict has no
-        // duplicate after the failed publish; this proves the resulting slot then
-        // recovers and replays end-to-end against a real server.
+    public void testRecoveryAfterARowTooLargeForTheSegmentReplaysGapFree() throws Exception {
+        // End to end: a row too large for the segment fails between sealed records,
+        // then a fresh process recovers the slot and replays it. The failed row
+        // minted a symbol and handed it back, so the persisted dictionary holds
+        // exactly the symbols of the four sealed records, and the recovering sender
+        // re-registers them (catch-up) and replays the records gap-free.
         assertMemoryLeak(() -> {
             // Phase 1: a silent server (no acks) + a small SF segment. Four small
-            // rows register sym-0..sym-3 and their frames are recorded; a fifth,
-            // oversized row registers (persists) sym-4 but its frame is too large for
-            // the segment, so appendBlocking throws and the frame is NOT recorded.
+            // rows register sym-0..sym-3 in four sealed records; a fifth, oversized
+            // row mints sym-4 but no record can hold it, so it fails on its at().
             try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
                 int port = silent.getPort();
                 silent.start();
@@ -1190,51 +1023,36 @@ public class DeltaDictRecoveryTest {
                         + ";sf_dir=" + sfDir
                         + ";sf_max_segment_bytes=4096"
                         + ";close_flush_timeout_millis=0;";
-                Sender s1 = Sender.fromConfig(cfg);
-                try {
+                try (Sender s1 = Sender.fromConfig(cfg)) {
                     for (int i = 0; i < 4; i++) {
                         s1.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
                         s1.flush();
                     }
-                    // Oversized frame: sym-4 is persisted (write-ahead) before the
-                    // publish fails, so the dictionary runs one ahead of the frames.
-                    s1.table("m").symbol("s", "sym-4")
-                            .stringColumn("p", TestUtils.repeat("x", 8000))
-                            .longColumn("v", 4).atNow();
                     try {
-                        s1.flush();
-                        Assert.fail("oversized frame must fail to publish");
+                        s1.table("m").symbol("s", "sym-4")
+                                .stringColumn("p", TestUtils.repeat("x", 8000))
+                                .longColumn("v", 4).atNow();
+                        Assert.fail("a row larger than any record must fail on its at()");
                     } catch (LineSenderException expected) {
-                        // PAYLOAD_TOO_LARGE -- frame not recorded, sym-4 stays persisted
-                    }
-                } finally {
-                    try {
-                        // Re-flushes the still-buffered oversized row and fails again
-                        // (expected); resources are still released, and the idempotent
-                        // write-ahead does not re-append sym-4.
-                        s1.close();
-                    } catch (LineSenderException ignored) {
+                        TestUtils.assertContains(expected.getMessage(), "row too large for the frame bound");
                     }
                 }
             }
 
-            // The persisted dictionary must hold the superset: sym-0..sym-4 (5 ids),
-            // one more than the four recorded frames reference, with no duplicate.
+            // The persisted dictionary holds the four sealed records' symbols, and
+            // not the failed row's.
             java.nio.file.Path slot = Paths.get(sfDir, "default");
             PersistedSymbolDict pd = PersistedSymbolDict.open(slot.toString());
             Assert.assertNotNull(pd);
             try {
-                Assert.assertEquals("failed publish must leave the dict a superset (sym-0..sym-4)",
-                        5, pd.size());
+                Assert.assertEquals("the failed row persisted nothing", 4, pd.size());
             } finally {
                 pd.close();
             }
 
             // Phase 2: recover against a fresh server that reconstructs its
-            // dictionary from the wire. The recovering sender must re-register all 5
-            // symbols via a catch-up (sym-4 exists ONLY in the dictionary -- no frame
-            // carries it) and replay the 4 recorded frames, leaving a complete,
-            // gap-free server dictionary.
+            // dictionary from the wire: a catch-up re-registers sym-0..sym-3, then
+            // the four records replay, leaving a complete, gap-free dictionary.
             DictReconstructingHandler handler = new DictReconstructingHandler();
             try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
                 int port = good.getPort();
@@ -1243,16 +1061,16 @@ public class DeltaDictRecoveryTest {
                 String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
                 try (Sender ignored = Sender.fromConfig(cfg)) {
                     long deadline = System.currentTimeMillis() + 5_000;
-                    while (System.currentTimeMillis() < deadline && handler.maxDictSize() < 5) {
+                    while (System.currentTimeMillis() < deadline && handler.dataFrameCount() < 4) {
                         Thread.sleep(20);
                     }
                 }
                 Assert.assertTrue("recovery must send a full-dictionary catch-up frame",
                         handler.sawCatchUpFrame);
+                Assert.assertEquals("the four records replay", 4, handler.dataFrameCount());
                 List<String> dict = handler.dictSnapshot();
-                Assert.assertEquals("recovered dictionary must include the failed-publish symbol",
-                        5, dict.size());
-                for (int i = 0; i < 5; i++) {
+                Assert.assertEquals("the recovered dictionary holds the records' symbols", 4, dict.size());
+                for (int i = 0; i < 4; i++) {
                     Assert.assertEquals("dictionary id " + i + " must be gap-free",
                             "sym-" + i, dict.get(i));
                 }
@@ -1486,9 +1304,9 @@ public class DeltaDictRecoveryTest {
                 Assert.assertEquals("c", dict.get(2));
                 Assert.assertEquals("d", dict.get(3));
             }
-            // The side-file is healed in passing -- persistNewSymbolsBeforePublish resumes
-            // from pd.size() (0 here), so the flush above re-persisted the rebuilt ids
-            // a,b,c along with d. That is not asserted on disk because it is not
+            // The side-file is healed in passing -- healPersistedDictionary re-persists
+            // the rebuilt ids a,b,c at recovery, and the seal of the flush above persists
+            // d (persistRecordSymbols resumes from pd.size()). That is not asserted on disk because it is not
             // observable here: the slot drains fully, and a fully-drained close removes
             // the dictionary (CursorSendEngine -> PersistedSymbolDict.removeOrphan), so
             // re-opening it would just yield a fresh empty file. The persist-resumes-from-
@@ -1609,7 +1427,7 @@ public class DeltaDictRecoveryTest {
     public void testDiscardedSurvivingDictionaryIsUnlinked() throws Exception {
         // The discard must UNLINK the survivor, not merely stop using it. Closing alone
         // left it on disk, and full-dict mode never rewrites it
-        // (persistNewSymbolsBeforePublish returns early on !deltaDictEnabled), so it was
+        // (only a delta-mode record's seal persists symbols), so it was
         // sticky: the very next recovery re-read it, and as soon as an intervening
         // session ingested FEWER distinct symbols than it holds, the discard's
         // recoveredMaxSymbolId >= size() guard stopped firing, delta mode came back on,
@@ -2097,10 +1915,12 @@ public class DeltaDictRecoveryTest {
      * and full self-sufficient frames need no side file at all (each carries the whole
      * dictionary from id 0, which is what recovery replays anyway).
      * <p>
-     * So the FIRST flush must still fail -- beginMessage has already baked a delta
-     * deltaStart into the staged frame, and publishing it would put ids on the ring the
-     * side-file cannot describe -- but the SECOND must succeed, in full-dict mode. Remove
-     * the disableDeltaDict call and the second flush throws exactly like the first.
+     * The record's seal runs the persist, and its failure does not fail the flush: the
+     * record still seals, because its frame carries the entries it needs. The sender
+     * then switches, so the SECOND flush ships a full-dictionary frame (deltaStart 0,
+     * the whole dictionary) where delta mode would ship deltaStart 1. Remove the
+     * disableDeltaDict call and the second frame is a delta frame that the side file
+     * cannot describe.
      */
     @Test(timeout = 60_000L)
     public void testPersistFailureDegradesToFullDictInsteadOfKillingFlushForever() throws Exception {
@@ -2126,30 +1946,20 @@ public class DeltaDictRecoveryTest {
                     // call allocate at all.
                     ff.armed = true;
                     sender.table("m").symbol("s", "a").longColumn("v", 1L).atNow();
-                    try {
-                        sender.flush();
-                        Assert.fail("the first flush must fail: its staged frame carries a delta "
-                                + "deltaStart the side-file cannot describe");
-                    } catch (LineSenderException expected) {
-                        Assert.assertTrue("expected the persist-failure message, got: "
-                                        + expected.getMessage(),
-                                expected.getMessage().contains("failed to persist symbol dictionary"));
-                    }
-
-                    // The rows are still buffered (the throw precedes every publish), so the
-                    // retry re-encodes them from id 0. Pre-fix this threw forever.
+                    // The persist at the seal fails; the flush does not.
+                    sender.flush();
+                    sender.table("m").symbol("s", "b").longColumn("v", 2L).atNow();
                     sender.flush();
 
                     long deadline = System.currentTimeMillis() + 5_000;
-                    while (System.currentTimeMillis() < deadline && handler.dataFrameCount() < 1) {
+                    while (System.currentTimeMillis() < deadline && handler.dataFrameCount() < 2) {
                         Thread.sleep(20);
                     }
-                    Assert.assertTrue("the degraded flush must actually reach the server",
-                            handler.dataFrameCount() >= 1);
-                    Assert.assertEquals("a degraded frame must be self-sufficient (deltaStart 0)",
+                    Assert.assertEquals("both flushes reach the server", 2, handler.dataFrameCount());
+                    Assert.assertEquals("the frame after the switch is self-sufficient (deltaStart 0)",
                             0, handler.lastDataDeltaStart());
-                    Assert.assertEquals("the full dictionary must ride along",
-                            java.util.Collections.singletonList("a"), handler.dictSnapshot());
+                    Assert.assertEquals("the full dictionary rides along",
+                            Arrays.asList("a", "b"), handler.dictSnapshot());
                 } finally {
                     try {
                         sender.close();

@@ -1657,8 +1657,10 @@ public final class SegmentRing implements QuietCloseable {
      * below the minimum reservation,
      * {@code min(QwoFormat.MIN_RECORD_RESERVATION, segment payload capacity / 4, maxPayloadCapacity)}
      * (never below the record header), the ring first rotates exactly as
-     * {@link #appendOrFsn} does. The reservation consumes no FSN and stays
-     * invisible to the I/O thread. Producer thread only.
+     * {@link #appendOrFsn} does. It also rotates away from an active segment of
+     * an older format version ({@link MmapSegment#version()}), so a record
+     * always lands in a version 2 segment. The reservation consumes no FSN and
+     * stays invisible to the I/O thread. Producer thread only.
      *
      * @return the envelope offset, {@link #BACKPRESSURE_NO_SPARE} when the
      * ring must rotate but has no spare or must first wait for a barrier, or
@@ -1701,8 +1703,10 @@ public final class SegmentRing implements QuietCloseable {
         long minReserve = Math.max(QwoFormat.HEADER_SIZE,
                 Math.min(minPayloadCapacity, Math.min(maxPayloadCapacity, segmentPayloadCapacity)));
         long capacity = Math.min(maxPayloadCapacity, target.capacityRemaining());
-        // version 1 active: rotation is added in Task 10
-        if (capacity < minReserve) {
+        // A version 1 active, resumed from an older client's slot, never takes a
+        // record (that client would read one as a torn tail): the record goes to
+        // a fresh version 2 segment, as when the room left is too small.
+        if (capacity < minReserve || target.version() < MmapSegment.VERSION) {
             target = rotateActive();
             if (target == null) {
                 return BACKPRESSURE_NO_SPARE;
@@ -1962,6 +1966,7 @@ public final class SegmentRing implements QuietCloseable {
      * the active durable ({@link #requestSyncBeforeRotation}).
      */
     private MmapSegment rotateActive() {
+        assert active.reservedOffset() < 0 : "rotation with a reserved record";
         MmapSegment spare = hotSpare;
         if (spare == null) {
             return null;

@@ -515,6 +515,20 @@ public class QwpTableBuffer implements QuietCloseable {
     }
 
     /**
+     * Lets every DECIMAL column of a staging buffer with no row take the scale
+     * of its next value, as {@link #reset()} does between batches: the open
+     * record's writer binds a column's scale per record, and the sender calls
+     * this when a record seals. GEOHASH precision stays, a schema property the
+     * server locks, as {@link #reset()} keeps it.
+     */
+    public void resetDecimalScales() {
+        assert rowCount == 0 && inProgressColumnCount == 0 : "resetDecimalScales needs a staging buffer with no row";
+        for (int i = 0, n = columns.size(); i < n; i++) {
+            fastColumns[i].decimalScale = -1;
+        }
+    }
+
+    /**
      * Undoes {@link #holdBackLastRow()}: the held row counts as committed
      * again. A no-op when no row is held.
      */

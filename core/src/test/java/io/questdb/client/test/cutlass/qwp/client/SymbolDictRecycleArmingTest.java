@@ -175,21 +175,17 @@ public class SymbolDictRecycleArmingTest {
                 try {
                     ff.armed = true; // next dictionary mmap growth raises a recognised fault
                     sender.table("m").symbol("s", "a").longColumn("v", 1L).atNow();
-                    try {
-                        sender.flush();
-                        Assert.fail("expected the injected mmap fault to fail this flush");
-                    } catch (LineSenderException expected) {
-                        // Same guard MmapFaultDegradesTest pins: the fault degrades the
-                        // sender to full self-sufficient frames instead of propagating raw.
-                    }
+                    // Same guard MmapFaultDegradesTest pins: the fault at the record's seal
+                    // degrades the sender to full self-sufficient frames instead of
+                    // propagating raw, and the seal still ships "a".
+                    sender.flush();
                     Assert.assertFalse("a recognised mmap access fault must degrade the sender "
                                     + "to full-dict mode",
                             sender.isDeltaDictEnabledForTest());
                     Assert.assertFalse("dictionary has only 1 entry, below the threshold of 3",
                             sender.isResetArmed());
 
-                    // The fault facade disarms itself after firing once, so this retry
-                    // succeeds and clears pendingRowCount back to 0; "a" is now published.
+                    // The fault facade disarmed itself after firing once; nothing is pending.
                     sender.flush();
                     Assert.assertFalse("still degraded, dictionary still below threshold",
                             sender.isDeltaDictEnabledForTest());

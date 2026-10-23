@@ -27,8 +27,10 @@ package io.questdb.client.test.cutlass.qwp.client;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.test.QuestDBFlushOnCloseTest;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
+import io.questdb.client.test.tools.DelegatingFilesFacade;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Rule;
@@ -534,14 +536,19 @@ public class SenderProbeMethodsTest {
 
     @Test
     public void testTryFlushOnAFullRingReturnsFalseAndKeepsTheRows() throws Exception {
+        // The frame path's tryFlush: a sender in delta mode seals records, which never
+        // wait for ring room, so the full ring this pins is reached only by a sender in
+        // full-dictionary mode (a slot whose .symbol-dict cannot open).
         try (TestWebSocketServer server = new TestWebSocketServer(new SilentHandler())) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-            String sfDir = temp.newFolder("sf").getAbsolutePath();
-            try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
-                    + ";sf_dir=" + sfDir + ";sf_max_segment_bytes=1024;sf_max_total_bytes=8192"
-                    + ";sf_append_deadline_millis=2000;auto_flush_rows=100000;auto_flush_interval=3600000"
-                    + ";auto_flush_bytes=off;close_flush_timeout_millis=0;")) {
+            String slot = temp.newFolder("sf").getAbsolutePath() + "/default";
+            CursorSendEngine engine = new CursorSendEngine(slot, 1024, 8192,
+                    TimeUnit.MILLISECONDS.toNanos(2_000), new UnopenableDictFacade());
+            // auto_flush_rows=100000, auto_flush_bytes=off, no age trigger, close_flush_timeout_millis=0
+            try (QwpWebSocketSender sender = QwpWebSocketSender.connect(
+                    "localhost", server.getPort(), null, 100_000, 0, 0L, null, false, engine, 0L)) {
+                Assert.assertFalse("setup: the full-dictionary frame path", sender.isDeltaDictEnabledForTest());
                 String pad = QuestDBFlushOnCloseTest.wideValue(128);
                 boolean full = false;
                 for (int i = 0; i < 200 && !full; i++) {
@@ -650,6 +657,17 @@ public class SenderProbeMethodsTest {
         @Override
         public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
             // no ack: the frame stays unacked on disk
+        }
+    }
+
+    /**
+     * Refuses to create the slot's {@code .symbol-dict}, so the engine runs in
+     * full-dictionary mode and the sender keeps its frame-per-flush path.
+     */
+    private static final class UnopenableDictFacade extends DelegatingFilesFacade {
+        @Override
+        public int openCleanRW(String path) {
+            return -1;
         }
     }
 }

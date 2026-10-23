@@ -263,9 +263,12 @@ public class SegmentRingRecordTest {
             try (QwoRecordWriter writer = new QwoRecordWriter();
                  QwpTableBuffer tb = new QwpTableBuffer("trades")) {
                 fillPattern(frame, 16, 5);
-                for (int pass = 0; pass < 2; pass++) {
-                    // pass 0: a recoverable open record; pass 1: one that fails validation
-                    boolean isCorrupt = pass == 1;
+                for (int pass = 0; pass < 4; pass++) {
+                    // passes 0 and 2: a recoverable open record; passes 1 and 3: one that fails
+                    // validation. Passes 0 and 1 recover through the manifest branch, passes 2
+                    // and 3 through the legacy (no manifest) migration branch.
+                    boolean isCorrupt = (pass & 1) == 1;
+                    boolean hasManifest = pass < 2;
                     String dir = tmpDir + "/pass" + pass;
                     Assert.assertEquals(0, Files.mkdir(dir, Files.DIR_MODE_DEFAULT));
                     String sealedPath = dir + "/s0.sfa";
@@ -283,7 +286,9 @@ public class SegmentRingRecordTest {
                         Assert.assertEquals(MmapSegment.HEADER_SIZE, s1.tryAppend(frame, 16));
                     }
                     // the frame accounting validates: the sealed member ends at 1, the active starts there
-                    SfManifest.create(FilesFacade.INSTANCE, dir, 0L, 1L).close();
+                    if (hasManifest) {
+                        SfManifest.create(FilesFacade.INSTANCE, dir, 0L, 1L).close();
+                    }
                     byte[] sealedBytes = readFile(sealedPath);
                     byte[] activeBytes = readFile(activePath);
                     for (int attempt = 0; attempt < 2; attempt++) {
@@ -300,6 +305,8 @@ public class SegmentRingRecordTest {
                         Assert.assertArrayEquals("the sealed member's bytes must stay intact",
                                 sealedBytes, readFile(sealedPath));
                         Assert.assertArrayEquals(activeBytes, readFile(activePath));
+                        Assert.assertEquals("a failed recovery creates no manifest",
+                                hasManifest, new java.io.File(dir, "sf-manifest.bin").exists());
                     }
                 }
             } finally {

@@ -40,6 +40,7 @@ import io.questdb.client.cutlass.qwp.client.QwpUdpSender;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderErrorHandler;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentBudget;
@@ -3430,6 +3431,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         maxTotalBytes, sfSharedBudget, appendDeadlineNanos,
                         syncIntervalNanos, errorHandler);
             }
+            reportRecoveredDataLoss(cursorEngine, slotPath, errorHandler);
             return new ConstructedEngine(cursorEngine, quarantined);
         }
 
@@ -3569,6 +3571,30 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         @TestOnly
         public static void setQuarantineFilesFacadeForTest(FilesFacade ff) {
             quarantineFilesFacade = ff == null ? FilesFacade.INSTANCE : ff;
+        }
+
+        /**
+         * Reports the rows the engine's recovery discarded, once, as a
+         * {@code DATA_LOSS} naming the slot: an open record a crash left corrupt in
+         * the resumed active segment ({@link CursorSendEngine#recoveredDataLossDetail()}).
+         * Dispatched synchronously, as {@link #quarantineTornSlot} dispatches its
+         * loss, to the default handler when the caller installed none; a throwing
+         * handler is logged, not propagated, so it cannot fail the build.
+         */
+        private static void reportRecoveredDataLoss(
+                CursorSendEngine engine, String slotPath, SenderErrorHandler errorHandler
+        ) {
+            String detail = engine.recoveredDataLossDetail();
+            if (detail == null || slotPath == null) {
+                return;
+            }
+            SenderErrorHandler handler = errorHandler != null ? errorHandler : DefaultSenderErrorHandler.INSTANCE;
+            try {
+                handler.onError(SenderError.dataLoss(detail, slotPath));
+            } catch (Throwable handlerFailure) {
+                LOG.error("sender error handler threw while reporting rows lost in recovery: {}",
+                        String.valueOf(handlerFailure));
+            }
         }
 
         private static int resolveIPv4(String host) {

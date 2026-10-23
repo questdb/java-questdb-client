@@ -61,12 +61,10 @@ public class MmapFaultDegradesTest {
 
     /**
      * Drives a RECOGNISED mmap-access-fault {@code InternalError} through
-     * {@code QwpWebSocketSender.persistNewSymbolsBeforePublish} -- one of the two guards
-     * ({@code instanceof Error && !isMmapAccessFault(t)}) this class exists to protect, at
-     * {@code QwpWebSocketSender.java:4028}. The sibling guard in {@code healPersistedDictionary}
-     * ({@code :3944}) has the identical shape but is not independently exercised here; it
-     * would need a recovery scenario (a torn persisted dictionary alongside surviving frames
-     * that still reference the missing ids) to reach, which this test does not set up.
+     * {@code QwpWebSocketSender.persistRecordSymbols}, the write-ahead at a record's seal --
+     * one of the two guards ({@code instanceof Error && !isMmapAccessFault(t)}) this class
+     * exists to protect. The sibling guard in {@code healPersistedDictionary} has the
+     * identical shape and is exercised by the recovery test below.
      * <p>
      * The fault is injected deterministically at the {@link io.questdb.client.std.FilesFacade#mmap}
      * seam {@code PersistedSymbolDict} already takes for testing -- the same technique
@@ -74,11 +72,12 @@ public class MmapFaultDegradesTest {
      * for {@code SegmentRing} -- rather than relying on a real SIGBUS, whose delivery frame is
      * JIT/JDK-version dependent (see {@code MmapSegmentRecoveryFaultTest.hasPreciseUnsafeAccessFaults}).
      * <p>
-     * Before the guard existed (an unqualified {@code instanceof Error}), the injected
-     * {@code InternalError} would be rethrown raw: {@code flush()} would surface it instead of
-     * a {@link LineSenderException}, and {@link QwpWebSocketSender#isDeltaDictEnabledForTest()}
-     * would stay {@code true} instead of degrading. Reverting either guard back to a bare
-     * {@code instanceof Error} turns this test red.
+     * A failed persist does not fail the seal: the record's frame carries the entries it
+     * needs, and the sender switches to full self-sufficient frames afterwards. With an
+     * unqualified {@code instanceof Error} the injected {@code InternalError} would be
+     * rethrown raw out of {@code flush()} and
+     * {@link QwpWebSocketSender#isDeltaDictEnabledForTest()} would stay {@code true}.
+     * Reverting the guard back to a bare {@code instanceof Error} turns this test red.
      */
     @Test
     public void testMmapAccessFaultDegradesPersistInsteadOfPropagating() throws Exception {
@@ -105,17 +104,10 @@ public class MmapFaultDegradesTest {
                 try {
                     ff.armed = true; // the next dictionary mmap growth raises the fault
                     sender.table("m").symbol("s", "boom").longColumn("v", 1L).atNow();
-                    try {
-                        sender.flush();
-                        Assert.fail("a recognised mmap access fault during persist must still "
-                                + "surface as a sender error, not silently succeed");
-                    } catch (LineSenderException expected) {
-                        Assert.assertTrue("the fault must be reported as a sender error, not a "
-                                        + "raw InternalError: " + expected.getMessage(),
-                                expected.getMessage().contains("failed to persist symbol dictionary before publish"));
-                    }
+                    // the persist at the seal faults; the seal, and so the flush, completes
+                    sender.flush();
                     Assert.assertFalse("a recognised mmap access fault must degrade the sender to "
-                                    + "full self-sufficient frames, not merely fail this one flush",
+                                    + "full self-sufficient frames",
                             sender.isDeltaDictEnabledForTest());
                 } finally {
                     try {

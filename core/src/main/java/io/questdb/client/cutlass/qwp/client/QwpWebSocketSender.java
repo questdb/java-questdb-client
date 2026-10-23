@@ -297,6 +297,9 @@ public class QwpWebSocketSender implements Sender {
     private boolean closeCleanupStarted;
     private long closeFlushTimeoutMillis = 5_000L;
     private volatile boolean closed;
+    // Set by crashForTest(): close0 then stops the loop and the engine as a
+    // process crash would, without a flush, a seal, an abandon or a drain.
+    private boolean isCrashedForTest;
     // Test-only lifecycle witness. close() invokes and clears it strictly after
     // publishing closed=true and before starting any drain or teardown work.
     private volatile Runnable closeStartedHook;
@@ -678,6 +681,11 @@ public class QwpWebSocketSender implements Sender {
     // is reachable deterministically.
     @TestOnly
     private volatile Runnable chunkPublishFaultForTesting;
+    // Test seam: runs inside sealRecord after the writer sealed the record and
+    // before the engine seals it, so an engine-side seal failure is reachable
+    // with the reservation and its committed rows intact.
+    @TestOnly
+    private volatile Runnable recordSealFaultForTesting;
     // Incremented once per completed symbol-dictionary recycle. 0 until the
     // first recycle commits. volatile: this is public API (see
     // getSymbolDictEpoch()), and a monitoring thread is its obvious reader.
@@ -1879,7 +1887,7 @@ public class QwpWebSocketSender implements Sender {
             // acks, so draining would only stall for the full timeout.
             // Also covers createForTesting() teardown and connect()
             // rollback paths where the loop (or both) may be null.
-            if (connectionError.get() == null && cursorEngine != null) {
+            if (!isCrashedForTest && connectionError.get() == null && cursorEngine != null) {
                 // 1) Flush user-thread state into the engine (encoded
                 //    rows -> mmap'd / malloc'd ring). After this, the
                 //    cursor engine's publishedFsn reflects the final
@@ -1975,7 +1983,7 @@ public class QwpWebSocketSender implements Sender {
         // unlink the only copy of its committed rows. Sealing needs no network,
         // so this also runs when the flush above failed or never ran because a
         // connection error is latched.
-        if (recordOffset >= 0 && record.isOpen() && cursorEngine != null) {
+        if (!isCrashedForTest && recordOffset >= 0 && record.isOpen() && cursorEngine != null) {
             try {
                 finishRecord(deferCommit);
             } catch (Throwable t) {
@@ -2061,6 +2069,31 @@ public class QwpWebSocketSender implements Sender {
             terminalError = null;
         }
         rethrowTerminal(terminalError);
+    }
+
+    /**
+     * Closes the sender as a process crash leaves it: the I/O loop and the
+     * engine stop without a flush, a seal, an abandon or a drain, so an open
+     * record stays on disk as the crash found it, and the engine keeps every
+     * segment file of the slot even when the slot looks drained. A new sender
+     * on the slot then recovers exactly what the ring holds. The native state
+     * is freed as {@link #close()} frees it, and later calls fail as on a
+     * closed sender.
+     */
+    @TestOnly
+    public void crashForTest() {
+        if (!closed) {
+            closed = true;
+            isCrashedForTest = true;
+            final boolean[] restoreInterrupt = {Thread.interrupted()};
+            try {
+                close0(restoreInterrupt);
+            } finally {
+                if (restoreInterrupt[0]) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
     }
 
     @TestOnly
@@ -2674,6 +2707,11 @@ public class QwpWebSocketSender implements Sender {
     @TestOnly
     public void setChunkPublishFaultForTesting(Runnable fault) {
         this.chunkPublishFaultForTesting = fault;
+    }
+
+    @TestOnly
+    public void setRecordSealFaultForTesting(Runnable fault) {
+        this.recordSealFaultForTesting = fault;
     }
 
     /**
@@ -5000,7 +5038,11 @@ public class QwpWebSocketSender implements Sender {
                     // (Sender.build()) still HOLDS the parent-anchored logical lock:
                     // unlinking it here would free the pathname without releasing the
                     // flock, letting the next acquireLogical create a second inode.
-                    engine.close(reclaimLogicalSlotLockOnClose);
+                    if (isCrashedForTest) {
+                        engine.crashForTest();
+                    } else {
+                        engine.close(reclaimLogicalSlotLockOnClose);
+                    }
                 } catch (Throwable t) {
                     LOG.error("Error closing owned CursorSendEngine: {}", String.valueOf(t));
                     terminalError = captureCloseError(terminalError, t);
@@ -5582,13 +5624,10 @@ public class QwpWebSocketSender implements Sender {
         }
 
         ensureActiveBufferReady();
-        // In full-dict mode every frame is self-sufficient: it carries the whole
-        // symbol dictionary from id 0 so orphan-drain / recovery replay to a fresh
-        // server never dangles a symbol id. In delta mode (memory-mode, and
-        // file-mode store-and-forward once the persisted dictionary opened) each
-        // frame carries only ids above sentMaxSymbolId; a reconnect re-registers
-        // the dictionary via an I/O-thread catch-up frame before replay, so the
-        // producer's monotonic baseline stays valid across the wire boundary.
+        // This frame path runs in full-dict mode only (delta mode appends rows to
+        // an open record, see useOpenRecord()): every frame is self-sufficient, it
+        // carries the whole symbol dictionary from id 0 so orphan-drain / recovery
+        // replay to a fresh server never dangles a symbol id.
         // Snapshot the volatile cap ONCE for this whole flush. The I/O thread lowers
         // serverMaxBatchSize on a mid-stream failover to a smaller-cap node
         // (applyServerBatchSizeLimit); if the dictionary pre-registration, the split
@@ -5634,7 +5673,7 @@ public class QwpWebSocketSender implements Sender {
         // on any failure below.
         boolean dictionaryChunksAwaitCommit = false;
         if (cap > 0 && messageSize > cap
-                && !deltaDictEnabled && currentBatchMaxSymbolId > deltaBaseline
+                && currentBatchMaxSymbolId > deltaBaseline
                 && !splitFramesFit(cap, deltaBaseline)
                 && splitFramesFit(cap, currentBatchMaxSymbolId)) {
             try {
@@ -5661,18 +5700,10 @@ public class QwpWebSocketSender implements Sender {
             // The batch fits the cap: an earlier rejection no longer describes it.
             retainedBatchRejection = null;
 
-            // Write-ahead: durably persist this frame's new symbols BEFORE it is
-            // published, so a recovered/orphan-drained slot can always rebuild the
-            // dictionary the (non-self-sufficient) delta frame references. No-op in
-            // memory mode and when the frame introduces no new symbols.
-            persistNewSymbolsBeforePublish();
             activeBuffer.ensureCapacity(messageSize);
             activeBuffer.write(buffer.getBufferPtr(), messageSize);
             activeBuffer.incrementRowCount();
             sealAndSwapBuffer();
-            // The frame carrying ids up to currentBatchMaxSymbolId is now on the ring;
-            // advance the delta baseline so the next frame ships only newer ids.
-            advanceSentMaxSymbolId();
 
             hasDeferredMessages = deferCommit;
             if (!deferCommit) {
@@ -5761,8 +5792,8 @@ public class QwpWebSocketSender implements Sender {
      * delivering those rows at-least-once (duplicated), not exactly-once. This is
      * within store-and-forward's at-least-once contract -- a DEDUP table or a
      * durable-ack await absorbs the duplicate, and the symbol-dict state stays
-     * consistent on the retry (the re-sent frames carry empty deltas and the
-     * write-ahead persist is a {@code pd.size()} no-op). Making the split atomic
+     * consistent on the retry (full-dict mode: every re-sent frame carries the
+     * whole dictionary again). Making the split atomic
      * (rolling back the published prefix, or skipping it on retry) would be a
      * larger change.
      *
@@ -5792,15 +5823,14 @@ public class QwpWebSocketSender implements Sender {
         // publish, or none publish and we throw with nothing stranded.
         //
         // Each split frame's size is derived from the combined encode flushPendingRows
-        // already performed. simBaseline mirrors the publish loop's baseline advance
-        // (advanceSentMaxSymbolId), so each size equals the frame the staged-slice
-        // assembler will build; this pass mutates no delta/persist state.
+        // already performed, at the one baseline every frame of the split carries
+        // (full-dict mode: no frame advances it), so each size equals the frame the
+        // staged-slice assembler will build; this pass mutates no delta state.
         int nonEmptyCount = flushTableBuffers.size();
-        int simBaseline = deltaBaseline;
         for (int i = 0; i < nonEmptyCount; i++) {
             CharSequence tableName = flushTableNames.getQuick(i);
             int messageSize = encoder.getSplitMessageSize(
-                    splitFrameBodyBytes.getQuick(i), simBaseline, currentBatchMaxSymbolId);
+                    splitFrameBodyBytes.getQuick(i), deltaBaseline, currentBatchMaxSymbolId);
             if (messageSize > cap) {
                 // The batch stays BUFFERED: this throw precedes every publish, and a
                 // rejected flush must not silently discard the caller's rows (see
@@ -5812,18 +5842,16 @@ public class QwpWebSocketSender implements Sender {
                 // never fit, so say that here rather than let a caller read the repeat
                 // rejections as a transient and keep appending to a batch that only
                 // grows.
-                // In FULL-DICT mode an over-cap dictionary has been handled upstream:
-                // flushPendingRows' fallback moved the section into its own chunk frames
-                // and re-encoded this batch against an empty delta, so reaching here means
-                // a table BODY is what does not fit. In DELTA mode that fallback is gated
-                // off -- publishing before persistNewSymbolsBeforePublish would break the
-                // write-ahead ordering -- so the section can still be the half that does
-                // not fit, and reset() alone does not shrink it: the next batch's delta
-                // starts at the same sentMaxSymbolId+1 and spans up to whatever id it
-                // references. Pick the remedy from which half actually exceeds the cap
-                // rather than prescribing one that cannot work.
+                // An over-cap dictionary is normally handled upstream: flushPendingRows'
+                // fallback moves the section into its own chunk frames and re-encodes this
+                // batch against an empty delta when that makes every body fit. When a
+                // table BODY does not fit even then, the fallback stays off and the
+                // section can still be the half that does not fit, which reset() alone
+                // does not shrink: the next batch re-registers from id 0. Pick the remedy
+                // from which half actually exceeds the cap rather than prescribing one
+                // that cannot work.
                 int frameOverhead = encoder.getSplitMessageSize(
-                        0, simBaseline, currentBatchMaxSymbolId);
+                        0, deltaBaseline, currentBatchMaxSymbolId);
                 String remedy = frameOverhead > cap
                         ? "the symbol dictionary section alone exceeds the cap, so neither reset() "
                         + "nor smaller batches shrink it -- every later batch re-registers from the "
@@ -5845,23 +5873,17 @@ public class QwpWebSocketSender implements Sender {
                         .put(remedy);
                 throw rejection;
             }
-            // Mirror advanceSentMaxSymbolId: once the first frame ships the batch's
-            // new ids, the remaining frames carry an empty delta above the baseline.
-            if (deltaDictEnabled && currentBatchMaxSymbolId > simBaseline) {
-                simBaseline = currentBatchMaxSymbolId;
-            }
         }
         // Every split frame fits the cap: an earlier rejection no longer describes
         // the batch.
         retainedBatchRejection = null;
 
         int tableBodyOffset = combinedBodyStart;
-        // Mirrors simBaseline above and advanceSentMaxSymbolId below, so the frame
-        // this loop assembles is byte-identical to the one the pre-flight sized.
-        // Re-reading symbolDeltaBaseline() here instead would ignore the dictionary
+        // The pre-flight's baseline, so the frame this loop assembles is
+        // byte-identical to the one the pre-flight sized. Re-reading
+        // symbolDeltaBaseline() here instead would ignore the dictionary
         // pre-registration, which advances the baseline without touching
         // sentMaxSymbolId (full-dict mode never advances it).
-        int frameBaseline = deltaBaseline;
         for (int i = 0; i < nonEmptyCount; i++) {
             CharSequence tableName = flushTableNames.getQuick(i);
 
@@ -5869,11 +5891,6 @@ public class QwpWebSocketSender implements Sender {
             boolean deferThis = deferCommit || !isLast;
 
             int tableBodyLength = splitFrameBodyBytes.getQuick(i);
-            // Persist before touching activeBuffer. If the write-ahead fails, the
-            // caller can retry with both the source rows and active microbatch
-            // unchanged. The first frame carries the batch's new symbols; later
-            // frames are no-ops once the baseline has advanced.
-            persistNewSymbolsBeforePublish();
             ensureActiveBufferReady();
             // The combined encoder buffer remains immutable for the whole split.
             // Assemble this frame directly into the active microbatch: patched
@@ -5884,7 +5901,7 @@ public class QwpWebSocketSender implements Sender {
                     tableBodyOffset,
                     tableBodyLength,
                     deferThis,
-                    frameBaseline,
+                    deltaBaseline,
                     currentBatchMaxSymbolId
             );
             tableBodyOffset += tableBodyLength;
@@ -5902,12 +5919,6 @@ public class QwpWebSocketSender implements Sender {
 
             activeBuffer.incrementRowCount();
             sealAndSwapBuffer();
-            // Frame queued: advance so the next split frame's delta starts above
-            // the ids this one just registered.
-            advanceSentMaxSymbolId();
-            if (deltaDictEnabled && currentBatchMaxSymbolId > frameBaseline) {
-                frameBaseline = currentBatchMaxSymbolId;
-            }
         }
 
         encoder.setDeferCommit(false);
@@ -5941,10 +5952,8 @@ public class QwpWebSocketSender implements Sender {
         if (currentTableBuffer != null && currentTableBuffer.hasHeldRow()) {
             // autoFlushAfterRow shipped every row but the one it held back, which
             // stays buffered as the only pending row. currentBatchMaxSymbolId keeps
-            // its value: the held row's symbol ids are at or below it, and a
-            // full-dictionary frame must still carry them. In delta mode the frame
-            // that just shipped carried them, and advanceSentMaxSymbolId moved the
-            // baseline past them.
+            // its value: the held row's symbol ids are at or below it, and the next
+            // full-dictionary frame must still carry them.
             currentTableBuffer.retainHeldRow();
             long heldRowBytes = currentTableBuffer.getBufferedBytes();
             pendingRowCount = 1;
@@ -6853,7 +6862,7 @@ public class QwpWebSocketSender implements Sender {
         //    above exists to remove, on the one path that bypassed it.
         //
         // Any symbol a cancelled row leaked is picked up (and, in delta mode,
-        // persisted) by the next real flush, whose persistNewSymbolsBeforePublish
+        // persisted) by the next record's seal, whose persistRecordSymbols
         // resumes from pd.size().
         int commitBaseline = symbolDeltaBaseline();
         encoder.beginMessage(0, globalSymbolDictionary, commitBaseline, commitBaseline);
@@ -6870,14 +6879,15 @@ public class QwpWebSocketSender implements Sender {
 
     /**
      * Whether rows go into an open record instead of the per-table buffers: in
-     * delta mode on a memory-mode ring. A store-and-forward directory keeps
-     * encoding a frame per flush, because a sealed record's new symbols are not
-     * yet written to its .symbol-dict and a recovered version 1 active segment
-     * cannot take a record. Full-dictionary mode always encodes frames.
+     * delta mode, with or without a store-and-forward directory. A sealed
+     * record's new symbols reach the slot's {@code .symbol-dict} before its seal
+     * ({@link #persistRecordSymbols()}). Full-dictionary mode, a slot whose
+     * {@code .symbol-dict} could not be opened or whose write failed at a seal,
+     * encodes a frame per flush: a record carries only its own dictionary
+     * entries, so it could not be recovered without the side file.
      */
     private boolean useOpenRecord() {
-        CursorSendEngine engine = cursorEngine;
-        return deltaDictEnabled && engine != null && engine.sfDir() == null;
+        return deltaDictEnabled && cursorEngine != null;
     }
 
     private SenderErrorHandler userErrorHandler() {
@@ -6899,18 +6909,6 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Advances the delta baseline once a frame carrying the current batch's
-     * symbols has been queued onto the ring. No-op in full-dict mode. Only ever
-     * moves the baseline forward, so a batch that used no new symbols leaves it
-     * unchanged.
-     */
-    private void advanceSentMaxSymbolId() {
-        if (deltaDictEnabled && currentBatchMaxSymbolId > sentMaxSymbolId) {
-            sentMaxSymbolId = currentBatchMaxSymbolId;
-        }
-    }
-
-    /**
      * Appends the row {@code nextRow()} just committed in the staging buffer to
      * the open record, opening one when none is, and empties the staging buffer.
      * When the record cannot take the row, this seals it (abandons it when it
@@ -6924,23 +6922,34 @@ public class QwpWebSocketSender implements Sender {
      * new symbols alone is larger than any dictionary region. On any failure the
      * row leaves the staging buffer with the columns it created and the symbol
      * ids it minted, so the record and the next row see none of it.
+     * <p>
+     * When the seal of the full record switches the sender to full-dictionary
+     * mode (its {@code .symbol-dict} write failed, see {@link #sealRecord}),
+     * no record opens: the row stays in the staging buffer, which becomes the
+     * frame path's table buffer, and this returns false.
      *
      * @param columnsBeforeRow the staging buffer's column count before the row
      * @param rowBytes         the staged row's buffered bytes, for the error message
+     * @return true when the row went into the record, false when it stays in
+     * its table buffer for the frame path
      */
-    private void appendRowToRecord(int columnsBeforeRow, long rowBytes) {
+    private boolean appendRowToRecord(int columnsBeforeRow, long rowBytes) {
         final QwpTableBuffer staged = currentTableBuffer;
         try {
             if (recordOffset < 0) {
                 openRecord(false);
             }
             if (record.appendStagedRow(staged, globalSymbolDictionary, currentBatchMaxSymbolId) == QwoRecordWriter.APPEND_NO_SPACE) {
-                reopenRecordForRefusedRow(rowBytes, false);
+                if (!reopenRecordForRefusedRow(rowBytes, false)) {
+                    return false;
+                }
                 if (record.appendStagedRow(staged, globalSymbolDictionary, currentBatchMaxSymbolId) == QwoRecordWriter.APPEND_NO_SPACE) {
                     if (record.capacity() >= recordCapacityHint()) {
                         throw refusedRowError(rowBytes);
                     }
-                    reopenRecordForRefusedRow(rowBytes, true);
+                    if (!reopenRecordForRefusedRow(rowBytes, true)) {
+                        return false;
+                    }
                     if (record.appendStagedRow(staged, globalSymbolDictionary, currentBatchMaxSymbolId) == QwoRecordWriter.APPEND_NO_SPACE) {
                         throw refusedRowError(rowBytes);
                     }
@@ -6951,6 +6960,7 @@ public class QwpWebSocketSender implements Sender {
             throw t;
         }
         staged.clearStagedRow();
+        return true;
     }
 
     /**
@@ -6970,7 +6980,9 @@ public class QwpWebSocketSender implements Sender {
      * dictionary from id 0, which is exactly what recovery and orphan-drain replay
      * against a fresh server. So degrade instead of dying. The producer's monotonic
      * baseline stops being consulted ({@link #symbolDeltaBaseline()} returns -1), and
-     * the write-ahead persist becomes a no-op.
+     * the write-ahead persist becomes a no-op. With open records the switch comes
+     * after the seal whose write failed ({@link #sealRecord}); rows appended from then
+     * on go into the table buffers and ship as frames ({@link #useOpenRecord()}).
      * <p>
      * Producer-thread only, like every other reader of {@code deltaDictEnabled}.
      */
@@ -7146,90 +7158,52 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Appends the symbols this frame introduces ({@code [sentMaxSymbolId+1 ..
-     * currentBatchMaxSymbolId]}) to the slot's persisted dictionary BEFORE the
-     * frame is published to the ring. This write-ahead ordering keeps the
-     * persisted dictionary a superset of every process-crash-recoverable frame's
-     * references, so recovery and orphan-drain can re-register it on a fresh
-     * server. Not fsync'd (see PersistedSymbolDict) -- a host crash that tears it
-     * is caught by the send loop's replay guard. No-op in memory mode (no
-     * persisted dictionary) and when the frame introduces no new symbols.
+     * Writes the open record's dictionary entries that the slot's
+     * {@code .symbol-dict} does not hold yet, ids {@code [pd.size(), dictEndId()]},
+     * as one chunk, before the seal makes the record a frame the server can
+     * acknowledge and the ring can trim. This is the write-ahead that keeps the
+     * side file a superset of every sealed frame's references; an open record
+     * needs none, because recovery folds its own dictionary region. One write
+     * per seal, none on the row path. The record's entries are byte-identical to
+     * the side file's, so they are copied as they are; entries the side file
+     * already holds (a crash between a persist and its seal) are skipped. Not
+     * fsync'd, like the frame path's write-ahead. No-op in memory mode.
+     *
+     * @return the write's failure, which the caller reports after the seal, or
+     * null; a JVM error other than a recognised mmap access fault propagates
+     * with the record still open
      */
-    private void persistNewSymbolsBeforePublish() {
-        if (!deltaDictEnabled || cursorEngine == null) {
-            return;
-        }
+    private Throwable persistRecordSymbols() {
         PersistedSymbolDict pd = cursorEngine.getPersistedSymbolDict();
         if (pd == null) {
-            return;
+            return null;
         }
-        // Persist [pd.size() .. currentBatchMaxSymbolId] as ONE write, BEFORE the
-        // frame is published.
-        //
-        // Resume from the dictionary's own durable size, NOT sentMaxSymbolId+1:
-        // the persist advances pd.size() only after a full write, whereas
-        // sentMaxSymbolId only advances after the WHOLE frame is published (via
-        // advanceSentMaxSymbolId, after activeBuffer.write). If a prior persist
-        // threw (short write -- disk full/quota) or the publish threw, the frame
-        // was not published and sentMaxSymbolId stayed put, while the symbols
-        // before the failure are already on disk. Keying the resume point off
-        // sentMaxSymbolId+1 would re-append that persisted prefix on the retry,
-        // duplicating entries and corrupting the dense id->symbol mapping recovery
-        // relies on (position i must be symbol id i). pd.size() resumes exactly
-        // past what is already durable, so the write-ahead is idempotent.
         int from = pd.size();
-        if (currentBatchMaxSymbolId < from) {
-            return; // nothing new to persist (warm batch, or an idempotent retry)
+        int endId = record.dictEndId();
+        if (endId < from) {
+            return null;
         }
-        // Fast path: the frame the encoder just built already holds these symbols
-        // in its delta section as [len][utf8]... -- byte-identical to what
-        // PersistedSymbolDict stores. In the common case pd.size() equals the
-        // frame's delta start id (sentMaxSymbolId+1), so persist those bytes
-        // straight from the frame instead of re-encoding the symbols. After a
-        // failed publish the durable size has run ahead of the wire baseline, so
-        // the frame's delta covers MORE than remains to persist; then re-encode
-        // just the [from .. currentBatchMaxSymbolId] suffix.
         try {
-            if (from == sentMaxSymbolId + 1) {
-                QwpBufferWriter buffer = encoder.getBuffer();
-                pd.appendRawEntries(
-                        buffer.getBufferPtr() + encoder.getDeltaEntriesStart(),
-                        encoder.getDeltaEntriesLen(),
-                        currentBatchMaxSymbolId - from + 1);
+            if (from >= record.dictStartId()) {
+                long entries = record.dictEntryAddr(from);
+                long entriesEnd = record.dictEntriesAddr() + record.dictEntriesLen();
+                pd.appendRawEntries(entries, (int) (entriesEnd - entries), endId - from + 1);
             } else {
-                pd.appendSymbols(globalSymbolDictionary, from, currentBatchMaxSymbolId);
+                // The side file lacks ids below the record's first; re-encode the
+                // whole range from the producer's dictionary.
+                pd.appendSymbols(globalSymbolDictionary, from, endId);
             }
+            return null;
         } catch (Throwable t) {
-            // A failed write to the persisted dictionary throws a low-level
-            // IllegalStateException: in production that is ff.allocate refusing to grow
-            // the mmap append window (how a full disk / exhausted quota surfaces there),
-            // and behind an injected facade a short positioned write. Surface it as a
-            // LineSenderException -- like every other flush-path failure, e.g. the cursor
-            // append in sealAndSwapBuffer -- so a caller catching LineSenderException
-            // around flush() also catches a disk-full during the write-ahead persist. The
-            // persist ran before publish and pd.size() did not advance on the failure, so
-            // the still-buffered rows re-persist the same range idempotently on retry.
-            // A JVM Error is never a persist failure; let it propagate -- except a
-            // recognised mmap access fault, which is NOT a JVM failure to propagate: it
-            // is how an unbacked or sparse append page surfaces, and commitMappedChunk
-            // uses Crc32c.updateUnsafe precisely so it arrives catchable here. Rethrowing
-            // it raw skips disableDeltaDict, and from healPersistedDictionary it escapes
-            // Sender.build() as neither UnreplayableSlotException nor LineSenderException,
-            // so the slot is neither quarantined nor reported and every restart re-faults
-            // the same page.
+            // A recognised mmap access fault is NOT a JVM failure to propagate: it is how
+            // an unbacked or sparse append page surfaces, and commitMappedChunk uses
+            // Crc32c.updateUnsafe precisely so it arrives catchable here. Rethrown raw it
+            // would skip the switch to full-dictionary mode, and every later seal would
+            // re-fault the same page.
             if (t instanceof Error && !MmapSegment.isMmapAccessFault(t)) {
                 throw (Error) t;
             }
-            // Degrade before throwing, so this failure is survivable rather than terminal:
-            // every LATER flush emits full self-sufficient frames, which need no side file
-            // (see disableDeltaDict). This one flush still has to fail -- beginMessage has
-            // already baked a delta deltaStart into the staged frame, and publishing it
-            // would put ids on the ring that the side-file cannot describe. The throw
-            // precedes every publish, so the caller's rows stay buffered and the next
-            // flush() re-encodes them from id 0.
-            disableDeltaDict(t);
-            throw new LineSenderException("failed to persist symbol dictionary before publish; "
-                    + "this sender has switched to full self-sufficient frames -- retry the flush", t);
+            return t;
         }
     }
 
@@ -7283,7 +7257,8 @@ public class QwpWebSocketSender implements Sender {
     private void publishDictionaryChunks(int cap, int from, int batchMaxId) {
         // Delta-mode callers (the CLOSE_LOOP resume re-registration) may only
         // ship ids the write-ahead persist already made durable -- guaranteed
-        // by persistNewSymbolsBeforePublish's ordering. The full-dict fallback
+        // by the seal-time persist (persistRecordSymbols), which runs before a
+        // record's ids become sentMaxSymbolId. The full-dict fallback
         // caller and the degraded delta->full state (a persist failure flipped
         // deltaDictEnabled off while pd froze) ship self-sufficient chunk
         // groups and carry no such contract.
@@ -7512,16 +7487,43 @@ public class QwpWebSocketSender implements Sender {
      * Closes the record that refused the staged row, sealing it when it holds
      * rows and giving it back otherwise, and opens the next one, with the
      * dictionary reserve the row needs and, when {@code isFullCapacity}, the
-     * whole frame bound.
+     * whole frame bound. Opens none when the seal switched the sender to
+     * full-dictionary mode.
+     *
+     * @return false when the sender no longer appends to records
      */
-    private void reopenRecordForRefusedRow(long rowBytes, boolean isFullCapacity) {
+    private boolean reopenRecordForRefusedRow(long rowBytes, boolean isFullCapacity) {
         nextDictReserve = retryDictReserve(rowBytes);
         if (record.rowCount() > 0) {
             sealRecord(transactional);
         } else {
             abandonRecord();
         }
+        if (!useOpenRecord()) {
+            nextDictReserve = 0;
+            return false;
+        }
         openRecord(isFullCapacity);
+        return true;
+    }
+
+    /**
+     * Unbinds the DECIMAL scale of every table buffer with no staged row once a
+     * record has sealed, as the frame path's {@code reset()} does between
+     * batches, so a column takes the scale of its first value in each record:
+     * within a record a value is rescaled to that scale and fails on precision
+     * loss, as within a batch on the frame path. The buffer holding the row the
+     * full record refused keeps its scale for that row and unbinds at the next
+     * seal. GEOHASH precision stays. One pass over the table buffers per seal.
+     */
+    private void resetDecimalScalesAfterSeal() {
+        ObjList<CharSequence> keys = tableBuffers.keys();
+        for (int i = 0, n = keys.size(); i < n; i++) {
+            QwpTableBuffer buf = tableBuffers.get(keys.getQuick(i));
+            if (buf != null && buf.getRowCount() == 0 && !buf.hasInProgressRow()) {
+                buf.resetDecimalScales();
+            }
+        }
     }
 
     private void resetSymbolDictStateForNewConnection() {
@@ -7859,21 +7861,33 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Publishes the open record's unpublished rows, then seals it into a frame:
+     * Publishes the open record's unpublished rows, writes its new dictionary
+     * entries to the slot's {@code .symbol-dict}, then seals it into a frame:
      * the ring assigns its FSN and the I/O thread materialises and sends it. The
      * record's dictionary entries become the new delta baseline. When the engine
      * refuses the seal, the writer is already closed and the ring's state is not
      * known, so the failure latches the sender terminal ({@link #recordSealFailure})
      * and no record stays open: every later call reports it and
      * {@link #close()} still drains what shipped.
+     * <p>
+     * A failed {@code .symbol-dict} write does not stop the seal: the record's
+     * committed rows exist nowhere else, and its frame carries the entries it
+     * needs, which recovery folds from the record as from a frame's delta
+     * section. After the seal the sender switches to full-dictionary frames
+     * ({@link #disableDeltaDict}), so the rows that follow take the frame path.
      */
     private void sealRecord(boolean deferCommit) {
         if (record.hasUncommittedRows()) {
             record.publish();
         }
+        Throwable persistFailure = persistRecordSymbols();
         int usedBytes = record.seal(deferCommit);
         long fsn;
         try {
+            Runnable sealFault = recordSealFaultForTesting;
+            if (sealFault != null) {
+                sealFault.run();
+            }
             fsn = cursorEngine.sealRecord(recordOffset, usedBytes);
         } catch (Throwable t) {
             recordOffset = -1L;
@@ -7891,6 +7905,10 @@ public class QwpWebSocketSender implements Sender {
         pendingBytes = 0;
         firstPendingRowTimeNanos = 0;
         clearSavepointAndRejection();
+        resetDecimalScalesAfterSeal();
+        if (persistFailure != null) {
+            disableDeltaDict(persistFailure);
+        }
         armIfEligible();
     }
 
@@ -7908,13 +7926,23 @@ public class QwpWebSocketSender implements Sender {
             // row only when that one cannot take it either.
             int columnsBeforeRow = currentTableBuffer.getCommittedColumnCount();
             long rowBytes = currentTableBuffer.nextRow();
-            appendRowToRecord(columnsBeforeRow, rowBytes);
-            if (pendingRowCount == 0) {
+            if (appendRowToRecord(columnsBeforeRow, rowBytes)) {
+                if (pendingRowCount == 0) {
+                    firstPendingRowTimeNanos = System.nanoTime();
+                }
+                pendingRowCount++;
+                rowsAppended++;
+                pendingBytes = record.usedBytes();
+            } else {
+                // The seal the row forced switched the sender to full-dictionary
+                // mode: every other table buffer is empty, and this row is the
+                // frame path's first pending row.
                 firstPendingRowTimeNanos = System.nanoTime();
+                pendingRowCount = 1;
+                rowsAppended++;
+                pendingBytes = rowBytes;
+                currentTableBufferSnapshotBytes = rowBytes;
             }
-            pendingRowCount++;
-            rowsAppended++;
-            pendingBytes = record.usedBytes();
             if (shouldAutoFlush()) {
                 autoFlushAfterRow();
             }

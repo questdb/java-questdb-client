@@ -256,6 +256,35 @@ public final class QwoRecordWriter implements QuietCloseable {
         return dictStartId + dictCount - 1;
     }
 
+    /**
+     * Address of the first dictionary entry, {@code [varint utf8Len][utf8]}
+     * per entry in id order from {@link #dictStartId()}.
+     */
+    public long dictEntriesAddr() {
+        return payloadAddr + HEADER_SIZE;
+    }
+
+    /**
+     * Encoded bytes of the dictionary entries, published or not.
+     */
+    public int dictEntriesLen() {
+        return dictUsed;
+    }
+
+    /**
+     * Address of the entry of symbol id {@code id}, which must lie in
+     * {@code [dictStartId(), dictEndId() + 1]}; the end of the entries for
+     * {@code dictEndId() + 1}. Walks the entries before it.
+     */
+    public long dictEntryAddr(int id) {
+        assert id >= dictStartId && id <= dictEndId() + 1 : "id outside the dictionary [id=" + id + ']';
+        long p = payloadAddr + HEADER_SIZE;
+        for (int i = dictStartId; i < id; i++) {
+            p = skipString(p);
+        }
+        return p;
+    }
+
     public int dictStartId() {
         return dictStartId;
     }

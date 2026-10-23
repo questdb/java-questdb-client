@@ -270,10 +270,9 @@ public class PersistedSymbolDictTest {
         // via appendRawEntries. A short write (disk full / quota) mid-persist must
         // throw WITHOUT advancing size()/appendOffset, so a retry keyed off size()
         // re-writes the identical bytes at the same offset and recovers a gap-free,
-        // duplicate-free dictionary. The failed-PUBLISH regressions
-        // (DeltaDictRecoveryTest) exercise a persist that SUCCEEDED; only this pins
-        // the persist-FAILURE trigger, whose idempotency the write-ahead
-        // (persistNewSymbolsBeforePublish, resuming from pd.size()) relies on.
+        // duplicate-free dictionary. This pins the persist-FAILURE trigger, whose
+        // idempotency the write-ahead at a record's seal (persistRecordSymbols,
+        // resuming from pd.size()) relies on.
         assertMemoryLeak(() -> {
             Path src = newFolder("qwp-symdict-src");
             Path dst = newFolder("qwp-symdict-dst");

@@ -25,7 +25,6 @@
 package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.Sender;
-import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
@@ -57,8 +56,8 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  * scratch (step 4), and a fresh engine re-derives {@code deltaDictEnabled} independently of
  * whatever the outgoing epoch's engine decided -- so once the underlying fault clears, the
  * next recycle heals the sender back into delta mode. If the fault has not cleared, the fresh
- * engine simply degrades again on its own first append: a normal, catchable
- * {@link LineSenderException}, not a latched {@code recycleFailure} terminal state.
+ * engine simply degrades again at its first record's seal, which still completes: no
+ * exception, and not a latched {@code recycleFailure} terminal state.
  * <p>
  * Also covers the two permanent recycle-metrics getters ({@code getSymbolDictEpoch()},
  * {@code getSymbolDictResetStarvationTimeouts()}).
@@ -188,28 +187,19 @@ public class SymbolDictRecycleHealingTest {
                 try {
                     Assert.assertTrue("must start in delta mode", sender.isDeltaDictEnabledForTest());
 
-                    // Degrade mid-life: fault the dictionary's next mmap growth.
+                    // Degrade mid-life: fault the dictionary's next mmap growth. The persist
+                    // at the record's seal faults (the guard MmapFaultDegradesTest pins); the
+                    // seal completes, so the flush still ships the row.
                     ff.armed = true;
                     sender.table("m").symbol("s", "a").longColumn("v", 1L).atNow();
-                    try {
-                        sender.flush();
-                        Assert.fail("expected the injected mmap fault to fail this flush");
-                    } catch (LineSenderException expected) {
-                        // same guard MmapFaultDegradesTest pins
-                        Assert.assertTrue("the fault must be reported as a sender error, not a "
-                                        + "raw InternalError: " + expected.getMessage(),
-                                expected.getMessage().contains(
-                                        "failed to persist symbol dictionary before publish"));
-                    }
+                    long fsn1 = sender.flushAndGetSequence();
                     Assert.assertFalse("a recognised mmap access fault must degrade the sender",
                             sender.isDeltaDictEnabledForTest());
 
-                    // Heal the facade. The retry below does not itself touch mmap --
-                    // persistNewSymbolsBeforePublish short-circuits once !deltaDictEnabled --
-                    // so healing here matters only for what the fresh post-recycle engine sees.
+                    // Heal the facade. Full-dict mode never touches the dictionary's mmap, so
+                    // healing here matters only for what the fresh post-recycle engine sees.
                     ff.armed = false;
-                    long fsn1 = sender.flushAndGetSequence();
-                    Assert.assertTrue("the degraded retry must still ingest the row",
+                    Assert.assertTrue("the record whose persist faulted must still ingest the row",
                             sender.awaitAckedFsn(fsn1, 5_000));
                     Assert.assertEquals(0, sender.getSymbolDictEpoch());
 
@@ -271,10 +261,10 @@ public class SymbolDictRecycleHealingTest {
      * dictionary file needs only {@code openCleanRW}/{@code write} for its header -- see
      * {@code PersistedSymbolDict.openFresh}), so the fresh engine transiently reports delta mode
      * right after the recycle; the degrade only becomes observable once something actually
-     * appends to it. Either way this must stay a degrade, not a break: a plain, catchable
-     * {@link LineSenderException} on the one flush that hits the fault, no raw {@code Error}
-     * escaping, no latched {@code recycleFailure} terminal state, and the sender keeps ingesting
-     * rows (in full-dict mode) right after.
+     * appends to it. Either way this must stay a degrade, not a break: the flush whose record's
+     * seal hits the fault still completes and ships the record, no raw {@code Error} escapes,
+     * no {@code recycleFailure} terminal state latches, and the sender keeps ingesting rows (in
+     * full-dict mode) right after.
      */
     @Test
     public void testRecycleDegradesAgainWhenFaultPersists() throws Exception {
@@ -296,21 +286,13 @@ public class SymbolDictRecycleHealingTest {
                         slot, 4L * 1024 * 1024, 64L * 1024 * 1024,
                         CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, ff));
                 try {
-                    // Degrade once before the recycle, same setup as the healing test.
+                    // Degrade once before the recycle, same setup as the healing test: the
+                    // record's seal persists, faults (same guard as MmapFaultDegradesTest) and
+                    // still seals, so the flush ships the row.
                     ff.armed = true;
                     sender.table("m").symbol("s", "a").longColumn("v", 1L).atNow();
-                    try {
-                        sender.flush();
-                        Assert.fail("expected the injected mmap fault to fail this flush");
-                    } catch (LineSenderException expected) {
-                        // expected -- same guard as MmapFaultDegradesTest
-                        Assert.assertTrue("the fault must be reported as a sender error, not a "
-                                        + "raw InternalError: " + expected.getMessage(),
-                                expected.getMessage().contains(
-                                        "failed to persist symbol dictionary before publish"));
-                    }
+                    long fsn1 = sender.flushAndGetSequence();
                     Assert.assertFalse(sender.isDeltaDictEnabledForTest());
-                    long fsn1 = sender.flushAndGetSequence(); // retry succeeds in full-dict mode
                     Assert.assertTrue(sender.awaitAckedFsn(fsn1, 5_000));
 
                     // Do NOT heal: the facade is still armed when the recycle rebuilds the
@@ -325,27 +307,20 @@ public class SymbolDictRecycleHealingTest {
                                     + "transiently re-derives delta mode before its first append",
                             sender.isDeltaDictEnabledForTest());
 
-                    // ...until this flush's append hits the still-armed facade and degrades it
-                    // again, exactly like the pre-recycle fault: a clean LineSenderException,
-                    // never a raw Error, and the sender is not latched terminal.
-                    try {
-                        sender.flush();
-                        Assert.fail("expected the still-armed facade to fault the post-recycle append too");
-                    } catch (LineSenderException expected) {
-                        // degrade, not break: a normal, catchable sender error
-                        Assert.assertTrue("the fault must be reported as a sender error, not a "
-                                        + "raw InternalError: " + expected.getMessage(),
-                                expected.getMessage().contains(
-                                        "failed to persist symbol dictionary before publish"));
-                    }
+                    // ...until this flush's seal persists into the still-armed facade and
+                    // degrades it again, exactly like the pre-recycle fault: the seal completes,
+                    // no raw Error escapes, and the sender is not latched terminal.
+                    long fsn2 = sender.flushAndGetSequence();
                     Assert.assertFalse("the fresh engine must degrade again, not stay in delta mode",
                             sender.isDeltaDictEnabledForTest());
-
-                    // Degrade, not break: the sender keeps working (full-dict mode now), no
-                    // latched recycleFailure and no exception escaping this retry.
-                    long fsn2 = sender.flushAndGetSequence();
                     Assert.assertTrue("the row must still get ingested after the second degrade",
                             sender.awaitAckedFsn(fsn2, 5_000));
+
+                    // Degrade, not break: the sender keeps working in full-dict mode.
+                    sender.table("m").symbol("s", "c").longColumn("v", 3L).atNow();
+                    long fsn3 = sender.flushAndGetSequence();
+                    Assert.assertTrue("a later row must still get ingested in full-dict mode",
+                            sender.awaitAckedFsn(fsn3, 5_000));
                 } finally {
                     sender.close();
                 }

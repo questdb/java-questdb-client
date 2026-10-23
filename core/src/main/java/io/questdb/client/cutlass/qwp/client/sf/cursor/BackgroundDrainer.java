@@ -873,8 +873,10 @@ public final class BackgroundDrainer implements Runnable {
 
     // Every markFailed site pairs with one of these: the .failed sentinel is
     // permanent (nothing in production clears it), so each one is a
-    // permanent-abandonment verdict on the slot's unacked data. A throwing
-    // sink must not disturb the drainer's own teardown arc.
+    // permanent-abandonment verdict on the slot's unacked data. The one report
+    // without a sentinel names the rows of a corrupt open record recovery
+    // discarded; the rest of that slot drains. A throwing sink must not disturb
+    // the drainer's own teardown arc.
     private void dispatchDataLoss(String reason) {
         if (slotPath == null) {
             // Only the @TestOnly zero-segment drainer carries a null slot path; a
@@ -1054,6 +1056,12 @@ public final class BackgroundDrainer implements Runnable {
             if (logicalSlotLock != null) {
                 logicalSlotLock.close();
                 logicalSlotLock = null;
+            }
+            // Recovery zeroed an open record the crash left corrupt: its rows are gone,
+            // the rest of the slot drains as usual. Report the loss once.
+            String recoveredLoss = engine.recoveredDataLossDetail();
+            if (recoveredLoss != null) {
+                dispatchDataLoss(recoveredLoss);
             }
             // A recovered deferred-only tail is an aborted transaction and can
             // be retired locally once everything below it is already ACKed.

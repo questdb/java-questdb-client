@@ -43,10 +43,9 @@ public class QwpWebSocketEncoder implements QuietCloseable {
     private NativeBufferWriter buffer;
     // Byte offsets, within the buffer, of the symbol-dict delta ENTRY region
     // ([len][utf8]... only, without the two section varints) that beginMessage
-    // last wrote. Let the producer persist those bytes straight to the slot's
-    // .symbol-dict instead of re-encoding the same symbols (see
-    // QwpWebSocketSender.persistNewSymbolsBeforePublish). Valid until the next
-    // beginMessage; stored as offsets so they survive a buffer realloc.
+    // last wrote. copySplitMessage copies those bytes into a split frame. Valid
+    // until the next beginMessage; stored as offsets so they survive a buffer
+    // realloc.
     private int deltaCount;
     private int deltaEntriesEnd;
     private int deltaEntriesStart;

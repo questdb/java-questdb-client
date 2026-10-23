@@ -148,13 +148,13 @@ public class DeltaDictCatchUpTest {
     }
 
     @Test
-    public void testFixedCapNearBoundarySymbolCatchesUpWithoutTerminal() throws Exception {
-        // Regression (homogeneous single cap): a symbol whose length sits just below
-        // the advertised cap is ACCEPTED into a data frame (messageSize <= cap) and
-        // enters the sent-dictionary mirror. On reconnect the catch-up must
-        // re-register it under the SAME cap -- the bare catch-up frame (header + two
-        // varints + the entry) is smaller than the data frame that already shipped
-        // it (which also carried the table schema + a row), so it fits.
+    public void testLargeSymbolOfAShippedRecordIsReRegisteredUnderTheSameCap() throws Exception {
+        // Homogeneous single cap: a large symbol a record accepted under the
+        // advertised cap enters the sent-dictionary mirror when the record ships. On
+        // reconnect the catch-up must re-register it under the SAME cap -- the bare
+        // catch-up frame (header + two varints + the entry) is smaller than the data
+        // frame that already shipped it (which also carried the table schema + a
+        // row), so it fits, and the catch-up must ship rather than terminate.
         //
         // Pre-fix, the single-entry terminal used the conservative PACKING budget
         // (cap - HEADER_SIZE - 16), which is stricter than the producer's publish
@@ -166,11 +166,13 @@ public class DeltaDictCatchUpTest {
         // on a shrunk cap, which MUST still terminate), this entry is legally
         // shippable and must NOT terminate.
         //
-        // In memory mode the producer's bound is its open record, which the sender
-        // sizes to the cap and whose header, wire margin and column chunks cost more
-        // than the catch-up frame's 12-byte header and two varints. At cap=400 the
-        // record takes a 250-char symbol (a 252-byte entry), and the solo catch-up
-        // frame is 12+1+2+252=267 bytes, within both the cap and the packing budget.
+        // The producer's bound is its open record, which the sender sizes to the cap
+        // and whose header, wire margin and column chunks cost more than the catch-up
+        // frame's 12-byte header and two varints, so the original near-boundary
+        // regression (a symbol inside the cap but over the packing budget) can no
+        // longer be produced. At cap=400 the record takes a 250-char symbol (a
+        // 252-byte entry), and the solo catch-up frame is 12+1+2+252=267 bytes,
+        // within both the cap and the packing budget.
         final int cap = 400;
         final String nearCapSymbol = TestUtils.repeat("x", 250);
         assertMemoryLeak(() -> {

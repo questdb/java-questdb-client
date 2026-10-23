@@ -293,90 +293,6 @@ public class SelfSufficientFramesTest {
         });
     }
 
-    /**
-     * A split that fails at frame k&gt;1 must leave the symbol dictionary consistent for
-     * the retry.
-     * <p>
-     * flushPendingRowsSplit publishes frames one at a time and documents that a failure
-     * partway through leaves frames 1..k-1 on the ring as deferred, with the next flush
-     * re-emitting the whole batch -- at-least-once, absorbed by DEDUP or a durable-ack
-     * await. Nothing exercised the k&gt;1 shape at all: every other failed-publish test
-     * fails at frame 1.
-     * <p>
-     * This is a CHARACTERISATION test, not a mutation guard, and the reason is worth
-     * recording. It confirms the javadoc's claim that "the re-sent frames carry empty
-     * deltas and the write-ahead persist is a pd.size() no-op" -- but it does not
-     * discriminate against reverting that pd.size() key, because frame 1 published
-     * SUCCESSFULLY and advanceSentMaxSymbolId therefore already moved the baseline past
-     * the whole batch. The retry is an early return under either key. That is precisely
-     * why the k&gt;1 path is safe, and it is the fact the test pins.
-     * <p>
-     * The failure is injected at the RING, not the cap: both frames pass the pre-flight
-     * (each is under the advertised cap) but "big"'s frame does not fit a fresh
-     * sf_max_segment_bytes segment, so it fails in sealAndSwapBuffer AFTER "a" was published.
-     */
-    @Test(timeout = 60_000L)
-    public void testMidSplitPublishFailureLeavesTheDictionaryIdempotent() throws Exception {
-        Path sfDir = temporaryFolder.newFolder("qwp-sf-midsplit").toPath();
-        assertMemoryLeak(() -> {
-            CapturingHandler handler = new CapturingHandler();
-            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
-                server.setAdvertisedMaxBatchSize(3_400);
-                int port = server.getPort();
-                server.start();
-                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-
-                String pad = new String(new char[100]).replace('\0', 'x');
-                String cfg = "ws::addr=localhost:" + port
-                        + ";sf_dir=" + sfDir
-                        + ";sf_max_segment_bytes=1024"
-                        + ";auto_flush_bytes=off;auto_flush_rows=1000000;auto_flush_interval=60000"
-                        + ";close_flush_timeout_millis=0;";
-                Sender sender = Sender.fromConfig(cfg);
-                try {
-                    // "a" first (small: fits a segment), "big" second (does not).
-                    sender.table("a").symbol("s", "alpha").longColumn("v", 1L).atNow();
-                    for (int i = 0; i < 28; i++) {
-                        sender.table("big").symbol("s", "bravo")
-                                .stringColumn("p", pad).longColumn("v", (long) i).atNow();
-                    }
-
-                    ObjList<String> afterFirst = null;
-                    for (int attempt = 0; attempt < 2; attempt++) {
-                        try {
-                            sender.flush();
-                            Assert.fail("the second split frame cannot fit a fresh segment");
-                        } catch (LineSenderException expected) {
-                            // Ring-level failure, not the cap pre-flight.
-                            Assert.assertFalse("must fail at the ring, not the cap pre-flight: "
-                                            + expected.getMessage(),
-                                    expected.getMessage().contains("too large for server batch cap"));
-                        }
-                        ObjList<String> persisted =
-                                ((QwpWebSocketSender) sender).getPersistedSymbolsForTest();
-                        Assert.assertNotNull(persisted);
-                        if (attempt == 0) {
-                            afterFirst = persisted;
-                        } else {
-                            Assert.assertEquals("a mid-split retry must not re-append the "
-                                            + "symbols the failed attempt already persisted",
-                                    afterFirst.size(), persisted.size());
-                        }
-                    }
-                    Assert.assertEquals("both symbols are persisted exactly once",
-                            2, afterFirst.size());
-                } finally {
-                    try {
-                        // close() re-flushes the retained batch, which is permanently
-                        // unflushable at this sf_max_segment_bytes -- not what we assert.
-                        sender.close();
-                    } catch (LineSenderException ignored) {
-                    }
-                }
-            }
-        });
-    }
-
     @Test
     public void testRowOverTheFrameBoundFailsAloneAndStrandsNothing() throws Exception {
         // Delta mode enforces the frame bound on the row, at at(): a row no record of
@@ -423,120 +339,95 @@ public class SelfSufficientFramesTest {
     }
 
     @Test
-    public void testFileModeSplitPersistsDictBeforeAFAILEDPublish() throws Exception {
-        // The SPLIT path's write-ahead ordering: persistNewSymbolsBeforePublish must run
-        // BEFORE sealAndSwapBuffer publishes the frame to the ring, exactly as it does on
-        // the non-split path.
+    public void testFileModePersistsTheRecordsSymbolsBeforeAFailedSeal() throws Exception {
+        // The write-ahead ordering of a record: its seal persists the record's new
+        // symbols to .symbol-dict BEFORE the engine seals it into a frame the server
+        // can acknowledge and the ring can trim. A seal that fails in the engine
+        // tells the order apart: the symbols are already durable when it throws;
+        // with the persist moved after the engine's seal, the throw beats it and the
+        // dictionary is still empty.
         //
-        // Its sibling below (testFileModeSplitPersistsDictBeforePublish) checks the dict
-        // after a SUCCESSFUL flush, which proves nothing about ORDER -- the symbols land
-        // in the file either way. Only a publish that FAILS while the symbols are new can
-        // tell the two apart: with the write-ahead intact the symbols are already durable
-        // when the publish throws; with the persist moved after the publish, the throw
-        // beats it and the dictionary is still empty. (The non-split path is pinned this
-        // way by DeltaDictRecoveryTest.testFailedPublishDoesNotDuplicatePersistedSymbols;
-        // the split path had no equivalent.)
-        //
-        // Why it matters: store-and-forward is process-crash durable. If a split frame
-        // reaches the ring before its symbols reach .symbol-dict, a JVM crash in that
-        // window leaves a recorded frame whose deltaStart exceeds the recovered
-        // dictionary -- so recovery declares the slot unreplayable and quarantines a slot
-        // that should have drained cleanly.
-        //
-        // Setup: the server cap (150) splits the two-table batch, and each split frame
-        // still FITS that cap, so the split pre-flight passes and the publish is actually
-        // attempted. sf_max_segment_bytes=64 then makes every frame larger than the segment, so
-        // appendBlocking fails with PAYLOAD_TOO_LARGE -- deterministically, no
-        // backpressure timing needed.
-        Path sfDir = temporaryFolder.newFolder("qwp-sf-split-persist-fail").toPath();
+        // Why it matters: once trimmed, a frame's own copy of its delta is gone, and a
+        // later recovery rebuilds the ids its successors reference from .symbol-dict
+        // alone; a missing entry makes the slot unreplayable.
+        Path sfDir = temporaryFolder.newFolder("qwp-sf-record-persist-fail").toPath();
         assertMemoryLeak(() -> {
             CapturingHandler handler = new CapturingHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
-                server.setAdvertisedMaxBatchSize(150); // forces the two-table batch to split
                 int port = server.getPort();
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
                 String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
-                        + ";sf_max_segment_bytes=64;auto_flush_bytes=off;";
-                String pad = TestUtils.repeat("x", 60);
-                Sender sender = Sender.fromConfig(config);
+                        + ";auto_flush_bytes=off;auto_flush_rows=1000000;auto_flush_interval=60000"
+                        + ";close_flush_timeout_millis=0;";
+                QwpWebSocketSender sender = (QwpWebSocketSender) Sender.fromConfig(config);
                 try {
-                    sender.table("t1").symbol("s", "alpha").stringColumn("p", pad).longColumn("v", 1L).atNow();
-                    sender.table("t2").symbol("s", "bravo").stringColumn("p", pad).longColumn("v", 2L).atNow();
+                    sender.table("t1").symbol("s", "alpha").longColumn("v", 1L).atNow();
+                    sender.table("t2").symbol("s", "bravo").longColumn("v", 2L).atNow();
+                    sender.setRecordSealFaultForTesting(() -> {
+                        throw new IllegalStateException("injected seal fault");
+                    });
                     try {
                         sender.flush();
-                        Assert.fail("a split frame larger than the segment must fail to publish");
+                        Assert.fail("the engine's seal must fail");
                     } catch (LineSenderException expected) {
-                        // PAYLOAD_TOO_LARGE -- the publish, not the pre-flight.
+                        TestUtils.assertContains(expected.getMessage(), "seal");
                     }
-                    Assert.assertEquals("the publish must fail, so no frame reaches the server",
+                    Assert.assertEquals("the seal failed, so no frame reaches the server",
                             0, handler.batches.size());
 
-                    // The write-ahead already ran: both of the batch's new symbols are
-                    // durable even though the frame that references them never
-                    // published. Move the persist after sealAndSwapBuffer and this is 0.
-                    ObjList<String> persisted =
-                            ((QwpWebSocketSender) sender).getPersistedSymbolsForTest();
+                    // The write-ahead already ran: both of the record's new symbols are
+                    // durable although the record never became a frame. Move the persist
+                    // after the engine's seal and this is 0.
+                    ObjList<String> persisted = sender.getPersistedSymbolsForTest();
                     Assert.assertNotNull(persisted);
-                    Assert.assertEquals("the split path must persist its new symbols BEFORE "
-                            + "publishing the frame that references them", 2, persisted.size());
+                    Assert.assertEquals("the seal must persist the record's new symbols BEFORE "
+                            + "the engine seals it", 2, persisted.size());
                     Assert.assertEquals("alpha", persisted.getQuick(0));
                     Assert.assertEquals("bravo", persisted.getQuick(1));
                 } finally {
-                    try {
-                        sender.close();
-                    } catch (LineSenderException ignored) {
-                        // close() re-flushes the still-buffered oversized rows and fails
-                        // again; expected, and not what this test asserts. close() still
-                        // runs its resource cleanup, so no native memory leaks.
-                    }
+                    sender.close();
                 }
             }
         });
     }
 
     @Test
-    public void testFileModeSplitPersistsDictBeforePublish() throws Exception {
-        // File-mode store-and-forward + a SPLIT flush: a two-table batch whose combined
-        // size exceeds the server cap splits into one frame per table
-        // (flushPendingRowsSplit). The first split frame's write-ahead persist
-        // (persistNewSymbolsBeforePublish, the appendRawEntries fast path) must record
-        // the batch's new symbols in .symbol-dict BEFORE the frames publish, so a
-        // recovered / orphan-drained slot can rebuild what the delta frames reference.
-        // The other split tests run in memory mode, so this is the only coverage of the
-        // split x persist path with a live PersistedSymbolDict.
-        Path sfDir = temporaryFolder.newFolder("qwp-sf-split-persist").toPath();
+    public void testFileModePersistsTheSymbolsOfEveryRecord() throws Exception {
+        // File-mode store-and-forward with a cap that holds one row per record: the
+        // second row does not fit the record holding the first, so at() seals that
+        // record and the row goes into the next. Each seal persists its record's new
+        // symbol, so .symbol-dict holds both while their frames are unacked, which is
+        // what a recovered or orphan-drained slot rebuilds the ids from.
+        Path sfDir = temporaryFolder.newFolder("qwp-sf-record-persist").toPath();
         assertMemoryLeak(() -> {
             CapturingHandler handler = new CapturingHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
-                server.setAdvertisedMaxBatchSize(150); // forces the two-table batch to split
+                server.setAdvertisedMaxBatchSize(1024);
                 int port = server.getPort();
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
-                String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";auto_flush_bytes=off;auto_flush_rows=1000000;auto_flush_interval=60000;";
                 Path dictFile = sfDir.resolve("default").resolve(".symbol-dict");
-                String pad = new String(new char[60]).replace('\0', 'x');
+                String pad = TestUtils.repeat("x", 500);
                 try (Sender sender = Sender.fromConfig(config)) {
-                    // Two tables, two new symbols, ONE flush -> the combined message
-                    // exceeds cap 150 and splits into two frames.
                     sender.table("t1").symbol("s", "alpha").stringColumn("p", pad).longColumn("v", 1L).atNow();
                     sender.table("t2").symbol("s", "bravo").stringColumn("p", pad).longColumn("v", 2L).atNow();
                     sender.flush();
                     waitFor(() -> handler.batches.size() >= 2, 5_000);
 
                     // Check .symbol-dict while the sender is live: a fully-drained
-                    // close would unlink it. The split's first-frame write-ahead
-                    // persist must have recorded BOTH new symbols.
+                    // close would unlink it.
                     Assert.assertTrue("persisted dictionary file exists", Files.exists(dictFile));
                     byte[] dict = Files.readAllBytes(dictFile);
-                    Assert.assertTrue("split-flush persist must record alpha", containsUtf8(dict, "alpha"));
-                    Assert.assertTrue("split-flush persist must record bravo", containsUtf8(dict, "bravo"));
+                    Assert.assertTrue("the first record's seal must persist alpha", containsUtf8(dict, "alpha"));
+                    Assert.assertTrue("the second record's seal must persist bravo", containsUtf8(dict, "bravo"));
                 }
 
-                Assert.assertEquals("the oversized two-table batch must split into 2 frames",
-                        2, handler.batches.size());
+                Assert.assertEquals("one frame per record", 2, handler.batches.size());
             }
         });
     }
@@ -578,14 +469,13 @@ public class SelfSufficientFramesTest {
     }
 
     @Test
-    public void testFullDictFallbackGateStaysOffInDeltaMode() throws Exception {
-        // The full-dictionary fallback of the frame path publishes dictionary-only
-        // chunk frames, which is safe only without a .symbol-dict write-ahead to
-        // order against. Delta mode must never produce one. It does not reach that
-        // path at all: every new entry lives in the dictionary region of the record
-        // whose rows use it, a region too small for the next row's symbols seals the
-        // record and the next record reserves a larger one, so every frame is a data
-        // frame and the dictionary arrives gap-free, each id once.
+    public void testFullDictionaryRegionSealsTheRecordAndEveryFrameIsADataFrame() throws Exception {
+        // Every new entry lives in the dictionary region of the record whose rows use
+        // it: a region too small for the next row's symbols seals the record and the
+        // next record reserves a larger one. Delta mode therefore never ships a
+        // dictionary-only frame (the frame path's full-dictionary fallback, which
+        // delta mode never reaches): every frame is a data frame within the cap, and
+        // the dictionary arrives gap-free, each id once.
         assertMemoryLeak(() -> {
             final int cap = 4096;
             CapturingHandler handler = new CapturingHandler();

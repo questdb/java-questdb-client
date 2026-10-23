@@ -501,7 +501,11 @@ public final class MmapSegment implements QuietCloseable {
                 }
                 throw new MmapSegmentException("mapped-memory fault while validating records in " + path, e);
             }
-            if (scan.tornTailBytes > 0) {
+            // A torn tail that is exactly an open record with committed rows is the
+            // designed outcome of a crash with a record open, not an incident: the
+            // ring seals it on the resumed active (and logs that) and fails closed on
+            // it anywhere else, so it gets no disk-health warning.
+            if (scan.tornTailBytes > 0 && !isRecoverableOpenRecordTail(addr, fileSize, scan)) {
                 // Observe-only: report the residue, never touch it here. A
                 // torn tail may be an interrupted append (dead bytes) OR a
                 // mid-file tear with unreachable valid-CRC frames past it --
@@ -1057,6 +1061,16 @@ public final class MmapSegment implements QuietCloseable {
     }
 
     /**
+     * Format version in the segment header: {@link #VERSION} for a segment this
+     * client created, down to {@link #MIN_VERSION} for one an older client left
+     * and recovery resumed. Only a segment of {@link #VERSION} may take a QWO1
+     * record: an older client reading the slot would treat one as a torn tail.
+     */
+    public byte version() {
+        return Unsafe.getUnsafe().getByte(mmapAddress + 4);
+    }
+
+    /**
      * Makes every frame written by {@link #tryWrite} visible to the consumer: the
      * I/O thread may read, and send, any frame below {@link #publishedOffset()}.
      * Producer thread only.
@@ -1371,6 +1385,20 @@ public final class MmapSegment implements QuietCloseable {
             nonZero |= Unsafe.getUnsafe().getByte(address + i++) != 0;
         }
         return nonZero;
+    }
+
+    /**
+     * Whether the scan's torn tail is exactly the open record it judged
+     * recoverable: valid with committed rows, at the recovery boundary, with
+     * nothing but zeroes past its reservation.
+     */
+    private static boolean isRecoverableOpenRecordTail(long addr, long fileSize, RecoveryScan scan) {
+        if (scan.openRecordOffset < 0 || scan.openRecordOffset != scan.lastGood
+                || !scan.isOpenRecordValid || scan.openRecordRows <= 0) {
+            return false;
+        }
+        long reservationEnd = scan.openRecordOffset + FRAME_HEADER_SIZE + scan.openRecordCapacity;
+        return !hasNonZero(addr + reservationEnd, fileSize - reservationEnd);
     }
 
     /**

@@ -251,6 +251,39 @@ public class QwpOpenRecordSenderTest {
     }
 
     @Test
+    public void testDecimalScaleBindsPerRecord() throws Exception {
+        assertMemoryLeak(() -> {
+            QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+            try (TestWebSocketServer server = startServer(log);
+                 Oracle first = new Oracle();
+                 Oracle second = new Oracle();
+                 Sender sender = Sender.fromConfig(config(server.getPort()))) {
+                // the first record binds the column's scale to its first value's, 1
+                decimalRow(sender, first.block("t"), Decimal64.fromLong(105, 1), 1);
+                sender.flush();
+                log.awaitDataFrames(1, 5_000);
+                Assert.assertArrayEquals(first.frame(-1, false), dataFrame(log, 0));
+                // the next record binds its own: 10.25 keeps scale 2, as in the next batch on the frame path
+                decimalRow(sender, second.block("t"), Decimal64.fromLong(1025, 2), 2);
+                sender.flush();
+                log.awaitDataFrames(2, 5_000);
+                Assert.assertArrayEquals(second.frame(-1, false), dataFrame(log, 1));
+
+                // within one record the first scale binds, and a publish does not unbind it
+                sender.table("t").decimalColumn("d", Decimal64.fromLong(105, 1)).at(TS_BASE + 3, ChronoUnit.MICROS);
+                sender.publishPending();
+                try {
+                    sender.table("t").decimalColumn("d", Decimal64.fromLong(1025, 2)).at(TS_BASE + 4, ChronoUnit.MICROS);
+                    Assert.fail("a finer scale within one record cannot be rescaled without precision loss");
+                } catch (LineSenderException expected) {
+                    TestUtils.assertContains(expected.getMessage(), "cannot rescale");
+                }
+                Assert.assertEquals("the earlier row stays", 1, sender.pendingRowCount());
+            }
+        });
+    }
+
+    @Test
     public void testFlushDeferredCarriesTheFlagAndFlushCommits() throws Exception {
         assertMemoryLeak(() -> {
             QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
@@ -754,6 +787,31 @@ public class QwpOpenRecordSenderTest {
     }
 
     @Test
+    public void testRowRefusedByAFullRecordKeepsItsDecimalScale() throws Exception {
+        assertMemoryLeak(() -> {
+            QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+            String pad = TestUtils.repeat("x", 1200);
+            try (TestWebSocketServer server = startServer(log, 4096);
+                 Oracle first = new Oracle();
+                 Oracle second = new Oracle();
+                 Sender sender = Sender.fromConfig(config(server.getPort()))) {
+                QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                // one table per row: two rows fill the 4 KiB record, the third is refused, the
+                // record seals and the row is retried in the next record with the scale it has
+                paddedDecimalRow(sender, first.block("t1"), pad, 1);
+                paddedDecimalRow(sender, first.block("t2"), pad, 2);
+                Assert.assertEquals(1, ws.recordOpensForTest());
+                paddedDecimalRow(sender, second.block("t3"), pad, 3);
+                Assert.assertEquals("the refused row opened the next record", 2, ws.recordOpensForTest());
+                sender.flush();
+                log.awaitDataFrames(2, 5_000);
+                Assert.assertArrayEquals(first.frame(-1, false), dataFrame(log, 0));
+                Assert.assertArrayEquals("the refused row keeps its scale 2", second.frame(-1, false), dataFrame(log, 1));
+            }
+        });
+    }
+
+    @Test
     public void testRowWithColumnsInDifferentOrderLandsByName() throws Exception {
         assertMemoryLeak(() -> {
             QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
@@ -913,7 +971,7 @@ public class QwpOpenRecordSenderTest {
         return "ws::addr=localhost:" + port + ";auto_flush_bytes=off;auto_flush_rows=1000000;auto_flush_interval=60000;close_flush_timeout_millis=0;";
     }
 
-    private static byte[] dataFrame(QuestDBFlushOnCloseTest.FrameLog log, int index) {
+    static byte[] dataFrame(QuestDBFlushOnCloseTest.FrameLog log, int index) {
         int seen = -1;
         for (byte[] frame : log.frames()) {
             if (QwpWireTestUtils.tableCount(frame) > 0 && ++seen == index) {
@@ -924,13 +982,37 @@ public class QwpOpenRecordSenderTest {
     }
 
     /**
+     * Appends {@code table(t).decimalColumn("d", value).at(TS_BASE + ts)} to the
+     * sender and the same row to the oracle's block {@code t}.
+     */
+    private static void decimalRow(Sender sender, QwpTableBuffer t, Decimal64 value, long ts) {
+        sender.table(t.getTableName()).decimalColumn("d", value).at(TS_BASE + ts, ChronoUnit.MICROS);
+        t.getOrCreateColumn("d", QwpConstants.TYPE_DECIMAL64, true).addDecimal64(value);
+        t.getOrCreateDesignatedTimestampColumn(QwpConstants.TYPE_TIMESTAMP).addLong(TS_BASE + ts);
+        t.nextRow();
+    }
+
+    /**
      * Appends {@code table(name).longColumn(column, value).at(TS_BASE + value)} to
      * the sender and the same row to the oracle's block {@code t}.
      */
-    private static void longRow(Sender sender, QwpTableBuffer t, String column, long value) {
+    static void longRow(Sender sender, QwpTableBuffer t, String column, long value) {
         sender.table(t.getTableName()).longColumn(column, value).at(TS_BASE + value, ChronoUnit.MICROS);
         t.getOrCreateColumn(column, QwpConstants.TYPE_LONG, true).addLong(value);
         t.getOrCreateDesignatedTimestampColumn(QwpConstants.TYPE_TIMESTAMP).addLong(TS_BASE + value);
+        t.nextRow();
+    }
+
+    /**
+     * Appends {@code table(t).decimalColumn("d", 1.25).stringColumn("p", pad).at(TS_BASE + ts)}
+     * to the sender and the same row to the oracle's block {@code t}.
+     */
+    private static void paddedDecimalRow(Sender sender, QwpTableBuffer t, String pad, long ts) {
+        Decimal64 value = Decimal64.fromLong(125, 2);
+        sender.table(t.getTableName()).decimalColumn("d", value).stringColumn("p", pad).at(TS_BASE + ts, ChronoUnit.MICROS);
+        t.getOrCreateColumn("d", QwpConstants.TYPE_DECIMAL64, true).addDecimal64(value);
+        t.getOrCreateColumn("p", QwpConstants.TYPE_VARCHAR, true).addString(pad);
+        t.getOrCreateDesignatedTimestampColumn(QwpConstants.TYPE_TIMESTAMP).addLong(TS_BASE + ts);
         t.nextRow();
     }
 
@@ -954,7 +1036,7 @@ public class QwpOpenRecordSenderTest {
      * Appends {@code table(t).symbol("s", symbol).at(TS_BASE + value)} to the
      * sender and the same row to the oracle's block {@code t}.
      */
-    private static void symbolRow(Sender sender, Oracle oracle, QwpTableBuffer t, String symbol, long value) {
+    static void symbolRow(Sender sender, Oracle oracle, QwpTableBuffer t, String symbol, long value) {
         sender.table(t.getTableName()).symbol("s", symbol).at(TS_BASE + value, ChronoUnit.MICROS);
         t.getOrCreateColumn("s", QwpConstants.TYPE_SYMBOL, true).addSymbolWithGlobalId(symbol, oracle.dict.getOrAddSymbol(symbol));
         t.getOrCreateDesignatedTimestampColumn(QwpConstants.TYPE_TIMESTAMP).addLong(TS_BASE + value);
@@ -993,7 +1075,7 @@ public class QwpOpenRecordSenderTest {
      * production {@link QwpWebSocketEncoder} against a dictionary that mints the
      * same ids as the sender's.
      */
-    private static final class Oracle implements QuietCloseable {
+    static final class Oracle implements QuietCloseable {
         final ArrayList<QwpTableBuffer> blocks = new ArrayList<>();
         final GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
         final QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
