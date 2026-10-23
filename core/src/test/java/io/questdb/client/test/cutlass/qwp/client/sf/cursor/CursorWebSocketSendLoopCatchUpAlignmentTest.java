@@ -1681,6 +1681,16 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         }
 
         @Override
+        public int appendBinaryFrame(long dataPtr, int length) {
+            sendBinary(dataPtr, length);
+            return 0;
+        }
+
+        @Override
+        public void flushFrames() {
+        }
+
+        @Override
         public void sendBinary(long dataPtr, int length) {
             recordSend();
             capture(dataPtr, length, 0L, 0);

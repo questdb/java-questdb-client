@@ -503,6 +503,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // stamp) BEFORE reading the flag, so a publish that misses the flag is seen
     // by the re-check and vice versa.
     private volatile boolean ioParked;
+    // Frame batching per loop iteration, see ioLoop.
+    private static final int SEND_BATCH_MAX_FRAMES = 128;
+    private static final int SEND_BATCH_MAX_BYTES = 64 * 1024;
+    // Frames above this are sent alone: too big to be worth the compacting
+    // memmove, and a batch holds at most SEND_BATCH_MAX_BYTES anyway.
+    private static final int SEND_BATCH_INLINE_MAX_PAYLOAD = 16 * 1024;
     // I/O-thread-only. Set by swapClient(): a reconnect rewinds the send cursor
     // to ackedFsn+1, which creates sendable work from inside the I/O thread --
     // no producer publish and no inbound byte will announce it. The loop treats
@@ -2800,7 +2806,22 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // Snapshot before the send attempt: a publish after this point is
                 // caught by the re-check below, so the idle decision cannot race it.
                 long publishedBeforeWork = engine.publishStamp();
-                boolean didWork = trySendOne();
+                // Batch: append up to SEND_BATCH_MAX_FRAMES frames (or
+                // SEND_BATCH_MAX_BYTES) into the client's send buffer, then one
+                // send. At one row per flush the kernel's TCP path per sendto
+                // was 68% of this thread's cycles; frames waiting in the
+                // segment cost one segment each instead of one syscall each.
+                boolean didWork = false;
+                int batched = 0;
+                while (batched < SEND_BATCH_MAX_FRAMES && trySendOne()) {
+                    didWork = true;
+                    batched++;
+                    WebSocketClient c = client;
+                    if (c == null || c.pendingFrameBytes() >= SEND_BATCH_MAX_BYTES) {
+                        break;
+                    }
+                }
+                flushPendingFrames();
                 // 1. Try to send next frame(s).
                 // 2. Try to receive ACKs.
                 if (tryReceiveAcks()) {
@@ -3055,6 +3076,19 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * doorbell is stateful, so a wake that landed before this call returns
      * immediately.
      */
+    /** Sends the frames trySendOne batched in the client's send buffer; a failure takes the reconnect path. */
+    private void flushPendingFrames() {
+        WebSocketClient c = client;
+        if (c == null || !running) {
+            return;
+        }
+        try {
+            c.flushFrames();
+        } catch (Throwable t) {
+            fail(t);
+        }
+    }
+
     private void awaitIdle() {
         WebSocketClient c = client;
         if (c == null) {
@@ -4036,7 +4070,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             return false;
         }
         try {
-            client.sendBinary(frameAddr, payloadLen);
+            if (payloadLen > SEND_BATCH_INLINE_MAX_PAYLOAD) {
+                // A large frame goes out alone, without the compacting memmove,
+                // after whatever small frames precede it.
+                client.flushFrames();
+                client.sendBinary(frameAddr, payloadLen);
+            } else {
+                client.appendBinaryFrame(frameAddr, payloadLen);
+            }
         } catch (Throwable t) {
             fail(t);
             return false;

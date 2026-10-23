@@ -488,6 +488,16 @@ public class CursorWebSocketSendLoopForegroundReconnectPolicyTest {
         }
 
         @Override
+        public int appendBinaryFrame(long dataPtr, int length) {
+            sendBinary(dataPtr, length);
+            return 0;
+        }
+
+        @Override
+        public void flushFrames() {
+        }
+
+        @Override
         public void sendBinary(long dataPtr, int length) {
             throw new RuntimeException("transient wire failure during catch-up");
         }

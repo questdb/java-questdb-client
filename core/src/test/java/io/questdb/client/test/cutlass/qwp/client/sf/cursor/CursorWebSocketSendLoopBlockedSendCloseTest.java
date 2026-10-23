@@ -229,6 +229,19 @@ public class CursorWebSocketSendLoopBlockedSendCloseTest {
             releaseSend.countDown();
         }
 
+        // Frame batching (appendBinaryFrame + flushFrames) routes to this
+        // double's per-frame sendBinary so its counting/blocking still sees
+        // every frame.
+        @Override
+        public int appendBinaryFrame(long dataPtr, int length) {
+            sendBinary(dataPtr, length);
+            return 0;
+        }
+
+        @Override
+        public void flushFrames() {
+        }
+
         @Override
         public void sendBinary(long dataPtr, int length, int timeout) {
             sendThread.set(Thread.currentThread());

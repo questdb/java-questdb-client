@@ -488,9 +488,44 @@ public abstract class WebSocketClient implements QuietCloseable {
      * @param length  data length
      * @param timeout timeout in milliseconds
      */
+    /**
+     * Appends one binary frame to the pending batch without sending it.
+     * {@link #flushFrames} sends every pending frame with one syscall; any
+     * {@code sendBinary} flushes the batch first so frame order holds.
+     *
+     * @return bytes pending in the batch after this frame
+     */
+    public int appendBinaryFrame(long dataPtr, int length) {
+        checkConnected();
+        sendBuffer.beginFrame();
+        sendBuffer.putBlockOfBytes(dataPtr, length);
+        sendBuffer.endBinaryFrameCompact();
+        return sendBuffer.getWritePos();
+    }
+
+    /** Sends the frames {@link #appendBinaryFrame} accumulated, if any, in one send. */
+    public void flushFrames() {
+        flushFrames(defaultTimeout);
+    }
+
+    public void flushFrames(int timeout) {
+        int pending = sendBuffer.getWritePos();
+        if (pending > 0) {
+            try {
+                doSend(sendBuffer.getBufferPtr(), pending, timeout);
+            } finally {
+                sendBuffer.reset();
+            }
+        }
+    }
+
+    public int pendingFrameBytes() {
+        return sendBuffer.getWritePos();
+    }
+
     public void sendBinary(long dataPtr, int length, int timeout) {
         checkConnected();
-        sendBuffer.reset();
+        flushFrames(timeout);
         sendBuffer.beginFrame();
         sendBuffer.putBlockOfBytes(dataPtr, length);
         WebSocketSendBuffer.FrameInfo frame = sendBuffer.endBinaryFrame();
@@ -518,7 +553,7 @@ public abstract class WebSocketClient implements QuietCloseable {
             int timeout
     ) {
         checkConnected();
-        sendBuffer.reset();
+        flushFrames(timeout);
         sendBuffer.beginFrame();
         sendBuffer.putBlockOfBytes(firstPtr, firstLength);
         sendBuffer.putBlockOfBytes(secondPtr, secondLength);
