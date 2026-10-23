@@ -201,7 +201,7 @@ public class MmapSegmentTest {
     @Test
     public void testHeaderShapeMatchesTheDocumentedLayout() throws Exception {
         assertEquals(24, MmapSegment.HEADER_SIZE);
-        assertEquals(1, MmapSegment.VERSION);
+        assertEquals(2, MmapSegment.VERSION);
         TestUtils.assertMemoryLeak(() -> {
             String path = tmpDir + "/seg-header.sfa";
             try (MmapSegment seg = MmapSegment.create(path, 7L, 4096L)) {
@@ -231,7 +231,7 @@ public class MmapSegmentTest {
             }
             try (RandomAccessFile file = new RandomAccessFile(path, "rw")) {
                 file.seek(4L);
-                file.writeByte(MmapSegment.VERSION + 1);
+                file.writeByte(3);
             }
             try {
                 MmapSegment.openExisting(path).close();

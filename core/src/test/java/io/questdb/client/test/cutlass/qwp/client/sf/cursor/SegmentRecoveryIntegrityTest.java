@@ -228,7 +228,7 @@ public class SegmentRecoveryIntegrityTest {
         TestUtils.assertMemoryLeak(() -> {
             writeSegmentWithFrames(tmpDir + "/sf-initial.sfa", 0, 2);
             String foreign = tmpDir + "/sf-0000000000000001.sfa";
-            writeRawSegmentHeader(foreign, MmapSegment.FILE_MAGIC, (byte) 99, 2L);
+            writeRawSegmentHeader(foreign, MmapSegment.FILE_MAGIC, (byte) 3, 2L);
             Map<String, byte[]> before = snapshotDir();
 
             try {
