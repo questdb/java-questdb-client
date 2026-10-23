@@ -1099,12 +1099,17 @@ public class CursorSendEngineTest {
     }
 
     private static void poisonRegisterGeneration(SegmentManager manager) throws Exception {
-        // register() publishes the ring into `rings` last. Nulling the list
-        // forces a deterministic constructor failure after the ring and
-        // watermark exist, without adding a production test hook.
-        Field f = SegmentManager.class.getDeclaredField("rings");
+        // register() adds the slot's side-file gauge to the budget before it
+        // publishes the ring. Nulling the budget's gauge list forces a
+        // deterministic constructor failure after the ring and watermark
+        // exist, without adding a production test hook; the worker never
+        // touches that list, so a shared manager keeps running.
+        Field b = SegmentManager.class.getDeclaredField("budget");
+        b.setAccessible(true);
+        Object budget = b.get(manager);
+        Field f = budget.getClass().getDeclaredField("sideFileGauges");
         f.setAccessible(true);
-        f.set(manager, null);
+        f.set(budget, null);
     }
 
     private static Thread workerThread(SegmentManager manager) throws Exception {

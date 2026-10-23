@@ -1064,24 +1064,24 @@ public final class SegmentRing implements QuietCloseable {
             if (spare == null) {
                 return BACKPRESSURE_NO_SPARE;
             }
-            try {
-                if (spare.baseSeq() != actualBase) {
-                    // A source that pre-created the segment (tests) guessed
-                    // the base. Pin it, and make it durable BEFORE the
-                    // manifest references it: an OS crash could otherwise
-                    // leave a durable manifest naming baseSeq=actualBase
-                    // while the on-disk header still carries the guess, and
-                    // recovery would fail a startup that lost nothing.
-                    spare.rebaseSeq(actualBase);
-                    if (manifest != null) {
-                        spare.syncHeader();
+            // Publish the successor before the volatile active promotion. The
+            // same monitor protects the sealed list and nextSealedAfter's trim
+            // fallback, while the volatile link also remains readable from a
+            // current segment after the manager removes and closes it.
+            synchronized (this) {
+                try {
+                    if (spare.baseSeq() != actualBase) {
+                        // A source that pre-created the segment (tests) guessed
+                        // the base. Pin it, and make it durable BEFORE the
+                        // manifest references it: an OS crash could otherwise
+                        // leave a durable manifest naming baseSeq=actualBase
+                        // while the on-disk header still carries the guess, and
+                        // recovery would fail a startup that lost nothing.
+                        spare.rebaseSeq(actualBase);
+                        if (manifest != null) {
+                            spare.syncHeader();
+                        }
                     }
-                }
-                // Publish the successor before the volatile active promotion. The
-                // same monitor protects the sealed list and nextSealedAfter's trim
-                // fallback, while the volatile link also remains readable from a
-                // current segment after the manager removes and closes it.
-                synchronized (this) {
                     if (manifest != null) {
                         // Inside the monitor: serialized with the trim path's
                         // advanceManifestHeadPast so neither writer publishes a
@@ -1089,22 +1089,28 @@ public final class SegmentRing implements QuietCloseable {
                         // moved past (SfManifest additionally clamps monotonic).
                         // BEFORE any ring mutation: if the manifest fsync throws,
                         // the rotation never happened -- previous stays active,
-                        // the new segment goes back to the source, and the
-                        // producer's retry re-runs this block from a consistent
-                        // state.
+                        // the new segment goes back to the source (which keeps
+                        // its file: the record may already be in the page
+                        // cache), and the producer's retry re-runs this block
+                        // from a consistent state.
                         long headBase = sealedHead < sealedSegments.size()
                                 ? sealedSegments.get(sealedHead).baseSeq()
                                 : previous.baseSeq();
                         manifest.update(headBase, actualBase);
                     }
-                    previous.linkSuccessor(spare);
-                    sealedSegments.add(previous);
-                    refreshOldestTrimmable();
-                    active = spare;
+                } catch (Throwable t) {
+                    try {
+                        source.discard(spare);
+                    } catch (Throwable suppressed) {
+                        t.addSuppressed(suppressed);
+                    }
+                    throw t;
                 }
-            } catch (Throwable t) {
-                source.discard(spare);
-                throw t;
+                // Committed: from here the rotation must not be undone.
+                previous.linkSuccessor(spare);
+                sealedSegments.add(previous);
+                refreshOldestTrimmable();
+                active = spare;
             }
             // The sealed segment may already be fully acked (the ACK landed
             // while it was still active, so it woke nothing): let trim look.

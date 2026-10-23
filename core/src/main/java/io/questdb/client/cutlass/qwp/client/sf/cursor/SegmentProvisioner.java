@@ -71,6 +71,12 @@ public final class SegmentProvisioner implements SegmentSource {
     private final long segmentSizeBytes;
     private long lastLogNs;
     private long nextGeneration;
+    // A segment handed back by discard(): the rotation's manifest update
+    // failed after its record may already have reached the page cache, so
+    // the file must stay (recovery would otherwise find the manifest naming
+    // a base with no segment and quarantine the slot). Still charged; the
+    // next rotation at the same base reuses it.
+    private MmapSegment retained;
     private long retryAtNanos;
 
     SegmentProvisioner(SegmentRing ring, String dir, long firstGeneration, long segmentSizeBytes,
@@ -91,24 +97,28 @@ public final class SegmentProvisioner implements SegmentSource {
 
     @Override
     public void close() {
-        // Holds no segments: every one it created belongs to the ring.
-    }
-
-    @Override
-    public void discard(MmapSegment segment) {
-        budget.release(segmentSizeBytes);
-        String path = dir == null ? null : segment.path();
-        try {
-            segment.close();
-        } finally {
-            if (path != null) {
-                ff.remove(path);
-            }
+        // Every segment it created belongs to the ring, except a retained
+        // one. Its file stays: an empty segment at a base the manifest may
+        // name, which recovery accepts either way.
+        if (retained != null) {
+            MmapSegment r = retained;
+            retained = null;
+            r.close();
         }
     }
 
     @Override
+    public void discard(MmapSegment segment) {
+        retained = segment;
+    }
+
+    @Override
     public MmapSegment next(long baseSeq) {
+        if (retained != null) {
+            MmapSegment r = retained;
+            retained = null;
+            return r;
+        }
         long now = System.nanoTime();
         if (retryAtNanos != 0L && now - retryAtNanos < 0L) {
             return null;
@@ -172,7 +182,9 @@ public final class SegmentProvisioner implements SegmentSource {
                 }
                 // create() removes its own file when it throws; only a
                 // segment that exists needs unlinking here.
-                ff.remove(path);
+                if (path != null) {
+                    ff.remove(path);
+                }
             }
             retryAtNanos = now + CREATE_RETRY_NANOS;
             if (now - lastLogNs >= LOG_THROTTLE_NANOS) {

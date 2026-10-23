@@ -43,8 +43,10 @@ public interface SegmentSource extends QuietCloseable {
 
     /**
      * Takes back a segment {@link #next} returned that the rotation could not
-     * complete with (the manifest update threw). Closes it and reverses any
-     * accounting {@link #next} did.
+     * commit (the manifest update threw). The segment keeps its file and its
+     * accounting: the manifest record naming its base may already be in the
+     * page cache, so recovery may need the file. The next {@link #next} at
+     * the same base returns it again.
      */
     void discard(MmapSegment segment);
 

@@ -24,10 +24,10 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentBudget;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
-import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentProvisioner;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.FilesFacade;
@@ -40,6 +40,8 @@ import org.junit.Test;
 
 import java.io.File;
 import java.nio.file.Paths;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -184,6 +186,80 @@ public class SegmentProvisionerTest {
                 Assert.assertEquals(2L, ring.getActive().baseSeq());
                 Assert.assertTrue(Files.exists(dir + "/sf-0000000000000008.sfa"));
                 manager.deregister(ring);
+            } finally {
+                Unsafe.free(buf, FRAME_PAYLOAD, MemoryTag.NATIVE_DEFAULT);
+                for (File f : new File(dir).listFiles()) {
+                    f.delete();
+                }
+                Files.remove(dir);
+            }
+        });
+    }
+
+    /**
+     * The manifest update is the last step of a rotation: write, then fsync.
+     * When the fsync fails the record is already in the page cache and names
+     * the new segment's base, so the file the rotation created must survive
+     * the failure: a later recovery that selects that record needs a segment
+     * at that base, and without one it quarantines the whole slot.
+     */
+    @Test
+    public void testFailedManifestSyncKeepsTheSegmentTheManifestMayName() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String dir = Paths.get(System.getProperty("java.io.tmpdir"), "qdb-provisioner-manifest-" + System.nanoTime()).toString();
+            Assert.assertEquals(0, Files.mkdir(dir, Files.DIR_MODE_DEFAULT));
+            // One frame per segment, so the second append rotates.
+            long segSize = MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + FRAME_PAYLOAD;
+            AtomicInteger manifestFd = new AtomicInteger(-1);
+            AtomicBoolean failManifestSync = new AtomicBoolean();
+            FilesFacade facade = new DelegatingFilesFacade() {
+                @Override
+                public int openRWExclusive(String path) {
+                    int fd = super.openRWExclusive(path);
+                    if (path.endsWith("sf-manifest.bin")) {
+                        manifestFd.set(fd);
+                    }
+                    return fd;
+                }
+
+                @Override
+                public int openRW(String path) {
+                    int fd = super.openRW(path);
+                    if (path.endsWith("sf-manifest.bin")) {
+                        manifestFd.set(fd);
+                    }
+                    return fd;
+                }
+
+                @Override
+                public int fsync(int fd) {
+                    if (failManifestSync.get() && fd == manifestFd.get()) {
+                        return -1;
+                    }
+                    return super.fsync(fd);
+                }
+            };
+            long buf = Unsafe.malloc(FRAME_PAYLOAD, MemoryTag.NATIVE_DEFAULT);
+            try {
+                try (SegmentManager manager = new SegmentManager(segSize, new SegmentBudget(8 * segSize), facade, System::nanoTime);
+                     CursorSendEngine engine = new CursorSendEngine(dir, segSize, manager)) {
+                    Assert.assertTrue(manifestFd.get() >= 0);
+                    Assert.assertEquals(0L, engine.appendBlocking(buf, FRAME_PAYLOAD));
+                    failManifestSync.set(true);
+                    try {
+                        engine.appendBlocking(buf, FRAME_PAYLOAD);
+                        Assert.fail("the rotation must surface the failed manifest sync");
+                    } catch (RuntimeException expected) {
+                        // the record is written, only its fsync failed
+                    }
+                    failManifestSync.set(false);
+                    // Not drained: close keeps the slot's files for the next start.
+                }
+                try (SegmentManager manager = new SegmentManager(segSize, new SegmentBudget(8 * segSize), facade, System::nanoTime);
+                     CursorSendEngine engine = new CursorSendEngine(dir, segSize, manager)) {
+                    Assert.assertEquals("the one frame before the failed rotation must be recovered",
+                            0L, engine.publishedFsn());
+                }
             } finally {
                 Unsafe.free(buf, FRAME_PAYLOAD, MemoryTag.NATIVE_DEFAULT);
                 for (File f : new File(dir).listFiles()) {
