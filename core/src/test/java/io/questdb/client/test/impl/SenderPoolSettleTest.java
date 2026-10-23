@@ -488,12 +488,35 @@ public class SenderPoolSettleTest {
         }
     }
 
+    @Test
+    public void testReleaseStampsIdleFromTheDelegatesPendingBatchStart() throws Exception {
+        List<RecordingSender> built = new ArrayList<>();
+        try (SenderPool pool = SenderPoolCloseSemanticsTest.newPoolWithDefaults(1, 1, Long.MAX_VALUE, built)) {
+            pool.setFlushOnClose(true);
+            try (Sender s = pool.borrow()) {
+                s.table("t").longColumn("v", 1L).atNow();
+                built.get(0).pendingBatchStartNanos = 123_456L;
+            }
+            Assert.assertEquals(123_456L, idleSinceOf(pool));
+
+            try (Sender s = pool.borrow()) {
+                s.table("t").longColumn("v", 2L).atNow();
+                built.get(0).pendingBatchStartNanos = 0L;
+                long before = System.nanoTime();
+                s.close();
+                long after = System.nanoTime();
+                long idleSince = idleSinceOf(pool);
+                Assert.assertTrue(before <= idleSince && idleSince <= after);
+            }
+        }
+    }
+
     @SuppressWarnings("unchecked")
     private static long idleSinceOf(SenderPool pool) throws Exception {
         Field availableF = SenderPool.class.getDeclaredField("available");
         availableF.setAccessible(true);
         Object slot = ((ArrayDeque<Object>) availableF.get(pool)).peekLast();
-        Method m = slot.getClass().getDeclaredMethod("idleSinceMillis");
+        Method m = slot.getClass().getDeclaredMethod("idleSinceNanos");
         m.setAccessible(true);
         return (long) m.invoke(slot);
     }

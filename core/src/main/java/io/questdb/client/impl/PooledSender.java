@@ -216,6 +216,7 @@ public final class PooledSender implements Sender {
         BatchTooLargeForCapException capRejection = null;
         int droppedLeaseRows = 0;
         int pendingRowsAtRetire = 0;
+        long nowNanos = 0L;
         try {
             // live(), not delegate(): re-validate the generation right before
             // touching the delegate, narrowing the duplicate-close race.
@@ -230,7 +231,8 @@ public final class PooledSender implements Sender {
                     // Pool shutting down: ship here so a failure reaches the caller.
                     delegate.flush();
                 } else {
-                    ship(pool, delegate);
+                    nowNanos = nowNanos(delegate);
+                    ship(pool, delegate, nowNanos);
                 }
                 recycle = true;
             } catch (RuntimeException e) {
@@ -264,7 +266,7 @@ public final class PooledSender implements Sender {
             }
         } finally {
             if (recycle) {
-                pool.giveBack(this);
+                pool.giveBack(this, nowNanos);
             } else {
                 // The probe, the cancel or the ship threw: the delegate has
                 // latched an error, the flush failed, or the generation went
@@ -586,6 +588,11 @@ public final class PooledSender implements Sender {
         return slot;
     }
 
+    private static long nowNanos(Sender delegate) {
+        long stamp = delegate.pendingBatchStartNanos();
+        return stamp != 0L ? stamp : System.nanoTime();
+    }
+
     /**
      * What a release ships, per the pool's settings:
      * <ul>
@@ -598,10 +605,10 @@ public final class PooledSender implements Sender {
      *       auto-flush threshold trips.</li>
      * </ul>
      */
-    private void ship(SenderPool pool, Sender delegate) {
+    private void ship(SenderPool pool, Sender delegate, long nowNanos) {
         if (pool.hasCommitWindow()) {
             boolean closes = slot.windowCloses(delegate.rowsAppended(), delegate.hasDeferredFrames(),
-                    System.nanoTime(), pool.commitRows(), pool.commitIntervalNanos());
+                    nowNanos, pool.commitRows(), pool.commitIntervalNanos());
             if (closes) {
                 delegate.flush();
                 slot.markCommitted(delegate.rowsAppended());

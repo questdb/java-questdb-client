@@ -1704,6 +1704,16 @@ public final class SenderPool implements AutoCloseable {
     }
 
     public void giveBack(PooledSender ps) {
+        giveBack(ps, 0L);
+    }
+
+    /**
+     * Returns the lease's slot to the pool.
+     *
+     * @param nowNanos the release's {@link System#nanoTime()} reading, or 0 to
+     *                 read the clock here
+     */
+    public void giveBack(PooledSender ps, long nowNanos) {
         SenderSlot s = ps.slot();
         long gen = ps.generation();
         lock.lock();
@@ -1718,7 +1728,7 @@ public final class SenderPool implements AutoCloseable {
                     return;
                 }
                 s.bumpGeneration();
-                s.markIdleAt(System.currentTimeMillis());
+                s.markIdleAt(nowNanos != 0L ? nowNanos : System.nanoTime());
                 assert !available.contains(s) : "slot already present in available deque on giveBack";
                 available.addLast(s);
                 slotReleased.signal();
@@ -2126,6 +2136,7 @@ public final class SenderPool implements AutoCloseable {
             return;
         }
         long now = System.currentTimeMillis();
+        long nowNanos = System.nanoTime();
         ArrayList<SenderSlot> toClose = null;
         lock.lock();
         try {
@@ -2141,7 +2152,7 @@ public final class SenderPool implements AutoCloseable {
             while (it.hasNext() && all.size() > minSize) {
                 SenderSlot s = it.next();
                 boolean idleExpired = idleTimeoutMillis < Long.MAX_VALUE
-                        && (now - s.idleSinceMillis()) >= idleTimeoutMillis;
+                        && (nowNanos - s.idleSinceNanos()) / 1_000_000L >= idleTimeoutMillis;
                 boolean overAge = maxLifetimeMillis < Long.MAX_VALUE
                         && (now - s.createdAtMillis()) >= maxLifetimeMillis;
                 if ((idleExpired || overAge) && !hasUnshippedWork(s.delegate())) {

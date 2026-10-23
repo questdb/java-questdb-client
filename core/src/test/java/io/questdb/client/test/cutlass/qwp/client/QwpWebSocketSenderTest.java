@@ -623,6 +623,26 @@ public class QwpWebSocketSenderTest {
     }
 
     @Test
+    public void testPendingBatchStartNanosFollowsThePendingBatch() throws Exception {
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = new TestWebSocketServer(new QuestDBFlushOnCloseTest.FrameLog())) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                        + ";auto_flush_rows=off;auto_flush_bytes=off;auto_flush_interval=60000;")) {
+                    Assert.assertEquals(0L, sender.pendingBatchStartNanos());
+                    sender.table("t").longColumn("v", 1).atNow();
+                    long stamp = sender.pendingBatchStartNanos();
+                    Assert.assertTrue(stamp > 0L);
+                    Assert.assertTrue(stamp <= System.nanoTime());
+                    sender.flush();
+                    Assert.assertEquals(0L, sender.pendingBatchStartNanos());
+                }
+            }
+        });
+    }
+
+    @Test
     public void testPendingBytesMatchesGroundTruthAcrossTableSwitches() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(

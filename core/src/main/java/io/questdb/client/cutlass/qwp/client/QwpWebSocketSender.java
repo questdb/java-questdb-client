@@ -3321,6 +3321,11 @@ public class QwpWebSocketSender implements Sender {
     }
 
     @Override
+    public long pendingBatchStartNanos() {
+        return firstPendingRowTimeNanos;
+    }
+
+    @Override
     public int pendingRowCount() {
         return pendingRowCount;
     }

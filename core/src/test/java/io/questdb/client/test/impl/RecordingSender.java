@@ -54,6 +54,7 @@ class RecordingSender implements Sender {
     volatile CountDownLatch flushGate;         // flush() blocks on it when set
     volatile RuntimeException latchedError;    // thrown by checkError() when set
     volatile CountDownLatch markSavepointGate; // markSavepoint() blocks on it when set
+    volatile long pendingBatchStartNanos;
     volatile int pendingRows;
     volatile boolean ringBusy;                 // tryFlush() returns false without flushing when set
     volatile boolean rowInProgress;
@@ -218,6 +219,11 @@ class RecordingSender implements Sender {
     public void markSavepoint() {
         awaitGate(markSavepointGate, "markSavepointGate");
         savepointRows = pendingRows;
+    }
+
+    @Override
+    public long pendingBatchStartNanos() {
+        return pendingBatchStartNanos;
     }
 
     @Override
