@@ -532,6 +532,33 @@ public class QwpWebSocketSenderTest {
     }
 
     @Test
+    public void testColumnBeforeTableThrows() throws Exception {
+        // Column setters run checkColumnContext(): closed, then table
+        // selected. Pins the no-table error on a fresh and on a closed sender.
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = createUnconnectedSender();
+            try {
+                sender.longColumn("x", 1L);
+                Assert.fail("Expected LineSenderException");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains("table() must be called before adding columns"));
+            }
+            try {
+                sender.symbol("x", "v");
+                Assert.fail("Expected LineSenderException");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains("table() must be called before adding columns"));
+            }
+            sender.close();
+            assertClosed(() -> sender.longColumn("x", 1L));
+            assertClosed(() -> sender.doubleColumn("x", 1.0));
+            assertClosed(() -> sender.symbol("x", "v"));
+            assertClosed(() -> sender.stringColumn("x", "v"));
+            assertClosed(() -> sender.boolColumn("x", true));
+        });
+    }
+
+    @Test
     public void testNullArrayReturnsThis() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpWebSocketSender sender = createUnconnectedSender()) {
