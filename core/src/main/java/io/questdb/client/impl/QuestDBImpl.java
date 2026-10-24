@@ -267,9 +267,10 @@ public final class QuestDBImpl implements QuestDB {
      * idle, crashes through {@link SenderPool#crashForTest()}: no flush, seal or
      * drain. With {@code sf_dir} the rows the slots' open records hold stay on
      * disk for the next handle on the same directory. The query pool keeps
-     * nothing on disk and closes as usual. Later calls and {@link #close()} are
-     * no-ops. No thread may be inside a call on one of the handle's leases; a
-     * lease borrowed at the crash fails its later calls as a closed sender does.
+     * nothing on disk and closes as usual. Later {@code crashForTest()} and
+     * {@link #close()} calls are no-ops, and {@link #borrowSender()} throws. No
+     * thread may be inside a call on one of the handle's leases; a lease
+     * borrowed at the crash fails its later calls as a closed sender does.
      */
     @TestOnly
     public synchronized void crashForTest() {

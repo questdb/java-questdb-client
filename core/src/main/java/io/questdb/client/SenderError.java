@@ -122,7 +122,9 @@ public final class SenderError {
      * @param detail          why the data is unreachable, from the recovery verdict;
      *                        becomes {@link #getServerMessage()}
      * @param quarantinedPath where the abandoned bytes remain on disk, for
-     *                        forensics and a manual resend
+     *                        forensics and a manual resend; for an open record a
+     *                        crash left corrupt, the slot directory whose
+     *                        recovery zeroed the record's bytes
      */
     public static SenderError dataLoss(@NotNull String detail, @NotNull String quarantinedPath) {
         return new SenderError(Category.DATA_LOSS, Policy.ABANDONED, NO_STATUS_BYTE, detail,
@@ -175,6 +177,8 @@ public final class SenderError {
      * @return for {@link Category#DATA_LOSS}: the on-disk path where the abandoned
      * bytes remain (a quarantined {@code .unreplayable-N} directory, or the slot
      * directory itself when a drainer left it behind a {@code .failed} sentinel).
+     * For an open record a crash left corrupt it is the slot directory, and the
+     * record's bytes are gone: recovery zeroed them so the slot could resume.
      * Null for every other category.
      */
     public @Nullable String getQuarantinedPath() {
@@ -286,16 +290,22 @@ public final class SenderError {
          * {@link #getServerMessage()} carries a client-side explanation. Fired
          * when store-and-forward recovery sets an unreplayable slot aside
          * (its symbol dictionary cannot be rebuilt from any source, or its
-         * durable chain is proven corrupt or incomplete) and when an orphan
+         * durable chain is proven corrupt or incomplete), when an orphan
          * drainer abandons a slot behind a {@code .failed} sentinel that
-         * nothing clears automatically.
+         * nothing clears automatically, and when recovery discards an open
+         * record a crash left corrupt in the slot's active segment.
          *
          * <p>Always paired with {@link Policy#ABANDONED}; the two are never
          * issued apart, and only {@link SenderError#dataLoss} constructs them.
-         * The bytes are preserved on disk — {@link #getQuarantinedPath()}
-         * names where — so the data can be inspected and re-ingested from its
-         * source. This is the event to page on. (The Rust client models the
-         * same verdict as {@code ErrorCode::StoreResendRequired}.)
+         * The bytes of a set-aside or abandoned slot are preserved on disk —
+         * {@link #getQuarantinedPath()} names where — so the data can be
+         * inspected and re-ingested from its source. A corrupt open record is
+         * the exception: recovery zeroes its bytes so the slot can take new
+         * rows, the path names the slot, and the detail names the segment
+         * file, the record's offset and the validation failure; re-ingest
+         * those rows from their source. This is the event to page on. (The Rust
+         * client models the same verdict as
+         * {@code ErrorCode::StoreResendRequired}.)
          */
         DATA_LOSS,
         /**
@@ -354,7 +364,8 @@ public final class SenderError {
          * quarantining {@code build()} returns a working sender on a fresh,
          * empty slot). The bytes stay on disk under the path named by
          * {@link SenderError#getQuarantinedPath()}, for forensics and a manual
-         * resend.
+         * resend, except those of a corrupt open record, which recovery zeroed;
+         * the path then names the slot, which stays in service.
          *
          * <p>Issued only with {@link Category#DATA_LOSS} and never resolvable
          * from user configuration: no resolver or {@code on_*_error} key can

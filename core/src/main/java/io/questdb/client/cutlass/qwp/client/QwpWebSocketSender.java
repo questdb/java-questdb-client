@@ -297,9 +297,6 @@ public class QwpWebSocketSender implements Sender {
     private boolean closeCleanupStarted;
     private long closeFlushTimeoutMillis = 5_000L;
     private volatile boolean closed;
-    // Set by crashForTest(): close0 then stops the loop and the engine as a
-    // process crash would, without a flush, a seal, an abandon or a drain.
-    private boolean isCrashedForTest;
     // Test-only lifecycle witness. close() invokes and clears it strictly after
     // publishing closed=true and before starting any drain or teardown work.
     private volatile Runnable closeStartedHook;
@@ -462,6 +459,9 @@ public class QwpWebSocketSender implements Sender {
     //         (Invariant B); endpoint-policy and transport failures stay
     //         contained in that loop and never reach the producer.
     private Sender.InitialConnectMode initialConnectMode = Sender.InitialConnectMode.OFF;
+    // Set by crashForTest(): close0 then stops the loop and the engine as a
+    // process crash would, without a flush, a seal, an abandon or a drain.
+    private boolean isCrashedForTest;
     private boolean ownsCursorEngine;
     // Whether close() may let the engine reclaim the parent-anchored LOGICAL slot lock.
     // False only while an outer frame holds it: Sender.build() acquires it for the whole
@@ -480,8 +480,6 @@ public class QwpWebSocketSender implements Sender {
     // Envelope offset of the open record in the cursor ring, or -1 while none
     // is open.
     private long recordOffset = -1L;
-    // When the open record was reserved (System.nanoTime()).
-    private long recordOpenedAtNanos;
     // Records opened over the sender's life, for tests.
     private int recordOpens;
     // Terminal latch: the engine refused to seal a record the writer had already
@@ -1844,6 +1842,23 @@ public class QwpWebSocketSender implements Sender {
         }
     }
 
+    /**
+     * Closes the sender as a process crash leaves it: the I/O loop and the
+     * engine stop without a flush, a seal, an abandon or a drain, so an open
+     * record stays on disk as the crash found it, and the engine keeps every
+     * segment file of the slot even when the slot looks drained. A new sender
+     * on the slot then recovers exactly what the ring holds. The native state
+     * is freed as {@link #close()} frees it, and later calls fail as on a
+     * closed sender.
+     */
+    @TestOnly
+    public void crashForTest() {
+        if (!closed) {
+            isCrashedForTest = true;
+            close();
+        }
+    }
+
     private void close0(boolean[] restoreInterrupt) {
         healthTracker.closed();
         Runnable hook = closeStartedHook;
@@ -2069,31 +2084,6 @@ public class QwpWebSocketSender implements Sender {
             terminalError = null;
         }
         rethrowTerminal(terminalError);
-    }
-
-    /**
-     * Closes the sender as a process crash leaves it: the I/O loop and the
-     * engine stop without a flush, a seal, an abandon or a drain, so an open
-     * record stays on disk as the crash found it, and the engine keeps every
-     * segment file of the slot even when the slot looks drained. A new sender
-     * on the slot then recovers exactly what the ring holds. The native state
-     * is freed as {@link #close()} frees it, and later calls fail as on a
-     * closed sender.
-     */
-    @TestOnly
-    public void crashForTest() {
-        if (!closed) {
-            closed = true;
-            isCrashedForTest = true;
-            final boolean[] restoreInterrupt = {Thread.interrupted()};
-            try {
-                close0(restoreInterrupt);
-            } finally {
-                if (restoreInterrupt[0]) {
-                    Thread.currentThread().interrupt();
-                }
-            }
-        }
     }
 
     @TestOnly
@@ -2923,10 +2913,14 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Whether rows go into an open record: {@link #publishPending()} publishes
-     * them without shipping and {@link #close()} seals them into the cursor ring,
-     * so with {@code sf_dir} they are recoverable. False in full-dictionary mode,
-     * which keeps pending rows in the per-table buffers until a flush encodes a
+     * Whether rows go into an open record in the cursor ring:
+     * {@link #publishPending()} publishes them there without shipping, so with
+     * {@code sf_dir} they are recoverable from the slot's directory. A seal
+     * ships them: a flush, an auto-flush threshold, a full record or the
+     * sender's {@link #close()}. When a seal fails, the record stays in the
+     * ring as an open record, and with {@code sf_dir} the next sender on the
+     * slot recovers its published rows. False in full-dictionary mode, which
+     * keeps pending rows in the per-table buffers until a flush encodes a
      * frame. A pooled close reads it to word the row count of a retired slot.
      */
     public boolean isOpenRecordMode() {
@@ -3429,10 +3423,13 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Delta mode: publishes the open record, so the rows appended so far are
-     * recoverable from the cursor ring and survive {@link #reset()} and
-     * {@link #resetToSavepoint()}; nothing ships until a seal. Full-dictionary
-     * mode has no open record and flushes.
+     * Delta mode: publishes the open record, so the completed rows appended so
+     * far are recoverable from the cursor ring and survive {@link #reset()} and
+     * {@link #resetToSavepoint()}; nothing ships until a seal. A row is appended
+     * at its {@code at()}: a row in progress stays in its staging buffer, is not
+     * published, and goes into the record at its {@code at()}. Full-dictionary
+     * mode has no open record and flushes, which throws while a row is in
+     * progress.
      */
     @Override
     public void publishPending() {
@@ -4107,11 +4104,21 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Flushes like {@link #flush()}, except that it does not wait for a full
-     * store-and-forward ring: when the ring cannot take the first frame within
-     * about a millisecond it returns {@code false}, publishes nothing and keeps
-     * every pending row. Once the first frame is on the ring the flush completes
-     * as {@code flush()} does.
+     * Flushes like {@link #flush()}, except that a frame the flush appends to
+     * the store-and-forward ring does not wait for a full ring: when the ring
+     * cannot take the first such frame within about a millisecond it returns
+     * {@code false}, publishes nothing and keeps every pending row. Once the
+     * first frame is on the ring the flush completes as {@code flush()} does.
+     * <p>
+     * Returning {@code false} for pending rows is a full-dictionary-mode
+     * property: there the flush encodes the rows into frames. With an open
+     * record the rows are in the ring already and the flush seals the record,
+     * which never waits for room, so a sender with an open record meets a full
+     * ring at the next record reservation inside {@code at()} instead: that
+     * reservation waits up to the backpressure deadline and then fails with
+     * "cursor SF record reservation failed". Only the rowless commit message
+     * that ends a deferred group with no rows pending can still find the ring
+     * full here.
      *
      * @return {@code true} if the flush completed, {@code false} if the ring was full
      */
@@ -7133,11 +7140,9 @@ public class QwpWebSocketSender implements Sender {
     private void openRecord(boolean isFullCapacity) {
         int capacityHint = recordCapacityHint();
         if (capacityHint < QwoFormat.HEADER_SIZE) {
-            throw new LineSenderException("frame bound below the record header: frameBound=").put(capacityHint)
-                    .put(", recordHeader=").put(QwoFormat.HEADER_SIZE)
-                    .put(", serverMaxBatchSize=").put(serverMaxBatchSize)
-                    .put(", segmentPayloadCapacity=").put(cursorEngine.segmentPayloadCapacity())
-                    .put("; raise http.recv.buffer.size on the server or sf_max_segment_bytes on the client");
+            throw putFrameBoundRemedy(new LineSenderException("frame bound below the record header: frameBound=")
+                    .put(capacityHint)
+                    .put(", recordHeader=").put(QwoFormat.HEADER_SIZE));
         }
         long offset;
         try {
@@ -7163,7 +7168,6 @@ public class QwpWebSocketSender implements Sender {
             throw t;
         }
         recordOffset = offset;
-        recordOpenedAtNanos = System.nanoTime();
         recordOpens++;
         nextDictReserve = 0;
     }
@@ -7396,6 +7400,16 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Ends a frame-bound error with the two inputs of the frame bound and the
+     * settings that raise them.
+     */
+    private LineSenderException putFrameBoundRemedy(LineSenderException e) {
+        return e.put(", serverMaxBatchSize=").put(serverMaxBatchSize)
+                .put(", segmentPayloadCapacity=").put(cursorEngine.segmentPayloadCapacity())
+                .put("; raise http.recv.buffer.size on the server or sf_max_segment_bytes on the client");
+    }
+
+    /**
      * Hands back the symbol ids above the open record's dictionary (above
      * {@code sentMaxSymbolId} when none is open): rows that never reached the
      * record minted them. Lowers the batch watermark with them.
@@ -7486,12 +7500,9 @@ public class QwpWebSocketSender implements Sender {
             }
         }
         int rowDictBytes = rowDictBytes();
-        return new LineSenderException("row too large for the frame bound: rowBytes=").put(rowBytes)
+        return putFrameBoundRemedy(new LineSenderException("row too large for the frame bound: rowBytes=").put(rowBytes)
                 .put(", rowDictBytes=").put(rowDictBytes)
-                .put(", frameBound=").put(record.capacity())
-                .put(", serverMaxBatchSize=").put(serverMaxBatchSize)
-                .put(", segmentPayloadCapacity=").put(cursorEngine.segmentPayloadCapacity())
-                .put("; raise http.recv.buffer.size on the server or sf_max_segment_bytes on the client");
+                .put(", frameBound=").put(record.capacity()));
     }
 
     /**

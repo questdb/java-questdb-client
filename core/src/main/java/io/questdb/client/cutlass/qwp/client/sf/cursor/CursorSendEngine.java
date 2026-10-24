@@ -1989,28 +1989,6 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
-     * Reserves a record like {@link #reserveRecordBlocking}, but spins only
-     * until {@code spinDeadlineNanos} while backpressured, as
-     * {@link #appendOrFsn(long, int, long)} does. Returns the envelope offset,
-     * {@link SegmentRing#BACKPRESSURE_NO_SPARE} when the spin ran out, or
-     * {@link SegmentRing#PAYLOAD_TOO_LARGE}.
-     */
-    public long reserveRecordOrFsn(int maxPayloadCapacity, long spinDeadlineNanos) {
-        long off = ring.reserveRecord(maxPayloadCapacity);
-        if (off >= 0 || off == SegmentRing.PAYLOAD_TOO_LARGE) {
-            return off;
-        }
-        while (System.nanoTime() < spinDeadlineNanos) {
-            Compat.onSpinWait();
-            off = ring.reserveRecord(maxPayloadCapacity);
-            if (off >= 0 || off == SegmentRing.PAYLOAD_TOO_LARGE) {
-                return off;
-            }
-        }
-        return SegmentRing.BACKPRESSURE_NO_SPARE;
-    }
-
-    /**
      * Payload capacity of the reserved record; 0 when none is reserved.
      */
     public int reservedRecordCapacity() {

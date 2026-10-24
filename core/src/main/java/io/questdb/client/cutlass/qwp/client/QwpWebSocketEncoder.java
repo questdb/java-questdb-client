@@ -193,22 +193,6 @@ public class QwpWebSocketEncoder implements QuietCloseable {
         return buffer;
     }
 
-    /**
-     * Byte length of the symbol-dict delta ENTRY region ({@code [len][utf8]...},
-     * excluding the two section varints) that {@link #beginMessage} last wrote.
-     */
-    public int getDeltaEntriesLen() {
-        return deltaEntriesEnd - deltaEntriesStart;
-    }
-
-    /**
-     * Byte offset, within {@link #getBuffer()}, of the symbol-dict delta ENTRY
-     * region {@link #beginMessage} last wrote.
-     */
-    public int getDeltaEntriesStart() {
-        return deltaEntriesStart;
-    }
-
     public int getSplitMessageSize(int tableBodyLength, int confirmedMaxId, int batchMaxId) {
         if (tableBodyLength < 0) {
             throw new IllegalArgumentException("tableBodyLength must be non-negative");

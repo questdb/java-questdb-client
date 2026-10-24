@@ -101,6 +101,16 @@ import java.util.function.IntFunction;
  * long-lived background recovery thread, while a pooled {@code QuestDB}
  * handle delegates the same serial scan to its {@link PoolHousekeeper}.
  * Construction never performs network recovery inline.
+ * <p>
+ * <b>Released rows.</b> A lease's {@link PooledSender#close()} publishes its
+ * rows into the slot's open record without shipping them, unless a threshold
+ * or the commit window ships them at that release; a delegate in
+ * full-dictionary mode flushes them at every release. A {@code QuestDB}
+ * handle's housekeeper ships what idle slots still hold
+ * ({@link #settleIdle()}). A pool built directly has no housekeeper: released
+ * rows ship at a later append or release whose threshold trips or that closes
+ * the commit window, at a lease's {@code flush()}, at a {@link #settleIdle()}
+ * call of the owner, or at {@link #close()}.
  */
 public final class SenderPool implements AutoCloseable {
 
@@ -2336,6 +2346,10 @@ public final class SenderPool implements AutoCloseable {
      * disables it; negative values are rejected. Must be set before the first borrow; the pool's delegates
      * must have been built with {@code transaction=on} so that auto-flush
      * inside a lease ships deferred frames too (QuestDBBuilder injects it).
+     * A delegate in full-dictionary mode (its slot's symbol dictionary file
+     * could not be opened or written) publishes with a flush whose frame
+     * carries no defer-commit flag, so on that slot every release commits and
+     * the window groups nothing.
      */
     public void setCommitWindow(int commitRows, long commitIntervalMillis) {
         if (commitRows < 0 || commitIntervalMillis < 0 || (commitRows > 0) != (commitIntervalMillis > 0)) {

@@ -1339,7 +1339,8 @@ public class QwpWebSocketEncoderTest {
                 long overflowSize = (long) HEADER_SIZE
                         + 1 // delta start 0
                         + 1 // delta count 2
-                        + encoder.getDeltaEntriesLen()
+                        + 5 // "AAPL": length varint and 4 bytes
+                        + 5 // "GOOG"
                         + Integer.MAX_VALUE;
                 assertFailure(OutOfMemoryError.class,
                         "split QWP message size overflow: " + overflowSize,

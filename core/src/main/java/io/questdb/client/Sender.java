@@ -281,9 +281,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     void atNow();
 
     /**
-     * Runs the same row, byte and age thresholds every append runs and ships the pending rows
-     * when one trips. At a pooled release the age threshold is the one that usually trips, which
-     * lets a pool ship rows a lease left behind once they are older than
+     * The release-time threshold check. Runs the row, byte and age thresholds every append
+     * runs and ships the pending rows when one trips. A pooled release calls it after
+     * {@link #publishPending()}, and there the age threshold is the one that usually trips:
+     * the release ships the rows leases left behind once the oldest is older than
      * {@code auto_flush_interval}. It does nothing while a row is in progress.
      * Only the WebSocket QWP transport implements it.
      */
@@ -796,9 +797,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * while a row is in progress. Any flush that ships the pending rows
      * empties the savepoint, so a later {@code resetToSavepoint()} discards
      * every pending row like {@link #reset()}. Pure bookkeeping: it runs no
-     * error check. Default no-op. The WebSocket sender in delta mode marks by
-     * publishing the rows appended so far (see {@link #publishPending()}), so
-     * {@code reset()} keeps them as well.
+     * error check. Default no-op. A WebSocket QWP sender that keeps its rows in
+     * an open record (see {@link #publishPending()}) marks by publishing the rows
+     * appended so far, so {@code reset()} keeps them as well.
      * <p>
      * A pooled sender ignores this call: the pool marks a savepoint when it
      * hands a slot to a borrower, and {@code resetToSavepoint()} on the pooled
@@ -823,9 +824,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * without shipping them. The WebSocket QWP sender publishes its open record:
      * the rows stay pending, {@link #resetToSavepoint()} and {@link #reset()} no
      * longer discard them, and the next seal ({@link #flush()}, an auto-flush
-     * threshold, close) ships them. Every other transport, and a WebSocket sender
-     * that encodes a frame per flush, flushes. Call it between rows, not while a
-     * row is in progress.
+     * threshold, close) ships them. Recoverable means in the client's ring, not
+     * acknowledged by the server. Only completed rows are published: a row is
+     * appended at its {@code at()}, so a row in progress stays staged and joins
+     * the record at its {@code at()}. Every other transport, and a WebSocket
+     * sender in full-dictionary mode (its slot's symbol dictionary file could not
+     * be opened or written, so it encodes a frame per flush), flushes instead,
+     * and that flush throws while a row is in progress.
      */
     default void publishPending() {
         flush();
@@ -988,6 +993,14 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * WebSocket transport implements the non-waiting path; other transports flush normally.
      * Once the first frame is on the ring, later frames of the same flush (a split batch,
      * dictionary chunks, the commit) wait for ring room exactly as {@code flush()} does.
+     * <p>
+     * A WebSocket sender that keeps its rows in an open record has them in the ring already:
+     * its flush seals the record, which never waits for room, so a full ring does not make
+     * this return {@code false} for its rows. Such a sender meets a full ring earlier, at the
+     * next record reservation inside {@code at()}, which waits up to the backpressure deadline
+     * and then fails. Only a rowless commit message that ends a deferred group can still find
+     * the ring full here. A sender in full-dictionary mode encodes its rows into frames at the
+     * flush, which is where this method's {@code false} applies.
      *
      * @return {@code true} if the flush completed, {@code false} if the ring was full
      */
@@ -1536,6 +1549,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * <br>
          * Unset by default, which flushes at 90 percent of the batch cap the server advertises,
          * and not by bytes when it advertises none. 0 disables byte-based auto-flush.
+         * <br>
+         * A sender that keeps its rows in an open record counts the record's bytes: its
+         * 48-byte header, its dictionary reserve and the slack of its column chunks besides
+         * the row data, so its frames can seal somewhat below the configured size.
          *
          * @param bytes maximum bytes per batch
          * @return this instance for method chaining

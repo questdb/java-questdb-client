@@ -153,17 +153,19 @@ public interface QuestDB extends Closeable {
      * back until it does. Call {@link Sender#flush()} to ship now and
      * {@link Sender#drain(long)} to wait for the server. A sender in
      * full-dictionary mode (its slot's symbol dictionary file could not be
-     * opened or written) has no open record: its {@code close()} ships the lease's rows in a frame of their own, which keeps
-     * them recoverable at the cost of one frame per close. Otherwise one frame
-     * carries the rows of every lease that closed since the last ship, so a
-     * server rejection of that frame discards those leases' rows together; the
-     * error is logged by the error handler and thrown by a later call on that
-     * slot. Call {@link Sender#flush()} before close when a lease's rows must not
-     * share a frame. {@link Sender#reset()} on a pooled Sender discards only that
-     * lease's rows. The free list is LIFO, so under
-     * steady load the pool shrinks to its working set and reopens connections
-     * on a burst; set {@code sender_pool_min} equal to {@code sender_pool_max}
-     * to keep every connection warm. Close-time errors are wrapped: only
+     * opened or written) has no open record: its {@code close()} ships the
+     * lease's rows in a frame of their own, which keeps them recoverable at the
+     * cost of one frame per close. That frame carries no defer-commit flag, so
+     * the server commits it and a commit window groups nothing on such a slot.
+     * Otherwise one frame carries the rows of every lease that closed since the
+     * last ship, so a server rejection of that frame discards those leases' rows
+     * together; the error is logged by the error handler and thrown by a later
+     * call on that slot. Call {@link Sender#flush()} before close when a lease's
+     * rows must not share a frame. {@link Sender#reset()} on a pooled Sender
+     * discards only that lease's rows. The free list is LIFO, so under steady
+     * load the pool shrinks to its working set and reopens connections on a
+     * burst; set {@code sender_pool_min} equal to {@code sender_pool_max} to
+     * keep every connection warm. Close-time errors are wrapped: only
      * {@code LineSenderServerException} keeps its type, so code that catches
      * another {@code LineSenderException} subclass around a pooled
      * {@code close()} must look at {@code getCause()}. A real disconnect only

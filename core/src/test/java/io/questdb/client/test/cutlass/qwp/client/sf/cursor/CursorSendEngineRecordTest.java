@@ -28,7 +28,6 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
-import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
 import io.questdb.client.cutlass.qwp.client.sf.record.QwoFormat;
 import io.questdb.client.cutlass.qwp.client.sf.record.QwoRecordWriter;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
@@ -113,7 +112,7 @@ public class CursorSendEngineRecordTest {
                 Assert.assertFalse(engine.hasReservedRecord());
                 Assert.assertEquals(0, engine.reservedRecordCapacity());
                 Assert.assertEquals("the abandoned space is reserved again",
-                        off, engine.reserveRecordOrFsn(RESERVATION, System.nanoTime()));
+                        off, engine.reserveRecordBlocking(RESERVATION));
                 engine.abandonRecord(off);
                 Assert.assertEquals(-1L, engine.publishedFsn());
             }
@@ -139,30 +138,6 @@ public class CursorSendEngineRecordTest {
                     TestUtils.assertContains(expected.getMessage(), "cursor ring backpressured");
                 }
                 Assert.assertEquals(stalls + 1, engine.getTotalBackpressureStalls());
-                Assert.assertFalse(engine.hasReservedRecord());
-                Assert.assertEquals(published, engine.publishedFsn());
-            } finally {
-                Unsafe.free(buf, FILL, MemoryTag.NATIVE_DEFAULT);
-            }
-        });
-    }
-
-    @Test
-    public void testReserveRecordOrFsnReturnsSentinelOnBusyRing() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            long buf = Unsafe.malloc(FILL, MemoryTag.NATIVE_DEFAULT);
-            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, SEGMENT_SIZE, CAP,
-                    CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS)) {
-                fillSecondSegment(engine, buf);
-                long stalls = engine.getTotalBackpressureStalls();
-                long published = engine.publishedFsn();
-                long t0 = System.nanoTime();
-                Assert.assertEquals(SegmentRing.BACKPRESSURE_NO_SPARE,
-                        engine.reserveRecordOrFsn(MIB, t0 + TimeUnit.MILLISECONDS.toNanos(20)));
-                Assert.assertTrue("the spin must last until its deadline",
-                        System.nanoTime() - t0 >= TimeUnit.MILLISECONDS.toNanos(20));
-                Assert.assertEquals(SegmentRing.BACKPRESSURE_NO_SPARE, engine.reserveRecordOrFsn(MIB, t0));
-                Assert.assertEquals("the spin path counts no stall", stalls, engine.getTotalBackpressureStalls());
                 Assert.assertFalse(engine.hasReservedRecord());
                 Assert.assertEquals(published, engine.publishedFsn());
             } finally {

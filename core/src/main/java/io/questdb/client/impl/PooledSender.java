@@ -210,8 +210,11 @@ public final class PooledSender implements Sender {
      * publish, which seals the record unflagged, or sends the commit message, and
      * commits the group; the other releases only publish, and an auto-flush
      * threshold that trips at one of them ships a frame flagged defer-commit. The
-     * window's age is measured from the first release that found work. A failed
-     * publish or ship retires the slot and throws the wrapper described above.
+     * window's age is measured from the first release that found work. A sender
+     * in full-dictionary mode publishes with a flush, whose frame carries no
+     * defer-commit flag, so every release commits and the window groups nothing
+     * on that slot. A failed publish or ship retires the slot and throws the
+     * wrapper described above.
      * <p>
      * Close-time errors are wrapped: the delegate's error is the cause. A latched
      * {@link LineSenderServerException} is rethrown as a new one carrying the same
