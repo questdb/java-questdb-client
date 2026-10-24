@@ -1392,6 +1392,67 @@ public final class SenderPool implements AutoCloseable {
         return defaultSender(slotIndex);
     }
 
+    /**
+     * Shuts the pool down as a process crash leaves it. Every slot's delegate,
+     * borrowed or idle, goes through {@link QwpWebSocketSender#crashForTest()}:
+     * no flush, seal, abandon or drain, and the slot's segment files stay, so an
+     * open record stays on disk as an open record. A delegate of another
+     * transport keeps nothing on disk and closes. The pool waits for no lease or
+     * creation; a creation still in flight tears its result down through the
+     * normal close. The caller stops the settle (the housekeeper) first, and no
+     * thread may be inside a call on a lease: a borrowed delegate's native state
+     * is freed here, and the lease's later calls fail as on a closed sender. A
+     * delegate whose crash throws does not stop the others; the first failure
+     * is rethrown at the end. A later {@link #close()} is a no-op.
+     */
+    @TestOnly
+    void crashForTest() {
+        markClosing();
+        stopStartupRecoveryDriver();
+        SenderSlot[] slots;
+        lock.lock();
+        try {
+            if (closeStarted) {
+                return;
+            }
+            closeStarted = true;
+            slotReleased.signalAll();
+            slots = all.toArray(new SenderSlot[0]);
+        } finally {
+            lock.unlock();
+        }
+        Throwable failure = null;
+        for (int i = 0; i < slots.length; i++) {
+            Sender delegate = slots[i].delegate();
+            try {
+                if (delegate instanceof QwpWebSocketSender) {
+                    ((QwpWebSocketSender) delegate).crashForTest();
+                } else {
+                    delegate.close();
+                }
+            } catch (Throwable t) {
+                // crash the remaining delegates before reporting the first failure
+                if (failure == null) {
+                    failure = t;
+                } else {
+                    addSuppressed(failure, t);
+                }
+            }
+        }
+        if (recoveryErrorDispatcher != null) {
+            recoveryErrorDispatcher.close();
+        }
+        if (failure instanceof RuntimeException) {
+            throw (RuntimeException) failure;
+        }
+        if (failure instanceof Error) {
+            throw (Error) failure;
+        }
+        if (failure != null) {
+            throw new IllegalStateException(failure);
+        }
+    }
+
     @TestOnly
     public void discardBrokenForTesting(PooledSender sender) {
         discardBroken(sender);

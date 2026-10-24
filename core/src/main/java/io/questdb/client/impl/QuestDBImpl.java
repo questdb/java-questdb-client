@@ -261,6 +261,28 @@ public final class QuestDBImpl implements QuestDB {
         closeQuietly(senderPool);
     }
 
+    /**
+     * Drops the handle as a process crash does. The housekeeper stops, so no
+     * settle, reap or recovery step runs, and every sender slot, borrowed or
+     * idle, crashes through {@link SenderPool#crashForTest()}: no flush, seal or
+     * drain. With {@code sf_dir} the rows the slots' open records hold stay on
+     * disk for the next handle on the same directory. The query pool keeps
+     * nothing on disk and closes as usual. Later calls and {@link #close()} are
+     * no-ops. No thread may be inside a call on one of the handle's leases; a
+     * lease borrowed at the crash fails its later calls as a closed sender does.
+     */
+    @TestOnly
+    public synchronized void crashForTest() {
+        if (closed) {
+            return;
+        }
+        closed = true;
+        senderPool.markClosing();
+        closeQuietly(housekeeper);
+        closeQuietly(queryPool);
+        senderPool.crashForTest();
+    }
+
     @TestOnly
     public QueryClientPool getQueryPoolForTesting() {
         return queryPool;

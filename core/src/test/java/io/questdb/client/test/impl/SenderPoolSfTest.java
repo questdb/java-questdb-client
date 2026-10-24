@@ -28,7 +28,9 @@ import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
+import io.questdb.client.QuestDB;
 import io.questdb.client.Sender;
+import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
@@ -37,11 +39,16 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentBudget;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLockContentionException;
+import io.questdb.client.cutlass.qwp.client.sf.record.QwoFormat;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.impl.PooledSender;
+import io.questdb.client.impl.QuestDBImpl;
 import io.questdb.client.impl.SenderPool;
 import io.questdb.client.std.Files;
+import io.questdb.client.test.QuestDBReleaseSemanticsTest;
+import io.questdb.client.test.cutlass.qwp.client.QwpOpenRecordRecoveryTest;
+import io.questdb.client.test.cutlass.qwp.client.QwpWireTestUtils;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
@@ -51,11 +58,16 @@ import org.junit.Test;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.io.RandomAccessFile;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -1566,6 +1578,183 @@ public class SenderPoolSfTest {
                     }
                 }
             }
+        });
+    }
+
+    @Test
+    public void testRowsReleasedWithoutFlushSurviveAHandleCrash() throws Exception {
+        // Phase 1: three leases on the handle's one slot each append a row and
+        // close() without a flush. Every auto-flush threshold and the settle are a
+        // minute away, so each release only publishes its row into the slot's open
+        // record and nothing reaches the never-acking server. Then the handle
+        // crashes: no flush, seal or drain, and the record stays open on disk.
+        // Phase 2: a new handle on the same sf_dir recovers the record and ships
+        // the three rows, each exactly once.
+        TestUtils.assertMemoryLeak(() -> {
+            String slotPath = slot("default-0");
+            SilentHandler silent = new SilentHandler();
+            long recordOffset;
+            try (TestWebSocketServer server = new TestWebSocketServer(silent)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                QuestDB db = QuestDB.connect(handleConfig(server.getPort(), 1, 1));
+                try {
+                    QwpWebSocketSender delegate = null;
+                    for (int i = 0; i < 3; i++) {
+                        try (Sender s = db.borrowSender()) {
+                            delegate = (QwpWebSocketSender) getDelegate((PooledSender) s);
+                            s.table("crash").symbol("s", "sym-" + i).stringColumn("m", crashRowMarker(i)).atNow();
+                        }
+                    }
+                    Assert.assertTrue("an sf_dir slot keeps its rows in an open record", delegate.isOpenRecordMode());
+                    CursorSendEngine engine = delegate.getCursorEngineForTesting();
+                    Assert.assertTrue("the released rows sit in the open record", engine.hasReservedRecord());
+                    Assert.assertEquals("no release sealed a frame", -1L, engine.publishedFsn());
+                    Assert.assertEquals("the slot holds the three released rows", 3, delegate.pendingRowCount());
+                    recordOffset = engine.getRingForTesting().getActive().reservedOffset();
+                    Assert.assertTrue(recordOffset >= 0);
+                } finally {
+                    ((QuestDBImpl) db).crashForTest();
+                }
+            }
+            Assert.assertEquals("nothing reached the wire before the crash", 0, silent.frames.get());
+            Assert.assertTrue("the crash keeps the slot's segment files", hasSegmentFile(slotPath));
+            Assert.assertEquals("the crash leaves the record open on disk", QwoFormat.STATE_OPEN,
+                    readLittleEndianInt(initialSegment(slotPath), recordOffset));
+
+            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+            try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                try (QuestDB ignored = QuestDB.connect(handleConfig(server.getPort(), 1, 1))) {
+                    for (int i = 0; i < 3; i++) {
+                        log.awaitAscii(crashRowMarker(i), 5_000);
+                    }
+                }
+            }
+            // Both handles and the server are closed: no frame can still arrive.
+            for (int i = 0; i < 3; i++) {
+                Assert.assertEquals("row " + i + " ships exactly once", 1, asciiOccurrences(log, crashRowMarker(i)));
+            }
+            Assert.assertEquals("the recovered record ships as one frame", 1, log.dataFrames());
+            List<String> dictionary = new ArrayList<>();
+            for (byte[] frame : log.frames()) {
+                QwpWireTestUtils.accumulateDeltaDictionary(frame, dictionary);
+            }
+            Assert.assertEquals("the recovered frame resolves the record's symbols",
+                    Arrays.asList("sym-0", "sym-1", "sym-2"), dictionary);
+        });
+    }
+
+    @Test
+    public void testHandleCrashKeepsTheRowsABorrowedLeasePublished() throws Exception {
+        // The crash also takes down a slot that is borrowed at that moment. Its
+        // lease's published row survives; the row it appended after the publish is
+        // lost, as in a process crash. The other slot, idle after its release,
+        // keeps the released row.
+        TestUtils.assertMemoryLeak(() -> {
+            SilentHandler silent = new SilentHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(silent)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                QuestDB db = QuestDB.connect(handleConfig(server.getPort(), 2, 2));
+                Sender held = null;
+                try {
+                    held = db.borrowSender();
+                    held.table("crash").stringColumn("m", "held-published").atNow();
+                    held.publishPending();
+                    held.table("crash").stringColumn("m", "held-unpublished").atNow();
+                    try (Sender released = db.borrowSender()) {
+                        released.table("crash").stringColumn("m", "released-row").atNow();
+                    }
+                } finally {
+                    ((QuestDBImpl) db).crashForTest();
+                }
+                try {
+                    held.table("crash");
+                    Assert.fail("the crash closes the borrowed lease's delegate");
+                } catch (LineSenderException expected) {
+                    TestUtils.assertContains(expected.getMessage(), "closed");
+                }
+            }
+            Assert.assertEquals("nothing reached the wire before the crash", 0, silent.frames.get());
+            Assert.assertTrue("the crash keeps slot 0's segment files", hasSegmentFile(slot("default-0")));
+            Assert.assertTrue("the crash keeps slot 1's segment files", hasSegmentFile(slot("default-1")));
+
+            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+            try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                try (QuestDB ignored = QuestDB.connect(handleConfig(server.getPort(), 2, 2))) {
+                    log.awaitAscii("held-published", 5_000);
+                    log.awaitAscii("released-row", 5_000);
+                }
+            }
+            Assert.assertEquals("the borrowed lease's published row ships once", 1, asciiOccurrences(log, "held-published"));
+            Assert.assertEquals("the released row ships once", 1, asciiOccurrences(log, "released-row"));
+            Assert.assertEquals("the row appended after the publish is lost", 0, asciiOccurrences(log, "held-unpublished"));
+        });
+    }
+
+    @Test
+    public void testCorruptOpenTailOfAPooledSlotIsReportedAsDataLossAtTheNextConnect() throws Exception {
+        // After the crash the slot's open record is corrupted on disk. The next
+        // handle builds the slot, which reports the loss once as DATA_LOSS naming
+        // the slot; the record's rows never ship, later rows flow.
+        TestUtils.assertMemoryLeak(() -> {
+            String slotPath = slot("default-0");
+            String segmentPath = initialSegment(slotPath);
+            long recordOffset;
+            try (TestWebSocketServer server = new TestWebSocketServer(new SilentHandler())) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                QuestDB db = QuestDB.connect(handleConfig(server.getPort(), 1, 1));
+                try {
+                    QwpWebSocketSender delegate = null;
+                    for (int i = 0; i < 3; i++) {
+                        try (Sender s = db.borrowSender()) {
+                            delegate = (QwpWebSocketSender) getDelegate((PooledSender) s);
+                            // the corruption flips a byte of the block's first column: a LONG
+                            s.table("crash").longColumn("v", i).stringColumn("m", "lost-row-" + i).atNow();
+                        }
+                    }
+                    recordOffset = delegate.getCursorEngineForTesting().getRingForTesting().getActive().reservedOffset();
+                    Assert.assertTrue(recordOffset >= 0);
+                } finally {
+                    ((QuestDBImpl) db).crashForTest();
+                }
+            }
+            QwpOpenRecordRecoveryTest.flipCommittedValueByte(segmentPath, recordOffset);
+
+            List<SenderError> errors = Collections.synchronizedList(new ArrayList<SenderError>());
+            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+            try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                try (QuestDB db = QuestDB.builder()
+                        .fromConfig(handleConfig(server.getPort(), 1, 1))
+                        .errorHandler(errors::add)
+                        .build()) {
+                    // build() prewarms the slot; its engine reports the loss at construction
+                    Assert.assertEquals("one report, at the slot's build: " + errors, 1, errors.size());
+                    SenderError loss = errors.get(0);
+                    Assert.assertEquals(SenderError.Category.DATA_LOSS, loss.getCategory());
+                    Assert.assertEquals(slotPath, loss.getQuarantinedPath());
+                    TestUtils.assertContains(loss.getServerMessage(), segmentPath);
+                    TestUtils.assertContains(loss.getServerMessage(), "offset " + recordOffset);
+                    TestUtils.assertContains(loss.getServerMessage(), "row crc mismatch");
+                    try (Sender s = db.borrowSender()) {
+                        s.table("crash").longColumn("v", 3).stringColumn("m", "after-crash-row").atNow();
+                        s.flush();
+                    }
+                    log.awaitAscii("after-crash-row", 5_000);
+                }
+            }
+            for (int i = 0; i < 3; i++) {
+                Assert.assertEquals("the corrupt record's row " + i + " never ships", 0, asciiOccurrences(log, "lost-row-" + i));
+            }
+            Assert.assertEquals("the later row ships once", 1, asciiOccurrences(log, "after-crash-row"));
+            Assert.assertEquals("reported once: " + errors, 1, errors.size());
         });
     }
 
@@ -4470,6 +4659,31 @@ public class SenderPoolSfTest {
                 });
     }
 
+    /**
+     * Occurrences of {@code text} as ASCII bytes across every frame the log
+     * parsed.
+     */
+    private static int asciiOccurrences(QuestDBReleaseSemanticsTest.FrameLog log, String text) {
+        byte[] needle = text.getBytes(StandardCharsets.US_ASCII);
+        int count = 0;
+        for (byte[] frame : log.frames()) {
+            for (int i = 0, n = frame.length - needle.length; i <= n; i++) {
+                int j = 0;
+                while (j < needle.length && frame[i + j] == needle[j]) {
+                    j++;
+                }
+                if (j == needle.length) {
+                    count++;
+                }
+            }
+        }
+        return count;
+    }
+
+    private static String crashRowMarker(int i) {
+        return "crash-row-" + i;
+    }
+
     private void createCandidateSlot(String name) throws IOException {
         java.nio.file.Path dir = Paths.get(slot(name));
         java.nio.file.Files.createDirectories(dir);
@@ -4491,6 +4705,30 @@ public class SenderPoolSfTest {
                         throw e.getCause();
                     }
                 });
+    }
+
+    /**
+     * A {@code QuestDB} handle on this test's {@code sf_dir}: every auto-flush
+     * threshold, the settle and the reap a minute away, no query connections,
+     * and a bounded close.
+     */
+    private String handleConfig(int port, int senderPoolMin, int senderPoolMax) {
+        return "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                + ";sender_pool_min=" + senderPoolMin + ";sender_pool_max=" + senderPoolMax
+                + ";query_pool_min=0;query_pool_max=1"
+                + ";auto_flush_interval=60000;housekeeper_interval_ms=60000"
+                + ";close_flush_timeout_millis=5000;";
+    }
+
+    private static String initialSegment(String slotPath) {
+        return slotPath + "/sf-initial.sfa";
+    }
+
+    private static int readLittleEndianInt(String path, long offset) throws IOException {
+        try (RandomAccessFile file = new RandomAccessFile(path, "r")) {
+            file.seek(offset);
+            return Integer.reverseBytes(file.readInt());
+        }
     }
 
     private String slot(String name) {
@@ -5034,9 +5272,12 @@ public class SenderPoolSfTest {
     }
 
     private static final class SilentHandler implements TestWebSocketServer.WebSocketServerHandler {
+        final AtomicInteger frames = new AtomicInteger();
+
         @Override
         public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
             // No ack -- frames stay unacked on disk for the recovery test.
+            frames.incrementAndGet();
         }
     }
 }

@@ -723,7 +723,7 @@ public class QwpOpenRecordRecoveryTest {
      * Flips a byte of the first committed value of the record at
      * {@code recordOffset}, so its row CRC no longer matches.
      */
-    private static void flipCommittedValueByte(String segmentPath, long recordOffset) throws Exception {
+    public static void flipCommittedValueByte(String segmentPath, long recordOffset) throws Exception {
         try (RandomAccessFile file = new RandomAccessFile(segmentPath, "rw")) {
             int capacity = Integer.reverseBytes(readIntAt(file, recordOffset + 4));
             byte[] payload = new byte[capacity];
