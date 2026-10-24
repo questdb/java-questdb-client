@@ -453,7 +453,9 @@ public class QwpTableBuffer implements QuietCloseable {
         int n = columns.size();
         if (columnAccessCursor < n) {
             ColumnBuffer candidate = fastColumns[columnAccessCursor];
-            if (Chars.equalsIgnoreCase(candidate.name, name)) {
+            // Callers almost always pass the same String constant row after
+            // row: identity settles it without the call.
+            if (candidate.name == name || Chars.equalsIgnoreCase(candidate.name, name)) {
                 columnAccessCursor++;
                 assertColumnType(name, type, candidate);
                 return candidate;
