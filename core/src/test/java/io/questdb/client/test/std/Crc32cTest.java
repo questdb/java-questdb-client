@@ -166,7 +166,7 @@ public class Crc32cTest {
             int[] lengths = {
                     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 16, 17,
                     31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256,
-                    257, 1_023, 4_096, 1 << 20
+                    257, 767, 768, 769, 1_023, 1_535, 1_536, 1_537, 2_304, 2_311, 4_096, 1 << 20
             };
             int[] seeds = {Crc32c.INIT, 0x1234_5678, -1};
             // The native side dispatches to the CPU's CRC32C instructions when
