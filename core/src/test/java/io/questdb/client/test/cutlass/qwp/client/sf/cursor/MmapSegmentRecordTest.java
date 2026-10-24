@@ -36,7 +36,7 @@ import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
-import io.questdb.client.test.tools.DelegatingFilesFacade;
+import io.questdb.client.test.tools.MsyncRecordingFacade;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
 import org.junit.Assert;
@@ -108,26 +108,26 @@ public class MmapSegmentRecordTest {
                 // the sender abandons only a record without committed rows
                 writeRows(seg, off, writer, tb, 1, false);
                 Assert.assertEquals(MmapSegment.HEADER_SIZE, seg.syncPublished());
-                Assert.assertEquals(1, ff.msyncCalls);
+                Assert.assertEquals(1, ff.calls());
                 assertMsyncReaches(ff, seg, reservedEnd);
 
                 // that barrier wrote the record's bytes to disk: the zeroes replacing them must follow
                 writer.abandon();
                 seg.abandonReserved(off);
                 Assert.assertEquals(MmapSegment.HEADER_SIZE, seg.syncPublished());
-                Assert.assertEquals(2, ff.msyncCalls);
+                Assert.assertEquals(2, ff.calls());
                 assertMsyncReaches(ff, seg, reservedEnd);
                 Assert.assertEquals(MmapSegment.HEADER_SIZE, seg.syncPublished());
-                Assert.assertEquals("nothing changed since the last barrier", 2, ff.msyncCalls);
+                Assert.assertEquals("nothing changed since the last barrier", 2, ff.calls());
 
                 // the same without a barrier while the record was reserved
                 Assert.assertEquals(off, seg.reserveRecord(RESERVATION));
                 seg.abandonReserved(off);
                 Assert.assertEquals(MmapSegment.HEADER_SIZE, seg.syncPublished());
-                Assert.assertEquals(3, ff.msyncCalls);
+                Assert.assertEquals(3, ff.calls());
                 assertMsyncReaches(ff, seg, reservedEnd);
                 Assert.assertEquals(MmapSegment.HEADER_SIZE, seg.syncPublished());
-                Assert.assertEquals(3, ff.msyncCalls);
+                Assert.assertEquals(3, ff.calls());
             }
         });
     }
@@ -150,7 +150,7 @@ public class MmapSegmentRecordTest {
                 appendRow(writer, tb, 3);
                 Assert.assertTrue(writer.usedBytes() > committedUsed);
                 Assert.assertEquals(MmapSegment.HEADER_SIZE, seg.syncPublished());
-                Assert.assertEquals(1, ff.msyncCalls);
+                Assert.assertEquals(1, ff.calls());
                 assertMsyncReaches(ff, seg, reservedEnd);
 
                 // the seal zeroes that row with the rest of the tail, and does not publish
@@ -159,10 +159,10 @@ public class MmapSegmentRecordTest {
                 seg.sealReserved(off, used);
                 Assert.assertTrue(off + MmapSegment.FRAME_HEADER_SIZE + used < reservedEnd);
                 Assert.assertEquals(MmapSegment.HEADER_SIZE, seg.syncPublished());
-                Assert.assertEquals(2, ff.msyncCalls);
+                Assert.assertEquals(2, ff.calls());
                 assertMsyncReaches(ff, seg, reservedEnd);
                 Assert.assertEquals(MmapSegment.HEADER_SIZE, seg.syncPublished());
-                Assert.assertEquals("nothing changed since the last barrier", 2, ff.msyncCalls);
+                Assert.assertEquals("nothing changed since the last barrier", 2, ff.calls());
 
                 // publishing the record (with a frame behind it) needs a barrier again
                 long frameOffset = seg.tryAppend(frame, 16);
@@ -170,7 +170,7 @@ public class MmapSegmentRecordTest {
                 Assert.assertFalse(seg.isPublishedDurable());
                 Assert.assertEquals(seg.publishedOffset(), seg.syncPublished());
                 Assert.assertTrue(seg.isPublishedDurable());
-                Assert.assertEquals(3, ff.msyncCalls);
+                Assert.assertEquals(3, ff.calls());
                 assertMsyncReaches(ff, seg, reservedEnd);
             } finally {
                 Unsafe.free(frame, 16, MemoryTag.NATIVE_DEFAULT);
@@ -575,18 +575,18 @@ public class MmapSegmentRecordTest {
                 writeRows(seg, off, writer, tb, 2, true);
 
                 Assert.assertEquals(MmapSegment.HEADER_SIZE, seg.syncPublished());
-                Assert.assertEquals(1, ff.msyncCalls);
+                Assert.assertEquals(1, ff.calls());
                 assertMsyncReaches(ff, seg, reservedEnd);
 
                 appendRow(writer, tb, 2);
                 writer.publish();
                 Assert.assertEquals(MmapSegment.HEADER_SIZE, seg.syncPublished());
-                Assert.assertEquals(2, ff.msyncCalls);
+                Assert.assertEquals(2, ff.calls());
                 assertMsyncReaches(ff, seg, reservedEnd);
 
                 // the open record changes in place, so every barrier covers it again while it is reserved
                 Assert.assertEquals(MmapSegment.HEADER_SIZE, seg.syncPublished());
-                Assert.assertEquals(3, ff.msyncCalls);
+                Assert.assertEquals(3, ff.calls());
                 assertMsyncReaches(ff, seg, reservedEnd);
                 Assert.assertTrue(seg.isPublishedDurable());
             }
@@ -694,8 +694,8 @@ public class MmapSegmentRecordTest {
     }
 
     private static void assertMsyncReaches(MsyncRecordingFacade ff, MmapSegment seg, long end) {
-        Assert.assertEquals(seg.address(), ff.lastMsyncAddr);
-        Assert.assertTrue("msync ends at " + ff.lastMsyncLen + ", below " + end, ff.lastMsyncLen >= end);
+        Assert.assertEquals(seg.address(), ff.lastAddr());
+        Assert.assertTrue("msync ends at " + ff.lastLen() + ", below " + end, ff.lastLen() >= end);
     }
 
     private static void assertSealRefused(MmapSegment seg) {
@@ -765,20 +765,6 @@ public class MmapSegmentRecordTest {
         }
         if (publish) {
             writer.publish();
-        }
-    }
-
-    private static final class MsyncRecordingFacade extends DelegatingFilesFacade {
-        long lastMsyncAddr;
-        long lastMsyncLen;
-        int msyncCalls;
-
-        @Override
-        public int msync(long addr, long len, boolean async) {
-            msyncCalls++;
-            lastMsyncAddr = addr;
-            lastMsyncLen = len;
-            return super.msync(addr, len, async);
         }
     }
 }

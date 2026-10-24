@@ -26,6 +26,7 @@ package io.questdb.client.test;
 import io.questdb.client.QuestDB;
 import io.questdb.client.Sender;
 import io.questdb.client.impl.QuestDBImpl;
+import io.questdb.client.test.cutlass.qwp.client.QwpSfTestUtils.FrameLog;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
 import org.junit.Rule;
@@ -78,7 +79,7 @@ public class QuestDBHousekeeperCadenceTest {
 
     @Test
     public void testHousekeeperIntervalAtLongMaxStillSettles() throws Exception {
-        QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+        FrameLog log = new FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));

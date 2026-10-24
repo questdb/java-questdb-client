@@ -32,8 +32,8 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
-import io.questdb.client.test.tools.DelegatingFilesFacade;
 import io.questdb.client.test.tools.TestUtils;
+import io.questdb.client.test.tools.UnopenableDictFacade;
 import org.junit.Assert;
 import org.junit.Rule;
 import org.junit.Test;
@@ -289,6 +289,87 @@ public class SelfSufficientFramesTest {
                     QwpWireTestUtils.accumulateDeltaDictionary(frame, dictionary);
                 }
                 Assert.assertEquals(Arrays.asList("a", "b"), dictionary);
+            }
+        });
+    }
+
+    /**
+     * A split that fails at frame k&gt;1 leaves the symbol dictionary consistent for
+     * the retry. Full-dictionary mode keeps the frame-per-flush path, and with it the
+     * split of a batch over the cap: flushPendingRowsSplit publishes the frames one at
+     * a time, so a failure partway through leaves frames 1..k-1 on the ring as
+     * deferred and the source rows buffered, and the next flush re-emits the whole
+     * batch. Every full-dictionary frame carries the whole dictionary from id 0, so a
+     * re-sent frame defines exactly the ids its first copy defined.
+     * <p>
+     * The failure is injected at the ring, not the cap: both frames pass the
+     * pre-flight (each is under the advertised cap), but "big"'s frame does not fit a
+     * fresh 1 KiB segment, so it fails in sealAndSwapBuffer after "a" was published.
+     */
+    @Test(timeout = 60_000L)
+    public void testMidSplitPublishFailureLeavesTheDictionaryIdempotent() throws Exception {
+        Path sfDir = temporaryFolder.newFolder("qwp-sf-midsplit").toPath();
+        String slot = sfDir.resolve("default").toString();
+        assertMemoryLeak(() -> {
+            CapturingHandler handler = new CapturingHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.setAdvertisedMaxBatchSize(3_400);
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                CursorSendEngine engine = new CursorSendEngine(
+                        slot, 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                        CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, new UnopenableDictFacade());
+                QwpWebSocketSender sender = QwpWebSocketSender.connect(
+                        "localhost", port, null, 0, 0, 0L, null, false, engine);
+                try {
+                    Assert.assertFalse("the engine runs in full-dictionary mode", sender.isOpenRecordMode());
+                    String pad = TestUtils.repeat("x", 100);
+                    // "a" first (fits a segment), "big" second (does not); together they
+                    // exceed the cap, so the flush splits them into one frame each.
+                    sender.table("a").symbol("s", "alpha")
+                            .stringColumn("p", TestUtils.repeat("y", 400)).longColumn("v", 1L).atNow();
+                    for (int i = 0; i < 28; i++) {
+                        sender.table("big").symbol("s", "bravo")
+                                .stringColumn("p", pad).longColumn("v", (long) i).atNow();
+                    }
+                    for (int attempt = 0; attempt < 2; attempt++) {
+                        try {
+                            sender.flush();
+                            Assert.fail("the second split frame cannot fit a fresh segment");
+                        } catch (LineSenderException expected) {
+                            // Ring-level failure, not the cap pre-flight.
+                            Assert.assertFalse("must fail at the ring, not the cap pre-flight: "
+                                            + expected.getMessage(),
+                                    expected.getMessage().contains("too large for server batch cap"));
+                            TestUtils.assertContains(expected.getMessage(), "cursor SF append failed");
+                        }
+                        Assert.assertEquals("each attempt publishes frame 1 before frame 2 fails",
+                                attempt, engine.publishedFsn());
+                        Assert.assertEquals("the batch stays buffered for the retry", 29, sender.pendingRowCount());
+                    }
+                } finally {
+                    try {
+                        // close() re-flushes the retained batch, which is permanently
+                        // unflushable at this segment size -- not what we assert.
+                        sender.close();
+                    } catch (LineSenderException ignored) {
+                    }
+                }
+
+                waitFor(() -> handler.batches.size() >= 2, 5_000);
+                byte[] first = handler.batches.get(0);
+                for (int i = 0, n = handler.batches.size(); i < n; i++) {
+                    byte[] frame = handler.batches.get(i);
+                    Assert.assertEquals("frame " + i + " starts its dictionary at id 0",
+                            0, readVarint(frame, DELTA_START_OFFSET));
+                    List<String> dictionary = new ArrayList<>();
+                    QwpWireTestUtils.accumulateDeltaDictionary(frame, dictionary);
+                    Assert.assertEquals("frame " + i + " defines the whole dictionary on its own",
+                            Arrays.asList("alpha", "bravo"), dictionary);
+                    Assert.assertArrayEquals("a retry re-sends the same frame", first, frame);
+                }
             }
         });
     }
@@ -1321,22 +1402,6 @@ public class SelfSufficientFramesTest {
 
     private static int readVarint(byte[] buf, int offset) {
         return QwpWireTestUtils.readVarint(buf, new int[]{offset});
-    }
-
-    /**
-     * Refuses every attempt to (re)create the symbol dictionary, WITHOUT ever
-     * leaving a file behind at its path -- the fault shape a transient failure
-     * (EIO, fd exhaustion) has on a slot with nothing there to lose. Used instead
-     * of a planted directory blocker: a blocker left on disk is exactly what
-     * openClean() now REFUSES to start on top of (see PersistedSymbolDictTest's
-     * truncate-refusal coverage), so it can no longer simulate the "nothing to
-     * lose" case this facade represents.
-     */
-    private static final class UnopenableDictFacade extends DelegatingFilesFacade {
-        @Override
-        public int openCleanRW(String path) {
-            return -1;
-        }
     }
 
     private static void waitFor(BoolCondition cond, long timeoutMillis) {

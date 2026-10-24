@@ -44,6 +44,7 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
 import java.io.IOException;
+import java.net.SocketException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Files;
@@ -1054,6 +1055,9 @@ public class WebSocketDynamicCredentialTest {
             long seq = seqs.computeIfAbsent(client, c -> new AtomicLong()).getAndIncrement();
             try {
                 client.sendBinary(buildAck(seq));
+            } catch (SocketException e) {
+                // The test dropped this connection while the ack was being written:
+                // nothing reads that ack any more, so the failed write is expected.
             } catch (IOException e) {
                 throw new RuntimeException(e);
             }

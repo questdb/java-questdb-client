@@ -38,7 +38,9 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.SfOperationalException;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.DelegatingFilesFacade;
+import io.questdb.client.test.tools.FullDiskDictFacade;
 import io.questdb.client.test.tools.TestUtils;
+import io.questdb.client.test.tools.UnopenableDictFacade;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Rule;
@@ -1758,46 +1760,6 @@ public class DeltaDictRecoveryTest {
         }
     }
 
-    /**
-     * Refuses every attempt to (re)create the symbol dictionary, WITHOUT ever
-     * leaving a file behind at its path -- the fault shape a transient failure
-     * (EIO, fd exhaustion) has on a slot with nothing there to lose. Used instead
-     * of a planted blocker to force full-dict fallback in phase 1: a blocker left
-     * on disk is exactly what openClean() now REFUSES to start on top of (see
-     * PersistedSymbolDictTest's truncate-refusal coverage), so it can no longer
-     * simulate the "nothing to lose" case this facade represents.
-     */
-    private static final class UnopenableDictFacade extends DelegatingFilesFacade {
-        @Override
-        public int openCleanRW(String path) {
-            return -1;
-        }
-    }
-
-    /**
-     * Refuses to grow the symbol dictionary's mmap append window -- the production
-     * shape of a full disk, since PersistedSymbolDict reserves that window through
-     * {@code ff.allocate} and ENOSPC surfaces there as a refusal.
-     * <p>
-     * {@code isMmapAllowed()} opts IN deliberately. The inherited default is
-     * {@code this == INSTANCE}, so any wrapping facade otherwise routes the dictionary
-     * down the positioned-write fallback that production never executes -- injecting a
-     * fault would then silently replace the code under test.
-     */
-    private static final class FullDiskDictFacade extends DelegatingFilesFacade {
-        boolean armed;
-
-        @Override
-        public boolean allocate(int fd, long size) {
-            return !armed && INSTANCE.allocate(fd, size);
-        }
-
-        @Override
-        public boolean isMmapAllowed() {
-            return true;
-        }
-    }
-
 
     /**
      * The unreplayable-slot contract: a recovered slot whose symbol dictionary cannot be
@@ -1946,7 +1908,7 @@ public class DeltaDictRecoveryTest {
                     // Armed from the start, so the very first ensureAppendMap is refused --
                     // a later append would sit inside the window already mapped and never
                     // call allocate at all.
-                    ff.armed = true;
+                    ff.isArmed = true;
                     sender.table("m").symbol("s", "a").longColumn("v", 1L).atNow();
                     // The persist at the seal fails; the flush does not.
                     sender.flush();

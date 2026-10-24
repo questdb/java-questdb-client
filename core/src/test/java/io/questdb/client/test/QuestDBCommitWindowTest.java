@@ -30,7 +30,7 @@ import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.impl.PooledSender;
-import io.questdb.client.test.QuestDBReleaseSemanticsTest.FrameLog;
+import io.questdb.client.test.cutlass.qwp.client.QwpSfTestUtils.FrameLog;
 import io.questdb.client.test.cutlass.qwp.client.QwpWireTestUtils;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;

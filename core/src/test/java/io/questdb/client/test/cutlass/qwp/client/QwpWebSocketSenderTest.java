@@ -37,8 +37,8 @@ import io.questdb.client.std.Decimal256;
 import io.questdb.client.std.Decimal64;
 import io.questdb.client.std.bytes.DirectByteSlice;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
-import io.questdb.client.test.tools.DelegatingFilesFacade;
 import io.questdb.client.test.tools.TestUtils;
+import io.questdb.client.test.tools.UnopenableDictFacade;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -902,16 +902,5 @@ public class QwpWebSocketSenderTest {
      */
     private QwpWebSocketSender createUnconnectedSender() {
         return QwpWebSocketSender.createForTesting("localhost", 9000);
-    }
-
-    /**
-     * Refuses to create the symbol dictionary, leaving nothing at its path, so the
-     * engine runs in full-dictionary mode.
-     */
-    private static final class UnopenableDictFacade extends DelegatingFilesFacade {
-        @Override
-        public int openCleanRW(String path) {
-            return -1;
-        }
     }
 }

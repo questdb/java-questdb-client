@@ -35,16 +35,16 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.record.QwoFormat;
-import io.questdb.client.cutlass.qwp.client.sf.record.QwoRecordReader;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.Unsafe;
-import io.questdb.client.test.QuestDBReleaseSemanticsTest;
+import io.questdb.client.test.cutlass.qwp.client.QwpSfTestUtils.FrameLog;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
-import io.questdb.client.test.tools.DelegatingFilesFacade;
+import io.questdb.client.test.tools.FullDiskDictFacade;
+import io.questdb.client.test.tools.MsyncRecordingFacade;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Before;
@@ -107,9 +107,9 @@ public class QwpOpenRecordRecoveryTest {
                     // close() skips its flush, commit and drain; its safety net still seals the record
                     sender.close();
                     Assert.assertEquals("the record is sealed on disk", QwoFormat.STATE_SEALED,
-                            readInt(activeSegmentPath(), recordOffset));
+                            QwpSfTestUtils.readInt(activeSegmentPath(), recordOffset));
                 }
-                QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+                FrameLog log = new FrameLog();
                 try (TestWebSocketServer server = startServer(log);
                      Sender ignored = Sender.fromConfig(config(server.getPort(), 5_000))) {
                     log.awaitDataFrames(1, 5_000);
@@ -127,7 +127,7 @@ public class QwpOpenRecordRecoveryTest {
             long recordOffset = crashWithACorruptOpenRecord();
 
             List<SenderError> errors = new ArrayList<>();
-            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+            FrameLog log = new FrameLog();
             try (QwpOpenRecordSenderTest.Oracle later = new QwpOpenRecordSenderTest.Oracle();
                  TestWebSocketServer server = startServer(log)) {
                 QwpTableBuffer t = later.block("t");
@@ -185,7 +185,7 @@ public class QwpOpenRecordRecoveryTest {
     @Test
     public void testCrashKeepsAFullyAcknowledgedSlot() throws Exception {
         assertMemoryLeak(() -> {
-            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+            FrameLog log = new FrameLog();
             try (QwpOpenRecordSenderTest.Oracle oracle = new QwpOpenRecordSenderTest.Oracle();
                  TestWebSocketServer server = startServer(log)) {
                 QwpWebSocketSender sender = (QwpWebSocketSender) Sender.fromConfig(config(server.getPort(), 0));
@@ -210,7 +210,7 @@ public class QwpOpenRecordRecoveryTest {
         assertMemoryLeak(() -> {
             final long segmentBytes = 256 * 1024;
             MsyncRecordingFacade ff = new MsyncRecordingFacade();
-            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+            FrameLog log = new FrameLog();
             try (QwpOpenRecordSenderTest.Oracle oracle = new QwpOpenRecordSenderTest.Oracle();
                  TestWebSocketServer server = startServer(log, 32 * 1024);
                  SegmentManager manager = new SegmentManager(segmentBytes, SegmentManager.DEFAULT_POLL_NANOS,
@@ -262,7 +262,7 @@ public class QwpOpenRecordRecoveryTest {
     @Test
     public void testPersistFailureAtARecordFullSealFailsAnOverCapRefusedRowAlone() throws Exception {
         assertMemoryLeak(() -> {
-            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+            FrameLog log = new FrameLog();
             String pad = TestUtils.repeat("x", 3000);
             try (QwpOpenRecordSenderTest.Oracle first = new QwpOpenRecordSenderTest.Oracle();
                  QwpOpenRecordSenderTest.Oracle second = new QwpOpenRecordSenderTest.Oracle();
@@ -311,7 +311,7 @@ public class QwpOpenRecordRecoveryTest {
     @Test
     public void testPersistFailureAtARecordFullSealMovesTheRefusedRowToTheFullDictionaryPath() throws Exception {
         assertMemoryLeak(() -> {
-            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+            FrameLog log = new FrameLog();
             String pad = TestUtils.repeat("x", 3000);
             try (QwpOpenRecordSenderTest.Oracle first = new QwpOpenRecordSenderTest.Oracle();
                  QwpOpenRecordSenderTest.Oracle second = new QwpOpenRecordSenderTest.Oracle();
@@ -348,7 +348,7 @@ public class QwpOpenRecordRecoveryTest {
     @Test
     public void testPersistFailureSealsThenSwitchesToFullDictionaryMode() throws Exception {
         assertMemoryLeak(() -> {
-            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+            FrameLog log = new FrameLog();
             try (QwpOpenRecordSenderTest.Oracle first = new QwpOpenRecordSenderTest.Oracle();
                  QwpOpenRecordSenderTest.Oracle second = new QwpOpenRecordSenderTest.Oracle();
                  QwpOpenRecordSenderTest.Oracle third = new QwpOpenRecordSenderTest.Oracle();
@@ -438,7 +438,7 @@ public class QwpOpenRecordRecoveryTest {
                 // the recovery fold sees every id it defines: the slot keeps its side file (it holds
                 // a record), the heal writes all five ids back, and a symbol the recovered sender
                 // mints takes the id after them instead of colliding with c.
-                QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+                FrameLog log = new FrameLog();
                 try (TestWebSocketServer server = startServer(log);
                      QwpWebSocketSender recovered = (QwpWebSocketSender) Sender.fromConfig(config(server.getPort(), 5_000))) {
                     log.awaitDataFrames(3, 5_000);
@@ -471,7 +471,7 @@ public class QwpOpenRecordRecoveryTest {
     @Test
     public void testPersistSkipsTheEntriesTheSideFileAlreadyHolds() throws Exception {
         assertMemoryLeak(() -> {
-            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+            FrameLog log = new FrameLog();
             try (QwpOpenRecordSenderTest.Oracle oracle = new QwpOpenRecordSenderTest.Oracle();
                  TestWebSocketServer server = startServer(log);
                  QwpWebSocketSender sender = (QwpWebSocketSender) Sender.fromConfig(config(server.getPort(), 5_000))) {
@@ -524,7 +524,7 @@ public class QwpOpenRecordRecoveryTest {
                     }
                     Assert.assertTrue("close() keeps the slot", segmentFileCount() > 0);
                 }
-                QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+                FrameLog log = new FrameLog();
                 try (TestWebSocketServer server = startServer(log);
                      Sender ignored = Sender.fromConfig(config(server.getPort(), 5_000))) {
                     log.awaitDataFrames(1, 5_000);
@@ -553,8 +553,8 @@ public class QwpOpenRecordRecoveryTest {
                     sender.crashForTest();
                     assertClosed(sender);
                 }
-                Assert.assertEquals("nothing reached the wire before the crash", 0, silent.frames());
-                QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+                Assert.assertEquals("nothing reached the wire before the crash", 0, silent.messages());
+                FrameLog log = new FrameLog();
                 try (TestWebSocketServer server = startServer(log);
                      Sender ignored = Sender.fromConfig(config(server.getPort(), 5_000))) {
                     log.awaitDataFrames(1, 5_000);
@@ -582,7 +582,7 @@ public class QwpOpenRecordRecoveryTest {
                             0, sender.getPersistedSymbolsForTest().size());
                     sender.crashForTest();
                 }
-                QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+                FrameLog log = new FrameLog();
                 try (TestWebSocketServer server = startServer(log);
                      QwpWebSocketSender sender = (QwpWebSocketSender) Sender.fromConfig(config(server.getPort(), 5_000))) {
                     log.awaitDataFrames(1, 5_000);
@@ -626,7 +626,7 @@ public class QwpOpenRecordRecoveryTest {
                     Assert.assertEquals(3, sender.pendingRowCount());
                     sender.crashForTest();
                 }
-                QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+                FrameLog log = new FrameLog();
                 try (TestWebSocketServer server = startServer(log);
                      Sender ignored = Sender.fromConfig(config(server.getPort(), 5_000))) {
                     log.awaitDataFrames(1, 5_000);
@@ -654,7 +654,7 @@ public class QwpOpenRecordRecoveryTest {
                 writeVersion1Segment(initialPath, segmentBytes, olderFrame);
                 PersistedSymbolDict.openClean(slotPath()).close();
 
-                QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+                FrameLog log = new FrameLog();
                 try (TestWebSocketServer server = startServer(log);
                      QwpWebSocketSender sender = (QwpWebSocketSender) Sender.fromConfig(config(server.getPort(), 5_000)
                              + "sf_max_segment_bytes=" + segmentBytes + ';')) {
@@ -698,7 +698,7 @@ public class QwpOpenRecordRecoveryTest {
                     sender.crashForTest();
                 }
                 // the rotated, empty version 1 segment does not stand in the record's way on recovery
-                QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+                FrameLog log = new FrameLog();
                 try (TestWebSocketServer server = startServer(log);
                      Sender ignored = Sender.fromConfig(config(server.getPort(), 5_000)
                              + "sf_max_segment_bytes=" + segmentBytes + ';')) {
@@ -716,37 +716,6 @@ public class QwpOpenRecordRecoveryTest {
             Assert.fail("a crashed sender is closed");
         } catch (LineSenderException expected) {
             TestUtils.assertContains(expected.getMessage(), "closed");
-        }
-    }
-
-    /**
-     * Flips a byte of the first committed value of the record at
-     * {@code recordOffset}, so its row CRC no longer matches.
-     */
-    public static void flipCommittedValueByte(String segmentPath, long recordOffset) throws Exception {
-        try (RandomAccessFile file = new RandomAccessFile(segmentPath, "rw")) {
-            int capacity = Integer.reverseBytes(readIntAt(file, recordOffset + 4));
-            byte[] payload = new byte[capacity];
-            file.seek(recordOffset + MmapSegment.FRAME_HEADER_SIZE);
-            file.readFully(payload);
-            long addr = Unsafe.malloc(capacity, MemoryTag.NATIVE_DEFAULT);
-            try {
-                for (int i = 0; i < capacity; i++) {
-                    Unsafe.getUnsafe().putByte(addr + i, payload[i]);
-                }
-                QwoRecordReader reader = new QwoRecordReader();
-                reader.of(addr, capacity);
-                int def = reader.columnDef(reader.firstBlock(), 0);
-                long value = reader.chunkValuesAddr(reader.firstChunk(def), QwpConstants.TYPE_LONG,
-                        reader.columnUsesBitmap(def));
-                long valueOffset = recordOffset + MmapSegment.FRAME_HEADER_SIZE + (value - addr);
-                file.seek(valueOffset);
-                int b = file.readByte();
-                file.seek(valueOffset);
-                file.writeByte(b ^ 0x40);
-            } finally {
-                Unsafe.free(addr, capacity, MemoryTag.NATIVE_DEFAULT);
-            }
         }
     }
 
@@ -774,17 +743,6 @@ public class QwpOpenRecordRecoveryTest {
             file.seek(offset);
             return file.readByte();
         }
-    }
-
-    private static int readInt(String path, long offset) throws Exception {
-        try (RandomAccessFile file = new RandomAccessFile(path, "r")) {
-            return Integer.reverseBytes(readIntAt(file, offset));
-        }
-    }
-
-    private static int readIntAt(RandomAccessFile file, long offset) throws Exception {
-        file.seek(offset);
-        return file.readInt();
     }
 
     private static TestWebSocketServer startServer(TestWebSocketServer.WebSocketServerHandler handler) throws Exception {
@@ -873,7 +831,7 @@ public class QwpOpenRecordRecoveryTest {
             Assert.assertTrue(recordOffset >= 0);
             sender.crashForTest();
         }
-        flipCommittedValueByte(activeSegmentPath(), recordOffset);
+        QwpSfTestUtils.flipCommittedValueByte(activeSegmentPath(), recordOffset);
         return recordOffset;
     }
 
@@ -887,73 +845,18 @@ public class QwpOpenRecordRecoveryTest {
     }
 
     /**
-     * Refuses to grow the symbol dictionary's mmap append window while armed:
-     * the production shape of a full disk. It opts into
-     * {@code isMmapAllowed()} so the dictionary takes its production path.
-     */
-    private static final class FullDiskDictFacade extends DelegatingFilesFacade {
-        volatile boolean isArmed;
-
-        @Override
-        public boolean allocate(int fd, long size) {
-            return !isArmed && INSTANCE.allocate(fd, size);
-        }
-
-        @Override
-        public boolean isMmapAllowed() {
-            return true;
-        }
-    }
-
-    private static final class MsyncRecordingFacade extends DelegatingFilesFacade {
-        private long[] addrs = new long[64];
-        private long[] lens = new long[64];
-        private int msyncCalls;
-
-        @Override
-        public synchronized int msync(long addr, long len, boolean async) {
-            if (msyncCalls == addrs.length) {
-                addrs = Arrays.copyOf(addrs, msyncCalls * 2);
-                lens = Arrays.copyOf(lens, msyncCalls * 2);
-            }
-            addrs[msyncCalls] = addr;
-            lens[msyncCalls] = len;
-            msyncCalls++;
-            return super.msync(addr, len, async);
-        }
-
-        synchronized int calls() {
-            return msyncCalls;
-        }
-
-        /**
-         * Longest msync that started at {@code addr} among the calls from the
-         * {@code fromCall}-th on; -1 when none did.
-         */
-        synchronized long maxLenSince(long addr, int fromCall) {
-            long max = -1L;
-            for (int i = fromCall; i < msyncCalls; i++) {
-                if (addrs[i] == addr && lens[i] > max) {
-                    max = lens[i];
-                }
-            }
-            return max;
-        }
-    }
-
-    /**
-     * Counts the frames it receives and acknowledges none.
+     * Counts the WebSocket messages it receives and acknowledges none.
      */
     private static final class SilentHandler implements TestWebSocketServer.WebSocketServerHandler {
-        private int frames;
+        private int messages;
+
+        synchronized int messages() {
+            return messages;
+        }
 
         @Override
         public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
-            frames++;
-        }
-
-        synchronized int frames() {
-            return frames;
+            messages++;
         }
     }
 }

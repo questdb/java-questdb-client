@@ -29,9 +29,10 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.test.QuestDBReleaseSemanticsTest;
+import io.questdb.client.test.cutlass.qwp.client.QwpSfTestUtils.FrameLog;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
-import io.questdb.client.test.tools.DelegatingFilesFacade;
 import io.questdb.client.test.tools.TestUtils;
+import io.questdb.client.test.tools.UnopenableDictFacade;
 import org.junit.Assert;
 import org.junit.Rule;
 import org.junit.Test;
@@ -62,7 +63,7 @@ public class SenderProbeMethodsTest {
 
     @Test
     public void testAutoFlushIfDueShipsOnlyRowsOlderThanTheInterval() throws Exception {
-        QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+        FrameLog log = new FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
@@ -107,7 +108,7 @@ public class SenderProbeMethodsTest {
 
     @Test
     public void testCrossingRowInATransactionShipsTheRowsBeforeItDeferred() throws Exception {
-        QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+        FrameLog log = new FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.setAdvertisedMaxBatchSize(4 * 1024);
             server.start();
@@ -135,7 +136,7 @@ public class SenderProbeMethodsTest {
 
     @Test
     public void testCrossingRowShipsTheRowsBeforeIt() throws Exception {
-        QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+        FrameLog log = new FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.setAdvertisedMaxBatchSize(4 * 1024);
             server.start();
@@ -176,7 +177,7 @@ public class SenderProbeMethodsTest {
 
     @Test
     public void testDeferredFlushShipsFlaggedFrameAndFlushCommits() throws Exception {
-        QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+        FrameLog log = new FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
@@ -206,7 +207,7 @@ public class SenderProbeMethodsTest {
 
     @Test
     public void testFlushAfterAnEmptySavepointResetShipsTheNextRow() throws Exception {
-        QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+        FrameLog log = new FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
@@ -271,7 +272,7 @@ public class SenderProbeMethodsTest {
 
     @Test
     public void testHeldCrossingRowWithANewSymbolKeepsTheDictionaryGapFree() throws Exception {
-        QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+        FrameLog log = new FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.setAdvertisedMaxBatchSize(4 * 1024);
             server.start();
@@ -301,7 +302,7 @@ public class SenderProbeMethodsTest {
 
     @Test
     public void testOverCapRowsShipInRecordSizedFramesAndCheckErrorStaysSilent() throws Exception {
-        QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+        FrameLog log = new FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.setAdvertisedMaxBatchSize(4 * 1024);
             server.start();
@@ -327,7 +328,7 @@ public class SenderProbeMethodsTest {
 
     @Test
     public void testResetToSavepointAfterARecordFilledInTheLeaseDropsOnlyTheUnshippedRows() throws Exception {
-        QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+        FrameLog log = new FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.setAdvertisedMaxBatchSize(4 * 1024);
             server.start();
@@ -356,7 +357,7 @@ public class SenderProbeMethodsTest {
 
     @Test
     public void testResetToSavepointKeepsRowsBufferedBeforeTheMark() throws Exception {
-        QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+        FrameLog log = new FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
@@ -384,7 +385,7 @@ public class SenderProbeMethodsTest {
 
     @Test
     public void testResetToSavepointReclaimsTheSymbolIdsOfTheDroppedRows() throws Exception {
-        QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+        FrameLog log = new FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
@@ -431,7 +432,7 @@ public class SenderProbeMethodsTest {
 
     @Test
     public void testRowOverTheFrameBoundFailsOnItsAtAfterTheRowsBeforeItShip() throws Exception {
-        QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+        FrameLog log = new FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.setAdvertisedMaxBatchSize(4 * 1024);
             server.start();
@@ -459,7 +460,7 @@ public class SenderProbeMethodsTest {
 
     @Test
     public void testRowOverTheFrameBoundFailsOnItsAtWithTheByteTriggerOff() throws Exception {
-        QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+        FrameLog log = new FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.setAdvertisedMaxBatchSize(4 * 1024);
             server.start();
@@ -482,7 +483,7 @@ public class SenderProbeMethodsTest {
 
     @Test
     public void testRowsOverTheCapWithTheByteTriggerOffShipInRecordSizedFrames() throws Exception {
-        QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+        FrameLog log = new FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.setAdvertisedMaxBatchSize(4 * 1024);
             server.start();
@@ -512,7 +513,7 @@ public class SenderProbeMethodsTest {
 
     @Test
     public void testSingleRowOverTheFrameBoundFailsOnItsAtAndLeavesNothingBuffered() throws Exception {
-        QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+        FrameLog log = new FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.setAdvertisedMaxBatchSize(4 * 1024);
             server.start();
@@ -577,7 +578,7 @@ public class SenderProbeMethodsTest {
 
     @Test
     public void testTryFlushShipsLikeFlushWhenTheRingHasRoom() throws Exception {
-        QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+        FrameLog log = new FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
@@ -595,7 +596,7 @@ public class SenderProbeMethodsTest {
 
     @Test
     public void testUnsetAutoFlushBytesShipsAtTheAdvertisedCap() throws Exception {
-        QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
+        FrameLog log = new FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.setAdvertisedMaxBatchSize(16 * 1024);
             server.start();
@@ -657,17 +658,6 @@ public class SenderProbeMethodsTest {
         @Override
         public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
             // no ack: the frame stays unacked on disk
-        }
-    }
-
-    /**
-     * Refuses to create the slot's {@code .symbol-dict}, so the engine runs in
-     * full-dictionary mode and the sender keeps its frame-per-flush path.
-     */
-    private static final class UnopenableDictFacade extends DelegatingFilesFacade {
-        @Override
-        public int openCleanRW(String path) {
-            return -1;
         }
     }
 }

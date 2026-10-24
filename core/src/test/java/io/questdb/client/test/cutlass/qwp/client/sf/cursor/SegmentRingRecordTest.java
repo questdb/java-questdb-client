@@ -40,7 +40,7 @@ import io.questdb.client.std.Files;
 import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
-import io.questdb.client.test.tools.DelegatingFilesFacade;
+import io.questdb.client.test.tools.MsyncRecordingFacade;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
 import org.junit.Assert;
@@ -153,7 +153,7 @@ public class SegmentRingRecordTest {
                 ring.abandonRecord(off);
                 Assert.assertTrue(active.isPublishedDurable());
                 Assert.assertFalse(active.isDurable());
-                int msyncsAtAbandon = ff.msyncCalls;
+                int msyncsAtAbandon = ff.calls();
 
                 bigLen = (int) (active.capacityRemaining() + 1);
                 big = Unsafe.malloc(bigLen, MemoryTag.NATIVE_DEFAULT);
@@ -166,7 +166,7 @@ public class SegmentRingRecordTest {
                 manager.serviceRingForTesting(ring);
                 Assert.assertTrue(active.isDurable());
                 Assert.assertTrue("an msync after the abandon must cover the abandoned extent",
-                        ff.msyncCalls > msyncsAtAbandon && ff.lastLenFor(active.address()) >= reservedEnd);
+                        ff.calls() > msyncsAtAbandon && ff.lastLenFor(active.address()) >= reservedEnd);
 
                 Assert.assertEquals(1L, ring.appendOrFsn(big, bigLen));
                 Assert.assertSame(spare, ring.getActive());
@@ -729,36 +729,6 @@ public class SegmentRingRecordTest {
         }
         if (publish) {
             writer.publish();
-        }
-    }
-
-    private static final class MsyncRecordingFacade extends DelegatingFilesFacade {
-        private long[] addrs = new long[64];
-        private long[] lens = new long[64];
-        private int msyncCalls;
-
-        @Override
-        public synchronized int msync(long addr, long len, boolean async) {
-            if (msyncCalls == addrs.length) {
-                addrs = java.util.Arrays.copyOf(addrs, msyncCalls * 2);
-                lens = java.util.Arrays.copyOf(lens, msyncCalls * 2);
-            }
-            addrs[msyncCalls] = addr;
-            lens[msyncCalls] = len;
-            msyncCalls++;
-            return super.msync(addr, len, async);
-        }
-
-        /**
-         * Length of the last msync that started at {@code addr}; -1 when none did.
-         */
-        synchronized long lastLenFor(long addr) {
-            for (int i = msyncCalls - 1; i >= 0; i--) {
-                if (addrs[i] == addr) {
-                    return lens[i];
-                }
-            }
-            return -1L;
         }
     }
 }
