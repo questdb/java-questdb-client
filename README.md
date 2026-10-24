@@ -32,7 +32,7 @@ try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;")) {
                 .doubleColumn("price", 2615.54)
                 .doubleColumn("amount", 0.00044)
                 .atNow();
-        // close() returns the Sender to the pool; rows ship once an auto-flush threshold trips (age, rows or bytes), or when the idle slot is settled.
+        // close() makes the row recoverable and returns the Sender to the pool; it ships once an auto-flush threshold trips (age, rows or bytes), or when the idle slot is settled.
     }
 }
 ```
@@ -98,15 +98,24 @@ snippets below borrow from its pools.
 
 ### Ingest Data
 
-Borrow a `Sender`, write rows, and close it. Close releases, flush ships, drain waits: `close()` returns the sender to
-the pool and ships the slot's pending rows once the oldest is older than `auto_flush_interval` (100 ms by default) or
-another auto-flush threshold trips, otherwise it only releases; rows left in the slot go out when an auto-flush
-threshold trips on a later append or `close()`, or when the pool's housekeeper settles the idle slot, typically within
-one `auto_flush_interval`. A lease that holds the slot without appending or closing, for example one that waits for input
-inside the `try` block, holds those rows back until it does: borrow once the data is in hand. Borrowing per
+Borrow a `Sender`, write rows, and close it. Close makes the rows recoverable and releases, flush ships, drain waits:
+`close()` publishes the lease's rows into the slot's store-and-forward ring without shipping them and returns the
+sender to the pool. The release itself ships the slot's rows once the oldest is older than `auto_flush_interval`
+(100 ms by default) or another auto-flush threshold trips; otherwise they go out when a threshold trips on a later
+append or `close()`, when the slot's open record fills, or when the pool's housekeeper settles the idle slot, typically
+within one `auto_flush_interval`. A lease that holds the slot without appending or closing, for example one that waits
+for input inside the `try` block, holds those rows back until it does: borrow once the data is in hand. Borrowing per
 message is the intended pattern and batches like a sender held for the whole run. Call `flush()` to ship now and
 `drain()` to wait for the server. The underlying connection is only torn down when the `QuestDB` handle itself is
-closed.
+closed. Before 1.3.12 a pooled `close()` flushed, one frame and one commit per close; call `flush()` before `close()`
+where you need that.
+
+**What recoverable means.** A row is recoverable once it is in the slot's store-and-forward ring, not once the server
+has it, and a later lease's `reset()` no longer discards it. Without `sf_dir` the ring lives in memory: the row
+survives the lease, a reconnect and a failover, but not the process. With `sf_dir` it also survives a crash of the
+process: the next `QuestDB` handle on the same `sf_dir` recovers the slot and ships the row. Rows a lease appended after
+its last `close()` or `publishPending()` are not published yet and are lost in a crash. `flush()` followed by `drain()`
+is the point where the server has the rows.
 
 ```java
 import io.questdb.client.Sender;
@@ -117,29 +126,35 @@ try (Sender sender = db.borrowSender()) {
             .doubleColumn("price", 42_500.50)
             .longColumn("size", 100)
             .atNow();
-    // close() returns the sender; the pool ships the row by threshold or on its next settle.
+    // close() publishes the row and returns the sender; the row ships by threshold or on the pool's next settle.
 }
 ```
 
 ### Sending Batches of Rows
 
 The sender buffers rows and sends them in batches. For high throughput, write many rows on one borrowed sender and
-flush per batch rather than per row: each flush has a fixed cost, so batching raises throughput. The final partial batch ships on the
-pool's next settle; call `flush()` before `close()` if you need it on the wire now.
+flush per batch rather than per row: each flush has a fixed cost, so batching raises throughput. The final partial
+batch is recoverable once `close()` returns and ships by threshold or on the pool's next settle; call `flush()` before
+`close()` if you need it on the wire now.
 
-If you borrow per message and want each message in the store-and-forward ring the moment `close()` returns, set
-`flush_on_close=on` together with a commit window (`commit_rows`, `commit_interval_ms`): every close ships one frame
-flagged defer-commit, the server appends it, and the pool commits once per window instead of once per close. A rejected
-frame then rolls back the whole open group, so every lease since the last commit loses its rows.
+Borrowing per message does not cost a frame per `close()`: the releases of many leases share one frame, and so one
+server commit; the frame ships when an auto-flush threshold trips (age, rows or bytes) or the slot's open record fills.
+A commit window (`commit_rows`, `commit_interval_ms`) groups commits further: frames that ship inside the window are
+flagged defer-commit, the release that fills the window ends the group with an unflagged frame, and the server commits
+once per window. A rejected frame then rolls back the whole open group, so every lease since the last commit loses its
+rows. A slot whose symbol dictionary file cannot be opened or written under `sf_dir` (a full disk, for example) falls
+back to full-dictionary frames: there every `close()` ships the lease's rows in a frame of their own, which the server
+commits at once, so a commit window groups nothing on that slot.
 
-A server rejection covers a whole frame. With the default `flush_on_close=off` one frame carries the rows of every
-lease that closed since the last ship, so one rejected row discards the other leases' rows in that frame as well,
-after their `close()` calls returned. The default error handler logs the rejection with the frame's sequence span, and
-the error is thrown by the next call on that slot, possibly to a lease that wrote none of the rejected rows. A
-retriable rejection (write error, internal error) replays the frame; a terminal one (schema mismatch, parse error,
-security error) retires the slot, and with `sf_dir` its unacked frames stay in the slot directory for recovery. A
-lease whose rows must not share a frame calls `flush()` before `close()`, or the handle sets `flush_on_close=on`.
-`reset()` on a borrowed sender discards only the rows appended through that lease.
+A server rejection covers a whole frame. One frame carries the rows of every lease that closed since the last ship, so
+one rejected row discards the other leases' rows in that frame as well, after their `close()` calls returned. The
+default error handler logs the rejection with the frame's sequence span, and the error is thrown by the next call on
+that slot, possibly to a lease that wrote none of the rejected rows. A retriable rejection (write error, internal
+error) replays the frame; a terminal one (schema mismatch, parse error, security error) retires the slot, and with
+`sf_dir` its unacked frames stay in the slot directory for recovery. A lease whose rows must not share a frame calls
+`flush()` before `close()`. `reset()` on a borrowed sender discards only the rows appended through that lease.
+Close-time errors are wrapped: the delegate's error is the cause, and only `LineSenderServerException` keeps its type,
+so code that catches another `LineSenderException` subclass around a pooled `close()` must look at `getCause()`.
 
 ```java
 try (Sender sender = db.borrowSender()) {
@@ -680,8 +695,7 @@ schema::key1=value1;key2=value2;
 | `acquire_timeout_ms`     | `5000`  | How long `borrowSender()`/`borrowQuery()` waits for a free slot                |
 | `idle_timeout_ms`        | `60000` | How long a pooled connection may stay idle before it is reaped                 |
 | `max_lifetime_ms`        | `1800000` | Maximum lifetime of a pooled connection before it is recycled                |
-| `flush_on_close`         | `off`   | `on` makes a pooled `close()` flush before releasing (one frame and one commit per close, the behaviour before 1.3.12). Note: "flush" means published to the store-and-forward ring, not acknowledged. Close-time errors are wrapped; the delegate's error is the cause; only `LineSenderServerException` keeps its type, so code that catches another `LineSenderException` subclass around a pooled `close()` must look at `getCause()`; with `on` and no commit window each lease ships its own frame, so a server rejection cannot discard other leases' rows; with `off` leases share frames and a rejection covers all of them; with a commit window a rejection rolls back the whole open group, every lease since the last commit |
-| `commit_rows`            | _(unset)_ | Commit window: with `flush_on_close=on`, closes ship frames flagged defer-commit and the server commits once per window of this many rows. Acks arrive at the commit; `drain()` after `flush()` |
+| `commit_rows`            | _(unset)_ | Commit window: frames that ship inside the window are flagged defer-commit and the release that fills it ends the group with an unflagged frame, so the server commits once per window of this many rows. Acks arrive at the commit; `drain()` after `flush()`. A slot in full-dictionary mode commits at every release |
 | `commit_interval_ms`     | _(unset)_ | Commit window age in milliseconds; setting either window key enables the window, the other defaults to 1000 rows / 100 ms. An idle slot's open group is committed at the settle cadence, so the interval only bounds groups on busy slots |
 
 ### Query routing keys
@@ -702,8 +716,15 @@ The ingest side also accepts store-and-forward and reconnection tuning keys (`au
 is the minimum working set every live sender keeps: two segments (`2 × sf_max_segment_bytes`, 8 MiB by default).
 `sf_durability=periodic` checkpoints mmap-published data in the background; `sf_sync_interval_millis` defaults to `5000`
 in that mode. The interval is a target cadence: JVM scheduling and storage-sync latency add to the actual loss window.
-Use `request_durable_ack=on` when end-to-end server durability is also required. See the
+Use `request_durable_ack=on` when end-to-end server durability is also required. `auto_flush_bytes` counts the bytes of
+the slot's open record, which besides the row data hold a 48-byte header, a dictionary reserve and the slack of the
+column chunks, so frames can seal somewhat below the configured size. See the
 [QuestDB documentation](https://questdb.com/docs/) for the full reference.
+
+**Store-and-forward directory format.** From 1.3.12 the client writes version 2 segment files into `sf_dir`. It resumes
+a directory an earlier release wrote, but an earlier release refuses a directory this one has written ("unsupported
+version") and leaves its files in place. Before a downgrade, close the handle with every row acknowledged (`flush()`
+and `drain()`): a drained slot keeps no segment files.
 
 ## Requirements
 
