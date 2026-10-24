@@ -44,6 +44,8 @@ public class OffHeapAppendMemory implements ArrayBufferAppender, QuietCloseable 
     private static final int DEFAULT_INITIAL_CAPACITY = 128;
     private long appendAddress;
     private long capacity;
+    // pageAddress + capacity, so the hot capacity check is one compare.
+    private long limitAddress;
     private long pageAddress;
 
     public OffHeapAppendMemory() {
@@ -54,6 +56,7 @@ public class OffHeapAppendMemory implements ArrayBufferAppender, QuietCloseable 
         this.capacity = Math.max(initialCapacity, 8);
         this.pageAddress = Unsafe.malloc(this.capacity, MemoryTag.NATIVE_ILP_RSS);
         this.appendAddress = pageAddress;
+        this.limitAddress = pageAddress + this.capacity;
     }
 
     /**
@@ -68,6 +71,7 @@ public class OffHeapAppendMemory implements ArrayBufferAppender, QuietCloseable 
         if (pageAddress != 0) {
             Unsafe.free(pageAddress, capacity, MemoryTag.NATIVE_ILP_RSS);
             pageAddress = 0;
+            limitAddress = 0;
             appendAddress = 0;
             capacity = 0;
         }
@@ -214,12 +218,20 @@ public class OffHeapAppendMemory implements ArrayBufferAppender, QuietCloseable 
     }
 
     private void ensureCapacity(long needed) {
-        long used = appendAddress - pageAddress;
-        if (used + needed > capacity) {
-            long newCapacity = Math.max(capacity * 2, used + needed);
-            pageAddress = Unsafe.realloc(pageAddress, capacity, newCapacity, MemoryTag.NATIVE_ILP_RSS);
-            capacity = newCapacity;
-            appendAddress = pageAddress + used;
+        // Fast path kept tiny so the JIT inlines it into every put: the
+        // realloc lives in grow(). This check ran once per column per row and
+        // was 15% of the producer's cycles as one body with the slow path.
+        if (appendAddress + needed > limitAddress) {
+            grow(needed);
         }
+    }
+
+    private void grow(long needed) {
+        long used = appendAddress - pageAddress;
+        long newCapacity = Math.max(capacity * 2, used + needed);
+        pageAddress = Unsafe.realloc(pageAddress, capacity, newCapacity, MemoryTag.NATIVE_ILP_RSS);
+        capacity = newCapacity;
+        appendAddress = pageAddress + used;
+        limitAddress = pageAddress + capacity;
     }
 }
