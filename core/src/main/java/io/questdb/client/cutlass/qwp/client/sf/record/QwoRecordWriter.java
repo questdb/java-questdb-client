@@ -100,6 +100,7 @@ public final class QwoRecordWriter implements QuietCloseable {
     private int dictStartId;
     private int dictUsed;
     private long epoch;
+    private boolean isFitShortcutEnabled = true;
     private boolean isOpen;
     private int lastRefusedDictBytes;
     private int maxColumnsPerBlock = MAX_COLUMNS;
@@ -165,7 +166,7 @@ public final class QwoRecordWriter implements QuietCloseable {
         int maxNominalRowCap = 0;
         for (int i = 0, n = block.colCount; i < n; i++) {
             ColumnState cs = block.columns.getQuick(i);
-            if (!planColumn(cs, staged.getColumn(i))) {
+            if (!planColumn(cs, cs.column)) {
                 return APPEND_NO_SPACE;
             }
             if (cs.planKind != PLAN_NONE) {
@@ -175,7 +176,9 @@ public final class QwoRecordWriter implements QuietCloseable {
         long budget = (long) capacity - usedBytes - WIRE_MARGIN_FIXED
                 - (long) WIRE_MARGIN_PER_BLOCK * (blockCount + (isNewBlock ? 1 : 0))
                 - (isNewBlock ? block.descriptorSize : 0);
-        if (!fitChunks(block, budget, maxNominalRowCap)) {
+        // A planned chunk has a nominal row capacity of at least 1, so 0 means that no column
+        // needs one, and fitChunks would only check that the budget is not negative.
+        if ((maxNominalRowCap > 0 || !isFitShortcutEnabled) ? !fitChunks(block, budget, maxNominalRowCap) : budget < 0) {
             return APPEND_NO_SPACE;
         }
 
@@ -201,7 +204,7 @@ public final class QwoRecordWriter implements QuietCloseable {
             } else if (cs.planKind == PLAN_RELOCATE) {
                 relocateChunk(cs);
             }
-            writeValue(cs, staged.getColumn(i));
+            writeValue(cs, cs.column);
         }
         block.crc = crc.finish();
         block.rowCount++;
@@ -235,7 +238,6 @@ public final class QwoRecordWriter implements QuietCloseable {
     @Override
     public void close() {
         isOpen = false;
-        crc.close();
         for (int i = 0, n = blocks.size(); i < n; i++) {
             blocks.getQuick(i).forget();
         }
@@ -504,6 +506,16 @@ public final class QwoRecordWriter implements QuietCloseable {
         return committedUsedBytes;
     }
 
+    /**
+     * Turns the shortcut off that skips {@code fitChunks} for a row whose
+     * columns all fit their current chunks, so a test can compare the records
+     * the shortcut and the full fit write.
+     */
+    @TestOnly
+    public void setFitShortcutForTest(boolean isEnabled) {
+        this.isFitShortcutEnabled = isEnabled;
+    }
+
     @TestOnly
     public void setMaxColumnsPerBlockForTest(int maxColumnsPerBlock) {
         this.maxColumnsPerBlock = maxColumnsPerBlock;
@@ -715,7 +727,7 @@ public final class QwoRecordWriter implements QuietCloseable {
     private boolean planColumn(ColumnState cs, QwpTableBuffer.ColumnBuffer col) {
         boolean present = col.getValueCount() > 0;
         cs.isPresent = present;
-        cs.planPrefix = cs.prefix >= 0 ? cs.prefix : stagedPrefix(cs.type, col);
+        cs.planPrefix = cs.prefix >= 0 || cs.prefixKind == PREFIX_NONE ? cs.prefix : stagedPrefix(cs.type, col);
         long len = 0;
         if (present) {
             switch (cs.type) {
@@ -747,8 +759,11 @@ public final class QwoRecordWriter implements QuietCloseable {
                     len = 1L + (long) Integer.BYTES * nDims + 8L * elements;
                     break;
                 }
+                case QwpConstants.TYPE_GEOHASH:
+                    len = valueWidth(QwpConstants.TYPE_GEOHASH, cs.planPrefix);
+                    break;
                 default:
-                    len = valueWidth(cs.type, cs.planPrefix);
+                    len = cs.width;
                     break;
             }
             if (len > capacity) {
@@ -1147,6 +1162,8 @@ public final class QwoRecordWriter implements QuietCloseable {
         long totalBytes;
         int totalValues;
         byte type;
+        // value width of a fixed-size type other than GEOHASH, whose width follows its precision
+        int width;
 
         void commit() {
             committedChunk = chunk;
@@ -1165,6 +1182,8 @@ public final class QwoRecordWriter implements QuietCloseable {
             type = col.getType();
             hasBitmap = col.usesNullBitmap();
             isVariableSize = QwoFormat.isVariableSize(type);
+            width = isVariableSize || type == QwpConstants.TYPE_BOOLEAN || type == QwpConstants.TYPE_SYMBOL
+                    || type == QwpConstants.TYPE_GEOHASH ? 0 : valueWidth(type, -1);
             switch (type) {
                 case QwpConstants.TYPE_GEOHASH:
                     prefixKind = PREFIX_GEOHASH;

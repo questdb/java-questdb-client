@@ -863,6 +863,44 @@ public class QwpOpenRecordSenderTest {
     }
 
     @Test
+    public void testSealedRecordAboveADeltaStartReplaysByteIdenticalAfterACatchUp() throws Exception {
+        // The first record registers "a" and is acknowledged; the second starts its dictionary
+        // at id 1 and is not. The reconnect re-registers the shipped dictionary with a rowless
+        // catch-up frame, which covers the ids below the record's delta start, and then replays
+        // the second record, byte for byte.
+        assertMemoryLeak(() -> {
+            ReplayLog log = new ReplayLog(1);
+            try (TestWebSocketServer server = startServer(log);
+                 Oracle first = new Oracle();
+                 Oracle second = new Oracle();
+                 Sender sender = Sender.fromConfig(config(server.getPort()))) {
+                symbolRow(sender, first, first.block("t"), "a", 1);
+                Assert.assertTrue("the first record is acknowledged", sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+                Assert.assertArrayEquals(first.frame(-1, false), log.awaitDataMessage(0, 0, 5_000));
+
+                second.dict.getOrAddSymbol("a");
+                QwpTableBuffer t = second.block("t");
+                symbolRow(sender, second, t, "b", 2);
+                symbolRow(sender, second, t, "a", 3);
+                sender.flush();
+                byte[] sent = log.awaitDataMessage(0, 1, 5_000);
+                int[] position = {QwpConstants.HEADER_SIZE};
+                Assert.assertEquals("delta start", 1, QwpWireTestUtils.readVarint(sent, position));
+                Assert.assertArrayEquals(second.frame(0, false), sent);
+
+                server.dropAllConnections();
+                byte[] replayed = log.awaitDataMessage(1, 0, 10_000);
+                Assert.assertArrayEquals("the replay is the frame first sent, byte for byte", sent, replayed);
+                List<byte[]> reconnected = log.messages(1);
+                Assert.assertEquals("the catch-up comes first and carries no rows", 0, QwpWireTestUtils.tableCount(reconnected.get(0)));
+                List<String> dictionary = new ArrayList<>();
+                QwpWireTestUtils.accumulateDeltaDictionary(reconnected.get(0), dictionary);
+                Assert.assertEquals("every id shipped so far", Arrays.asList("a", "b"), dictionary);
+            }
+        });
+    }
+
+    @Test
     public void testSealedRecordReplaysByteIdenticalAfterAReconnect() throws Exception {
         assertMemoryLeak(() -> {
             ReplayLog log = new ReplayLog();
@@ -1153,29 +1191,51 @@ public class QwpOpenRecordSenderTest {
     }
 
     /**
-     * Keeps every message per connection and acknowledges only on the second
-     * connection and later, so the first connection's frames stay
-     * unacknowledged and a reconnect replays them.
+     * Keeps every message per connection. The first connection acknowledges its
+     * first {@code acksOnFirstConnection} messages and no more, so the frames after
+     * them stay unacknowledged and a reconnect replays them; later connections
+     * acknowledge everything.
      */
     private static final class ReplayLog implements TestWebSocketServer.WebSocketServerHandler {
+        private final int acksOnFirstConnection;
         private final List<List<byte[]>> messages = new ArrayList<>();
         private TestWebSocketServer.ClientHandler currentClient;
         private long nextSeq;
+
+        ReplayLog() {
+            this(0);
+        }
+
+        ReplayLog(int acksOnFirstConnection) {
+            this.acksOnFirstConnection = acksOnFirstConnection;
+        }
 
         /**
          * Waits for the first data message (one with a table) the
          * {@code connection}-th connection, counted from 0, received.
          */
         byte[] awaitDataMessage(int connection, long timeoutMillis) throws InterruptedException {
+            return awaitDataMessage(connection, 0, timeoutMillis);
+        }
+
+        /**
+         * Waits for the {@code index}-th data message (one with a table), counted
+         * from 0, the {@code connection}-th connection received.
+         */
+        byte[] awaitDataMessage(int connection, int index, long timeoutMillis) throws InterruptedException {
             long deadline = System.currentTimeMillis() + timeoutMillis;
             while (System.currentTimeMillis() < deadline) {
-                byte[] message = firstDataMessage(connection);
+                byte[] message = dataMessage(connection, index);
                 if (message != null) {
                     return message;
                 }
                 Thread.sleep(10);
             }
-            throw new AssertionError("no data message on connection " + connection + " within " + timeoutMillis + " ms");
+            throw new AssertionError("no data message " + index + " on connection " + connection + " within " + timeoutMillis + " ms");
+        }
+
+        synchronized List<byte[]> messages(int connection) {
+            return new ArrayList<>(messages.get(connection));
         }
 
         @Override
@@ -1186,7 +1246,7 @@ public class QwpOpenRecordSenderTest {
                 nextSeq = 0;
             }
             messages.get(messages.size() - 1).add(data.clone());
-            if (messages.size() > 1) {
+            if (messages.size() > 1 || nextSeq < acksOnFirstConnection) {
                 try {
                     client.sendBinary(QwpWireTestUtils.buildAck(nextSeq++));
                 } catch (IOException e) {
@@ -1195,10 +1255,11 @@ public class QwpOpenRecordSenderTest {
             }
         }
 
-        private synchronized byte[] firstDataMessage(int connection) {
+        private synchronized byte[] dataMessage(int connection, int index) {
             if (connection < messages.size()) {
+                int seen = -1;
                 for (byte[] message : messages.get(connection)) {
-                    if (QwpWireTestUtils.tableCount(message) > 0) {
+                    if (QwpWireTestUtils.tableCount(message) > 0 && ++seen == index) {
                         return message;
                     }
                 }

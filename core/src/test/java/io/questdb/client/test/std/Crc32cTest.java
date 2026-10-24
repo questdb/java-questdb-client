@@ -160,6 +160,98 @@ public class Crc32cTest {
         });
     }
 
+    /**
+     * A chain of register updates equals one {@link Crc32c#updateUnsafe} over
+     * the same pieces laid out back to back in memory, the way the open record's
+     * row CRC used to gather them, bit for bit.
+     */
+    @Test
+    public void testRegisterFormsChainLikeOneUpdateOverTheGatheredBytes() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            java.util.Random rnd = new java.util.Random(0x5EED_C0DEL);
+            int capacity = 64 * Long.BYTES;
+            long buf = Unsafe.malloc(capacity, MemoryTag.NATIVE_DEFAULT);
+            try {
+                for (int iter = 0; iter < 10_000; iter++) {
+                    int seed = rnd.nextInt();
+                    int crc = seed;
+                    int len = 0;
+                    for (int piece = 0, n = 1 + rnd.nextInt(16); piece < n; piece++) {
+                        long value = rnd.nextLong();
+                        switch (rnd.nextInt(3)) {
+                            case 0:
+                                crc = Crc32c.updateByte(crc, (int) value);
+                                putLittleEndian(buf + len, value, Byte.BYTES);
+                                len += Byte.BYTES;
+                                break;
+                            case 1:
+                                crc = Crc32c.updateInt(crc, (int) value);
+                                putLittleEndian(buf + len, value, Integer.BYTES);
+                                len += Integer.BYTES;
+                                break;
+                            default:
+                                crc = Crc32c.updateLong(crc, value);
+                                putLittleEndian(buf + len, value, Long.BYTES);
+                                len += Long.BYTES;
+                                break;
+                        }
+                    }
+                    Assert.assertEquals("iter=" + iter, Crc32c.updateUnsafe(seed, buf, len), crc);
+                    Assert.assertEquals("iter=" + iter, Crc32c.update(seed, buf, len), crc);
+                }
+            } finally {
+                Unsafe.free(buf, capacity, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    /**
+     * Each register form equals {@link Crc32c#updateUnsafe} over the value's
+     * bytes in little-endian order, written one byte at a time so the check does
+     * not depend on the platform's byte order; {@code updateByte} takes only the
+     * low 8 bits of its argument.
+     */
+    @Test
+    public void testRegisterFormsMatchUpdateUnsafeOverLittleEndianBytes() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            java.util.Random rnd = new java.util.Random(0xB17E_0DE5L);
+            long buf = Unsafe.malloc(Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+            try {
+                long[] values = {0, 1, -1, 0xFF, 0x100, 0x0102_0304_0506_0708L, Long.MIN_VALUE, Long.MAX_VALUE};
+                int[] seeds = {Crc32c.INIT, 0x1234_5678, -1};
+                for (int iter = 0; iter < 100_000 + values.length * seeds.length; iter++) {
+                    int seed;
+                    long value;
+                    if (iter < values.length * seeds.length) {
+                        seed = seeds[iter % seeds.length];
+                        value = values[iter / seeds.length];
+                    } else {
+                        seed = rnd.nextInt();
+                        value = rnd.nextLong();
+                    }
+                    putLittleEndian(buf, value, Long.BYTES);
+                    String msg = "seed=" + seed + " value=" + value;
+                    Assert.assertEquals(msg, Crc32c.updateUnsafe(seed, buf, Byte.BYTES), Crc32c.updateByte(seed, (int) value));
+                    Assert.assertEquals(msg, Crc32c.updateUnsafe(seed, buf, Integer.BYTES), Crc32c.updateInt(seed, (int) value));
+                    Assert.assertEquals(msg, Crc32c.updateUnsafe(seed, buf, Long.BYTES), Crc32c.updateLong(seed, value));
+                }
+                // the Castagnoli vector through the register forms: "12345678" is one
+                // little-endian long, "9" one byte
+                byte[] msg = "123456789".getBytes();
+                long first8 = 0;
+                for (int i = 0; i < Long.BYTES; i++) {
+                    first8 |= (msg[i] & 0xFFL) << (8 * i);
+                }
+                assertEquals(0xE3069283, Crc32c.updateByte(Crc32c.updateLong(Crc32c.INIT, first8), msg[8]));
+                int viaInts = Crc32c.updateInt(Crc32c.INIT, (int) first8);
+                viaInts = Crc32c.updateInt(viaInts, (int) (first8 >>> 32));
+                assertEquals(0xE3069283, Crc32c.updateByte(viaInts, msg[8]));
+            } finally {
+                Unsafe.free(buf, Long.BYTES, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
     @Test
     public void testUnsafeMatchesNativeAcrossAlignmentsLengthsAndSeeds() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
@@ -208,5 +300,11 @@ public class Crc32cTest {
                 Unsafe.free(buf, len, MemoryTag.NATIVE_DEFAULT);
             }
         });
+    }
+
+    private static void putLittleEndian(long addr, long value, int len) {
+        for (int i = 0; i < len; i++) {
+            Unsafe.getUnsafe().putByte(addr + i, (byte) (value >>> (8 * i)));
+        }
     }
 }

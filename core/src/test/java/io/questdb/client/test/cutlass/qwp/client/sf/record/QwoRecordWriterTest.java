@@ -44,6 +44,7 @@ import org.junit.Test;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Random;
 import java.util.function.Consumer;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
@@ -355,6 +356,129 @@ public class QwoRecordWriterTest {
     }
 
     @Test
+    public void testCrcStreamMatchesReferenceForEveryValueWidth() throws Exception {
+        // QwoCrc folds a 1-, 4- or 8-byte value from a register and any other width from
+        // memory: every width and both bitmap modes against a stream built independently
+        withRecord((mem, writer) -> {
+            writer.open(mem, REGION, QwpConstants.VERSION, 0, QwoFormat.DEFAULT_DICT_RESERVE);
+            GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+            QwoRecordReader reader = new QwoRecordReader();
+            try (
+                    QwpTableBuffer tb = new QwpTableBuffer("widths");
+                    NativeBufferWriter ref = new NativeBufferWriter()
+            ) {
+                for (int r = 0; r < 4; r++) {
+                    final int row = r;
+                    // row 2 leaves every bitmap column null
+                    final boolean present = r != 2;
+                    final long v = 0x0102030405060708L * (r + 1) ^ 0x8070605040302010L;
+                    stage(tb, t -> {
+                        t.getOrCreateColumn("b", QwpConstants.TYPE_BYTE, false).addByte((byte) v);
+                        t.getOrCreateColumn("sh", QwpConstants.TYPE_SHORT, false).addShort((short) v);
+                        t.getOrCreateColumn("ch", QwpConstants.TYPE_CHAR, false).addShort((short) (v >>> 16));
+                        if (present) {
+                            t.getOrCreateColumn("i", QwpConstants.TYPE_INT, true).addInt((int) v);
+                            t.getOrCreateColumn("fl", QwpConstants.TYPE_FLOAT, true).addFloat(1.0f + row / 8.0f);
+                            t.getOrCreateColumn("ip", QwpConstants.TYPE_IPv4, true).addIPv4((int) (v >>> 24) | 1);
+                            t.getOrCreateColumn("g5", QwpConstants.TYPE_GEOHASH, true).addGeoHash(v & 0x1F, 5);
+                            t.getOrCreateColumn("g30", QwpConstants.TYPE_GEOHASH, true).addGeoHash(v & 0x3FFF_FFFFL, 30);
+                            t.getOrCreateColumn("g40", QwpConstants.TYPE_GEOHASH, true).addGeoHash(v & 0xFF_FFFF_FFFFL, 40);
+                            t.getOrCreateColumn("d64", QwpConstants.TYPE_DECIMAL64, true).addDecimal64(Decimal64.fromLong(v >> 8, 3));
+                            t.getOrCreateColumn("dt", QwpConstants.TYPE_DATE, true).addLong(v >>> 1);
+                            t.getOrCreateColumn("ns", QwpConstants.TYPE_TIMESTAMP_NANOS, true).addLong(v >>> 2);
+                            t.getOrCreateColumn("u", QwpConstants.TYPE_UUID, true).addUuid(v, ~v);
+                            t.getOrCreateColumn("l256", QwpConstants.TYPE_LONG256, true).addLong256(v, v + 1, v + 2, v + 3);
+                            t.getOrCreateColumn("d256", QwpConstants.TYPE_DECIMAL256, true)
+                                    .addDecimal256(new Decimal256(0, row, v >>> 4, v, 2));
+                        }
+                    });
+                    Assert.assertEquals(QwoRecordWriter.APPEND_OK, writer.appendStagedRow(tb, dict, -1));
+                    tb.clearStagedRow();
+
+                    // reference stream, in column order, independent of the writer
+                    ref.putByte((byte) v);
+                    ref.putShort((short) v);
+                    ref.putShort((short) (v >>> 16));
+                    ref.putByte(present ? (byte) 1 : (byte) 0);
+                    if (present) {
+                        ref.putInt((int) v);
+                    }
+                    ref.putByte(present ? (byte) 1 : (byte) 0);
+                    if (present) {
+                        ref.putFloat(1.0f + row / 8.0f);
+                    }
+                    ref.putByte(present ? (byte) 1 : (byte) 0);
+                    if (present) {
+                        ref.putInt((int) (v >>> 24) | 1);
+                    }
+                    ref.putByte(present ? (byte) 1 : (byte) 0);
+                    if (present) {
+                        ref.putByte((byte) (v & 0x1F));
+                    }
+                    ref.putByte(present ? (byte) 1 : (byte) 0);
+                    if (present) {
+                        ref.putInt((int) (v & 0x3FFF_FFFFL));
+                    }
+                    ref.putByte(present ? (byte) 1 : (byte) 0);
+                    if (present) {
+                        long g40 = v & 0xFF_FFFF_FFFFL;
+                        for (int i = 0; i < 5; i++) {
+                            ref.putByte((byte) (g40 >>> (8 * i)));
+                        }
+                    }
+                    ref.putByte(present ? (byte) 1 : (byte) 0);
+                    if (present) {
+                        ref.putLong(v >> 8);
+                    }
+                    ref.putByte(present ? (byte) 1 : (byte) 0);
+                    if (present) {
+                        ref.putLong(v >>> 1);
+                    }
+                    ref.putByte(present ? (byte) 1 : (byte) 0);
+                    if (present) {
+                        ref.putLong(v >>> 2);
+                    }
+                    ref.putByte(present ? (byte) 1 : (byte) 0);
+                    if (present) {
+                        // UUID: lo, then hi
+                        ref.putLong(~v);
+                        ref.putLong(v);
+                    }
+                    ref.putByte(present ? (byte) 1 : (byte) 0);
+                    if (present) {
+                        ref.putLong(v);
+                        ref.putLong(v + 1);
+                        ref.putLong(v + 2);
+                        ref.putLong(v + 3);
+                    }
+                    ref.putByte(present ? (byte) 1 : (byte) 0);
+                    if (present) {
+                        // DECIMAL256 on the wire: ll, lh, hl, hh
+                        ref.putLong(v);
+                        ref.putLong(v >>> 4);
+                        ref.putLong(row);
+                        ref.putLong(0);
+                    }
+
+                    writer.publish();
+                    reader.of(mem, REGION);
+                    int b = reader.firstBlock();
+                    Assert.assertEquals(r + 1, reader.rowCount(b));
+                    Assert.assertEquals(
+                            "row crc after " + (r + 1) + " rows",
+                            Crc32c.updateUnsafe(Crc32c.INIT, ref.getBufferPtr(), ref.getPosition()),
+                            QwoFormat.crcOf(Unsafe.getUnsafe().getLong(mem + b + QwoFormat.D_ROW_WORD))
+                    );
+                }
+                Assert.assertEquals("one block: the column set never changed", 1, writer.blockCount());
+                QwoValidator validator = new QwoValidator();
+                Assert.assertTrue(validator.detail(), validator.validateOpen(mem, REGION));
+                Assert.assertEquals(4, validator.committedRows());
+            }
+        });
+    }
+
+    @Test
     public void testCrcStreamMatchesReferenceOverRows() throws Exception {
         withRecord((mem, writer) -> {
             GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
@@ -622,6 +746,190 @@ public class QwoRecordWriterTest {
                     }
                 }
                 Assert.assertTrue("the second chunk was relocated, the first never", isRelocated);
+            }
+        });
+    }
+
+    @Test
+    public void testFitShortcutRefusesARowWithoutColumnsLikeTheFullFit() throws Exception {
+        // A row without columns plans no chunk, so the shortcut alone decides whether the
+        // descriptor of its table's block fits: one-row tables without columns fill a small
+        // record until the budget runs out, and both writers refuse the same table.
+        assertMemoryLeak(() -> {
+            final int capacity = 2048;
+            // slack past the capacity, so a writer that ignored the budget writes in bounds
+            final int region = 2 * capacity;
+            long memA = Unsafe.calloc(region, MemoryTag.NATIVE_DEFAULT);
+            long memB = Unsafe.calloc(region, MemoryTag.NATIVE_DEFAULT);
+            ArrayList<QwpTableBuffer> tables = new ArrayList<>();
+            try (QwoRecordWriter shortcut = new QwoRecordWriter(); QwoRecordWriter fullFit = new QwoRecordWriter()) {
+                fullFit.setFitShortcutForTest(false);
+                GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+                shortcut.open(memA, capacity, QwpConstants.VERSION, 0, 0);
+                fullFit.open(memB, capacity, QwpConstants.VERSION, 0, 0);
+                int appended = 0;
+                while (true) {
+                    String name = "z" + appended;
+                    QwpTableBuffer tbA = new QwpTableBuffer(name);
+                    tables.add(tbA);
+                    QwpTableBuffer tbB = new QwpTableBuffer(name);
+                    tables.add(tbB);
+                    tbA.nextRow();
+                    tbB.nextRow();
+                    long budget = (long) capacity - shortcut.usedBytes() - QwoFormat.WIRE_MARGIN_FIXED
+                            - (long) QwoFormat.WIRE_MARGIN_PER_BLOCK * (shortcut.blockCount() + 1)
+                            - (QwoFormat.D_NAME + QwoFormat.stringBytes(name));
+                    int code = shortcut.appendStagedRow(tbA, dict, -1);
+                    Assert.assertEquals("table " + appended, fullFit.appendStagedRow(tbB, dict, -1), code);
+                    Assert.assertEquals("table " + appended + ", budget " + budget,
+                            budget >= 0 ? QwoRecordWriter.APPEND_OK : QwoRecordWriter.APPEND_NO_SPACE, code);
+                    assertSameRecord(shortcut, fullFit, memA, memB, "table " + appended);
+                    if (code == QwoRecordWriter.APPEND_NO_SPACE) {
+                        break;
+                    }
+                    appended++;
+                }
+                Assert.assertTrue("tables before the refusal: " + appended, appended > 20);
+                Assert.assertTrue(shortcut.usedBytes() <= capacity);
+                // a second row of a table with a block plans nothing and still fits
+                QwpTableBuffer firstA = tables.get(0);
+                QwpTableBuffer firstB = tables.get(1);
+                firstA.clearStagedRow();
+                firstB.clearStagedRow();
+                firstA.nextRow();
+                firstB.nextRow();
+                Assert.assertEquals(QwoRecordWriter.APPEND_OK, shortcut.appendStagedRow(firstA, dict, -1));
+                Assert.assertEquals(QwoRecordWriter.APPEND_OK, fullFit.appendStagedRow(firstB, dict, -1));
+                assertSameRecord(shortcut, fullFit, memA, memB, "second row of z0");
+                Assert.assertEquals(appended + 1, shortcut.rowCount());
+            } finally {
+                for (int i = 0, n = tables.size(); i < n; i++) {
+                    tables.get(i).close();
+                }
+                Unsafe.free(memA, region, MemoryTag.NATIVE_DEFAULT);
+                Unsafe.free(memB, region, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testFitShortcutWritesTheSameRecordsAsTheFullFit() throws Exception {
+        // A row whose columns all fit their current chunks skips fitChunks. A second writer
+        // with the shortcut off is the reference: over rows that fit, rows that start chunks,
+        // a VARCHAR value that relocates its chunk while the other columns fit, rollbacks
+        // and the refusals of a full record, both writers write the same bytes.
+        assertMemoryLeak(() -> {
+            final int capacity = 24 * 1024;
+            final int rows = 4000;
+            final String[] strings = new String[rows];
+            final Double[] doubles = new Double[rows];
+            final int[] symbols = new int[rows];
+            // rows 0-4 are fixed: row 2's 30 bytes overflow the 32-byte two-row chunk that
+            // already holds row 1's 10, so its VARCHAR chunk relocates while every other
+            // column has room; row 3 starts the four-row chunks and row 4 fits them
+            final String[] head = {"a", "abcdefghij", "abcdefghijabcdefghijabcdefghij", "x", "y"};
+            Random rnd = new Random(42);
+            for (int r = 0; r < rows; r++) {
+                if (r < head.length) {
+                    strings[r] = head[r];
+                    doubles[r] = r * 0.5;
+                    symbols[r] = r;
+                    continue;
+                }
+                int dice = rnd.nextInt(100);
+                if (dice >= 15) {
+                    int len = dice < 20 ? 200 + rnd.nextInt(100) : rnd.nextInt(60);
+                    StringBuilder sb = new StringBuilder();
+                    for (int i = 0; i < len; i++) {
+                        sb.append((char) ('a' + rnd.nextInt(26)));
+                    }
+                    strings[r] = sb.toString();
+                }
+                doubles[r] = rnd.nextInt(5) == 0 ? null : rnd.nextDouble();
+                symbols[r] = rnd.nextInt(10) == 0 ? -1 : rnd.nextInt(10);
+            }
+            long memA = Unsafe.calloc(capacity, MemoryTag.NATIVE_DEFAULT);
+            long memB = Unsafe.calloc(capacity, MemoryTag.NATIVE_DEFAULT);
+            try (
+                    QwoRecordWriter shortcut = new QwoRecordWriter();
+                    QwoRecordWriter fullFit = new QwoRecordWriter();
+                    QwpTableBuffer tbA = new QwpTableBuffer("t");
+                    QwpTableBuffer tbB = new QwpTableBuffer("t")
+            ) {
+                fullFit.setFitShortcutForTest(false);
+                GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+                for (int i = 0; i < 10; i++) {
+                    dict.getOrAddSymbol("s" + i);
+                }
+                shortcut.open(memA, capacity, QwpConstants.VERSION, 0, 256);
+                fullFit.open(memB, capacity, QwpConstants.VERSION, 0, 256);
+                QwoRecordReader reader = new QwoRecordReader();
+                int longChunk1 = 0;
+                int stringChunk1 = 0;
+                int shortcutRows = 0;
+                int chunkRows = 0;
+                int seals = 0;
+                for (int r = 0; r < rows; r++) {
+                    stageMixedRow(tbA, r, strings, doubles, symbols);
+                    stageMixedRow(tbB, r, strings, doubles, symbols);
+                    int usedBefore = shortcut.usedBytes();
+                    int code = shortcut.appendStagedRow(tbA, dict, 9);
+                    Assert.assertEquals("row " + r, fullFit.appendStagedRow(tbB, dict, 9), code);
+                    assertSameRecord(shortcut, fullFit, memA, memB, "row " + r);
+                    if (code == QwoRecordWriter.APPEND_NO_SPACE) {
+                        shortcut.publish();
+                        fullFit.publish();
+                        Assert.assertEquals(fullFit.seal(false), shortcut.seal(false));
+                        assertSameBytes(memA, memB, capacity, "sealed record " + seals);
+                        seals++;
+                        // the ring hands out zeroed space
+                        Unsafe.getUnsafe().setMemory(memA, capacity, (byte) 0);
+                        Unsafe.getUnsafe().setMemory(memB, capacity, (byte) 0);
+                        shortcut.open(memA, capacity, QwpConstants.VERSION, 0, 256);
+                        fullFit.open(memB, capacity, QwpConstants.VERSION, 0, 256);
+                        Assert.assertEquals(QwoRecordWriter.APPEND_OK, shortcut.appendStagedRow(tbA, dict, 9));
+                        Assert.assertEquals(QwoRecordWriter.APPEND_OK, fullFit.appendStagedRow(tbB, dict, 9));
+                        assertSameRecord(shortcut, fullFit, memA, memB, "row " + r + " in a fresh record");
+                    } else if (shortcut.usedBytes() == usedBefore) {
+                        shortcutRows++;
+                    } else {
+                        chunkRows++;
+                    }
+                    tbA.clearStagedRow();
+                    tbB.clearStagedRow();
+                    if (r == 4) {
+                        Assert.assertEquals("row 4 fits the chunks row 3 started", usedBefore, shortcut.usedBytes());
+                    }
+                    if (r % 50 == 49) {
+                        shortcut.rollback();
+                        fullFit.rollback();
+                        assertSameRecord(shortcut, fullFit, memA, memB, "rollback after row " + r);
+                    } else if (r <= 2 || r % 3 == 2) {
+                        shortcut.publish();
+                        fullFit.publish();
+                        assertSameRecord(shortcut, fullFit, memA, memB, "publish after row " + r);
+                    }
+                    if (r == 1 || r == 2) {
+                        reader.of(memA, capacity);
+                        int b = reader.firstBlock();
+                        int longC1 = reader.nextChunk(reader.firstChunk(reader.columnDef(b, 0)));
+                        int stringC1 = reader.nextChunk(reader.firstChunk(reader.columnDef(b, 1)));
+                        if (r == 1) {
+                            longChunk1 = longC1;
+                            stringChunk1 = stringC1;
+                        } else {
+                            Assert.assertEquals("the LONG column keeps its chunk", longChunk1, longC1);
+                            Assert.assertNotEquals("the VARCHAR chunk relocated", stringChunk1, stringC1);
+                            Assert.assertTrue(usedBefore < shortcut.usedBytes());
+                        }
+                    }
+                }
+                Assert.assertTrue("rows that fit their chunks: " + shortcutRows, shortcutRows > 1000);
+                Assert.assertTrue("rows that took chunks: " + chunkRows, chunkRows > 50);
+                Assert.assertTrue("records sealed full: " + seals, seals > 2);
+            } finally {
+                Unsafe.free(memA, capacity, MemoryTag.NATIVE_DEFAULT);
+                Unsafe.free(memB, capacity, MemoryTag.NATIVE_DEFAULT);
             }
         });
     }
@@ -1079,6 +1387,56 @@ public class QwoRecordWriterTest {
     }
 
     @Test
+    public void testSealZeroesWhatARolledBackRelocationDirtied() throws Exception {
+        withRecord((mem, writer) -> {
+            // a ring reservation is zero past what the writer writes
+            Unsafe.getUnsafe().setMemory(mem, REGION, (byte) 0);
+            writer.open(mem, REGION, QwpConstants.VERSION, 0, QwoFormat.DEFAULT_DICT_RESERVE);
+            GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < 100; i++) {
+                sb.append((char) ('A' + i % 26));
+            }
+            final String big = sb.toString();
+            QwoRecordReader reader = new QwoRecordReader();
+            try (QwpTableBuffer tb = new QwpTableBuffer("reloc")) {
+                append(writer, tb, dict, -1, t -> t.getOrCreateColumn("s", QwpConstants.TYPE_VARCHAR, true).addString("a"));
+                append(writer, tb, dict, -1, t -> t.getOrCreateColumn("s", QwpConstants.TYPE_VARCHAR, true).addString("bb"));
+                writer.publish();
+                int committed = writer.usedBytes();
+                reader.of(mem, REGION);
+                int def = reader.columnDef(reader.firstBlock(), 0);
+                int c0 = reader.firstChunk(def);
+                int c1 = reader.nextChunk(c0);
+
+                // the third value overflows the published two-row chunk: its copy goes past the
+                // published extent, and the link to it waits for a publish that never comes
+                append(writer, tb, dict, -1, t -> t.getOrCreateColumn("s", QwpConstants.TYPE_VARCHAR, true).addString(big));
+                int mark = writer.usedBytes();
+                Assert.assertTrue("the relocated chunk lies past the published extent", mark > committed);
+                Assert.assertEquals(mark, writer.maxUsedBytes());
+                writer.rollback();
+                Assert.assertEquals(committed, writer.usedBytes());
+                Assert.assertTrue("the rolled-back relocation left bytes past usedBytes", hasNonZero(mem, committed, mark));
+
+                int used = writer.seal(false);
+                Assert.assertEquals(committed, used);
+                Assert.assertEquals(mark, writer.maxUsedBytes());
+                assertFilled(mem, used, REGION, (byte) 0);
+                // the published chain is the one before the relocation
+                Assert.assertEquals(c1, reader.nextChunk(c0));
+                Assert.assertEquals(0, reader.nextChunk(c1));
+                long offsets = reader.chunkOffsetsAddr(c1, true);
+                Assert.assertEquals(2, Unsafe.getUnsafe().getInt(offsets + 4));
+                Assert.assertEquals("bb", nameOf(reader.chunkBytesAddr(c1, true, reader.chunkRowCap(c1)), 2));
+                QwoValidator validator = new QwoValidator();
+                Assert.assertTrue(validator.detail(), validator.validateSealed(mem, used));
+                Assert.assertEquals(2, validator.committedRows());
+            }
+        });
+    }
+
+    @Test
     public void testSealZeroesWhatRolledBackAppendsDirtied() throws Exception {
         withRecord((mem, writer) -> {
             // a ring reservation is zero past what the writer writes
@@ -1227,6 +1585,29 @@ public class QwoRecordWriterTest {
         }
     }
 
+    private static void assertSameBytes(long memA, long memB, int len, String label) {
+        int i = 0;
+        while (i + Long.BYTES <= len && Unsafe.getUnsafe().getLong(memA + i) == Unsafe.getUnsafe().getLong(memB + i)) {
+            i += Long.BYTES;
+        }
+        for (; i < len; i++) {
+            byte a = Unsafe.getUnsafe().getByte(memA + i);
+            byte b = Unsafe.getUnsafe().getByte(memB + i);
+            if (a != b) {
+                Assert.fail(label + ": byte " + a + " != " + b + " at " + i);
+            }
+        }
+    }
+
+    private static void assertSameRecord(QwoRecordWriter a, QwoRecordWriter b, long memA, long memB, String label) {
+        Assert.assertEquals(label, b.usedBytes(), a.usedBytes());
+        Assert.assertEquals(label, b.maxUsedBytes(), a.maxUsedBytes());
+        Assert.assertEquals(label, b.rowCount(), a.rowCount());
+        Assert.assertEquals(label, b.blockCount(), a.blockCount());
+        Assert.assertEquals(label, b.dictEntriesLen(), a.dictEntriesLen());
+        assertSameBytes(memA, memB, a.maxUsedBytes(), label);
+    }
+
     private static boolean hasNonZero(long mem, int from, int to) {
         for (int i = from; i < to; i++) {
             if (Unsafe.getUnsafe().getByte(mem + i) != 0) {
@@ -1248,6 +1629,26 @@ public class QwoRecordWriterTest {
         row.accept(tb);
         tb.nextRow();
         Assert.assertEquals(1, tb.getRowCount());
+    }
+
+    /**
+     * Stages row {@code r} of the shortcut test: LONG, VARCHAR, DOUBLE, SYMBOL,
+     * BOOLEAN (no bitmap) and INT, the nullable ones left out when null.
+     */
+    private static void stageMixedRow(QwpTableBuffer t, int r, String[] strings, Double[] doubles, int[] symbols) {
+        t.getOrCreateColumn("l", QwpConstants.TYPE_LONG, true).addLong(r);
+        if (strings[r] != null) {
+            t.getOrCreateColumn("s", QwpConstants.TYPE_VARCHAR, true).addString(strings[r]);
+        }
+        if (doubles[r] != null) {
+            t.getOrCreateColumn("d", QwpConstants.TYPE_DOUBLE, true).addDouble(doubles[r]);
+        }
+        if (symbols[r] >= 0) {
+            t.getOrCreateColumn("sym", QwpConstants.TYPE_SYMBOL, true).addSymbolWithGlobalId("s" + symbols[r], symbols[r]);
+        }
+        t.getOrCreateColumn("f", QwpConstants.TYPE_BOOLEAN, false).addBoolean(r % 3 == 0);
+        t.getOrCreateColumn("i", QwpConstants.TYPE_INT, true).addInt(r * 31);
+        t.nextRow();
     }
 
     private static void withRecord(RecordCode code) throws Exception {

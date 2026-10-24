@@ -26,8 +26,6 @@ package io.questdb.client.cutlass.qwp.client.sf.record;
 
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.std.Crc32c;
-import io.questdb.client.std.MemoryTag;
-import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
 
 /**
@@ -44,27 +42,15 @@ import io.questdb.client.std.Unsafe;
  *     is a little-endian {@code u32} length followed by its bytes.</li>
  * </ul>
  * The first row of a block starts from {@link Crc32c#INIT}; each later row
- * chains from the previous row's CRC. Small pieces are gathered in an off-heap
- * scratch so a row costs few {@link Crc32c#updateUnsafe} calls; the native
- * {@code Crc32c.update} is never used on this path.
+ * chains from the previous row's CRC. Each piece extends the CRC in place, with
+ * no gathering copy: a flag byte, a length and a value of 1, 4 or 8 bytes go
+ * through the register forms of {@link Crc32c}, any other value through
+ * {@link Crc32c#updateUnsafe} at its chunk address; both give the CRC of the
+ * same byte stream. The native {@code Crc32c.update} is never used on this
+ * path.
  */
-final class QwoCrc implements QuietCloseable {
-    private static final int SCRATCH_SIZE = 128;
+final class QwoCrc {
     private int crc;
-    private int pos;
-    private long scratch;
-
-    QwoCrc() {
-        scratch = Unsafe.malloc(SCRATCH_SIZE, MemoryTag.NATIVE_DEFAULT);
-    }
-
-    @Override
-    public void close() {
-        if (scratch != 0) {
-            Unsafe.free(scratch, SCRATCH_SIZE, MemoryTag.NATIVE_DEFAULT);
-            scratch = 0;
-        }
-    }
 
     /**
      * Starts a row, chaining from {@code seed}: {@link Crc32c#INIT} for a
@@ -72,14 +58,12 @@ final class QwoCrc implements QuietCloseable {
      */
     void begin(int seed) {
         crc = seed;
-        pos = 0;
     }
 
     /**
      * Ends the row and returns the CRC over every row so far.
      */
     int finish() {
-        flush();
         return crc;
     }
 
@@ -88,10 +72,10 @@ final class QwoCrc implements QuietCloseable {
      */
     void putBoolean(boolean bitmap, boolean present, boolean value) {
         if (bitmap) {
-            putByte(present ? 1 : 0);
+            crc = Crc32c.updateByte(crc, present ? 1 : 0);
         }
         if (present) {
-            putByte(value ? 1 : 0);
+            crc = Crc32c.updateByte(crc, value ? 1 : 0);
         }
     }
 
@@ -103,45 +87,26 @@ final class QwoCrc implements QuietCloseable {
     void putValue(byte type, boolean bitmap, boolean present, long valueAddr, int valueLen) {
         assert type != QwpConstants.TYPE_BOOLEAN;
         if (bitmap) {
-            putByte(present ? 1 : 0);
+            crc = Crc32c.updateByte(crc, present ? 1 : 0);
         }
         if (present) {
             if (QwoFormat.isVariableSize(type)) {
-                putLength(valueLen);
+                crc = Crc32c.updateInt(crc, valueLen);
             }
-            putBytes(valueAddr, valueLen);
+            switch (valueLen) {
+                case 1:
+                    crc = Crc32c.updateByte(crc, Unsafe.getUnsafe().getByte(valueAddr));
+                    break;
+                case 4:
+                    crc = Crc32c.updateInt(crc, Unsafe.getUnsafe().getInt(valueAddr));
+                    break;
+                case 8:
+                    crc = Crc32c.updateLong(crc, Unsafe.getUnsafe().getLong(valueAddr));
+                    break;
+                default:
+                    crc = Crc32c.updateUnsafe(crc, valueAddr, valueLen);
+                    break;
+            }
         }
-    }
-
-    private void flush() {
-        if (pos > 0) {
-            crc = Crc32c.updateUnsafe(crc, scratch, pos);
-            pos = 0;
-        }
-    }
-
-    private void putByte(int value) {
-        if (pos == SCRATCH_SIZE) {
-            flush();
-        }
-        Unsafe.getUnsafe().putByte(scratch + pos++, (byte) value);
-    }
-
-    private void putBytes(long addr, int len) {
-        if (len <= SCRATCH_SIZE - pos) {
-            Unsafe.getUnsafe().copyMemory(addr, scratch + pos, len);
-            pos += len;
-        } else {
-            flush();
-            crc = Crc32c.updateUnsafe(crc, addr, len);
-        }
-    }
-
-    private void putLength(int len) {
-        if (pos > SCRATCH_SIZE - Integer.BYTES) {
-            flush();
-        }
-        Unsafe.getUnsafe().putInt(scratch + pos, len);
-        pos += Integer.BYTES;
     }
 }

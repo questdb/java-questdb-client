@@ -67,6 +67,60 @@ public final class Crc32c {
     public static native int update(int seed, long addr, long len);
 
     /**
+     * Extends a running CRC-32C with one byte, the low 8 bits of {@code value};
+     * the same result as {@link #updateUnsafe} over that byte in memory. The
+     * register forms let a caller checksum a value it holds without storing it
+     * for {@link #updateUnsafe} to read back.
+     *
+     * @param seed previous CRC value, or {@link #INIT} to start fresh
+     * @return the new CRC value
+     */
+    public static int updateByte(int seed, int value) {
+        int crc = ~seed;
+        return ~((crc >>> 8) ^ CRC32C_TABLE[(crc ^ value) & 0xFF]);
+    }
+
+    /**
+     * Extends a running CRC-32C with the four bytes of {@code value} in
+     * little-endian order; the same result as {@link #updateUnsafe} over an
+     * {@code int} stored with {@link Unsafe#putInt} on a little-endian platform.
+     *
+     * @param seed previous CRC value, or {@link #INIT} to start fresh
+     * @return the new CRC value
+     */
+    public static int updateInt(int seed, int value) {
+        int[] table = CRC32C_TABLE;
+        int crc = ~seed ^ value;
+        return ~(table[3 * 256 + (crc & 0xFF)]
+                ^ table[2 * 256 + ((crc >>> 8) & 0xFF)]
+                ^ table[256 + ((crc >>> 16) & 0xFF)]
+                ^ table[crc >>> 24]);
+    }
+
+    /**
+     * Extends a running CRC-32C with the eight bytes of {@code value} in
+     * little-endian order; the same result as {@link #updateUnsafe} over a
+     * {@code long} stored with {@link Unsafe#putLong} on a little-endian
+     * platform. One step of the slice-by-8 loop of {@link #updateUnsafe}.
+     *
+     * @param seed previous CRC value, or {@link #INIT} to start fresh
+     * @return the new CRC value
+     */
+    public static int updateLong(int seed, long value) {
+        int[] table = CRC32C_TABLE;
+        int lo = ~seed ^ (int) value;
+        int hi = (int) (value >>> 32);
+        return ~(table[7 * 256 + (lo & 0xFF)]
+                ^ table[6 * 256 + ((lo >>> 8) & 0xFF)]
+                ^ table[5 * 256 + ((lo >>> 16) & 0xFF)]
+                ^ table[4 * 256 + (lo >>> 24)]
+                ^ table[3 * 256 + (hi & 0xFF)]
+                ^ table[2 * 256 + ((hi >>> 8) & 0xFF)]
+                ^ table[256 + ((hi >>> 16) & 0xFF)]
+                ^ table[hi >>> 24]);
+    }
+
+    /**
      * Java/Unsafe slice-by-8 CRC-32C for memory that can fault while it is read,
      * such as a recovery mmap over a sparse or concurrently truncated file.
      * Keeping every load at an {@link Unsafe} intrinsic site lets HotSpot turn an

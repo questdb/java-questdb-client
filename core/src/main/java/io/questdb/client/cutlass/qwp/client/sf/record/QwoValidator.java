@@ -83,6 +83,7 @@ public final class QwoValidator {
     private static final int MAX_GEOHASH_PRECISION = 60;
     private static final int REQUIRED_FLAGS = QwpConstants.FLAG_GORILLA | QwpConstants.FLAG_DELTA_SYMBOL_DICT;
     private final IntList chunkByteCaps = new IntList();
+    private final QwoCrc crc = new QwoCrc();
     private final ObjList<QwoColumnCursor> cursors = new ObjList<>();
     private final QwoRecordReader reader = new QwoRecordReader();
     private final IntHashSet visitedBlocks = new IntHashSet();
@@ -91,7 +92,6 @@ public final class QwoValidator {
     private int blockChainLength;
     private int bound;
     private int committedRows;
-    private QwoCrc crc;
     private String detail;
     private long extent;
     private boolean isOpenValidated;
@@ -328,19 +328,13 @@ public final class QwoValidator {
         detail = null;
         isOpenValidated = false;
         usedBytes = 0;
-        crc = new QwoCrc();
-        try {
-            if (validateRecord(len, isSealed)) {
-                isOpenValidated = !isSealed;
-                return true;
-            }
-            committedRows = 0;
-            usedBytes = 0;
-            return false;
-        } finally {
-            crc.close();
-            crc = null;
+        if (validateRecord(len, isSealed)) {
+            isOpenValidated = !isSealed;
+            return true;
         }
+        committedRows = 0;
+        usedBytes = 0;
+        return false;
     }
 
     private boolean validateBlock(int b, int index) {
