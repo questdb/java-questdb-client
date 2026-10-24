@@ -358,14 +358,23 @@ public class QwoRecordWriterTest {
     @Test
     public void testCrcStreamMatchesReferenceForEveryValueWidth() throws Exception {
         // QwoCrc folds a 1-, 4- or 8-byte value from a register and any other width from
-        // memory: every width and both bitmap modes against a stream built independently
+        // memory. Every width, both bitmap modes, VARCHAR values of 1, 4 and 8 bytes behind
+        // their length, SYMBOL varints of 1, 3 and 4 bytes, and a second block, whose CRC
+        // starts again from INIT, against streams built independently of the writer.
         withRecord((mem, writer) -> {
-            writer.open(mem, REGION, QwpConstants.VERSION, 0, QwoFormat.DEFAULT_DICT_RESERVE);
+            // the smallest id whose varint takes 4 bytes; ids below dictStartId belong to
+            // earlier records, so this record needs no dictionary entry for it
+            final int largeId = 1 << 21;
+            writer.open(mem, REGION, QwpConstants.VERSION, largeId + 1, QwoFormat.DEFAULT_DICT_RESERVE);
             GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+            final String[] strings = {"abcd", "abcdefgh", null, "x"};
+            final int[] symbols = {largeId, 5, -1, 20_000};
             QwoRecordReader reader = new QwoRecordReader();
             try (
                     QwpTableBuffer tb = new QwpTableBuffer("widths");
-                    NativeBufferWriter ref = new NativeBufferWriter()
+                    QwpTableBuffer second = new QwpTableBuffer("second");
+                    NativeBufferWriter ref = new NativeBufferWriter();
+                    NativeBufferWriter secondRef = new NativeBufferWriter()
             ) {
                 for (int r = 0; r < 4; r++) {
                     final int row = r;
@@ -390,74 +399,35 @@ public class QwoRecordWriterTest {
                             t.getOrCreateColumn("l256", QwpConstants.TYPE_LONG256, true).addLong256(v, v + 1, v + 2, v + 3);
                             t.getOrCreateColumn("d256", QwpConstants.TYPE_DECIMAL256, true)
                                     .addDecimal256(new Decimal256(0, row, v >>> 4, v, 2));
+                            t.getOrCreateColumn("s", QwpConstants.TYPE_VARCHAR, true).addString(strings[row]);
+                            t.getOrCreateColumn("sym", QwpConstants.TYPE_SYMBOL, true)
+                                    .addSymbolWithGlobalId("v" + symbols[row], symbols[row]);
                         }
                     });
                     Assert.assertEquals(QwoRecordWriter.APPEND_OK, writer.appendStagedRow(tb, dict, -1));
                     tb.clearStagedRow();
 
-                    // reference stream, in column order, independent of the writer
+                    // reference stream, in column order
                     ref.putByte((byte) v);
                     ref.putShort((short) v);
                     ref.putShort((short) (v >>> 16));
-                    ref.putByte(present ? (byte) 1 : (byte) 0);
-                    if (present) {
-                        ref.putInt((int) v);
-                    }
-                    ref.putByte(present ? (byte) 1 : (byte) 0);
-                    if (present) {
-                        ref.putFloat(1.0f + row / 8.0f);
-                    }
-                    ref.putByte(present ? (byte) 1 : (byte) 0);
-                    if (present) {
-                        ref.putInt((int) (v >>> 24) | 1);
-                    }
-                    ref.putByte(present ? (byte) 1 : (byte) 0);
-                    if (present) {
-                        ref.putByte((byte) (v & 0x1F));
-                    }
-                    ref.putByte(present ? (byte) 1 : (byte) 0);
-                    if (present) {
-                        ref.putInt((int) (v & 0x3FFF_FFFFL));
-                    }
-                    ref.putByte(present ? (byte) 1 : (byte) 0);
-                    if (present) {
-                        long g40 = v & 0xFF_FFFF_FFFFL;
-                        for (int i = 0; i < 5; i++) {
-                            ref.putByte((byte) (g40 >>> (8 * i)));
-                        }
-                    }
-                    ref.putByte(present ? (byte) 1 : (byte) 0);
-                    if (present) {
-                        ref.putLong(v >> 8);
-                    }
-                    ref.putByte(present ? (byte) 1 : (byte) 0);
-                    if (present) {
-                        ref.putLong(v >>> 1);
-                    }
-                    ref.putByte(present ? (byte) 1 : (byte) 0);
-                    if (present) {
-                        ref.putLong(v >>> 2);
-                    }
-                    ref.putByte(present ? (byte) 1 : (byte) 0);
-                    if (present) {
-                        // UUID: lo, then hi
-                        ref.putLong(~v);
-                        ref.putLong(v);
-                    }
-                    ref.putByte(present ? (byte) 1 : (byte) 0);
-                    if (present) {
-                        ref.putLong(v);
-                        ref.putLong(v + 1);
-                        ref.putLong(v + 2);
-                        ref.putLong(v + 3);
-                    }
-                    ref.putByte(present ? (byte) 1 : (byte) 0);
-                    if (present) {
-                        // DECIMAL256 on the wire: ll, lh, hl, hh
-                        ref.putLong(v);
-                        ref.putLong(v >>> 4);
-                        ref.putLong(row);
-                        ref.putLong(0);
+                    putFlagged(ref, present, Integer.BYTES, v);
+                    putFlagged(ref, present, Integer.BYTES, Float.floatToRawIntBits(1.0f + row / 8.0f));
+                    putFlagged(ref, present, Integer.BYTES, (v >>> 24) | 1);
+                    putFlagged(ref, present, 1, v & 0x1F);
+                    putFlagged(ref, present, 4, v & 0x3FFF_FFFFL);
+                    putFlagged(ref, present, 5, v & 0xFF_FFFF_FFFFL);
+                    putFlagged(ref, present, Long.BYTES, v >> 8);
+                    putFlagged(ref, present, Long.BYTES, v >>> 1);
+                    putFlagged(ref, present, Long.BYTES, v >>> 2);
+                    // UUID: lo, then hi
+                    putFlagged(ref, present, Long.BYTES, ~v, v);
+                    putFlagged(ref, present, Long.BYTES, v, v + 1, v + 2, v + 3);
+                    // DECIMAL256 on the wire: ll, lh, hl, hh
+                    putFlagged(ref, present, Long.BYTES, v, v >>> 4, row, 0);
+                    putFlaggedUtf8(ref, strings[row]);
+                    if (putPresence(ref, present)) {
+                        ref.putVarint(symbols[row]);
                     }
 
                     writer.publish();
@@ -471,9 +441,30 @@ public class QwoRecordWriterTest {
                     );
                 }
                 Assert.assertEquals("one block: the column set never changed", 1, writer.blockCount());
+
+                for (int r = 0; r < 2; r++) {
+                    final int row = r;
+                    stage(second, t -> {
+                        t.getOrCreateColumn("s", QwpConstants.TYPE_VARCHAR, true).addString(strings[row]);
+                        t.getOrCreateColumn("i", QwpConstants.TYPE_INT, true).addInt(row + 7);
+                    });
+                    Assert.assertEquals(QwoRecordWriter.APPEND_OK, writer.appendStagedRow(second, dict, -1));
+                    second.clearStagedRow();
+                    putFlaggedUtf8(secondRef, strings[row]);
+                    putFlagged(secondRef, true, Integer.BYTES, row + 7);
+                }
+                writer.publish();
+                reader.of(mem, REGION);
+                int b2 = reader.nextBlock(reader.firstBlock());
+                Assert.assertEquals(2, reader.rowCount(b2));
+                Assert.assertEquals(
+                        "the second block's row crc starts from INIT",
+                        Crc32c.updateUnsafe(Crc32c.INIT, secondRef.getBufferPtr(), secondRef.getPosition()),
+                        QwoFormat.crcOf(Unsafe.getUnsafe().getLong(mem + b2 + QwoFormat.D_ROW_WORD))
+                );
                 QwoValidator validator = new QwoValidator();
                 Assert.assertTrue(validator.detail(), validator.validateOpen(mem, REGION));
-                Assert.assertEquals(4, validator.committedRows());
+                Assert.assertEquals(6, validator.committedRows());
             }
         });
     }
@@ -1623,6 +1614,39 @@ public class QwoRecordWriterTest {
             b[i] = Unsafe.getUnsafe().getByte(addr + i);
         }
         return new String(b, StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Appends a column's reference CRC contribution: its presence byte and, when
+     * present, the low {@code width} bytes of each word in little-endian order.
+     */
+    private static void putFlagged(NativeBufferWriter ref, boolean present, int width, long... words) {
+        if (putPresence(ref, present)) {
+            for (long word : words) {
+                for (int i = 0; i < width; i++) {
+                    ref.putByte((byte) (word >>> (8 * i)));
+                }
+            }
+        }
+    }
+
+    /**
+     * Appends a VARCHAR column's reference CRC contribution: its presence byte
+     * and, for a non-null value, the {@code u32} UTF-8 length and the bytes.
+     */
+    private static void putFlaggedUtf8(NativeBufferWriter ref, String value) {
+        if (putPresence(ref, value != null)) {
+            byte[] utf8 = value.getBytes(StandardCharsets.UTF_8);
+            ref.putInt(utf8.length);
+            for (byte x : utf8) {
+                ref.putByte(x);
+            }
+        }
+    }
+
+    private static boolean putPresence(NativeBufferWriter ref, boolean present) {
+        ref.putByte(present ? (byte) 1 : (byte) 0);
+        return present;
     }
 
     private static void stage(QwpTableBuffer tb, Consumer<QwpTableBuffer> row) {

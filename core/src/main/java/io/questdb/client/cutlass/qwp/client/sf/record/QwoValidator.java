@@ -73,8 +73,7 @@ import static io.questdb.client.cutlass.qwp.client.sf.record.QwoFormat.*;
  * the stored usedBytes and the end of the structure the walk reached.
  * <p>
  * The structure is checked before the cursor follows it, because the cursor
- * trusts the offsets it reads. Validation allocates (recovery path) and frees
- * its off-heap scratch before returning. Not thread-safe.
+ * trusts the offsets it reads. Not thread-safe.
  */
 public final class QwoValidator {
     private static final int ALLOWED_FLAGS = QwpConstants.FLAG_DEFER_COMMIT

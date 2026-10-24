@@ -727,7 +727,7 @@ public final class QwoRecordWriter implements QuietCloseable {
     private boolean planColumn(ColumnState cs, QwpTableBuffer.ColumnBuffer col) {
         boolean present = col.getValueCount() > 0;
         cs.isPresent = present;
-        cs.planPrefix = cs.prefix >= 0 || cs.prefixKind == PREFIX_NONE ? cs.prefix : stagedPrefix(cs.type, col);
+        cs.planPrefix = (cs.prefix >= 0 || cs.prefixKind == PREFIX_NONE) ? cs.prefix : stagedPrefix(cs.type, col);
         long len = 0;
         if (present) {
             switch (cs.type) {
