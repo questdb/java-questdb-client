@@ -63,7 +63,13 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * published bytes ({@link #reserveRecord}), fills it in place, and seals it into
  * {@code [u32 STATE_SEALED][u32 usedBytes][usedBytes bytes]}
  * ({@link #sealReserved}); the record's own CRCs replace the frame CRC. A sealed
- * record counts as one frame. Recovery opens versions {@link #MIN_VERSION}
+ * record counts as one frame. Every byte of a file-backed segment past the
+ * append cursor is zero, and recovery relies on it. A reservation is carved
+ * from that space, and after its seal or abandon every byte of it past the
+ * record's usedBytes (all of it, for an abandon) is zero again: the writer's
+ * seal or the segment's abandon zeroes the bytes the writer wrote there, all
+ * below its high-water mark, and the rest of the reservation was never
+ * written. Recovery opens versions {@link #MIN_VERSION}
  * through {@link #VERSION}. It only reports an open record left by a crash;
  * {@link #sealRecoveredOpenRecord()} seals one that holds committed rows.
  * <p>
@@ -556,23 +562,33 @@ public final class MmapSegment implements QuietCloseable {
     }
 
     /**
-     * Gives back the record reserved at {@code off}: zeroes the whole envelope
-     * {@code [off, off + 8 + capacity)} and moves the append cursor back to
-     * {@code off}, restoring the zero-fill invariant past the append cursor.
-     * Nothing was published, so the consumer never saw the record, and the
-     * next {@link #syncPublished()} flushes the zeroed range. Producer thread
-     * only.
+     * Gives back the record reserved at {@code off}: zeroes the envelope and the
+     * first {@code dirtyBytes} payload bytes, {@code [off, off + 8 + dirtyBytes)},
+     * and moves the append cursor back to {@code off}. The producer wrote no
+     * payload byte at or above {@code dirtyBytes} (a writer's
+     * {@code QwoRecordWriter.maxUsedBytes()}), and those bytes are zero by the
+     * invariant past the append cursor the reservation was carved from, so after
+     * the abandon every byte of the former reservation is zero and the invariant
+     * holds again past {@code off}. Nothing was published, so the consumer never
+     * saw the record, and the next {@link #syncPublished()} flushes the whole
+     * former reservation. Producer thread only.
      * <p>
      * Abandon only a record that holds no committed rows: an earlier barrier
      * may already have made those rows durable, and abandoning them loses
      * them. The sender enforces this; the segment does not check it.
      *
-     * @throws IllegalStateException when no record is reserved at {@code off}
+     * @throws IllegalStateException    when no record is reserved at {@code off}
+     * @throws IllegalArgumentException when {@code dirtyBytes} is outside
+     *                                  {@code [0, capacity]}
      */
-    public void abandonReserved(long off) {
+    public void abandonReserved(long off, int dirtyBytes) {
         checkReserved(off);
+        if (dirtyBytes < 0 || dirtyBytes > reservedCapacity) {
+            throw new IllegalArgumentException("dirtyBytes " + dirtyBytes
+                    + " outside [0, " + reservedCapacity + ']');
+        }
         long end = off + FRAME_HEADER_SIZE + reservedCapacity;
-        Unsafe.getUnsafe().setMemory(mmapAddress + off, end - off, (byte) 0);
+        Unsafe.getUnsafe().setMemory(mmapAddress + off, FRAME_HEADER_SIZE + dirtyBytes, (byte) 0);
         appendCursor = off;
         markDirty(end);
         reservedCursor = off;
@@ -804,13 +820,11 @@ public final class MmapSegment implements QuietCloseable {
     }
 
     /**
-     * Seals the open record at {@code off} on the mapping: zeroes
-     * {@code [off + 8 + usedBytes, off + 8 + capacity)}, stores the length,
-     * then {@code STATE_SEALED}.
+     * Seals the open record at {@code off} on the mapping, whose payload past
+     * {@code usedBytes} the caller has left zero: stores the length, then
+     * {@code STATE_SEALED}.
      */
-    private void sealInPlace(long off, int capacity, int usedBytes) {
-        long payload = mmapAddress + off + FRAME_HEADER_SIZE;
-        Unsafe.getUnsafe().setMemory(payload + usedBytes, capacity - usedBytes, (byte) 0);
+    private void sealInPlace(long off, int usedBytes) {
         Unsafe.getUnsafe().putInt(mmapAddress + off + 4, usedBytes);
         Unsafe.getUnsafe().putInt(mmapAddress + off, QwoFormat.STATE_SEALED);
     }
@@ -976,7 +990,10 @@ public final class MmapSegment implements QuietCloseable {
                     + ", detail=" + validator.detail() + ']');
         }
         validator.finalizeForRecovery(payload);
-        sealInPlace(off, capacity, used);
+        // No writer survived the crash to bound what it wrote: its unpublished
+        // appends can sit anywhere past usedBytes, so the whole tail is zeroed.
+        Unsafe.getUnsafe().setMemory(payload + used, capacity - used, (byte) 0);
+        sealInPlace(off, used);
         appendCursor = off + FRAME_HEADER_SIZE + used;
         frameCount = frameCount + 1;
         publishedCursor = appendCursor;
@@ -996,13 +1013,19 @@ public final class MmapSegment implements QuietCloseable {
 
     /**
      * Seals the record reserved at {@code off} at {@code usedBytes} payload
-     * bytes: zeroes the unused tail {@code [off + 8 + usedBytes, off + 8 + capacity)},
-     * then stores the length and, last, {@code STATE_SEALED}, so a crash at any
+     * bytes: stores the length and, last, {@code STATE_SEALED}, so a crash at any
      * point leaves either an open record recovery can seal or a sealed one. The
      * append cursor moves back to the record's end and the record counts as a
      * frame; like a frame from {@code tryWrite}, it stays unpublished until
      * {@code publishWritten}. The next {@link #syncPublished()} flushes the
      * whole former reservation, the zeroed tail included. Producer thread only.
+     * <p>
+     * The caller leaves every payload byte past {@code usedBytes} zero, which
+     * {@code QwoRecordWriter.seal} does: it zeroes the bytes its appends dirtied
+     * there, and the bytes above its high-water mark were never written and are
+     * zero by the invariant past the append cursor. So after the seal every byte
+     * of the former reservation past {@code usedBytes} is zero and the invariant
+     * holds past the new append cursor; the seal does not zero that tail again.
      *
      * @throws IllegalStateException    when no record is reserved at {@code off}
      * @throws IllegalArgumentException when {@code usedBytes} is outside
@@ -1014,7 +1037,7 @@ public final class MmapSegment implements QuietCloseable {
             throw new IllegalArgumentException("usedBytes " + usedBytes
                     + " outside [" + QwoFormat.HEADER_SIZE + ", " + reservedCapacity + ']');
         }
-        sealInPlace(off, reservedCapacity, usedBytes);
+        sealInPlace(off, usedBytes);
         appendCursor = off + FRAME_HEADER_SIZE + usedBytes;
         // Single writer, as in tryWrite; precedes the publishedCursor store.
         frameCount = frameCount + 1;

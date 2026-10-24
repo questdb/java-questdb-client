@@ -90,6 +90,42 @@ public class QwpOpenRecordRecoveryTest {
     }
 
     @Test
+    public void testAbandonedRecordLeavesTheSegmentZeroPastItsOffset() throws Exception {
+        assertMemoryLeak(() -> {
+            FrameLog log = new FrameLog();
+            try (QwpOpenRecordSenderTest.Oracle oracle = new QwpOpenRecordSenderTest.Oracle();
+                 TestWebSocketServer server = startServer(log);
+                 QwpWebSocketSender sender = (QwpWebSocketSender) Sender.fromConfig(config(server.getPort(), 5_000))) {
+                QwpTableBuffer t = oracle.block("t");
+                // rows that write blocks and chunks past the record's header and dictionary reserve
+                sender.table("t").longColumn("v", 1).at(TS_BASE + 1, ChronoUnit.MICROS);
+                sender.table("u").stringColumn("s", "abc").longColumn("w", 2).at(TS_BASE + 2, ChronoUnit.MICROS);
+                MmapSegment active = sender.getCursorEngineForTesting().activeSegment();
+                long recordOffset = active.reservedOffset();
+                Assert.assertTrue(recordOffset >= 0);
+                // reset() rolls them back, so the flush gives the empty record back to the ring
+                sender.reset();
+                Assert.assertEquals(0, sender.pendingRowCount());
+                sender.flush();
+                Assert.assertEquals(-1L, active.reservedOffset());
+                for (long p = recordOffset, end = active.sizeBytes(); p < end; p++) {
+                    if (Unsafe.getUnsafe().getByte(active.address() + p) != 0) {
+                        Assert.fail("non-zero byte at offset " + p + " past the abandoned record at " + recordOffset);
+                    }
+                }
+                Assert.assertEquals("nothing shipped", 0, log.dataFrames());
+
+                // the next record takes the space back
+                longRow(sender, t, "v", 3);
+                Assert.assertEquals(recordOffset, active.reservedOffset());
+                sender.flush();
+                log.awaitDataFrames(1, 5_000);
+                Assert.assertArrayEquals(oracle.frame(-1, false), dataFrame(log, 0));
+            }
+        });
+    }
+
+    @Test
     public void testCloseSealsTheOpenRecordWhenAConnectionErrorIsLatched() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpOpenRecordSenderTest.Oracle oracle = new QwpOpenRecordSenderTest.Oracle()) {

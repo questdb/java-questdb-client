@@ -913,12 +913,13 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
-     * Gives back the record reserved at {@code envelopeOffset}; see
-     * {@link SegmentRing#abandonRecord(long)}. Only for a record without
-     * committed rows. Producer thread only.
+     * Gives back the record reserved at {@code envelopeOffset}, zeroing the
+     * envelope and the first {@code dirtyBytes} payload bytes, the most the
+     * producer wrote; see {@link SegmentRing#abandonRecord(long, int)}. Only for
+     * a record without committed rows. Producer thread only.
      */
-    public void abandonRecord(long envelopeOffset) {
-        ring.abandonRecord(envelopeOffset);
+    public void abandonRecord(long envelopeOffset, int dirtyBytes) {
+        ring.abandonRecord(envelopeOffset, dirtyBytes);
     }
 
     /**
@@ -1997,7 +1998,8 @@ public final class CursorSendEngine implements QuietCloseable {
 
     /**
      * Seals the record reserved at {@code envelopeOffset} at {@code usedBytes}
-     * payload bytes, publishes it and returns its FSN; see
+     * payload bytes, whose payload past {@code usedBytes} the caller has left
+     * zero, publishes it and returns its FSN; see
      * {@link SegmentRing#sealRecord(long, int)}. Producer thread only.
      */
     public long sealRecord(long envelopeOffset, int usedBytes) {

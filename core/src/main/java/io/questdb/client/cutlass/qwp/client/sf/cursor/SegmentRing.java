@@ -1036,20 +1036,23 @@ public final class SegmentRing implements QuietCloseable {
 
     /**
      * Gives back the record reserved at {@code envelopeOffset}: the active
-     * segment zeroes its envelope and moves its append cursor back, so the
-     * next frame or record reuses the space. The record never had an FSN.
-     * The caller abandons only a record without committed rows, which an
-     * earlier barrier may already have made durable (the sender enforces it);
-     * with assertions enabled the ring checks it before touching the record.
-     * Producer thread only.
+     * segment zeroes its envelope and the first {@code dirtyBytes} payload bytes,
+     * the most the producer wrote (see {@link MmapSegment#abandonReserved}), and
+     * moves its append cursor back, so the next frame or record reuses the
+     * space. The record never had an FSN. The caller abandons only a record
+     * without committed rows, which an earlier barrier may already have made
+     * durable (the sender enforces it); with assertions enabled the ring checks
+     * it before touching the record. Producer thread only.
      *
-     * @throws IllegalStateException when no record is reserved at {@code envelopeOffset}
+     * @throws IllegalStateException    when no record is reserved at {@code envelopeOffset}
+     * @throws IllegalArgumentException when {@code dirtyBytes} is outside
+     *                                  {@code [0, reservedCapacity()]}
      */
-    public void abandonRecord(long envelopeOffset) {
+    public void abandonRecord(long envelopeOffset, int dirtyBytes) {
         MmapSegment target = active;
         assert target.reservedOffset() != envelopeOffset || !hasCommittedRows(target, envelopeOffset)
                 : "record at offset " + envelopeOffset + " holds committed rows and must be sealed, not abandoned";
-        target.abandonReserved(envelopeOffset);
+        target.abandonReserved(envelopeOffset, dirtyBytes);
     }
 
     /**
@@ -1730,7 +1733,9 @@ public final class SegmentRing implements QuietCloseable {
      * Seals the record reserved at {@code envelopeOffset} at {@code usedBytes}
      * payload bytes and publishes it: the record becomes the active segment's
      * next frame and takes the next FSN, exactly as a frame from
-     * {@link #appendOrFsn}, which this returns. Producer thread only.
+     * {@link #appendOrFsn}, which this returns. The caller has left the payload
+     * past {@code usedBytes} zero, as {@code QwoRecordWriter.seal} does (see
+     * {@link MmapSegment#sealReserved}). Producer thread only.
      *
      * @throws IllegalStateException    when no record is reserved at {@code envelopeOffset}
      * @throws IllegalArgumentException when {@code usedBytes} is outside

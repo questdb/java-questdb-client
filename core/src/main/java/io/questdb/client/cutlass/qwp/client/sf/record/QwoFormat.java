@@ -70,6 +70,7 @@ public final class QwoFormat {
     public static final int MAGIC_RECORD = 0x314F5751;
     public static final int MAX_BLOCKS = 0xFFFF;
     public static final int MAX_CHUNK_ROWS = 4096;
+    public static final int MAX_COLUMNS = 0xFFFF;
     public static final int MAX_ROWS_PER_BLOCK = 1_000_000;
     public static final int MIN_RECORD_RESERVATION = 65536;
     public static final int OFF_BLOCK_COUNT = 6;

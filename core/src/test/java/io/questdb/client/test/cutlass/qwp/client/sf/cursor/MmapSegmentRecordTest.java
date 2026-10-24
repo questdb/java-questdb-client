@@ -47,6 +47,7 @@ import java.io.RandomAccessFile;
 
 public class MmapSegmentRecordTest {
     private static final byte FLAGS_OPEN = (byte) (QwpConstants.FLAG_GORILLA | QwpConstants.FLAG_DELTA_SYMBOL_DICT);
+    private static final byte POISON = 0x5A;
     private static final int RESERVATION = 64 * 1024;
     private static final long SEGMENT_SIZE = 1024 * 1024;
     private static final long TS_BASE = 1_700_000_000_000_000L;
@@ -63,6 +64,81 @@ public class MmapSegmentRecordTest {
     }
 
     @Test
+    public void testAbandonLeavesTheReservationAboveTheHighWaterMarkUntouched() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String path = tmpDir + "/abandon-mark.sfa";
+            try (QwoRecordWriter writer = new QwoRecordWriter();
+                 QwpTableBuffer tb = new QwpTableBuffer("trades");
+                 MmapSegment seg = MmapSegment.create(path, 0L, SEGMENT_SIZE)) {
+                long off = seg.reserveRecord(RESERVATION);
+                long payload = seg.payloadAddress(off);
+                writeRows(seg, off, writer, tb, 2, false);
+                int mark = writer.maxUsedBytes();
+                Assert.assertTrue(mark < RESERVATION);
+                // the zero-fill invariant keeps these bytes zero; poisoned, they show what the abandon touches
+                Unsafe.getUnsafe().setMemory(payload + mark, RESERVATION - mark, POISON);
+                writer.abandon();
+                seg.abandonReserved(off, writer.maxUsedBytes());
+                Assert.assertEquals(-1L, seg.reservedOffset());
+                assertZero(seg.address(), off, off + MmapSegment.FRAME_HEADER_SIZE + mark);
+                assertFilled(payload + mark, RESERVATION - mark, POISON);
+            }
+        });
+    }
+
+    @Test
+    public void testAbandonRefusesADirtyExtentOutsideTheReservation() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String path = tmpDir + "/abandon-bound.sfa";
+            try (MmapSegment seg = MmapSegment.create(path, 0L, SEGMENT_SIZE)) {
+                long off = seg.reserveRecord(RESERVATION);
+                for (int dirty : new int[]{-1, RESERVATION + 1}) {
+                    try {
+                        seg.abandonReserved(off, dirty);
+                        Assert.fail("dirtyBytes " + dirty + " must be refused");
+                    } catch (IllegalArgumentException expected) {
+                        TestUtils.assertContains(expected.getMessage(), "dirtyBytes " + dirty + " outside [0, " + RESERVATION + ']');
+                    }
+                    Assert.assertEquals("the record stays reserved", off, seg.reservedOffset());
+                    Assert.assertEquals(QwoFormat.STATE_OPEN, Unsafe.getUnsafe().getInt(seg.address() + off));
+                }
+                seg.abandonReserved(off, RESERVATION);
+                Assert.assertEquals(-1L, seg.reservedOffset());
+                assertZero(seg.address(), MmapSegment.HEADER_SIZE, SEGMENT_SIZE);
+            }
+        });
+    }
+
+    @Test
+    public void testAbandonZeroesWhatRolledBackAppendsDirtied() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String path = tmpDir + "/abandon-rollback.sfa";
+            try (QwoRecordWriter writer = new QwoRecordWriter();
+                 QwpTableBuffer tb = new QwpTableBuffer("trades")) {
+                try (MmapSegment seg = MmapSegment.create(path, 0L, SEGMENT_SIZE)) {
+                    long off = seg.reserveRecord(RESERVATION);
+                    writeRows(seg, off, writer, tb, 3, false);
+                    int mark = writer.usedBytes();
+                    // the sender abandons a record whose rows were all rolled back
+                    writer.rollback();
+                    Assert.assertFalse(writer.hasUncommittedRows());
+                    Assert.assertTrue(writer.usedBytes() < mark);
+                    Assert.assertEquals(mark, writer.maxUsedBytes());
+                    writer.abandon();
+                    seg.abandonReserved(off, writer.maxUsedBytes());
+                    assertZero(seg.address(), MmapSegment.HEADER_SIZE, SEGMENT_SIZE);
+                }
+                try (MmapSegment seg = MmapSegment.openExisting(path)) {
+                    Assert.assertEquals(0L, seg.frameCount());
+                    Assert.assertEquals(MmapSegment.HEADER_SIZE, seg.publishedOffset());
+                    Assert.assertEquals(0L, seg.tornTailBytes());
+                    Assert.assertEquals(-1L, seg.recoveredOpenRecordOffset());
+                }
+            }
+        });
+    }
+
+    @Test
     public void testAbandonedRecordLeavesZerosAndRecoversClean() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             String path = tmpDir + "/abandon.sfa";
@@ -74,7 +150,7 @@ public class MmapSegmentRecordTest {
                     long off = seg.reserveRecord(RESERVATION);
                     // the sender abandons only a record without committed rows
                     writeRows(seg, off, writer, tb, 2, false);
-                    seg.abandonReserved(off);
+                    seg.abandonReserved(off, writer.maxUsedBytes());
                     writer.abandon();
                     Assert.assertEquals(-1L, seg.reservedOffset());
                     assertZero(seg.address(), MmapSegment.HEADER_SIZE, SEGMENT_SIZE);
@@ -113,7 +189,7 @@ public class MmapSegmentRecordTest {
 
                 // that barrier wrote the record's bytes to disk: the zeroes replacing them must follow
                 writer.abandon();
-                seg.abandonReserved(off);
+                seg.abandonReserved(off, writer.maxUsedBytes());
                 Assert.assertEquals(MmapSegment.HEADER_SIZE, seg.syncPublished());
                 Assert.assertEquals(2, ff.calls());
                 assertMsyncReaches(ff, seg, reservedEnd);
@@ -122,7 +198,7 @@ public class MmapSegmentRecordTest {
 
                 // the same without a barrier while the record was reserved
                 Assert.assertEquals(off, seg.reserveRecord(RESERVATION));
-                seg.abandonReserved(off);
+                seg.abandonReserved(off, 0);
                 Assert.assertEquals(MmapSegment.HEADER_SIZE, seg.syncPublished());
                 Assert.assertEquals(3, ff.calls());
                 assertMsyncReaches(ff, seg, reservedEnd);
@@ -481,7 +557,7 @@ public class MmapSegmentRecordTest {
                 } catch (IllegalStateException expected) {
                     TestUtils.assertContains(expected.getMessage(), "record reserved");
                 }
-                seg.abandonReserved(off);
+                seg.abandonReserved(off, 0);
                 Assert.assertEquals(0, seg.reservedCapacity());
                 assertZero(seg.address(), MmapSegment.HEADER_SIZE, SEGMENT_SIZE);
             }
@@ -519,6 +595,44 @@ public class MmapSegmentRecordTest {
                     Assert.assertEquals(0L, seg.tornTailBytes());
                     assertZero(seg.address(), seg.publishedOffset(), SEGMENT_SIZE);
                     assertSealed(seg, MmapSegment.HEADER_SIZE, 3);
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testSealLeavesTheReservationAboveTheHighWaterMarkUntouched() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String path = tmpDir + "/seal-mark.sfa";
+            long off = MmapSegment.HEADER_SIZE;
+            try (QwoRecordWriter writer = new QwoRecordWriter();
+                 QwpTableBuffer tb = new QwpTableBuffer("trades")) {
+                try (MmapSegment seg = MmapSegment.create(path, 0L, SEGMENT_SIZE)) {
+                    Assert.assertEquals(off, seg.reserveRecord(RESERVATION));
+                    long payload = seg.payloadAddress(off);
+                    writeRows(seg, off, writer, tb, 3, true);
+                    int committedUsed = writer.usedBytes();
+                    // an uncommitted row in a new chunk past usedBytes, which the seal rolls back
+                    appendRow(writer, tb, 3);
+                    int mark = writer.maxUsedBytes();
+                    Assert.assertTrue(mark > committedUsed);
+                    // the zero-fill invariant keeps these bytes zero; poisoned, they show what the seal touches
+                    Unsafe.getUnsafe().setMemory(payload + mark, RESERVATION - mark, POISON);
+
+                    int used = writer.seal(false);
+                    Assert.assertEquals(committedUsed, used);
+                    seg.sealReserved(off, used);
+                    // the writer zeroed the bytes its appends dirtied; neither it nor the segment touched the rest
+                    assertZero(payload, used, mark);
+                    assertFilled(payload + mark, RESERVATION - mark, POISON);
+                    assertSealed(seg, off, 3);
+                    // what the invariant guarantees in production, so the segment reopens clean
+                    Unsafe.getUnsafe().setMemory(payload + mark, RESERVATION - mark, (byte) 0);
+                }
+                try (MmapSegment seg = MmapSegment.openExisting(path)) {
+                    Assert.assertEquals(1L, seg.frameCount());
+                    Assert.assertEquals(0L, seg.tornTailBytes());
+                    assertSealed(seg, off, 3);
                 }
             }
         });
@@ -611,7 +725,7 @@ public class MmapSegmentRecordTest {
                 Assert.assertEquals(0L, seg.frameCount());
                 Assert.assertEquals(remaining, seg.capacityRemaining());
                 Assert.assertEquals(MmapSegment.HEADER_SIZE, seg.publishedOffset());
-                seg.abandonReserved(off);
+                seg.abandonReserved(off, 0);
                 Assert.assertEquals(MmapSegment.HEADER_SIZE, seg.tryAppend(frame, 16));
                 Assert.assertEquals(1L, seg.frameCount());
             } finally {
@@ -683,6 +797,15 @@ public class MmapSegmentRecordTest {
         tb.nextRow();
         Assert.assertEquals(QwoRecordWriter.APPEND_OK, writer.appendStagedRow(tb, new GlobalSymbolDictionary(), -1));
         tb.clearStagedRow();
+    }
+
+    private static void assertFilled(long addr, long len, byte value) {
+        for (long p = 0; p < len; p++) {
+            byte b = Unsafe.getUnsafe().getByte(addr + p);
+            if (b != value) {
+                Assert.fail("byte " + b + " at offset " + p + ", expected " + value);
+            }
+        }
     }
 
     private static void assertMapping(long base, byte[] expected) {

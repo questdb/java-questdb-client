@@ -61,8 +61,16 @@ import static io.questdb.client.cutlass.qwp.client.sf.record.QwoFormat.*;
  * published rows recoverable. The header CRC covers only fields fixed at
  * {@link #open}, so neither publish nor seal rewrites it.
  * <p>
+ * The writer writes no payload byte at or above {@link #maxUsedBytes()}, the
+ * high-water mark of its bump pointer, which {@link #rollback()} never lowers.
+ * Over a range that was zero at {@link #open} (a ring reservation, carved from
+ * the zeroed space past the segment's append cursor) every byte above the mark
+ * is still zero, so {@link #seal} zeroes only the bytes between the sealed
+ * extent and the mark, and the ring's abandon only the bytes below the mark.
+ * <p>
  * Working state lives on the heap in per-block and per-column state objects,
- * pooled across records; the append path allocates nothing once they exist.
+ * pooled across records; the append path allocates nothing once they exist,
+ * apart from the rare growth of the deferred-link array ({@code storeLink}).
  * Not thread-safe.
  */
 public final class QwoRecordWriter implements QuietCloseable {
@@ -94,16 +102,19 @@ public final class QwoRecordWriter implements QuietCloseable {
     private long epoch;
     private boolean isOpen;
     private int lastRefusedDictBytes;
+    private int maxColumnsPerBlock = MAX_COLUMNS;
     private int maxRowsPerBlock = MAX_ROWS_PER_BLOCK;
+    private int maxUsedBytes;
     private long payloadAddr;
     private int pendingLinkCount;
-    private long[] pendingLinks = new long[16];
+    private long[] pendingLinks = new long[64];
     private int rowCount;
     private int usedBytes;
 
     /**
      * Marks the record closed without touching its memory; the caller zeroes or
-     * reuses the range.
+     * reuses the range, of which {@link #maxUsedBytes()} bounds the bytes this
+     * record wrote.
      */
     public void abandon() {
         isOpen = false;
@@ -120,8 +131,9 @@ public final class QwoRecordWriter implements QuietCloseable {
      * cannot take the row; {@link #lastRefusedDictBytes()} then tells whether the
      * dictionary region was the cause
      * @throws IllegalArgumentException when {@code staged} does not hold exactly
-     *                                  one row, a SYMBOL column without a null bitmap holds a negative id, or
-     *                                  a GEOHASH or DECIMAL column has no null bitmap
+     *                                  one row, a SYMBOL column without a null bitmap holds a negative id,
+     *                                  a GEOHASH or DECIMAL column has no null bitmap, or a row that needs a
+     *                                  new block has more than {@link QwoFormat#MAX_COLUMNS} columns
      */
     public int appendStagedRow(QwpTableBuffer staged, GlobalSymbolDictionary dict, int batchMaxSymbolId) {
         checkOpen();
@@ -319,6 +331,17 @@ public final class QwoRecordWriter implements QuietCloseable {
     }
 
     /**
+     * High-water mark of {@link #usedBytes()} since {@link #open}: no payload
+     * byte at or above it was written by this record. {@link #rollback()} lowers
+     * the bump pointer but not the mark, so the bytes a rolled-back append
+     * dirtied stay below it. Still valid once the record is sealed, abandoned or
+     * closed, until the next {@link #open}.
+     */
+    public int maxUsedBytes() {
+        return maxUsedBytes;
+    }
+
+    /**
      * Starts a record over {@code [payloadAddr, payloadAddr + capacity)}: writes
      * the header with the flags GORILLA and DELTA_SYMBOL_DICT and the header CRC,
      * and reserves {@code dictReserve} bytes for dictionary entries right after
@@ -336,6 +359,8 @@ public final class QwoRecordWriter implements QuietCloseable {
         this.dictStartId = dictStartId;
         this.dictCapacity = dictReserve;
         usedBytes = HEADER_SIZE + dictReserve;
+        // the header and the dictionary region lie below the mark from the start
+        maxUsedBytes = usedBytes;
         Unsafe.getUnsafe().putInt(payloadAddr + OFF_MAGIC, MAGIC_RECORD);
         Unsafe.getUnsafe().putByte(payloadAddr + OFF_VERSION, version);
         Unsafe.getUnsafe().putByte(payloadAddr + OFF_FLAGS, FLAGS_OPEN);
@@ -455,8 +480,13 @@ public final class QwoRecordWriter implements QuietCloseable {
     /**
      * Seals the published state: rolls back any unpublished rows, stores the
      * flags (GORILLA, DELTA_SYMBOL_DICT and, when asked, DEFER_COMMIT),
-     * blockCount and usedBytes, zeroes {@code [usedBytes, capacity)} and closes
-     * the record. The counters keep describing the sealed record.
+     * blockCount and usedBytes, zeroes {@code [usedBytes, maxUsedBytes())} and
+     * closes the record. The counters keep describing the sealed record.
+     * <p>
+     * The bytes from {@link #maxUsedBytes()} to the capacity were never written,
+     * so over a range that was zero at {@link #open}, as a ring reservation is,
+     * every byte of the record above usedBytes is zero after the seal. The ring
+     * relies on that: it does not zero a sealed record's tail again.
      *
      * @return the payload bytes the sealed record occupies
      */
@@ -469,9 +499,14 @@ public final class QwoRecordWriter implements QuietCloseable {
         Unsafe.getUnsafe().putByte(payloadAddr + OFF_FLAGS, flags);
         Unsafe.getUnsafe().putShort(payloadAddr + OFF_BLOCK_COUNT, (short) committedBlockCount);
         Unsafe.getUnsafe().putInt(payloadAddr + OFF_USED_BYTES, committedUsedBytes);
-        Unsafe.getUnsafe().setMemory(payloadAddr + committedUsedBytes, capacity - committedUsedBytes, (byte) 0);
+        Unsafe.getUnsafe().setMemory(payloadAddr + committedUsedBytes, maxUsedBytes - committedUsedBytes, (byte) 0);
         isOpen = false;
         return committedUsedBytes;
+    }
+
+    @TestOnly
+    public void setMaxColumnsPerBlockForTest(int maxColumnsPerBlock) {
+        this.maxColumnsPerBlock = maxColumnsPerBlock;
     }
 
     @TestOnly
@@ -555,7 +590,7 @@ public final class QwoRecordWriter implements QuietCloseable {
 
     private void allocateChunk(ColumnState cs) {
         int rowCap = cs.planRowCap;
-        int chunk = usedBytes;
+        int chunk = bump(cs.planSize);
         long p = payloadAddr + chunk;
         Unsafe.getUnsafe().putInt(p + C_NEXT, 0);
         Unsafe.getUnsafe().putInt(p + C_ROW_CAP, rowCap);
@@ -581,7 +616,20 @@ public final class QwoRecordWriter implements QuietCloseable {
         cs.chunkRows = 0;
         cs.chunkValues = 0;
         cs.chunkBytes = 0;
-        usedBytes += cs.planSize;
+    }
+
+    /**
+     * Moves the bump pointer {@code size} bytes on, raising the high-water mark
+     * with it before the caller writes the new structure, and returns the
+     * structure's offset.
+     */
+    private int bump(int size) {
+        int offset = usedBytes;
+        usedBytes = offset + size;
+        if (usedBytes > maxUsedBytes) {
+            maxUsedBytes = usedBytes;
+        }
+        return offset;
     }
 
     private void checkOpen() {
@@ -726,6 +774,13 @@ public final class QwoRecordWriter implements QuietCloseable {
      * goes ahead.
      */
     private BlockState prepareBlock(QwpTableBuffer staged) {
+        int colCount = staged.getColumnCount();
+        if (colCount > maxColumnsPerBlock) {
+            // the descriptor's colCount is a u16
+            throw new IllegalArgumentException("table '" + staged.getTableName()
+                    + "' has more columns than a record block holds [columns=" + colCount
+                    + ", max=" + maxColumnsPerBlock + ']');
+        }
         BlockState block;
         if (blockCount < blocks.size()) {
             block = blocks.getQuick(blockCount);
@@ -735,7 +790,6 @@ public final class QwoRecordWriter implements QuietCloseable {
         }
         block.index = blockCount;
         block.owner = staged;
-        int colCount = staged.getColumnCount();
         block.colCount = colCount;
         block.rowCount = 0;
         block.crc = Crc32c.INIT;
@@ -767,7 +821,7 @@ public final class QwoRecordWriter implements QuietCloseable {
 
     private void relocateChunk(ColumnState cs) {
         int rowCap = cs.planRowCap;
-        int chunk = usedBytes;
+        int chunk = bump(cs.planSize);
         long p = payloadAddr + chunk;
         Unsafe.getUnsafe().putInt(p + C_NEXT, 0);
         Unsafe.getUnsafe().putInt(p + C_ROW_CAP, rowCap);
@@ -802,12 +856,15 @@ public final class QwoRecordWriter implements QuietCloseable {
         cs.chunk = chunk;
         cs.chunkRowCap = rowCap;
         cs.chunkByteCap = cs.planByteCap;
-        usedBytes += cs.planSize;
     }
 
     /**
      * Stores a link to new structure: directly when the link lives in memory no
      * published structure reaches, otherwise deferred to {@link #publish()}.
+     * A batch defers a link each time a column's chain grows, or its newest chunk
+     * moves, behind a published chunk. The array holds 64 links and doubles when
+     * a batch defers more, a rare amortised allocation (a lease with many columns
+     * that each cross a chunk boundary before the next publish).
      */
     private void storeLink(int linkOffset, int target) {
         if (linkOffset >= committedUsedBytes) {
@@ -840,7 +897,7 @@ public final class QwoRecordWriter implements QuietCloseable {
     }
 
     private void writeDescriptor(BlockState block, QwpTableBuffer staged) {
-        int desc = usedBytes;
+        int desc = bump((int) block.descriptorSize);
         long p = payloadAddr + desc;
         Unsafe.getUnsafe().putInt(p + D_CRC, 0);
         Unsafe.getUnsafe().putInt(p + D_NEXT, 0);
@@ -860,8 +917,8 @@ public final class QwoRecordWriter implements QuietCloseable {
             Unsafe.getUnsafe().putInt(q + COL_FIRST_CHUNK, 0);
             q += COL_FIXED_SIZE;
         }
+        assert q - p == block.descriptorSize : "descriptor size " + (q - p) + " != planned " + block.descriptorSize;
         block.descOffset = desc;
-        usedBytes += (int) (q - p);
     }
 
     private void writeDictionaryEntries(GlobalSymbolDictionary dict, int fromId, int toId) {

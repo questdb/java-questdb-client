@@ -6577,9 +6577,13 @@ public class QwpWebSocketSender implements Sender {
      */
     private void recycleForDictReset() {
         // The swap closes the engine an open record lives in. Callers recycle
-        // only with no pending row, so the record holds none and is abandoned.
+        // only with no pending row, and pendingRowCount counts the record's
+        // rows, published or not, so the record holds none: it is given back,
+        // never sealed (a seal here would add a frame to the ring the caller
+        // proved drained). A record with rows is sealed by a flush first.
         if (recordOffset >= 0) {
-            finishRecord(transactional);
+            assert record.rowCount() == 0 : "dictionary recycle with " + record.rowCount() + " rows in the open record";
+            abandonRecord();
         }
         // step 0: own the slot for the whole swap. The parent-anchored logical
         // lock is taken from the live engine's slot directory (null in memory
@@ -6916,10 +6920,11 @@ public class QwpWebSocketSender implements Sender {
 
     /**
      * Gives the open record's reservation back to the ring; only for a record
-     * without committed rows, whose bytes the ring zeroes.
+     * without committed rows. The ring zeroes the bytes below the writer's
+     * high-water mark, all the record wrote.
      */
     private void abandonRecord() {
-        cursorEngine.abandonRecord(recordOffset);
+        cursorEngine.abandonRecord(recordOffset, record.maxUsedBytes());
         record.abandon();
         recordOffset = -1L;
         pendingRowCount = 0;
@@ -7165,7 +7170,9 @@ public class QwpWebSocketSender implements Sender {
             record.open(cursorEngine.recordPayloadAddress(offset), capacity, QwpConstants.VERSION,
                     sentMaxSymbolId + 1, dictReserve);
         } catch (Throwable t) {
-            cursorEngine.abandonRecord(offset);
+            // the writer did not open, so its high-water mark belongs to the
+            // previous record: the ring zeroes the whole reservation instead
+            cursorEngine.abandonRecord(offset, capacity);
             throw t;
         }
         recordOffset = offset;

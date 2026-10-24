@@ -89,7 +89,7 @@ public class SegmentRingRecordTest {
                 // the sender abandons only a record without committed rows
                 writeRows(ring, off, writer, tb, 2, false);
                 writer.abandon();
-                ring.abandonRecord(off);
+                ring.abandonRecord(off, writer.maxUsedBytes());
                 Assert.assertFalse(ring.hasReservedRecord());
                 Assert.assertEquals(0, ring.reservedCapacity());
                 Assert.assertEquals(remaining, seg.capacityRemaining());
@@ -102,7 +102,7 @@ public class SegmentRingRecordTest {
                 Assert.assertEquals(off + MmapSegment.FRAME_HEADER_SIZE + 16, seg.publishedOffset());
                 Assert.assertEquals(2L, seg.frameCount());
                 Assert.assertEquals(off + MmapSegment.FRAME_HEADER_SIZE + 16, ring.reserveRecord(RESERVATION));
-                ring.abandonRecord(seg.reservedOffset());
+                ring.abandonRecord(seg.reservedOffset(), 0);
             } finally {
                 Unsafe.free(frame, 16, MemoryTag.NATIVE_DEFAULT);
             }
@@ -150,7 +150,7 @@ public class SegmentRingRecordTest {
 
                 // the zeroes replacing those bytes are not durable, though nothing was published
                 writer.abandon();
-                ring.abandonRecord(off);
+                ring.abandonRecord(off, writer.maxUsedBytes());
                 Assert.assertTrue(active.isPublishedDurable());
                 Assert.assertFalse(active.isDurable());
                 int msyncsAtAbandon = ff.calls();
@@ -201,7 +201,7 @@ public class SegmentRingRecordTest {
                 writeRows(ring, off, writer, tb, 2, true);
                 byte[] envelope = copyOf(seg.address() + off, MmapSegment.FRAME_HEADER_SIZE + RESERVATION);
                 try {
-                    ring.abandonRecord(off);
+                    ring.abandonRecord(off, writer.maxUsedBytes());
                     Assert.fail("a record with committed rows must not be abandoned");
                 } catch (AssertionError expected) {
                     TestUtils.assertContains(expected.getMessage(), "committed rows");
@@ -248,7 +248,7 @@ public class SegmentRingRecordTest {
                 Assert.assertEquals(1L, seg.frameCount());
                 Assert.assertEquals(published, seg.publishedOffset());
                 Assert.assertEquals(off, seg.reservedOffset());
-                ring.abandonRecord(off);
+                ring.abandonRecord(off, 0);
                 Assert.assertEquals(1L, ring.appendOrFsn(frame, 16));
             } finally {
                 Unsafe.free(frame, 16, MemoryTag.NATIVE_DEFAULT);
@@ -495,7 +495,7 @@ public class SegmentRingRecordTest {
                 Assert.assertEquals(seg0.publishedOffset(), off);
                 Assert.assertSame(seg0, ring.getActive());
                 Assert.assertEquals(MIN_RESERVE - 1, ring.reservedCapacity());
-                ring.abandonRecord(off);
+                ring.abandonRecord(off, 0);
 
                 MmapSegment spare = MmapSegment.create(tmpDir + "/1.sfa", 7L, SEGMENT_SIZE);
                 ring.installHotSpare(spare);
@@ -582,7 +582,7 @@ public class SegmentRingRecordTest {
                 // the default minimum still fits the small active
                 long off = ring.reserveRecord(MIB);
                 Assert.assertEquals(minimum - 1, ring.reservedCapacity());
-                ring.abandonRecord(off);
+                ring.abandonRecord(off, 0);
             } finally {
                 Unsafe.free(big, fill, MemoryTag.NATIVE_DEFAULT);
             }
@@ -606,16 +606,16 @@ public class SegmentRingRecordTest {
                 long off = ring.reserveRecord(MIB);
                 Assert.assertSame(seg0, ring.getActive());
                 Assert.assertEquals(room, ring.reservedCapacity());
-                ring.abandonRecord(off);
+                ring.abandonRecord(off, 0);
                 // so does a minimum the room covers, and one below the record header (clamped up to it)
                 off = ring.reserveRecord(MIB, room);
                 Assert.assertSame(seg0, ring.getActive());
                 Assert.assertEquals(room, ring.reservedCapacity());
-                ring.abandonRecord(off);
+                ring.abandonRecord(off, 0);
                 off = ring.reserveRecord(1000, 0);
                 Assert.assertSame(seg0, ring.getActive());
                 Assert.assertEquals(1000, ring.reservedCapacity());
-                ring.abandonRecord(off);
+                ring.abandonRecord(off, 0);
 
                 // a minimum above the room rotates; without a spare that is backpressure
                 Assert.assertEquals(SegmentRing.BACKPRESSURE_NO_SPARE, ring.reserveRecord(MIB, room + 1));
@@ -633,13 +633,13 @@ public class SegmentRingRecordTest {
                 Assert.assertEquals(1, ring.getSealedSegments().size());
                 Assert.assertSame(seg0, ring.getSealedSegments().get(0));
                 Assert.assertEquals("a reservation consumes no FSN", 0L, ring.publishedFsn());
-                ring.abandonRecord(off);
+                ring.abandonRecord(off, 0);
 
                 // on a fresh active, a minimum clamped to the requested capacity fits in place
                 off = ring.reserveRecord(4096, 8192);
                 Assert.assertSame(spare, ring.getActive());
                 Assert.assertEquals(4096, ring.reservedCapacity());
-                ring.abandonRecord(off);
+                ring.abandonRecord(off, 0);
             } finally {
                 Unsafe.free(big, fill, MemoryTag.NATIVE_DEFAULT);
             }

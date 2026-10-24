@@ -50,6 +50,7 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
 public class QwoRecordWriterTest {
 
+    private static final byte POISON = 0x5A;
     private static final int REGION = 256 * 1024;
 
     @Test
@@ -193,6 +194,46 @@ public class QwoRecordWriterTest {
                 append(writer, other, dict, -1, t -> t.getOrCreateColumn("v", QwpConstants.TYPE_LONG, true).addLong(9));
                 Assert.assertEquals(2, writer.blockCount());
                 Assert.assertEquals(4, writer.rowCount());
+            }
+        });
+    }
+
+    @Test
+    public void testBlockWithMoreColumnsThanTheLimitIsRefused() throws Exception {
+        Assert.assertEquals("the descriptor's colCount is a u16", 0xFFFF, QwoFormat.MAX_COLUMNS);
+        withRecord((mem, writer) -> {
+            // the staged buffer caps a table far below the u16 limit, so the test lowers it
+            writer.setMaxColumnsPerBlockForTest(2);
+            writer.open(mem, REGION, QwpConstants.VERSION, 0, QwoFormat.DEFAULT_DICT_RESERVE);
+            GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+            try (QwpTableBuffer tb = new QwpTableBuffer("wide")) {
+                append(writer, tb, dict, -1, t -> {
+                    t.getOrCreateColumn("a", QwpConstants.TYPE_LONG, true).addLong(1);
+                    t.getOrCreateColumn("b", QwpConstants.TYPE_LONG, true).addLong(2);
+                });
+                writer.publish();
+                int used = writer.usedBytes();
+                stage(tb, t -> {
+                    t.getOrCreateColumn("a", QwpConstants.TYPE_LONG, true).addLong(3);
+                    t.getOrCreateColumn("b", QwpConstants.TYPE_LONG, true).addLong(4);
+                    t.getOrCreateColumn("c", QwpConstants.TYPE_LONG, true).addLong(5);
+                });
+                try {
+                    writer.appendStagedRow(tb, dict, -1);
+                    Assert.fail("a block with more columns than the limit must be refused");
+                } catch (IllegalArgumentException expected) {
+                    TestUtils.assertContains(expected.getMessage(),
+                            "table 'wide' has more columns than a record block holds [columns=3, max=2]");
+                }
+                tb.clearStagedRow();
+                Assert.assertEquals(1, writer.blockCount());
+                Assert.assertEquals(1, writer.rowCount());
+                Assert.assertEquals(used, writer.usedBytes());
+                Assert.assertFalse(writer.hasUncommittedRows());
+                int sealed = writer.seal(false);
+                QwoValidator validator = new QwoValidator();
+                Assert.assertTrue(validator.detail(), validator.validateSealed(mem, sealed));
+                Assert.assertEquals(1, validator.committedRows());
             }
         });
     }
@@ -946,8 +987,37 @@ public class QwoRecordWriterTest {
     }
 
     @Test
+    public void testSealLeavesTheBytesAboveTheHighWaterMarkUntouched() throws Exception {
+        withRecord((mem, writer) -> {
+            // withRecord poisons the whole region; in a ring reservation those bytes are zero
+            writer.open(mem, REGION, QwpConstants.VERSION, 0, QwoFormat.DEFAULT_DICT_RESERVE);
+            GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+            try (QwpTableBuffer tb = new QwpTableBuffer("s")) {
+                appendLong(writer, tb, dict, 1);
+                appendLong(writer, tb, dict, 2);
+                writer.publish();
+                int committed = writer.usedBytes();
+                // row 3 fills the 2-row chunk, row 4 allocates a 4-row chunk past the published
+                // extent; the seal rolls both back
+                appendLong(writer, tb, dict, 3);
+                appendLong(writer, tb, dict, 4);
+                int mark = writer.maxUsedBytes();
+                Assert.assertEquals(writer.usedBytes(), mark);
+                Assert.assertTrue(mark > committed);
+
+                int used = writer.seal(false);
+                Assert.assertEquals(committed, used);
+                assertFilled(mem, used, mark, (byte) 0);
+                assertFilled(mem, mark, REGION, POISON);
+            }
+        });
+    }
+
+    @Test
     public void testSealWritesFlagsUsedBytesAndZeroesTail() throws Exception {
         withRecord((mem, writer) -> {
+            // a ring reservation is zero; the seal zeroes only what the appends dirtied
+            Unsafe.getUnsafe().setMemory(mem, REGION, (byte) 0);
             writer.open(mem, REGION, QwpConstants.VERSION, 0, QwoFormat.DEFAULT_DICT_RESERVE);
             QwoRecordReader reader = new QwoRecordReader();
             reader.of(mem, REGION);
@@ -995,6 +1065,8 @@ public class QwoRecordWriterTest {
                 writer.open(mem, REGION, QwpConstants.VERSION, 0, QwoFormat.DEFAULT_DICT_RESERVE);
                 Assert.assertEquals(epoch + 1, writer.epoch());
                 Assert.assertEquals(0, writer.rowCount());
+                Assert.assertEquals("open resets the mark", QwoFormat.HEADER_SIZE + QwoFormat.DEFAULT_DICT_RESERVE,
+                        writer.maxUsedBytes());
                 appendLong(writer, tb, dict, 5);
                 Assert.assertEquals(0, tb.qwoBlock());
                 writer.publish();
@@ -1002,6 +1074,53 @@ public class QwoRecordWriterTest {
                 reader.of(mem, REGION);
                 Assert.assertEquals(QwpConstants.FLAG_GORILLA | QwpConstants.FLAG_DELTA_SYMBOL_DICT, reader.flags());
                 Assert.assertEquals(1, reader.rowCount(reader.firstBlock()));
+            }
+        });
+    }
+
+    @Test
+    public void testSealZeroesWhatRolledBackAppendsDirtied() throws Exception {
+        withRecord((mem, writer) -> {
+            // a ring reservation is zero past what the writer writes
+            Unsafe.getUnsafe().setMemory(mem, REGION, (byte) 0);
+            writer.open(mem, REGION, QwpConstants.VERSION, 0, QwoFormat.DEFAULT_DICT_RESERVE);
+            Assert.assertEquals("the header and the dictionary reserve lie below the mark",
+                    QwoFormat.HEADER_SIZE + QwoFormat.DEFAULT_DICT_RESERVE, writer.maxUsedBytes());
+            GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+            try (QwpTableBuffer tb = new QwpTableBuffer("rb"); QwpTableBuffer late = new QwpTableBuffer("late")) {
+                appendLong(writer, tb, dict, 0);
+                appendLong(writer, tb, dict, 1);
+                writer.publish();
+                int committed = writer.usedBytes();
+                Assert.assertEquals(committed, writer.maxUsedBytes());
+
+                // row 3 allocates a chunk and the new table a block past the published extent
+                appendLong(writer, tb, dict, 2);
+                appendLong(writer, tb, dict, 3);
+                appendLongTo(writer, late, dict, 99);
+                int mark = writer.usedBytes();
+                Assert.assertEquals(mark, writer.maxUsedBytes());
+                writer.rollback();
+                Assert.assertEquals(committed, writer.usedBytes());
+                Assert.assertEquals("a rollback does not lower the mark", mark, writer.maxUsedBytes());
+                Assert.assertTrue("the rolled-back appends left bytes past usedBytes", hasNonZero(mem, committed, mark));
+
+                // appended again they dirty less than the first time, and the seal rolls them back too
+                appendLong(writer, tb, dict, 4);
+                appendLong(writer, tb, dict, 5);
+                Assert.assertTrue(writer.usedBytes() > committed);
+                Assert.assertTrue(writer.usedBytes() < mark);
+                Assert.assertEquals(mark, writer.maxUsedBytes());
+
+                int used = writer.seal(false);
+                Assert.assertEquals(committed, used);
+                Assert.assertEquals(mark, writer.maxUsedBytes());
+                assertFilled(mem, used, mark, (byte) 0);
+                // nothing above the mark was written, so the whole tail is zero, as the ring needs
+                assertFilled(mem, mark, REGION, (byte) 0);
+                QwoValidator validator = new QwoValidator();
+                Assert.assertTrue(validator.detail(), validator.validateSealed(mem, used));
+                Assert.assertEquals(2, validator.committedRows());
             }
         });
     }
@@ -1099,6 +1218,24 @@ public class QwoRecordWriterTest {
         append(writer, tb, dict, -1, t -> t.getOrCreateColumn("w", QwpConstants.TYPE_LONG, true).addLong(value));
     }
 
+    private static void assertFilled(long mem, int from, int to, byte value) {
+        for (int i = from; i < to; i++) {
+            byte b = Unsafe.getUnsafe().getByte(mem + i);
+            if (b != value) {
+                Assert.fail("byte " + b + " at " + i + ", expected " + value + " in [" + from + ", " + to + ')');
+            }
+        }
+    }
+
+    private static boolean hasNonZero(long mem, int from, int to) {
+        for (int i = from; i < to; i++) {
+            if (Unsafe.getUnsafe().getByte(mem + i) != 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static String nameOf(long addr, int len) {
         byte[] b = new byte[len];
         for (int i = 0; i < len; i++) {
@@ -1118,7 +1255,7 @@ public class QwoRecordWriterTest {
             long mem = Unsafe.malloc(REGION, MemoryTag.NATIVE_DEFAULT);
             try (QwoRecordWriter writer = new QwoRecordWriter()) {
                 // garbage, so nothing relies on zeroed memory
-                Unsafe.getUnsafe().setMemory(mem, REGION, (byte) 0x5A);
+                Unsafe.getUnsafe().setMemory(mem, REGION, POISON);
                 code.run(mem, writer);
             } finally {
                 Unsafe.free(mem, REGION, MemoryTag.NATIVE_DEFAULT);

@@ -349,6 +349,8 @@ public class QwoValidatorTest {
     @Test
     public void testDescriptorNextPointingOutsideUsedBytesIsInvalid() throws Exception {
         withRecord((mem, writer, validator) -> {
+            // a ring reservation is zero, and the seal keeps the tail past the record so
+            Unsafe.getUnsafe().setMemory(mem, REGION, (byte) 0);
             writer.open(mem, REGION, VERSION, 0, QwoFormat.DEFAULT_DICT_RESERVE);
             GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
             QwoRecordReader reader = new QwoRecordReader();

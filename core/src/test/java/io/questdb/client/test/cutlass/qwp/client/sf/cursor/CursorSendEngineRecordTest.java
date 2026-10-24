@@ -108,12 +108,12 @@ public class CursorSendEngineRecordTest {
                         engine.recordPayloadAddress(off));
                 Assert.assertEquals(-1L, engine.publishedFsn());
 
-                engine.abandonRecord(off);
+                engine.abandonRecord(off, 0);
                 Assert.assertFalse(engine.hasReservedRecord());
                 Assert.assertEquals(0, engine.reservedRecordCapacity());
                 Assert.assertEquals("the abandoned space is reserved again",
                         off, engine.reserveRecordBlocking(RESERVATION));
-                engine.abandonRecord(off);
+                engine.abandonRecord(off, 0);
                 Assert.assertEquals(-1L, engine.publishedFsn());
             }
         });
@@ -204,7 +204,7 @@ public class CursorSendEngineRecordTest {
         long off = engine.reserveRecordBlocking(MIB);
         Assert.assertNotSame("too little room left: the reservation rotates", first, engine.activeSegment());
         Assert.assertEquals(MmapSegment.HEADER_SIZE, off);
-        engine.abandonRecord(off);
+        engine.abandonRecord(off, 0);
         Assert.assertEquals(1L, engine.appendBlocking(buf, FILL));
     }
 }

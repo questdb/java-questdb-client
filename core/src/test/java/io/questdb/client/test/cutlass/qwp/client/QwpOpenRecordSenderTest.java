@@ -414,7 +414,7 @@ public class QwpOpenRecordSenderTest {
                     // follows closes the writer and fails in the engine
                     sender.table("t").longColumn("v", 2).at(TS_BASE + 2, ChronoUnit.MICROS);
                     CursorSendEngine engine = ((QwpWebSocketSender) sender).getCursorEngineForTesting();
-                    engine.abandonRecord(engine.getRingForTesting().getActive().reservedOffset());
+                    engine.abandonRecord(engine.getRingForTesting().getActive().reservedOffset(), engine.reservedRecordCapacity());
                     LineSenderException sealFailure = null;
                     try {
                         sender.flush();
@@ -468,7 +468,7 @@ public class QwpOpenRecordSenderTest {
                     sender.table("t").longColumn("v", 2).at(TS_BASE + 2, ChronoUnit.MICROS);
                     CursorSendEngine engine = sender.getCursorEngineForTesting();
                     long reserved = engine.getRingForTesting().getActive().reservedOffset();
-                    engine.abandonRecord(reserved);
+                    engine.abandonRecord(reserved, engine.reservedRecordCapacity());
                     Assert.assertEquals(reserved, engine.getRingForTesting().reserveRecord(QwoFormat.HEADER_SIZE));
                     LineSenderException sealFailure = null;
                     try {
@@ -863,6 +863,29 @@ public class QwpOpenRecordSenderTest {
     }
 
     @Test
+    public void testSealedRecordReplaysByteIdenticalAfterAReconnect() throws Exception {
+        assertMemoryLeak(() -> {
+            ReplayLog log = new ReplayLog();
+            try (TestWebSocketServer server = startServer(log);
+                 Oracle oracle = new Oracle();
+                 Sender sender = Sender.fromConfig(config(server.getPort()))) {
+                QwpTableBuffer t = oracle.block("t");
+                symbolRow(sender, oracle, t, "a", 1);
+                symbolRow(sender, oracle, t, "b", 2);
+                symbolRow(sender, oracle, t, "a", 3);
+                sender.flush();
+                byte[] sent = log.awaitDataMessage(0, 5_000);
+                Assert.assertArrayEquals(oracle.frame(-1, false), sent);
+
+                // the first connection acknowledges nothing, so the reconnect replays the record
+                server.dropAllConnections();
+                byte[] replayed = log.awaitDataMessage(1, 10_000);
+                Assert.assertArrayEquals("the replay is the frame first sent, byte for byte", sent, replayed);
+            }
+        });
+    }
+
+    @Test
     public void testSymbolsRegisteredOnceAcrossReleases() throws Exception {
         assertMemoryLeak(() -> {
             FrameLog log = new FrameLog();
@@ -1126,6 +1149,61 @@ public class QwpOpenRecordSenderTest {
                 bytes[i] = Unsafe.getUnsafe().getByte(ptr + i);
             }
             return bytes;
+        }
+    }
+
+    /**
+     * Keeps every message per connection and acknowledges only on the second
+     * connection and later, so the first connection's frames stay
+     * unacknowledged and a reconnect replays them.
+     */
+    private static final class ReplayLog implements TestWebSocketServer.WebSocketServerHandler {
+        private final List<List<byte[]>> messages = new ArrayList<>();
+        private TestWebSocketServer.ClientHandler currentClient;
+        private long nextSeq;
+
+        /**
+         * Waits for the first data message (one with a table) the
+         * {@code connection}-th connection, counted from 0, received.
+         */
+        byte[] awaitDataMessage(int connection, long timeoutMillis) throws InterruptedException {
+            long deadline = System.currentTimeMillis() + timeoutMillis;
+            while (System.currentTimeMillis() < deadline) {
+                byte[] message = firstDataMessage(connection);
+                if (message != null) {
+                    return message;
+                }
+                Thread.sleep(10);
+            }
+            throw new AssertionError("no data message on connection " + connection + " within " + timeoutMillis + " ms");
+        }
+
+        @Override
+        public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            if (currentClient != client) {
+                currentClient = client;
+                messages.add(new ArrayList<>());
+                nextSeq = 0;
+            }
+            messages.get(messages.size() - 1).add(data.clone());
+            if (messages.size() > 1) {
+                try {
+                    client.sendBinary(QwpWireTestUtils.buildAck(nextSeq++));
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            }
+        }
+
+        private synchronized byte[] firstDataMessage(int connection) {
+            if (connection < messages.size()) {
+                for (byte[] message : messages.get(connection)) {
+                    if (QwpWireTestUtils.tableCount(message) > 0) {
+                        return message;
+                    }
+                }
+            }
+            return null;
         }
     }
 }

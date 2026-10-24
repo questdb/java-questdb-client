@@ -33,6 +33,7 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderConnectionDispatcher;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher;
 import io.questdb.client.std.Files;
@@ -130,6 +131,97 @@ public class SymbolDictRecycleTest {
                 Assert.assertEquals("connection 2's dictionary must hold only the post-recycle "
                                 + "symbols, not a, b",
                         Arrays.asList("c", "d"), handler.dictFor(2));
+            }
+        });
+    }
+
+    /**
+     * An open record without rows at the recycle (its rows were reset) goes back
+     * to the outgoing engine's ring before the swap, and the first record after
+     * the swap starts its dictionary at id 0.
+     */
+    @Test
+    public void testRecycleGivesBackAnEmptyOpenRecordBeforeTheSwap() throws Exception {
+        assertMemoryLeak(() -> {
+            String sfDir = temporaryFolder.getRoot().toPath().resolve("recycle-empty-record").toString();
+            RecycleHandler handler = new RecycleHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + server.getPort() + ";sf_dir=" + sfDir + ";";
+                try (Sender sender = Sender.fromConfig(cfg)) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
+                    Assert.assertTrue(sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+
+                    // a row opens a record and reset() rolls it back: the record stays open, empty
+                    sender.table("t").symbol("s", "b").longColumn("v", 2L).atNow();
+                    sender.reset();
+                    Assert.assertEquals(0, sender.pendingRowCount());
+                    MmapSegment outgoingActive = ws.getCursorEngineForTesting().activeSegment();
+                    Assert.assertTrue("the record is open", outgoingActive.reservedOffset() >= 0);
+                    sender.resetSymbolDictionary();
+                    Assert.assertTrue(ws.isResetArmed());
+
+                    // the recycle runs inside this table()
+                    sender.table("t").symbol("s", "c").longColumn("v", 3L).atNow();
+                    Assert.assertEquals(1, ws.getSymbolDictEpoch());
+                    Assert.assertEquals("the outgoing ring got the record back before the swap",
+                            -1L, outgoingActive.reservedOffset());
+                    Assert.assertNotSame(outgoingActive, ws.getCursorEngineForTesting().activeSegment());
+                    Assert.assertTrue(sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+                }
+                Assert.assertEquals(2, handler.connectionsAccepted.get());
+                Assert.assertEquals("the reset row's symbol never shipped", Collections.singletonList("a"), handler.dictFor(1));
+                Assert.assertEquals("the first record after the swap starts its dictionary at id 0",
+                        0, handler.conn2FirstFrameDeltaStart);
+                Assert.assertEquals(Collections.singletonList("c"), handler.dictFor(2));
+            }
+        });
+    }
+
+    /**
+     * An open record with rows is never torn down by the recycle: the barrier
+     * refuses while the record holds rows, the flush seals them into the outgoing
+     * epoch, and the recycle runs at the next barrier, after which the first
+     * record starts its dictionary at id 0.
+     */
+    @Test
+    public void testRecycleWaitsForAnOpenRecordWithRowsToSeal() throws Exception {
+        assertMemoryLeak(() -> {
+            String sfDir = temporaryFolder.getRoot().toPath().resolve("recycle-record-rows").toString();
+            RecycleHandler handler = new RecycleHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + server.getPort() + ";sf_dir=" + sfDir + ";";
+                try (Sender sender = Sender.fromConfig(cfg)) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
+                    Assert.assertTrue(sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+
+                    // a published row in the open record; the request arms at the next seal
+                    sender.table("t").symbol("s", "b").longColumn("v", 2L).atNow();
+                    sender.publishPending();
+                    sender.resetSymbolDictionary();
+                    Assert.assertFalse(ws.isResetArmed());
+                    sender.table("t").symbol("s", "c").longColumn("v", 3L).atNow();
+                    Assert.assertEquals("no recycle while the record holds rows", 0, ws.getSymbolDictEpoch());
+
+                    long sealed = sender.flushAndGetSequence();
+                    Assert.assertTrue("the seal arms", ws.isResetArmed());
+                    Assert.assertTrue(sender.awaitAckedFsn(sealed, 5_000));
+                    // the recycle runs inside this table(), with no record open
+                    sender.table("t").symbol("s", "d").longColumn("v", 4L).atNow();
+                    Assert.assertEquals(1, ws.getSymbolDictEpoch());
+                    Assert.assertTrue(sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+                }
+                Assert.assertEquals(2, handler.connectionsAccepted.get());
+                Assert.assertEquals("the sealed record's rows shipped before the swap",
+                        Arrays.asList("a", "b", "c"), handler.dictFor(1));
+                Assert.assertEquals("the first record after the swap starts its dictionary at id 0",
+                        0, handler.conn2FirstFrameDeltaStart);
+                Assert.assertEquals(Collections.singletonList("d"), handler.dictFor(2));
             }
         });
     }
