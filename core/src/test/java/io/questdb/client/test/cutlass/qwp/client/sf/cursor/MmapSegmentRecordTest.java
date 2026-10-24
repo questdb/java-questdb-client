@@ -454,59 +454,6 @@ public class MmapSegmentRecordTest {
     }
 
     @Test
-    public void testRecoverableOpenTailLogsNoTornTailWarning() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            ch.qos.logback.classic.Logger logger = (ch.qos.logback.classic.Logger)
-                    org.slf4j.LoggerFactory.getLogger(MmapSegment.class);
-            ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> appender =
-                    new ch.qos.logback.core.read.ListAppender<>();
-            appender.start();
-            ch.qos.logback.classic.Level savedLevel = logger.getLevel();
-            logger.setLevel(ch.qos.logback.classic.Level.ALL);
-            logger.addAppender(appender);
-            long off = MmapSegment.HEADER_SIZE;
-            try (QwoRecordWriter writer = new QwoRecordWriter();
-                 QwpTableBuffer tb = new QwpTableBuffer("trades")) {
-                // 0: a recoverable open record and nothing past its reservation;
-                // 1: the same with a stray byte past the reservation;
-                // 2: an open record that fails validation
-                for (int tail = 0; tail < 3; tail++) {
-                    String path = tmpDir + "/warn" + tail + ".sfa";
-                    try (MmapSegment seg = MmapSegment.create(path, 0L, SEGMENT_SIZE)) {
-                        Assert.assertEquals(off, seg.reserveRecord(RESERVATION));
-                        writeRows(seg, off, writer, tb, 3, true);
-                        writer.abandon();
-                        if (tail == 1) {
-                            Unsafe.getUnsafe().putByte(seg.address() + off + MmapSegment.FRAME_HEADER_SIZE + RESERVATION + 100, (byte) 1);
-                        } else if (tail == 2) {
-                            flipCommittedValueByte(seg.payloadAddress(off), RESERVATION);
-                        }
-                    }
-                    appender.list.clear();
-                    try (MmapSegment seg = MmapSegment.openExisting(path)) {
-                        Assert.assertEquals("tail " + tail, tail != 2, seg.hasRecoverableOpenRecord());
-                        Assert.assertTrue(seg.tornTailBytes() > 0);
-                    }
-                    boolean isWarned = false;
-                    for (ch.qos.logback.classic.spi.ILoggingEvent e : appender.list) {
-                        if (e.getLevel() == ch.qos.logback.classic.Level.WARN
-                                && e.getFormattedMessage().contains("torn tail")) {
-                            isWarned = true;
-                            break;
-                        }
-                    }
-                    Assert.assertEquals("only a torn tail that is not exactly a recoverable open record warns [tail="
-                            + tail + ", events=" + appender.list + ']', tail != 0, isWarned);
-                }
-            } finally {
-                logger.detachAppender(appender);
-                logger.setLevel(savedLevel);
-                appender.stop();
-            }
-        });
-    }
-
-    @Test
     public void testReserveRefusedWhenNoRoom() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             String path = tmpDir + "/no-room.sfa";
@@ -669,6 +616,62 @@ public class MmapSegmentRecordTest {
                 Assert.assertEquals(1L, seg.frameCount());
             } finally {
                 Unsafe.free(frame, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testValidOpenRecordTailLogsNoTornTailWarning() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            ch.qos.logback.classic.Logger logger = (ch.qos.logback.classic.Logger)
+                    org.slf4j.LoggerFactory.getLogger(MmapSegment.class);
+            ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> appender =
+                    new ch.qos.logback.core.read.ListAppender<>();
+            appender.start();
+            ch.qos.logback.classic.Level savedLevel = logger.getLevel();
+            logger.setLevel(ch.qos.logback.classic.Level.ALL);
+            logger.addAppender(appender);
+            long off = MmapSegment.HEADER_SIZE;
+            try (QwoRecordWriter writer = new QwoRecordWriter();
+                 QwpTableBuffer tb = new QwpTableBuffer("trades")) {
+                // 0: a recoverable open record and nothing past its reservation;
+                // 1: the same with a stray byte past the reservation;
+                // 2: an open record that fails validation;
+                // 3: a valid open record without committed rows (a crash after a seal, before
+                //    the next publish) and nothing past its reservation
+                for (int tail = 0; tail < 4; tail++) {
+                    String path = tmpDir + "/warn" + tail + ".sfa";
+                    try (MmapSegment seg = MmapSegment.create(path, 0L, SEGMENT_SIZE)) {
+                        Assert.assertEquals(off, seg.reserveRecord(RESERVATION));
+                        writeRows(seg, off, writer, tb, 3, tail != 3);
+                        writer.abandon();
+                        if (tail == 1) {
+                            Unsafe.getUnsafe().putByte(seg.address() + off + MmapSegment.FRAME_HEADER_SIZE + RESERVATION + 100, (byte) 1);
+                        } else if (tail == 2) {
+                            flipCommittedValueByte(seg.payloadAddress(off), RESERVATION);
+                        }
+                    }
+                    appender.list.clear();
+                    try (MmapSegment seg = MmapSegment.openExisting(path)) {
+                        Assert.assertEquals("tail " + tail, tail == 0 || tail == 1, seg.hasRecoverableOpenRecord());
+                        Assert.assertEquals("tail " + tail, tail == 2, seg.hasInvalidOpenRecord());
+                        Assert.assertTrue(seg.tornTailBytes() > 0);
+                    }
+                    boolean isWarned = false;
+                    for (ch.qos.logback.classic.spi.ILoggingEvent e : appender.list) {
+                        if (e.getLevel() == ch.qos.logback.classic.Level.WARN
+                                && e.getFormattedMessage().contains("torn tail")) {
+                            isWarned = true;
+                            break;
+                        }
+                    }
+                    Assert.assertEquals("only a torn tail that is not exactly a valid open record warns [tail="
+                            + tail + ", events=" + appender.list + ']', tail == 1 || tail == 2, isWarned);
+                }
+            } finally {
+                logger.detachAppender(appender);
+                logger.setLevel(savedLevel);
+                appender.stop();
             }
         });
     }

@@ -1306,11 +1306,13 @@ public class DeltaDictRecoveryTest {
             }
             // The side-file is healed in passing -- healPersistedDictionary re-persists
             // the rebuilt ids a,b,c at recovery, and the seal of the flush above persists
-            // d (persistRecordSymbols resumes from pd.size()). That is not asserted on disk because it is not
-            // observable here: the slot drains fully, and a fully-drained close removes
-            // the dictionary (CursorSendEngine -> PersistedSymbolDict.removeOrphan), so
-            // re-opening it would just yield a fresh empty file. The persist-resumes-from-
-            // pd.size() behaviour is pinned by the testFailedPublish* tests.
+            // d (persistRecordSymbols resumes from pd.size()). That is not asserted on
+            // disk because it is not observable here: the slot drains fully, and a
+            // fully-drained close removes the dictionary (CursorSendEngine ->
+            // PersistedSymbolDict.removeOrphan), so re-opening it would just yield a fresh
+            // empty file. The persist-resumes-from-pd.size() behaviour is pinned by
+            // testRecoveryHealsThePersistedDictionaryBeforeAnyNewFrame and
+            // QwpOpenRecordRecoveryTest.testPersistSkipsTheEntriesTheSideFileAlreadyHolds.
         });
     }
 

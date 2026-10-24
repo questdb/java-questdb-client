@@ -222,26 +222,88 @@ public class QwpOpenRecordRecoveryTest {
                 try (QwpWebSocketSender sender = QwpWebSocketSender.connect(
                         "localhost", server.getPort(), null, 0, 0, 0L, null, false, engine)) {
                     QwpTableBuffer t = oracle.block("t");
+                    int msyncsAtReserve = ff.calls();
                     for (int i = 1; i <= 3; i++) {
                         longRow(sender, t, "v", i);
                     }
-                    sender.publishPending();
                     MmapSegment active = engine.getRingForTesting().getActive();
                     long recordOffset = active.reservedOffset();
                     Assert.assertTrue("the rows sit in an open record", recordOffset >= 0);
-                    long committedEnd = recordOffset + MmapSegment.FRAME_HEADER_SIZE + sender.recordUsedBytesForTest();
+                    // let a barrier flush the reservation before the rows are published, so the
+                    // one the test then waits for is a later barrier, not the reservation's own
+                    long reservationEnd = recordOffset + MmapSegment.FRAME_HEADER_SIZE + active.reservedCapacity();
                     long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
-                    while (ff.lastLenFor(active.address()) < committedEnd && System.nanoTime() < deadline) {
+                    while (ff.maxLenSince(active.address(), msyncsAtReserve) < reservationEnd && System.nanoTime() < deadline) {
                         Thread.sleep(5);
                     }
-                    Assert.assertTrue("a periodic barrier covers the committed rows [msync="
-                                    + ff.lastLenFor(active.address()) + ", committedEnd=" + committedEnd + ']',
-                            ff.lastLenFor(active.address()) >= committedEnd);
+                    Assert.assertTrue("setup: a barrier flushed the reservation",
+                            ff.maxLenSince(active.address(), msyncsAtReserve) >= reservationEnd);
+                    sender.publishPending();
+                    // only a barrier issued after the publish counts: the earlier one flushed the
+                    // reservation before the rows were committed
+                    int msyncsAtPublish = ff.calls();
+                    long committedEnd = recordOffset + MmapSegment.FRAME_HEADER_SIZE + sender.recordUsedBytesForTest();
+                    deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
+                    while (ff.maxLenSince(active.address(), msyncsAtPublish) < committedEnd && System.nanoTime() < deadline) {
+                        Thread.sleep(5);
+                    }
+                    Assert.assertTrue("a periodic barrier after the publish covers the committed rows [msync="
+                                    + ff.maxLenSince(active.address(), msyncsAtPublish) + ", committedEnd=" + committedEnd + ']',
+                            ff.maxLenSince(active.address(), msyncsAtPublish) >= committedEnd);
                     Assert.assertEquals("the barrier ships nothing", 0, log.dataFrames());
                     sender.flush();
                     log.awaitDataFrames(1, 5_000);
                     Assert.assertArrayEquals(oracle.frame(-1, false), dataFrame(log, 0));
                 }
+            }
+        });
+    }
+
+    @Test
+    public void testPersistFailureAtARecordFullSealFailsAnOverCapRefusedRowAlone() throws Exception {
+        assertMemoryLeak(() -> {
+            QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+            String pad = TestUtils.repeat("x", 3000);
+            try (QwpOpenRecordSenderTest.Oracle first = new QwpOpenRecordSenderTest.Oracle();
+                 QwpOpenRecordSenderTest.Oracle second = new QwpOpenRecordSenderTest.Oracle();
+                 TestWebSocketServer server = startServer(log, 8 * 1024)) {
+                FullDiskDictFacade ff = new FullDiskDictFacade();
+                QwpWebSocketSender sender = connectOnDictFacade(server.getPort(), ff);
+                try {
+                    ff.isArmed = true;
+                    padRow(sender, first, first.block("t1"), "a", pad, 1);
+                    padRow(sender, first, first.block("t2"), "b", pad, 2);
+                    // a row over the 8 KiB cap: the record refuses it, its seal persists a and b,
+                    // which fails, and the sender switches; the row then meets the frame path's cap
+                    // guard and fails alone, as it would without the switch
+                    try {
+                        sender.table("t3").symbol("s", "c").stringColumn("p", TestUtils.repeat("x", 9000))
+                                .at(TS_BASE + 3, ChronoUnit.MICROS);
+                        Assert.fail("a row over the cap must fail on its at()");
+                    } catch (LineSenderException expected) {
+                        TestUtils.assertContains(expected.getMessage(), "row too large for server batch cap");
+                    }
+                    Assert.assertFalse("setup: the failed persist switched the sender", sender.isDeltaDictEnabledForTest());
+                    Assert.assertEquals("nothing of the failed row is buffered", 0, sender.pendingRowCount());
+                    Assert.assertFalse(sender.hasRowInProgress());
+                    sender.checkError(); // nothing is retained
+                    log.awaitDataFrames(1, 5_000);
+                    Assert.assertArrayEquals(first.frame(-1, false), dataFrame(log, 0));
+
+                    // the sender stays usable: a fitting row ships on the frame path. The failed
+                    // row minted c, which full-dictionary mode keeps, so the frame carries it.
+                    for (String s : new String[]{"a", "b", "c"}) {
+                        second.dict.getOrAddSymbol(s);
+                    }
+                    padRow(sender, second, second.block("t4"), "d", "y", 4);
+                    sender.flush();
+                    log.awaitDataFrames(2, 5_000);
+                    Assert.assertArrayEquals("a full-dictionary frame", second.frame(-1, false), dataFrame(log, 1));
+                    sender.checkError();
+                } finally {
+                    sender.close();
+                }
+                Assert.assertEquals(2, log.dataFrames());
             }
         });
     }
@@ -860,16 +922,22 @@ public class QwpOpenRecordRecoveryTest {
             return super.msync(addr, len, async);
         }
 
+        synchronized int calls() {
+            return msyncCalls;
+        }
+
         /**
-         * Length of the last msync that started at {@code addr}; -1 when none did.
+         * Longest msync that started at {@code addr} among the calls from the
+         * {@code fromCall}-th on; -1 when none did.
          */
-        synchronized long lastLenFor(long addr) {
-            for (int i = msyncCalls - 1; i >= 0; i--) {
-                if (addrs[i] == addr) {
-                    return lens[i];
+        synchronized long maxLenSince(long addr, int fromCall) {
+            long max = -1L;
+            for (int i = fromCall; i < msyncCalls; i++) {
+                if (addrs[i] == addr && lens[i] > max) {
+                    max = lens[i];
                 }
             }
-            return -1L;
+            return max;
         }
     }
 

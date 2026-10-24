@@ -501,11 +501,12 @@ public final class MmapSegment implements QuietCloseable {
                 }
                 throw new MmapSegmentException("mapped-memory fault while validating records in " + path, e);
             }
-            // A torn tail that is exactly an open record with committed rows is the
-            // designed outcome of a crash with a record open, not an incident: the
-            // ring seals it on the resumed active (and logs that) and fails closed on
-            // it anywhere else, so it gets no disk-health warning.
-            if (scan.tornTailBytes > 0 && !isRecoverableOpenRecordTail(addr, fileSize, scan)) {
+            // A torn tail that is exactly a valid open record is the designed outcome
+            // of a crash with a record open, not an incident: the ring seals one with
+            // committed rows on the resumed active (and logs that), zeroes one without
+            // (a crash after a seal and before the next publish), and fails closed on
+            // either anywhere else, so it gets no disk-health warning.
+            if (scan.tornTailBytes > 0 && !isValidOpenRecordTail(addr, fileSize, scan)) {
                 // Observe-only: report the residue, never touch it here. A
                 // torn tail may be an interrupted append (dead bytes) OR a
                 // mid-file tear with unreachable valid-CRC frames past it --
@@ -1388,13 +1389,13 @@ public final class MmapSegment implements QuietCloseable {
     }
 
     /**
-     * Whether the scan's torn tail is exactly the open record it judged
-     * recoverable: valid with committed rows, at the recovery boundary, with
-     * nothing but zeroes past its reservation.
+     * Whether the scan's torn tail is exactly an open record it judged valid, with
+     * or without committed rows: at the recovery boundary, with nothing but
+     * zeroes past its reservation. An open record that failed validation, or any
+     * other byte past the boundary, is not.
      */
-    private static boolean isRecoverableOpenRecordTail(long addr, long fileSize, RecoveryScan scan) {
-        if (scan.openRecordOffset < 0 || scan.openRecordOffset != scan.lastGood
-                || !scan.isOpenRecordValid || scan.openRecordRows <= 0) {
+    private static boolean isValidOpenRecordTail(long addr, long fileSize, RecoveryScan scan) {
+        if (scan.openRecordOffset < 0 || scan.openRecordOffset != scan.lastGood || !scan.isOpenRecordValid) {
             return false;
         }
         long reservationEnd = scan.openRecordOffset + FRAME_HEADER_SIZE + scan.openRecordCapacity;

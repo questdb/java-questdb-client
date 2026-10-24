@@ -7402,7 +7402,7 @@ public class QwpWebSocketSender implements Sender {
      * batch does not have to re-encode them.
      * <p>
      * Delta mode anchors every section at {@code sentMaxSymbolId + 1}, and that
-     * watermark only advances when a frame is published. Symbols an abandoned
+     * watermark only advances when a record seals. Symbols an abandoned
      * batch registered therefore sit permanently between the watermark and the
      * dictionary tip: the next batch that touches ANY newer id spans them again,
      * so the section never shrinks and the sender stays wedged on the very cap
@@ -7417,7 +7417,7 @@ public class QwpWebSocketSender implements Sender {
      *       send loop's catch-up mirror;</li>
      *   <li>{@code id < pd.size()} is in the {@code .symbol-dict} that recovery
      *       replays positionally -- the write-ahead persist runs BEFORE the
-     *       publish, so a persist that succeeded under a publish that failed
+     *       record's seal, so a persist that succeeded under a seal that failed
      *       leaves durable ids above the watermark.</li>
      * </ul>
      * Handing either to a different string is the silent misattribution the dense
@@ -7904,11 +7904,13 @@ public class QwpWebSocketSender implements Sender {
         pendingRowCount = 0;
         pendingBytes = 0;
         firstPendingRowTimeNanos = 0;
-        clearSavepointAndRejection();
-        resetDecimalScalesAfterSeal();
+        // The switch follows the seal (spec 4.4) and precedes everything that
+        // could still throw, so delta mode never outlives a short .symbol-dict.
         if (persistFailure != null) {
             disableDeltaDict(persistFailure);
         }
+        clearSavepointAndRejection();
+        resetDecimalScalesAfterSeal();
         armIfEligible();
     }
 
@@ -7936,7 +7938,16 @@ public class QwpWebSocketSender implements Sender {
             } else {
                 // The seal the row forced switched the sender to full-dictionary
                 // mode: every other table buffer is empty, and this row is the
-                // frame path's first pending row.
+                // frame path's first pending row. It skipped the frame path's
+                // at()-time cap guard, so apply it here: an over-cap row fails
+                // alone instead of becoming a batch every flush() rejects.
+                int cap = serverMaxBatchSize;
+                if (cap > 0 && rowBytes > cap) {
+                    discardStagedRow(currentTableBuffer, columnsBeforeRow);
+                    throw new LineSenderException("row too large for server batch cap")
+                            .put(" [rowBytes=").put(rowBytes)
+                            .put(", serverMaxBatchSize=").put(cap).put(']');
+                }
                 firstPendingRowTimeNanos = System.nanoTime();
                 pendingRowCount = 1;
                 rowsAppended++;
