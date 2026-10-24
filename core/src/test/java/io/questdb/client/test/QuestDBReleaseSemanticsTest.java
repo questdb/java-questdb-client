@@ -28,6 +28,7 @@ import io.questdb.client.QuestDB;
 import io.questdb.client.LineSenderServerException;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.impl.PooledSender;
 import io.questdb.client.test.cutlass.qwp.client.QwpWireTestUtils;
@@ -107,6 +108,38 @@ public class QuestDBReleaseSemanticsTest {
                     Assert.assertFalse("the failed row's column never ships", containsAscii(frame, "discarded_column"));
                     Assert.assertFalse("the reset row's column never ships", containsAscii(frame, "reset_column"));
                     Assert.assertFalse("the reset row never ships", containsAscii(frame, "dropped-by-reset"));
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testFailedShipRetiresTheSlotAndNamesTheRecoverableRows() throws Exception {
+        FrameLog log = new FrameLog();
+        try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            // commit_rows=1: every release closes the window and seals the open record
+            try (QuestDB db = QuestDB.connect(config(server.getPort(),
+                    "commit_rows=1;commit_interval_ms=60000;auto_flush_interval=60000;housekeeper_interval_ms=60000;"))) {
+                Sender retired = null;
+                boolean hasCloseThrown = false;
+                try (Sender s = db.borrowSender()) {
+                    retired = ((PooledSender) s).getDelegateForTesting();
+                    Assert.assertTrue("memory mode puts rows into an open record", ((QwpWebSocketSender) retired).isOpenRecordMode());
+                    ((QwpWebSocketSender) retired).setRecordSealFaultForTesting(() -> {
+                        throw new IllegalStateException("injected seal failure");
+                    });
+                    s.table("t").longColumn("v", 1L).atNow();
+                } catch (LineSenderException e) {
+                    hasCloseThrown = true;
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("slot retired with 1 row(s) not yet shipped "
+                            + "(recoverable from the slot's store-and-forward directory when sf_dir is set): "));
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("cursor SF record seal failed"));
+                }
+                Assert.assertTrue("the release's seal fails and close() reports the retirement", hasCloseThrown);
+                try (Sender s = db.borrowSender()) {
+                    Assert.assertNotSame("the retired slot is replaced", retired, ((PooledSender) s).getDelegateForTesting());
                 }
             }
         }
@@ -355,6 +388,13 @@ public class QuestDBReleaseSemanticsTest {
                 }
                 Assert.assertTrue("160 KiB of rows need several records, got " + log.dataFrames() + " data frame(s)",
                         log.dataFrames() >= 6);
+                // A record seals only when the next 4 KiB row no longer fits its 32 KiB, so
+                // it holds over half the cap: 160 KiB of rows take at most
+                // ceil(160 KiB / 16 KiB) = 10 records. With the warm-up frame and one frame
+                // of slack the bound is 12, which a frame per release (41) fails.
+                int maxDataFrames = 1 + (40 * pad.length() + cap / 2 - 1) / (cap / 2) + 1;
+                Assert.assertTrue("rows of several leases share a record, got " + log.dataFrames() + " data frame(s)",
+                        log.dataFrames() <= maxDataFrames);
             }
         }
     }

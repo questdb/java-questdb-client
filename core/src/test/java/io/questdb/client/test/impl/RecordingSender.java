@@ -59,10 +59,14 @@ class RecordingSender implements Sender {
     volatile RuntimeException latchedError;    // thrown by checkError() when set
     volatile CountDownLatch markSavepointGate; // markSavepoint() blocks on it when set
     volatile int pendingRows;
+    volatile RuntimeException publishError;    // thrown by publishPending() when set
     volatile boolean ringBusy;                 // tryFlush() returns false without flushing when set
     volatile boolean rowInProgress;
     volatile long rowsAppended;
     volatile int savepointRows;
+    // transaction=on, which QuestDBBuilder injects with a commit window: the
+    // real sender's auto-flush then seals flagged defer-commit
+    volatile boolean transactional;
 
     @Override
     public void at(long timestamp, ChronoUnit unit) {
@@ -83,8 +87,14 @@ class RecordingSender implements Sender {
 
     @Override
     public void autoFlushIfDue() {
+        // Like the real sender: an auto-flush seals with the transactional flag,
+        // so with transaction=on it ships a flagged frame and the group stays open.
         if (autoFlushDue) {
-            flush();
+            if (transactional) {
+                flushDeferred();
+            } else {
+                flush();
+            }
         }
     }
 
@@ -238,6 +248,10 @@ class RecordingSender implements Sender {
 
     @Override
     public void publishPending() {
+        RuntimeException e = publishError;
+        if (e != null) {
+            throw e;
+        }
         // Like the open record's publish: the rows stay pending, and a later
         // resetToSavepoint() keeps them.
         publishCount.incrementAndGet();

@@ -31,6 +31,7 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
 import io.questdb.client.cutlass.qwp.client.BatchTooLargeForCapException;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.Decimal256;
 import io.questdb.client.std.Decimal64;
@@ -178,11 +179,14 @@ public final class PooledSender implements Sender {
      * delegate that has latched a terminal error is retired instead of being
      * returned, and a new {@link LineSenderException} is thrown here whose
      * cause is the delegate's error and whose message carries the number of rows
-     * not yet shipped at the retirement. The count lives on the wrapper of a
-     * non-server failure; the typed server branch below carries none. A lease body
-     * that already threw the typed error keeps it as the primary exception, with
-     * close's wrapper suppressed. The typed error and its classification live on
-     * the cause.
+     * not yet shipped at the retirement; for a sender with an open record, whose
+     * close seals them into the ring, it adds that they are recoverable from the
+     * slot's store-and-forward directory when {@code sf_dir} is set, and rows the
+     * cap rollback below discarded are counted apart. The count lives on the
+     * wrapper of a non-server failure; the typed server branch below carries
+     * none. A lease body that already threw the typed error keeps it as the
+     * primary exception, with close's wrapper suppressed. The typed error and its
+     * classification live on the cause.
      * <p>
      * A server batch cap rejection ({@link BatchTooLargeForCapException}, retained
      * by an auto-flush or thrown by the release's own flush) can only come from a
@@ -225,6 +229,7 @@ public final class PooledSender implements Sender {
         RuntimeException failure = null;
         BatchTooLargeForCapException capRejection = null;
         int droppedLeaseRows = 0;
+        boolean isOpenRecordAtRetire = false;
         int pendingRowsAtRetire = 0;
         try {
             // live(), not delegate(): re-validate the generation right before
@@ -282,7 +287,10 @@ public final class PooledSender implements Sender {
                 // once this finally returns. Rows a rollback above dropped are
                 // lost with the slot as well.
                 try {
-                    pendingRowsAtRetire = droppedLeaseRows + slot.delegate().pendingRowCount();
+                    Sender retired = slot.delegate();
+                    pendingRowsAtRetire = retired.pendingRowCount();
+                    isOpenRecordAtRetire = retired instanceof QwpWebSocketSender
+                            && ((QwpWebSocketSender) retired).isOpenRecordMode();
                 } catch (Throwable ignored) {
                     // best effort: the count is only for the message
                 }
@@ -301,9 +309,13 @@ public final class PooledSender implements Sender {
                     ? ((BatchTooLargeForCapException) failure).getDetail()
                     : failure.getMessage();
             boolean retryable = failure instanceof LineSenderException && ((LineSenderException) failure).isRetryable();
+            // Only an open record's rows are sealed into the ring when the slot's
+            // close runs; rows the cap rollback discarded are gone.
             LineSenderException wrapper = new LineSenderException("pooled sender close failed, slot retired with "
-                    + pendingRowsAtRetire + " row(s) not yet shipped (recoverable from the slot's store-and-forward "
-                    + "directory when sf_dir is set): " + msg, retryable);
+                    + pendingRowsAtRetire + " row(s) not yet shipped"
+                    + (isOpenRecordAtRetire ? " (recoverable from the slot's store-and-forward directory when sf_dir is set)" : "")
+                    + (droppedLeaseRows > 0 ? ", " + droppedLeaseRows + " row(s) of this lease dropped by the cap rollback" : "")
+                    + ": " + msg, retryable);
             wrapper.initCause(failure);
             throw wrapper;
         }
@@ -500,12 +512,13 @@ public final class PooledSender implements Sender {
     }
 
     /**
-     * Publishes the rows appended so far into the slot's open record without
-     * shipping them, exactly what {@link #close()} does first: they become
-     * recoverable and a later {@link #reset()} keeps them. A sender in
-     * full-dictionary mode has no open record and flushes instead. Forwards to
-     * the delegate's {@link Sender#publishPending()}, not to this handle's
-     * {@link #flush()}, so it neither ships a frame nor commits a window.
+     * Does what {@link #close()} does first: forwards to the delegate's
+     * {@link Sender#publishPending()}, not to this handle's {@link #flush()}. On a
+     * sender with an open record the rows appended so far become recoverable
+     * without shipping, a later {@link #reset()} keeps them, and no frame ships
+     * and no commit window closes. A sender in full-dictionary mode has no open
+     * record and flushes instead: the rows ship in an unflagged frame, which
+     * commits.
      */
     @Override
     public void publishPending() {
@@ -514,11 +527,14 @@ public final class PooledSender implements Sender {
 
     /**
      * Discards the rows appended through this lease and keeps the rows earlier
-     * leases left in the slot's buffer: the pool marks a savepoint at borrow and
-     * this rolls back to it ({@link Sender#resetToSavepoint()}). After a flush
-     * inside the lease, explicit or by auto-flush, every pending row is this
-     * lease's own and all of them go. Use it to drop a batch the server cannot
-     * accept, for example after a {@code BatchTooLargeForCapException}.
+     * leases left in the slot: the pool marks a savepoint at borrow and this
+     * rolls back to it ({@link Sender#resetToSavepoint()}). A
+     * {@link #publishPending()} inside the lease moves the savepoint to the rows
+     * published so far, so a later reset keeps them and discards only the rows
+     * appended since. After a flush inside the lease, explicit or by auto-flush,
+     * every pending row is this lease's own and all of them go. Use it to drop a
+     * batch the server cannot accept, for example after a
+     * {@code BatchTooLargeForCapException}.
      */
     @Override
     public void reset() {

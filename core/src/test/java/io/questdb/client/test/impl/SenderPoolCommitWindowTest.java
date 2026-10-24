@@ -77,6 +77,34 @@ public class SenderPoolCommitWindowTest {
     }
 
     @Test
+    public void testAutoFlushInsideTheWindowShipsFlaggedAndTheClosingReleaseCommits() {
+        List<RecordingSender> built = new ArrayList<>();
+        try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(1, 1, built)) {
+            pool.setCommitWindow(3, 60_000L);
+            RecordingSender d;
+            try (Sender s = pool.borrow()) {
+                d = built.get(0);
+                d.transactional = true;                  // transaction=on, which QuestDBBuilder injects with a window
+                d.autoFlushDue = true;                   // every release finds an auto-flush threshold due
+                s.table("t").longColumn("v", 1L).atNow();
+            }
+            Assert.assertEquals("the auto-flush at a non-closing release ships a flagged frame", 1, d.deferredFlushCount.get());
+            Assert.assertTrue("the group stays open", d.hasDeferredFrames());
+            Assert.assertEquals("nothing committed", 0, d.flushCount.get());
+            borrowAppendClose(pool, 2L);
+            Assert.assertEquals(2, d.deferredFlushCount.get());
+            Assert.assertEquals(0, d.flushCount.get());
+            // 3 rows in the window: had a flagged auto-flush marked the commit, the
+            // window would count fewer rows here and this release would not commit
+            borrowAppendClose(pool, 3L);
+            Assert.assertEquals("the closing release flushes once, which commits the group", 1, d.flushCount.get());
+            Assert.assertEquals("and does not auto-flush on top", 2, d.deferredFlushCount.get());
+            Assert.assertFalse(d.hasDeferredFrames());
+            Assert.assertEquals(0, d.pendingRowCount());
+        }
+    }
+
+    @Test
     public void testDrainResetsTheWindow() {
         List<RecordingSender> built = new ArrayList<>();
         try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(1, 1, built)) {

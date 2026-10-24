@@ -2923,6 +2923,17 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Whether rows go into an open record: {@link #publishPending()} publishes
+     * them without shipping and {@link #close()} seals them into the cursor ring,
+     * so with {@code sf_dir} they are recoverable. False in full-dictionary mode,
+     * which keeps pending rows in the per-table buffers until a flush encodes a
+     * frame. A pooled close reads it to word the row count of a retired slot.
+     */
+    public boolean isOpenRecordMode() {
+        return useOpenRecord();
+    }
+
+    /**
      * Whether the symbol-dictionary recycle is currently armed. Set by
      * {@link #armIfEligible()} at the tail of every flush (and immediately by
      * {@link #resetSymbolDictionary()} when no row or flush is in progress).

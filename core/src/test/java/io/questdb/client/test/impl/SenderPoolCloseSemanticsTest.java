@@ -33,6 +33,7 @@ import io.questdb.client.LineSenderServerException;
 import io.questdb.client.Sender;
 import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.BatchTooLargeForCapException;
 import io.questdb.client.impl.PooledSender;
 import io.questdb.client.impl.SenderPool;
 import org.junit.Assert;
@@ -70,8 +71,8 @@ public class SenderPoolCloseSemanticsTest {
                 Assert.fail("close() must propagate the ship failure");
             } catch (LineSenderException e) {
                 Assert.assertSame(original, e.getCause());
-                Assert.assertTrue(e.getMessage(), e.getMessage().contains("slot retired with 1 row(s) not yet shipped "
-                        + "(recoverable from the slot's store-and-forward directory when sf_dir is set): auto-flush ship failed"));
+                // the double has no open record, so the rows are not claimed recoverable
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains("slot retired with 1 row(s) not yet shipped: auto-flush ship failed"));
             }
             Assert.assertEquals("the release published the rows before the ship failed", 1, delegate.publishCount.get());
             Assert.assertEquals("slot must be retired, not stranded", 0, pool.totalSize());
@@ -96,6 +97,36 @@ public class SenderPoolCloseSemanticsTest {
             } catch (LineSenderException e) {
                 Assert.assertSame(original, e.getCause());
                 Assert.assertTrue(e.getMessage().contains("latched during cancel"));
+            }
+            Assert.assertEquals("slot must be retired, not stranded", 0, pool.totalSize());
+            Assert.assertEquals(1, delegate.closeCount.get());
+        }
+    }
+
+    @Test
+    public void testCapRollbackThatStillFailsRetiresTheSlotAndCountsTheDroppedRows() {
+        List<RecordingSender> built = new ArrayList<>();
+        try (SenderPool pool = newPool(1, 1, built)) {
+            try (Sender a = pool.borrow()) {
+                a.table("t").longColumn("v", 1L).atNow();       // published at A's release
+            }
+            RecordingSender delegate = built.get(0);
+            Sender b = pool.borrow();
+            b.table("t").longColumn("v", 2L).atNow();
+            b.table("t").longColumn("v", 3L).atNow();
+            // A frame-path sender: the release's publish is a flush the cap rejects,
+            // and the retry after the rollback is rejected too.
+            delegate.publishError = new BatchTooLargeForCapException("batch too large for server batch cap");
+            delegate.flushError = new BatchTooLargeForCapException("batch too large for server batch cap");
+            try {
+                b.close();
+                Assert.fail("close() must report the retirement");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getCause() instanceof BatchTooLargeForCapException);
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains(
+                        "slot retired with 1 row(s) not yet shipped, 2 row(s) of this lease dropped by the cap rollback: "));
+                Assert.assertFalse("rows of a sender without an open record are not claimed recoverable",
+                        e.getMessage().contains("recoverable"));
             }
             Assert.assertEquals("slot must be retired, not stranded", 0, pool.totalSize());
             Assert.assertEquals(1, delegate.closeCount.get());
@@ -328,6 +359,29 @@ public class SenderPoolCloseSemanticsTest {
             }
             Assert.assertEquals("only the second lease's close published; the stale call never reached the delegate",
                     3, delegate.publishCount.get());
+        }
+    }
+
+    @Test
+    public void testPublishThrowingAtCloseRetiresSlot() {
+        List<RecordingSender> built = new ArrayList<>();
+        try (SenderPool pool = newPool(1, 1, built)) {
+            Sender first = pool.borrow();
+            RecordingSender delegate = built.get(0);
+            LineSenderException original = new LineSenderException("publish failed");
+            delegate.publishError = original;
+            delegate.autoFlushDue = true;                        // a release past the publish would flush here
+            first.table("t").longColumn("v", 1L).atNow();
+            try {
+                first.close();
+                Assert.fail("close() must propagate the publish failure");
+            } catch (LineSenderException e) {
+                Assert.assertSame(original, e.getCause());
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains("slot retired with 1 row(s) not yet shipped: publish failed"));
+            }
+            Assert.assertEquals("the failed publish stops the release before autoFlushIfDue()", 0, delegate.flushCount.get());
+            Assert.assertEquals("slot must be retired, not stranded", 0, pool.totalSize());
+            Assert.assertEquals(1, delegate.closeCount.get());
         }
     }
 

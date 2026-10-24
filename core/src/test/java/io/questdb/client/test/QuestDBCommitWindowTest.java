@@ -56,7 +56,7 @@ public class QuestDBCommitWindowTest {
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
             try (QuestDB db = QuestDB.connect(config(server.getPort(), "commit_rows=1000;commit_interval_ms=100;housekeeper_interval_ms=60000;auto_flush_interval=60000;"))) {
                 try (Sender s = db.borrowSender()) {
-                    s.table("t").longColumn("v", 1L).atNow();
+                    s.table("t").stringColumn("s", "age-row-1").atNow();
                 }
                 // Hold the only slot across the window: the settle skips a leased slot (it
                 // would otherwise commit the idle group on its 100 ms cadence), so the
@@ -64,11 +64,12 @@ public class QuestDBCommitWindowTest {
                 try (Sender s = db.borrowSender()) {
                     Thread.sleep(150);
                     Assert.assertEquals("the first release published its row and shipped nothing", 0, log.dataFrames());
-                    s.table("t").longColumn("v", 2L).atNow();
+                    s.table("t").stringColumn("s", "age-row-2").atNow();
                 }
-                log.awaitDataFrames(1, 5_000);
-                Assert.assertFalse("the release that closes the window commits", log.deferFlag(0));
+                log.awaitAscii("age-row-1", 5_000);
+                log.awaitAscii("age-row-2", 5_000);
                 Assert.assertEquals("both rows ride in the one committing frame", 1, log.dataFrames());
+                Assert.assertFalse("the release that closes the window commits", log.deferFlag(0));
             }
         }
     }
@@ -127,10 +128,16 @@ public class QuestDBCommitWindowTest {
             // settle cadence 60 s: only the release that fills the window ships
             try (QuestDB db = QuestDB.connect(config(server.getPort(),
                     "commit_rows=3;commit_interval_ms=60000;housekeeper_interval_ms=60000;auto_flush_interval=60000;"))) {
-                QuestDBReleaseSemanticsTest.appendThreeRowsInThreeLeases(db);
-                log.awaitDataFrames(1, 5_000);
-                Assert.assertFalse("the third release fills the window: unflagged, commits the group", log.deferFlag(0));
+                for (int i = 0; i < 3; i++) {
+                    try (Sender s = db.borrowSender()) {
+                        s.table("t").stringColumn("s", "window-row-" + i).atNow();
+                    }
+                }
+                for (int i = 0; i < 3; i++) {
+                    log.awaitAscii("window-row-" + i, 5_000);
+                }
                 Assert.assertEquals("the first two releases only published: one frame carries the three rows", 1, log.dataFrames());
+                Assert.assertFalse("the third release fills the window: unflagged, commits the group", log.deferFlag(0));
                 Assert.assertEquals("no separate commit message when the closing frame carries rows", 0, log.commitFrames());
             }
         }

@@ -142,17 +142,18 @@ public interface QuestDB extends Closeable {
      * into the slot's store-and-forward ring without shipping them, then returns
      * the slot. Published rows survive a later lease's {@link Sender#reset()}
      * and, with {@code sf_dir}, a crash of the process; recoverable means in the
-     * client's ring, not acknowledged by the server. The rows ship when an
-     * auto-flush threshold trips on a later append or release (usually the
-     * oldest row turning older than {@code auto_flush_interval}), when the
-     * slot's open record fills, when the commit window closes, or when the
-     * housekeeper settles the idle slot, within about one
-     * {@code auto_flush_interval} of it going idle. A lease that holds the slot
-     * without appending or closing holds those rows back until it does. Call
-     * {@link Sender#flush()} to ship now and {@link Sender#drain(long)} to wait
-     * for the server. A sender in full-dictionary mode (its slot's symbol
-     * dictionary file could not be opened or written) has no open record: its
-     * {@code close()} ships the lease's rows in a frame of their own, which keeps
+     * client's ring, not acknowledged by the server. The release itself ships
+     * the slot's rows when an auto-flush threshold is already due (usually the
+     * oldest row older than {@code auto_flush_interval}) or when it closes the
+     * commit window. Otherwise the rows ship when a threshold trips on a later
+     * append or release, when the slot's open record fills, when a later
+     * release closes the commit window, or when the housekeeper settles the
+     * idle slot, within about one {@code auto_flush_interval} of it going idle.
+     * A lease that holds the slot without appending or closing holds those rows
+     * back until it does. Call {@link Sender#flush()} to ship now and
+     * {@link Sender#drain(long)} to wait for the server. A sender in
+     * full-dictionary mode (its slot's symbol dictionary file could not be
+     * opened or written) has no open record: its {@code close()} ships the lease's rows in a frame of their own, which keeps
      * them recoverable at the cost of one frame per close. Otherwise one frame
      * carries the rows of every lease that closed since the last ship, so a
      * server rejection of that frame discards those leases' rows together; the
