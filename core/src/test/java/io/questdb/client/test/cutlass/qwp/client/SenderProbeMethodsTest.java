@@ -28,7 +28,7 @@ import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
-import io.questdb.client.test.QuestDBFlushOnCloseTest;
+import io.questdb.client.test.QuestDBReleaseSemanticsTest;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.DelegatingFilesFacade;
 import io.questdb.client.test.tools.TestUtils;
@@ -62,7 +62,7 @@ public class SenderProbeMethodsTest {
 
     @Test
     public void testAutoFlushIfDueShipsOnlyRowsOlderThanTheInterval() throws Exception {
-        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+        QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
@@ -107,7 +107,7 @@ public class SenderProbeMethodsTest {
 
     @Test
     public void testCrossingRowInATransactionShipsTheRowsBeforeItDeferred() throws Exception {
-        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+        QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.setAdvertisedMaxBatchSize(4 * 1024);
             server.start();
@@ -115,11 +115,11 @@ public class SenderProbeMethodsTest {
             // transaction=on, which a commit window injects: the rows the full record
             // holds ship inside the open transaction, and only flush() commits it
             try (Sender sender = Sender.fromConfig(configWithoutAutoFlushBytes(server.getPort()) + "transaction=on;")) {
-                String wide = QuestDBFlushOnCloseTest.wideValue(1000);
+                String wide = QuestDBReleaseSemanticsTest.wideValue(1000);
                 for (int i = 0; i < 3; i++) {
                     sender.table("t").stringColumn("s", wide).atNow();
                 }
-                sender.table("t").stringColumn("s", QuestDBFlushOnCloseTest.wideValue(1500)).atNow();
+                sender.table("t").stringColumn("s", QuestDBReleaseSemanticsTest.wideValue(1500)).atNow();
                 Assert.assertEquals("only the crossing row stays buffered", 1, sender.pendingRowCount());
                 log.awaitDataFrames(1, 5_000);
                 Assert.assertTrue("the rows before the crossing row ship without committing", log.deferFlag(0));
@@ -135,20 +135,20 @@ public class SenderProbeMethodsTest {
 
     @Test
     public void testCrossingRowShipsTheRowsBeforeIt() throws Exception {
-        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+        QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.setAdvertisedMaxBatchSize(4 * 1024);
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
             // no auto_flush_bytes key: the byte trigger sits at 90% of the 4 KiB cap (3686 bytes)
             try (Sender sender = Sender.fromConfig(configWithoutAutoFlushBytes(server.getPort()))) {
-                String wide = QuestDBFlushOnCloseTest.wideValue(1000);
+                String wide = QuestDBReleaseSemanticsTest.wideValue(1000);
                 for (int i = 0; i < 3; i++) {
                     sender.table("t").stringColumn("s", wide).atNow();
                 }
                 // the 4 KiB record has no room for this 1.5 KB row: the sender seals the
                 // three rows before it into a frame and the row opens the next record
-                sender.table("t").stringColumn("s", QuestDBFlushOnCloseTest.wideValue(1500)).atNow();
+                sender.table("t").stringColumn("s", QuestDBReleaseSemanticsTest.wideValue(1500)).atNow();
                 Assert.assertEquals("only the crossing row stays buffered", 1, sender.pendingRowCount());
                 log.awaitDataFrames(1, 5_000);
                 sender.flush();
@@ -176,7 +176,7 @@ public class SenderProbeMethodsTest {
 
     @Test
     public void testDeferredFlushShipsFlaggedFrameAndFlushCommits() throws Exception {
-        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+        QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
@@ -206,7 +206,7 @@ public class SenderProbeMethodsTest {
 
     @Test
     public void testFlushAfterAnEmptySavepointResetShipsTheNextRow() throws Exception {
-        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+        QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
@@ -271,20 +271,20 @@ public class SenderProbeMethodsTest {
 
     @Test
     public void testHeldCrossingRowWithANewSymbolKeepsTheDictionaryGapFree() throws Exception {
-        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+        QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.setAdvertisedMaxBatchSize(4 * 1024);
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
             try (Sender sender = Sender.fromConfig(configWithoutAutoFlushBytes(server.getPort()))) {
                 Assert.assertTrue("memory mode selects delta mode", ((QwpWebSocketSender) sender).isDeltaDictEnabledForTest());
-                String wide = QuestDBFlushOnCloseTest.wideValue(1000);
+                String wide = QuestDBReleaseSemanticsTest.wideValue(1000);
                 for (int i = 0; i < 3; i++) {
                     sender.table("t").symbol("y", "a").stringColumn("s", wide).atNow();
                 }
                 // the crossing row registers "b", which the full record has no room
                 // for: "b" goes into the next record's dictionary with the row
-                sender.table("t").symbol("y", "b").stringColumn("s", QuestDBFlushOnCloseTest.wideValue(1500)).atNow();
+                sender.table("t").symbol("y", "b").stringColumn("s", QuestDBReleaseSemanticsTest.wideValue(1500)).atNow();
                 sender.flush();
                 sender.table("t").symbol("y", "b").atNow();
                 sender.flush();
@@ -301,14 +301,14 @@ public class SenderProbeMethodsTest {
 
     @Test
     public void testOverCapRowsShipInRecordSizedFramesAndCheckErrorStaysSilent() throws Exception {
-        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+        QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.setAdvertisedMaxBatchSize(4 * 1024);
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
             try (Sender sender = Sender.fromConfig(config(server.getPort()))) {
                 Assert.assertEquals("the cap is known once fromConfig returns", 4 * 1024, ((QwpWebSocketSender) sender).getServerMaxBatchSize());
-                String wide = QuestDBFlushOnCloseTest.wideValue(1000);
+                String wide = QuestDBReleaseSemanticsTest.wideValue(1000);
                 for (int i = 0; i < 6; i++) {
                     sender.table("t").stringColumn("s", wide).atNow();
                 }
@@ -327,7 +327,7 @@ public class SenderProbeMethodsTest {
 
     @Test
     public void testResetToSavepointAfterARecordFilledInTheLeaseDropsOnlyTheUnshippedRows() throws Exception {
-        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+        QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.setAdvertisedMaxBatchSize(4 * 1024);
             server.start();
@@ -335,7 +335,7 @@ public class SenderProbeMethodsTest {
             try (Sender sender = Sender.fromConfig(config(server.getPort()))) {
                 sender.table("t").longColumn("v", 1L).atNow();
                 sender.markSavepoint();
-                String wide = QuestDBFlushOnCloseTest.wideValue(1000);
+                String wide = QuestDBReleaseSemanticsTest.wideValue(1000);
                 for (int i = 0; i < 6; i++) {
                     sender.table("t").stringColumn("s", wide).atNow();
                 }
@@ -356,7 +356,7 @@ public class SenderProbeMethodsTest {
 
     @Test
     public void testResetToSavepointKeepsRowsBufferedBeforeTheMark() throws Exception {
-        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+        QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
@@ -384,7 +384,7 @@ public class SenderProbeMethodsTest {
 
     @Test
     public void testResetToSavepointReclaimsTheSymbolIdsOfTheDroppedRows() throws Exception {
-        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+        QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
@@ -431,14 +431,14 @@ public class SenderProbeMethodsTest {
 
     @Test
     public void testRowOverTheFrameBoundFailsOnItsAtAfterTheRowsBeforeItShip() throws Exception {
-        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+        QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.setAdvertisedMaxBatchSize(4 * 1024);
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
             // no auto_flush_bytes key: the byte trigger sits at 90% of the 4 KiB cap (3686 bytes)
             try (Sender sender = Sender.fromConfig(configWithoutAutoFlushBytes(server.getPort()))) {
-                String wide = QuestDBFlushOnCloseTest.wideValue(1000);
+                String wide = QuestDBReleaseSemanticsTest.wideValue(1000);
                 for (int i = 0; i < 3; i++) {
                     sender.table("t").stringColumn("s", wide).atNow();
                 }
@@ -459,14 +459,14 @@ public class SenderProbeMethodsTest {
 
     @Test
     public void testRowOverTheFrameBoundFailsOnItsAtWithTheByteTriggerOff() throws Exception {
-        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+        QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.setAdvertisedMaxBatchSize(4 * 1024);
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
             try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
                     + ";auto_flush_bytes=off;auto_flush_rows=4;auto_flush_interval=60000;close_flush_timeout_millis=0;")) {
-                String wide = QuestDBFlushOnCloseTest.wideValue(1000);
+                String wide = QuestDBReleaseSemanticsTest.wideValue(1000);
                 for (int i = 0; i < 3; i++) {
                     sender.table("t").stringColumn("s", wide).atNow();
                 }
@@ -482,7 +482,7 @@ public class SenderProbeMethodsTest {
 
     @Test
     public void testRowsOverTheCapWithTheByteTriggerOffShipInRecordSizedFrames() throws Exception {
-        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+        QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.setAdvertisedMaxBatchSize(4 * 1024);
             server.start();
@@ -491,7 +491,7 @@ public class SenderProbeMethodsTest {
             // record seals, and it does so before the rows exceed the cap
             try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
                     + ";auto_flush_bytes=off;auto_flush_rows=6;auto_flush_interval=60000;close_flush_timeout_millis=0;")) {
-                String wide = QuestDBFlushOnCloseTest.wideValue(1000);
+                String wide = QuestDBReleaseSemanticsTest.wideValue(1000);
                 for (int i = 0; i < 6; i++) {
                     sender.table("t").stringColumn("s", wide).atNow();
                 }
@@ -512,7 +512,7 @@ public class SenderProbeMethodsTest {
 
     @Test
     public void testSingleRowOverTheFrameBoundFailsOnItsAtAndLeavesNothingBuffered() throws Exception {
-        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+        QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.setAdvertisedMaxBatchSize(4 * 1024);
             server.start();
@@ -549,7 +549,7 @@ public class SenderProbeMethodsTest {
             try (QwpWebSocketSender sender = QwpWebSocketSender.connect(
                     "localhost", server.getPort(), null, 100_000, 0, 0L, null, false, engine, 0L)) {
                 Assert.assertFalse("setup: the full-dictionary frame path", sender.isDeltaDictEnabledForTest());
-                String pad = QuestDBFlushOnCloseTest.wideValue(128);
+                String pad = QuestDBReleaseSemanticsTest.wideValue(128);
                 boolean full = false;
                 for (int i = 0; i < 200 && !full; i++) {
                     sender.table("t").stringColumn("p", pad).longColumn("v", i).atNow();
@@ -577,7 +577,7 @@ public class SenderProbeMethodsTest {
 
     @Test
     public void testTryFlushShipsLikeFlushWhenTheRingHasRoom() throws Exception {
-        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+        QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
@@ -595,7 +595,7 @@ public class SenderProbeMethodsTest {
 
     @Test
     public void testUnsetAutoFlushBytesShipsAtTheAdvertisedCap() throws Exception {
-        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+        QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.setAdvertisedMaxBatchSize(16 * 1024);
             server.start();
@@ -603,7 +603,7 @@ public class SenderProbeMethodsTest {
             // no auto_flush_bytes key: the sender binds its byte trigger to 90% of the 16 KiB cap
             try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
                     + ";auto_flush_rows=1000000;auto_flush_interval=60000;close_flush_timeout_millis=0;")) {
-                String value = QuestDBFlushOnCloseTest.wideValue(1000);
+                String value = QuestDBReleaseSemanticsTest.wideValue(1000);
                 for (int i = 0; i < 20; i++) {
                     sender.table("t").stringColumn("s", value).atNow();
                 }
@@ -616,7 +616,7 @@ public class SenderProbeMethodsTest {
     }
 
     private static void assertRowTooLargeForTheFrameBound(Sender sender, String table, String column, int length) {
-        sender.table(table).stringColumn(column, QuestDBFlushOnCloseTest.wideValue(length));
+        sender.table(table).stringColumn(column, QuestDBReleaseSemanticsTest.wideValue(length));
         try {
             sender.atNow();
             Assert.fail("a row no record can take must fail on its own at()");

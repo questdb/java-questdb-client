@@ -74,7 +74,7 @@ public final class QuestDBImpl implements QuestDB {
                 acquireTimeoutMillis, idleTimeoutMillis, maxLifetimeMillis,
                 housekeeperIntervalMillis, queryCloseTimeoutMillis, null,
                 errorHandler, connectionListener, drainerListener,
-                false, housekeeperIntervalMillis, 0, 0L);
+                housekeeperIntervalMillis, 0, 0L);
     }
 
     public QuestDBImpl(
@@ -93,7 +93,6 @@ public final class QuestDBImpl implements QuestDB {
             SenderErrorHandler errorHandler,
             SenderConnectionListener connectionListener,
             BackgroundDrainerListener drainerListener,
-            boolean flushOnClose,
             long settleIntervalMillis,
             int commitRows,
             long commitIntervalMillis
@@ -102,7 +101,7 @@ public final class QuestDBImpl implements QuestDB {
                 acquireTimeoutMillis, idleTimeoutMillis, maxLifetimeMillis,
                 housekeeperIntervalMillis, queryCloseTimeoutMillis, null, null,
                 tokenProvider, errorHandler, connectionListener, drainerListener,
-                flushOnClose, settleIntervalMillis, commitRows, commitIntervalMillis);
+                settleIntervalMillis, commitRows, commitIntervalMillis);
     }
 
     // Test-only constructor exposing the senderFactory and connectHook seams:
@@ -130,7 +129,7 @@ public final class QuestDBImpl implements QuestDB {
                 acquireTimeoutMillis, idleTimeoutMillis, maxLifetimeMillis,
                 housekeeperIntervalMillis, QueryClientPool.DEFAULT_CLOSE_QUERY_TIMEOUT_MILLIS,
                 senderFactory, connectHook, null, null, null, null,
-                false, housekeeperIntervalMillis, 0, 0L);
+                housekeeperIntervalMillis, 0, 0L);
     }
 
     // Full constructor adding the ingest-side errorHandler/connectionListener/
@@ -156,7 +155,6 @@ public final class QuestDBImpl implements QuestDB {
             SenderErrorHandler errorHandler,
             SenderConnectionListener connectionListener,
             BackgroundDrainerListener drainerListener,
-            boolean flushOnClose,
             long settleIntervalMillis,
             int commitRows,
             long commitIntervalMillis
@@ -173,7 +171,6 @@ public final class QuestDBImpl implements QuestDB {
                     // server; the housekeeper drives it via runStartupRecoveryStep().
                     true,
                     errorHandler, connectionListener, drainerListener, tokenProvider);
-            builtSenderPool.setFlushOnClose(flushOnClose);
             if (commitRows > 0) {
                 builtSenderPool.setCommitWindow(commitRows, commitIntervalMillis);
             }

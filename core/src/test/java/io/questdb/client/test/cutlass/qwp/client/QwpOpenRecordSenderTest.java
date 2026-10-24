@@ -39,7 +39,7 @@ import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
 import io.questdb.client.std.Decimal64;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
-import io.questdb.client.test.QuestDBFlushOnCloseTest;
+import io.questdb.client.test.QuestDBReleaseSemanticsTest;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
@@ -70,7 +70,7 @@ public class QwpOpenRecordSenderTest {
     @Test
     public void testAutoFlushIntervalSealsOnNextAppend() throws Exception {
         assertMemoryLeak(() -> {
-            QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
             try (TestWebSocketServer server = startServer(log);
                  Oracle oracle = new Oracle();
                  Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
@@ -90,7 +90,7 @@ public class QwpOpenRecordSenderTest {
     @Test
     public void testAutoFlushRowsSealsAFrame() throws Exception {
         assertMemoryLeak(() -> {
-            QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
             try (TestWebSocketServer server = startServer(log);
                  Oracle oracle = new Oracle();
                  Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
@@ -111,7 +111,7 @@ public class QwpOpenRecordSenderTest {
     @Test
     public void testBlockRowLimitSealsAtOneMillionRows() throws Exception {
         assertMemoryLeak(() -> {
-            QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
             try (TestWebSocketServer server = startServer(log);
                  Oracle first = new Oracle();
                  Oracle second = new Oracle();
@@ -140,7 +140,7 @@ public class QwpOpenRecordSenderTest {
     @Test
     public void testCancelRowKeepsEarlierRows() throws Exception {
         assertMemoryLeak(() -> {
-            QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
             try (TestWebSocketServer server = startServer(log);
                  Oracle oracle = new Oracle();
                  Sender sender = Sender.fromConfig(config(server.getPort()))) {
@@ -163,7 +163,7 @@ public class QwpOpenRecordSenderTest {
     @Test
     public void testCancelledRowKeepsTheGeohashPrecisionAndDecimalScale() throws Exception {
         assertMemoryLeak(() -> {
-            QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
             try (TestWebSocketServer server = startServer(log);
                  Oracle oracle = new Oracle();
                  Sender sender = Sender.fromConfig(config(server.getPort()))) {
@@ -203,7 +203,7 @@ public class QwpOpenRecordSenderTest {
     @Test
     public void testCancelledRowSymbolIsReclaimedAndRegisteredOnce() throws Exception {
         assertMemoryLeak(() -> {
-            QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
             try (TestWebSocketServer server = startServer(log);
                  Oracle oracle = new Oracle();
                  Sender sender = Sender.fromConfig(config(server.getPort()))) {
@@ -231,7 +231,7 @@ public class QwpOpenRecordSenderTest {
     @Test
     public void testCloseSealsAndDrains() throws Exception {
         assertMemoryLeak(() -> {
-            QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
             try (TestWebSocketServer server = startServer(log);
                  Oracle oracle = new Oracle()) {
                 QwpTableBuffer t = oracle.block("t");
@@ -253,7 +253,7 @@ public class QwpOpenRecordSenderTest {
     @Test
     public void testDecimalScaleBindsPerRecord() throws Exception {
         assertMemoryLeak(() -> {
-            QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
             try (TestWebSocketServer server = startServer(log);
                  Oracle first = new Oracle();
                  Oracle second = new Oracle();
@@ -286,7 +286,7 @@ public class QwpOpenRecordSenderTest {
     @Test
     public void testFlushDeferredCarriesTheFlagAndFlushCommits() throws Exception {
         assertMemoryLeak(() -> {
-            QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
             try (TestWebSocketServer server = startServer(log);
                  Oracle oracle = new Oracle();
                  Sender sender = Sender.fromConfig(config(server.getPort()))) {
@@ -310,7 +310,7 @@ public class QwpOpenRecordSenderTest {
     @Test
     public void testOversizeSymbolFailsOnItsWriter() throws Exception {
         assertMemoryLeak(() -> {
-            QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
             try (TestWebSocketServer server = startServer(log, 64 * 1024);
                  Oracle oracle = new Oracle();
                  Sender sender = Sender.fromConfig(config(server.getPort()))) {
@@ -346,7 +346,7 @@ public class QwpOpenRecordSenderTest {
     @Test
     public void testPendingRowCountCountsRecordRows() throws Exception {
         assertMemoryLeak(() -> {
-            QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
             try (TestWebSocketServer server = startServer(log);
                  Oracle oracle = new Oracle();
                  Sender sender = Sender.fromConfig(config(server.getPort()))) {
@@ -374,7 +374,7 @@ public class QwpOpenRecordSenderTest {
     @Test
     public void testPublishPendingShipsNothingAndFlushShipsAll() throws Exception {
         assertMemoryLeak(() -> {
-            QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
             try (TestWebSocketServer server = startServer(log);
                  Oracle oracle = new Oracle();
                  Sender sender = Sender.fromConfig(config(server.getPort()))) {
@@ -398,7 +398,7 @@ public class QwpOpenRecordSenderTest {
     @Test
     public void testRecordSealFailureLatchesTheSenderTerminal() throws Exception {
         assertMemoryLeak(() -> {
-            QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
             try (TestWebSocketServer server = startServer(log);
                  Oracle oracle = new Oracle()) {
                 Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
@@ -446,7 +446,7 @@ public class QwpOpenRecordSenderTest {
     @Test
     public void testRecordSealFailureOnAnIllegalArgumentSkipsTheCommitAtClose() throws Exception {
         assertMemoryLeak(() -> {
-            QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
             try (TestWebSocketServer server = startServer(log);
                  Oracle oracle = new Oracle()) {
                 QwpWebSocketSender sender = (QwpWebSocketSender) Sender.fromConfig("ws::addr=localhost:" + server.getPort()
@@ -567,7 +567,7 @@ public class QwpOpenRecordSenderTest {
     @Test
     public void testResetDropsOnlyUnpublishedRows() throws Exception {
         assertMemoryLeak(() -> {
-            QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
             try (TestWebSocketServer server = startServer(log);
                  Oracle oracle = new Oracle();
                  Sender sender = Sender.fromConfig(config(server.getPort()))) {
@@ -587,7 +587,7 @@ public class QwpOpenRecordSenderTest {
     @Test
     public void testResetDropsTheColumnsOfUnpublishedRows() throws Exception {
         assertMemoryLeak(() -> {
-            QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
             try (TestWebSocketServer server = startServer(log);
                  Oracle oracle = new Oracle();
                  Sender sender = Sender.fromConfig(config(server.getPort()))) {
@@ -609,7 +609,7 @@ public class QwpOpenRecordSenderTest {
     @Test
     public void testRowLargerThanAnyRecordFailsOnItsOwnAt() throws Exception {
         assertMemoryLeak(() -> {
-            QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
             try (TestWebSocketServer server = startServer(log, 64 * 1024);
                  Oracle first = new Oracle();
                  Oracle second = new Oracle();
@@ -639,7 +639,7 @@ public class QwpOpenRecordSenderTest {
     @Test
     public void testRowLargerThanRemainingReservationSealsAndReopensOnce() throws Exception {
         assertMemoryLeak(() -> {
-            QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
             // a 48 KiB cap keeps every frame within the test server's 64 KiB receive buffer
             try (TestWebSocketServer server = startServer(log, 48 * 1024);
                  Oracle first = new Oracle();
@@ -678,7 +678,7 @@ public class QwpOpenRecordSenderTest {
     @Test
     public void testRowLargerThanRoomLeftAfterASealedRecordShipsThroughAFullCapacityRecord() throws Exception {
         assertMemoryLeak(() -> {
-            QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
             // a 60 KiB cap keeps every frame within the test server's 64 KiB receive buffer
             try (TestWebSocketServer server = startServer(log, 60 * 1024);
                  Oracle small = new Oracle();
@@ -741,7 +741,7 @@ public class QwpOpenRecordSenderTest {
     @Test
     public void testRowLargerThanTheRoomLeftShipsInAFreshSegment() throws Exception {
         assertMemoryLeak(() -> {
-            QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
             // a 60 KiB cap keeps every frame within the test server's 64 KiB receive buffer
             try (TestWebSocketServer server = startServer(log, 60 * 1024);
                  Oracle oracle = new Oracle()) {
@@ -789,7 +789,7 @@ public class QwpOpenRecordSenderTest {
     @Test
     public void testRowRefusedByAFullRecordKeepsItsDecimalScale() throws Exception {
         assertMemoryLeak(() -> {
-            QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
             String pad = TestUtils.repeat("x", 1200);
             try (TestWebSocketServer server = startServer(log, 4096);
                  Oracle first = new Oracle();
@@ -814,7 +814,7 @@ public class QwpOpenRecordSenderTest {
     @Test
     public void testRowWithColumnsInDifferentOrderLandsByName() throws Exception {
         assertMemoryLeak(() -> {
-            QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
             try (TestWebSocketServer server = startServer(log);
                  Oracle oracle = new Oracle();
                  Sender sender = Sender.fromConfig(config(server.getPort()))) {
@@ -838,7 +838,7 @@ public class QwpOpenRecordSenderTest {
     @Test
     public void testRowsAppendedThenFlushArriveAsOneFrame() throws Exception {
         assertMemoryLeak(() -> {
-            QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
             try (TestWebSocketServer server = startServer(log);
                  Oracle oracle = new Oracle();
                  Sender sender = Sender.fromConfig(config(server.getPort()))) {
@@ -860,7 +860,7 @@ public class QwpOpenRecordSenderTest {
     @Test
     public void testSymbolsRegisteredOnceAcrossReleases() throws Exception {
         assertMemoryLeak(() -> {
-            QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
             try (TestWebSocketServer server = startServer(log);
                  Oracle oracle = new Oracle();
                  Sender sender = Sender.fromConfig(config(server.getPort()))) {
@@ -892,7 +892,7 @@ public class QwpOpenRecordSenderTest {
     @Test
     public void testThousandTablesRoundRobinFitInOneRecord() throws Exception {
         assertMemoryLeak(() -> {
-            QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
             try (TestWebSocketServer server = startServer(log);
                  Oracle oracle = new Oracle();
                  Sender sender = Sender.fromConfig(config(server.getPort()))) {
@@ -931,7 +931,7 @@ public class QwpOpenRecordSenderTest {
     @Test
     public void testTwoTablesAndASchemaChangeProduceThreeBlocks() throws Exception {
         assertMemoryLeak(() -> {
-            QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+            QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
             try (TestWebSocketServer server = startServer(log);
                  Oracle oracle = new Oracle();
                  Sender sender = Sender.fromConfig(config(server.getPort()))) {
@@ -971,7 +971,7 @@ public class QwpOpenRecordSenderTest {
         return "ws::addr=localhost:" + port + ";auto_flush_bytes=off;auto_flush_rows=1000000;auto_flush_interval=60000;close_flush_timeout_millis=0;";
     }
 
-    static byte[] dataFrame(QuestDBFlushOnCloseTest.FrameLog log, int index) {
+    static byte[] dataFrame(QuestDBReleaseSemanticsTest.FrameLog log, int index) {
         int seen = -1;
         for (byte[] frame : log.frames()) {
             if (QwpWireTestUtils.tableCount(frame) > 0 && ++seen == index) {

@@ -78,11 +78,11 @@ public class QuestDBHousekeeperCadenceTest {
 
     @Test
     public void testHousekeeperIntervalAtLongMaxStillSettles() throws Exception {
-        QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
+        QuestDBReleaseSemanticsTest.FrameLog log = new QuestDBReleaseSemanticsTest.FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-            try (QuestDB db = QuestDB.connect(QuestDBFlushOnCloseTest.config(server.getPort(),
+            try (QuestDB db = QuestDB.connect(QuestDBReleaseSemanticsTest.config(server.getPort(),
                     "housekeeper_interval_ms=" + Long.MAX_VALUE + ";"))) {
                 try (Sender s = db.borrowSender()) {
                     s.table("t").longColumn("v", 1L).atNow();

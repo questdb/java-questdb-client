@@ -30,7 +30,7 @@ import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.impl.PooledSender;
-import io.questdb.client.test.QuestDBFlushOnCloseTest.FrameLog;
+import io.questdb.client.test.QuestDBReleaseSemanticsTest.FrameLog;
 import io.questdb.client.test.cutlass.qwp.client.QwpWireTestUtils;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
@@ -40,9 +40,11 @@ import java.io.IOException;
 import java.util.concurrent.TimeUnit;
 
 /**
- * The commit window as the server sees it: flagged frames per close, one
- * unflagged frame per window, a rowless commit message for an idle tail, and
- * the client's reaction to a rejected frame inside a group.
+ * The commit window as the server sees it: releases inside the window publish
+ * and ship nothing, the release that closes the window ships one unflagged
+ * frame, frames flagged defer-commit come from flushes inside a lease, a rowless
+ * commit message commits an idle group, and the client reacts to a rejected
+ * frame inside a group.
  */
 public class QuestDBCommitWindowTest {
 
@@ -61,11 +63,12 @@ public class QuestDBCommitWindowTest {
                 // release below is the first thing to find the group older than the window.
                 try (Sender s = db.borrowSender()) {
                     Thread.sleep(150);
+                    Assert.assertEquals("the first release published its row and shipped nothing", 0, log.dataFrames());
                     s.table("t").longColumn("v", 2L).atNow();
                 }
-                log.awaitDataFrames(2, 5_000);
-                Assert.assertTrue(log.deferFlag(0));
-                Assert.assertFalse(log.deferFlag(1));
+                log.awaitDataFrames(1, 5_000);
+                Assert.assertFalse("the release that closes the window commits", log.deferFlag(0));
+                Assert.assertEquals("both rows ride in the one committing frame", 1, log.dataFrames());
             }
         }
     }
@@ -101,6 +104,7 @@ public class QuestDBCommitWindowTest {
                     + "reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=50;")) {
                 try (Sender s = db.borrowSender()) {
                     s.table("t").longColumn("v", 1L).atNow();
+                    s.flushDeferred();                          // a flagged frame opens the group
                 }
                 try (Sender s = db.borrowSender()) {
                     s.table("t").longColumn("v", 2L).atNow();   // closes the window: the committing frame is rejected
@@ -115,17 +119,18 @@ public class QuestDBCommitWindowTest {
     }
 
     @Test
-    public void testRowsWindowShipsFlaggedFramesThenOneCommittingFrame() throws Exception {
+    public void testRowsWindowShipsOneCommittingFrameAtTheClosingRelease() throws Exception {
         FrameLog log = new FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-            try (QuestDB db = QuestDB.connect(config(server.getPort(), "commit_rows=3;commit_interval_ms=60000;housekeeper_interval_ms=60000;"))) {
-                QuestDBFlushOnCloseTest.appendThreeRowsInThreeLeases(db);
-                log.awaitDataFrames(3, 5_000);
-                Assert.assertTrue(log.deferFlag(0));
-                Assert.assertTrue(log.deferFlag(1));
-                Assert.assertFalse("third close fills the window: unflagged, commits the group", log.deferFlag(2));
+            // settle cadence 60 s: only the release that fills the window ships
+            try (QuestDB db = QuestDB.connect(config(server.getPort(),
+                    "commit_rows=3;commit_interval_ms=60000;housekeeper_interval_ms=60000;auto_flush_interval=60000;"))) {
+                QuestDBReleaseSemanticsTest.appendThreeRowsInThreeLeases(db);
+                log.awaitDataFrames(1, 5_000);
+                Assert.assertFalse("the third release fills the window: unflagged, commits the group", log.deferFlag(0));
+                Assert.assertEquals("the first two releases only published: one frame carries the three rows", 1, log.dataFrames());
                 Assert.assertEquals("no separate commit message when the closing frame carries rows", 0, log.commitFrames());
             }
         }
@@ -141,6 +146,7 @@ public class QuestDBCommitWindowTest {
             try (QuestDB db = QuestDB.connect(config(server.getPort(), "commit_rows=1000;commit_interval_ms=100;housekeeper_interval_ms=60000;"))) {
                 try (Sender s = db.borrowSender()) {
                     s.table("t").longColumn("v", 1L).atNow();
+                    s.flushDeferred();                          // the group's flagged frame; the release finds no rows left
                 }
                 log.awaitDataFrames(1, 5_000);
                 Assert.assertTrue(log.deferFlag(0));
@@ -165,6 +171,7 @@ public class QuestDBCommitWindowTest {
                     try (Sender s = db.borrowSender()) {
                         retiredDelegate = ((PooledSender) s).getDelegateForTesting();
                         s.table("t").longColumn("v", v).atNow();
+                        s.flushDeferred();                       // one flagged frame per lease
                     } catch (LineSenderServerException e) {
                         seen = e;
                     } catch (LineSenderException e) {
@@ -187,7 +194,7 @@ public class QuestDBCommitWindowTest {
     }
 
     private static String config(int port, String extra) {
-        return QuestDBFlushOnCloseTest.config(port, "flush_on_close=on;" + extra);
+        return QuestDBReleaseSemanticsTest.config(port, extra);
     }
 
     /**

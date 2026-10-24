@@ -60,7 +60,6 @@ public class PoolConfigHonoredTest {
             expected.put("idle_timeout_ms", 4321L);
             expected.put("max_lifetime_ms", 98765L);
             expected.put("housekeeper_interval_ms", 222L);
-            expected.put("flush_on_close", Boolean.TRUE);
             expected.put("commit_rows", 500);
             expected.put("commit_interval_ms", 250L);
 

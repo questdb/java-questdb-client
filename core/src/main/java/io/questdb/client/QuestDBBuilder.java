@@ -80,8 +80,6 @@ public final class QuestDBBuilder {
     private SenderConnectionListener connectionListener;
     private BackgroundDrainerListener drainerListener;
     private SenderErrorHandler errorHandler;
-    // null = not set explicitly; the string key or the default applies.
-    private Boolean flushOnClose;
     private long housekeeperIntervalMillis = UNSET;
     private HttpTokenProvider httpTokenProvider;
     private String config;
@@ -128,14 +126,15 @@ public final class QuestDBBuilder {
     }
 
     /**
-     * Age of a commit window in milliseconds. Setting a commit window makes
-     * pooled closes ship frames flagged defer-commit: the server appends them
-     * and commits once per window, when either {@link #commitRows(int)} rows
-     * or this many milliseconds have accumulated since the last commit. Acks
-     * then arrive at the commit, so a {@link Sender#drain(long)} should follow
-     * a {@link Sender#flush()}. Requires {@code flush_on_close=on}. When only
-     * one of the two window settings is given, the other takes the auto-flush
-     * default (1000 rows, 100 ms).
+     * Age of a commit window in milliseconds. Setting a commit window makes the
+     * server commit once per window: pooled closes publish the leases' rows, the
+     * close that finds either {@link #commitRows(int)} rows or this many
+     * milliseconds accumulated since the last commit ships them in a committing
+     * frame, and frames an auto-flush ships inside the window are flagged
+     * defer-commit, so the server appends them and commits at the window's end.
+     * Acks then arrive at the commit, so a {@link Sender#drain(long)} should
+     * follow a {@link Sender#flush()}. When only one of the two window settings
+     * is given, the other takes the auto-flush default (1000 rows, 100 ms).
      */
     public QuestDBBuilder commitIntervalMillis(long millis) {
         if (millis < 1) {
@@ -209,27 +208,6 @@ public final class QuestDBBuilder {
     }
 
     /**
-     * Whether {@code close()} on a borrowed sender flushes its rows before
-     * returning the slot. Off by default: close releases, flush ships, drain
-     * waits, and rows left in a slot ship within one auto-flush interval of
-     * the slot going idle, or at the next append or close on it after that
-     * interval. On restores the behaviour before 1.3.12, one frame and one WAL
-     * commit per close, which is the slow path for applications that borrow per message. In this
-     * client "flush" means published to the store-and-forward ring, not
-     * acknowledged by the server; use {@link Sender#drain(long)} for that.
-     * With {@code on} and no commit window every lease ships its own frame, so
-     * a server rejection cannot discard other leases' rows. With {@code off}
-     * leases share frames and a rejection covers all of them. With a commit
-     * window a rejection rolls back the whole open group, every lease since the
-     * last commit.
-     * Overrides {@code flush_on_close} in the config string.
-     */
-    public QuestDBBuilder flushOnClose(boolean flushOnClose) {
-        this.flushOnClose = flushOnClose;
-        return this;
-    }
-
-    /**
      * Builds the {@link QuestDB} handle. Validates both connect strings up
      * front -- so a malformed config fails here even when both pools have
      * {@code min == 0} and nothing connects -- then eagerly creates {@code min}
@@ -289,9 +267,6 @@ public final class QuestDBBuilder {
         resolvePoolLong(idleTimeoutMillis, "idle_timeout_ms", view, DEFAULT_IDLE_TIMEOUT_MILLIS, this::idleTimeoutMillis);
         resolvePoolLong(maxLifetimeMillis, "max_lifetime_ms", view, DEFAULT_MAX_LIFETIME_MILLIS, this::maxLifetimeMillis);
         resolvePoolLong(housekeeperIntervalMillis, "housekeeper_interval_ms", view, DEFAULT_HOUSEKEEPER_INTERVAL_MILLIS, this::housekeeperIntervalMillis);
-        if (flushOnClose == null) {
-            flushOnClose = view.getBool("flush_on_close", false);
-        }
         int windowRows = commitRows;
         if (windowRows == UNSET && view.has("commit_rows")) {
             windowRows = view.getInt("commit_rows", UNSET);
@@ -312,12 +287,6 @@ public final class QuestDBBuilder {
             }
             if (windowIntervalMillis == UNSET) {
                 windowIntervalMillis = DEFAULT_COMMIT_INTERVAL_MILLIS;
-            }
-            if (!flushOnClose) {
-                throw new IllegalArgumentException(
-                        "conflicting configuration: commit_rows/commit_interval_ms need flush_on_close=on in this version. "
-                                + "The buffered variant (flush_on_close=off with a commit window) is not available yet; "
-                                + "set flush_on_close=on or remove the commit window keys.");
             }
             String transaction = view.getStr("transaction");
             if (transaction != null && !"on".equalsIgnoreCase(transaction)) {
@@ -353,7 +322,6 @@ public final class QuestDBBuilder {
                 errorHandler,
                 connectionListener,
                 drainerListener,
-                flushOnClose,
                 settleIntervalMillis,
                 windowRows,
                 windowIntervalMillis
@@ -580,7 +548,6 @@ public final class QuestDBBuilder {
         m.put("idle_timeout_ms", idleTimeoutMillis);
         m.put("max_lifetime_ms", maxLifetimeMillis);
         m.put("housekeeper_interval_ms", housekeeperIntervalMillis);
-        m.put("flush_on_close", flushOnClose);
         m.put("commit_rows", resolvedCommitRows);
         m.put("commit_interval_ms", resolvedCommitIntervalMillis);
         return m;

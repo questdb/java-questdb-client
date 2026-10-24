@@ -244,56 +244,32 @@ public class QuestDBBuilderTest {
     }
 
     @Test
-    public void testFlushOnCloseBuilderCallOverridesString() {
-        QuestDBBuilder b = QuestDB.builder()
-                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=off;")
-                .flushOnClose(true);
-        try (QuestDB ignored = b.build()) {
-            Assert.assertEquals(Boolean.TRUE, b.poolConfigSnapshotForTest().get("flush_on_close"));
+    public void testFlushOnCloseKeyIsRejectedAsUnknown() {
+        // The open record made the key unnecessary: a pooled close publishes the
+        // lease's rows, so the key fails like any other unknown key.
+        try {
+            QuestDB.builder()
+                    .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=on;")
+                    .build()
+                    .close();
+            Assert.fail("expected build() to reject flush_on_close");
+        } catch (RuntimeException e) {
+            Assert.assertNotNull(e.getMessage());
+            Assert.assertTrue(e.getMessage(), e.getMessage().contains("unknown configuration key"));
+            Assert.assertTrue(e.getMessage(), e.getMessage().contains("flush_on_close"));
         }
-    }
-
-    @Test
-    public void testFlushOnCloseKeyParsedAndSnapshotted() {
-        QuestDBBuilder on = QuestDB.builder()
-                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=on;");
-        try (QuestDB ignored = on.build()) {
-            Assert.assertEquals(Boolean.TRUE, on.poolConfigSnapshotForTest().get("flush_on_close"));
-        }
-        QuestDBBuilder dflt = QuestDB.builder()
-                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;");
-        try (QuestDB ignored = dflt.build()) {
-            Assert.assertEquals("default is off", Boolean.FALSE, dflt.poolConfigSnapshotForTest().get("flush_on_close"));
-        }
-        QuestDBBuilder t = QuestDB.builder()
-                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=true;");
-        try (QuestDB ignored = t.build()) {
-            Assert.assertEquals(Boolean.TRUE, t.poolConfigSnapshotForTest().get("flush_on_close"));
-        }
-        QuestDBBuilder f = QuestDB.builder()
-                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=false;");
-        try (QuestDB ignored = f.build()) {
-            Assert.assertEquals(Boolean.FALSE, f.poolConfigSnapshotForTest().get("flush_on_close"));
-        }
-    }
-
-    @Test
-    public void testFlushOnCloseRejectsInvalidValue() {
-        assertBuildRejected(
-                "ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=maybe;",
-                "flush_on_close");
     }
 
     @Test
     public void testCommitWindowKeysParsedWithDefaults() {
         QuestDBBuilder rowsOnly = QuestDB.builder()
-                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=on;commit_rows=500;");
+                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;commit_rows=500;");
         try (QuestDB ignored = rowsOnly.build()) {
             Assert.assertEquals(500, rowsOnly.poolConfigSnapshotForTest().get("commit_rows"));
             Assert.assertEquals("interval defaults to the auto-flush default", 100L, rowsOnly.poolConfigSnapshotForTest().get("commit_interval_ms"));
         }
         QuestDBBuilder intervalOnly = QuestDB.builder()
-                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=on;commit_interval_ms=250;");
+                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;commit_interval_ms=250;");
         try (QuestDB ignored = intervalOnly.build()) {
             Assert.assertEquals("rows default to the auto-flush default", 1000, intervalOnly.poolConfigSnapshotForTest().get("commit_rows"));
             Assert.assertEquals(250L, intervalOnly.poolConfigSnapshotForTest().get("commit_interval_ms"));
@@ -309,7 +285,7 @@ public class QuestDBBuilderTest {
     @Test
     public void testCommitWindowBuilderCallsOverrideString() {
         QuestDBBuilder b = QuestDB.builder()
-                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=on;commit_rows=500;")
+                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;commit_rows=500;")
                 .commitRows(7)
                 .commitIntervalMillis(9L);
         try (QuestDB ignored = b.build()) {
@@ -332,12 +308,12 @@ public class QuestDBBuilderTest {
     @Test
     public void testWindowInjectsTransactionOnIntoIngestConfig() {
         QuestDBBuilder b = QuestDB.builder()
-                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=on;commit_rows=10;");
+                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;commit_rows=10;");
         try (QuestDB ignored = b.build()) {
             Assert.assertTrue(b.ingestConfigForTest().startsWith("ws::transaction=on;"));
         }
         QuestDBBuilder explicitOn = QuestDB.builder()
-                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=on;commit_rows=10;transaction=on;");
+                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;commit_rows=10;transaction=on;");
         try (QuestDB ignored = explicitOn.build()) {
             String resolved = explicitOn.ingestConfigForTest();
             Assert.assertEquals(resolved, resolved.indexOf("transaction=on;"), resolved.lastIndexOf("transaction=on;"));
@@ -353,18 +329,8 @@ public class QuestDBBuilderTest {
     @Test
     public void testWindowWithTransactionOffIsRejected() {
         assertBuildRejected(
-                "ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=on;commit_rows=10;transaction=off;",
+                "ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;commit_rows=10;transaction=off;",
                 "transaction");
-    }
-
-    @Test
-    public void testWindowWithoutFlushOnCloseIsRejected() {
-        assertBuildRejected(
-                "ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;commit_rows=10;",
-                "flush_on_close");
-        assertBuildRejected(
-                "ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=off;commit_interval_ms=10;",
-                "flush_on_close");
     }
 
     @Test
@@ -383,10 +349,10 @@ public class QuestDBBuilderTest {
     @Test
     public void testCommitWindowStringKeysBelowOneAreRejected() {
         assertBuildRejected(
-                "ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=on;commit_rows=0;",
+                "ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;commit_rows=0;",
                 "commit_rows");
         assertBuildRejected(
-                "ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;flush_on_close=on;commit_interval_ms=-5;",
+                "ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;commit_interval_ms=-5;",
                 "commit_interval_ms");
     }
 

@@ -46,7 +46,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * The pooled close() contract after the release-mode change: close releases,
+ * The pooled close() contract: close makes the rows recoverable and releases,
  * flush ships, drain waits. Drives {@link SenderPool} through its
  * {@code senderFactory} seam with {@link RecordingSender} doubles, so nothing
  * touches the network. The config string is parsed for store-and-forward
@@ -54,6 +54,30 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 public class SenderPoolCloseSemanticsTest {
     private static final String CONFIG = "http::addr=127.0.0.1:1;protocol_version=2;auto_flush=off;";
+
+    @Test
+    public void testAutoFlushThrowingAtCloseRetiresSlot() {
+        List<RecordingSender> built = new ArrayList<>();
+        try (SenderPool pool = newPool(1, 1, built)) {
+            Sender first = pool.borrow();
+            RecordingSender delegate = built.get(0);
+            LineSenderException original = new LineSenderException("auto-flush ship failed");
+            delegate.autoFlushDue = true;
+            delegate.flushError = original;
+            first.table("t").longColumn("v", 1L).atNow();
+            try {
+                first.close();
+                Assert.fail("close() must propagate the ship failure");
+            } catch (LineSenderException e) {
+                Assert.assertSame(original, e.getCause());
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains("slot retired with 1 row(s) not yet shipped "
+                        + "(recoverable from the slot's store-and-forward directory when sf_dir is set): auto-flush ship failed"));
+            }
+            Assert.assertEquals("the release published the rows before the ship failed", 1, delegate.publishCount.get());
+            Assert.assertEquals("slot must be retired, not stranded", 0, pool.totalSize());
+            Assert.assertEquals(1, delegate.closeCount.get());
+        }
+    }
 
     @Test
     public void testCancelRowThrowingAtCloseRetiresSlot() {
@@ -79,17 +103,37 @@ public class SenderPoolCloseSemanticsTest {
     }
 
     @Test
-    public void testCloseDoesNotFlushWithFlushOnCloseOff() {
+    public void testClosePublishesAndDoesNotFlush() {
         List<RecordingSender> built = new ArrayList<>();
         try (SenderPool pool = newPool(1, 1, built)) {
-            Assert.assertFalse(pool.isFlushOnClose());
             try (Sender s = pool.borrow()) {
                 s.table("t").longColumn("v", 1L).atNow();
             }
             RecordingSender delegate = built.get(0);
+            Assert.assertEquals("close() publishes the lease's rows", 1, delegate.publishCount.get());
             Assert.assertEquals("close() must not ship rows", 0, delegate.flushCount.get());
-            Assert.assertEquals("rows stay in the slot's buffer", 1, delegate.pendingRowCount());
+            Assert.assertEquals("rows stay in the slot's open record", 1, delegate.pendingRowCount());
             Assert.assertEquals("slot must be back on the free list", 1, pool.availableSize());
+        }
+    }
+
+    @Test
+    public void testCloseWithAgedRowsFlushesThroughAutoFlushIfDue() {
+        List<RecordingSender> built = new ArrayList<>();
+        try (SenderPool pool = newPool(1, 1, built)) {
+            try (Sender a = pool.borrow()) {
+                a.table("t").longColumn("v", 1L).atNow();
+            }
+            RecordingSender delegate = built.get(0);
+            Assert.assertEquals("no threshold due: the release only publishes", 0, delegate.flushCount.get());
+            delegate.autoFlushDue = true;                        // A's row is now older than auto_flush_interval
+            try (Sender b = pool.borrow()) {
+                b.table("t").longColumn("v", 2L).atNow();
+            }
+            Assert.assertEquals(2, delegate.publishCount.get());
+            Assert.assertEquals("a due threshold ships both leases' rows at the release", 1, delegate.flushCount.get());
+            Assert.assertEquals(0, delegate.pendingRowCount());
+            Assert.assertEquals(1, pool.availableSize());
         }
     }
 
@@ -113,36 +157,6 @@ public class SenderPoolCloseSemanticsTest {
             } catch (LineSenderException e) {
                 Assert.assertFalse("a non-retryable cause makes a non-retryable wrapper", e.isRetryable());
             }
-        }
-    }
-
-    @Test
-    public void testDirectPoolFlushesOnCloseByDefault() {
-        List<RecordingSender> built = new ArrayList<>();
-        try (SenderPool pool = newPoolWithDefaults(1, 1, Long.MAX_VALUE, built)) {
-            Assert.assertTrue("a direct pool has no housekeeper to settle released rows", pool.isFlushOnClose());
-            try (Sender s = pool.borrow()) {
-                s.table("t").longColumn("v", 1L).atNow();
-            }
-            RecordingSender delegate = built.get(0);
-            Assert.assertEquals(1, delegate.flushCount.get());
-            Assert.assertEquals(0, delegate.pendingRowCount());
-            Assert.assertEquals(1, pool.availableSize());
-        }
-    }
-
-    @Test
-    public void testFlushOnCloseRestoresShippingAtClose() {
-        List<RecordingSender> built = new ArrayList<>();
-        try (SenderPool pool = newPool(1, 1, built)) {
-            pool.setFlushOnClose(true);
-            try (Sender s = pool.borrow()) {
-                s.table("t").longColumn("v", 1L).atNow();
-            }
-            RecordingSender delegate = built.get(0);
-            Assert.assertEquals(1, delegate.flushCount.get());
-            Assert.assertEquals(0, delegate.pendingRowCount());
-            Assert.assertEquals(1, pool.availableSize());
         }
     }
 
@@ -222,28 +236,6 @@ public class SenderPoolCloseSemanticsTest {
     }
 
     @Test
-    public void testFlushDeferredThrowingAtCloseRetiresSlot() {
-        List<RecordingSender> built = new ArrayList<>();
-        try (SenderPool pool = newPool(1, 1, built)) {
-            pool.setFlushOnClose(true);
-            pool.setCommitWindow(1000, 60_000L);
-            Sender first = pool.borrow();
-            RecordingSender delegate = built.get(0);
-            LineSenderException original = new LineSenderException("deferred ship failed");
-            delegate.deferredFlushError = original;
-            first.table("t").longColumn("v", 1L).atNow();
-            try {
-                first.close();
-                Assert.fail("close() must propagate the deferred ship failure");
-            } catch (LineSenderException e) {
-                Assert.assertSame(original, e.getCause());
-            }
-            Assert.assertEquals("slot must be retired, not stranded", 0, pool.totalSize());
-            Assert.assertEquals(1, delegate.closeCount.get());
-        }
-    }
-
-    @Test
     public void testLatchedServerErrorAtCloseKeepsItsType() {
         List<RecordingSender> built = new ArrayList<>();
         try (SenderPool pool = newPool(1, 1, built)) {
@@ -285,7 +277,6 @@ public class SenderPoolCloseSemanticsTest {
                 built.add(s);
                 return s;
             });
-            pool.setFlushOnClose(false);
             try (Sender s = pool.borrow()) {
                 s.table("t").longColumn("v", 1L).atNow();
                 s.table("t").longColumn("v", 2L).atNow();
@@ -323,6 +314,34 @@ public class SenderPoolCloseSemanticsTest {
                 b.reset();
                 Assert.assertEquals("the flush emptied the savepoint, so reset drops every pending row", 0, delegate.pendingRowCount());
             }
+        }
+    }
+
+    @Test
+    public void testResetAfterPublishKeepsPublishedRows() {
+        List<RecordingSender> built = new ArrayList<>();
+        // markSavepoint() at borrow is a no-op here, as on a sender whose release
+        // already published every row: the release's publish alone keeps A's rows.
+        try (SenderPool pool = new SenderPool(CONFIG, 1, 1, 150L, Long.MAX_VALUE, Long.MAX_VALUE, idx -> {
+            RecordingSender s = new RecordingSender() {
+                @Override
+                public void markSavepoint() {
+                }
+            };
+            built.add(s);
+            return s;
+        })) {
+            try (Sender a = pool.borrow()) {
+                a.table("t").longColumn("v", 1L).atNow();
+                a.table("t").longColumn("v", 2L).atNow();
+            }
+            RecordingSender delegate = built.get(0);
+            try (Sender b = pool.borrow()) {
+                b.table("t").longColumn("v", 3L).atNow();
+                b.reset();
+                Assert.assertEquals("B's reset keeps the two rows A's release published", 2, delegate.pendingRowCount());
+            }
+            Assert.assertEquals("nothing shipped", 0, delegate.flushCount.get());
         }
     }
 
@@ -421,12 +440,8 @@ public class SenderPoolCloseSemanticsTest {
         }
     }
 
-    // Release-only close, the QuestDB facade's default. A directly built pool
-    // flushes on close unless told otherwise.
     static SenderPool newPool(int min, int max, List<RecordingSender> built) {
-        SenderPool pool = newPoolWithDefaults(min, max, Long.MAX_VALUE, built);
-        pool.setFlushOnClose(false);
-        return pool;
+        return newPoolWithDefaults(min, max, Long.MAX_VALUE, built);
     }
 
     static SenderPool newPoolWithDefaults(int min, int max, long idleTimeoutMillis, List<RecordingSender> built) {

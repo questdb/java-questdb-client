@@ -48,14 +48,13 @@ import java.time.temporal.ChronoUnit;
  * {@link Sender} call to the reused {@link SenderSlot}'s delegate, validating
  * that generation first via {@link SenderSlot#live(long)}.
  * <p>
- * Behaviour difference from a raw Sender: {@link #close()} returns the slot to
- * the pool and ships the slot's pending rows once the oldest is older than
- * {@code auto_flush_interval} or another auto-flush threshold trips; otherwise
- * the rows wait for a later append or release, or for the pool's housekeeper
- * settle. With {@code flush_on_close=on}, the default of a directly built
- * {@code SenderPool}, close flushes first. The
- * underlying Sender is only truly closed when
- * {@link io.questdb.client.QuestDB#close()} shuts the pool down.
+ * Behaviour difference from a raw Sender: {@link #close()} makes the lease's
+ * rows recoverable and returns the slot to the pool. It publishes the rows into
+ * the slot's open record without shipping them, and ships a frame only when the
+ * commit window closes or an auto-flush threshold trips, usually the age one;
+ * otherwise the rows wait for a later append or release, for the record to fill,
+ * or for the pool's housekeeper settle. The underlying Sender is only truly
+ * closed when {@link io.questdb.client.QuestDB#close()} shuts the pool down.
  * <p>
  * Because the slot is reused across borrows, this wrapper -- not the slot --
  * carries the lease identity. A stale handle (held after {@link #close()}, with
@@ -151,53 +150,64 @@ public final class PooledSender implements Sender {
     }
 
     /**
-     * Returns this lease's slot to the pool and ships the slot's pending
-     * rows once the oldest is older than {@code auto_flush_interval} or another
-     * auto-flush threshold trips (see the commit-window note below); otherwise
-     * the rows wait in the slot's buffer for a later append or release, or for
-     * the pool's housekeeper settle. With {@code flush_on_close=on}, the
-     * default of a directly built {@code SenderPool}, the rows are flushed
-     * first, as before 1.3.12. {@link #reset()} on a lease discards only that
+     * Returns this lease's slot to the pool. Close makes the rows recoverable and
+     * releases, flush ships, drain waits: the release publishes the rows appended
+     * through this lease into the slot's open record ({@link Sender#publishPending()})
+     * without shipping them. Published rows survive a later lease's {@link #reset()}
+     * and, with {@code sf_dir}, a crash of the process: recovery replays them from
+     * the slot's store-and-forward directory. Recoverable means in the client's
+     * ring, not acknowledged by the server; {@link #flush()} and then
+     * {@link #drain(long)} is the point where the server has the rows. The release
+     * ships a frame only when the commit window closes (see below) or an auto-flush
+     * threshold trips, usually the age one, the oldest row older than
+     * {@code auto_flush_interval}; otherwise the rows wait in the open record for a
+     * later append or release, for the record to fill, or for the pool's
+     * housekeeper settle. A sender in full-dictionary mode (its slot's symbol
+     * dictionary file could not be opened or written) has no open record: its
+     * publish is a {@link Sender#flush()}, so each release ships the lease's rows
+     * in a frame of its own, which keeps them recoverable at the cost a release had
+     * before the open record. {@link #reset()} on a lease discards only that
      * lease's rows. Does not close the underlying {@link Sender}; that only
      * happens when the owning {@code QuestDB} is closed. If the pool is already
-     * shutting down when this lease comes home, the underlying Sender is torn
-     * down here, on the calling thread, which ships whatever it still buffers.
+     * shutting down when this lease comes home, the rows are flushed here and the
+     * underlying Sender is torn down on the calling thread.
      * <p>
-     * A row left in progress is cancelled, the slot is returned, and then a
+     * A row left in progress is cancelled before the publish, so nothing
+     * half-built is ever published, the slot is returned, and then a
      * {@link LineSenderException} is thrown so the mistake is visible. A
      * delegate that has latched a terminal error is retired instead of being
      * returned, and a new {@link LineSenderException} is thrown here whose
-     * cause is the delegate's error and whose message carries the number of unshipped rows at
-     * the retirement. The count lives on the wrapper of a non-server failure; the typed server
-     * branch below carries none. A lease body that already threw the typed
-     * error keeps it as the primary exception, with close's wrapper
-     * suppressed. The typed error and its classification live on the cause.
+     * cause is the delegate's error and whose message carries the number of rows
+     * not yet shipped at the retirement. The count lives on the wrapper of a
+     * non-server failure; the typed server branch below carries none. A lease body
+     * that already threw the typed error keeps it as the primary exception, with
+     * close's wrapper suppressed. The typed error and its classification live on
+     * the cause.
      * <p>
      * A server batch cap rejection ({@link BatchTooLargeForCapException}, retained
-     * by an auto-flush or thrown by close's own flush) does not retire the slot at
-     * once. QwpWebSocketSender handles a byte-trigger crossing row itself, so a
-     * rejection that reaches close comes, for example, from a lease whose own
-     * rows push the batch over the cap through an explicit flush() with the byte
-     * trigger off, or from a held row whose own frame exceeds the cap. The
-     * rejected batch can hold mostly rows earlier leases left. The lease is rolled
-     * back to its borrow mark, which drops only this lease's rows, and the flush is
-     * retried: when the rows left by earlier leases ship, the slot is returned and a
-     * {@link LineSenderException} whose cause is the rejection names the number of
-     * this lease's rows dropped. Only an inherited batch the cap still rejects
-     * retires the slot, with the wrapper described above.
+     * by an auto-flush or thrown by the release's own flush) can only come from a
+     * sender in full-dictionary mode: an open record never grows past the frame
+     * bound, and a row too large for it fails on its own {@code at()}. It does not
+     * retire the slot at once. The rejected batch can hold mostly rows earlier
+     * leases left. The lease is rolled back to its borrow mark, which drops only
+     * this lease's rows, and the flush is retried: when the rows left by earlier
+     * leases ship, the slot is returned and a {@link LineSenderException} whose
+     * cause is the rejection names the number of this lease's rows dropped. Only
+     * an inherited batch the cap still rejects retires the slot, with the wrapper
+     * described above.
      * <p>
      * Idempotent for sequential reuse: a stale generation (the lease was
      * already returned and the slot possibly re-borrowed) is a no-op. Concurrent
      * double-close of ONE lease from two threads is outside the Sender
      * threading contract.
      * <p>
-     * With a commit window ({@link SenderPool#setCommitWindow}) and
-     * {@code flush_on_close=on}, each close ships a deferred frame; the close
-     * that fills the window (rows appended or age of the open group) flushes
-     * instead, which commits the group. Without {@code flush_on_close}, only
-     * the release that closes the window ships: it flushes, committing the
-     * group. The window's age is measured from the first release that found
-     * work. A failed ship retires the slot and throws the wrapper described above.
+     * With a commit window ({@link SenderPool#setCommitWindow}), the release that
+     * fills the window (rows appended or age of the open group) flushes after the
+     * publish, which seals the record unflagged, or sends the commit message, and
+     * commits the group; the other releases only publish, and an auto-flush
+     * threshold that trips at one of them ships a frame flagged defer-commit. The
+     * window's age is measured from the first release that found work. A failed
+     * publish or ship retires the slot and throws the wrapper described above.
      * <p>
      * Close-time errors are wrapped: the delegate's error is the cause. A latched
      * {@link LineSenderServerException} is rethrown as a new one carrying the same
@@ -240,11 +250,11 @@ public final class PooledSender implements Sender {
                 failure = e;
             }
             if (failure instanceof BatchTooLargeForCapException) {
-                // QwpWebSocketSender handles a byte-trigger crossing row itself, so
-                // this rejection comes, for example, from the lease's own rows
-                // pushing the batch over the cap through an explicit flush() with
-                // the byte trigger off, or from a held row whose own frame exceeds
-                // the cap. The
+                // Only a sender in full-dictionary mode can raise it: an open record
+                // never grows past the frame bound. On that frame path the rejection
+                // comes, for example, from the lease's own rows pushing the batch
+                // over the cap through an explicit flush() with the byte trigger off,
+                // or from a held row whose own frame exceeds the cap. The
                 // rejected batch can hold mostly rows earlier leases left.
                 // Drop only this lease's rows and retry: the slot stays in service
                 // when the rest ships, and an inherited batch the cap still
@@ -292,7 +302,8 @@ public final class PooledSender implements Sender {
                     : failure.getMessage();
             boolean retryable = failure instanceof LineSenderException && ((LineSenderException) failure).isRetryable();
             LineSenderException wrapper = new LineSenderException("pooled sender close failed, slot retired with "
-                    + pendingRowsAtRetire + " unshipped row(s): " + msg, retryable);
+                    + pendingRowsAtRetire + " row(s) not yet shipped (recoverable from the slot's store-and-forward "
+                    + "directory when sf_dir is set): " + msg, retryable);
             wrapper.initCause(failure);
             throw wrapper;
         }
@@ -587,18 +598,23 @@ public final class PooledSender implements Sender {
     }
 
     /**
-     * What a release ships, per the pool's settings:
+     * What a release does once the probe passed and a row in progress was
+     * cancelled:
      * <ul>
-     *   <li>commit window set and closing now: {@code flush()}, which ships
-     *       pending rows unflagged and commits the group;</li>
-     *   <li>otherwise {@code flush_on_close=on}: {@code flushDeferred()} with a
-     *       window, {@code flush()} without one;</li>
-     *   <li>otherwise {@code autoFlushIfDue()}: ships every pending row once
-     *       the oldest is older than {@code auto_flush_interval} or another
-     *       auto-flush threshold trips.</li>
+     *   <li>{@code publishPending()}: makes the lease's rows recoverable in the
+     *       open record without shipping them (a flush in full-dictionary
+     *       mode);</li>
+     *   <li>commit window set and closing now: {@code flush()}, which seals the
+     *       record unflagged, or sends the commit message, and commits the
+     *       group;</li>
+     *   <li>otherwise {@code autoFlushIfDue()}: seals the record once the oldest
+     *       row is older than {@code auto_flush_interval} or another auto-flush
+     *       threshold trips.</li>
      * </ul>
+     * The clock is read only with a commit window.
      */
     private void ship(SenderPool pool, Sender delegate) {
+        delegate.publishPending();
         if (pool.hasCommitWindow()) {
             boolean closes = slot.windowCloses(delegate.rowsAppended(), delegate.hasDeferredFrames(),
                     System.nanoTime(), pool.commitRows(), pool.commitIntervalNanos());
@@ -607,15 +623,7 @@ public final class PooledSender implements Sender {
                 slot.markCommitted(delegate.rowsAppended());
                 return;
             }
-            if (pool.isFlushOnClose()) {
-                delegate.flushDeferred();
-            }
-            return;
         }
-        if (pool.isFlushOnClose()) {
-            delegate.flush();
-        } else {
-            delegate.autoFlushIfDue();
-        }
+        delegate.autoFlushIfDue();
     }
 }

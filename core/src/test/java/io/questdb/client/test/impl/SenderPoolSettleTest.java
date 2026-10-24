@@ -58,7 +58,6 @@ public class SenderPoolSettleTest {
     public void testReapSkipsSlotUntilSettleShipsItsRows() throws Exception {
         List<RecordingSender> built = new ArrayList<>();
         try (SenderPool pool = SenderPoolCloseSemanticsTest.newPoolWithDefaults(0, 1, 1L, built)) {
-            pool.setFlushOnClose(false);
             try (Sender s = pool.borrow()) {
                 s.table("t").longColumn("v", 1L).atNow();
             }
@@ -290,7 +289,6 @@ public class SenderPoolSettleTest {
                     built.add(rs);
                     return rs;
                 });
-        pool.setFlushOnClose(false);
         try {
             try (Sender s = pool.borrow()) {
                 s.table("t").longColumn("v", 1L).atNow();

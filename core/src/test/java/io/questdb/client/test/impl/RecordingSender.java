@@ -40,12 +40,16 @@ import java.util.concurrent.atomic.AtomicInteger;
  * In-memory {@link Sender} double for pool tests. Records calls, models the
  * buffer state the pool asks about, and can be told to fail or to block.
  * Never touches the network. Not final, so a test can override a single method.
+ * Models a sender with an open record: {@link #publishPending()} ships nothing
+ * and moves the savepoint to the published rows.
  */
 class RecordingSender implements Sender {
     final AtomicInteger cancelCount = new AtomicInteger();
     final AtomicInteger closeCount = new AtomicInteger();
     final AtomicInteger deferredFlushCount = new AtomicInteger();
     final AtomicInteger flushCount = new AtomicInteger();
+    final AtomicInteger publishCount = new AtomicInteger();
+    volatile boolean autoFlushDue;             // autoFlushIfDue() flushes when set
     volatile RuntimeException cancelError;     // thrown by cancelRow() when set
     volatile RuntimeException deferredFlushError; // thrown by flushDeferred() when set
     volatile boolean deferredFramesOpen;
@@ -75,6 +79,13 @@ class RecordingSender implements Sender {
     @Override
     public void atNow() {
         at(0L, ChronoUnit.MICROS);
+    }
+
+    @Override
+    public void autoFlushIfDue() {
+        if (autoFlushDue) {
+            flush();
+        }
     }
 
     @Override
@@ -223,6 +234,14 @@ class RecordingSender implements Sender {
     @Override
     public int pendingRowCount() {
         return pendingRows;
+    }
+
+    @Override
+    public void publishPending() {
+        // Like the open record's publish: the rows stay pending, and a later
+        // resetToSavepoint() keeps them.
+        publishCount.incrementAndGet();
+        savepointRows = pendingRows;
     }
 
     @Override

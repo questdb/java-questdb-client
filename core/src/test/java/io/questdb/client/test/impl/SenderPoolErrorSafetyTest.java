@@ -183,7 +183,9 @@ public class SenderPoolErrorSafetyTest {
                     first.close();
                     Assert.fail("close() must propagate the Error thrown by flush()");
                 } catch (AssertionError expected) {
-                    // expected: the original throwable propagates naturally
+                    // expected: the original throwable propagates naturally; the
+                    // message check keeps the fail() above from being swallowed here
+                    Assert.assertEquals("injected flush failure", expected.getMessage());
                 }
 
                 Sender second = pool.borrow();
@@ -210,7 +212,9 @@ public class SenderPoolErrorSafetyTest {
     }
 
     // Like fakeSender(), but flush() throws an Error to drive the
-    // PooledSender.close() abnormal-exit branch.
+    // PooledSender.close() abnormal-exit branch. publishPending(), the first call
+    // of a release, throws it too: its default is flush(), as on a frame-path
+    // sender, but a proxy answers default methods itself and never runs it.
     private static Sender flushThrowingSender() {
         return (Sender) Proxy.newProxyInstance(
                 Sender.class.getClassLoader(),
@@ -218,6 +222,7 @@ public class SenderPoolErrorSafetyTest {
                 (proxy, method, args) -> {
                     switch (method.getName()) {
                         case "flush":
+                        case "publishPending":
                             throw new AssertionError("injected flush failure");
                         case "close":
                             return null;

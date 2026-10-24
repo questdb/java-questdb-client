@@ -256,9 +256,6 @@ public final class SenderPool implements AutoCloseable {
     // production; lifecycle tests use it to acknowledge distinct retries
     // without inspecting transient Condition queue membership.
     private volatile Runnable creationWaitRetryHook;
-    // On for a directly built pool, which has no housekeeper to settle rows a
-    // release leaves in an idle slot. QuestDBImpl sets it from flush_on_close.
-    private volatile boolean flushOnClose = true;
     // Slots removed from `all` whose delegate is still releasing its flock.
     // They keep reserving capacity (and their slotInUse mark) until the
     // flock drops, so the cap check and the slot allocator stay consistent
@@ -1754,11 +1751,11 @@ public final class SenderPool implements AutoCloseable {
     }
 
     /**
-     * Ships rows left behind in idle slots. With flush on close off, the
-     * {@code QuestDB} facade's default, a pooled {@code close()} does not flush,
-     * and auto-flush thresholds are only evaluated on append,
-     * so a slot nobody borrows again would keep its last rows until the pool
-     * closes. The housekeeper calls this on its settle cadence.
+     * Ships rows left behind in idle slots. A pooled {@code close()} publishes
+     * the lease's rows without shipping them, and auto-flush thresholds are only
+     * evaluated on append and release, so a slot nobody borrows again would keep
+     * its last rows until the pool closes. The housekeeper calls this on its
+     * settle cadence.
      * <p>
      * The settle lists the dirty slots under the pool lock, then takes one slot at
      * a time off the free list under that lock and stamps it with a fresh
@@ -2243,7 +2240,7 @@ public final class SenderPool implements AutoCloseable {
         return commitRows;
     }
 
-    /** Whether a commit window is configured: pooled closes ship deferred frames and commit per window. */
+    /** Whether a commit window is configured: the release that fills the window commits it. */
     public boolean hasCommitWindow() {
         return commitRows > 0;
     }
@@ -2251,18 +2248,6 @@ public final class SenderPool implements AutoCloseable {
     /** Whether {@code close()} has started; a lease returning now is torn down instead of recycled. */
     boolean isClosed() {
         return closed;
-    }
-
-    /**
-     * Whether a pooled {@code close()} ships the lease's rows before releasing
-     * the slot (the behaviour before 1.3.12) or only releases it. On by default
-     * for a directly built pool, since nothing settles its idle slots. The
-     * {@code QuestDB} facade sets it from {@code flush_on_close}, off by
-     * default: rows then ship when an auto-flush threshold trips on a later
-     * append, or when the housekeeper settles the idle slot.
-     */
-    public boolean isFlushOnClose() {
-        return flushOnClose;
     }
 
     /**
@@ -2298,10 +2283,6 @@ public final class SenderPool implements AutoCloseable {
         }
         this.commitRows = commitRows;
         this.commitIntervalNanos = TimeUnit.MILLISECONDS.toNanos(commitIntervalMillis);
-    }
-
-    public void setFlushOnClose(boolean flushOnClose) {
-        this.flushOnClose = flushOnClose;
     }
 
     private SenderSlot createSlot(IntFunction<Sender> factory, int slotIndex) {
