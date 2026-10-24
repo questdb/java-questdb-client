@@ -1641,8 +1641,7 @@ public class QwpWebSocketSender implements Sender {
      */
     @Override
     public QwpWebSocketSender binaryColumn(CharSequence columnName, long ptr, long len) {
-        checkNotClosed();
-        checkTableSelected();
+        checkColumnContext();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_BINARY, true);
             if (col != null) {
@@ -1657,8 +1656,7 @@ public class QwpWebSocketSender implements Sender {
 
     @Override
     public QwpWebSocketSender boolColumn(CharSequence columnName, boolean value) {
-        checkNotClosed();
-        checkTableSelected();
+        checkColumnContext();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_BOOLEAN, false);
             if (col != null) {
@@ -1684,8 +1682,7 @@ public class QwpWebSocketSender implements Sender {
      * @return this sender for method chaining
      */
     public QwpWebSocketSender byteColumn(CharSequence columnName, byte value) {
-        checkNotClosed();
-        checkTableSelected();
+        checkColumnContext();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_BYTE, false);
             if (col != null) {
@@ -1717,8 +1714,7 @@ public class QwpWebSocketSender implements Sender {
      * @return this sender for method chaining
      */
     public QwpWebSocketSender charColumn(CharSequence columnName, char value) {
-        checkNotClosed();
-        checkTableSelected();
+        checkColumnContext();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_CHAR, false);
             if (col != null) {
@@ -2233,8 +2229,7 @@ public class QwpWebSocketSender implements Sender {
 
     @Override
     public QwpWebSocketSender doubleColumn(CharSequence columnName, double value) {
-        checkNotClosed();
-        checkTableSelected();
+        checkColumnContext();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_DOUBLE, true);
             if (col != null) {
@@ -2255,8 +2250,7 @@ public class QwpWebSocketSender implements Sender {
      * @return this sender for method chaining
      */
     public QwpWebSocketSender floatColumn(CharSequence columnName, float value) {
-        checkNotClosed();
-        checkTableSelected();
+        checkColumnContext();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_FLOAT, true);
             if (col != null) {
@@ -3021,8 +3015,7 @@ public class QwpWebSocketSender implements Sender {
      * @return this sender for method chaining
      */
     public QwpWebSocketSender intColumn(CharSequence columnName, int value) {
-        checkNotClosed();
-        checkTableSelected();
+        checkColumnContext();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_INT, true);
             if (col != null) {
@@ -3050,8 +3043,7 @@ public class QwpWebSocketSender implements Sender {
      */
     @Override
     public QwpWebSocketSender ipv4Column(CharSequence columnName, int address) {
-        checkNotClosed();
-        checkTableSelected();
+        checkColumnContext();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_IPv4, true);
             if (col != null) {
@@ -3124,8 +3116,7 @@ public class QwpWebSocketSender implements Sender {
      * @return this sender for method chaining
      */
     public QwpWebSocketSender long256Column(CharSequence columnName, long l0, long l1, long l2, long l3) {
-        checkNotClosed();
-        checkTableSelected();
+        checkColumnContext();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_LONG256, true);
             if (col != null) {
@@ -3208,8 +3199,7 @@ public class QwpWebSocketSender implements Sender {
 
     @Override
     public QwpWebSocketSender longColumn(CharSequence columnName, long value) {
-        checkNotClosed();
-        checkTableSelected();
+        checkColumnContext();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_LONG, true);
             if (col != null) {
@@ -3619,8 +3609,7 @@ public class QwpWebSocketSender implements Sender {
      * @return this sender for method chaining
      */
     public QwpWebSocketSender shortColumn(CharSequence columnName, short value) {
-        checkNotClosed();
-        checkTableSelected();
+        checkColumnContext();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_SHORT, false);
             if (col != null) {
@@ -3735,8 +3724,7 @@ public class QwpWebSocketSender implements Sender {
 
     @Override
     public QwpWebSocketSender stringColumn(CharSequence columnName, CharSequence value) {
-        checkNotClosed();
-        checkTableSelected();
+        checkColumnContext();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_VARCHAR, true);
             if (col != null) {
@@ -3751,8 +3739,7 @@ public class QwpWebSocketSender implements Sender {
 
     @Override
     public QwpWebSocketSender symbol(CharSequence columnName, CharSequence value) {
-        checkNotClosed();
-        checkTableSelected();
+        checkColumnContext();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_SYMBOL, true);
             if (col != null) {
@@ -3806,8 +3793,7 @@ public class QwpWebSocketSender implements Sender {
 
     @Override
     public QwpWebSocketSender timestampColumn(CharSequence columnName, long value, ChronoUnit unit) {
-        checkNotClosed();
-        checkTableSelected();
+        checkColumnContext();
         try {
             if (unit == ChronoUnit.NANOS) {
                 QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_TIMESTAMP_NANOS, true);
@@ -3830,8 +3816,7 @@ public class QwpWebSocketSender implements Sender {
 
     @Override
     public QwpWebSocketSender timestampColumn(CharSequence columnName, Instant value) {
-        checkNotClosed();
-        checkTableSelected();
+        checkColumnContext();
         try {
             long micros = value.getEpochSecond() * 1_000_000L + value.getNano() / 1000L;
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_TIMESTAMP, true);
@@ -3854,8 +3839,7 @@ public class QwpWebSocketSender implements Sender {
      * @return this sender for method chaining
      */
     public QwpWebSocketSender uuidColumn(CharSequence columnName, long lo, long hi) {
-        checkNotClosed();
-        checkTableSelected();
+        checkColumnContext();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_UUID, true);
             if (col != null) {
@@ -4638,6 +4622,26 @@ public class QwpWebSocketSender implements Sender {
         if (recycleFailure != null) {
             throw new LineSenderException(recycleFailure)
                     .put("sender is terminal: symbol dictionary recycle failed");
+        }
+    }
+
+    /**
+     * The per-column guard: closed and table-selected only. Column setters
+     * ran {@link #checkNotClosed()} too, whose connection-error poll is three
+     * volatile loads (connectionError, cursorSendLoop, its terminalError) --
+     * per column, per row, that was ~15% of the producer's cycles at
+     * saturation. An asynchronous I/O-thread error now surfaces at the row
+     * boundary instead: {@link #table}, {@code at()}/{@code atNow()} (via
+     * {@link #sendRow}), flush and close still poll it. The closed check
+     * stays per column because {@link #currentTableBuffer} is off-heap and
+     * freed by close.
+     */
+    private void checkColumnContext() {
+        if (closed) {
+            throw new LineSenderException("Sender is closed");
+        }
+        if (currentTableBuffer == null) {
+            throw new LineSenderException("table() must be called before adding columns");
         }
     }
 
