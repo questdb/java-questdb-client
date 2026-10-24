@@ -299,6 +299,39 @@ public class SenderPoolCloseSemanticsTest {
     }
 
     @Test
+    public void testPublishPendingOnALeasePublishesWithoutShipping() {
+        List<RecordingSender> built = new ArrayList<>();
+        try (SenderPool pool = newPool(1, 1, built)) {
+            RecordingSender delegate;
+            try (Sender s = pool.borrow()) {
+                delegate = built.get(0);
+                s.table("t").longColumn("v", 1L).atNow();
+                s.publishPending();
+                Assert.assertEquals("the lease's publishPending() reaches the delegate", 1, delegate.publishCount.get());
+                Assert.assertEquals("and ships nothing", 0, delegate.flushCount.get());
+                s.table("t").longColumn("v", 2L).atNow();
+                s.reset();
+                Assert.assertEquals("reset() keeps the row the lease published", 1, delegate.pendingRowCount());
+            }
+            Assert.assertEquals("close() publishes once more", 2, delegate.publishCount.get());
+            Assert.assertEquals("neither publish shipped", 0, delegate.flushCount.get());
+            Assert.assertEquals(1, delegate.pendingRowCount());
+            Sender stale = null;
+            try (Sender s = pool.borrow()) {
+                stale = s;
+            }
+            try {
+                stale.publishPending();
+                Assert.fail("a stale lease must not publish into the slot");
+            } catch (IllegalStateException expected) {
+                // "sender handle is closed (returned to the pool)"
+            }
+            Assert.assertEquals("only the second lease's close published; the stale call never reached the delegate",
+                    3, delegate.publishCount.get());
+        }
+    }
+
+    @Test
     public void testResetAfterAFlushInsideTheLeaseDropsEveryPendingRow() {
         List<RecordingSender> built = new ArrayList<>();
         try (SenderPool pool = newPool(1, 1, built)) {

@@ -500,6 +500,19 @@ public final class PooledSender implements Sender {
     }
 
     /**
+     * Publishes the rows appended so far into the slot's open record without
+     * shipping them, exactly what {@link #close()} does first: they become
+     * recoverable and a later {@link #reset()} keeps them. A sender in
+     * full-dictionary mode has no open record and flushes instead. Forwards to
+     * the delegate's {@link Sender#publishPending()}, not to this handle's
+     * {@link #flush()}, so it neither ships a frame nor commits a window.
+     */
+    @Override
+    public void publishPending() {
+        slot.live(generation).publishPending();
+    }
+
+    /**
      * Discards the rows appended through this lease and keeps the rows earlier
      * leases left in the slot's buffer: the pool marks a savepoint at borrow and
      * this rolls back to it ({@link Sender#resetToSavepoint()}). After a flush
