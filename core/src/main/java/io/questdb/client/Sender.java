@@ -42,7 +42,6 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderErrorHandler;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
-import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentBudget;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegmentCorruptionException;
@@ -827,10 +826,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * threshold, close) ships them. Recoverable means in the client's ring, not
      * acknowledged by the server. Only completed rows are published: a row is
      * appended at its {@code at()}, so a row in progress stays staged and joins
-     * the record at its {@code at()}. Every other transport, and a WebSocket
-     * sender in full-dictionary mode (its slot's symbol dictionary file could not
-     * be opened or written, so it encodes a frame per flush), flushes instead,
-     * and that flush throws while a row is in progress.
+     * the record at its {@code at()}. Every other transport calls
+     * {@link #flush()} instead, with that transport's own handling of a row in
+     * progress. A WebSocket sender in full-dictionary mode (its slot's symbol
+     * dictionary file could not be opened or written, so it encodes a frame per
+     * flush) flushes too, and its flush throws while a row is in progress.
      */
     default void publishPending() {
         flush();

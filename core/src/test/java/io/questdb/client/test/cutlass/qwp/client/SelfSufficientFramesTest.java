@@ -360,6 +360,9 @@ public class SelfSufficientFramesTest {
 
                 waitFor(() -> handler.batches.size() >= 2, 5_000);
                 byte[] first = handler.batches.get(0);
+                Assert.assertEquals("frame 1 of the split stays on the ring deferred",
+                        QwpConstants.FLAG_DEFER_COMMIT,
+                        first[QwpConstants.HEADER_OFFSET_FLAGS] & QwpConstants.FLAG_DEFER_COMMIT);
                 for (int i = 0, n = handler.batches.size(); i < n; i++) {
                     byte[] frame = handler.batches.get(i);
                     Assert.assertEquals("frame " + i + " starts its dictionary at id 0",

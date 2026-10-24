@@ -99,16 +99,16 @@ snippets below borrow from its pools.
 ### Ingest Data
 
 Borrow a `Sender`, write rows, and close it. Close makes the rows recoverable and releases, flush ships, drain waits:
-`close()` publishes the lease's rows into the slot's store-and-forward ring without shipping them and returns the
-sender to the pool. The release itself ships the slot's rows once the oldest is older than `auto_flush_interval`
-(100 ms by default) or another auto-flush threshold trips; otherwise they go out when a threshold trips on a later
-append or `close()`, when the slot's open record fills, or when the pool's housekeeper settles the idle slot, typically
-within one `auto_flush_interval`. A lease that holds the slot without appending or closing, for example one that waits
-for input inside the `try` block, holds those rows back until it does: borrow once the data is in hand. Borrowing per
-message is the intended pattern and batches like a sender held for the whole run. Call `flush()` to ship now and
-`drain()` to wait for the server. The underlying connection is only torn down when the `QuestDB` handle itself is
-closed. Before 1.3.12 a pooled `close()` flushed, one frame and one commit per close; call `flush()` before `close()`
-where you need that.
+`close()` publishes the lease's rows into the slot's store-and-forward ring and returns the sender to the pool. It
+ships the slot's rows only when an auto-flush threshold is already due: the oldest row is older than
+`auto_flush_interval` (100 ms by default), or another threshold trips. Otherwise they go out when a threshold trips on a
+later append or `close()`, when the slot's open record fills, or when the pool's housekeeper settles the idle slot,
+typically within one `auto_flush_interval`. A lease that holds the slot without appending or closing, for example one
+that waits for input inside the `try` block, holds those rows back until it does: borrow once the data is in hand.
+Borrowing per message is the intended pattern and batches like a sender held for the whole run. Call `flush()` to ship
+now and `drain()` to wait for the server. The underlying connection is only torn down when the `QuestDB` handle itself
+is closed. Before 1.3.12 a pooled `close()` flushed, one frame and one commit per close; call `flush()` before
+`close()` where you need that.
 
 **What recoverable means.** A row is recoverable once it is in the slot's store-and-forward ring, not once the server
 has it, and a later lease's `reset()` no longer discards it. Without `sf_dir` the ring lives in memory: the row

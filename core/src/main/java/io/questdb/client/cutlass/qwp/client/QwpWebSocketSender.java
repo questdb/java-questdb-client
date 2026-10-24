@@ -4116,7 +4116,8 @@ public class QwpWebSocketSender implements Sender {
      * which never waits for room, so a sender with an open record meets a full
      * ring at the next record reservation inside {@code at()} instead: that
      * reservation waits up to the backpressure deadline and then fails with
-     * "cursor SF record reservation failed". Only the rowless commit message
+     * "cursor SF record reservation failed", or with the I/O loop's terminal
+     * error when the loop has died. Only the rowless commit message
      * that ends a deferred group with no rows pending can still find the ring
      * full here.
      *
