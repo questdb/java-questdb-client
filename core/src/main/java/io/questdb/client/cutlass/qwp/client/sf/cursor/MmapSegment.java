@@ -740,7 +740,10 @@ public final class MmapSegment implements QuietCloseable {
         if (payloadLen > 0) {
             Unsafe.getUnsafe().copyMemory(payloadAddr, mmapAddress + offset + FRAME_HEADER_SIZE, payloadLen);
         }
-        int crc = Crc32c.update(Crc32c.INIT, lenAddr, 4L + payloadLen);
+        // Only recovery reads the CRC, and a memory-backed segment is never
+        // recovered: it would be a pass over every byte for nothing. The field
+        // stays, zeroed, so both backings keep one frame layout.
+        int crc = memoryBacked ? 0 : Crc32c.update(Crc32c.INIT, lenAddr, 4L + payloadLen);
         Unsafe.getUnsafe().putInt(mmapAddress + offset, crc);
         appendCursor = offset + total;
         // Plain read + write of the volatile field. `frameCount++` would
