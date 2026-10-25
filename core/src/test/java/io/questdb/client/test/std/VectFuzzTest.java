@@ -35,6 +35,40 @@ import org.junit.Test;
 
 public class VectFuzzTest {
     @Test
+    public void testMemcpyEverySmallLengthAndAlignment() throws Exception {
+        assertMemoryLeak(() -> {
+            // crosses the small-copy cutoff, at every source/destination misalignment;
+            // the guard byte after each copy must stay untouched
+            int maxLen = 160;
+            int size = maxLen + 16;
+            long from = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
+            long to = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
+            try {
+                for (int i = 0; i < size; i++) {
+                    Unsafe.getUnsafe().putByte(from + i, (byte) (i * 31 + 7));
+                }
+                for (int len = 0; len <= maxLen; len++) {
+                    for (int srcOff = 0; srcOff < 8; srcOff++) {
+                        for (int dstOff = 0; dstOff < 8; dstOff++) {
+                            Vect.memset(to, size, 0);
+                            Vect.memcpy(to + dstOff, from + srcOff, len);
+                            for (int i = 0; i < len; i++) {
+                                if (Unsafe.getUnsafe().getByte(to + dstOff + i) != Unsafe.getUnsafe().getByte(from + srcOff + i)) {
+                                    Assert.fail("len=" + len + " srcOff=" + srcOff + " dstOff=" + dstOff + " byte " + i);
+                                }
+                            }
+                            Assert.assertEquals("guard, len=" + len, 0, Unsafe.getUnsafe().getByte(to + dstOff + len));
+                        }
+                    }
+                }
+            } finally {
+                Unsafe.free(from, size, MemoryTag.NATIVE_DEFAULT);
+                Unsafe.free(to, size, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
     public void testMemmove() throws Exception {
         assertMemoryLeak(() -> {
             int maxSize = 1024 * 1024;
