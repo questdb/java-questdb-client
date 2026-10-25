@@ -71,6 +71,9 @@ public class QwpTableBuffer implements QuietCloseable {
     private int committedColumnCount; // columns that existed at last nextRow()
     private ColumnBuffer[] fastColumns; // plain array for O(1) sequential access
     private int inProgressColumnCount;
+    // Set while the sender's pending-tables list holds this buffer, so the buffer
+    // is listed once. Producer thread only.
+    private boolean listedPending;
     // Bytes appended across every column's off-heap memories, kept by the
     // memories themselves (see OffHeapAppendMemory.bytesCell). Array columns
     // keep their data in Java arrays, so a table that has one walks instead.
@@ -279,6 +282,13 @@ public class QwpTableBuffer implements QuietCloseable {
     }
 
     /**
+     * Returns true while the sender's pending-tables list holds this buffer.
+     */
+    public boolean isListedPending() {
+        return listedPending;
+    }
+
+    /**
      * Advances to the next row.
      * <p>
      * This should be called after all column values for the current row have been set.
@@ -398,6 +408,13 @@ public class QwpTableBuffer implements QuietCloseable {
             columns.remove(i);
         }
         rebuildColumnAccessStructures();
+    }
+
+    /**
+     * Marks whether the sender's pending-tables list holds this buffer.
+     */
+    public void setListedPending(boolean listedPending) {
+        this.listedPending = listedPending;
     }
 
     private static void assertColumnType(CharSequence name, byte type, ColumnBuffer column) {
