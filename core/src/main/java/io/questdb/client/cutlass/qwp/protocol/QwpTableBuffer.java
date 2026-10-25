@@ -1489,6 +1489,7 @@ public class QwpTableBuffer implements QuietCloseable {
         }
 
         public void reset() {
+            final int sizeBefore = size;
             size = 0;
             valueCount = 0;
             hasNulls = false;
@@ -1505,11 +1506,14 @@ public class QwpTableBuffer implements QuietCloseable {
             if (stringData != null) {
                 stringData.truncate();
             }
-            if (nullBufPtr != 0 && size > 0) {
+            if (nullBufPtr != 0 && sizeBefore > 0) {
                 // Only the words this batch touched, and through the intrinsic:
                 // Vect.memset is a JNI call, and one per column per flush was
-                // 15% of the producer's time at one row per flush.
-                Unsafe.getUnsafe().setMemory(nullBufPtr, ((long) ((size + 63) >>> 6)) << 3, (byte) 0);
+                // 15% of the producer's time at one row per flush. Non-null
+                // appends do not grow the bitmap, so the batch can hold more
+                // rows than the bitmap covers.
+                final int rowsToClear = Math.min(sizeBefore, nullBufCapRows);
+                Unsafe.getUnsafe().setMemory(nullBufPtr, ((long) ((rowsToClear + 63) >>> 6)) << 3, (byte) 0);
             }
             if (symbolDict != null) {
                 symbolDict.clear();

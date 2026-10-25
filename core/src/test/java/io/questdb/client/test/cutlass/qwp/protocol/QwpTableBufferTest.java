@@ -1389,6 +1389,37 @@ public class QwpTableBufferTest {
     }
 
     @Test
+    public void testResetClearsNullBitmapForNextBatch() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                QwpTableBuffer.ColumnBuffer col = table.getOrCreateColumn("b", QwpConstants.TYPE_LONG, true);
+                // A null at row 0, then more non-null rows than the 64-row initial bitmap
+                // holds: non-null appends do not grow the bitmap, so the clear on reset
+                // must stay within its allocation.
+                col.addNull();
+                table.nextRow();
+                for (int i = 1; i < 200; i++) {
+                    col.addLong(i);
+                    table.nextRow();
+                }
+
+                table.reset();
+
+                col.addLong(30);
+                table.nextRow();
+                col.addNull();
+                table.nextRow();
+
+                // A stale bit at row 0 would ship a bitmap of two nulls over one value.
+                assertFalse(col.isNull(0));
+                assertTrue(col.isNull(1));
+                assertEquals(2, col.getSize());
+                assertEquals(1, col.getValueCount());
+            }
+        });
+    }
+
+    @Test
     public void testRetainInProgressRowFastClearsUnstagedNullableColumn() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpTableBuffer table = new QwpTableBuffer("test")) {
