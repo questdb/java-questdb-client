@@ -193,35 +193,24 @@ public class OffHeapAppendMemory implements ArrayBufferAppender, QuietCloseable 
         }
         int len = value.length();
         ensureCapacity((long) len * 4); // worst case: all supplementary chars
-        long start = appendAddress;
-        for (int i = 0; i < len; i++) {
+        final long start = appendAddress;
+        // ASCII fast path on a local cursor: writing the appendAddress field
+        // per char, interleaved with Unsafe stores, kept the JIT from holding
+        // the address in a register. Most values never leave this loop.
+        long addr = start;
+        int i = 0;
+        for (; i < len; i++) {
             char c = value.charAt(i);
-            if (c < 0x80) {
-                Unsafe.getUnsafe().putByte(appendAddress++, (byte) c);
-            } else if (c < 0x800) {
-                Unsafe.getUnsafe().putByte(appendAddress++, (byte) (0xC0 | (c >> 6)));
-                Unsafe.getUnsafe().putByte(appendAddress++, (byte) (0x80 | (c & 0x3F)));
-            } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < len) {
-                char c2 = value.charAt(++i);
-                if (Character.isLowSurrogate(c2)) {
-                    int codePoint = 0x10000 + ((c - 0xD800) << 10) + (c2 - 0xDC00);
-                    Unsafe.getUnsafe().putByte(appendAddress++, (byte) (0xF0 | (codePoint >> 18)));
-                    Unsafe.getUnsafe().putByte(appendAddress++, (byte) (0x80 | ((codePoint >> 12) & 0x3F)));
-                    Unsafe.getUnsafe().putByte(appendAddress++, (byte) (0x80 | ((codePoint >> 6) & 0x3F)));
-                    Unsafe.getUnsafe().putByte(appendAddress++, (byte) (0x80 | (codePoint & 0x3F)));
-                } else {
-                    Unsafe.getUnsafe().putByte(appendAddress++, (byte) '?');
-                    i--;
-                }
-            } else if (Character.isSurrogate(c)) {
-                Unsafe.getUnsafe().putByte(appendAddress++, (byte) '?');
-            } else {
-                Unsafe.getUnsafe().putByte(appendAddress++, (byte) (0xE0 | (c >> 12)));
-                Unsafe.getUnsafe().putByte(appendAddress++, (byte) (0x80 | ((c >> 6) & 0x3F)));
-                Unsafe.getUnsafe().putByte(appendAddress++, (byte) (0x80 | (c & 0x3F)));
+            if (c >= 0x80) {
+                break;
             }
+            Unsafe.getUnsafe().putByte(addr++, (byte) c);
         }
-        bytesCell[0] += appendAddress - start;
+        if (i < len) {
+            addr = putUtf8NonAscii(value, i, len, addr);
+        }
+        appendAddress = addr;
+        bytesCell[0] += addr - start;
     }
 
     /**
@@ -239,6 +228,38 @@ public class OffHeapAppendMemory implements ArrayBufferAppender, QuietCloseable 
     public void truncate() {
         bytesCell[0] -= appendAddress - pageAddress;
         appendAddress = pageAddress;
+    }
+
+    // From the first non-ASCII char on; returns the address past the last byte.
+    private static long putUtf8NonAscii(CharSequence value, int i, int len, long addr) {
+        for (; i < len; i++) {
+            char c = value.charAt(i);
+            if (c < 0x80) {
+                Unsafe.getUnsafe().putByte(addr++, (byte) c);
+            } else if (c < 0x800) {
+                Unsafe.getUnsafe().putByte(addr++, (byte) (0xC0 | (c >> 6)));
+                Unsafe.getUnsafe().putByte(addr++, (byte) (0x80 | (c & 0x3F)));
+            } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < len) {
+                char c2 = value.charAt(++i);
+                if (Character.isLowSurrogate(c2)) {
+                    int codePoint = 0x10000 + ((c - 0xD800) << 10) + (c2 - 0xDC00);
+                    Unsafe.getUnsafe().putByte(addr++, (byte) (0xF0 | (codePoint >> 18)));
+                    Unsafe.getUnsafe().putByte(addr++, (byte) (0x80 | ((codePoint >> 12) & 0x3F)));
+                    Unsafe.getUnsafe().putByte(addr++, (byte) (0x80 | ((codePoint >> 6) & 0x3F)));
+                    Unsafe.getUnsafe().putByte(addr++, (byte) (0x80 | (codePoint & 0x3F)));
+                } else {
+                    Unsafe.getUnsafe().putByte(addr++, (byte) '?');
+                    i--;
+                }
+            } else if (Character.isSurrogate(c)) {
+                Unsafe.getUnsafe().putByte(addr++, (byte) '?');
+            } else {
+                Unsafe.getUnsafe().putByte(addr++, (byte) (0xE0 | (c >> 12)));
+                Unsafe.getUnsafe().putByte(addr++, (byte) (0x80 | ((c >> 6) & 0x3F)));
+                Unsafe.getUnsafe().putByte(addr++, (byte) (0x80 | (c & 0x3F)));
+            }
+        }
+        return addr;
     }
 
     private void ensureCapacity(long needed) {
