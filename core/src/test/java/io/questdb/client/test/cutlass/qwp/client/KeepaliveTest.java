@@ -29,6 +29,7 @@ import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.io.IOException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -57,6 +58,25 @@ public class KeepaliveTest {
     }
 
     @Test
+    public void testNoPingsWhileFramesFlow() throws Exception {
+        // every send restarts the idle clock, so a sender flushing well inside the
+        // interval never pings; without that it pinged once per interval regardless
+        final long intervalMillis = 300;
+        AtomicInteger pings = new AtomicInteger();
+        try (TestWebSocketServer server = startServer(pings);
+             Sender sender = Sender.fromConfig(config(server, intervalMillis))) {
+            long end = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(5 * intervalMillis);
+            while (System.nanoTime() < end) {
+                sender.table("t").longColumn("x", 1).atNow();
+                sender.flush();
+                Thread.sleep(10);
+            }
+        }
+        // one stall past the interval on a slow box may earn a PING; ~5 means none were suppressed
+        Assert.assertTrue("pinged while frames were flowing: " + pings.get(), pings.get() <= 1);
+    }
+
+    @Test
     public void testNoPingsByDefault() throws Exception {
         AtomicInteger pings = new AtomicInteger();
         try (TestWebSocketServer server = startServer(pings);
@@ -73,6 +93,17 @@ public class KeepaliveTest {
 
     private static TestWebSocketServer startServer(AtomicInteger pings) throws Exception {
         TestWebSocketServer server = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
+            private long nextSeq;
+
+            @Override
+            public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+                try {
+                    client.sendBinary(QwpWireTestUtils.buildAck(nextSeq++));
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            }
+
             @Override
             public void onPing(TestWebSocketServer.ClientHandler client) {
                 pings.incrementAndGet();

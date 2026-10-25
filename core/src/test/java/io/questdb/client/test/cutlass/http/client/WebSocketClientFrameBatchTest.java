@@ -41,9 +41,9 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * Several binary frames appended with {@code appendBinaryFrame} and sent by one
- * {@code flushFrames} must arrive as distinct, intact messages: the compacting
- * frame end removes the header gap that would otherwise sit between them, for
- * every header size (7-bit, 16-bit and 64-bit payload lengths).
+ * {@code flushFrames} must arrive as distinct, intact messages: each frame is
+ * written header first and masked as its payload is copied in, flush against
+ * the previous one, for every header size and every 8-byte tail length.
  */
 public class WebSocketClientFrameBatchTest {
 
@@ -61,7 +61,7 @@ public class WebSocketClientFrameBatchTest {
         // The test server parses frames from a 64 KiB buffer, so stay under it; the
         // three header sizes (7-bit, 16-bit, 64-bit lengths) are still all covered
         // by the real client's framing, which this test exercises up to 16-bit.
-        int[] sizes = {0, 1, 125, 126, 127, 1000, 16 * 1024, 60000, 3, 16 * 1024 + 1};
+        int[] sizes = {0, 1, 125, 126, 127, 1000, 16 * 1024, 60000, 3, 16 * 1024 + 1, 2, 4};
         long total = 0;
         for (int sz : sizes) total += sz;
         long buf = Unsafe.malloc(Math.max(1L, total), MemoryTag.NATIVE_DEFAULT);

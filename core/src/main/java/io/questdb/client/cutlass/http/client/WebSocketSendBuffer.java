@@ -145,21 +145,21 @@ public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
     }
 
     /**
-     * Ends a binary frame and closes the gap {@link #beginFrame} reserved for
-     * the largest header, so this frame sits flush against the previous one
-     * and several frames can go out in a single send. Costs one memmove of
-     * the frame by at most 12 bytes; callers keep large frames on
-     * {@link #endBinaryFrame} and send them alone.
+     * Appends one complete binary frame, header first, flush against the
+     * previous one, so several frames can go out in a single send. The payload
+     * is masked as it is copied in: one pass over it.
      */
-    public FrameInfo endBinaryFrameCompact() {
-        FrameInfo frame = endFrame(WebSocketOpcode.BINARY);
-        int gap = frame.offset - frameStartOffset;
-        if (gap > 0) {
-            Vect.memmove(bufPtr + frameStartOffset, bufPtr + frame.offset, frame.length);
-            writePos = frameStartOffset + frame.length;
-            frame.set(frameStartOffset, frame.length);
+    public void putBinaryFrame(long from, int len) {
+        int headerSize = WebSocketFrameWriter.headerSize(len, true);
+        long required = (long) writePos + headerSize + len;
+        if (required > bufCapacity) {
+            grow(required);
         }
-        return frame;
+        int maskKey = rnd.nextInt();
+        long frame = bufPtr + writePos;
+        WebSocketFrameWriter.writeHeader(frame, true, WebSocketOpcode.BINARY, len, maskKey);
+        WebSocketFrameWriter.copyMasked(from, frame + headerSize, len, maskKey);
+        writePos += headerSize + len;
     }
 
     /**

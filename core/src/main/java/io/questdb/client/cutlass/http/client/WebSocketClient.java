@@ -497,9 +497,7 @@ public abstract class WebSocketClient implements QuietCloseable {
      */
     public int appendBinaryFrame(long dataPtr, int length) {
         checkConnected();
-        sendBuffer.beginFrame();
-        sendBuffer.putBlockOfBytes(dataPtr, length);
-        sendBuffer.endBinaryFrameCompact();
+        sendBuffer.putBinaryFrame(dataPtr, length);
         return sendBuffer.getWritePos();
     }
 

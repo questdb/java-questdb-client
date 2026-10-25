@@ -506,8 +506,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // Frame batching per loop iteration, see ioLoop.
     private static final int SEND_BATCH_MAX_FRAMES = 128;
     private static final int SEND_BATCH_MAX_BYTES = 64 * 1024;
-    // Frames above this are sent alone: too big to be worth the compacting
-    // memmove, and a batch holds at most SEND_BATCH_MAX_BYTES anyway.
+    // Frames above this are sent alone: a batch holds at most
+    // SEND_BATCH_MAX_BYTES anyway.
     private static final int SEND_BATCH_INLINE_MAX_PAYLOAD = 16 * 1024;
     // I/O-thread-only. Set by swapClient(): a reconnect rewinds the send cursor
     // to ackedFsn+1, which creates sendable work from inside the I/O thread --
@@ -2822,6 +2822,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     }
                 }
                 flushPendingFrames();
+                if (batched > 0) {
+                    // Once per batch, not per frame: the clock read was a tenth
+                    // of this thread's cycles at one row per flush.
+                    lastFrameOrPingNanos = System.nanoTime();
+                }
                 // 1. Try to send next frame(s).
                 // 2. Try to receive ACKs.
                 if (tryReceiveAcks()) {
@@ -4071,8 +4076,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         }
         try {
             if (payloadLen > SEND_BATCH_INLINE_MAX_PAYLOAD) {
-                // A large frame goes out alone, without the compacting memmove,
-                // after whatever small frames precede it.
+                // A large frame goes out alone, after whatever small frames
+                // precede it, so the batch buffer stays bounded.
                 client.flushFrames();
                 client.sendBinary(frameAddr, payloadLen);
             } else {
@@ -4099,7 +4104,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             // perfectly from id 0.
             accumulateSentDict(frameAddr, payloadLen, deltaStart);
         }
-        lastFrameOrPingNanos = System.nanoTime();
         sendOffset = frameEnd;
         long fsnSent = fsnAtZero + nextWireSeq;
         nextWireSeq++;

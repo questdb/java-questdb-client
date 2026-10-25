@@ -73,6 +73,14 @@ public final class WebSocketFrameWriter {
      * @param maskKey the 4-byte mask key
      */
     public static void maskPayload(long buf, long len, int maskKey) {
+        copyMasked(buf, buf, len, maskKey);
+    }
+
+    /**
+     * Copies {@code len} bytes from {@code src} to {@code dst}, XOR-ing them with
+     * the mask key on the way. {@code src == dst} masks in place.
+     */
+    public static void copyMasked(long src, long dst, long len, int maskKey) {
         // maskKey is in big-endian convention: MSB = wire byte 0 = mask byte for position 0.
         // For bulk XOR via getInt/getLong (native byte order), convert to native order
         // so that memory position 0 XORs with mask byte 0, position 1 with mask byte 1, etc.
@@ -83,23 +91,23 @@ public final class WebSocketFrameWriter {
 
         // Process 8-byte chunks
         while (i + 8 <= len) {
-            long value = Unsafe.getUnsafe().getLong(buf + i);
-            Unsafe.getUnsafe().putLong(buf + i, value ^ longMask);
+            long value = Unsafe.getUnsafe().getLong(src + i);
+            Unsafe.getUnsafe().putLong(dst + i, value ^ longMask);
             i += 8;
         }
 
         // Process 4-byte chunk if remaining
         if (i + 4 <= len) {
-            int value = Unsafe.getUnsafe().getInt(buf + i);
-            Unsafe.getUnsafe().putInt(buf + i, value ^ nativeMask);
+            int value = Unsafe.getUnsafe().getInt(src + i);
+            Unsafe.getUnsafe().putInt(dst + i, value ^ nativeMask);
             i += 4;
         }
 
         // Process remaining bytes - extract mask byte in big-endian order
         while (i < len) {
-            byte b = Unsafe.getUnsafe().getByte(buf + i);
+            byte b = Unsafe.getUnsafe().getByte(src + i);
             int maskByte = (maskKey >>> ((3 - ((int) i & 3)) << 3)) & 0xFF;
-            Unsafe.getUnsafe().putByte(buf + i, (byte) (b ^ maskByte));
+            Unsafe.getUnsafe().putByte(dst + i, (byte) (b ^ maskByte));
             i++;
         }
     }
