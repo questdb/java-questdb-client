@@ -33,6 +33,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.IdentityHashMap;
+import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 
 /**
  * Chain of {@link MmapSegment}s presented to the user thread as one logical
@@ -68,6 +69,8 @@ public final class SegmentRing implements QuietCloseable {
             RetainedSegmentMembershipMode.IDENTITY;
     private static final Logger LOG = LoggerFactory.getLogger(SegmentRing.class);
     private static final int MAX_PENDING_TRIMS = 64;
+    private static final AtomicLongFieldUpdater<SegmentRing> PUBLISHED_FSN =
+            AtomicLongFieldUpdater.newUpdater(SegmentRing.class, "publishedFsn");
     // Tally of sealed-list entries inspected by nextSealedAfter(). Test-only
     // operation count for deterministic traversal-complexity assertions.
     private static long nextSealedComparisons;
@@ -1133,7 +1136,10 @@ public final class SegmentRing implements QuietCloseable {
         // one, so losing the last frame's ACK would stall close() and drain()
         // until their timeouts. publishedFsn may run one frame ahead of
         // publishedOffset() for an instant, but never behind it.
-        publishedFsn = fsn;
+        // Release stores for the FSN and the bytes; the volatile publishStamp
+        // store after them is the publish's one full fence, which the I/O
+        // loop's parked-flag handshake needs.
+        PUBLISHED_FSN.lazySet(this, fsn);
         target.publishWritten();
         publishStamp = publishStamp + 1; // single producer
         return fsn;

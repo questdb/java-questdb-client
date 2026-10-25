@@ -36,6 +36,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 
 /**
  * One mmap-backed SF segment file. The user thread (the single producer)
@@ -70,11 +71,16 @@ public final class MmapSegment implements QuietCloseable {
     public static final int HEADER_SIZE = 24;
     public static final byte MANIFEST_REQUIRED_FLAG = 1;
     public static final byte VERSION = 1;
+    // Release stores for the producer's per-frame publication, see tryWrite.
+    private static final AtomicLongFieldUpdater<MmapSegment> FRAME_COUNT =
+            AtomicLongFieldUpdater.newUpdater(MmapSegment.class, "frameCount");
     private static final Logger LOG = LoggerFactory.getLogger(MmapSegment.class);
     // Deduplicates the process-wide "mlock refused" warning: the refusal is a
     // soft downgrade (see syncPublished) and must not spam the log once per
     // barrier when RLIMIT_MEMLOCK or the platform says no.
     private static final AtomicBoolean MLOCK_REFUSAL_WARNED = new AtomicBoolean();
+    private static final AtomicLongFieldUpdater<MmapSegment> PUBLISHED_CURSOR =
+            AtomicLongFieldUpdater.newUpdater(MmapSegment.class, "publishedCursor");
     private static final int RECOVERY_BUFFER_SIZE = 64 * 1024;
 
     private final FilesFacade filesFacade;
@@ -707,9 +713,12 @@ public final class MmapSegment implements QuietCloseable {
      * Producer thread only.
      */
     void publishWritten() {
-        // Until this volatile write retires, the consumer cannot see any of the
-        // bytes tryWrite wrote, and once it does, every one of them is complete.
-        publishedCursor = appendCursor;
+        // Until this store lands, the consumer cannot see any of the bytes
+        // tryWrite wrote, and once it does, every one of them is complete: a
+        // release store orders them before it. A volatile store would also
+        // fence (drain the store buffer) once per frame; SegmentRing's
+        // publishStamp store, last in the publish, keeps that one fence.
+        PUBLISHED_CURSOR.lazySet(this, appendCursor);
     }
 
     /**
@@ -746,13 +755,11 @@ public final class MmapSegment implements QuietCloseable {
         int crc = memoryBacked ? 0 : Crc32c.update(Crc32c.INIT, lenAddr, 4L + payloadLen);
         Unsafe.getUnsafe().putInt(mmapAddress + offset, crc);
         appendCursor = offset + total;
-        // Plain read + write of the volatile field. `frameCount++` would
-        // trip the "non-atomic increment of volatile" inspection, but
-        // single-writer invariant (only the producer thread mutates) makes
-        // the RMW race-free by design. It precedes the publishedCursor store
-        // in publishWritten, so a consumer that sees the frame's bytes also
-        // sees the frame count that makes its FSN discoverable.
-        frameCount = frameCount + 1;
+        // Single writer (only the producer thread mutates), so the plain read
+        // and release store are race-free. It precedes the publishedCursor
+        // store in publishWritten, so a consumer that sees the frame's bytes
+        // also sees the frame count that makes its FSN discoverable.
+        FRAME_COUNT.lazySet(this, frameCount + 1);
         return offset;
     }
 
