@@ -119,6 +119,34 @@ public class MicrobatchBufferTest {
     }
 
     @Test
+    public void testClearEmptiesAFillingBufferAndKeepsItsBatchId() throws Exception {
+        assertMemoryLeak(() -> {
+            try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
+                buffer.writeByte((byte) 1);
+                buffer.incrementRowCount();
+                long batchId = buffer.getBatchId();
+
+                buffer.clear();
+
+                Assert.assertFalse(buffer.hasData());
+                Assert.assertEquals(0, buffer.getBufferPos());
+                Assert.assertEquals(0, buffer.getRowCount());
+                Assert.assertTrue(buffer.isFilling());
+                Assert.assertEquals(batchId, buffer.getBatchId());
+
+                buffer.writeByte((byte) 2);
+                buffer.seal();
+                try {
+                    buffer.clear();
+                    Assert.fail("clear() must refuse a sealed buffer");
+                } catch (IllegalStateException expected) {
+                    Assert.assertTrue(expected.getMessage().contains("SEALED"));
+                }
+            }
+        });
+    }
+
+    @Test
     public void testConcurrentBatchIdUniqueness() throws Exception {
         int threadCount = 8;
         int buffersPerThread = 500;

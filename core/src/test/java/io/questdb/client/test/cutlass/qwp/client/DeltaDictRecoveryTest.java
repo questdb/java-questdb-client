@@ -1033,7 +1033,7 @@ public class DeltaDictRecoveryTest {
     @Test
     public void testFailedPublishDoesNotDuplicatePersistedSymbols() throws Exception {
         // Regression: persistNewSymbolsBeforePublish is a write-ahead -- it runs
-        // BEFORE the frame is published (sealAndSwapBuffer -> appendBlocking). If
+        // BEFORE the frame is published (publishActiveBuffer -> appendBlocking). If
         // publish fails (here PAYLOAD_TOO_LARGE, a frame bigger than the SF
         // segment; a backpressure deadline in production), the frame's symbols are
         // already on disk but sentMaxSymbolId is NOT advanced and the rows stay

@@ -314,7 +314,7 @@ public class SelfSufficientFramesTest {
      * <p>
      * The failure is injected at the RING, not the cap: both frames pass the pre-flight
      * (each is under the advertised cap) but "big"'s frame does not fit a fresh
-     * sf_max_segment_bytes segment, so it fails in sealAndSwapBuffer AFTER "a" was published.
+     * sf_max_segment_bytes segment, so it fails in publishActiveBuffer AFTER "a" was published.
      */
     @Test(timeout = 60_000L)
     public void testMidSplitPublishFailureLeavesTheDictionaryIdempotent() throws Exception {
@@ -454,7 +454,7 @@ public class SelfSufficientFramesTest {
     @Test
     public void testFileModeSplitPersistsDictBeforeAFAILEDPublish() throws Exception {
         // The SPLIT path's write-ahead ordering: persistNewSymbolsBeforePublish must run
-        // BEFORE sealAndSwapBuffer publishes the frame to the ring, exactly as it does on
+        // BEFORE publishActiveBuffer publishes the frame to the ring, exactly as it does on
         // the non-split path.
         //
         // Its sibling below (testFileModeSplitPersistsDictBeforePublish) checks the dict
@@ -504,7 +504,7 @@ public class SelfSufficientFramesTest {
 
                     // The write-ahead already ran: both of the batch's new symbols are
                     // durable even though the frame that references them never
-                    // published. Move the persist after sealAndSwapBuffer and this is 0.
+                    // published. Move the persist after publishActiveBuffer and this is 0.
                     ObjList<String> persisted =
                             ((QwpWebSocketSender) sender).getPersistedSymbolsForTest();
                     Assert.assertNotNull(persisted);
@@ -1260,7 +1260,7 @@ public class SelfSufficientFramesTest {
         // close -- splitFramesFit proves the batch is SHIPPABLE once chunked, so the
         // chunks are published, and then the data frame fails to publish anyway.
         //
-        // sealAndSwapBuffer throws on a buffer-recycle timeout and on appendBlocking's
+        // publishActiveBuffer throws on an append failure and on appendBlocking's
         // backpressure/PAYLOAD_TOO_LARGE paths, none of which a size check can see. The
         // chunks are already on the ring carrying FLAG_DEFER_COMMIT with no rollback, so
         // without the commit below the server withholds their ack and clamps the
@@ -1406,7 +1406,7 @@ public class SelfSufficientFramesTest {
     @Test
     public void testCloseStillDrainsWhenTheRetainedBatchIsOverCap() throws Exception {
         // close() step 1 flushes; an over-cap batch throws there. Letting that throw
-        // escape skips sendCommitMessage, sealAndSwapBuffer AND drainOnClose --
+        // escape skips sendCommitMessage, publishActiveBuffer AND drainOnClose --
         // abandoning every row an earlier successful flush already published. close()
         // therefore discards the retained batch, remembers the error, and runs the rest.
         //

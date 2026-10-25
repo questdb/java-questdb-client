@@ -167,6 +167,20 @@ public class MicrobatchBuffer implements QuietCloseable {
         }
     }
 
+    /**
+     * Empties a FILLING buffer for the next batch without a state transition or a
+     * new batch id: a buffer that only one thread ever touches needs no hand-off.
+     *
+     * @throws IllegalStateException if not in FILLING state
+     */
+    public void clear() {
+        if (state != STATE_FILLING) {
+            throw new IllegalStateException("Cannot clear buffer in state " + stateName(state));
+        }
+        bufferPos = 0;
+        rowCount = 0;
+    }
+
     @Override
     public void close() {
         if (bufferPtr != 0) {

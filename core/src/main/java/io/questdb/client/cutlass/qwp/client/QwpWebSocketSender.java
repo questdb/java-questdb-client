@@ -83,7 +83,6 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
@@ -197,12 +196,15 @@ public class QwpWebSocketSender implements Sender {
     // exception, the SYNC one too unless the failure is retryable (then it retries within the reconnect
     // budget), while the running background drainer treats it as a transient outage and retries it
     // indefinitely (never bounded by the reconnect budget, never terminal) per store-and-forward Invariant B.
+    // The frame being assembled for the ring. One buffer is enough: the ring copy
+    // happens on this thread, so nothing ever holds a sealed buffer while the next
+    // frame is built.
+    private final MicrobatchBuffer activeBuffer;
     private final Supplier<String> authorizationHeaderSupplier;
     private final int autoFlushBytes;
     private final long autoFlushIntervalNanos;
     // Auto-flush configuration
     private final int autoFlushRows;
-    private final MicrobatchBuffer buffer1;
     private final AtomicReference<LineSenderException> connectionError = new AtomicReference<>();
     private final Decimal256 currentDecimal256 = new Decimal256();
     // Encoder for QWP v1 messages
@@ -256,13 +258,10 @@ public class QwpWebSocketSender implements Sender {
     private final CharSequenceObjHashMap<QwpTableBuffer> tableBuffers;
     // null means plain text (no TLS)
     private final ClientTlsConfiguration tlsConfig;
-    private MicrobatchBuffer activeBuffer;
     private long authTimeoutMs = DEFAULT_AUTH_TIMEOUT_MS;
     // Upper bound (ms) on each TCP connect attempt. 0 (default) falls back to
     // the OS connect timeout. Applied to every WebSocketClient before connect.
     private int connectTimeoutMs = 0;
-    // Double-buffering for async I/O
-    private MicrobatchBuffer buffer0;
     // Cached column references to avoid repeated hashmap lookups
     private QwpTableBuffer.ColumnBuffer cachedTimestampColumn;
     private QwpTableBuffer.ColumnBuffer cachedTimestampNanosColumn;
@@ -714,16 +713,11 @@ public class QwpWebSocketSender implements Sender {
 
         int microbatchBufferSize = Math.max(DEFAULT_MICROBATCH_BUFFER_SIZE, autoFlushBytes * 2);
         try {
-            this.buffer0 = new MicrobatchBuffer(microbatchBufferSize);
-            this.buffer1 = new MicrobatchBuffer(microbatchBufferSize);
+            this.activeBuffer = new MicrobatchBuffer(microbatchBufferSize);
         } catch (Throwable t) {
-            if (buffer0 != null) {
-                buffer0.close();
-            }
             encoder.close();
             throw t;
         }
-        this.activeBuffer = buffer0;
     }
 
     /**
@@ -1847,7 +1841,7 @@ public class QwpWebSocketSender implements Sender {
                 //    RETAINED by design so it can go out once a
                 //    larger-cap node is reached -- but on close there is
                 //    no later flush, and letting the throw escape here
-                //    skips sendCommitMessage, sealAndSwapBuffer and
+                //    skips sendCommitMessage, publishActiveBuffer and
                 //    drainOnClose, abandoning every row an earlier
                 //    successful flush already published. The message
                 //    that path emits tells the caller to close the
@@ -1861,10 +1855,10 @@ public class QwpWebSocketSender implements Sender {
                     terminalError = captureCloseError(terminalError, e);
                 } catch (Throwable t) {
                     // Same reasoning as the pre-flight rejection above, for the
-                    // failures a size check cannot see: sealAndSwapBuffer's
-                    // buffer-recycle timeout and appendBlocking's backpressure
+                    // failures a size check cannot see: publishActiveBuffer's
+                    // append failure and appendBlocking's backpressure
                     // deadline. Letting those escape to the outer catch skipped
-                    // sendCommitMessage, sealAndSwapBuffer and drainOnClose -- so a
+                    // sendCommitMessage, publishActiveBuffer and drainOnClose -- so a
                     // flush that had already published deferred dictionary chunks
                     // left their group open forever, and every row an EARLIER
                     // successful flush published was abandoned unacked. The batch is
@@ -1877,7 +1871,7 @@ public class QwpWebSocketSender implements Sender {
                     sendCommitMessage();
                 }
                 if (activeBuffer != null && activeBuffer.hasData()) {
-                    sealAndSwapBuffer();
+                    publishActiveBuffer();
                     if (!deferCommit) {
                         lastCommitBoundaryFsn = cursorEngine.publishedFsn();
                     }
@@ -2329,7 +2323,7 @@ public class QwpWebSocketSender implements Sender {
         long beforeFsn = cursorEngine != null ? cursorEngine.publishedFsn() : -1L;
 
         // Cursor SF: append happens on the user thread inside
-        // sealAndSwapBuffer, so by the time we reach here every encoded batch
+        // publishActiveBuffer, so by the time we reach here every encoded batch
         // is published in its mmap'd segment. PERIODIC stable-storage barriers
         // run independently in the manager. No processingCount to drain and no
         // awaitPendingAcks here; just surface any I/O thread error.
@@ -2338,7 +2332,7 @@ public class QwpWebSocketSender implements Sender {
             sendCommitMessage();
         }
         if (activeBuffer != null && activeBuffer.hasData()) {
-            sealAndSwapBuffer();
+            publishActiveBuffer();
             if (!deferCommit) {
                 // Same residual-seal boundary update as close(): a
                 // non-deferred residual publish is commit-bearing and must be
@@ -4666,15 +4660,9 @@ public class QwpWebSocketSender implements Sender {
         closeCleanupStarted = true;
         try {
             try {
-                buffer0.close();
+                activeBuffer.close();
             } catch (Throwable t) {
-                LOG.error("Error closing buffer0: {}", String.valueOf(t));
-                terminalError = captureCloseError(terminalError, t);
-            }
-            try {
-                buffer1.close();
-            } catch (Throwable t) {
-                LOG.error("Error closing buffer1: {}", String.valueOf(t));
+                LOG.error("Error closing the microbatch buffer: {}", String.valueOf(t));
                 terminalError = captureCloseError(terminalError, t);
             }
             if (client != null) {
@@ -4990,39 +4978,6 @@ public class QwpWebSocketSender implements Sender {
         }
     }
 
-    /**
-     * Ensures the active buffer is ready for writing (in FILLING state).
-     * If the buffer is in RECYCLED state, resets it. If it's in use, waits for it.
-     */
-    private void ensureActiveBufferReady() {
-        if (activeBuffer.isFilling()) {
-            return; // Already ready
-        }
-
-        if (activeBuffer.isRecycled()) {
-            // Buffer was recycled but not reset - reset it now
-            activeBuffer.reset();
-            return;
-        }
-
-        // Buffer is in use (SEALED or SENDING) - wait for it
-        // Use a while loop to handle spurious wakeups and race conditions with the latch
-        while (activeBuffer.isInUse()) {
-            if (LOG.isDebugEnabled()) {
-                LOG.debug("Waiting for active buffer [id={}, state={}]", activeBuffer.getBatchId(), MicrobatchBuffer.stateName(activeBuffer.getState()));
-            }
-            boolean recycled = activeBuffer.awaitRecycled(30, TimeUnit.SECONDS);
-            if (!recycled) {
-                throw new LineSenderException("Timeout waiting for active buffer to be recycled");
-            }
-        }
-
-        // Buffer should now be RECYCLED - reset it
-        if (activeBuffer.isRecycled()) {
-            activeBuffer.reset();
-        }
-    }
-
     private void ensureConnected() {
         checkNotClosed();
         resumeRecycleIfPending();
@@ -5264,7 +5219,6 @@ public class QwpWebSocketSender implements Sender {
             LOG.debug("Flushing pending rows [count={}, tables={}, defer={}]", pendingRowCount, tableCount, deferCommit);
         }
 
-        ensureActiveBufferReady();
         // In full-dict mode every frame is self-sufficient: it carries the whole
         // symbol dictionary from id 0 so orphan-drain / recovery replay to a fresh
         // server never dangles a symbol id. In delta mode (memory-mode, and
@@ -5310,7 +5264,7 @@ public class QwpWebSocketSender implements Sender {
         // slices live in (beginMessage calls buffer.reset()).
         // splitFramesFit only proves the batch is SHIPPABLE once chunked. It says
         // nothing about whether the frames that follow will actually publish:
-        // sealAndSwapBuffer throws on a buffer-recycle timeout and on appendBlocking's
+        // publishActiveBuffer throws on an append failure and on appendBlocking's
         // backpressure deadline (the ring at sf_max_total_bytes), and neither is
         // reachable from a size check. Once a chunk is on the ring the flush owns a
         // commit debt that only its own data frame closes, so track that and close it
@@ -5344,7 +5298,7 @@ public class QwpWebSocketSender implements Sender {
             activeBuffer.ensureCapacity(messageSize);
             activeBuffer.write(buffer.getBufferPtr(), messageSize);
             activeBuffer.incrementRowCount();
-            sealAndSwapBuffer();
+            publishActiveBuffer();
             // The frame carrying ids up to currentBatchMaxSymbolId is now on the ring;
             // advance the delta baseline so the next frame ships only newer ids.
             advanceSentMaxSymbolId();
@@ -5423,8 +5377,8 @@ public class QwpWebSocketSender implements Sender {
      * message arrives.
      * <p>
      * <b>Not atomic across frames.</b> The frames publish one at a time, so a
-     * publish failure partway through -- {@link #sealAndSwapBuffer()} throwing on
-     * frame k&gt;1, e.g. a backpressure deadline or the buffer-recycle timeout --
+     * publish failure partway through -- {@link #publishActiveBuffer()} throwing on
+     * frame k&gt;1, e.g. a backpressure deadline or an append failure --
      * leaves frames 1..k-1 already on the ring as deferred (appended, not yet
      * committed). The throw propagates past the {@code resetTableBuffersAfterFlush}
      * at the end of the loop, so the source rows survive in their table buffers
@@ -5539,7 +5493,6 @@ public class QwpWebSocketSender implements Sender {
             // unchanged. The first frame carries the batch's new symbols; later
             // frames are no-ops once the baseline has advanced.
             persistNewSymbolsBeforePublish();
-            ensureActiveBufferReady();
             // The combined encoder buffer remains immutable for the whole split.
             // Assemble this frame directly into the active microbatch: patched
             // header + staged delta bytes + the staged table-body slice. No row or
@@ -5566,7 +5519,7 @@ public class QwpWebSocketSender implements Sender {
                     + ", messageSize=" + messageSize + ", serverMaxBatchSize=" + cap + ']';
 
             activeBuffer.incrementRowCount();
-            sealAndSwapBuffer();
+            publishActiveBuffer();
             // Frame queued: advance so the next split frame's delta starts above
             // the ids this one just registered.
             advanceSentMaxSymbolId();
@@ -6396,7 +6349,7 @@ public class QwpWebSocketSender implements Sender {
                     }
                     throw e;
                 } catch (Throwable t) {
-                    // Cap rejection, seal/buffer-recycle timeout, or
+                    // Cap rejection, an append failure, or
                     // appendBlocking's backpressure deadline (no drainer is
                     // attached here, so a full ring parks until the deadline):
                     // publishDictionaryChunks already clamped the watermark to
@@ -6504,11 +6457,10 @@ public class QwpWebSocketSender implements Sender {
         encoder.beginMessage(0, globalSymbolDictionary, commitBaseline, commitBaseline);
         int messageSize = encoder.finishMessage();
         QwpBufferWriter buffer = encoder.getBuffer();
-        ensureActiveBufferReady();
         activeBuffer.ensureCapacity(messageSize);
         activeBuffer.write(buffer.getBufferPtr(), messageSize);
         activeBuffer.incrementRowCount();
-        sealAndSwapBuffer();
+        publishActiveBuffer();
         hasDeferredMessages = false;
         lastCommitBoundaryFsn = cursorEngine.publishedFsn();
     }
@@ -6701,7 +6653,7 @@ public class QwpWebSocketSender implements Sender {
             // the mmap append window (how a full disk / exhausted quota surfaces there),
             // and behind an injected facade a short positioned write. Surface it as a
             // LineSenderException -- like every other flush-path failure, e.g. the cursor
-            // append in sealAndSwapBuffer -- so a caller catching LineSenderException
+            // append in publishActiveBuffer -- so a caller catching LineSenderException
             // around flush() also catches a disk-full during the write-ahead persist. The
             // persist ran before publish and pd.size() did not advance on the failure, so
             // the still-buffered rows re-persist the same range idempotently on retry.
@@ -6813,7 +6765,7 @@ public class QwpWebSocketSender implements Sender {
             }
             // Pass two publishes. Every chunk is a DEFERRED frame, so from the first
             // successful publish onward this method owns a commit debt: if a later chunk
-            // throws (sealAndSwapBuffer's buffer-recycle timeout, or appendBlocking's
+            // throws (publishActiveBuffer's append failure, or appendBlocking's
             // backpressure deadline when the ring is at sf_max_total_bytes), the chunks
             // already on the ring have no rollback and nothing downstream will close their
             // group. Close it in the catch instead -- see commitOrphanedDictionaryChunks.
@@ -6845,7 +6797,7 @@ public class QwpWebSocketSender implements Sender {
                 // above it the replay guard fails the loop with a false "host
                 // crash", below it a ringed id could be reclaimed and rebound.
                 // publishDictionaryChunk cannot throw with its frame already
-                // appended (sealAndSwapBuffer's throw sites precede the append),
+                // appended (publishActiveBuffer's throw sites precede the append),
                 // so chunkStart - 1 is exact; a pre-flight rejection leaves it
                 // at from - 1 (nothing ringed, the mirror is gone, the next
                 // flush re-registers from 0). Full-dict mode never reads the
@@ -6888,11 +6840,10 @@ public class QwpWebSocketSender implements Sender {
         encoder.beginMessage(0, globalSymbolDictionary, startId - 1, endId);
         int messageSize = encoder.finishMessage();
         QwpBufferWriter buffer = encoder.getBuffer();
-        ensureActiveBufferReady();
         activeBuffer.ensureCapacity(messageSize);
         activeBuffer.write(buffer.getBufferPtr(), messageSize);
         activeBuffer.incrementRowCount();
-        sealAndSwapBuffer();
+        publishActiveBuffer();
         // The chunk is on the ring carrying FLAG_DEFER_COMMIT, so the server withholds
         // its ack and clamps the connection's cumulative-ack watermark until the group
         // commits. Record that debt here rather than leaving it to the caller: when the
@@ -7119,70 +7070,22 @@ public class QwpWebSocketSender implements Sender {
      * Seals the current buffer and swaps to the other buffer.
      * Enqueues the sealed buffer for async sending.
      */
-    private void sealAndSwapBuffer() {
+    private void publishActiveBuffer() {
         if (!activeBuffer.hasData()) {
             return; // Nothing to send
         }
-
-        MicrobatchBuffer toSend = activeBuffer;
-        toSend.seal();
-
-        if (LOG.isDebugEnabled()) {
-            LOG.debug("Sealing buffer [id={}, rows={}, bytes={}]", toSend.getBatchId(), toSend.getRowCount(), toSend.getBufferPos());
-        }
-
-        // Swap to the other buffer
-        activeBuffer = (activeBuffer == buffer0) ? buffer1 : buffer0;
-
-        // If the other buffer is still being sent, wait for it
-        // Use a while loop to handle spurious wakeups and race conditions with the latch
-        while (activeBuffer.isInUse()) {
-            if (LOG.isDebugEnabled()) {
-                LOG.debug("Waiting for buffer recycle [id={}, state={}]", activeBuffer.getBatchId(), MicrobatchBuffer.stateName(activeBuffer.getState()));
-            }
-            boolean recycled = activeBuffer.awaitRecycled(30, TimeUnit.SECONDS);
-            if (!recycled) {
-                throw new LineSenderException("Timeout waiting for buffer to be recycled");
-            }
-            if (LOG.isDebugEnabled()) {
-                LOG.debug("Buffer recycled [id={}, state={}]", activeBuffer.getBatchId(), MicrobatchBuffer.stateName(activeBuffer.getState()));
-            }
-        }
-
-        // Reset the new active buffer
-        int stateBeforeReset = activeBuffer.getState();
-        if (LOG.isDebugEnabled()) {
-            LOG.debug("Resetting buffer [id={}, state={}]", activeBuffer.getBatchId(), MicrobatchBuffer.stateName(stateBeforeReset));
-        }
-        activeBuffer.reset();
-
-        // Hand off the sealed buffer to the cursor engine on the user thread
-        // (durable mmap append, returns once published).
         try {
-            toSend.markSending();
-            cursorEngine.appendBlocking(toSend.getBufferPtr(), toSend.getBufferPos());
-            toSend.markRecycled();
+            cursorEngine.appendBlocking(activeBuffer.getBufferPtr(), activeBuffer.getBufferPos());
         } catch (Throwable t) {
-            // appendBlocking failed synchronously on the user thread — the
-            // payload never reached the engine, so no I/O thread will
-            // recycle toSend. Recycle it here so a later flush can swap
-            // back to it; flushPendingRows aborts its post-enqueue state
-            // updates after this throw, so the source rows stay intact and the
-            // next batch re-emits the same rows along with the full inline
-            // schema and the symbol-dict delta the batch requires.
-            if (toSend.isSending()) {
-                toSend.markRecycled();
-            } else if (toSend.isSealed()) {
-                toSend.rollbackSealForRetry();
-            }
-            // Surface any I/O thread error first — appendBlocking itself only
-            // throws on PAYLOAD_TOO_LARGE / backpressure deadline, but the
-            // I/O loop can have failed independently.
+            // Nothing reached the ring. Drop the encoded frame: a retry re-encodes
+            // from the table buffers, which still hold the rows.
+            activeBuffer.clear();
             if (cursorSendLoop != null) {
                 cursorSendLoop.checkError();
             }
             throw new LineSenderException("cursor SF append failed", t);
         }
+        activeBuffer.clear();
     }
 
     /**

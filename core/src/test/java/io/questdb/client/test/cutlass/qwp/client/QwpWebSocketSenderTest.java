@@ -359,13 +359,14 @@ public class QwpWebSocketSenderTest {
                         Assert.assertTrue(e.getMessage().contains("cursor SF append failed"));
                     }
 
-                    MicrobatchBuffer buffer0 = getMicrobatchBuffer(sender, "buffer0");
-                    MicrobatchBuffer buffer1 = getMicrobatchBuffer(sender, "buffer1");
+                    // The retry re-encodes from the table buffers, so the failed
+                    // frame must not stay in the buffer it would be appended after.
+                    MicrobatchBuffer buffer = getMicrobatchBuffer(sender, "activeBuffer");
                     Assert.assertFalse(
-                            "failed append must not leave any buffer in use [buffer0="
-                                    + MicrobatchBuffer.stateName(buffer0.getState())
-                                    + ", buffer1=" + MicrobatchBuffer.stateName(buffer1.getState()) + "]",
-                            buffer0.isInUse() || buffer1.isInUse());
+                            "failed append must not leave the buffer in use [state="
+                                    + MicrobatchBuffer.stateName(buffer.getState()) + "]",
+                            buffer.isInUse());
+                    Assert.assertFalse("failed append must drop the encoded frame", buffer.hasData());
                 } catch (LineSenderException ignored) {
                 }
                 // close() drains pending rows, which appendBlocking still

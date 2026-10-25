@@ -241,8 +241,7 @@ public class SlotLockReleasedContractTest {
                     // still-running I/O thread might touch (to avoid SIGSEGV).
                     // Free them here -- the same set the post-guard close() tail
                     // would have freed -- so assertMemoryLeak passes.
-                    freeFieldQuietly(wss, "buffer0");
-                    freeFieldQuietly(wss, "buffer1");
+                    freeFieldQuietly(wss, "activeBuffer");
                     freeFieldQuietly(wss, "client");
                     if (Boolean.TRUE.equals(readField(wss, "ownsCursorEngine", Boolean.class))) {
                         freeFieldQuietly(wss, "cursorEngine");
@@ -508,8 +507,7 @@ public class SlotLockReleasedContractTest {
                 // the (then-running) I/O thread might touch; free the same set
                 // the post-guard tail would have freed.
                 if (wss != null) {
-                    freeFieldQuietly(wss, "buffer0");
-                    freeFieldQuietly(wss, "buffer1");
+                    freeFieldQuietly(wss, "activeBuffer");
                     freeFieldQuietly(wss, "client");
                     freeFieldQuietly(wss, "errorDispatcher");
                     freeFieldQuietly(wss, "progressDispatcher");
