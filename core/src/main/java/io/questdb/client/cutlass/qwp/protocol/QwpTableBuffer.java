@@ -1490,6 +1490,7 @@ public class QwpTableBuffer implements QuietCloseable {
 
         public void reset() {
             final int sizeBefore = size;
+            final boolean hadNulls = hasNulls;
             size = 0;
             valueCount = 0;
             hasNulls = false;
@@ -1506,16 +1507,21 @@ public class QwpTableBuffer implements QuietCloseable {
             if (stringData != null) {
                 stringData.truncate();
             }
-            if (nullBufPtr != 0 && sizeBefore > 0) {
-                // Only the words this batch touched, and through the intrinsic:
-                // Vect.memset is a JNI call, and one per column per flush was
-                // 15% of the producer's time at one row per flush. Non-null
-                // appends do not grow the bitmap, so the batch can hold more
-                // rows than the bitmap covers.
+            if (nullBufPtr != 0 && hadNulls) {
+                // A bit is set only while hasNulls is true (markNull is the only
+                // setter; truncateTo, compactNullBitmap and clearToEmptyFast clear
+                // what they drop), so a batch without nulls leaves nothing to clear.
+                // Otherwise only the words this batch touched, through the
+                // intrinsic: Vect.memset is a JNI call, and one per column per
+                // flush was 15% of the producer's time at one row per flush.
+                // Non-null appends do not grow the bitmap, so the batch can hold
+                // more rows than the bitmap covers.
                 final int rowsToClear = Math.min(sizeBefore, nullBufCapRows);
                 Unsafe.getUnsafe().setMemory(nullBufPtr, ((long) ((rowsToClear + 63) >>> 6)) << 3, (byte) 0);
             }
-            if (symbolDict != null) {
+            // The local dictionary fills only without a sender (global ids leave it
+            // empty), and clearing a hash map fills its whole key array.
+            if (symbolDict != null && symbolList.size() > 0) {
                 symbolDict.clear();
                 symbolList.clear();
             }
@@ -1646,7 +1652,7 @@ public class QwpTableBuffer implements QuietCloseable {
                 geohashPrecision = -1;
                 maxGlobalSymbolId = -1;
                 storeGlobalSymbolIdsOnly = false;
-                if (symbolDict != null) {
+                if (symbolDict != null && symbolList.size() > 0) {
                     symbolDict.clear();
                     symbolList.clear();
                 }
@@ -1889,7 +1895,7 @@ public class QwpTableBuffer implements QuietCloseable {
             geohashPrecision = -1;
             maxGlobalSymbolId = -1;
             storeGlobalSymbolIdsOnly = false;
-            if (symbolDict != null) {
+            if (symbolDict != null && symbolList.size() > 0) {
                 symbolDict.clear();
                 symbolList.clear();
             }
