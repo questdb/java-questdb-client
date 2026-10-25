@@ -482,13 +482,6 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
-     * Sends binary data as a WebSocket binary frame.
-     *
-     * @param dataPtr pointer to data
-     * @param length  data length
-     * @param timeout timeout in milliseconds
-     */
-    /**
      * Appends one binary frame to the pending batch without sending it.
      * {@link #flushFrames} sends every pending frame with one syscall; any
      * {@code sendBinary} flushes the batch first so frame order holds.
@@ -521,6 +514,13 @@ public abstract class WebSocketClient implements QuietCloseable {
         return sendBuffer.getWritePos();
     }
 
+    /**
+     * Sends binary data as a WebSocket binary frame.
+     *
+     * @param dataPtr pointer to data
+     * @param length  data length
+     * @param timeout timeout in milliseconds
+     */
     public void sendBinary(long dataPtr, int length, int timeout) {
         checkConnected();
         flushFrames(timeout);
