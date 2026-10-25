@@ -30,6 +30,7 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.ArrayBufferAppender;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
+import io.questdb.client.cutlass.qwp.client.NativeBufferWriter;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.std.CharSequenceIntHashMap;
 import io.questdb.client.std.Chars;
@@ -47,6 +48,7 @@ import io.questdb.client.std.Vect;
 import io.questdb.client.std.str.StringSink;
 import io.questdb.client.std.str.Utf8s;
 
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 
 import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
@@ -63,12 +65,16 @@ public class QwpTableBuffer implements QuietCloseable {
     private static final int MAX_COLUMN_NAME_LENGTH = 127;
     private final LowerCaseCharSequenceIntHashMap columnNameToIndex;
     private final ObjList<ColumnBuffer> columns;
+    // Wire form of the table name, built once: varint UTF-8 length, then the bytes.
+    private final byte[] encodedTableName;
     private final QwpWebSocketSender sender;
     private final String tableName;
     private QwpColumnDef[] cachedColumnDefs;
     private int columnAccessCursor; // tracks expected next column index
     private boolean columnDefsCacheValid;
     private int committedColumnCount; // columns that existed at last nextRow()
+    // Wire form of cachedColumnDefs, rebuilt with it (see getEncodedColumnDefs).
+    private byte[] encodedColumnDefs;
     private ColumnBuffer[] fastColumns; // plain array for O(1) sequential access
     private int inProgressColumnCount;
     // Set while the sender's pending-tables list holds this buffer, so the buffer
@@ -93,6 +99,7 @@ public class QwpTableBuffer implements QuietCloseable {
      */
     public QwpTableBuffer(String tableName, QwpWebSocketSender sender) {
         this.tableName = tableName;
+        this.encodedTableName = encodeName(tableName);
         this.sender = sender;
         this.columns = new ObjList<>();
         this.columnNameToIndex = new LowerCaseCharSequenceIntHashMap();
@@ -192,9 +199,28 @@ public class QwpTableBuffer implements QuietCloseable {
                 ColumnBuffer col = columns.get(i);
                 cachedColumnDefs[i] = new QwpColumnDef(col.name, col.type);
             }
+            encodedColumnDefs = encodeColumnDefs(cachedColumnDefs);
             columnDefsCacheValid = true;
         }
         return cachedColumnDefs;
+    }
+
+    /**
+     * Returns the wire form of the column definitions: varint column count, then per
+     * column varint name length, UTF-8 name and the type code. Rebuilt together with
+     * {@link #getColumnDefs()}; do not modify the returned array.
+     */
+    public byte[] getEncodedColumnDefs() {
+        getColumnDefs();
+        return encodedColumnDefs;
+    }
+
+    /**
+     * Returns the wire form of the table name: varint UTF-8 length, then the UTF-8
+     * bytes. Built once in the constructor; do not modify the returned array.
+     */
+    public byte[] getEncodedTableName() {
+        return encodedTableName;
     }
 
     /**
@@ -424,6 +450,43 @@ public class QwpTableBuffer implements QuietCloseable {
                             + column.type + ", sentType=" + type
             );
         }
+    }
+
+    // String.getBytes(UTF_8) writes '?' for an unpaired surrogate, as Utf8s.strCpyUtf8
+    // (the buffer writer's putString) does, so the cached bytes match what it wrote.
+    private static byte[] encodeColumnDefs(QwpColumnDef[] defs) {
+        byte[][] names = new byte[defs.length][];
+        int size = NativeBufferWriter.varintSize(defs.length);
+        for (int i = 0; i < defs.length; i++) {
+            names[i] = defs[i].getName().getBytes(StandardCharsets.UTF_8);
+            size += NativeBufferWriter.varintSize(names[i].length) + names[i].length + 1;
+        }
+        byte[] out = new byte[size];
+        int pos = putVarint(out, 0, defs.length);
+        for (int i = 0; i < defs.length; i++) {
+            pos = putVarint(out, pos, names[i].length);
+            System.arraycopy(names[i], 0, out, pos, names[i].length);
+            pos += names[i].length;
+            out[pos++] = defs[i].getWireTypeCode();
+        }
+        return out;
+    }
+
+    private static byte[] encodeName(String name) {
+        byte[] utf8 = name.getBytes(StandardCharsets.UTF_8);
+        byte[] out = new byte[NativeBufferWriter.varintSize(utf8.length) + utf8.length];
+        int pos = putVarint(out, 0, utf8.length);
+        System.arraycopy(utf8, 0, out, pos, utf8.length);
+        return out;
+    }
+
+    private static int putVarint(byte[] dst, int pos, long value) {
+        while (value > 0x7F) {
+            dst[pos++] = (byte) ((value & 0x7F) | 0x80);
+            value >>>= 7;
+        }
+        dst[pos++] = (byte) value;
+        return pos;
     }
 
     private ColumnBuffer createColumn(CharSequence name, byte type, boolean useNullBitmap) {
