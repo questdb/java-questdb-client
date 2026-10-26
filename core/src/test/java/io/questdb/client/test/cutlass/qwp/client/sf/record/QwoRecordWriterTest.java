@@ -606,6 +606,39 @@ public class QwoRecordWriterTest {
     }
 
     @Test
+    public void testDescriptorNamesAreEncodedOncePerBuffer() throws Exception {
+        withRecord((mem, writer) -> {
+            GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+            QwoRecordReader reader = new QwoRecordReader();
+            try (QwpTableBuffer tb = new QwpTableBuffer("t\u00ebst_\u8868")) {
+                Assert.assertNull(tb.qwoEncodedName());
+                byte[] tableBytes = null;
+                byte[] columnBytes = null;
+                for (int r = 0; r < 2; r++) {
+                    writer.open(mem, REGION, QwpConstants.VERSION, 0, QwoFormat.DEFAULT_DICT_RESERVE);
+                    append(writer, tb, dict, -1, t -> t.getOrCreateColumn("\u5217_\u00e9", QwpConstants.TYPE_LONG, true).addLong(5));
+                    Assert.assertNotNull(tb.qwoEncodedName());
+                    Assert.assertNotNull(tb.getColumn(0).qwoEncodedName());
+                    if (r == 0) {
+                        tableBytes = tb.qwoEncodedName();
+                        columnBytes = tb.getColumn(0).qwoEncodedName();
+                    } else {
+                        Assert.assertSame(tableBytes, tb.qwoEncodedName());
+                        Assert.assertSame(columnBytes, tb.getColumn(0).qwoEncodedName());
+                    }
+                    writer.publish();
+                    reader.of(mem, REGION);
+                    int b = reader.firstBlock();
+                    Assert.assertEquals("t\u00ebst_\u8868", nameOf(reader.tableNameAddr(b), reader.tableNameLen(b)));
+                    int def = reader.columnDef(b, 0);
+                    Assert.assertEquals("\u5217_\u00e9", nameOf(reader.columnNameAddr(def), reader.columnNameLen(def)));
+                    writer.seal(false);
+                }
+            }
+        });
+    }
+
+    @Test
     public void testDictionaryEntriesAppendedOnceInIdOrder() throws Exception {
         withRecord((mem, writer) -> {
             writer.open(mem, REGION, QwpConstants.VERSION, 0, QwoFormat.DEFAULT_DICT_RESERVE);

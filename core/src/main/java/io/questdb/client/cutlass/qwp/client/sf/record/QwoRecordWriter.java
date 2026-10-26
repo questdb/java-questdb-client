@@ -76,6 +76,7 @@ import static io.questdb.client.cutlass.qwp.client.sf.record.QwoFormat.*;
 public final class QwoRecordWriter implements QuietCloseable {
     public static final int APPEND_NO_SPACE = 1;
     public static final int APPEND_OK = 0;
+    private static final long BYTE_ARRAY_BASE = Unsafe.getUnsafe().arrayBaseOffset(byte[].class);
     private static final long DOUBLE_ARRAY_BASE = Unsafe.getUnsafe().arrayBaseOffset(double[].class);
     private static final byte FLAGS_OPEN = (byte) (QwpConstants.FLAG_GORILLA | QwpConstants.FLAG_DELTA_SYMBOL_DICT);
     private static final long LONG_ARRAY_BASE = Unsafe.getUnsafe().arrayBaseOffset(long[].class);
@@ -544,6 +545,12 @@ public final class QwoRecordWriter implements QuietCloseable {
         return C_DATA + chunkDataBytes(cs.type, cs.planPrefix, cs.hasBitmap, rowCap, 0) + byteCap;
     }
 
+    private static byte[] copyOut(long addr, int n) {
+        byte[] bytes = new byte[n];
+        Unsafe.getUnsafe().copyMemory(null, addr, bytes, BYTE_ARRAY_BASE, n);
+        return bytes;
+    }
+
     private static long plannedByteCap(ColumnState cs, int rowCap, boolean isMinimal) {
         if (!cs.isVariableSize) {
             return 0;
@@ -568,6 +575,28 @@ public final class QwoRecordWriter implements QuietCloseable {
             return isMinimal ? cs.chunkRows + 1 : Math.max(cs.chunkRows + 1, Math.min(cs.planNominalRowCap, limit));
         }
         return isMinimal ? 1 : Math.min(cs.planNominalRowCap, limit);
+    }
+
+    private static int putName(long addr, QwpTableBuffer staged) {
+        byte[] cached = staged.qwoEncodedName();
+        if (cached != null) {
+            Unsafe.getUnsafe().copyMemory(cached, BYTE_ARRAY_BASE, null, addr, cached.length);
+            return cached.length;
+        }
+        int n = putString(addr, staged.getTableName());
+        staged.qwoEncodedName(copyOut(addr, n));
+        return n;
+    }
+
+    private static int putName(long addr, QwpTableBuffer.ColumnBuffer col) {
+        byte[] cached = col.qwoEncodedName();
+        if (cached != null) {
+            Unsafe.getUnsafe().copyMemory(cached, BYTE_ARRAY_BASE, null, addr, cached.length);
+            return cached.length;
+        }
+        int n = putString(addr, col.getName());
+        col.qwoEncodedName(copyOut(addr, n));
+        return n;
     }
 
     private static int stagedPrefix(byte type, QwpTableBuffer.ColumnBuffer col) {
@@ -811,7 +840,8 @@ public final class QwoRecordWriter implements QuietCloseable {
         block.committedRowCount = 0;
         block.committedCrc = Crc32c.INIT;
         block.isTouched = false;
-        long size = D_NAME + stringBytes(staged.getTableName());
+        byte[] tableName = staged.qwoEncodedName();
+        long size = D_NAME + (tableName != null ? tableName.length : stringBytes(staged.getTableName()));
         for (int i = 0; i < colCount; i++) {
             ColumnState cs;
             if (i < block.columns.size()) {
@@ -828,7 +858,8 @@ public final class QwoRecordWriter implements QuietCloseable {
                 throw new IllegalArgumentException("column '" + col.getName()
                         + "' needs a null bitmap: it is a GEOHASH or DECIMAL column [type=" + cs.type + ']');
             }
-            size += stringBytes(col.getName()) + COL_FIXED_SIZE;
+            byte[] colName = col.qwoEncodedName();
+            size += (colName != null ? colName.length : stringBytes(col.getName())) + COL_FIXED_SIZE;
         }
         block.descriptorSize = size;
         return block;
@@ -920,10 +951,10 @@ public final class QwoRecordWriter implements QuietCloseable {
         Unsafe.getUnsafe().putShort(p + D_FLAGS, (short) 0);
         Unsafe.getUnsafe().putLong(p + D_ROW_WORD, 0L);
         long q = p + D_NAME;
-        q += putString(q, staged.getTableName());
+        q += putName(q, staged);
         for (int i = 0, n = block.colCount; i < n; i++) {
             ColumnState cs = block.columns.getQuick(i);
-            q += putString(q, staged.getColumn(i).getName());
+            q += putName(q, staged.getColumn(i));
             cs.defTail = (int) (q - payloadAddr);
             Unsafe.getUnsafe().putByte(q + COL_TYPE, cs.type);
             Unsafe.getUnsafe().putByte(q + COL_PREFIX_KIND, PREFIX_NONE);

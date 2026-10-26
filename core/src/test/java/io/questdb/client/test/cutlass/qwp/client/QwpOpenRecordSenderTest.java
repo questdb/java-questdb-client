@@ -372,6 +372,35 @@ public class QwpOpenRecordSenderTest {
     }
 
     @Test
+    public void testNonAsciiNamesStayByteIdenticalAcrossRecords() throws Exception {
+        assertMemoryLeak(() -> {
+            // 2, 3 and 4 byte UTF-8 (the last as a surrogate pair), reused from the cache in the second record
+            final String table = "t\u00ebst_\u8868";
+            final String longName = "\u5217_\u00e9";
+            final String doubleName = "v\uD83D\uDE00";
+            FrameLog log = new FrameLog();
+            try (TestWebSocketServer server = startServer(log);
+                 Sender sender = Sender.fromConfig(config(server.getPort()))) {
+                for (int i = 0; i < 2; i++) {
+                    try (Oracle oracle = new Oracle()) {
+                        QwpTableBuffer t = oracle.block(table);
+                        sender.table(table).longColumn(longName, i).doubleColumn(doubleName, 1.5 + i)
+                                .longColumn("ascii", 10 + i).at(TS_BASE + i, ChronoUnit.MICROS);
+                        t.getOrCreateColumn(longName, QwpConstants.TYPE_LONG, true).addLong(i);
+                        t.getOrCreateColumn(doubleName, QwpConstants.TYPE_DOUBLE, true).addDouble(1.5 + i);
+                        t.getOrCreateColumn("ascii", QwpConstants.TYPE_LONG, true).addLong(10 + i);
+                        t.getOrCreateDesignatedTimestampColumn(QwpConstants.TYPE_TIMESTAMP).addLong(TS_BASE + i);
+                        t.nextRow();
+                        sender.flush();
+                        log.awaitDataFrames(i + 1, 5_000);
+                        Assert.assertArrayEquals(oracle.frame(-1, false), dataFrame(log, i));
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
     public void testOversizeSymbolFailsOnItsWriter() throws Exception {
         assertMemoryLeak(() -> {
             FrameLog log = new FrameLog();

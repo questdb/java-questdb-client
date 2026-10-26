@@ -83,6 +83,7 @@ public class QwpTableBuffer implements QuietCloseable {
     // The open-record writer's handle on this table: the index of the table's
     // current block in the record opened at epoch qwoEpoch, or -1 for none.
     private int qwoBlock = -1;
+    private byte[] qwoEncodedName;
     private long qwoEpoch = -1;
     private int rowCount;
     // Savepoint for rollbackToSavepoint(): the row count and column count at the
@@ -485,6 +486,19 @@ public class QwpTableBuffer implements QuietCloseable {
 
     public void qwoBlock(int block) {
         this.qwoBlock = block;
+    }
+
+    /**
+     * The {@code [varint utf8Len][utf8]} bytes of this table's name as the
+     * open-record writer put them in a descriptor, or null before its first one.
+     * The name is final, so the bytes never go stale.
+     */
+    public byte[] qwoEncodedName() {
+        return qwoEncodedName;
+    }
+
+    public void qwoEncodedName(byte[] bytes) {
+        this.qwoEncodedName = bytes;
     }
 
     /**
@@ -962,6 +976,7 @@ public class QwpTableBuffer implements QuietCloseable {
         private int nullBufCapRows;
         // Off-heap null bitmap (bit-packed, 1 bit per row)
         private long nullBufPtr;
+        private byte[] qwoEncodedName;
         private QwpWebSocketSender sender;
         private int size;         // Total row count (including nulls)
         // Symbol specific (dictionary stays on-heap)
@@ -1812,6 +1827,18 @@ public class QwpTableBuffer implements QuietCloseable {
             long longAddr = nullBufPtr + ((long) (index >>> 6)) * 8;
             int bitIndex = index & 63;
             return (Unsafe.getUnsafe().getLong(longAddr) & (1L << bitIndex)) != 0;
+        }
+
+        /**
+         * The {@code [varint utf8Len][utf8]} bytes of this column's name as the
+         * open-record writer put them in a descriptor, or null before its first one.
+         */
+        public byte[] qwoEncodedName() {
+            return qwoEncodedName;
+        }
+
+        public void qwoEncodedName(byte[] bytes) {
+            this.qwoEncodedName = bytes;
         }
 
         public void reset() {
