@@ -325,6 +325,19 @@ public class SenderPoolTest {
     }
 
     @Test
+    public void testMaxLifetimeStillReapsWithIdleInNanos() throws InterruptedException {
+        // Idle timeout off: only the wall-clock max lifetime can reap the slot.
+        try (SenderPool pool = new SenderPool(DEAD_HTTP_CONFIG, 0, 2, 1_000, Long.MAX_VALUE, 100)) {
+            Sender a = pool.borrow();
+            a.close();
+            Assert.assertEquals(1, pool.totalSize());
+            Thread.sleep(200);
+            pool.reapIdle();
+            Assert.assertEquals("a slot past its max lifetime is reaped", 0, pool.totalSize());
+        }
+    }
+
+    @Test
     public void testReapIdleRespectsMinSize() throws InterruptedException {
         // min=2: two slots must stay even after long idle.
         try (SenderPool pool = new SenderPool(DEAD_HTTP_CONFIG, 2, 4, 1_000, 50, Long.MAX_VALUE)) {

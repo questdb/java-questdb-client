@@ -486,12 +486,36 @@ public class SenderPoolSettleTest {
         }
     }
 
+    @Test
+    public void testReleaseSharesOneClockReadBetweenTheAgeCheckAndTheIdleMark() throws Exception {
+        List<RecordingSender> built = new ArrayList<>();
+        try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(1, 1, built)) {
+            // an earlier lease leaves a row behind; this release appends nothing
+            try (Sender s = pool.borrow()) {
+                s.table("t").longColumn("v", 1L).atNow();
+            }
+            RecordingSender delegate = built.get(0);
+            Assert.assertEquals(0, delegate.flushCount.get());
+            delegate.autoFlushDue = true;
+            Sender lease = pool.borrow();
+            long before = System.nanoTime();
+            lease.close();
+            long after = System.nanoTime();
+            Assert.assertEquals("the release's age check ships the row left behind", 1, delegate.flushCount.get());
+            long idleSince = idleSinceOf(pool);
+            Assert.assertEquals("the age check and the idle mark share one reading",
+                    delegate.lastAutoFlushNowNanos, idleSince);
+            Assert.assertTrue("the reading is taken during close(): " + before + " <= " + idleSince + " <= " + after,
+                    before <= idleSince && idleSince <= after);
+        }
+    }
+
     @SuppressWarnings("unchecked")
     private static long idleSinceOf(SenderPool pool) throws Exception {
         Field availableF = SenderPool.class.getDeclaredField("available");
         availableF.setAccessible(true);
         Object slot = ((ArrayDeque<Object>) availableF.get(pool)).peekLast();
-        Method m = slot.getClass().getDeclaredMethod("idleSinceMillis");
+        Method m = slot.getClass().getDeclaredMethod("idleSinceNanos");
         m.setAccessible(true);
         return (long) m.invoke(slot);
     }

@@ -291,6 +291,19 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     }
 
     /**
+     * The same check as {@link #autoFlushIfDue()}, with the caller's
+     * {@link System#nanoTime()} reading as now for the age threshold. A pooled
+     * release passes the one reading it also uses for its idle mark and its
+     * commit window. The default ignores the reading and runs
+     * {@link #autoFlushIfDue()}.
+     *
+     * @param nowNanos the caller's {@link System#nanoTime()} reading
+     */
+    default void autoFlushIfDue(long nowNanos) {
+        autoFlushIfDue();
+    }
+
+    /**
      * Block until the server has acknowledged every frame up to {@code targetFsn},
      * or until {@code timeoutMillis} elapses. Pair with {@link #flushAndGetSequence()}
      * to obtain {@code targetFsn} for a specific flush.

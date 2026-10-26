@@ -95,6 +95,11 @@ public final class PooledSender implements Sender {
     }
 
     @Override
+    public void autoFlushIfDue(long nowNanos) {
+        slot.live(generation).autoFlushIfDue(nowNanos);
+    }
+
+    @Override
     public boolean awaitAckedFsn(long targetFsn, long timeoutMillis) {
         return slot.live(generation).awaitAckedFsn(targetFsn, timeoutMillis);
     }
@@ -233,6 +238,10 @@ public final class PooledSender implements Sender {
         BatchTooLargeForCapException capRejection = null;
         int droppedLeaseRows = 0;
         boolean isOpenRecordAtRetire = false;
+        // The release's one clock reading, taken before ship(). The pool-closed
+        // branch never reads it: giveBack() retires the slot there, without an
+        // idle mark.
+        long nowNanos = 0L;
         int pendingRowsAtRetire = 0;
         try {
             // live(), not delegate(): re-validate the generation right before
@@ -248,7 +257,8 @@ public final class PooledSender implements Sender {
                     // Pool shutting down: ship here so a failure reaches the caller.
                     delegate.flush();
                 } else {
-                    ship(pool, delegate);
+                    nowNanos = System.nanoTime();
+                    ship(pool, delegate, nowNanos);
                 }
                 recycle = true;
             } catch (RuntimeException e) {
@@ -282,7 +292,7 @@ public final class PooledSender implements Sender {
             }
         } finally {
             if (recycle) {
-                pool.giveBack(this);
+                pool.giveBack(this, nowNanos);
             } else {
                 // The probe, the cancel or the ship threw: the delegate has
                 // latched an error, the flush failed, or the generation went
@@ -639,23 +649,24 @@ public final class PooledSender implements Sender {
      *   <li>commit window set and closing now: {@code flush()}, which seals the
      *       record unflagged, or sends the commit message, and commits the
      *       group;</li>
-     *   <li>otherwise {@code autoFlushIfDue()}: seals the record once the oldest
-     *       row is older than {@code auto_flush_interval} or another auto-flush
-     *       threshold trips.</li>
+     *   <li>otherwise {@code autoFlushIfDue(nowNanos)}: seals the record once the
+     *       oldest row is older than {@code auto_flush_interval} or another
+     *       auto-flush threshold trips.</li>
      * </ul>
-     * The clock is read only with a commit window.
+     * Reads no clock: {@code nowNanos} is the release's one reading, which the
+     * commit window, the age threshold and the slot's idle mark share.
      */
-    private void ship(SenderPool pool, Sender delegate) {
+    private void ship(SenderPool pool, Sender delegate, long nowNanos) {
         delegate.publishPending();
         if (pool.hasCommitWindow()) {
             boolean closes = slot.windowCloses(delegate.rowsAppended(), delegate.hasDeferredFrames(),
-                    System.nanoTime(), pool.commitRows(), pool.commitIntervalNanos());
+                    nowNanos, pool.commitRows(), pool.commitIntervalNanos());
             if (closes) {
                 delegate.flush();
                 slot.markCommitted(delegate.rowsAppended());
                 return;
             }
         }
-        delegate.autoFlushIfDue();
+        delegate.autoFlushIfDue(nowNanos);
     }
 }

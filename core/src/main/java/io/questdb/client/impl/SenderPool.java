@@ -1772,6 +1772,17 @@ public final class SenderPool implements AutoCloseable {
     }
 
     public void giveBack(PooledSender ps) {
+        giveBack(ps, System.nanoTime());
+    }
+
+    /**
+     * Returns the lease's slot to the free set, its idle mark stamped with
+     * {@code nowNanos}. While the pool shuts down, retires the slot instead.
+     *
+     * @param nowNanos the release's {@link System#nanoTime()} reading, the
+     *                 idle mark {@link #reapIdle()} measures the idle timeout from
+     */
+    public void giveBack(PooledSender ps, long nowNanos) {
         SenderSlot s = ps.slot();
         long gen = ps.generation();
         lock.lock();
@@ -1786,7 +1797,7 @@ public final class SenderPool implements AutoCloseable {
                     return;
                 }
                 s.bumpGeneration();
-                s.markIdleAt(System.currentTimeMillis());
+                s.markIdleAt(nowNanos);
                 assert !available.contains(s) : "slot already present in available deque on giveBack";
                 available.addLast(s);
                 slotReleased.signal();
@@ -2193,7 +2204,10 @@ public final class SenderPool implements AutoCloseable {
         if (closed) {
             return;
         }
+        // The idle mark is a System.nanoTime() reading; the maximum lifetime
+        // stays on the wall clock, like the slot's creation stamp.
         long now = System.currentTimeMillis();
+        long nowNanos = System.nanoTime();
         ArrayList<SenderSlot> toClose = null;
         lock.lock();
         try {
@@ -2209,7 +2223,7 @@ public final class SenderPool implements AutoCloseable {
             while (it.hasNext() && all.size() > minSize) {
                 SenderSlot s = it.next();
                 boolean idleExpired = idleTimeoutMillis < Long.MAX_VALUE
-                        && (now - s.idleSinceMillis()) >= idleTimeoutMillis;
+                        && (nowNanos - s.idleSinceNanos()) / 1_000_000L >= idleTimeoutMillis;
                 boolean overAge = maxLifetimeMillis < Long.MAX_VALUE
                         && (now - s.createdAtMillis()) >= maxLifetimeMillis;
                 if ((idleExpired || overAge) && !hasUnshippedWork(s.delegate())) {

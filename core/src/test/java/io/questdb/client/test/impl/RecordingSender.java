@@ -56,6 +56,7 @@ class RecordingSender implements Sender {
     volatile RuntimeException flushError;      // thrown by flush() when set
     volatile Error flushFatal;                 // thrown by flush() when set, before flushError
     volatile CountDownLatch flushGate;         // flush() blocks on it when set
+    volatile long lastAutoFlushNowNanos;       // the reading the last autoFlushIfDue(long) got
     volatile RuntimeException latchedError;    // thrown by checkError() when set
     volatile CountDownLatch markSavepointGate; // markSavepoint() blocks on it when set
     volatile int pendingRows;
@@ -96,6 +97,12 @@ class RecordingSender implements Sender {
                 flush();
             }
         }
+    }
+
+    @Override
+    public void autoFlushIfDue(long nowNanos) {
+        lastAutoFlushNowNanos = nowNanos;
+        autoFlushIfDue();
     }
 
     @Override
