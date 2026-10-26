@@ -520,8 +520,6 @@ public class QwpWebSocketSender implements Sender {
     // while no engine is retained.
     private volatile CursorSendEngine retainedEngine;
     private int pendingRowCount;
-    // Monotonic for the sender's life; reset() does not clear it. Counts rows whether or not they shipped.
-    private long rowsAppended;
     // Pending counters and batch symbol watermark at the last markSavepoint();
     // the counters are zero and the watermark is -1 once a flush ships the pending
     // rows, at which point resetToSavepoint() discards every pending row like
@@ -2385,33 +2383,6 @@ public class QwpWebSocketSender implements Sender {
         flush0(true);
     }
 
-    @Override
-    public long flushDeferred() {
-        checkNotClosed();
-        checkRecycleFailure();
-        if (cursorEngine != null) {
-            cursorEngine.checkDurability();
-        }
-        ensureNoInProgressRow();
-        ensureConnected();
-
-        long beforeFsn = cursorEngine != null ? cursorEngine.publishedFsn() : -1L;
-
-        // Same publish path as flushAndGetSequence() with the flag forced on:
-        // the frame is appended server-side, not committed, and its ack is
-        // withheld until a later unflagged frame or commit message. The commit
-        // boundary is deliberately NOT advanced here.
-        flushPendingRows(true);
-        if (activeBuffer != null && activeBuffer.hasData()) {
-            sealAndSwapBuffer();
-        }
-        cursorSendLoop.checkError();
-        checkConnectionError();
-
-        long afterFsn = cursorEngine != null ? cursorEngine.publishedFsn() : -1L;
-        return afterFsn > beforeFsn ? fsnEpochBase + afterFsn : -1L;
-    }
-
     /**
      * Flushes pending rows and blocks until the server has acknowledged
      * every frame published so far (the current published-FSN watermark),
@@ -3543,11 +3514,6 @@ public class QwpWebSocketSender implements Sender {
         cachedTimestampColumn = null;
         cachedTimestampNanosColumn = null;
         retainedBatchRejection = null;
-    }
-
-    @Override
-    public long rowsAppended() {
-        return rowsAppended;
     }
 
     /**
@@ -7670,7 +7636,6 @@ public class QwpWebSocketSender implements Sender {
             currentTableBuffer.setListedPending(true);
             pendingTables.add(currentTableBuffer);
         }
-        rowsAppended++;
 
         // Advance pendingBytes by the bytes the just-committed row added to
         // the current table. nextRow() accumulated the total during its

@@ -65,8 +65,8 @@ final class PoolHousekeeper {
      * @param intervalMillis       reap cadence: idle and over-age slots
      * @param settleIntervalMillis settle cadence: ships rows left in idle slots;
      *                             {@code auto_flush_interval} (100 ms when
-     *                             unset), or the commit interval when that is
-     *                             shorter
+     *                             unset). The commit window does not shorten it:
+     *                             each sender's I/O thread closes the window
      */
     PoolHousekeeper(SenderPool senderPool, QueryClientPool queryPool, long intervalMillis, long settleIntervalMillis) {
         this.senderPool = senderPool;

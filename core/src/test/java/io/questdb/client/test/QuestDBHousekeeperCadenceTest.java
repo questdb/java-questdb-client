@@ -24,7 +24,10 @@
 package io.questdb.client.test;
 
 import io.questdb.client.QuestDB;
+import io.questdb.client.QuestDBBuilder;
 import io.questdb.client.Sender;
+import io.questdb.client.impl.ConfigString;
+import io.questdb.client.impl.ConfigView;
 import io.questdb.client.impl.QuestDBImpl;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
@@ -37,9 +40,9 @@ import java.util.Arrays;
 import java.util.concurrent.TimeUnit;
 
 /**
- * The housekeeper's two cadences under extreme settings: a startup
- * store-and-forward recovery that keeps failing, and a reap interval of
- * {@code Long.MAX_VALUE}.
+ * The housekeeper's two cadences under extreme settings, a startup
+ * store-and-forward recovery that keeps failing and a reap interval of
+ * {@code Long.MAX_VALUE}, and the settle cadence the builder resolves.
  */
 public class QuestDBHousekeeperCadenceTest {
 
@@ -90,6 +93,22 @@ public class QuestDBHousekeeperCadenceTest {
                 log.awaitDataFrames(1, 3_000);              // the 100 ms settle must still run
             }
         }
+    }
+
+    @Test
+    public void testSettleIntervalIgnoresTheCommitWindow() {
+        // The I/O thread closes the commit window, so the settle cadence follows
+        // auto_flush_interval alone: 100 ms when it is unset.
+        Assert.assertEquals(250L, settleIntervalOf("auto_flush_interval=250;"));
+        Assert.assertEquals(250L, settleIntervalOf("auto_flush_interval=250;commit_interval_ms=40;"));
+        Assert.assertEquals(250L, settleIntervalOf("auto_flush_interval=250;commit_interval_ms=900;"));
+        Assert.assertEquals(100L, settleIntervalOf(""));
+        Assert.assertEquals(100L, settleIntervalOf("commit_interval_ms=40;"));
+        Assert.assertEquals(100L, settleIntervalOf("commit_rows=0;commit_interval_ms=0;"));
+    }
+
+    private static long settleIntervalOf(String extra) {
+        return QuestDBBuilder.resolveSettleIntervalMillis(new ConfigView(ConfigString.parse("ws::addr=127.0.0.1:1;" + extra)));
     }
 
     private static final class SilentHandler implements TestWebSocketServer.WebSocketServerHandler {

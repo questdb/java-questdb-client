@@ -174,9 +174,7 @@ public final class QuestDBImpl implements QuestDB {
                     true,
                     errorHandler, connectionListener, drainerListener, tokenProvider);
             builtSenderPool.setFlushOnClose(flushOnClose);
-            if (commitRows > 0) {
-                builtSenderPool.setCommitWindow(commitRows, commitIntervalMillis);
-            }
+            builtSenderPool.setCommitWindow(commitRows, commitIntervalMillis);
             builtQueryPool = new QueryClientPool(
                     queryConfig, queryMin, queryMax, acquireTimeoutMillis,
                     idleTimeoutMillis, maxLifetimeMillis, connectHook, null, tokenProvider);

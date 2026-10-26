@@ -249,7 +249,10 @@ public final class SenderPool implements AutoCloseable {
     // production; regression tests release a retired slot here to prove that
     // the terminal pass re-probes returned capacity before throwing.
     private volatile Runnable borrowWaitExpiredHook;
-    private volatile long commitIntervalNanos;
+    // Commit-window bounds every WebSocket delegate's I/O thread applies; 0
+    // disables a bound. Written under lock by setCommitWindow(); createSlot()
+    // reads them outside the lock for a new slot's delegate.
+    private volatile long commitIntervalMillis;
     private volatile int commitRows;
     // Test seam invoked after close() handles an interrupt and confirms the
     // original creation-wait deadline still permits another wait. Null in
@@ -1768,7 +1771,8 @@ public final class SenderPool implements AutoCloseable {
      * opt-in, a pooled {@code close()} does not flush,
      * and auto-flush thresholds are only evaluated on append,
      * so a slot nobody borrows again would keep its last rows until the pool
-     * closes. The housekeeper calls this on its settle cadence.
+     * closes. The housekeeper calls this on its settle cadence. The commit
+     * window is not the settle's job: each delegate's I/O thread closes it.
      * <p>
      * The settle lists the dirty slots under the pool lock, then takes one slot at
      * a time off the free list under that lock and stamps it with a fresh
@@ -1845,8 +1849,7 @@ public final class SenderPool implements AutoCloseable {
             Throwable fatal = null;
             BatchTooLargeForCapException overCap = null;
             try {
-                // PooledSender.tryFlush() already marks the commit on the slot. A
-                // false result means the ring could not take the frame at once:
+                // A false result means the ring could not take the frame at once:
                 // not a failure, the rows stay and the next settle retries.
                 flushed = lease.tryFlush();
                 if (flushed) {
@@ -1973,8 +1976,9 @@ public final class SenderPool implements AutoCloseable {
     }
 
     /**
-     * What {@link #settleIdle()} looks for in an idle slot. Phase A: buffered
-     * rows and deferred frames awaiting their commit.
+     * What {@link #settleIdle()} looks for in an idle slot: buffered rows, and
+     * the deferred group of a {@code transaction=on} delegate awaiting the
+     * commit that its flush sends.
      */
     private static boolean hasUnshippedWork(Sender delegate) {
         return delegate.pendingRowCount() > 0 || delegate.hasDeferredFrames();
@@ -2244,21 +2248,6 @@ public final class SenderPool implements AutoCloseable {
         }
     }
 
-    /** Age per commit window in nanoseconds, or 0 when no window is configured. */
-    public long commitIntervalNanos() {
-        return commitIntervalNanos;
-    }
-
-    /** Rows per commit window, or 0 when no window is configured. */
-    public int commitRows() {
-        return commitRows;
-    }
-
-    /** Whether a commit window is configured: pooled closes ship deferred frames and commit per window. */
-    public boolean hasCommitWindow() {
-        return commitRows > 0;
-    }
-
     /** Whether {@code close()} has started; a lease returning now is torn down instead of recycled. */
     boolean isClosed() {
         return closed;
@@ -2297,18 +2286,39 @@ public final class SenderPool implements AutoCloseable {
     }
 
     /**
-     * Configures the commit window. Both values positive enable it; {@code 0, 0}
-     * disables it; negative values are rejected. Must be set before the first borrow; the pool's delegates
-     * must have been built with {@code transaction=on} so that auto-flush
-     * inside a lease ships deferred frames too (QuestDBBuilder injects it).
+     * Sets the commit window of the pool's WebSocket delegates. A
+     * {@code flush_on_close=on} release publishes its rows as a window member
+     * ({@link Sender#flushAsWindowMember()}); the delegate's I/O thread sends
+     * members with the commit deferred and commits the window once its members
+     * carry {@code commitRows} rows or its first member is
+     * {@code commitIntervalMillis} old. 0 disables a bound; both 0 make every
+     * release commit on its own. This method pushes the bounds to the delegates
+     * of every slot the pool holds now, prewarmed slots included, and every
+     * slot the pool builds later starts with them. Call it
+     * before the first borrow: a slot that a concurrent borrow is building
+     * may start with the earlier bounds. Delegates of other transports have no
+     * window.
+     *
+     * @throws IllegalArgumentException if a bound is negative
      */
     public void setCommitWindow(int commitRows, long commitIntervalMillis) {
-        if (commitRows < 0 || commitIntervalMillis < 0 || (commitRows > 0) != (commitIntervalMillis > 0)) {
-            throw new IllegalArgumentException("commit window needs both rows and interval, or neither: rows="
-                    + commitRows + ", intervalMillis=" + commitIntervalMillis);
+        if (commitRows < 0 || commitIntervalMillis < 0) {
+            throw new IllegalArgumentException("commit window bounds must not be negative [rows="
+                    + commitRows + ", intervalMillis=" + commitIntervalMillis + ']');
         }
-        this.commitRows = commitRows;
-        this.commitIntervalNanos = TimeUnit.MILLISECONDS.toNanos(commitIntervalMillis);
+        lock.lock();
+        try {
+            this.commitRows = commitRows;
+            this.commitIntervalMillis = commitIntervalMillis;
+            for (int i = 0, n = all.size(); i < n; i++) {
+                Sender delegate = all.get(i).delegate();
+                if (delegate instanceof QwpWebSocketSender) {
+                    ((QwpWebSocketSender) delegate).setCommitWindow(commitRows, commitIntervalMillis);
+                }
+            }
+        } finally {
+            lock.unlock();
+        }
     }
 
     public void setFlushOnClose(boolean flushOnClose) {
@@ -2323,8 +2333,9 @@ public final class SenderPool implements AutoCloseable {
             }
             SenderSlot slot = new SenderSlot(delegate, this, slotIndex);
             if (delegate instanceof QwpWebSocketSender) {
-                ((QwpWebSocketSender) delegate).setSlotLockReleaseListener(
-                        () -> recoverReleasedSlot(slot));
+                QwpWebSocketSender webSocketDelegate = (QwpWebSocketSender) delegate;
+                webSocketDelegate.setSlotLockReleaseListener(() -> recoverReleasedSlot(slot));
+                webSocketDelegate.setCommitWindow(commitRows, commitIntervalMillis);
             }
             return slot;
         } catch (Throwable failure) {

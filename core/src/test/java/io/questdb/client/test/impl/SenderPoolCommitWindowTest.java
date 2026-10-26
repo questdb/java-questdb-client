@@ -33,229 +33,78 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * The pool's commit window with {@code flush_on_close=on}: each close ships a
- * deferred frame, the close that fills the window ships a committing frame
- * instead, and the settle step commits an open group left idle.
+ * What a pooled release asks of its delegate: under {@code flush_on_close=on}
+ * one window-member flush, which the delegate's I/O thread may defer within
+ * the pool's commit window; under {@code off} an auto-flush check. The settle
+ * ships rows an {@code off} release left in an idle slot.
  */
 public class SenderPoolCommitWindowTest {
 
     @Test
-    public void testAgeClockRestartsAfterACommit() throws Exception {
+    public void testReleaseUnderFlushOnCloseOffChecksAutoFlush() {
         List<RecordingSender> built = new ArrayList<>();
         try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(1, 1, built)) {
-            pool.setFlushOnClose(true);
-            pool.setCommitWindow(1_000, 30L);
-            borrowAppendClose(pool, 1L);                 // deferred: the window opens
-            Thread.sleep(60);
-            borrowAppendClose(pool, 2L);                 // older than 30 ms: commits
+            pool.setCommitWindow(1_000, 100L);
+            borrowAppendClose(pool, 1L);
             RecordingSender d = built.get(0);
-            Assert.assertEquals(1, d.flushCount.get());
-            Assert.assertEquals(1, d.deferredFlushCount.get());
-            borrowAppendClose(pool, 3L);                 // a fresh window: this close must defer
-            Assert.assertEquals("a clock that was not restarted at the commit would commit every close", 1, d.flushCount.get());
-            Assert.assertEquals(2, d.deferredFlushCount.get());
-        }
-    }
-
-    @Test
-    public void testAgeWindowClosesAtNextRelease() throws Exception {
-        List<RecordingSender> built = new ArrayList<>();
-        try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(1, 1, built)) {
-            pool.setFlushOnClose(true);
-            pool.setCommitWindow(1_000, 30L);
-            try (Sender s = pool.borrow()) {
-                s.table("t").longColumn("v", 1L).atNow();
-            }
-            RecordingSender d = built.get(0);
-            Assert.assertEquals(1, d.deferredFlushCount.get());
-            Thread.sleep(60);
-            try (Sender s = pool.borrow()) {
-                s.table("t").longColumn("v", 2L).atNow();
-            }
-            Assert.assertEquals("group older than the interval: this close commits", 1, d.flushCount.get());
-            Assert.assertEquals(1, d.deferredFlushCount.get());
-        }
-    }
-
-    @Test
-    public void testDrainResetsTheWindow() {
-        List<RecordingSender> built = new ArrayList<>();
-        try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(1, 1, built)) {
-            pool.setFlushOnClose(true);
-            pool.setCommitWindow(3, 60_000L);
-            borrowAppendClose(pool, 1L);            // deferred: the window is open with 1 row
-            try (Sender s = pool.borrow()) {
-                s.table("t").longColumn("v", 2L).atNow();
-                Assert.assertTrue(s.drain(0));      // app commits at 2 rows: the window restarts here
-            }
-            RecordingSender d = built.get(0);
-            Assert.assertEquals(1, d.deferredFlushCount.get());
-            Assert.assertEquals(1, d.flushCount.get());
-            // 3 rows in total: a counter that ignored the drain would commit here
-            borrowAppendClose(pool, 3L);
-            borrowAppendClose(pool, 4L);
-            Assert.assertEquals(3, d.deferredFlushCount.get());
-            Assert.assertEquals(1, d.flushCount.get());
-            // 3 rows since the drain: the window closes with a committing frame
-            borrowAppendClose(pool, 5L);
-            Assert.assertEquals(3, d.deferredFlushCount.get());
-            Assert.assertEquals(2, d.flushCount.get());
-        }
-    }
-
-    @Test
-    public void testLeaseFlushAndGetSequenceResetsTheWindow() {
-        List<RecordingSender> built = new ArrayList<>();
-        try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(1, 1, built)) {
-            pool.setFlushOnClose(true);
-            pool.setCommitWindow(3, 60_000L);
-            borrowAppendClose(pool, 1L);                 // deferred: the window is open with 1 row
-            try (Sender s = pool.borrow()) {
-                s.table("t").longColumn("v", 2L).atNow();
-                s.flushAndGetSequence();                 // app commits at 2 rows: the window restarts here
-            }
-            RecordingSender d = built.get(0);
-            Assert.assertEquals(1, d.deferredFlushCount.get());
-            Assert.assertEquals(1, d.flushCount.get());
-            borrowAppendClose(pool, 3L);                 // 3 rows in total: a counter that ignored the flush would commit here
-            borrowAppendClose(pool, 4L);
-            Assert.assertEquals(3, d.deferredFlushCount.get());
-            Assert.assertEquals(1, d.flushCount.get());
-            borrowAppendClose(pool, 5L);                 // 3 rows since the flush: the window closes
-            Assert.assertEquals(3, d.deferredFlushCount.get());
-            Assert.assertEquals(2, d.flushCount.get());
-        }
-    }
-
-    @Test
-    public void testLeaseFlushResetsTheWindow() {
-        List<RecordingSender> built = new ArrayList<>();
-        try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(1, 1, built)) {
-            pool.setFlushOnClose(true);
-            pool.setCommitWindow(3, 60_000L);
-            borrowAppendClose(pool, 1L);            // deferred: the window is open with 1 row
-            try (Sender s = pool.borrow()) {
-                s.table("t").longColumn("v", 2L).atNow();
-                s.flush();                          // app commits at 2 rows: the window restarts here
-            }
-            RecordingSender d = built.get(0);
-            Assert.assertEquals(1, d.deferredFlushCount.get());
-            Assert.assertEquals(1, d.flushCount.get());
-            // 3 rows in total: a counter that ignored the flush would commit here
-            borrowAppendClose(pool, 3L);
-            borrowAppendClose(pool, 4L);
-            Assert.assertEquals(3, d.deferredFlushCount.get());
-            Assert.assertEquals(1, d.flushCount.get());
-            // 3 rows since the flush: the window closes with a committing frame
-            borrowAppendClose(pool, 5L);
-            Assert.assertEquals(3, d.deferredFlushCount.get());
-            Assert.assertEquals(2, d.flushCount.get());
-        }
-    }
-
-    @Test
-    public void testReleaseWithoutRowsDoesNotOpenAWindow() throws Exception {
-        List<RecordingSender> built = new ArrayList<>();
-        try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(1, 1, built)) {
-            pool.setFlushOnClose(true);
-            pool.setCommitWindow(1_000, 30L);
-            try (Sender s = pool.borrow()) {
-                Assert.assertNotNull(s);           // no rows
-            }
-            Thread.sleep(60);
-            try (Sender s = pool.borrow()) {
-                s.table("t").longColumn("v", 1L).atNow();
-            }
-            RecordingSender d = built.get(0);
-            Assert.assertEquals("the empty release must not have started the clock", 1, d.deferredFlushCount.get());
+            Assert.assertEquals(1, d.autoFlushIfDueCount.get());
+            Assert.assertEquals(0, d.windowMemberFlushCount.get());
             Assert.assertEquals(0, d.flushCount.get());
+            Assert.assertEquals("the rows stay in the slot", 1, d.pendingRowCount());
         }
     }
 
     @Test
-    public void testRowsWindowClosesWithCommittingFlush() {
+    public void testReleaseUnderFlushOnCloseShipsAWindowMember() {
         List<RecordingSender> built = new ArrayList<>();
         try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(1, 1, built)) {
             pool.setFlushOnClose(true);
-            pool.setCommitWindow(3, 60_000L);
+            pool.setCommitWindow(1_000, 100L);
             RecordingSender d = null;
             for (int i = 0; i < 3; i++) {
-                try (Sender s = pool.borrow()) {
-                    s.table("t").longColumn("v", i).atNow();
-                }
+                borrowAppendClose(pool, i);
                 d = built.get(0);
+                Assert.assertEquals("one window-member flush per release", i + 1, d.windowMemberFlushCount.get());
             }
-            Assert.assertEquals("first two closes ship deferred", 2, d.deferredFlushCount.get());
-            Assert.assertEquals("third close fills the window and commits", 1, d.flushCount.get());
-            Assert.assertFalse(d.hasDeferredFrames());
-            // the window restarts: a fourth close is deferred again
-            try (Sender s = pool.borrow()) {
-                s.table("t").longColumn("v", 4L).atNow();
-            }
-            Assert.assertEquals(3, d.deferredFlushCount.get());
-            Assert.assertEquals(1, d.flushCount.get());
+            Assert.assertEquals("a release never flushes", 0, d.flushCount.get());
+            Assert.assertEquals(0, d.autoFlushIfDueCount.get());
+            Assert.assertEquals(0, d.pendingRowCount());
         }
     }
 
     @Test
-    public void testSetCommitWindowRejectsNegativeOrMixedValues() {
+    public void testSetCommitWindowRejectsNegativeValues() {
         List<RecordingSender> built = new ArrayList<>();
         try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(1, 1, built)) {
-            int[][] bad = {{-1, -1}, {0, -5}, {5, 0}, {0, 5}};
-            for (int[] b : bad) {
+            long[][] bad = {{-1, 0}, {0, -1}};
+            for (long[] b : bad) {
                 try {
-                    pool.setCommitWindow(b[0], b[1]);
+                    pool.setCommitWindow((int) b[0], b[1]);
                     Assert.fail("expected IllegalArgumentException for " + b[0] + ", " + b[1]);
                 } catch (IllegalArgumentException expected) {
-                    Assert.assertFalse(pool.hasCommitWindow());
+                    Assert.assertTrue(expected.getMessage(), expected.getMessage().contains("must not be negative"));
                 }
             }
-            pool.setCommitWindow(0, 0);
-            Assert.assertFalse(pool.hasCommitWindow());
+            pool.setCommitWindow(0, 0L);
+            pool.setCommitWindow(0, 50L);
+            pool.setCommitWindow(10, 0L);
         }
     }
 
     @Test
-    public void testSettleCommitsIdleOpenGroup() {
+    public void testSettleShipsIdleRowsWithTryFlush() {
         List<RecordingSender> built = new ArrayList<>();
         try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(1, 1, built)) {
-            pool.setFlushOnClose(true);
-            pool.setCommitWindow(2, 60_000L);
-            try (Sender s = pool.borrow()) {
-                s.table("t").longColumn("v", 1L).atNow();
-            }
+            pool.setCommitWindow(1_000, 100L);
+            borrowAppendClose(pool, 1L);
             RecordingSender d = built.get(0);
-            Assert.assertTrue(d.hasDeferredFrames());
+            Assert.assertEquals(1, d.pendingRowCount());
+            Assert.assertEquals(1, pool.settleIdle());
+            Assert.assertEquals(1, d.tryFlushCount.get());
+            Assert.assertEquals(1, d.flushCount.get());
             Assert.assertEquals(0, d.pendingRowCount());
-            Assert.assertEquals("an open group is unshipped work for the settle", 1, pool.settleIdle());
-            Assert.assertEquals(1, d.flushCount.get());
-            Assert.assertFalse(d.hasDeferredFrames());
-            Assert.assertEquals("window restarted by the settle", 0, pool.settleIdle());
-            // the settle marked the commit at 1 row, so the next close (2 rows
-            // appended in total, 1 in the window) defers; had the mark been
-            // missed, the window would count 2 rows and this close would commit
-            try (Sender s = pool.borrow()) {
-                s.table("t").longColumn("v", 2L).atNow();
-            }
-            Assert.assertEquals(2, d.deferredFlushCount.get());
-            Assert.assertEquals(1, d.flushCount.get());
-        }
-    }
-
-    @Test
-    public void testWindowOffMeansEveryCloseCommits() {
-        List<RecordingSender> built = new ArrayList<>();
-        try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(1, 1, built)) {
-            pool.setFlushOnClose(true);
-            Assert.assertFalse(pool.hasCommitWindow());
-            for (int i = 0; i < 2; i++) {
-                try (Sender s = pool.borrow()) {
-                    s.table("t").longColumn("v", i).atNow();
-                }
-            }
-            RecordingSender d = built.get(0);
-            Assert.assertEquals(2, d.flushCount.get());
-            Assert.assertEquals(0, d.deferredFlushCount.get());
+            Assert.assertEquals("nothing left to settle", 0, pool.settleIdle());
+            Assert.assertEquals(1, d.tryFlushCount.get());
         }
     }
 

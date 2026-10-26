@@ -209,7 +209,8 @@ public class SenderPoolErrorSafetyTest {
         return f.get(pooledWrapper);
     }
 
-    // Like fakeSender(), but flush() throws an Error to drive the
+    // Like fakeSender(), but flush() and flushAsWindowMember(), the ship of a
+    // flush_on_close=on release, throw an Error to drive the
     // PooledSender.close() abnormal-exit branch.
     private static Sender flushThrowingSender() {
         return (Sender) Proxy.newProxyInstance(
@@ -218,6 +219,7 @@ public class SenderPoolErrorSafetyTest {
                 (proxy, method, args) -> {
                     switch (method.getName()) {
                         case "flush":
+                        case "flushAsWindowMember":
                             throw new AssertionError("injected flush failure");
                         case "close":
                             return null;

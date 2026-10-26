@@ -141,7 +141,14 @@ public interface QuestDB extends Closeable {
      * pooled Sender ships the lease's pending rows as one frame into the
      * store-and-forward ring and returns the slot, so every row appended before
      * {@code close()} is in the ring when it returns. Call
-     * {@link Sender#drain(long)} to wait for the server. Set
+     * {@link Sender#drain(long)} to wait for the server. The sender's I/O
+     * thread sends the frames of successive closes with the commit deferred
+     * and commits them together, once per commit window
+     * ({@code commit_rows}, default {@code auto_flush_rows}, and
+     * {@code commit_interval_ms}, default {@code auto_flush_interval}), so a
+     * row becomes visible on the server up to one window after {@code close()};
+     * {@code flush()}, {@code drain()} and an auto-flush inside a lease commit
+     * at once. Set
      * {@code flush_on_close=off} to opt in to buffering across leases:
      * {@code close()} then only releases the slot, and its rows go out when an
      * auto-flush threshold trips on a later append or release, or when the
@@ -151,8 +158,10 @@ public interface QuestDB extends Closeable {
      * {@code off}, one frame carries the rows of every lease that closed since
      * the last ship, so a server rejection of that frame discards those leases'
      * rows together; the error is logged by the error handler and thrown by a
-     * later call on that slot. With the default each lease ships its own frame,
-     * so a rejection covers only that lease's rows.
+     * later call on that slot. With the default each lease ships its own frame.
+     * A rejection inside a commit window rolls back the open window on the
+     * server; the I/O thread replays it once, so the leases before the rejected
+     * frame commit and the rejection strikes that frame alone.
      * {@link Sender#reset()} on a pooled Sender discards only that lease's rows.
      * Note that in this client "flush" means published to the store-and-forward
      * ring, not acknowledged by the server. The free list is LIFO, so under

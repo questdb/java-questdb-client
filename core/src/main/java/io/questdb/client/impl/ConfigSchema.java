@@ -133,8 +133,8 @@ public final class ConfigSchema {
         longRange("housekeeper_interval_ms", Side.POOL, OPEN, OPEN_MAX, false, false);
         boolOnOff("lazy_connect", Side.POOL); // facade flag: tolerant non-blocking startup (async ingest + lazy reads)
         boolOnOff("flush_on_close", Side.POOL); // pooled close() ships rows (on, default) or only releases the slot (off)
-        intRange("commit_rows", Side.POOL, OPEN, OPEN_MAX, false, false); // commit window: rows per server commit
-        longRange("commit_interval_ms", Side.POOL, OPEN, OPEN_MAX, false, false); // commit window: age per server commit
+        intRange("commit_rows", Side.POOL, OPEN, OPEN_MAX, false, false); // I/O-thread commit window under flush_on_close=on: rows per server commit (default auto_flush_rows, 0 disables)
+        longRange("commit_interval_ms", Side.POOL, OPEN, OPEN_MAX, false, false); // I/O-thread commit window under flush_on_close=on: age per server commit (default auto_flush_interval, 0 disables)
 
         // RESERVED -- accepted no-op (error-policy keys reserved by the spec).
         str("on_internal_error", Side.RESERVED);

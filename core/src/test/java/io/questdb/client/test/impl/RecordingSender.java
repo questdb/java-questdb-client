@@ -42,12 +42,13 @@ import java.util.concurrent.atomic.AtomicInteger;
  * Never touches the network. Not final, so a test can override a single method.
  */
 class RecordingSender implements Sender {
+    final AtomicInteger autoFlushIfDueCount = new AtomicInteger();
     final AtomicInteger cancelCount = new AtomicInteger();
     final AtomicInteger closeCount = new AtomicInteger();
-    final AtomicInteger deferredFlushCount = new AtomicInteger();
     final AtomicInteger flushCount = new AtomicInteger();
+    final AtomicInteger tryFlushCount = new AtomicInteger();
+    final AtomicInteger windowMemberFlushCount = new AtomicInteger(); // every flushAsWindowMember() call
     volatile RuntimeException cancelError;     // thrown by cancelRow() when set
-    volatile RuntimeException deferredFlushError; // thrown by flushDeferred() when set
     volatile boolean deferredFramesOpen;
     volatile RuntimeException flushError;      // thrown by flush() when set
     volatile Error flushFatal;                 // thrown by flush() when set, before flushError
@@ -58,14 +59,13 @@ class RecordingSender implements Sender {
     volatile int pendingRows;
     volatile boolean ringBusy;                 // tryFlush() returns false without flushing when set
     volatile boolean rowInProgress;
-    volatile long rowsAppended;
     volatile int savepointRows;
+    volatile RuntimeException windowMemberFlushError; // thrown by flushAsWindowMember() when set
 
     @Override
     public void at(long timestamp, ChronoUnit unit) {
         rowInProgress = false;
         pendingRows++;
-        rowsAppended++;
     }
 
     @Override
@@ -76,6 +76,11 @@ class RecordingSender implements Sender {
     @Override
     public void atNow() {
         at(0L, ChronoUnit.MICROS);
+    }
+
+    @Override
+    public void autoFlushIfDue() {
+        autoFlushIfDueCount.incrementAndGet();
     }
 
     @Override
@@ -165,21 +170,18 @@ class RecordingSender implements Sender {
     }
 
     @Override
-    public long flushDeferred() {
+    public void flushAsWindowMember() {
         awaitGate(flushGate, "flushGate");
-        RuntimeException deferredError = deferredFlushError;
-        if (deferredError != null) {
-            throw deferredError;
+        windowMemberFlushCount.incrementAndGet();
+        RuntimeException e = windowMemberFlushError;
+        if (e != null) {
+            throw e;
         }
-        boolean hadRows = pendingRows > 0;
-        if (!hadRows) {
-            return -1L;                       // nothing pending: the real sender publishes nothing
-        }
+        // Like the real sender: ships the pending rows as one committing frame
+        // into the ring; the I/O thread decides whether it defers the commit.
         pendingBatchStartNanos = 0L;
         pendingRows = 0;
         savepointRows = 0;
-        deferredFramesOpen = true;
-        return deferredFlushCount.incrementAndGet();
     }
 
     @Override
@@ -247,11 +249,6 @@ class RecordingSender implements Sender {
     }
 
     @Override
-    public long rowsAppended() {
-        return rowsAppended;
-    }
-
-    @Override
     public Sender stringColumn(CharSequence name, CharSequence value) {
         return this;
     }
@@ -279,6 +276,7 @@ class RecordingSender implements Sender {
 
     @Override
     public boolean tryFlush() {
+        tryFlushCount.incrementAndGet();
         if (ringBusy) {
             return false;
         }

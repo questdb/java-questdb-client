@@ -48,8 +48,9 @@ import java.util.concurrent.TimeUnit;
  * at release ({@code checkError()}, {@code hasRowInProgress()} and
  * {@code pendingRowCount()}), the savepoint pair ({@code markSavepoint()} and
  * {@code resetToSavepoint()}) behind a lease's {@code reset()}, the deferred
- * flush of the commit window, the cap-bound byte trigger and the crossing row
- * the sender holds back when the cap rejects the auto-flushed batch.
+ * group of a {@code transaction=on} sender that the settle probes, the
+ * cap-bound byte trigger and the crossing row the sender holds back when the
+ * cap rejects the auto-flushed batch.
  */
 public class SenderProbeMethodsTest {
 
@@ -145,8 +146,8 @@ public class SenderProbeMethodsTest {
             server.setAdvertisedMaxBatchSize(4 * 1024);
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-            // transaction=on, which a commit window injects: the rows before the crossing
-            // row ship inside the open transaction, and only flush() commits it
+            // transaction=on: the rows before the crossing row ship inside the open
+            // transaction, and only flush() commits it
             try (Sender sender = Sender.fromConfig(configWithoutAutoFlushBytes(server.getPort()) + "transaction=on;")) {
                 String wide = QuestDBFlushOnCloseTest.wideValue(1000);
                 for (int i = 0; i < 3; i++) {
@@ -312,41 +313,33 @@ public class SenderProbeMethodsTest {
             sender.checkError();                            // default: no-op
             Assert.assertFalse(sender.hasRowInProgress());  // default: false
             Assert.assertEquals(0, sender.pendingRowCount()); // default: 0
-            Assert.assertEquals(0L, sender.rowsAppended());
-            Assert.assertFalse(sender.hasDeferredFrames());
-            try {
-                sender.flushDeferred();
-                Assert.fail("expected UnsupportedOperationException");
-            } catch (UnsupportedOperationException expected) {
-            }
+            Assert.assertFalse(sender.hasDeferredFrames());   // default: false
         }
     }
 
     @Test
-    public void testDeferredFlushShipsFlaggedFrameAndFlushCommits() throws Exception {
+    public void testDeferredGroupOfATransactionOpensAtAutoFlushAndFlushCommitsIt() throws Exception {
         QuestDBFlushOnCloseTest.FrameLog log = new QuestDBFlushOnCloseTest.FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-            try (Sender sender = Sender.fromConfig(config(server.getPort()))) {
-                Assert.assertEquals(0L, sender.rowsAppended());
+            try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                    + ";auto_flush_bytes=off;auto_flush_rows=2;auto_flush_interval=60000;close_flush_timeout_millis=0;transaction=on;")) {
                 Assert.assertFalse(sender.hasDeferredFrames());
-                Assert.assertEquals(-1L, sender.flushDeferred());          // nothing pending
 
                 sender.table("t").longColumn("v", 1L).atNow();
-                Assert.assertEquals(1L, sender.rowsAppended());
-                Assert.assertTrue(sender.flushDeferred() >= 0L);
+                Assert.assertFalse("one row is below the threshold: nothing shipped", sender.hasDeferredFrames());
+                sender.table("t").longColumn("v", 2L).atNow();             // auto-flush inside the transaction
                 Assert.assertTrue("a deferred frame is open", sender.hasDeferredFrames());
                 Assert.assertEquals(0, sender.pendingRowCount());
 
-                sender.table("t").longColumn("v", 2L).atNow();
+                sender.table("t").longColumn("v", 3L).atNow();
                 sender.flush();                                            // closes the group
                 Assert.assertFalse(sender.hasDeferredFrames());
-                Assert.assertEquals(2L, sender.rowsAppended());
 
                 log.awaitDataFrames(2, 5_000);
                 Assert.assertEquals("no separate commit message: the committing frame carries the rows", 0, log.commitFrames());
-                Assert.assertTrue("first frame carries FLAG_DEFER_COMMIT", log.deferFlag(0));
+                Assert.assertTrue("the auto-flushed frame carries FLAG_DEFER_COMMIT", log.deferFlag(0));
                 Assert.assertFalse("committing frame is unflagged", log.deferFlag(1));
             }
         }

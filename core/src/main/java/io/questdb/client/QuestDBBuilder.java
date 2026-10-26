@@ -54,6 +54,8 @@ import java.util.function.LongConsumer;
 public final class QuestDBBuilder {
 
     static final long DEFAULT_ACQUIRE_TIMEOUT_MILLIS = 5_000;
+    // Commit window when neither commit_* nor auto_flush_* is set: the
+    // WebSocket sender's own auto-flush defaults.
     static final long DEFAULT_COMMIT_INTERVAL_MILLIS = 100;
     static final int DEFAULT_COMMIT_ROWS = 1000;
     static final long DEFAULT_HOUSEKEEPER_INTERVAL_MILLIS = 5_000;
@@ -128,29 +130,42 @@ public final class QuestDBBuilder {
     }
 
     /**
-     * Age of a commit window in milliseconds. Setting a commit window makes
-     * pooled closes ship frames flagged defer-commit: the server appends them
-     * and commits once per window, when either {@link #commitRows(int)} rows
-     * or this many milliseconds have accumulated since the last commit. Acks
-     * then arrive at the commit, so a {@link Sender#drain(long)} should follow
-     * a {@link Sender#flush()}. Requires {@code flush_on_close=on}. When only
-     * one of the two window settings is given, the other takes the auto-flush
-     * default (1000 rows, 100 ms).
+     * Age bound of the commit window in milliseconds. Each pooled
+     * {@code close()} publishes a committing frame into the store-and-forward
+     * ring; the sender's I/O thread sends it with the commit deferred and
+     * commits once per window: with the frame that brings the window to
+     * {@link #commitRows(int)} rows, or with a commit-only frame once the
+     * window's first frame is this many milliseconds old. An auto-flush
+     * inside a lease, {@link Sender#flush()}, {@link Sender#drain(long)},
+     * {@link Sender#awaitAckedFsn(long, long)} and {@link QuestDB#close()}
+     * commit the window at once. 0 disables this bound; both bounds at 0 make
+     * every {@code close()} commit on its own. Defaults to
+     * {@code auto_flush_interval} (100 ms). Applies only under
+     * {@code flush_on_close=on}; {@link #build()} rejects it under
+     * {@code off}. A sender built with {@code transaction=on} keeps its own
+     * commit semantics and ignores the window.
+     * <p>
+     * With {@code sf_dir}, a client crash between the server's commit and
+     * the arrival of its ack replays up to one window as duplicates: the
+     * delivery stays at-least-once, with a larger unit.
      */
     public QuestDBBuilder commitIntervalMillis(long millis) {
-        if (millis < 1) {
-            throw new IllegalArgumentException("commitIntervalMillis must be >= 1");
+        if (millis < 0) {
+            throw new IllegalArgumentException("commitIntervalMillis must be >= 0");
         }
         this.commitIntervalMillis = millis;
         return this;
     }
 
     /**
-     * Rows per commit window. See {@link #commitIntervalMillis(long)}.
+     * Row bound of the commit window: the frame that brings the window to this
+     * many rows commits it. 0 disables this bound. Defaults to
+     * {@code auto_flush_rows} (1000; 0 with {@code auto_flush_rows=off}). See
+     * {@link #commitIntervalMillis(long)}.
      */
     public QuestDBBuilder commitRows(int rows) {
-        if (rows < 1) {
-            throw new IllegalArgumentException("commitRows must be >= 1");
+        if (rows < 0) {
+            throw new IllegalArgumentException("commitRows must be >= 0");
         }
         this.commitRows = rows;
         return this;
@@ -217,11 +232,13 @@ public final class QuestDBBuilder {
      * next append or close on it after that interval. In this
      * client "flush" means published to the store-and-forward ring, not
      * acknowledged by the server; use {@link Sender#drain(long)} for that.
-     * With {@code on} and no commit window every lease ships its own frame, so
-     * a server rejection cannot discard other leases' rows. With {@code off}
-     * leases share frames and a rejection covers all of them. With a commit
-     * window a rejection rolls back the whole open group, every lease since the
-     * last commit.
+     * With {@code on} every lease ships its own frame, and the I/O thread
+     * commits the frames of one commit window together (see
+     * {@link #commitIntervalMillis(long)}). A server rejection inside a window
+     * rolls back the open window; the I/O thread replays it once, so the
+     * leases before the rejected frame commit and the rejection strikes that
+     * frame alone. With {@code off} leases share frames and a rejection covers
+     * all of them.
      * Overrides {@code flush_on_close} in the config string.
      */
     public QuestDBBuilder flushOnClose(boolean flushOnClose) {
@@ -295,47 +312,38 @@ public final class QuestDBBuilder {
         int windowRows = commitRows;
         if (windowRows == UNSET && view.has("commit_rows")) {
             windowRows = view.getInt("commit_rows", UNSET);
-            if (windowRows < 1) {
-                throw new IllegalArgumentException("commit_rows must be >= 1, got " + windowRows);
+            if (windowRows < 0) {
+                throw new IllegalArgumentException("commit_rows must be >= 0, got " + windowRows);
             }
         }
         long windowIntervalMillis = commitIntervalMillis;
         if (windowIntervalMillis == UNSET && view.has("commit_interval_ms")) {
             windowIntervalMillis = view.getLong("commit_interval_ms", UNSET);
-            if (windowIntervalMillis < 1) {
-                throw new IllegalArgumentException("commit_interval_ms must be >= 1, got " + windowIntervalMillis);
+            if (windowIntervalMillis < 0) {
+                throw new IllegalArgumentException("commit_interval_ms must be >= 0, got " + windowIntervalMillis);
             }
         }
-        if (windowRows != UNSET || windowIntervalMillis != UNSET) {
-            if (windowRows == UNSET) {
-                windowRows = DEFAULT_COMMIT_ROWS;
-            }
-            if (windowIntervalMillis == UNSET) {
-                windowIntervalMillis = DEFAULT_COMMIT_INTERVAL_MILLIS;
-            }
-            if (!flushOnClose) {
+        if (!flushOnClose) {
+            // Under off a release ships no window member, so the keys would do nothing.
+            if (windowRows != UNSET || windowIntervalMillis != UNSET) {
                 throw new IllegalArgumentException(
-                        "conflicting configuration: commit_rows/commit_interval_ms need flush_on_close=on in this version. "
-                                + "The buffered variant (flush_on_close=off with a commit window) is not available yet; "
-                                + "set flush_on_close=on or remove the commit window keys.");
+                        "conflicting configuration: commit_rows/commit_interval_ms apply to flush_on_close=on only; "
+                                + "remove them or set flush_on_close=on");
             }
-            String transaction = view.getStr("transaction");
-            if (transaction != null && !"on".equalsIgnoreCase(transaction)) {
-                throw new IllegalArgumentException(
-                        "conflicting configuration: a commit window needs transaction=on on the pooled senders, but "
-                                + "transaction=" + transaction + " was set. Remove transaction= (the pool sets it) or set it to on.");
-            }
-            if (transaction == null) {
-                ingestConfig = injectAfterSchema(ingestConfig, "transaction=on;");
-            }
-        } else {
             windowRows = 0;
             windowIntervalMillis = 0;
+        } else {
+            if (windowRows == UNSET) {
+                windowRows = derivedCommitRows(view);
+            }
+            if (windowIntervalMillis == UNSET) {
+                windowIntervalMillis = derivedCommitIntervalMillis(view);
+            }
         }
         resolvedCommitRows = windowRows;
         resolvedCommitIntervalMillis = windowIntervalMillis;
         resolvedIngestConfig = ingestConfig;
-        long settleIntervalMillis = resolveSettleIntervalMillis(view, windowIntervalMillis);
+        long settleIntervalMillis = resolveSettleIntervalMillis(view);
 
         return new QuestDBImpl(
                 ingestConfig,
@@ -586,6 +594,26 @@ public final class QuestDBBuilder {
         return m;
     }
 
+    // The commit window's age bound when commit_interval_ms is unset: the
+    // effective auto-flush interval. The WebSocket transport rejects
+    // auto_flush_interval=off, so the interval is a number or unset.
+    private static long derivedCommitIntervalMillis(ConfigView view) {
+        return view.getLong("auto_flush_interval", DEFAULT_COMMIT_INTERVAL_MILLIS);
+    }
+
+    // The commit window's row bound when commit_rows is unset: the effective
+    // auto-flush row threshold, 0 when auto_flush_rows=off disables it.
+    private static int derivedCommitRows(ConfigView view) {
+        String rows = view.getStr("auto_flush_rows");
+        if (rows == null) {
+            return DEFAULT_COMMIT_ROWS;
+        }
+        if ("off".equalsIgnoreCase(rows)) {
+            return 0;
+        }
+        return view.getInt("auto_flush_rows", DEFAULT_COMMIT_ROWS);
+    }
+
     // Inserts a key right after the "ws::" / "wss::" schema separator so the
     // sender parse sees it as part of the ingest config.
     private static String injectAfterSchema(String config, String keyValue) {
@@ -608,16 +636,14 @@ public final class QuestDBBuilder {
      * {@link #DEFAULT_SETTLE_INTERVAL_MILLIS} when unset. The WebSocket
      * transport rejects both {@code auto_flush=off} and
      * {@code auto_flush_interval=off}, so the interval is a number or unset.
-     * With a commit window, the shorter of that and {@code commitIntervalMillis}
-     * (0 = no window).
+     * The commit window plays no part: the I/O thread closes it.
      * Public only for the unit test, which lives in another package.
      */
     @TestOnly
-    public static long resolveSettleIntervalMillis(ConfigView view, long commitIntervalMillis) {
+    public static long resolveSettleIntervalMillis(ConfigView view) {
         // getLong uses the connect-string number syntax (underscore separators
         // included), the same one the Sender parse already accepted.
-        long fromAutoFlush = Math.max(1L, view.getLong("auto_flush_interval", DEFAULT_SETTLE_INTERVAL_MILLIS));
-        return commitIntervalMillis > 0 ? Math.min(fromAutoFlush, commitIntervalMillis) : fromAutoFlush;
+        return Math.max(1L, view.getLong("auto_flush_interval", DEFAULT_SETTLE_INTERVAL_MILLIS));
     }
 
     private static void requireWebSocketSchema(CharSequence config, String role) {

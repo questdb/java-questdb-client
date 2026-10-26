@@ -50,7 +50,9 @@ import java.time.temporal.ChronoUnit;
  * <p>
  * Behaviour difference from a raw Sender: {@link #close()} returns the slot to
  * the pool after flushing the lease's pending rows as one frame into the
- * store-and-forward ring ({@code flush_on_close=on}, the default). With
+ * store-and-forward ring ({@code flush_on_close=on}, the default), as a member
+ * of the pool's commit window: the delegate's I/O thread may defer the
+ * frame's server commit until the window closes. With
  * {@code flush_on_close=off}, the opt-in, close only releases the slot: the
  * rows ship once the oldest is older than {@code auto_flush_interval} or
  * another auto-flush threshold trips, otherwise they wait for a later append
@@ -153,9 +155,9 @@ public final class PooledSender implements Sender {
 
     /**
      * Returns this lease's slot to the pool after flushing its pending rows
-     * as one frame into the store-and-forward ring (see the commit-window note
-     * below). With {@code flush_on_close=off}, the opt-in, the rows are not
-     * flushed here: they ship once the oldest is older than
+     * as one committing frame into the store-and-forward ring (see the
+     * commit-window note below). With {@code flush_on_close=off}, the opt-in,
+     * the rows are not flushed here: they ship once the oldest is older than
      * {@code auto_flush_interval} or another auto-flush threshold trips, and
      * otherwise wait in the slot's buffer for a later append or release, or for
      * the pool's housekeeper settle. {@link #reset()} on a lease discards only that
@@ -192,14 +194,16 @@ public final class PooledSender implements Sender {
      * double-close of ONE lease from two threads is outside the Sender
      * threading contract.
      * <p>
-     * With a commit window ({@link SenderPool#setCommitWindow}) and
-     * {@code flush_on_close=on}, each close ships a deferred frame; the close
-     * that fills the window (rows appended or age of the open group) flushes
-     * instead, which commits the group. With {@code flush_on_close=off}, only
-     * the release that closes the window ships: it flushes, committing the
-     * group. The group opens at the first-row stamp of the lease whose release
-     * found work. Each later release is measured by its own first-row stamp
-     * against that opening. A failed ship retires the slot and throws the wrapper described above.
+     * Commit window: with {@code flush_on_close=on} the close ships the rows
+     * through {@link Sender#flushAsWindowMember()}. The frame is in the ring,
+     * committing, when this method returns; the delegate's I/O thread sends it
+     * with the commit deferred and commits once per window of the pool's
+     * bounds ({@link SenderPool#setCommitWindow}): with the frame that reaches
+     * the row bound, with a commit-only frame once the window reaches the age
+     * bound, or at once when a flush, a drain or an ack wait on the slot, or
+     * the shutdown of the owning {@code QuestDB}, asks for it. A row therefore
+     * becomes visible on the server up to one window after this close. A
+     * failed ship retires the slot and throws the wrapper described above.
      * <p>
      * The idle clock of the released slot is marked at the first row of the released
      * lease's batch, not at the release. A lease held longer than {@code idle_timeout_ms}
@@ -242,7 +246,7 @@ public final class PooledSender implements Sender {
                     delegate.flush();
                 } else {
                     nowNanos = nowNanos(delegate);
-                    ship(pool, delegate, nowNanos);
+                    ship(pool, delegate);
                 }
                 recycle = true;
             } catch (RuntimeException e) {
@@ -266,7 +270,6 @@ public final class PooledSender implements Sender {
                     delegate.resetToSavepoint();
                     droppedLeaseRows = pendingBeforeRollback - delegate.pendingRowCount();
                     delegate.flush();
-                    slot.markCommitted(delegate.rowsAppended());
                     capRejection = (BatchTooLargeForCapException) failure;
                     failure = null;
                     recycle = true;
@@ -377,10 +380,7 @@ public final class PooledSender implements Sender {
 
     @Override
     public boolean drain(long timeoutMillis) {
-        Sender delegate = slot.live(generation);
-        boolean drained = delegate.drain(timeoutMillis);
-        slot.markCommitted(delegate.rowsAppended());
-        return drained;
+        return slot.live(generation).drain(timeoutMillis);
     }
 
     @Override
@@ -391,27 +391,17 @@ public final class PooledSender implements Sender {
 
     @Override
     public void flush() {
-        Sender delegate = slot.live(generation);
-        delegate.flush();
-        slot.markCommitted(delegate.rowsAppended());
+        slot.live(generation).flush();
     }
 
     @Override
     public long flushAndGetSequence() {
-        Sender delegate = slot.live(generation);
-        long sequence = delegate.flushAndGetSequence();
-        slot.markCommitted(delegate.rowsAppended());
-        return sequence;
+        return slot.live(generation).flushAndGetSequence();
     }
 
     @Override
     public void flushAsWindowMember() {
         slot.live(generation).flushAsWindowMember();
-    }
-
-    @Override
-    public long flushDeferred() {
-        return slot.live(generation).flushDeferred();
     }
 
     @Override
@@ -524,11 +514,6 @@ public final class PooledSender implements Sender {
     }
 
     @Override
-    public long rowsAppended() {
-        return slot.live(generation).rowsAppended();
-    }
-
-    @Override
     public Sender shortColumn(CharSequence name, short value) {
         slot.live(generation).shortColumn(name, value);
         return this;
@@ -566,12 +551,7 @@ public final class PooledSender implements Sender {
 
     @Override
     public boolean tryFlush() {
-        Sender delegate = slot.live(generation);
-        boolean flushed = delegate.tryFlush();
-        if (flushed) {
-            slot.markCommitted(delegate.rowsAppended());
-        }
-        return flushed;
+        return slot.live(generation).tryFlush();
     }
 
     @Override
@@ -611,31 +591,17 @@ public final class PooledSender implements Sender {
     /**
      * What a release ships, per the pool's settings:
      * <ul>
-     *   <li>commit window set and closing now: {@code flush()}, which ships
-     *       pending rows unflagged and commits the group;</li>
-     *   <li>otherwise {@code flush_on_close=on}: {@code flushDeferred()} with a
-     *       window, {@code flush()} without one;</li>
-     *   <li>otherwise {@code autoFlushIfDue()}: ships every pending row once
-     *       the oldest is older than {@code auto_flush_interval} or another
-     *       auto-flush threshold trips.</li>
+     *   <li>{@code flush_on_close=on}: {@code flushAsWindowMember()}, which
+     *       publishes the pending rows as one committing frame; the delegate's
+     *       I/O thread applies the commit window to it;</li>
+     *   <li>{@code off}: {@code autoFlushIfDue()}, which ships every pending
+     *       row once the oldest is older than {@code auto_flush_interval} or
+     *       another auto-flush threshold trips.</li>
      * </ul>
      */
-    private void ship(SenderPool pool, Sender delegate, long nowNanos) {
-        if (pool.hasCommitWindow()) {
-            boolean closes = slot.windowCloses(delegate.rowsAppended(), delegate.hasDeferredFrames(),
-                    nowNanos, pool.commitRows(), pool.commitIntervalNanos());
-            if (closes) {
-                delegate.flush();
-                slot.markCommitted(delegate.rowsAppended());
-                return;
-            }
-            if (pool.isFlushOnClose()) {
-                delegate.flushDeferred();
-            }
-            return;
-        }
+    private static void ship(SenderPool pool, Sender delegate) {
         if (pool.isFlushOnClose()) {
-            delegate.flush();
+            delegate.flushAsWindowMember();
         } else {
             delegate.autoFlushIfDue();
         }

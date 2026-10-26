@@ -99,8 +99,10 @@ snippets below borrow from its pools.
 ### Ingest Data
 
 Borrow a `Sender`, write rows, and close it. `close()` ships the lease's pending rows as one committing frame into the
-store-and-forward ring (with a commit window the frame is flagged defer-commit instead) before it returns and hands the sender back to the pool. That is publishing, not
-acknowledgement: call `drain()` to wait for the server. Borrowing per message is the intended pattern. With
+store-and-forward ring before it returns and hands the sender back to the pool. That is publishing, not
+acknowledgement: call `drain()` to wait for the server. The sender's I/O thread sends the frame with the commit deferred
+and commits once per commit window (see [Sending Batches of Rows](#sending-batches-of-rows)), so the rows become visible
+on the server up to one window after `close()`. Borrowing per message is the intended pattern. With
 `flush_on_close=off`, the opt-in, `close()` only releases the slot and the rows stay in it across leases; they ship when
 an auto-flush threshold trips on a later append or `close()`, or when the pool's housekeeper settles the idle slot,
 typically within one `auto_flush_interval` (100 ms by default). A lease that holds the slot without appending or
@@ -125,23 +127,32 @@ try (Sender sender = db.borrowSender()) {
 The sender buffers rows and sends them in batches. For high throughput, write many rows on one borrowed sender and
 flush per batch rather than per row: each flush has a fixed cost, so batching raises throughput. By default a pooled
 `close()` ships the lease's pending rows as one frame into the store-and-forward ring, so the final partial batch is in
-the ring when `close()` returns. If you borrow per message, that is one frame per message. Without a commit window every pooled `close()` is one server commit, which bounds throughput for borrow-per-row; `commit_rows` and `commit_interval_ms` lift that bound. To commit once per window
-instead of once per close, set a commit window (`commit_rows`, `commit_interval_ms`, which requires `flush_on_close=on`):
-every close ships one frame flagged defer-commit, the server appends it, and the pool commits once per window. A rejected
-frame then rolls back the whole open group, so every lease since the last commit loses its rows.
+the ring when `close()` returns. If you borrow per message, that is one frame per message.
+
+The sender's I/O thread commits those frames once per commit window rather than once per `close()`. It sends each
+release frame with the commit deferred and commits with the frame that brings the window to `commit_rows` rows, or with
+a commit-only frame once the window is `commit_interval_ms` old. The bounds default to `auto_flush_rows` (1000) and
+`auto_flush_interval` (100 ms), so borrow-per-row gets the same server-side visibility as a held lease. An auto-flush
+inside a lease, `flush()`, `drain()`, `awaitAckedFsn()` and closing the `QuestDB` handle commit the window at once. A
+bound of `0` disables it; with both at `0` every `close()` commits on its own. The keys apply only under
+`flush_on_close=on`, and a sender built with `transaction=on` keeps its own commit semantics, so the window leaves it
+alone. With `sf_dir`, a client crash between the server's commit and the arrival of its ack replays up to one window
+as duplicates: delivery stays at-least-once, with a larger unit.
 
 `flush_on_close=off` is the opt-in that buffers rows across leases: `close()` only releases the slot, and the rows ship
 when an auto-flush threshold trips on a later append or release, or when the housekeeper settles the idle slot. Call
 `flush()` before `close()` if you need them on the wire now.
 
-A server rejection covers a whole frame. With the default each lease ships its own frame, so a rejection covers only
-that lease's rows. With `flush_on_close=off` one frame carries the rows of every lease that closed since the last ship,
-so one rejected row discards the other leases' rows in that frame as well, after their `close()` calls returned. The
-default error handler logs the rejection with the frame's sequence span, and the error is thrown by the next call on
-that slot, possibly to a lease that wrote none of the rejected rows. A retriable rejection (write error, internal error)
-replays the frame; a terminal one (schema mismatch, parse error, security error) retires the slot, and with `sf_dir`
-its unacked frames stay in the slot directory for recovery. With `off`, a lease whose rows must not share a frame calls
-`flush()` before `close()`. `reset()` on a borrowed sender discards only the rows appended through that lease.
+A server rejection covers a whole frame. With the default each lease ships its own frame. A rejection inside a commit
+window rolls back the open window on the server; the I/O thread replays the window once with every frame committing, so
+the leases before the rejected frame commit and the rejection strikes that frame alone. With `flush_on_close=off` one
+frame carries the rows of every lease that closed since the last ship, so one rejected row discards the other leases'
+rows in that frame as well, after their `close()` calls returned. The default error handler logs the rejection with the
+frame's sequence span, and the error is thrown by the next call on that slot, possibly to a lease that wrote none of the
+rejected rows. A retriable rejection (write error, internal error) replays the frame; a terminal one (schema mismatch,
+parse error, security error) retires the slot, and with `sf_dir` its unacked frames stay in the slot directory for
+recovery. With `off`, a lease whose rows must not share a frame calls `flush()` before `close()`. `reset()` on a
+borrowed sender discards only the rows appended through that lease.
 
 ```java
 try (Sender sender = db.borrowSender()) {
@@ -682,9 +693,9 @@ schema::key1=value1;key2=value2;
 | `acquire_timeout_ms`     | `5000`  | How long `borrowSender()`/`borrowQuery()` waits for a free slot                |
 | `idle_timeout_ms`        | `60000` | How long a pooled connection may stay idle before it is reaped. A released slot's idle clock starts at the first row of the released lease's batch, not at the release, so a lease held longer than this leaves its slot reap-eligible on the next housekeeper tick when the pool is above `sender_pool_min`. Nothing is lost, because a slot with unshipped rows is never reaped; the cost is one reconnect on a later borrow. With `flush_on_close=off` the mark can be the first row of an earlier lease's batch, bounded by `auto_flush_interval` while the interval trigger is on |
 | `max_lifetime_ms`        | `1800000` | Maximum lifetime of a pooled connection before it is recycled                |
-| `flush_on_close`         | `on`    | `on` makes a pooled `close()` flush before releasing (one frame and one commit per close); `off` is the opt-in that only releases the slot and buffers rows across leases until an auto-flush threshold or the housekeeper settle ships them. Note: "flush" means published to the store-and-forward ring, not acknowledged. Close-time errors are wrapped; the delegate's error is the cause; only `LineSenderServerException` keeps its type, so code that catches another `LineSenderException` subclass around a pooled `close()` must look at `getCause()`; with `on` and no commit window each lease ships its own frame, so a server rejection cannot discard other leases' rows; with `off` leases share frames and a rejection covers all of them; with a commit window a rejection rolls back the whole open group, every lease since the last commit |
-| `commit_rows`            | _(unset)_ | Commit window: with `flush_on_close=on`, closes ship frames flagged defer-commit and the server commits once per window of this many rows. Acks arrive at the commit; `drain()` after `flush()` |
-| `commit_interval_ms`     | _(unset)_ | Commit window age in milliseconds; setting either window key enables the window, the other defaults to 1000 rows / 100 ms. An idle slot's open group is committed at the settle cadence, so the interval only bounds groups on busy slots |
+| `flush_on_close`         | `on`    | `on` makes a pooled `close()` flush before releasing: one committing frame per close in the store-and-forward ring, which the I/O thread commits once per commit window (`commit_rows`, `commit_interval_ms`); `off` is the opt-in that only releases the slot and buffers rows across leases until an auto-flush threshold or the housekeeper settle ships them. Note: "flush" means published to the store-and-forward ring, not acknowledged. Close-time errors are wrapped; the delegate's error is the cause; only `LineSenderServerException` keeps its type, so code that catches another `LineSenderException` subclass around a pooled `close()` must look at `getCause()`; with `on` each lease ships its own frame, and a rejection inside a window rolls back the open window, which the I/O thread replays once so the leases before the rejected frame commit; with `off` leases share frames and a rejection covers all of them |
+| `commit_rows`            | `auto_flush_rows` (`1000`) | Row bound of the commit window: the I/O thread sends release frames with the commit deferred and commits once per window, with the frame that brings the window to this many rows. `0` disables the bound; with `commit_interval_ms=0` as well every `close()` commits on its own. An auto-flush inside a lease, `flush()`, `drain()`, `awaitAckedFsn()` and closing the `QuestDB` handle commit the window at once. Applies only under `flush_on_close=on` (rejected under `off`); a `transaction=on` sender keeps its own commits and ignores it. With `sf_dir`, a crash between the server's commit and the ack can replay up to one window as duplicates (at-least-once) |
+| `commit_interval_ms`     | `auto_flush_interval` (`100`) | Age bound of the commit window in milliseconds: once the window's first frame is this old, the I/O thread commits it, with a commit-only frame when the slot is quiet. `0` disables the bound; with `commit_rows=0` as well every `close()` commits on its own. Same scope and duplicate exposure as `commit_rows` |
 
 ### Query routing keys
 

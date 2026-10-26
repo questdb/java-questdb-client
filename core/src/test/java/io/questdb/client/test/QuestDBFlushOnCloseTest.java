@@ -152,9 +152,14 @@ public class QuestDBFlushOnCloseTest {
                 appendThreeRowsInThreeLeases(db);
                 log.awaitDataFrames(3, 5_000);
                 Assert.assertEquals(3, log.dataFrames());
-                for (int i = 0; i < 3; i++) {
-                    Assert.assertFalse("no commit window: frames are not flagged", log.deferFlag(i));
+                // the default commit window (1000 rows, 100 ms) defers the releases on the wire
+                Assert.assertTrue("the first release opens the window", log.deferFlag(0));
+                long deadline = System.currentTimeMillis() + 3_000;
+                while (log.commitFrames() == 0 && log.deferFlag(2) && System.currentTimeMillis() < deadline) {
+                    Thread.sleep(10);
                 }
+                Assert.assertTrue("the window commits within its 100 ms age bound",
+                        log.commitFrames() > 0 || !log.deferFlag(2));
             }
         }
     }
@@ -165,7 +170,7 @@ public class QuestDBFlushOnCloseTest {
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-            try (QuestDB db = QuestDB.connect(config(server.getPort(), "flush_on_close=on;housekeeper_interval_ms=60000;"))) {
+            try (QuestDB db = QuestDB.connect(config(server.getPort(), "flush_on_close=on;commit_rows=0;commit_interval_ms=0;housekeeper_interval_ms=60000;"))) {
                 appendThreeRowsInThreeLeases(db);
                 log.awaitDataFrames(3, 5_000);
                 Assert.assertEquals(3, log.dataFrames());

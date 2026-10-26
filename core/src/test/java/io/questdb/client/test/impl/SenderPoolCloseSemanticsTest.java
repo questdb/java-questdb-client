@@ -125,7 +125,8 @@ public class SenderPoolCloseSemanticsTest {
                 s.table("t").longColumn("v", 1L).atNow();
             }
             RecordingSender delegate = built.get(0);
-            Assert.assertEquals(1, delegate.flushCount.get());
+            Assert.assertEquals("the release ships the rows as a window member", 1, delegate.windowMemberFlushCount.get());
+            Assert.assertEquals(0, delegate.flushCount.get());
             Assert.assertEquals(0, delegate.pendingRowCount());
             Assert.assertEquals(1, pool.availableSize());
         }
@@ -140,7 +141,8 @@ public class SenderPoolCloseSemanticsTest {
                 s.table("t").longColumn("v", 1L).atNow();
             }
             RecordingSender delegate = built.get(0);
-            Assert.assertEquals(1, delegate.flushCount.get());
+            Assert.assertEquals("the release ships the rows as a window member", 1, delegate.windowMemberFlushCount.get());
+            Assert.assertEquals(0, delegate.flushCount.get());
             Assert.assertEquals(0, delegate.pendingRowCount());
             Assert.assertEquals(1, pool.availableSize());
         }
@@ -222,19 +224,18 @@ public class SenderPoolCloseSemanticsTest {
     }
 
     @Test
-    public void testFlushDeferredThrowingAtCloseRetiresSlot() {
+    public void testWindowMemberFlushThrowingAtCloseRetiresSlot() {
         List<RecordingSender> built = new ArrayList<>();
         try (SenderPool pool = newPool(1, 1, built)) {
             pool.setFlushOnClose(true);
-            pool.setCommitWindow(1000, 60_000L);
             Sender first = pool.borrow();
             RecordingSender delegate = built.get(0);
-            LineSenderException original = new LineSenderException("deferred ship failed");
-            delegate.deferredFlushError = original;
+            LineSenderException original = new LineSenderException("window-member ship failed");
+            delegate.windowMemberFlushError = original;
             first.table("t").longColumn("v", 1L).atNow();
             try {
                 first.close();
-                Assert.fail("close() must propagate the deferred ship failure");
+                Assert.fail("close() must propagate the window-member ship failure");
             } catch (LineSenderException e) {
                 Assert.assertSame(original, e.getCause());
             }
