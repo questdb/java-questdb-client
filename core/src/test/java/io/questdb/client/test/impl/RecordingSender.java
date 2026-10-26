@@ -57,10 +57,12 @@ class RecordingSender implements Sender {
     volatile Error flushFatal;                 // thrown by flush() when set, before flushError
     volatile CountDownLatch flushGate;         // flush() blocks on it when set
     volatile long lastAutoFlushNowNanos;       // the reading the last autoFlushIfDue(long) got
+    volatile long lastPublishEndNanos;         // System.nanoTime() as the last publishPending() returned
     volatile RuntimeException latchedError;    // thrown by checkError() when set
     volatile CountDownLatch markSavepointGate; // markSavepoint() blocks on it when set
     volatile int pendingRows;
     volatile RuntimeException publishError;    // thrown by publishPending() when set
+    volatile CountDownLatch publishGate;       // publishPending() blocks on it when set
     volatile boolean ringBusy;                 // tryFlush() returns false without flushing when set
     volatile boolean rowInProgress;
     volatile long rowsAppended;
@@ -255,6 +257,7 @@ class RecordingSender implements Sender {
 
     @Override
     public void publishPending() {
+        awaitGate(publishGate, "publishGate");
         RuntimeException e = publishError;
         if (e != null) {
             throw e;
@@ -263,6 +266,7 @@ class RecordingSender implements Sender {
         // resetToSavepoint() keeps them.
         publishCount.incrementAndGet();
         savepointRows = pendingRows;
+        lastPublishEndNanos = System.nanoTime();
     }
 
     @Override

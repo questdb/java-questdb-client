@@ -238,10 +238,11 @@ public final class PooledSender implements Sender {
         BatchTooLargeForCapException capRejection = null;
         int droppedLeaseRows = 0;
         boolean isOpenRecordAtRetire = false;
-        // The release's one clock reading, taken before ship(). The pool-closed
-        // branch never reads it: giveBack() retires the slot there, without an
-        // idle mark.
-        long nowNanos = 0L;
+        // The slot's idle mark: ship()'s one clock reading, or a fresh reading
+        // after the cap retry's flush. Every recycle into an open pool sets it.
+        // Only the pool-closed branch leaves it unset, and giveBack() retires
+        // the slot there without an idle mark.
+        long idleMarkNanos = 0L;
         int pendingRowsAtRetire = 0;
         try {
             // live(), not delegate(): re-validate the generation right before
@@ -257,8 +258,7 @@ public final class PooledSender implements Sender {
                     // Pool shutting down: ship here so a failure reaches the caller.
                     delegate.flush();
                 } else {
-                    nowNanos = System.nanoTime();
-                    ship(pool, delegate, nowNanos);
+                    idleMarkNanos = ship(pool, delegate);
                 }
                 recycle = true;
             } catch (RuntimeException e) {
@@ -283,6 +283,9 @@ public final class PooledSender implements Sender {
                     droppedLeaseRows = pendingBeforeRollback - delegate.pendingRowCount();
                     delegate.flush();
                     slot.markCommitted(delegate.rowsAppended());
+                    // ship() returned no reading: the probe or the ship threw.
+                    // Read the clock after the retry's flush, which can block.
+                    idleMarkNanos = System.nanoTime();
                     capRejection = (BatchTooLargeForCapException) failure;
                     failure = null;
                     recycle = true;
@@ -292,7 +295,7 @@ public final class PooledSender implements Sender {
             }
         } finally {
             if (recycle) {
-                pool.giveBack(this, nowNanos);
+                pool.giveBack(this, idleMarkNanos);
             } else {
                 // The probe, the cancel or the ship threw: the delegate has
                 // latched an error, the flush failed, or the generation went
@@ -653,20 +656,26 @@ public final class PooledSender implements Sender {
      *       oldest row is older than {@code auto_flush_interval} or another
      *       auto-flush threshold trips.</li>
      * </ul>
-     * Reads no clock: {@code nowNanos} is the release's one reading, which the
-     * commit window, the age threshold and the slot's idle mark share.
+     * Reads the clock once, after {@code publishPending()}: in full-dictionary
+     * mode the publish is a flush that can block under ring backpressure, so a
+     * reading taken before it would predate the release. The commit window and
+     * the age threshold use that reading.
+     *
+     * @return the reading, which the pool stamps as the slot's idle mark
      */
-    private void ship(SenderPool pool, Sender delegate, long nowNanos) {
+    private long ship(SenderPool pool, Sender delegate) {
         delegate.publishPending();
+        long nowNanos = System.nanoTime();
         if (pool.hasCommitWindow()) {
             boolean closes = slot.windowCloses(delegate.rowsAppended(), delegate.hasDeferredFrames(),
                     nowNanos, pool.commitRows(), pool.commitIntervalNanos());
             if (closes) {
                 delegate.flush();
                 slot.markCommitted(delegate.rowsAppended());
-                return;
+                return nowNanos;
             }
         }
         delegate.autoFlushIfDue(nowNanos);
+        return nowNanos;
     }
 }

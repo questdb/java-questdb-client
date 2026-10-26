@@ -510,6 +510,71 @@ public class SenderPoolSettleTest {
         }
     }
 
+    @Test
+    public void testCapRetryAfterARetainedRejectionStampsAFreshIdleMark() throws Exception {
+        List<RecordingSender> built = new ArrayList<>();
+        try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(1, 1, built)) {
+            try (Sender s = pool.borrow()) {
+                s.table("t").longColumn("v", 1L).atNow();
+            }
+            RecordingSender delegate = built.get(0);
+            Sender lease = pool.borrow();
+            lease.table("t").longColumn("v", 2L).atNow();
+            // An auto-flush during the lease retained a cap rejection: the probe
+            // rethrows it before the release ships anything.
+            delegate.latchedError = new BatchTooLargeForCapException("single table batch too large for server batch cap");
+            long before = System.nanoTime();
+            try {
+                lease.close();
+                Assert.fail("close() must report the rows of this lease it dropped");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains("dropped 1 row(s) of this lease"));
+            }
+            long after = System.nanoTime();
+            delegate.latchedError = null;
+            Assert.assertEquals("the slot stays in service", 1, pool.availableSize());
+            Assert.assertEquals("the retry ships the row left behind", 1, delegate.flushCount.get());
+            long idleSince = idleSinceOf(pool);
+            Assert.assertTrue("the recycle stamps a reading taken during close(): " + before + " <= " + idleSince + " <= " + after,
+                    before <= idleSince && idleSince <= after);
+        }
+    }
+
+    @Test
+    public void testReleaseReadsTheClockAfterThePublish() throws Exception {
+        List<RecordingSender> built = new ArrayList<>();
+        try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(1, 1, built)) {
+            // an earlier lease leaves a row behind; this release appends nothing
+            try (Sender s = pool.borrow()) {
+                s.table("t").longColumn("v", 1L).atNow();
+            }
+            RecordingSender delegate = built.get(0);
+            delegate.autoFlushDue = true;
+            Sender lease = pool.borrow();
+            // A publish that blocks, like a full-dictionary flush under ring backpressure.
+            CountDownLatch publishGate = new CountDownLatch(1);
+            delegate.publishGate = publishGate;
+            Thread releaser = new Thread(() -> {
+                try {
+                    Thread.sleep(20);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                publishGate.countDown();
+            }, "publish-releaser");
+            releaser.start();
+            lease.close();
+            releaser.join(2_000);
+            Assert.assertFalse(releaser.isAlive());
+            Assert.assertEquals(1, delegate.flushCount.get());
+            long idleSince = idleSinceOf(pool);
+            Assert.assertEquals("the age check and the idle mark share one reading",
+                    delegate.lastAutoFlushNowNanos, idleSince);
+            Assert.assertTrue("the reading follows the publish: " + delegate.lastPublishEndNanos + " <= " + idleSince,
+                    delegate.lastPublishEndNanos <= idleSince);
+        }
+    }
+
     @SuppressWarnings("unchecked")
     private static long idleSinceOf(SenderPool pool) throws Exception {
         Field availableF = SenderPool.class.getDeclaredField("available");
