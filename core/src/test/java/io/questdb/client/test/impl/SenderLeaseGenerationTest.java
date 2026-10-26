@@ -44,8 +44,10 @@ import java.util.ArrayDeque;
  * it under the pool lock so a stale close/write is dropped.
  * <p>
  * Reaches package-private internals by reflection (same white-box style as the
- * other tests here); {@code SenderSlot} is constructed with a {@code null}
- * delegate, which the paths under test never dereference.
+ * other tests here); {@code SenderSlot} is constructed around an in-memory
+ * {@link RecordingSender}, since the {@code PooledSender} constructor reads the
+ * delegate's {@code rowsAppended()}. The paths under test write nothing through
+ * the delegate.
  */
 public class SenderLeaseGenerationTest {
 
@@ -81,7 +83,7 @@ public class SenderLeaseGenerationTest {
                     /*idleTimeoutMillis*/ Long.MAX_VALUE,
                     /*maxLifetimeMillis*/ Long.MAX_VALUE)) {
                 ArrayDeque<Object> available = (ArrayDeque<Object>) availableF.get(pool);
-                Object slot = slotCtor.newInstance(null, pool, -1);
+                Object slot = slotCtor.newInstance(new RecordingSender(), pool, -1);
 
                 // borrow #1 stamps generation 1; lease A captures 1.
                 bump.invoke(slot);
@@ -135,7 +137,7 @@ public class SenderLeaseGenerationTest {
                     PooledSender.class.getDeclaredConstructor(slotClass, long.class);
             leaseCtor.setAccessible(true);
 
-            Object slot = slotCtor.newInstance(null, null, -1);
+            Object slot = slotCtor.newInstance(new RecordingSender(), null, -1);
             bump.invoke(slot); // generation -> 1, lease A captures 1
             PooledSender leaseA = leaseCtor.newInstance(slot, 1L);
             bump.invoke(slot); // released
