@@ -48,10 +48,22 @@ public final class CursorSendCounters {
     public final AtomicLong acks = new AtomicLong();
     /** Producer appends that hit a full ring and parked; {@code CursorSendEngine#getTotalBackpressureStalls()}. */
     public final AtomicLong backpressureStalls = new AtomicLong();
+    /** Commit-only frames the send loop synthesised to close a quiet commit-window group. */
+    public final AtomicLong commitFramesSynthesised = new AtomicLong();
+    /** Commit-window members the send loop sent with {@code FLAG_DEFER_COMMIT}. */
+    public final AtomicLong framesDeferred = new AtomicLong();
     /** Frames re-sent inside post-reconnect catch-up windows. */
     public final AtomicLong framesReplayed = new AtomicLong();
     /** Binary frames issued to the wire, replays included. */
     public final AtomicLong framesSent = new AtomicLong();
+    /** Commit-window groups the age bound closed. */
+    public final AtomicLong groupsClosedByAge = new AtomicLong();
+    /** Commit-window groups an unmarked committing frame closed. */
+    public final AtomicLong groupsClosedByFrame = new AtomicLong();
+    /** Commit-window groups the row bound closed. */
+    public final AtomicLong groupsClosedByRows = new AtomicLong();
+    /** Commit-window groups a close request closed. */
+    public final AtomicLong groupsClosedOnDemand = new AtomicLong();
     /** Reconnect attempts, failed and successful alike. */
     public final AtomicLong reconnectAttempts = new AtomicLong();
     /** Successful reconnects. */
@@ -68,8 +80,14 @@ public final class CursorSendCounters {
     public void addAll(CursorSendCounters other) {
         acks.addAndGet(other.acks.get());
         backpressureStalls.addAndGet(other.backpressureStalls.get());
+        commitFramesSynthesised.addAndGet(other.commitFramesSynthesised.get());
+        framesDeferred.addAndGet(other.framesDeferred.get());
         framesReplayed.addAndGet(other.framesReplayed.get());
         framesSent.addAndGet(other.framesSent.get());
+        groupsClosedByAge.addAndGet(other.groupsClosedByAge.get());
+        groupsClosedByFrame.addAndGet(other.groupsClosedByFrame.get());
+        groupsClosedByRows.addAndGet(other.groupsClosedByRows.get());
+        groupsClosedOnDemand.addAndGet(other.groupsClosedOnDemand.get());
         reconnectAttempts.addAndGet(other.reconnectAttempts.get());
         reconnects.addAndGet(other.reconnects.get());
         serverErrors.addAndGet(other.serverErrors.get());

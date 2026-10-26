@@ -66,8 +66,9 @@ import java.util.concurrent.locks.LockSupport;
  *       binary frame to the server.</li>
  *   <li>Polls the WebSocket for server ACK frames; on each ACK with
  *       cumulative wire sequence {@code N}, calls
- *       {@code engine.acknowledge(fsnAtZero + N)} so the segment manager
- *       can trim fully-acked segments.</li>
+ *       {@code engine.acknowledge(fsnAtZero + N - S)}, where {@code S} counts
+ *       the commit-only frames the loop synthesised at or below {@code N}, so
+ *       the segment manager can trim fully-acked segments.</li>
  *   <li>On wire failure, runs the configured reconnect policy: capped
  *       exponential backoff with jitter, retried indefinitely (Invariant B --
  *       a store-and-forward drainer never gives up on a wall-clock budget).
@@ -272,7 +273,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * Throttle "reconnect attempt N failed" WARN logs to one per 5 s.
      */
     private static final long RECONNECT_LOG_THROTTLE_NANOS = 5_000_000_000L;
-    // Size of wireScratchAddr: one QWP header (12 bytes), rounded up.
+    // The commit-only frame trySendGroupCommit synthesises: a 12-byte QWP header
+    // and an empty delta section [0][0].
+    private static final int SYNTHETIC_COMMIT_SIZE = QwpConstants.HEADER_SIZE + 2;
+    // Size of wireScratchAddr: one QWP header (12 bytes) or one synthesised
+    // commit (14 bytes), rounded up.
     private static final int WIRE_SCRATCH_SIZE = 16;
     // Test seam: when true, recovery mirror seeding throws immediately AFTER
     // ensureSentDictCapacity has grown (and therefore taken ownership of) the mirror,
@@ -308,6 +313,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // user-facing 5-minute default is applied at the config layer.
     private final long catchUpCapGapMinEscalationWindowNanos;
     private final CatchUpCapGapPolicy catchUpCapGapPolicy;
+    // The commit window: bounds and close requests from the producer side, the
+    // open group from the I/O thread. See CommitWindow and wireFlagsFor.
+    private final CommitWindow commitWindow = new CommitWindow();
     private final CursorSendEngine engine;
     private final long parkNanos;
     private final ReconnectPolicy reconnectPolicy;
@@ -335,10 +343,19 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private final WebSocketResponse response = new WebSocketResponse();
     private final ResponseHandler responseHandler = new ResponseHandler();
     private final CountDownLatch shutdownLatch = new CountDownLatch(1);
+    // Wire sequences of the commit-only frames this connection synthesised:
+    // they take a wire sequence but no FSN, so every wire-sequence-to-FSN
+    // translation goes through fsnOfWireSeq / nextFsnToSend. Cleared per
+    // connection with the wire baseline. I/O thread only.
+    private final SyntheticWireSeqs syntheticWireSeqs = new SyntheticWireSeqs();
     // Counters for observability of the durable-ack path. Both are zero
     // when durableAckMode is false.
     private final AtomicLong totalDurableAcks = new AtomicLong();
     private final AtomicLong totalDurableTrimAdvances = new AtomicLong();
+    // First FSN the commit window may defer: frames published before this loop
+    // was constructed are recovered from an earlier session and go out as
+    // stored, committing.
+    private final long windowFloorFsn;
     // Sender-lifetime observability counters: acks, frames sent/replayed,
     // reconnect attempts and successes, server errors. A fresh instance per
     // loop by default; QwpWebSocketSender hands every loop generation its own
@@ -834,6 +851,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         }
         this.client = client;
         this.engine = engine;
+        this.windowFloorFsn = engine.publishedFsn() + 1L;
         this.hasReplayDictionaryDependency = engine.isDeltaDictEnabled()
                 || engine.recoveredMaxSymbolDeltaStart() > 0L;
         // Recovery / orphan-drain: the loop starts with a fresh in-memory mirror,
@@ -1606,6 +1624,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * Commit-only frames this loop synthesised to close a quiet commit-window
+     * group (see {@link #setCommitWindow}).
+     */
+    public long getTotalCommitFramesSynthesised() {
+        return counters.commitFramesSynthesised.get();
+    }
+
+    /**
      * Total {@code STATUS_DURABLE_ACK} frames received since the loop started.
      * Always 0 when {@code durableAckMode} is false. Useful for confirming
      * the server is actually emitting durable acks under load.
@@ -1626,6 +1652,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * Commit-window members sent with {@code FLAG_DEFER_COMMIT}, their commit
+     * left to a later frame of their group.
+     */
+    public long getTotalFramesDeferred() {
+        return counters.framesDeferred.get();
+    }
+
+    /**
      * Cumulative count of frames re-sent during post-reconnect catch-up
      * windows. One increment per replayed frame. Zero in steady state; a
      * sustained nonzero rate signals flapping where every reconnect replays
@@ -1637,6 +1671,36 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
 
     public long getTotalFramesSent() {
         return counters.framesSent.get();
+    }
+
+    /**
+     * Commit-window groups the age bound closed, at a member's send or with a
+     * synthesised commit.
+     */
+    public long getTotalGroupsClosedByAge() {
+        return counters.groupsClosedByAge.get();
+    }
+
+    /**
+     * Commit-window groups an unmarked committing frame closed: an auto-flush
+     * inside a lease, a flush with rows, a commit message.
+     */
+    public long getTotalGroupsClosedByFrame() {
+        return counters.groupsClosedByFrame.get();
+    }
+
+    /**
+     * Commit-window groups whose members reached the row bound.
+     */
+    public long getTotalGroupsClosedByRows() {
+        return counters.groupsClosedByRows.get();
+    }
+
+    /**
+     * Commit-window groups a {@link #requestGroupClose} closed.
+     */
+    public long getTotalGroupsClosedOnDemand() {
+        return counters.groupsClosedOnDemand.get();
     }
 
     /**
@@ -1715,6 +1779,17 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * Asks the I/O thread to commit every frame up to {@code throughFsn}
+     * (engine-relative) without waiting for the window bounds: the open group
+     * closes once the loop has sent that frame, with the frame itself when it is
+     * a window member, otherwise with a synthesised commit. Callable from the
+     * producer thread and from any thread that waits for acks.
+     */
+    public void requestGroupClose(long throughFsn) {
+        commitWindow.requestCloseThrough(throughFsn);
+    }
+
+    /**
      * Replaces this loop's counters with the sender's shared, sender-lifetime
      * instance, folding anything already counted into it. Must run before
      * {@link #start()}: the I/O thread reads the field after start()'s
@@ -1734,6 +1809,20 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         }
         shared.addAll(counters);
         counters = shared;
+    }
+
+    /**
+     * Sets the commit-window bounds: the I/O thread sends the frames the sender
+     * marked with {@link QwpConstants#FLAG_WINDOW_MEMBER} deferred, so the
+     * server commits them together, until their group reaches {@code rows}
+     * rows or its first member is {@code intervalMillis} old. 0 disables a
+     * bound; both 0 disables the window and members go out committing. Callable
+     * from any thread, also while the loop runs. Durable-ack mode never defers.
+     *
+     * @throws IllegalArgumentException if a bound is negative
+     */
+    public void setCommitWindow(int rows, long intervalMillis) {
+        commitWindow.configure(rows, intervalMillis);
     }
 
     /**
@@ -2519,7 +2608,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             releasePendingEntry(pendingDurable.pollFirst());
         }
         if (highest != Long.MIN_VALUE) {
-            long fsn = fsnAtZero + highest;
+            long fsn = fsnOfWireSeq(highest);
             if (engine.acknowledge(fsn)) {
                 totalDurableTrimAdvances.incrementAndGet();
                 dispatchProgress(fsn);
@@ -2670,8 +2759,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             // keepalive clock here rather than pinging on the first idle pass.
             lastFrameOrPingNanos = System.nanoTime();
             while (running) {
+                // 1. Try to send the next frame; with none to send, close a
+                //    quiet commit-window group.
                 boolean didWork = trySendOne();
-                // 1. Try to send next frame(s).
+                if (!didWork && running) {
+                    didWork = trySendGroupCommit();
+                }
                 // 2. Try to receive ACKs.
                 if (tryReceiveAcks()) {
                     didWork = true;
@@ -2937,7 +3030,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      */
     private void snapshotReplayTarget() {
         if (hasEverConnected && nextWireSeq > 0L) {
-            long lastSentFsn = fsnAtZero + (nextWireSeq - 1L);
+            long lastSentFsn = fsnOfWireSeq(nextWireSeq - 1L);
             if (lastSentFsn > replayTargetFsn) {
                 replayTargetFsn = lastSentFsn;
             }
@@ -3015,6 +3108,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // handleServerRejection can tell "only the catch-up went out" from "the
         // head data frame went out".
         dataFrameSentThisConnection = false;
+        // The server rolled back whatever the previous connection left open, and
+        // the fresh connection's wire sequences restart, so the open group and the
+        // synthesised-commit sequences start over too. Every frame below
+        // replayStart is acked, which is what the window counts as committed.
+        syntheticWireSeqs.clear();
+        commitWindow.resetForConnection(replayStart - 1L);
         // Do not gate solely on isDeltaDictEnabled(): a recovered delta slot can
         // lose access to its side-file while its on-disk frames still start above
         // zero. hasReplayDictionaryDependency preserves that distinction while
@@ -3031,6 +3130,59 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             this.fsnAtZero = replayStart;
             this.nextWireSeq = 0L;
         }
+    }
+
+    /**
+     * Row count of the first table of a QWP frame, read past the frame's delta
+     * symbol section and the table name. Returns -1 when the frame is not QWP,
+     * carries no table, is zstd-compressed, or is truncated before the row
+     * count. The commit window's row bound counts a member by this number, so a
+     * member of several tables counts its first table only.
+     */
+    static long firstTableRowCount(long payloadAddr, int payloadLen) {
+        if (payloadLen < QwpConstants.HEADER_SIZE
+                || Unsafe.getUnsafe().getInt(payloadAddr) != QwpConstants.MAGIC_MESSAGE) {
+            return -1L;
+        }
+        int flags = Unsafe.getUnsafe().getByte(payloadAddr + QwpConstants.HEADER_OFFSET_FLAGS) & 0xFF;
+        if ((flags & QwpConstants.FLAG_ZSTD) != 0 || Unsafe.getUnsafe().getShort(payloadAddr + 6) == 0) {
+            return -1L;
+        }
+        long limit = payloadAddr + payloadLen;
+        long p = payloadAddr + QwpConstants.HEADER_SIZE;
+        long encoded;
+        if ((flags & QwpConstants.FLAG_DELTA_SYMBOL_DICT) != 0) {
+            encoded = readVarintAt(p, limit); // delta start id
+            if (encoded < 0L) {
+                return -1L;
+            }
+            p += encoded & 7L;
+            encoded = readVarintAt(p, limit); // delta count
+            if (encoded < 0L) {
+                return -1L;
+            }
+            p += encoded & 7L;
+            for (long i = 0, n = encoded >>> 3; i < n; i++) {
+                encoded = readVarintAt(p, limit); // [len varint][utf8]
+                if (encoded < 0L) {
+                    return -1L;
+                }
+                p += (encoded & 7L) + (encoded >>> 3);
+                if (p > limit) {
+                    return -1L;
+                }
+            }
+        }
+        encoded = readVarintAt(p, limit); // table name: [len varint][utf8]
+        if (encoded < 0L) {
+            return -1L;
+        }
+        p += (encoded & 7L) + (encoded >>> 3);
+        if (p > limit) {
+            return -1L;
+        }
+        encoded = readVarintAt(p, limit); // row count
+        return encoded < 0L ? -1L : encoded >>> 3;
     }
 
     /**
@@ -3605,6 +3757,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     @TestOnly
+    public static long firstTableRowCountForTest(long payloadAddr, int payloadLen) {
+        return firstTableRowCount(payloadAddr, payloadLen);
+    }
+
+    @TestOnly
     public void positionCursorForStartForTest() {
         positionCursorForStart();
     }
@@ -3641,6 +3798,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     @TestOnly
     public void setNextWireSeqForTest(long value) {
         nextWireSeq = value;
+        syntheticWireSeqs.clear();
     }
 
     @TestOnly
@@ -3656,6 +3814,26 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     @TestOnly
     public boolean trySendOneForTest() {
         return trySendOne();
+    }
+
+    // Counts a commit-window group close by its cause; NONE and DEFERRED count nothing here.
+    private void countClose(int closeCode) {
+        switch (closeCode) {
+            case CommitWindow.CLOSED_BY_AGE:
+                counters.groupsClosedByAge.incrementAndGet();
+                break;
+            case CommitWindow.CLOSED_BY_DEMAND:
+                counters.groupsClosedOnDemand.incrementAndGet();
+                break;
+            case CommitWindow.CLOSED_BY_FRAME:
+                counters.groupsClosedByFrame.incrementAndGet();
+                break;
+            case CommitWindow.CLOSED_BY_ROWS:
+                counters.groupsClosedByRows.incrementAndGet();
+                break;
+            default:
+                break;
+        }
     }
 
     private void ensureCatchUpFrameCapacity(int required) {
@@ -3691,6 +3869,23 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * The FSN a wire sequence of this connection stands for. A synthesised
+     * commit stands for the last ring frame sent before it, so acking it acks
+     * that frame. Exact only for a sequence above the last trimmed
+     * acknowledgement, which every caller passes.
+     */
+    private long fsnOfWireSeq(long wireSeq) {
+        return fsnAtZero + wireSeq - syntheticWireSeqs.countAtOrBelow(wireSeq);
+    }
+
+    /**
+     * The FSN of the next ring frame this connection sends.
+     */
+    private long nextFsnToSend() {
+        return fsnAtZero + nextWireSeq - syntheticWireSeqs.total();
+    }
+
+    /**
      * Sends one ring frame. With {@code wireFlags < 0} the frame goes out as
      * stored. Otherwise the frame's 12-byte QWP header is copied to the wire
      * scratch with {@code wireFlags} as its flags byte, and the frame goes out as
@@ -3707,11 +3902,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             client.sendBinary(frameAddr, payloadLen);
             return;
         }
-        long scratch = wireScratchAddr;
-        if (scratch == 0L) {
-            scratch = Unsafe.malloc(WIRE_SCRATCH_SIZE, MemoryTag.NATIVE_DEFAULT);
-            wireScratchAddr = scratch;
-        }
+        long scratch = wireScratch();
         Unsafe.getUnsafe().copyMemory(frameAddr, scratch, QwpConstants.HEADER_SIZE);
         Unsafe.getUnsafe().putByte(scratch + QwpConstants.HEADER_OFFSET_FLAGS, (byte) wireFlags);
         client.sendBinary(
@@ -3720,25 +3911,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 frameAddr + QwpConstants.HEADER_SIZE,
                 payloadLen - QwpConstants.HEADER_SIZE
         );
-    }
-
-    /**
-     * The flags byte a ring frame goes out with when it must differ from the
-     * stored one: a QWP frame (magic checked as in {@link #isDeltaFrame}) that
-     * carries the client-internal {@link QwpConstants#FLAG_WINDOW_MEMBER} goes out
-     * with that bit cleared. Returns -1 for every other frame, which goes out as
-     * stored.
-     */
-    private static int strippedWireFlags(long frameAddr, int payloadLen) {
-        if (payloadLen < QwpConstants.HEADER_SIZE
-                || Unsafe.getUnsafe().getInt(frameAddr) != QwpConstants.MAGIC_MESSAGE) {
-            return -1;
-        }
-        int flags = Unsafe.getUnsafe().getByte(frameAddr + QwpConstants.HEADER_OFFSET_FLAGS) & 0xFF;
-        if ((flags & QwpConstants.FLAG_WINDOW_MEMBER) == 0) {
-            return -1;
-        }
-        return flags & ~QwpConstants.FLAG_WINDOW_MEMBER;
     }
 
     private boolean tryReceiveAcks() {
@@ -3754,12 +3926,59 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * Closes a quiet commit-window group: once its age bound has passed, or a
+     * close request covers the last frame sent, and no stored deferred frame
+     * (a split release's leading frame, a dictionary chunk) holds it open, sends
+     * a 14-byte commit-only frame that commits the group. The frame takes a wire
+     * sequence but no FSN (see {@link #fsnOfWireSeq}). Called when
+     * {@link #trySendOne} found nothing to send.
+     *
+     * @return true if a commit went out
+     */
+    private boolean trySendGroupCommit() {
+        if (!commitWindow.isGroupOpen()) {
+            return false;
+        }
+        long nowNanos = System.nanoTime();
+        int closeCode = commitWindow.pollQuiet(nowNanos, nextFsnToSend() - 1L);
+        if (closeCode == CommitWindow.NONE) {
+            return false;
+        }
+        long frame = wireScratch();
+        Unsafe.getUnsafe().putByte(frame, (byte) 'Q');
+        Unsafe.getUnsafe().putByte(frame + 1, (byte) 'W');
+        Unsafe.getUnsafe().putByte(frame + 2, (byte) 'P');
+        Unsafe.getUnsafe().putByte(frame + 3, (byte) '1');
+        Unsafe.getUnsafe().putByte(frame + 4, (byte) client.getServerQwpVersion());
+        Unsafe.getUnsafe().putByte(frame + QwpConstants.HEADER_OFFSET_FLAGS,
+                (byte) (QwpConstants.FLAG_GORILLA | QwpConstants.FLAG_DELTA_SYMBOL_DICT));
+        Unsafe.getUnsafe().putShort(frame + 6, (short) 0); // tableCount
+        Unsafe.getUnsafe().putInt(frame + 8, SYNTHETIC_COMMIT_SIZE - QwpConstants.HEADER_SIZE);
+        // An empty delta section: start id 0, count 0. It registers no symbol.
+        Unsafe.getUnsafe().putByte(frame + QwpConstants.HEADER_SIZE, (byte) 0);
+        Unsafe.getUnsafe().putByte(frame + QwpConstants.HEADER_SIZE + 1, (byte) 0);
+        try {
+            client.sendBinary(frame, SYNTHETIC_COMMIT_SIZE);
+        } catch (Throwable t) {
+            fail(t);
+            return false;
+        }
+        syntheticWireSeqs.add(nextWireSeq);
+        nextWireSeq++;
+        counters.framesSent.incrementAndGet();
+        counters.commitFramesSynthesised.incrementAndGet();
+        countClose(closeCode);
+        lastFrameOrPingNanos = nowNanos;
+        return true;
+    }
+
+    /**
      * Returns true if at least one frame was sent (caller skips the park).
      * Bounded: sends at most one frame per call so the ACK side gets
      * scheduling fairness.
      */
     private boolean trySendOne() {
-        if (orphanSkipTipFsn >= 0 && fsnAtZero + nextWireSeq >= orphanSkipStartFsn) {
+        if (orphanSkipTipFsn >= 0 && nextFsnToSend() >= orphanSkipStartFsn) {
             // The send cursor reached the orphaned deferred tail. Its frames
             // belong to an aborted transaction and must never be transmitted
             // (a commit-bearing frame from this session would commit them --
@@ -3873,8 +4092,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                             + sentDictCount + "; cannot replay without corrupting data -- resend required"));
             return false;
         }
+        long fsnSent = nextFsnToSend();
+        // One clock read per frame: the commit window's age bound and the idle
+        // keepalive both take it.
+        long nowNanos = System.nanoTime();
         try {
-            sendRingFrame(frameAddr, payloadLen, strippedWireFlags(frameAddr, payloadLen));
+            sendRingFrame(frameAddr, payloadLen, wireFlagsFor(frameAddr, payloadLen, fsnSent, nowNanos));
         } catch (Throwable t) {
             fail(t);
             return false;
@@ -3896,9 +4119,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             // perfectly from id 0.
             accumulateSentDict(frameAddr, payloadLen, deltaStart);
         }
-        lastFrameOrPingNanos = System.nanoTime();
+        lastFrameOrPingNanos = nowNanos;
         sendOffset = frameEnd;
-        long fsnSent = fsnAtZero + nextWireSeq;
         nextWireSeq++;
         counters.framesSent.incrementAndGet();
         if (replayTargetFsn >= 0) {
@@ -3908,6 +4130,67 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             }
         }
         return true;
+    }
+
+    /**
+     * The flags byte ring frame {@code fsn} goes out with, or -1 to send it as
+     * stored, and the frame's step through the commit window. Every ring frame
+     * the loop sends passes here exactly once per send, so the window sees
+     * recovered, replayed and stored-deferred frames as well as members.
+     * <ul>
+     *   <li>A frame without {@link QwpConstants#FLAG_WINDOW_MEMBER} goes out as
+     *       stored; a committing one closes the open group.</li>
+     *   <li>A marked frame goes out with the marker cleared. It is deferred, with
+     *       {@code FLAG_DEFER_COMMIT} set, only when the window is active, the
+     *       loop is not in durable-ack mode, the frame was stored committing,
+     *       was published after this loop was constructed, lies past the replay
+     *       range, has a first table whose row count parses, and the window does
+     *       not close its group with it. Otherwise it goes out committing.</li>
+     * </ul>
+     * A self-contained decision per frame: it reads only the frame and the
+     * loop's own state, so a batched send can call it for each frame it packs.
+     */
+    private int wireFlagsFor(long frameAddr, int payloadLen, long fsn, long nowNanos) {
+        if (payloadLen < QwpConstants.HEADER_SIZE
+                || Unsafe.getUnsafe().getInt(frameAddr) != QwpConstants.MAGIC_MESSAGE) {
+            countClose(commitWindow.onUnmarked(fsn, false));
+            return -1;
+        }
+        int flags = Unsafe.getUnsafe().getByte(frameAddr + QwpConstants.HEADER_OFFSET_FLAGS) & 0xFF;
+        boolean isStoredDeferred = (flags & QwpConstants.FLAG_DEFER_COMMIT) != 0;
+        if ((flags & QwpConstants.FLAG_WINDOW_MEMBER) == 0) {
+            countClose(commitWindow.onUnmarked(fsn, isStoredDeferred));
+            return -1;
+        }
+        int wireFlags = flags & ~QwpConstants.FLAG_WINDOW_MEMBER;
+        long rows = -1L;
+        if (!isStoredDeferred
+                && !durableAckMode
+                && commitWindow.isActive()
+                && fsn >= windowFloorFsn
+                && (replayTargetFsn < 0 || fsn > replayTargetFsn)) {
+            rows = firstTableRowCount(frameAddr, payloadLen);
+        }
+        if (rows < 0) {
+            countClose(commitWindow.onUnmarked(fsn, isStoredDeferred));
+            return wireFlags;
+        }
+        int verdict = commitWindow.onMember(fsn, rows, nowNanos);
+        if (verdict == CommitWindow.DEFERRED) {
+            counters.framesDeferred.incrementAndGet();
+            return wireFlags | QwpConstants.FLAG_DEFER_COMMIT;
+        }
+        countClose(verdict);
+        return wireFlags;
+    }
+
+    private long wireScratch() {
+        long scratch = wireScratchAddr;
+        if (scratch == 0L) {
+            scratch = Unsafe.malloc(WIRE_SCRATCH_SIZE, MemoryTag.NATIVE_DEFAULT);
+            wireScratchAddr = scratch;
+        }
+        return scratch;
     }
 
     /**
@@ -4254,7 +4537,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                             wireSeq, highestSent);
                 }
                 counters.acks.incrementAndGet();
-                long okFsn = fsnAtZero + capped;
+                long okFsn = fsnOfWireSeq(capped);
                 if (okFsn > highestOkFsn) {
                     highestOkFsn = okFsn;
                 }
@@ -4286,9 +4569,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     drainPendingDurable();
                     return;
                 }
-                if (engine.acknowledge(fsnAtZero + capped)) {
-                    dispatchProgress(fsnAtZero + capped);
+                if (engine.acknowledge(okFsn)) {
+                    dispatchProgress(okFsn);
                 }
+                // Acks are cumulative, so no later translation needs a sequence at
+                // or below this one: the synthesised commits it covers fold into a
+                // count. Durable-ack mode never synthesises a commit, and its
+                // queued OKs still translate sequences below this one.
+                syntheticWireSeqs.trimThrough(capped);
                 return;
             }
             if (response.isDurableAck()) {
@@ -4461,7 +4749,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 LOG.warn("server NACK wire seq {} outside sent range [0, {}], clamping",
                         wireSeq, highestSent);
             }
-            long fsn = fsnAtZero + cappedSeq;
+            long fsn = fsnOfWireSeq(cappedSeq);
             if (fsn <= engine.ackedFsn()) {
                 // The clamped wire seq maps at or below the replay head, so this
                 // NACK is for a dictionary catch-up frame -- which occupies the

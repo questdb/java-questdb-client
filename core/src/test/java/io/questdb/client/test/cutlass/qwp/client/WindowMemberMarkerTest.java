@@ -52,7 +52,7 @@ public class WindowMemberMarkerTest {
 
     @Test
     public void testAutoFlushInsideTheLeaseIsNotMarked() throws Exception {
-        withSender("auto_flush_rows=2;", 0, (s, log) -> {
+        withSender("auto_flush_rows=2;auto_flush_interval=60000;", 0, (s, log) -> {
             s.setCommitWindow(1000, 100);
             for (int i = 0; i < 3; i++) {
                 row(s, "t", i);
@@ -85,8 +85,8 @@ public class WindowMemberMarkerTest {
 
             log.awaitDataFrames(1, 5_000);
             byte[] wire = firstDataFrame(log);
-            Assert.assertEquals("the marker never reaches the wire",
-                    0, wire[QwpConstants.HEADER_OFFSET_FLAGS] & MARKER);
+            Assert.assertEquals("the member goes out deferred and the marker never reaches the wire",
+                    (ringFlags(s, 0) & ~MARKER) | DEFER, wire[QwpConstants.HEADER_OFFSET_FLAGS] & 0xFF);
         });
     }
 
@@ -104,7 +104,7 @@ public class WindowMemberMarkerTest {
         // auto_flush_bytes=off: the default byte trigger (90 percent of the
         // advertised cap) would ship table t1 before the release, and the batch
         // would never reach the split.
-        withSender("auto_flush_bytes=off;", 4 * 1024, (s, log) -> {
+        withSender("auto_flush_bytes=off;auto_flush_interval=60000;", 4 * 1024, (s, log) -> {
             s.setCommitWindow(1000, 100);
             String pad = new String(new char[100]).replace('\0', 'x');
             for (int i = 0; i < 30; i++) {
@@ -129,7 +129,7 @@ public class WindowMemberMarkerTest {
 
     @Test
     public void testTransactionalSenderIsNeverMarked() throws Exception {
-        withSender("transaction=on;", 0, (s, log) -> {
+        withSender("transaction=on;auto_flush_interval=60000;", 0, (s, log) -> {
             s.setCommitWindow(1000, 100);
             for (int i = 0; i < 3; i++) {
                 row(s, "t", i);

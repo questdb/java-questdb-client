@@ -129,8 +129,9 @@ public final class CommitWindow {
         return close;
     }
 
-    public void requestCloseThrough(long fsn) {
-        // a single producer per sender calls this, so the check-then-write is safe
+    public synchronized void requestCloseThrough(long fsn) {
+        // The producer and a thread waiting for acks may both ask; the lock keeps
+        // the request monotonic. The I/O thread only reads the volatile.
         if (fsn > closeRequestFsn) {
             closeRequestFsn = fsn;
         }

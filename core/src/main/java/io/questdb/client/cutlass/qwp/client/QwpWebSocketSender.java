@@ -1591,6 +1591,8 @@ public class QwpWebSocketSender implements Sender {
         if (getAckedFsn() >= targetFsn) {
             return true;
         }
+        // An open commit window holds back the acks of its members; commit them now.
+        requestWindowClose();
         if (timeoutMillis <= 0L) {
             return false;
         }
@@ -1946,6 +1948,10 @@ public class QwpWebSocketSender implements Sender {
                 if (cursorSendLoop != null && !terminalOwnedByCustomHandler) {
                     cursorSendLoop.checkUnsurfacedError();
                 }
+                // An open commit window holds back the acks the drain below
+                // waits for, so commit its members now. Only the sender does
+                // this: the loop's own close() stops the I/O thread at once.
+                requestWindowClose();
                 // 3) Bounded drain: block until the server has ACK'd
                 //    everything we just published, or until the
                 //    configured timeout elapses. closeFlushTimeoutMillis
@@ -2998,6 +3004,15 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Commit-only frames the I/O loop synthesised since this sender started, each
+     * closing a quiet commit-window group (see {@link #setCommitWindow}).
+     * Sender-lifetime, like the other counters.
+     */
+    public long getTotalCommitFramesSynthesised() {
+        return counters.commitFramesSynthesised.get();
+    }
+
+    /**
      * Number of {@link SenderConnectionEvent} notifications delivered to the
      * user listener since this sender started. Counts every delivery attempt,
      * including those where the listener threw.
@@ -3019,6 +3034,15 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Commit-window members the I/O loop sent deferred since this sender
+     * started, their commit left to a later frame of their group (see
+     * {@link #setCommitWindow}). Sender-lifetime, like the other counters.
+     */
+    public long getTotalFramesDeferred() {
+        return counters.framesDeferred.get();
+    }
+
+    /**
      * Count of frames re-sent during post-reconnect catch-up windows since
      * this sender started. Zero in steady state; a sustained nonzero rate
      * signals flapping where every reconnect replays meaningful work.
@@ -3036,6 +3060,41 @@ public class QwpWebSocketSender implements Sender {
      */
     public long getTotalFramesSent() {
         return counters.framesSent.get();
+    }
+
+    /**
+     * Commit-window groups the age bound closed since this sender started (see
+     * {@link #setCommitWindow}). Sender-lifetime, like the other counters.
+     */
+    public long getTotalGroupsClosedByAge() {
+        return counters.groupsClosedByAge.get();
+    }
+
+    /**
+     * Commit-window groups an unmarked committing frame closed since this sender
+     * started: an auto-flush inside a lease, a flush with rows, a commit
+     * message. Sender-lifetime, like the other counters.
+     */
+    public long getTotalGroupsClosedByFrame() {
+        return counters.groupsClosedByFrame.get();
+    }
+
+    /**
+     * Commit-window groups whose members reached the row bound since this
+     * sender started. Sender-lifetime, like the other counters.
+     */
+    public long getTotalGroupsClosedByRows() {
+        return counters.groupsClosedByRows.get();
+    }
+
+    /**
+     * Commit-window groups a close request closed since this sender started: a
+     * rowless flush, a drain or an ack wait, close(), or a symbol-dictionary
+     * recycle waiting for a drained ring. Sender-lifetime, like the other
+     * counters.
+     */
+    public long getTotalGroupsClosedOnDemand() {
+        return counters.groupsClosedOnDemand.get();
     }
 
     /**
@@ -3380,6 +3439,8 @@ public class QwpWebSocketSender implements Sender {
      * its members carry {@code rows} rows or its first member is
      * {@code intervalMillis} old. 0 disables that bound; both 0 disables the
      * window, and {@link #flushAsWindowMember()} then behaves as {@link #flush()}.
+     * A live I/O loop applies them at once, and a loop built later (the first
+     * connect, a symbol-dictionary recycle) starts with them.
      *
      * @throws IllegalArgumentException if a bound is negative
      */
@@ -3390,6 +3451,10 @@ public class QwpWebSocketSender implements Sender {
         }
         this.commitWindowRows = rows;
         this.commitWindowIntervalMillis = intervalMillis;
+        CursorWebSocketSendLoop loop = cursorSendLoop;
+        if (loop != null) {
+            loop.setCommitWindow(rows, intervalMillis);
+        }
     }
 
     @Override
@@ -5336,6 +5401,7 @@ public class QwpWebSocketSender implements Sender {
             }
             cursorSendLoop.setErrorDispatcher(errorDispatcher);
             cursorSendLoop.setKeepaliveIntervalMillis(keepaliveIntervalMillis);
+            cursorSendLoop.setCommitWindow(commitWindowRows, commitWindowIntervalMillis);
             // Symmetric progress dispatcher: lazy-allocated mirror of the
             // error path. Wired before start() for the same reason -- the
             // I/O thread should never observe a null dispatcher between
@@ -5486,6 +5552,11 @@ public class QwpWebSocketSender implements Sender {
                 // before its ack and memory-mode data could be lost on exit.
                 lastCommitBoundaryFsn = cursorEngine.publishedFsn();
             }
+        }
+        if (!isWindowMember) {
+            // A flush commits what it ships, and a rowless one still commits the
+            // members an open window holds back.
+            requestWindowClose();
         }
         cursorSendLoop.checkError();
         checkConnectionError();
@@ -6399,6 +6470,10 @@ public class QwpWebSocketSender implements Sender {
         if (isRingDrained()) {
             recycleForDictReset();
         } else {
+            // A rows-only commit window could hold the ring undrained forever;
+            // commit its members so a later barrier, or the starvation wait,
+            // finds it drained.
+            requestWindowClose();
             maybeBlockForStarvedReset();
         }
     }
@@ -6432,6 +6507,23 @@ public class QwpWebSocketSender implements Sender {
         if (lock != null) {
             recycleSlotLock = null;
             lock.close();
+        }
+    }
+
+    /**
+     * Asks the I/O loop to commit every frame published so far, closing an open
+     * commit-window group without waiting for its bounds. Called wherever the
+     * caller is about to wait for acks or for a drained ring. A no-op without a
+     * window. Snapshots the loop and engine volatiles, which a recycle swaps.
+     */
+    private void requestWindowClose() {
+        if (commitWindowRows <= 0 && commitWindowIntervalMillis <= 0) {
+            return;
+        }
+        CursorWebSocketSendLoop loop = cursorSendLoop;
+        CursorSendEngine engine = cursorEngine;
+        if (loop != null && engine != null) {
+            loop.requestGroupClose(engine.publishedFsn());
         }
     }
 

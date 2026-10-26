@@ -51,8 +51,10 @@ import java.util.Set;
  *   <li>any other frame commits the open transaction plus itself and yields
  *       {@code ACK(seq)}, unless that ack is delayed.</li>
  * </ul>
- * Opening a connection rolls back the open transaction of every earlier one, as a
- * server does when the previous socket dies.
+ * The model assumes a single live connection at a time, the way one sender
+ * uses the server: {@link #openConnection()} rolls back the open transaction of
+ * every earlier connection, as a server does when the previous socket dies, so
+ * two connections that interleave frames do not model two concurrent senders.
  * <p>
  * Thread-safe: an I/O thread and a test thread may use one model at once. The
  * returned lists are snapshots.
