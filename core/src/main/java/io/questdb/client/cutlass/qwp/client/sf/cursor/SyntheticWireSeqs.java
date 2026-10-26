@@ -34,7 +34,9 @@ import org.jetbrains.annotations.TestOnly;
  * the loop subtracts the count of such sequences at or below an acknowledged
  * wire sequence to keep the wire-sequence-to-FSN mapping exact. Sequences are
  * added in increasing order, and the entries an acknowledgement has passed
- * are trimmed while their count is kept. Used by the I/O thread only.
+ * are trimmed while their count is kept; the backing list compacts as it
+ * trims, so it stays bounded by the entries still in flight. Used by the I/O
+ * thread only.
  */
 public final class SyntheticWireSeqs {
     private final LongList seqs = new LongList();
@@ -51,6 +53,15 @@ public final class SyntheticWireSeqs {
         seqs.add(wireSeq);
         size++;
         lastSeq = wireSeq;
+    }
+
+    /**
+     * Entries the backing list holds: the retained ones plus trimmed ones not
+     * yet compacted away.
+     */
+    @TestOnly
+    public int backingSize() {
+        return size;
     }
 
     public void clear() {
@@ -94,6 +105,20 @@ public final class SyntheticWireSeqs {
             seqs.clear();
             head = 0;
             size = 0;
+        } else if (head >= size - head) {
+            // An ack can always find the next synthesised commit in flight, so the
+            // list may never empty. Once the trimmed prefix is at least as long as
+            // the live tail, move the tail to the front: amortised O(1) per entry,
+            // and the backing list stays within twice the live count.
+            // LongList.clear() keeps the backing array, and copying forward never
+            // overwrites an entry before it is read.
+            int live = size - head;
+            seqs.clear();
+            for (int i = 0; i < live; i++) {
+                seqs.add(seqs.getQuick(head + i));
+            }
+            head = 0;
+            size = live;
         }
     }
 }

@@ -28,6 +28,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.SyntheticWireSeqs;
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
 public class SyntheticWireSeqsTest {
 
@@ -62,6 +63,30 @@ public class SyntheticWireSeqsTest {
     }
 
     @Test
+    public void testCompactionKeepsCountsExact() {
+        SyntheticWireSeqs s = new SyntheticWireSeqs();
+        for (long seq = 1; seq <= 6; seq++) {
+            s.add(seq);
+        }
+        s.trimThrough(3);
+        assertEquals(3, s.retained());
+        assertEquals("half trimmed: the live entries move to the front", 3, s.backingSize());
+        assertEquals(3, s.countAtOrBelow(3));
+        assertEquals(4, s.countAtOrBelow(4));
+        assertEquals(5, s.countAtOrBelow(5));
+        assertEquals(6, s.countAtOrBelow(6));
+        assertEquals(6, s.total());
+        s.add(7);
+        assertEquals(7, s.countAtOrBelow(7));
+        assertEquals(7, s.total());
+        try {
+            s.add(7);
+            org.junit.Assert.fail();
+        } catch (IllegalStateException expected) {
+        }
+    }
+
+    @Test
     public void testCountsSynthesisedSeqsAtOrBelow() {
         SyntheticWireSeqs s = new SyntheticWireSeqs();
         s.add(3);
@@ -72,6 +97,24 @@ public class SyntheticWireSeqsTest {
         assertEquals(2, s.countAtOrBelow(7));
         assertEquals(2, s.countAtOrBelow(100));
         assertEquals(2, s.total());
+    }
+
+    @Test
+    public void testTrimCompactsWhileAnEntryStaysInFlight() {
+        // The next synthesised commit always goes out before the ack of the
+        // previous one arrives, so the list never empties.
+        SyntheticWireSeqs s = new SyntheticWireSeqs();
+        s.add(0);
+        for (int i = 1; i <= 10_000; i++) {
+            long newest = 3L * i;
+            s.add(newest);
+            s.trimThrough(newest - 1);
+            assertEquals(1, s.retained());
+            assertTrue("the backing list stays bounded, holds " + s.backingSize(), s.backingSize() <= 2);
+            assertEquals(i + 1, s.total());
+            assertEquals(i, s.countAtOrBelow(newest - 1));
+            assertEquals(i + 1, s.countAtOrBelow(newest));
+        }
     }
 
     @Test

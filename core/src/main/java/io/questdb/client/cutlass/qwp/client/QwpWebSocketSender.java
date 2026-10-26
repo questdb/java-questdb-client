@@ -6513,13 +6513,15 @@ public class QwpWebSocketSender implements Sender {
     /**
      * Asks the I/O loop to commit every frame published so far, closing an open
      * commit-window group without waiting for its bounds. Called wherever the
-     * caller is about to wait for acks or for a drained ring. A no-op without a
-     * window. Snapshots the loop and engine volatiles, which a recycle swaps.
+     * caller is about to wait for acks or for a drained ring. Not gated on the
+     * current bounds: a window disabled after its members went out deferred
+     * still leaves their group open, and only this request closes it. Without
+     * window members the request changes nothing on the I/O thread, so a
+     * sender that never had a window pays one uncontended lock per call.
+     * Snapshots the loop and engine volatiles, which a recycle swaps; may run
+     * on a thread waiting for acks.
      */
     private void requestWindowClose() {
-        if (commitWindowRows <= 0 && commitWindowIntervalMillis <= 0) {
-            return;
-        }
         CursorWebSocketSendLoop loop = cursorSendLoop;
         CursorSendEngine engine = cursorEngine;
         if (loop != null && engine != null) {

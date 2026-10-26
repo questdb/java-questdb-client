@@ -94,6 +94,24 @@ public class CommitWindowSenderTest {
     }
 
     @Test
+    public void testDisablingTheWindowStillClosesItsOpenGroup() throws Exception {
+        withSender((s, model) -> {
+            s.setCommitWindow(1000, 60_000);
+            row(s, 1);
+            s.flushAsWindowMember();
+            // the member must be on the wire, deferred, before the window goes away
+            awaitDataFrames(model, 1);
+            Assert.assertEquals(0, model.commits());
+            s.setCommitWindow(0, 0);
+            long start = System.nanoTime();
+            Assert.assertTrue(s.drain(5_000));
+            long millis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+            Assert.assertTrue("drain took " + millis + " ms", millis < 2_000);
+            Assert.assertEquals(1, model.commits());
+        });
+    }
+
+    @Test
     public void testDrainInsideAnOpenWindowReturnsWithinTheFlushTimeout() throws Exception {
         withSender((s, model) -> {
             s.setCommitWindow(1000, 60_000);
