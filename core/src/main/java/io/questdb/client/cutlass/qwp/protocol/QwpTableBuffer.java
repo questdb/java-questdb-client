@@ -150,6 +150,7 @@ public class QwpTableBuffer implements QuietCloseable {
         fastColumns = null;
         columnAccessCursor = 0;
         committedColumnCount = 0;
+        hasDecimalColumns = false;
         inProgressColumnCount = 0;
         isRowHeld = false;
         rowCount = 0;

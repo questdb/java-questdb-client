@@ -73,13 +73,13 @@ public class QwpOpenRecordSenderTest {
             FrameLog log = new FrameLog();
             try (TestWebSocketServer server = startServer(log);
                  Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
-                         + ";auto_flush_rows=off;auto_flush_bytes=off;auto_flush_interval=200;close_flush_timeout_millis=0;")) {
+                         + ";auto_flush_rows=off;auto_flush_bytes=off;auto_flush_interval=1000;close_flush_timeout_millis=0;")) {
                 // 17 rows appended at once; the first row's age is below the interval
                 for (int i = 1; i <= 17; i++) {
                     sender.table("t").longColumn("v", i).atNow();
                 }
                 Assert.assertEquals(17, sender.pendingRowCount());
-                Thread.sleep(500);
+                Thread.sleep(1_500);
 
                 // past 16 pending rows only every sixteenth row reads the clock
                 sender.table("t").longColumn("v", 18).atNow();
@@ -94,7 +94,7 @@ public class QwpOpenRecordSenderTest {
                 // rows 2 to 16 are always checked
                 sender.table("t").longColumn("v", 1).atNow();
                 Assert.assertEquals(1, sender.pendingRowCount());
-                Thread.sleep(500);
+                Thread.sleep(1_500);
                 sender.table("t").longColumn("v", 2).atNow();
                 Assert.assertEquals(0, sender.pendingRowCount());
 
@@ -103,10 +103,36 @@ public class QwpOpenRecordSenderTest {
                     sender.table("t").longColumn("v", i).atNow();
                 }
                 Assert.assertEquals(17, sender.pendingRowCount());
-                Thread.sleep(500);
+                Thread.sleep(1_500);
                 ((QwpWebSocketSender) sender).autoFlushIfDue();
                 Assert.assertEquals(0, sender.pendingRowCount());
                 log.awaitDataFrames(3, 5_000);
+            }
+        });
+    }
+
+    @Test
+    public void testAutoFlushIfDueShipsOnTheByteThresholdBeforeTheAgeIsDue() throws Exception {
+        assertMemoryLeak(() -> {
+            FrameLog log = new FrameLog();
+            try (TestWebSocketServer server = startServer(log);
+                 Oracle oracle = new Oracle();
+                 QwpWebSocketSender sender = (QwpWebSocketSender) Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                         + ";auto_flush_rows=off;auto_flush_bytes=1000000;auto_flush_interval=60000;close_flush_timeout_millis=0;")) {
+                QwpTableBuffer t = oracle.block("t");
+                longRow(sender, t, "v", 1);
+                longRow(sender, t, "v", 2);
+                Assert.assertEquals(2, sender.pendingRowCount());
+                // Every append checks the row and byte thresholds, so pending rows pass one
+                // only when it moves: a failover to a node with a smaller cap lowers the byte
+                // threshold to 90 percent of that cap, here below what the record holds.
+                long pendingBytes = sender.getPendingBytes();
+                sender.applyServerBatchSizeLimit((int) pendingBytes);
+                Assert.assertTrue(sender.getEffectiveAutoFlushBytes() < pendingBytes);
+                sender.autoFlushIfDue(System.nanoTime());
+                Assert.assertEquals("the byte threshold seals the record before the age is due", 0, sender.pendingRowCount());
+                log.awaitDataFrames(1, 5_000);
+                Assert.assertArrayEquals(oracle.frame(-1, false), dataFrame(log, 0));
             }
         });
     }
@@ -127,6 +153,33 @@ public class QwpOpenRecordSenderTest {
                 Assert.assertEquals("a reading past the interval seals the record", 0, sender.pendingRowCount());
                 log.awaitDataFrames(1, 5_000);
                 Assert.assertArrayEquals(oracle.frame(-1, false), dataFrame(log, 0));
+            }
+        });
+    }
+
+    @Test
+    public void testAutoFlushIfDueWithNothingPendingShipsNothing() throws Exception {
+        assertMemoryLeak(() -> {
+            FrameLog log = new FrameLog();
+            try (TestWebSocketServer server = startServer(log);
+                 Oracle first = new Oracle();
+                 Oracle second = new Oracle();
+                 Sender sender = Sender.fromConfig(config(server.getPort()))) {
+                // a reading far past any interval: with no row pending there is no age to check
+                long farFuture = System.nanoTime() + 3_600_000_000_000L;
+                sender.autoFlushIfDue(farFuture);
+                Assert.assertEquals(0, sender.pendingRowCount());
+                longRow(sender, first.block("t"), "v", 1);
+                sender.flush();
+                log.awaitDataFrames(1, 5_000);
+                sender.autoFlushIfDue(farFuture);
+                Assert.assertEquals(0, sender.pendingRowCount());
+                longRow(sender, second.block("t"), "v", 2);
+                sender.flush();
+                log.awaitDataFrames(2, 5_000);
+                Assert.assertEquals("the checks with nothing pending shipped no frame", 2, log.frames().size());
+                Assert.assertArrayEquals(first.frame(-1, false), dataFrame(log, 0));
+                Assert.assertArrayEquals(second.frame(-1, false), dataFrame(log, 1));
             }
         });
     }

@@ -1186,6 +1186,10 @@ public class QwpTableBufferTest {
                 assertTrue(table.hasDecimalColumns());
                 table.truncateColumns(before);
                 assertFalse(table.hasDecimalColumns());
+                table.getOrCreateColumn("d", QwpConstants.TYPE_DECIMAL128, true);
+                assertTrue(table.hasDecimalColumns());
+                table.clear();
+                assertFalse("clear() drops every column, the decimal ones too", table.hasDecimalColumns());
             }
         });
     }

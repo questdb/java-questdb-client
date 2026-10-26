@@ -288,7 +288,7 @@ public class QuestDBReleaseSemanticsTest {
     }
 
     @Test
-    public void testRowsOfALeaseHeldPastTheIntervalShipWithinOneSettle() throws Exception {
+    public void testRowsOfALeaseHeldPastTheIntervalStillShipAfterItsRelease() throws Exception {
         FrameLog log = new FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {
             server.start();
