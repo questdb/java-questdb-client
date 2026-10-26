@@ -55,8 +55,9 @@ import java.time.temporal.ChronoUnit;
  * commit window closes or an auto-flush threshold trips, usually the age one.
  * Without a commit window only a release whose lease appended nothing checks the
  * thresholds: each append already did. Otherwise the rows wait for a later
- * append or release, for the record to fill, or for the pool's housekeeper
- * settle. The underlying Sender is only truly closed when
+ * append or release, for the record to fill, or for a settle: the housekeeper's
+ * under a {@code QuestDB} handle, the owner's {@link SenderPool#settleIdle()}
+ * call for a pool built directly. The underlying Sender is only truly closed when
  * {@link io.questdb.client.QuestDB#close()} shuts the pool down.
  * <p>
  * Because the slot is reused across borrows, this wrapper -- not the slot --
@@ -175,16 +176,21 @@ public final class PooledSender implements Sender {
      * {@code auto_flush_interval}. Without a commit window only a release whose
      * lease appended nothing runs that check: each append already ran the
      * thresholds, the age one on a stride, so a release after appends does not run
-     * them again and reads no clock. Rows the release does not ship wait in the
-     * open record for a later append that trips a threshold, a release without
-     * rows, a {@link #flush()}, the record to fill, or the pool's housekeeper
-     * settle, which runs every {@code auto_flush_interval}. The rows of a lease
-     * that held the slot past the interval after its last append ship that way
-     * too, and stay recoverable in the ring throughout. A sender in
-     * full-dictionary mode (its slot's symbol dictionary file could not be opened
-     * or written) has no open record: its publish is a {@link Sender#flush()}, so
-     * each release ships the lease's rows in a frame of its own, which keeps them
-     * recoverable at the cost a release had before the open record.
+     * them again. Rows the release does not ship wait in the open record for a
+     * later append that trips a threshold, a release without rows, a
+     * {@link #flush()}, the record to fill, or a settle: the one a
+     * {@code QuestDB} handle's housekeeper runs every {@code auto_flush_interval},
+     * or, for a pool built directly, its owner's {@link SenderPool#settleIdle()}
+     * call. The rows of a lease that held the slot past the interval after its
+     * last append ship that way too, and stay recoverable in the ring throughout.
+     * Without a commit window a release after appends also leaves the slot's
+     * idle mark to the pool's next reap sweep, so {@code idle_timeout_ms} counts
+     * from that sweep: the slot is reaped at most one sweep (housekeeper tick)
+     * late, never early. A sender in full-dictionary mode (its slot's symbol
+     * dictionary file could not be opened or written) has no open record: its
+     * publish is a {@link Sender#flush()}, so each release ships the lease's rows
+     * in a frame of its own, which keeps them recoverable at the cost a release
+     * had before the open record.
      * {@link #reset()} on a lease discards only that lease's rows. Does not close
      * the underlying {@link Sender}; that only happens when the owning
      * {@code QuestDB} is closed. If the pool is already shutting down when this
@@ -251,10 +257,11 @@ public final class PooledSender implements Sender {
         BatchTooLargeForCapException capRejection = null;
         int droppedLeaseRows = 0;
         boolean isOpenRecordAtRetire = false;
-        // The slot's idle mark: the one ship() returns, or a fresh reading
-        // after the cap retry's flush. Every recycle into an open pool sets it.
-        // Only the pool-closed branch leaves it unset, and giveBack() retires
-        // the slot there without an idle mark.
+        // The slot's idle mark: the one ship() returns, a reading or, for a
+        // release after appends, SenderSlot.UNSTAMPED, or a fresh reading after
+        // the cap retry's flush. Every recycle into an open pool sets it. Only
+        // the pool-closed branch leaves it unset, and giveBack() retires the
+        // slot there without an idle mark.
         long idleMarkNanos = 0L;
         int pendingRowsAtRetire = 0;
         try {
@@ -536,11 +543,6 @@ public final class PooledSender implements Sender {
     }
 
     @Override
-    public long pendingBatchStartNanos() {
-        return slot.live(generation).pendingBatchStartNanos();
-    }
-
-    @Override
     public int pendingRowCount() {
         return slot.live(generation).pendingRowCount();
     }
@@ -670,9 +672,8 @@ public final class PooledSender implements Sender {
      *   <li>no commit window and the lease appended rows: nothing more. Each
      *       append ran the row and byte thresholds, and the age one on a
      *       stride, so the release does not check them again and reads no
-     *       clock: its idle mark is the pending batch's first-row stamp
-     *       ({@code pendingBatchStartNanos()}), or a fresh reading when nothing
-     *       is pending, as after a full-dictionary publish;</li>
+     *       clock: it returns {@link SenderSlot#UNSTAMPED}, which leaves the
+     *       idle mark to the next {@link SenderPool#reapIdle()} sweep;</li>
      *   <li>commit window set and closing now: {@code flush()}, which seals the
      *       record unflagged, or sends the commit message, and commits the
      *       group;</li>
@@ -685,20 +686,20 @@ public final class PooledSender implements Sender {
      * backpressure, so a reading taken before it would predate the release. The
      * commit window, the age threshold and the idle mark use that reading.
      * <p>
-     * The batch stamp can predate the lease, since the open record spans leases,
-     * and a lease that held the slot after its last append makes it older still.
-     * An idle mark that old never reaps a slot that still holds rows: the reap
-     * skips a slot with unshipped work, so the settle ships the rows before the
-     * reap can close the slot.
+     * The first reap sweep that finds an unstamped slot in the free list stamps
+     * it with the sweep's own reading instead of testing its idle time, so its
+     * idle timeout counts from that sweep: the slot is reaped at most one sweep
+     * late, and never early, however long the lease held it after its last
+     * append.
      *
-     * @return the slot's idle mark, a {@link System#nanoTime()} reading
+     * @return the slot's idle mark: a {@link System#nanoTime()} reading, or
+     * {@link SenderSlot#UNSTAMPED}
      */
     private long ship(SenderPool pool, Sender delegate) {
         delegate.publishPending();
         boolean hasCommitWindow = pool.hasCommitWindow();
         if (!hasCommitWindow && delegate.rowsAppended() != rowsAppendedAtBorrow) {
-            long batchStartNanos = delegate.pendingBatchStartNanos();
-            return batchStartNanos != 0L ? batchStartNanos : System.nanoTime();
+            return SenderSlot.UNSTAMPED;
         }
         long nowNanos = System.nanoTime();
         if (hasCommitWindow) {

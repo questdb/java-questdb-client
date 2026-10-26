@@ -3433,16 +3433,6 @@ public class QwpWebSocketSender implements Sender {
         return new ReconnectSupplier(stopFlag, "drainer stop requested during connect");
     }
 
-    /**
-     * The first pending row's stamp, which every seal and flush clears. On the
-     * open-record path the record spans pool leases, so the stamp can belong to
-     * an earlier lease's row.
-     */
-    @Override
-    public long pendingBatchStartNanos() {
-        return firstPendingRowTimeNanos;
-    }
-
     @Override
     public int pendingRowCount() {
         return recordOffset >= 0 ? record.rowCount() : pendingRowCount;
@@ -8066,10 +8056,12 @@ public class QwpWebSocketSender implements Sender {
             return true;
         }
         if (autoFlushIntervalNanos > 0) {
-            // Row 1 just stamped firstPendingRowTimeNanos (age zero). Slow producers never
-            // get past 16 pending rows and are checked on every row; fast ones overshoot
-            // the age bound by at most 16 rows' time. Every other caller passes
-            // perRow = false and always runs the age test.
+            // Row 1 just stamped firstPendingRowTimeNanos (age zero). Rows 2 to 16 read the
+            // clock on every append; past 16 pending rows only every 16th append does. A
+            // fast producer overshoots the age bound by at most 16 rows' time, but after a
+            // burst past 16 rows a slow producer's rows can wait up to 16 appends beyond it:
+            // flush(), a release without rows and the pool's settle bound that wait. Every
+            // other caller passes perRow = false and always runs the age test.
             if (perRow && (pendingRowCount == 1 || (pendingRowCount > 16 && (pendingRowCount & 15) != 0))) {
                 return false;
             }

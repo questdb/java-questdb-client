@@ -24,7 +24,6 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
-import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
@@ -365,6 +364,65 @@ public class QwpWebSocketSenderTest {
     }
 
     @Test
+    public void testFrameAgeCheckRunsOnRowsTwoToSixteenThenEverySixteenth() throws Exception {
+        // The frame-per-flush path, which only a full-dictionary engine keeps, reads the
+        // clock for the per-row age check on the same stride as the open record.
+        String sfDir = TestUtils.createTmpDir("qdb-frame-stride-");
+        try {
+            assertMemoryLeak(() -> {
+                QwpSfTestUtils.FrameLog log = new QwpSfTestUtils.FrameLog();
+                try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+                    server.start();
+                    Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                    CursorSendEngine engine = new CursorSendEngine(Paths.get(sfDir, "default").toString(),
+                            1024 * 1024, 64L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                            new UnopenableDictFacade());
+                    try (QwpWebSocketSender sender = QwpWebSocketSender.connect(
+                            "localhost", server.getPort(), null, /*autoFlushRows*/ 0, /*autoFlushBytes*/ 0,
+                            /*autoFlushIntervalNanos*/ 1_000_000_000L, null, false, engine, 0L)) {
+                        Assert.assertFalse("the engine runs in full-dictionary mode", sender.isOpenRecordMode());
+                        // 17 rows appended at once; the first row's age is below the interval
+                        for (int i = 1; i <= 17; i++) {
+                            sender.table("t").longColumn("v", i).atNow();
+                        }
+                        Assert.assertEquals(17, sender.pendingRowCount());
+                        Thread.sleep(1_500);
+
+                        // past 16 pending rows only every sixteenth row reads the clock
+                        sender.table("t").longColumn("v", 18).atNow();
+                        Assert.assertEquals(18, sender.pendingRowCount());
+                        for (int i = 19; i <= 31; i++) {
+                            sender.table("t").longColumn("v", i).atNow();
+                        }
+                        Assert.assertEquals(31, sender.pendingRowCount());
+                        sender.table("t").longColumn("v", 32).atNow();
+                        Assert.assertEquals(0, sender.pendingRowCount());
+
+                        // rows 2 to 16 are always checked
+                        sender.table("t").longColumn("v", 1).atNow();
+                        Assert.assertEquals(1, sender.pendingRowCount());
+                        Thread.sleep(1_500);
+                        sender.table("t").longColumn("v", 2).atNow();
+                        Assert.assertEquals(0, sender.pendingRowCount());
+
+                        // the release path always reads the clock
+                        for (int i = 1; i <= 17; i++) {
+                            sender.table("t").longColumn("v", i).atNow();
+                        }
+                        Assert.assertEquals(17, sender.pendingRowCount());
+                        Thread.sleep(1_500);
+                        sender.autoFlushIfDue();
+                        Assert.assertEquals(0, sender.pendingRowCount());
+                        log.awaitDataFrames(3, 5_000);
+                    }
+                }
+            });
+        } finally {
+            TestUtils.removeTmpDirRec(sfDir);
+        }
+    }
+
+    @Test
     public void testGeoHashColumnLongAfterCloseThrows() throws Exception {
         assertMemoryLeak(() -> {
             QwpWebSocketSender sender = createUnconnectedSender();
@@ -540,30 +598,6 @@ public class QwpWebSocketSenderTest {
                 Assert.fail("Expected LineSenderException");
             } catch (LineSenderException e) {
                 Assert.assertTrue(e.getMessage().contains("closed"));
-            }
-        });
-    }
-
-    @Test
-    public void testPendingBatchStartNanosFollowsThePendingBatch() throws Exception {
-        assertMemoryLeak(() -> {
-            try (TestWebSocketServer server = new TestWebSocketServer(new QwpSfTestUtils.FrameLog())) {
-                server.start();
-                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-                try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
-                        + ";auto_flush_rows=off;auto_flush_bytes=off;auto_flush_interval=60000;")) {
-                    Assert.assertEquals(0L, sender.pendingBatchStartNanos());
-                    sender.table("t").longColumn("v", 1L).atNow();
-                    long stamp = sender.pendingBatchStartNanos();
-                    Assert.assertTrue(stamp > 0L);
-                    Assert.assertTrue(stamp <= System.nanoTime());
-                    sender.table("t").longColumn("v", 2L).atNow();
-                    Assert.assertEquals("a later row keeps the first row's stamp", stamp, sender.pendingBatchStartNanos());
-                    sender.publishPending();
-                    Assert.assertEquals("the publish keeps the rows pending, and the stamp", stamp, sender.pendingBatchStartNanos());
-                    sender.flush();
-                    Assert.assertEquals(0L, sender.pendingBatchStartNanos());
-                }
             }
         });
     }

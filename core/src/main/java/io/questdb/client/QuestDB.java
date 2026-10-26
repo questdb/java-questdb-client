@@ -143,9 +143,11 @@ public interface QuestDB extends Closeable {
      * the slot. Published rows survive a later lease's {@link Sender#reset()}
      * and, with {@code sf_dir}, a crash of the process; recoverable means in the
      * client's ring, not acknowledged by the server. The release itself ships
-     * the slot's rows when an auto-flush threshold is already due (usually the
-     * oldest row older than {@code auto_flush_interval}) or when it closes the
-     * commit window. Without a commit window, a release after appends does not
+     * the slot's rows when it closes the commit window, or when an auto-flush
+     * threshold is already due (usually the oldest row older than
+     * {@code auto_flush_interval}) and the release checks the thresholds: a
+     * release whose lease appended nothing does, and so does every release with
+     * a commit window. Without a commit window, a release after appends does not
      * check the thresholds again: each append already did, the age threshold on
      * a stride. Otherwise the rows ship when a threshold trips on a later
      * append or release, at a {@link Sender#flush()}, when the slot's open
@@ -170,7 +172,11 @@ public interface QuestDB extends Closeable {
      * discards only that lease's rows. The free list is LIFO, so under steady
      * load the pool shrinks to its working set and reopens connections on a
      * burst; set {@code sender_pool_min} equal to {@code sender_pool_max} to
-     * keep every connection warm. Close-time errors are wrapped: only
+     * keep every connection warm. A connection's {@code idle_timeout_ms} counts
+     * from its last {@code close()}, or, after a {@code close()} that appended
+     * rows without a commit window, from the housekeeper's next reap tick, so
+     * such a connection is reaped at most one tick late, never early.
+     * Close-time errors are wrapped: only
      * {@code LineSenderServerException} keeps its type, so code that catches
      * another {@code LineSenderException} subclass around a pooled
      * {@code close()} must look at {@code getCause()}. A real disconnect only

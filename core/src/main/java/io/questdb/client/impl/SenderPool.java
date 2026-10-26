@@ -1777,13 +1777,15 @@ public final class SenderPool implements AutoCloseable {
     }
 
     /**
-     * Returns the lease's slot to the free set, its idle mark stamped with
-     * {@code nowNanos}. While the pool shuts down, retires the slot instead.
+     * Returns the lease's slot to the free set, its idle mark set to
+     * {@code idleMarkNanos}. While the pool shuts down, retires the slot instead.
      *
-     * @param nowNanos the release's {@link System#nanoTime()} reading, the
-     *                 idle mark {@link #reapIdle()} measures the idle timeout from
+     * @param idleMarkNanos the release's {@link System#nanoTime()} reading, which
+     *                      {@link #reapIdle()} measures the idle timeout from, or
+     *                      {@code SenderSlot.UNSTAMPED} for a release that read no
+     *                      clock, which leaves the mark to the next reap sweep
      */
-    public void giveBack(PooledSender ps, long nowNanos) {
+    public void giveBack(PooledSender ps, long idleMarkNanos) {
         SenderSlot s = ps.slot();
         long gen = ps.generation();
         lock.lock();
@@ -1798,7 +1800,7 @@ public final class SenderPool implements AutoCloseable {
                     return;
                 }
                 s.bumpGeneration();
-                s.markIdleAt(nowNanos);
+                s.markIdleAt(idleMarkNanos);
                 assert !available.contains(s) : "slot already present in available deque on giveBack";
                 available.addLast(s);
                 slotReleased.signal();
@@ -2200,6 +2202,13 @@ public final class SenderPool implements AutoCloseable {
      * would drop rows a release left there, so it waits until
      * {@link #settleIdle()} ships them. Called by the {@link PoolHousekeeper}
      * on its tick.
+     * <p>
+     * A release after appends without a commit window reads no clock and leaves
+     * its slot unstamped ({@code SenderSlot.UNSTAMPED}). The sweep stamps every
+     * unstamped slot in the free list with its own reading, even with the pool
+     * at {@code minSize}, and does not test such a slot's idle time that sweep,
+     * so its idle timeout counts from the sweep: it is reaped at most one tick
+     * late, never early. The maximum lifetime still applies to it.
      */
     public void reapIdle() {
         if (closed) {
@@ -2221,10 +2230,21 @@ public final class SenderPool implements AutoCloseable {
             // finally released its flock.
             reprobeRetiredSlots();
             Iterator<SenderSlot> it = available.iterator();
-            while (it.hasNext() && all.size() > minSize) {
+            while (it.hasNext()) {
                 SenderSlot s = it.next();
-                boolean idleExpired = idleTimeoutMillis < Long.MAX_VALUE
-                        && (nowNanos - s.idleSinceNanos()) / 1_000_000L >= idleTimeoutMillis;
+                long idleSinceNanos = s.idleSinceNanos();
+                if (idleSinceNanos == SenderSlot.UNSTAMPED) {
+                    // The release read no clock: the idle timeout counts from this
+                    // sweep. Stamp with the pool at minSize too, where nothing is
+                    // reaped, so the count does not start late once the pool grows.
+                    s.markIdleAt(nowNanos);
+                }
+                if (all.size() <= minSize) {
+                    continue;
+                }
+                boolean idleExpired = idleSinceNanos != SenderSlot.UNSTAMPED
+                        && idleTimeoutMillis < Long.MAX_VALUE
+                        && (nowNanos - idleSinceNanos) / 1_000_000L >= idleTimeoutMillis;
                 boolean overAge = maxLifetimeMillis < Long.MAX_VALUE
                         && (now - s.createdAtMillis()) >= maxLifetimeMillis;
                 if ((idleExpired || overAge) && !hasUnshippedWork(s.delegate())) {

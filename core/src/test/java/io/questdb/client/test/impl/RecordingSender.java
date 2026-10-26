@@ -60,7 +60,6 @@ class RecordingSender implements Sender {
     volatile long lastPublishEndNanos;         // System.nanoTime() as the last publishPending() returned
     volatile RuntimeException latchedError;    // thrown by checkError() when set
     volatile CountDownLatch markSavepointGate; // markSavepoint() blocks on it when set
-    volatile long pendingBatchStartNanos;      // returned by pendingBatchStartNanos()
     volatile int pendingRows;
     volatile RuntimeException publishError;    // thrown by publishPending() when set
     volatile CountDownLatch publishGate;       // publishPending() blocks on it when set
@@ -249,11 +248,6 @@ class RecordingSender implements Sender {
     public void markSavepoint() {
         awaitGate(markSavepointGate, "markSavepointGate");
         savepointRows = pendingRows;
-    }
-
-    @Override
-    public long pendingBatchStartNanos() {
-        return pendingBatchStartNanos;
     }
 
     @Override

@@ -44,6 +44,10 @@ import io.questdb.client.Sender;
  */
 final class SenderSlot {
 
+    // The idle mark of a slot whose release read no clock, a release after
+    // appends without a commit window. The next SenderPool.reapIdle() sweep
+    // stamps such a slot with its own reading.
+    static final long UNSTAMPED = Long.MIN_VALUE;
     private final long createdAtMillis;
     private final Sender delegate;
     private final SenderPool pool;
@@ -67,6 +71,9 @@ final class SenderSlot {
     // longer matches. Volatile so a stale handle on another thread observes
     // the latest value without taking the pool lock.
     private volatile long generation;
+    // System.nanoTime() reading the idle timeout counts from, or UNSTAMPED.
+    // After construction only giveBack() and reapIdle() write it, under the
+    // pool lock.
     private volatile long idleSinceNanos;
 
     SenderSlot(Sender delegate, SenderPool pool, int slotIndex) {

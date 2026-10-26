@@ -292,8 +292,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * the window does not close calls it. So the rows of a lease that holds the slot past
      * {@code auto_flush_interval} after its last append do not ship at its release: they
      * ship at the next append that checks the age, at a release without rows, at a
-     * {@link #flush()}, or at the pool housekeeper's settle, which runs every
-     * {@code auto_flush_interval}. They stay recoverable in the store-and-forward ring
+     * {@link #flush()}, or at the settle that ships an idle slot's rows: a
+     * {@link QuestDB} handle's housekeeper runs it every {@code auto_flush_interval}, and
+     * a pool built directly, which has no housekeeper, runs it when its owner calls
+     * {@code settleIdle()}. They stay recoverable in the store-and-forward ring
      * throughout.
      */
     default void autoFlushIfDue() {
@@ -305,6 +307,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * release that runs the check passes the one reading it also uses for its
      * idle mark and its commit window. The default ignores the reading and runs
      * {@link #autoFlushIfDue()}.
+     * <p>
+     * The reading must come from {@link System#nanoTime()}: the age threshold
+     * subtracts the sender's own {@code nanoTime()} stamp of the oldest pending
+     * row from it, so a reading from another clock, such as
+     * {@link System#currentTimeMillis()}, makes the check flush when nothing is
+     * due or never flush at all.
      *
      * @param nowNanos the caller's {@link System#nanoTime()} reading
      */
@@ -827,22 +835,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * sender rolls back to that mark.
      */
     default void markSavepoint() {
-    }
-
-    /**
-     * The {@link System#nanoTime()} reading the sender took when it appended the
-     * first row of the pending batch, which on the WebSocket QWP transport is the
-     * open record's first row; {@code 0} when nothing is pending. A pooled release
-     * whose lease appended rows uses it as the slot's idle mark instead of reading
-     * the clock, unless the pool has a commit window. The open record spans pool
-     * leases, so the stamp can come from an earlier lease's row. Only the
-     * WebSocket QWP transport stamps its batches; other transports return
-     * {@code 0}.
-     *
-     * @return the first pending row's {@link System#nanoTime()} reading, or {@code 0}
-     */
-    default long pendingBatchStartNanos() {
-        return 0L;
     }
 
     /**
@@ -1616,6 +1608,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * <br>
          * It flushes the buffer even when the number of buffered rows is less than the value set by {@link #autoFlushRows(int)}.
          * This prevents rows from being locally buffered for too long when the rate of incoming data is low.
+         * <p>
+         * Over WebSocket an append checks the age while 2 to 16 rows are pending; past 16 pending rows only every
+         * 16th append checks it. After a burst, a slow producer's rows can therefore wait up to 16 appends beyond the
+         * interval. {@link Sender#flush()} bounds that wait, and so does the housekeeper's settle for an idle slot of a
+         * {@link QuestDB} handle's pool.
          * <p>
          * <strong>Important:</strong>This option does not cause the Sender to flush the buffer at regular intervals.
          * Auto-flushing is only triggered when calling {@link #atNow()}, {@link #at(Instant)} or {@link #at(long, ChronoUnit)}.

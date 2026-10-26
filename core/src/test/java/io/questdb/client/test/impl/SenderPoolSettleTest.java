@@ -33,6 +33,8 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.BatchTooLargeForCapException;
 import io.questdb.client.impl.PooledSender;
 import io.questdb.client.impl.SenderPool;
+import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
+import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 import org.slf4j.LoggerFactory;
@@ -62,6 +64,8 @@ public class SenderPoolSettleTest {
                 s.table("t").longColumn("v", 1L).atNow();
             }
             RecordingSender delegate = built.get(0);
+            // A release after appends leaves the idle mark to the next sweep.
+            pool.reapIdle();
             Thread.sleep(20);
             pool.reapIdle();
             Assert.assertEquals("an idle-expired slot holding rows is not reaped", 1, pool.totalSize());
@@ -576,64 +580,63 @@ public class SenderPoolSettleTest {
     }
 
     @Test
-    public void testReleaseAfterAppendsReadsNoClockAndStampsIdleFromTheBatchStart() throws Exception {
+    public void testReleaseAfterAppendsReadsNoClockAndLeavesTheSlotUnstamped() throws Exception {
         List<RecordingSender> built = new ArrayList<>();
         try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(1, 1, built)) {
             Sender lease = pool.borrow();
             RecordingSender delegate = built.get(0);
             delegate.autoFlushDue = true;                // a release that checked the age would ship here
-            delegate.pendingBatchStartNanos = 123_456L;
             lease.table("t").longColumn("v", 1L).atNow();
             lease.close();
             Assert.assertEquals("the release published the lease's row", 1, delegate.publishCount.get());
             Assert.assertEquals("each append already checked the age: the release does not", 0, delegate.flushCount.get());
             Assert.assertEquals("the release never called autoFlushIfDue(long)", 0L, delegate.lastAutoFlushNowNanos);
             Assert.assertEquals(1, delegate.pendingRowCount());
-            Assert.assertEquals("the idle mark is the pending batch's first-row stamp", 123_456L, idleSinceOf(pool));
-        }
-    }
-
-    @Test
-    public void testReleaseAfterAppendsWithNothingPendingStampsIdleNow() throws Exception {
-        List<RecordingSender> built = new ArrayList<>();
-        try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(1, 1, built)) {
-            Sender lease = pool.borrow();
-            RecordingSender delegate = built.get(0);
-            // no batch stamp, as after a publish that flushed in full-dictionary mode
-            delegate.pendingBatchStartNanos = 0L;
-            lease.table("t").longColumn("v", 1L).atNow();
+            Assert.assertEquals("the release leaves the idle mark to the next reap sweep",
+                    unstampedIdleMark(), idleSinceOf(pool));
+            // The sweep stamps the slot even at sender_pool_min, where it reaps nothing.
             long before = System.nanoTime();
-            lease.close();
+            pool.reapIdle();
             long after = System.nanoTime();
-            Assert.assertEquals("the release never called autoFlushIfDue(long)", 0L, delegate.lastAutoFlushNowNanos);
             long idleSince = idleSinceOf(pool);
-            Assert.assertTrue("the idle mark is a reading taken during close(): " + before + " <= " + idleSince + " <= " + after,
+            Assert.assertTrue("the sweep stamps its own reading: " + before + " <= " + idleSince + " <= " + after,
                     before <= idleSince && idleSince <= after);
+            Assert.assertEquals(1, pool.totalSize());
         }
     }
 
     @Test
-    public void testStaleIdleStampNeverReapsASlotWithPendingRows() throws Exception {
-        List<RecordingSender> built = new ArrayList<>();
-        try (SenderPool pool = SenderPoolCloseSemanticsTest.newPoolWithDefaults(0, 1, 50, built)) {
-            // the open record's first row went in 10 s ago, far past the 50 ms idle timeout
-            long staleStamp = System.nanoTime() - 10_000_000_000L;
-            try (Sender s = pool.borrow()) {
-                built.get(0).pendingBatchStartNanos = staleStamp;
-                s.table("t").longColumn("v", 1L).atNow();
+    public void testLeaseHeldPastTheIdleTimeoutIsNotReapedRightAfterItsRelease() throws Exception {
+        // The real sender stamps the open record's first row at its append. A lease
+        // that appends and then holds the slot past the idle timeout must not hand
+        // the reap an idle mark that old: the slot was in use moments ago.
+        TestUtils.assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
+            })) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                String config = "ws::addr=localhost:" + server.getPort()
+                        + ";auto_flush_rows=off;auto_flush_bytes=off;auto_flush_interval=60000;close_flush_timeout_millis=0;";
+                long idleTimeoutMillis = 50L;
+                try (SenderPool pool = new SenderPool(config, 0, 1, 1_000L, idleTimeoutMillis, Long.MAX_VALUE)) {
+                    Sender lease = pool.borrow();
+                    lease.table("t").longColumn("v", 1L).atNow();
+                    Thread.sleep(2 * idleTimeoutMillis);     // held past the idle timeout after its last append
+                    lease.close();
+                    Assert.assertEquals("the settle ships the lease's row", 1, pool.settleIdle());
+                    long before = System.nanoTime();
+                    pool.reapIdle();
+                    long after = System.nanoTime();
+                    Assert.assertEquals("a slot in use moments ago is not reaped", 1, pool.totalSize());
+                    long idleSince = idleSinceOf(pool);
+                    Assert.assertTrue("the sweep stamps the idle mark: " + before + " <= " + idleSince + " <= " + after,
+                            before <= idleSince && idleSince <= after);
+                    Thread.sleep(2 * idleTimeoutMillis);
+                    pool.reapIdle();
+                    Assert.assertEquals("an idle timeout after that sweep reaps the slot", 0, pool.totalSize());
+                }
             }
-            RecordingSender delegate = built.get(0);
-            Assert.assertEquals(1, delegate.pendingRowCount());
-            Assert.assertEquals("the release stamped the stale batch start as the idle mark", staleStamp, idleSinceOf(pool));
-            pool.reapIdle();
-            Assert.assertEquals("a slot holding rows is not reaped, however old its idle mark", 1, pool.totalSize());
-            Assert.assertEquals(0, delegate.closeCount.get());
-            Assert.assertEquals(1, pool.settleIdle());
-            Assert.assertEquals(0, delegate.pendingRowCount());
-            Thread.sleep(100);
-            pool.reapIdle();
-            Assert.assertEquals("the reap closes the slot once the settle shipped its rows", 0, pool.totalSize());
-        }
+        });
     }
 
     @SuppressWarnings("unchecked")
@@ -644,5 +647,11 @@ public class SenderPoolSettleTest {
         Method m = slot.getClass().getDeclaredMethod("idleSinceNanos");
         m.setAccessible(true);
         return (long) m.invoke(slot);
+    }
+
+    private static long unstampedIdleMark() throws Exception {
+        Field f = Class.forName("io.questdb.client.impl.SenderSlot").getDeclaredField("UNSTAMPED");
+        f.setAccessible(true);
+        return f.getLong(null);
     }
 }
