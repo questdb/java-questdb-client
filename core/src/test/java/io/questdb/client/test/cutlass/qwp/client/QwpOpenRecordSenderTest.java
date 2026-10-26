@@ -118,12 +118,12 @@ public class QwpOpenRecordSenderTest {
             try (TestWebSocketServer server = startServer(log);
                  Oracle oracle = new Oracle();
                  Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
-                         + ";auto_flush_bytes=off;auto_flush_rows=1000000;auto_flush_interval=200;close_flush_timeout_millis=0;")) {
+                         + ";auto_flush_bytes=off;auto_flush_rows=1000000;auto_flush_interval=60000;close_flush_timeout_millis=0;")) {
                 QwpTableBuffer t = oracle.block("t");
                 longRow(sender, t, "v", 1);
                 sender.autoFlushIfDue(System.nanoTime());
                 Assert.assertEquals("a reading younger than the interval keeps the record open", 1, sender.pendingRowCount());
-                sender.autoFlushIfDue(System.nanoTime() + 300_000_000L);
+                sender.autoFlushIfDue(System.nanoTime() + 61_000_000_000L);
                 Assert.assertEquals("a reading past the interval seals the record", 0, sender.pendingRowCount());
                 log.awaitDataFrames(1, 5_000);
                 Assert.assertArrayEquals(oracle.frame(-1, false), dataFrame(log, 0));
