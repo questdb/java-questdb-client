@@ -266,6 +266,13 @@ public class QwpWebSocketSender implements Sender {
     // it, a flush seals it into a frame.
     private final QwoRecordWriter record = new QwoRecordWriter();
     private final IntList splitFrameBodyBytes = new IntList();
+    // Every buffer in tableBuffers, in creation order, so markSavepoint(), reset(),
+    // resetToSavepoint(), rollbackRecordToPublished() and the decimal-scale unbind at
+    // seal walk a plain list instead of probing the hash map per table. Appended
+    // wherever a buffer is created, cleared with tableBuffers at close. The frame path's
+    // collectNonEmptyTables() and totalBufferedBytes() stay on key order, which fixes the
+    // table order inside a frame.
+    private final ObjList<QwpTableBuffer> tableBufferList = new ObjList<>();
     private final CharSequenceObjHashMap<QwpTableBuffer> tableBuffers;
     // null means plain text (no TLS)
     private final ClientTlsConfiguration tlsConfig;
@@ -2061,6 +2068,7 @@ public class QwpWebSocketSender implements Sender {
                 }
             }
             tableBuffers.clear();
+            tableBufferList.clear();
         } catch (Throwable t) {
             LOG.error("Error closing encoder or table buffers: {}", String.valueOf(t));
             terminalError = captureCloseError(terminalError, t);
@@ -2886,6 +2894,7 @@ public class QwpWebSocketSender implements Sender {
         if (buffer == null) {
             buffer = new QwpTableBuffer(tableName, this);
             tableBuffers.put(tableName, buffer);
+            tableBufferList.add(buffer);
         }
         currentTableBuffer = buffer;
         currentTableBufferSnapshotBytes = buffer.getBufferedBytes();
@@ -3390,12 +3399,8 @@ public class QwpWebSocketSender implements Sender {
             }
             return;
         }
-        ObjList<CharSequence> keys = tableBuffers.keys();
-        for (int i = 0, n = keys.size(); i < n; i++) {
-            QwpTableBuffer buf = tableBuffers.get(keys.getQuick(i));
-            if (buf != null) {
-                buf.markSavepoint();
-            }
+        for (int i = 0, n = tableBufferList.size(); i < n; i++) {
+            tableBufferList.getQuick(i).markSavepoint();
         }
         savepointBatchMaxSymbolId = currentBatchMaxSymbolId;
         savepointPendingRowCount = pendingRowCount;
@@ -3532,12 +3537,8 @@ public class QwpWebSocketSender implements Sender {
             return;
         }
         // Reset ALL table buffers, not just the current one
-        ObjList<CharSequence> keys = tableBuffers.keys();
-        for (int i = 0, n = keys.size(); i < n; i++) {
-            QwpTableBuffer buf = tableBuffers.get(keys.getQuick(i));
-            if (buf != null) {
-                buf.reset();
-            }
+        for (int i = 0, n = tableBufferList.size(); i < n; i++) {
+            tableBufferList.getQuick(i).reset();
         }
         discardPendingBatchState();
     }
@@ -3584,12 +3585,8 @@ public class QwpWebSocketSender implements Sender {
         // buffer's mark sits at "no rows, server-known columns", so the rollback
         // drops the column definitions the lease created that the server has not
         // seen, which reset() would keep and ship null-padded.
-        ObjList<CharSequence> keys = tableBuffers.keys();
-        for (int i = 0, n = keys.size(); i < n; i++) {
-            QwpTableBuffer buf = tableBuffers.get(keys.getQuick(i));
-            if (buf != null) {
-                buf.rollbackToSavepoint();
-            }
+        for (int i = 0, n = tableBufferList.size(); i < n; i++) {
+            tableBufferList.getQuick(i).rollbackToSavepoint();
         }
         if (savepointPendingRowCount == 0) {
             // No rows before the mark, or a flush since emptied it: every pending
@@ -4073,6 +4070,7 @@ public class QwpWebSocketSender implements Sender {
             currentTableName = tableName.toString();
             currentTableBuffer = new QwpTableBuffer(currentTableName, this);
             tableBuffers.put(currentTableName, currentTableBuffer);
+            tableBufferList.add(currentTableBuffer);
         }
         // Re-snap so sendRow()'s delta math is anchored to this table's
         // current byte count. The prior current table's bytes already match
@@ -7577,10 +7575,9 @@ public class QwpWebSocketSender implements Sender {
      * seal. GEOHASH precision stays. One pass over the table buffers per seal.
      */
     private void resetDecimalScalesAfterSeal() {
-        ObjList<CharSequence> keys = tableBuffers.keys();
-        for (int i = 0, n = keys.size(); i < n; i++) {
-            QwpTableBuffer buf = tableBuffers.get(keys.getQuick(i));
-            if (buf != null && buf.getRowCount() == 0 && !buf.hasInProgressRow()) {
+        for (int i = 0, n = tableBufferList.size(); i < n; i++) {
+            QwpTableBuffer buf = tableBufferList.getQuick(i);
+            if (buf.hasDecimalColumns() && buf.getRowCount() == 0 && !buf.hasInProgressRow()) {
                 buf.resetDecimalScales();
             }
         }
@@ -7776,14 +7773,11 @@ public class QwpWebSocketSender implements Sender {
             record.rollback();
         }
         long epoch = record.epoch();
-        ObjList<CharSequence> keys = tableBuffers.keys();
-        for (int i = 0, n = keys.size(); i < n; i++) {
-            QwpTableBuffer buf = tableBuffers.get(keys.getQuick(i));
-            if (buf != null) {
-                int block = buf.qwoBlock();
-                boolean hasPublishedBlock = isOpen && buf.qwoEpoch() == epoch && block >= 0 && block < record.blockCount();
-                buf.truncateColumns(hasPublishedBlock ? record.blockColumnCount(block) : 0);
-            }
+        for (int i = 0, n = tableBufferList.size(); i < n; i++) {
+            QwpTableBuffer buf = tableBufferList.getQuick(i);
+            int block = buf.qwoBlock();
+            boolean hasPublishedBlock = isOpen && buf.qwoEpoch() == epoch && block >= 0 && block < record.blockCount();
+            buf.truncateColumns(hasPublishedBlock ? record.blockColumnCount(block) : 0);
         }
         int keptDictEndId = isOpen ? record.committedDictEndId() : sentMaxSymbolId;
         currentBatchMaxSymbolId = keptDictEndId;

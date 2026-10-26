@@ -70,6 +70,7 @@ public class QwpTableBuffer implements QuietCloseable {
     private boolean columnDefsCacheValid;
     private int committedColumnCount; // columns that existed at last nextRow()
     private ColumnBuffer[] fastColumns; // plain array for O(1) sequential access
+    private boolean hasDecimalColumns; // any column is DECIMAL64/128/256
     // held* arrays: holdBackLastRow() captures each column's state before the
     // last committed row here; while isRowHeld is set, the column writer encodes
     // only the rows before the held one.
@@ -337,6 +338,14 @@ public class QwpTableBuffer implements QuietCloseable {
      */
     public String getTableName() {
         return tableName;
+    }
+
+    /**
+     * Returns true while any column is of type DECIMAL64, DECIMAL128 or DECIMAL256,
+     * i.e. while {@link #resetDecimalScales()} has a scale to unbind.
+     */
+    public boolean hasDecimalColumns() {
+        return hasDecimalColumns;
     }
 
     /**
@@ -706,6 +715,10 @@ public class QwpTableBuffer implements QuietCloseable {
         }
     }
 
+    private static boolean isDecimalType(byte type) {
+        return type == TYPE_DECIMAL64 || type == TYPE_DECIMAL128 || type == TYPE_DECIMAL256;
+    }
+
     private ColumnBuffer createColumn(CharSequence name, byte type, boolean useNullBitmap) {
         if (columns.size() >= MAX_COLUMNS_PER_TABLE) {
             throw new LineSenderException("column count exceeds maximum: " + (columns.size() + 1) +
@@ -729,6 +742,9 @@ public class QwpTableBuffer implements QuietCloseable {
                 fastColumns = newArr;
             }
             fastColumns[index] = col;
+            if (isDecimalType(type)) {
+                hasDecimalColumns = true;
+            }
             // Pre-pad with nulls for already-committed rows so the next
             // value the caller adds lands at the correct row position.
             for (int r = 0; r < rowCount; r++) {
@@ -793,12 +809,15 @@ public class QwpTableBuffer implements QuietCloseable {
             Arrays.fill(fastColumns, null);
         }
 
+        boolean isDecimalFound = false;
         for (int i = 0; i < columnCount; i++) {
             ColumnBuffer col = columns.getQuick(i);
             col.index = i;
             fastColumns[i] = col;
             columnNameToIndex.put(col.name, i);
+            isDecimalFound |= isDecimalType(col.type);
         }
+        hasDecimalColumns = isDecimalFound;
 
         columnDefsCacheValid = false;
         cachedColumnDefs = null;

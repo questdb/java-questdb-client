@@ -1175,6 +1175,22 @@ public class QwpTableBufferTest {
     }
 
     @Test
+    public void testHasDecimalColumnsFollowsTheSchema() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                assertFalse(table.hasDecimalColumns());
+                table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, true);
+                assertFalse(table.hasDecimalColumns());
+                int before = table.getColumnCount();
+                table.getOrCreateColumn("d", QwpConstants.TYPE_DECIMAL64, true);
+                assertTrue(table.hasDecimalColumns());
+                table.truncateColumns(before);
+                assertFalse(table.hasDecimalColumns());
+            }
+        });
+    }
+
+    @Test
     public void testHoldBackLastRowGrowsPastTheInitialColumnCapacity() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpTableBuffer both = new QwpTableBuffer("t");

@@ -348,6 +348,31 @@ public class QwpOpenRecordSenderTest {
     }
 
     @Test
+    public void testDecimalScalesUnbindAtSealAcrossTables() throws Exception {
+        assertMemoryLeak(() -> {
+            FrameLog log = new FrameLog();
+            try (TestWebSocketServer server = startServer(log);
+                 Oracle first = new Oracle();
+                 Oracle second = new Oracle();
+                 Sender sender = Sender.fromConfig(config(server.getPort()))) {
+                decimalRow(sender, first.block("a"), Decimal64.fromLong(105, 1), 1);
+                longRow(sender, first.block("b"), "v", 2);
+                decimalRow(sender, first.block("c"), Decimal64.fromLong(205, 1), 3);
+                sender.flush();
+                log.awaitDataFrames(1, 5_000);
+                Assert.assertArrayEquals(first.frame(-1, false), dataFrame(log, 0));
+                // the seal unbound the scales of both decimal tables, so scale 2 binds without rescaling
+                decimalRow(sender, second.block("a"), Decimal64.fromLong(1025, 2), 4);
+                longRow(sender, second.block("b"), "v", 5);
+                decimalRow(sender, second.block("c"), Decimal64.fromLong(2025, 2), 6);
+                sender.flush();
+                log.awaitDataFrames(2, 5_000);
+                Assert.assertArrayEquals(second.frame(-1, false), dataFrame(log, 1));
+            }
+        });
+    }
+
+    @Test
     public void testFlushDeferredCarriesTheFlagAndFlushCommits() throws Exception {
         assertMemoryLeak(() -> {
             FrameLog log = new FrameLog();
