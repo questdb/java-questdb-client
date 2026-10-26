@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
@@ -539,6 +540,30 @@ public class QwpWebSocketSenderTest {
                 Assert.fail("Expected LineSenderException");
             } catch (LineSenderException e) {
                 Assert.assertTrue(e.getMessage().contains("closed"));
+            }
+        });
+    }
+
+    @Test
+    public void testPendingBatchStartNanosFollowsThePendingBatch() throws Exception {
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = new TestWebSocketServer(new QwpSfTestUtils.FrameLog())) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                        + ";auto_flush_rows=off;auto_flush_bytes=off;auto_flush_interval=60000;")) {
+                    Assert.assertEquals(0L, sender.pendingBatchStartNanos());
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    long stamp = sender.pendingBatchStartNanos();
+                    Assert.assertTrue(stamp > 0L);
+                    Assert.assertTrue(stamp <= System.nanoTime());
+                    sender.table("t").longColumn("v", 2L).atNow();
+                    Assert.assertEquals("a later row keeps the first row's stamp", stamp, sender.pendingBatchStartNanos());
+                    sender.publishPending();
+                    Assert.assertEquals("the publish keeps the rows pending, and the stamp", stamp, sender.pendingBatchStartNanos());
+                    sender.flush();
+                    Assert.assertEquals(0L, sender.pendingBatchStartNanos());
+                }
             }
         });
     }

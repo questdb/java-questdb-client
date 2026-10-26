@@ -575,6 +575,67 @@ public class SenderPoolSettleTest {
         }
     }
 
+    @Test
+    public void testReleaseAfterAppendsReadsNoClockAndStampsIdleFromTheBatchStart() throws Exception {
+        List<RecordingSender> built = new ArrayList<>();
+        try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(1, 1, built)) {
+            Sender lease = pool.borrow();
+            RecordingSender delegate = built.get(0);
+            delegate.autoFlushDue = true;                // a release that checked the age would ship here
+            delegate.pendingBatchStartNanos = 123_456L;
+            lease.table("t").longColumn("v", 1L).atNow();
+            lease.close();
+            Assert.assertEquals("the release published the lease's row", 1, delegate.publishCount.get());
+            Assert.assertEquals("each append already checked the age: the release does not", 0, delegate.flushCount.get());
+            Assert.assertEquals("the release never called autoFlushIfDue(long)", 0L, delegate.lastAutoFlushNowNanos);
+            Assert.assertEquals(1, delegate.pendingRowCount());
+            Assert.assertEquals("the idle mark is the pending batch's first-row stamp", 123_456L, idleSinceOf(pool));
+        }
+    }
+
+    @Test
+    public void testReleaseAfterAppendsWithNothingPendingStampsIdleNow() throws Exception {
+        List<RecordingSender> built = new ArrayList<>();
+        try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(1, 1, built)) {
+            Sender lease = pool.borrow();
+            RecordingSender delegate = built.get(0);
+            // no batch stamp, as after a publish that flushed in full-dictionary mode
+            delegate.pendingBatchStartNanos = 0L;
+            lease.table("t").longColumn("v", 1L).atNow();
+            long before = System.nanoTime();
+            lease.close();
+            long after = System.nanoTime();
+            Assert.assertEquals("the release never called autoFlushIfDue(long)", 0L, delegate.lastAutoFlushNowNanos);
+            long idleSince = idleSinceOf(pool);
+            Assert.assertTrue("the idle mark is a reading taken during close(): " + before + " <= " + idleSince + " <= " + after,
+                    before <= idleSince && idleSince <= after);
+        }
+    }
+
+    @Test
+    public void testStaleIdleStampNeverReapsASlotWithPendingRows() throws Exception {
+        List<RecordingSender> built = new ArrayList<>();
+        try (SenderPool pool = SenderPoolCloseSemanticsTest.newPoolWithDefaults(0, 1, 50, built)) {
+            // the open record's first row went in 10 s ago, far past the 50 ms idle timeout
+            long staleStamp = System.nanoTime() - 10_000_000_000L;
+            try (Sender s = pool.borrow()) {
+                built.get(0).pendingBatchStartNanos = staleStamp;
+                s.table("t").longColumn("v", 1L).atNow();
+            }
+            RecordingSender delegate = built.get(0);
+            Assert.assertEquals(1, delegate.pendingRowCount());
+            Assert.assertEquals("the release stamped the stale batch start as the idle mark", staleStamp, idleSinceOf(pool));
+            pool.reapIdle();
+            Assert.assertEquals("a slot holding rows is not reaped, however old its idle mark", 1, pool.totalSize());
+            Assert.assertEquals(0, delegate.closeCount.get());
+            Assert.assertEquals(1, pool.settleIdle());
+            Assert.assertEquals(0, delegate.pendingRowCount());
+            Thread.sleep(100);
+            pool.reapIdle();
+            Assert.assertEquals("the reap closes the slot once the settle shipped its rows", 0, pool.totalSize());
+        }
+    }
+
     @SuppressWarnings("unchecked")
     private static long idleSinceOf(SenderPool pool) throws Exception {
         Field availableF = SenderPool.class.getDeclaredField("available");

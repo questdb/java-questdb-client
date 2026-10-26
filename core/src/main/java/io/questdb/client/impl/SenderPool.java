@@ -104,13 +104,14 @@ import java.util.function.IntFunction;
  * <p>
  * <b>Released rows.</b> A lease's {@link PooledSender#close()} publishes its
  * rows into the slot's open record without shipping them, unless a threshold
- * or the commit window ships them at that release; a delegate in
- * full-dictionary mode flushes them at every release. A {@code QuestDB}
- * handle's housekeeper ships what idle slots still hold
- * ({@link #settleIdle()}). A pool built directly has no housekeeper: released
- * rows ship at a later append or release whose threshold trips or that closes
- * the commit window, at a lease's {@code flush()}, at a {@link #settleIdle()}
- * call of the owner, or at {@link #close()}.
+ * or the commit window ships them at that release; without a commit window
+ * only a release whose lease appended nothing checks the thresholds, since
+ * each append already did. A delegate in full-dictionary mode flushes them at
+ * every release. A {@code QuestDB} handle's housekeeper ships what idle slots
+ * still hold ({@link #settleIdle()}). A pool built directly has no
+ * housekeeper: released rows ship at a later append or release whose threshold
+ * trips or that closes the commit window, at a lease's {@code flush()}, at a
+ * {@link #settleIdle()} call of the owner, or at {@link #close()}.
  */
 public final class SenderPool implements AutoCloseable {
 

@@ -145,18 +145,23 @@ public interface QuestDB extends Closeable {
      * client's ring, not acknowledged by the server. The release itself ships
      * the slot's rows when an auto-flush threshold is already due (usually the
      * oldest row older than {@code auto_flush_interval}) or when it closes the
-     * commit window. Otherwise the rows ship when a threshold trips on a later
-     * append or release, when the slot's open record fills, when a later
-     * release closes the commit window, or when the housekeeper settles the
-     * idle slot, within about one {@code auto_flush_interval} of it going idle.
-     * A lease that holds the slot without appending or closing holds those rows
-     * back until it does. Call {@link Sender#flush()} to ship now and
-     * {@link Sender#drain(long)} to wait for the server. A sender in
-     * full-dictionary mode (its slot's symbol dictionary file could not be
-     * opened or written) has no open record: its {@code close()} ships the
-     * lease's rows in a frame of their own, which keeps them recoverable at the
-     * cost of one frame per close. That frame carries no defer-commit flag, so
-     * the server commits it and a commit window groups nothing on such a slot.
+     * commit window. Without a commit window, a release after appends does not
+     * check the thresholds again: each append already did, the age threshold on
+     * a stride. Otherwise the rows ship when a threshold trips on a later
+     * append or release, at a {@link Sender#flush()}, when the slot's open
+     * record fills, when a later release closes the commit window, or when the
+     * housekeeper settles the idle slot, which it does every
+     * {@code auto_flush_interval}. The rows of a lease that held the slot past
+     * {@code auto_flush_interval} after its last append ship that way too, and
+     * stay recoverable in the ring throughout. A lease that holds the slot
+     * without appending or closing holds those rows back until it does. Call
+     * {@link Sender#flush()} to ship now and {@link Sender#drain(long)} to wait
+     * for the server. A sender in full-dictionary mode (its slot's symbol
+     * dictionary file could not be opened or written) has no open record: its
+     * {@code close()} ships the lease's rows in a frame of their own, which keeps
+     * them recoverable at the cost of one frame per close. That frame carries no
+     * defer-commit flag, so the server commits it and a commit window groups
+     * nothing on such a slot.
      * Otherwise one frame carries the rows of every lease that closed since the
      * last ship, so a server rejection of that frame discards those leases' rows
      * together; the error is logged by the error handler and thrown by a later

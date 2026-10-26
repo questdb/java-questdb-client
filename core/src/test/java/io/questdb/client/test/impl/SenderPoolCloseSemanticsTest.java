@@ -60,21 +60,25 @@ public class SenderPoolCloseSemanticsTest {
     public void testAutoFlushThrowingAtCloseRetiresSlot() {
         List<RecordingSender> built = new ArrayList<>();
         try (SenderPool pool = newPool(1, 1, built)) {
-            Sender first = pool.borrow();
+            try (Sender a = pool.borrow()) {
+                a.table("t").longColumn("v", 1L).atNow();       // left in the open record
+            }
             RecordingSender delegate = built.get(0);
+            // A release that appended nothing runs the age check: a release after
+            // appends does not, since each append already did.
+            Sender second = pool.borrow();
             LineSenderException original = new LineSenderException("auto-flush ship failed");
             delegate.autoFlushDue = true;
             delegate.flushError = original;
-            first.table("t").longColumn("v", 1L).atNow();
             try {
-                first.close();
+                second.close();
                 Assert.fail("close() must propagate the ship failure");
             } catch (LineSenderException e) {
                 Assert.assertSame(original, e.getCause());
                 // the double has no open record, so the rows are not claimed recoverable
                 Assert.assertTrue(e.getMessage(), e.getMessage().contains("slot retired with 1 row(s) not yet shipped: auto-flush ship failed"));
             }
-            Assert.assertEquals("the release published the rows before the ship failed", 1, delegate.publishCount.get());
+            Assert.assertEquals("the second release published before its ship failed", 2, delegate.publishCount.get());
             Assert.assertEquals("slot must be retired, not stranded", 0, pool.totalSize());
             Assert.assertEquals(1, delegate.closeCount.get());
         }
@@ -162,7 +166,12 @@ public class SenderPoolCloseSemanticsTest {
                 b.table("t").longColumn("v", 2L).atNow();
             }
             Assert.assertEquals(2, delegate.publishCount.get());
-            Assert.assertEquals("a due threshold ships both leases' rows at the release", 1, delegate.flushCount.get());
+            Assert.assertEquals("each append already checked the age: a release after appends only publishes",
+                    0, delegate.flushCount.get());
+            Assert.assertEquals(2, delegate.pendingRowCount());
+            pool.borrow().close();                               // a lease that appends nothing
+            Assert.assertEquals(3, delegate.publishCount.get());
+            Assert.assertEquals("a release without rows ships both leases' aged rows", 1, delegate.flushCount.get());
             Assert.assertEquals(0, delegate.pendingRowCount());
             Assert.assertEquals(1, pool.availableSize());
         }
@@ -366,14 +375,17 @@ public class SenderPoolCloseSemanticsTest {
     public void testPublishThrowingAtCloseRetiresSlot() {
         List<RecordingSender> built = new ArrayList<>();
         try (SenderPool pool = newPool(1, 1, built)) {
-            Sender first = pool.borrow();
+            try (Sender a = pool.borrow()) {
+                a.table("t").longColumn("v", 1L).atNow();       // left in the open record
+            }
             RecordingSender delegate = built.get(0);
+            // appends nothing, so a release past the publish would run the age check
+            Sender second = pool.borrow();
             LineSenderException original = new LineSenderException("publish failed");
             delegate.publishError = original;
             delegate.autoFlushDue = true;                        // a release past the publish would flush here
-            first.table("t").longColumn("v", 1L).atNow();
             try {
-                first.close();
+                second.close();
                 Assert.fail("close() must propagate the publish failure");
             } catch (LineSenderException e) {
                 Assert.assertSame(original, e.getCause());

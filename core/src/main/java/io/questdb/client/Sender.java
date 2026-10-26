@@ -281,11 +281,20 @@ public interface Sender extends Closeable, ArraySender<Sender> {
 
     /**
      * The release-time threshold check. Runs the row, byte and age thresholds every append
-     * runs and ships the pending rows when one trips. A pooled release calls it after
-     * {@link #publishPending()}, and there the age threshold is the one that usually trips:
-     * the release ships the rows leases left behind once the oldest is older than
-     * {@code auto_flush_interval}. It does nothing while a row is in progress.
-     * Only the WebSocket QWP transport implements it.
+     * runs and ships the pending rows when one trips. It does nothing while a row is in
+     * progress. Only the WebSocket QWP transport implements it.
+     * <p>
+     * A pooled release calls it after {@link #publishPending()} when its lease appended no
+     * rows, and there the age threshold is the one that usually trips: the release ships
+     * the rows earlier leases left once the oldest is older than {@code auto_flush_interval}.
+     * A release after appends does not call it, because each append already ran the row and
+     * byte thresholds, and the age one on a stride; with a commit window set, every release
+     * the window does not close calls it. So the rows of a lease that holds the slot past
+     * {@code auto_flush_interval} after its last append do not ship at its release: they
+     * ship at the next append that checks the age, at a release without rows, at a
+     * {@link #flush()}, or at the pool housekeeper's settle, which runs every
+     * {@code auto_flush_interval}. They stay recoverable in the store-and-forward ring
+     * throughout.
      */
     default void autoFlushIfDue() {
     }
@@ -293,8 +302,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     /**
      * The same check as {@link #autoFlushIfDue()}, with the caller's
      * {@link System#nanoTime()} reading as now for the age threshold. A pooled
-     * release passes the one reading it also uses for its idle mark and its
-     * commit window. The default ignores the reading and runs
+     * release that runs the check passes the one reading it also uses for its
+     * idle mark and its commit window. The default ignores the reading and runs
      * {@link #autoFlushIfDue()}.
      *
      * @param nowNanos the caller's {@link System#nanoTime()} reading
@@ -818,6 +827,22 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * sender rolls back to that mark.
      */
     default void markSavepoint() {
+    }
+
+    /**
+     * The {@link System#nanoTime()} reading the sender took when it appended the
+     * first row of the pending batch, which on the WebSocket QWP transport is the
+     * open record's first row; {@code 0} when nothing is pending. A pooled release
+     * whose lease appended rows uses it as the slot's idle mark instead of reading
+     * the clock, unless the pool has a commit window. The open record spans pool
+     * leases, so the stamp can come from an earlier lease's row. Only the
+     * WebSocket QWP transport stamps its batches; other transports return
+     * {@code 0}.
+     *
+     * @return the first pending row's {@link System#nanoTime()} reading, or {@code 0}
+     */
+    default long pendingBatchStartNanos() {
+        return 0L;
     }
 
     /**

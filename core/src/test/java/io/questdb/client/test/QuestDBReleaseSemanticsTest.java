@@ -288,6 +288,25 @@ public class QuestDBReleaseSemanticsTest {
     }
 
     @Test
+    public void testRowsOfALeaseHeldPastTheIntervalShipWithinOneSettle() throws Exception {
+        FrameLog log = new FrameLog();
+        try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            try (QuestDB db = QuestDB.connect(config(server.getPort(), "auto_flush_interval=100;housekeeper_interval_ms=60000;"))) {
+                try (Sender s = db.borrowSender()) {
+                    s.table("t").longColumn("v", 1L).atNow();
+                    // inside the lease: the housekeeper cannot reach a leased slot,
+                    // and the release after an append does not check the age again
+                    Thread.sleep(300);
+                }
+                // the settle runs every auto_flush_interval and ships the idle slot's row
+                log.awaitDataFrames(1, 5_000);
+            }
+        }
+    }
+
+    @Test
     public void testSettleShipsOnDefaultCadenceWhenIntervalUnset() throws Exception {
         FrameLog log = new FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {

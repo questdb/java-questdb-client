@@ -52,10 +52,12 @@ import java.time.temporal.ChronoUnit;
  * Behaviour difference from a raw Sender: {@link #close()} makes the lease's
  * rows recoverable and returns the slot to the pool. It publishes the rows into
  * the slot's open record without shipping them, and ships a frame only when the
- * commit window closes or an auto-flush threshold trips, usually the age one;
- * otherwise the rows wait for a later append or release, for the record to fill,
- * or for the pool's housekeeper settle. The underlying Sender is only truly
- * closed when {@link io.questdb.client.QuestDB#close()} shuts the pool down.
+ * commit window closes or an auto-flush threshold trips, usually the age one.
+ * Without a commit window only a release whose lease appended nothing checks the
+ * thresholds: each append already did. Otherwise the rows wait for a later
+ * append or release, for the record to fill, or for the pool's housekeeper
+ * settle. The underlying Sender is only truly closed when
+ * {@link io.questdb.client.QuestDB#close()} shuts the pool down.
  * <p>
  * Because the slot is reused across borrows, this wrapper -- not the slot --
  * carries the lease identity. A stale handle (held after {@link #close()}, with
@@ -67,11 +69,15 @@ import java.time.temporal.ChronoUnit;
 public final class PooledSender implements Sender {
 
     private final long generation;
+    // The delegate's rowsAppended() when the lease began: close() tells a lease
+    // that appended rows from one that did not by comparing against it.
+    private final long rowsAppendedAtBorrow;
     private final SenderSlot slot;
 
     PooledSender(SenderSlot slot, long generation) {
         this.slot = slot;
         this.generation = generation;
+        this.rowsAppendedAtBorrow = slot.delegate().rowsAppended();
     }
 
     @Override
@@ -165,18 +171,25 @@ public final class PooledSender implements Sender {
      * ring, not acknowledged by the server; {@link #flush()} and then
      * {@link #drain(long)} is the point where the server has the rows. The release
      * ships a frame only when the commit window closes (see below) or an auto-flush
-     * threshold trips, usually the age one, the oldest row older than
-     * {@code auto_flush_interval}; otherwise the rows wait in the open record for a
-     * later append or release, for the record to fill, or for the pool's
-     * housekeeper settle. A sender in full-dictionary mode (its slot's symbol
-     * dictionary file could not be opened or written) has no open record: its
-     * publish is a {@link Sender#flush()}, so each release ships the lease's rows
-     * in a frame of its own, which keeps them recoverable at the cost a release had
-     * before the open record. {@link #reset()} on a lease discards only that
-     * lease's rows. Does not close the underlying {@link Sender}; that only
-     * happens when the owning {@code QuestDB} is closed. If the pool is already
-     * shutting down when this lease comes home, the rows are flushed here and the
-     * underlying Sender is torn down on the calling thread.
+     * threshold trips at it, usually the age one, the oldest row older than
+     * {@code auto_flush_interval}. Without a commit window only a release whose
+     * lease appended nothing runs that check: each append already ran the
+     * thresholds, the age one on a stride, so a release after appends does not run
+     * them again and reads no clock. Rows the release does not ship wait in the
+     * open record for a later append that trips a threshold, a release without
+     * rows, a {@link #flush()}, the record to fill, or the pool's housekeeper
+     * settle, which runs every {@code auto_flush_interval}. The rows of a lease
+     * that held the slot past the interval after its last append ship that way
+     * too, and stay recoverable in the ring throughout. A sender in
+     * full-dictionary mode (its slot's symbol dictionary file could not be opened
+     * or written) has no open record: its publish is a {@link Sender#flush()}, so
+     * each release ships the lease's rows in a frame of its own, which keeps them
+     * recoverable at the cost a release had before the open record.
+     * {@link #reset()} on a lease discards only that lease's rows. Does not close
+     * the underlying {@link Sender}; that only happens when the owning
+     * {@code QuestDB} is closed. If the pool is already shutting down when this
+     * lease comes home, the rows are flushed here and the underlying Sender is
+     * torn down on the calling thread.
      * <p>
      * A row left in progress is cancelled before the publish, so nothing
      * half-built is ever published, the slot is returned, and then a
@@ -238,7 +251,7 @@ public final class PooledSender implements Sender {
         BatchTooLargeForCapException capRejection = null;
         int droppedLeaseRows = 0;
         boolean isOpenRecordAtRetire = false;
-        // The slot's idle mark: ship()'s one clock reading, or a fresh reading
+        // The slot's idle mark: the one ship() returns, or a fresh reading
         // after the cap retry's flush. Every recycle into an open pool sets it.
         // Only the pool-closed branch leaves it unset, and giveBack() retires
         // the slot there without an idle mark.
@@ -523,6 +536,11 @@ public final class PooledSender implements Sender {
     }
 
     @Override
+    public long pendingBatchStartNanos() {
+        return slot.live(generation).pendingBatchStartNanos();
+    }
+
+    @Override
     public int pendingRowCount() {
         return slot.live(generation).pendingRowCount();
     }
@@ -649,6 +667,12 @@ public final class PooledSender implements Sender {
      *   <li>{@code publishPending()}: makes the lease's rows recoverable in the
      *       open record without shipping them (a flush in full-dictionary
      *       mode);</li>
+     *   <li>no commit window and the lease appended rows: nothing more. Each
+     *       append ran the row and byte thresholds, and the age one on a
+     *       stride, so the release does not check them again and reads no
+     *       clock: its idle mark is the pending batch's first-row stamp
+     *       ({@code pendingBatchStartNanos()}), or a fresh reading when nothing
+     *       is pending, as after a full-dictionary publish;</li>
      *   <li>commit window set and closing now: {@code flush()}, which seals the
      *       record unflagged, or sends the commit message, and commits the
      *       group;</li>
@@ -656,17 +680,28 @@ public final class PooledSender implements Sender {
      *       oldest row is older than {@code auto_flush_interval} or another
      *       auto-flush threshold trips.</li>
      * </ul>
-     * Reads the clock once, after {@code publishPending()}: in full-dictionary
-     * mode the publish is a flush that can block under ring backpressure, so a
-     * reading taken before it would predate the release. The commit window and
-     * the age threshold use that reading.
+     * Outside the first case, reads the clock once, after {@code publishPending()}:
+     * in full-dictionary mode the publish is a flush that can block under ring
+     * backpressure, so a reading taken before it would predate the release. The
+     * commit window, the age threshold and the idle mark use that reading.
+     * <p>
+     * The batch stamp can predate the lease, since the open record spans leases,
+     * and a lease that held the slot after its last append makes it older still.
+     * An idle mark that old never reaps a slot that still holds rows: the reap
+     * skips a slot with unshipped work, so the settle ships the rows before the
+     * reap can close the slot.
      *
-     * @return the reading, which the pool stamps as the slot's idle mark
+     * @return the slot's idle mark, a {@link System#nanoTime()} reading
      */
     private long ship(SenderPool pool, Sender delegate) {
         delegate.publishPending();
+        boolean hasCommitWindow = pool.hasCommitWindow();
+        if (!hasCommitWindow && delegate.rowsAppended() != rowsAppendedAtBorrow) {
+            long batchStartNanos = delegate.pendingBatchStartNanos();
+            return batchStartNanos != 0L ? batchStartNanos : System.nanoTime();
+        }
         long nowNanos = System.nanoTime();
-        if (pool.hasCommitWindow()) {
+        if (hasCommitWindow) {
             boolean closes = slot.windowCloses(delegate.rowsAppended(), delegate.hasDeferredFrames(),
                     nowNanos, pool.commitRows(), pool.commitIntervalNanos());
             if (closes) {

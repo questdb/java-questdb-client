@@ -3428,6 +3428,16 @@ public class QwpWebSocketSender implements Sender {
         return new ReconnectSupplier(stopFlag, "drainer stop requested during connect");
     }
 
+    /**
+     * The first pending row's stamp, which every seal and flush clears. On the
+     * open-record path the record spans pool leases, so the stamp can belong to
+     * an earlier lease's row.
+     */
+    @Override
+    public long pendingBatchStartNanos() {
+        return firstPendingRowTimeNanos;
+    }
+
     @Override
     public int pendingRowCount() {
         return recordOffset >= 0 ? record.rowCount() : pendingRowCount;
