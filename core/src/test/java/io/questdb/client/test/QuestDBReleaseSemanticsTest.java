@@ -186,6 +186,28 @@ public class QuestDBReleaseSemanticsTest {
     }
 
     @Test
+    public void testOneRowLeasesKeepTheAgeBound() throws Exception {
+        FrameLog log = new FrameLog();
+        try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            try (QuestDB db = QuestDB.connect(config(server.getPort(), "auto_flush_interval=100;housekeeper_interval_ms=60000;"))) {
+                try (Sender s = db.borrowSender()) {
+                    s.table("t").longColumn("v", 1L).atNow();
+                }
+                try (Sender s = db.borrowSender()) {
+                    Sender delegate = ((PooledSender) s).getDelegateForTesting();
+                    // inside the lease: the housekeeper cannot reach a leased slot
+                    Thread.sleep(300);
+                    s.table("t").longColumn("v", 2L).atNow();
+                    Assert.assertEquals("the record's row 2 read the clock and sealed", 0, delegate.pendingRowCount());
+                }
+                log.awaitDataFrames(1, 5_000);
+            }
+        }
+    }
+
+    @Test
     public void testPartialRowReleaseAfterTheIntervalStillShipsEarlierRows() throws Exception {
         FrameLog log = new FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {

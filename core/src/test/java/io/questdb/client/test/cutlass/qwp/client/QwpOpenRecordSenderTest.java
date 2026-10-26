@@ -68,6 +68,50 @@ public class QwpOpenRecordSenderTest {
     private static final long TS_BASE = 1_700_000_000_000_000L;
 
     @Test
+    public void testAgeCheckRunsOnRowsTwoToSixteenThenEverySixteenth() throws Exception {
+        assertMemoryLeak(() -> {
+            FrameLog log = new FrameLog();
+            try (TestWebSocketServer server = startServer(log);
+                 Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                         + ";auto_flush_rows=off;auto_flush_bytes=off;auto_flush_interval=200;close_flush_timeout_millis=0;")) {
+                // 17 rows appended at once; the first row's age is below the interval
+                for (int i = 1; i <= 17; i++) {
+                    sender.table("t").longColumn("v", i).atNow();
+                }
+                Assert.assertEquals(17, sender.pendingRowCount());
+                Thread.sleep(500);
+
+                // past 16 pending rows only every sixteenth row reads the clock
+                sender.table("t").longColumn("v", 18).atNow();
+                Assert.assertEquals(18, sender.pendingRowCount());
+                for (int i = 19; i <= 31; i++) {
+                    sender.table("t").longColumn("v", i).atNow();
+                }
+                Assert.assertEquals(31, sender.pendingRowCount());
+                sender.table("t").longColumn("v", 32).atNow();
+                Assert.assertEquals(0, sender.pendingRowCount());
+
+                // rows 2 to 16 are always checked
+                sender.table("t").longColumn("v", 1).atNow();
+                Assert.assertEquals(1, sender.pendingRowCount());
+                Thread.sleep(500);
+                sender.table("t").longColumn("v", 2).atNow();
+                Assert.assertEquals(0, sender.pendingRowCount());
+
+                // the release path always reads the clock
+                for (int i = 1; i <= 17; i++) {
+                    sender.table("t").longColumn("v", i).atNow();
+                }
+                Assert.assertEquals(17, sender.pendingRowCount());
+                Thread.sleep(500);
+                ((QwpWebSocketSender) sender).autoFlushIfDue();
+                Assert.assertEquals(0, sender.pendingRowCount());
+                log.awaitDataFrames(3, 5_000);
+            }
+        });
+    }
+
+    @Test
     public void testAutoFlushIntervalSealsOnNextAppend() throws Exception {
         assertMemoryLeak(() -> {
             FrameLog log = new FrameLog();

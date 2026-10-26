@@ -1555,7 +1555,7 @@ public class QwpWebSocketSender implements Sender {
         if (currentTableBuffer != null && currentTableBuffer.hasInProgressRow()) {
             return;
         }
-        if (shouldAutoFlush()) {
+        if (shouldAutoFlush(false)) {
             flushPendingRows(transactional);
         }
     }
@@ -4331,12 +4331,12 @@ public class QwpWebSocketSender implements Sender {
                 }
                 throw t;
             }
-            // With auto_flush_bytes=off shouldAutoFlush() has no byte test, so a held row
+            // With auto_flush_bytes=off shouldAutoFlush(false) has no byte test, so a held row
             // whose own frame exceeds the advertised cap would stay in the slot after its
             // lease. Flush it at once when it reaches the same 90 percent budget the
             // default byte trigger uses.
             int cap = serverMaxBatchSize;
-            if (shouldAutoFlush() || (cap > 0 && getPendingBytes() >= byteBudgetForCap(cap))) {
+            if (shouldAutoFlush(false) || (cap > 0 && getPendingBytes() >= byteBudgetForCap(cap))) {
                 flushPendingRows(transactional);
             }
         }
@@ -7984,7 +7984,7 @@ public class QwpWebSocketSender implements Sender {
                 pendingBytes = rowBytes;
                 currentTableBufferSnapshotBytes = rowBytes;
             }
-            if (shouldAutoFlush()) {
+            if (shouldAutoFlush(true)) {
                 autoFlushAfterRow();
             }
             return;
@@ -8021,15 +8021,18 @@ public class QwpWebSocketSender implements Sender {
         pendingBytes += bufferedNow - currentTableBufferSnapshotBytes;
         currentTableBufferSnapshotBytes = bufferedNow;
 
-        if (shouldAutoFlush()) {
+        if (shouldAutoFlush(true)) {
             autoFlushAfterRow();
         }
     }
 
     /**
-     * Checks if any auto-flush threshold is exceeded.
+     * Checks if any auto-flush threshold is exceeded. The per-row caller passes
+     * {@code perRow = true} and may skip the age check's clock read; release and
+     * housekeeper callers pass {@code false} and always read it. On the open-record
+     * path {@code pendingRowCount} counts the open record's rows across pool leases.
      */
-    private boolean shouldAutoFlush() {
+    private boolean shouldAutoFlush(boolean perRow) {
         if (pendingRowCount <= 0) {
             return false;
         }
@@ -8040,6 +8043,13 @@ public class QwpWebSocketSender implements Sender {
             return true;
         }
         if (autoFlushIntervalNanos > 0) {
+            // Row 1 just stamped firstPendingRowTimeNanos (age zero). Slow producers never
+            // get past 16 pending rows and are checked on every row; fast ones overshoot
+            // the age bound by at most 16 rows' time. Release and housekeeper checks pass
+            // perRow = false and always read the clock.
+            if (perRow && (pendingRowCount == 1 || (pendingRowCount > 16 && (pendingRowCount & 15) != 0))) {
+                return false;
+            }
             long ageNanos = System.nanoTime() - firstPendingRowTimeNanos;
             return ageNanos >= autoFlushIntervalNanos;
         }
