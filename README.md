@@ -129,15 +129,18 @@ flush per batch rather than per row: each flush has a fixed cost, so batching ra
 `close()` ships the lease's pending rows as one frame into the store-and-forward ring, so the final partial batch is in
 the ring when `close()` returns. If you borrow per message, that is one frame per message.
 
-The sender's I/O thread commits those frames once per commit window rather than once per `close()`. It sends each
-release frame with the commit deferred and commits with the frame that brings the window to `commit_rows` rows, or with
-a commit-only frame once the window is `commit_interval_ms` old. The bounds default to `auto_flush_rows` (1000) and
-`auto_flush_interval` (100 ms), so borrow-per-row gets the same server-side visibility as a held lease. An auto-flush
-inside a lease, `flush()`, `drain()`, `awaitAckedFsn()` and closing the `QuestDB` handle commit the window at once. A
-bound of `0` disables it; with both at `0` every `close()` commits on its own. The keys apply only under
-`flush_on_close=on`, and a sender built with `transaction=on` keeps its own commit semantics, so the window leaves it
-alone. With `sf_dir`, a client crash between the server's commit and the arrival of its ack replays up to one window
-as duplicates: delivery stays at-least-once, with a larger unit.
+The sender's I/O thread commits those frames once per commit window rather than once per `close()`, and each pooled
+connection has its own window. The I/O thread sends each release frame with the commit deferred and commits with the
+frame that brings the window to `commit_rows` rows, or with a commit-only frame once the window is `commit_interval_ms`
+old. The bounds default to `auto_flush_rows` (1000) and `auto_flush_interval` (100 ms), so borrow-per-row gets the same
+server-side visibility as a held lease. An auto-flush inside a lease, `flush()`, `flushAndGetSequence()`, `drain()` and
+`awaitAckedFsn()` commit the window of the lease's connection at once; the windows of the other connections still close
+at their own bounds. Closing the `QuestDB` handle commits every window. A bound of `0` disables it; with both at `0`
+every `close()` commits on its own. The keys apply only under `flush_on_close=on`, and a sender built with
+`transaction=on` keeps its own commit semantics, so the window leaves it alone. With `sf_dir`, a client crash between
+the server's commit and the arrival of its ack replays up to one window as duplicates: delivery stays at-least-once,
+with a larger unit. Without `sf_dir` the ring is in memory, and a client crash can lose its unacknowledged frames: up
+to one window of them, against about one round trip without the window.
 
 `flush_on_close=off` is the opt-in that buffers rows across leases: `close()` only releases the slot, and the rows ship
 when an auto-flush threshold trips on a later append or release, or when the housekeeper settles the idle slot. Call
@@ -694,8 +697,8 @@ schema::key1=value1;key2=value2;
 | `idle_timeout_ms`        | `60000` | How long a pooled connection may stay idle before it is reaped. A released slot's idle clock starts at the first row of the released lease's batch, not at the release, so a lease held longer than this leaves its slot reap-eligible on the next housekeeper tick when the pool is above `sender_pool_min`. Nothing is lost, because a slot with unshipped rows is never reaped; the cost is one reconnect on a later borrow. With `flush_on_close=off` the mark can be the first row of an earlier lease's batch, bounded by `auto_flush_interval` while the interval trigger is on |
 | `max_lifetime_ms`        | `1800000` | Maximum lifetime of a pooled connection before it is recycled                |
 | `flush_on_close`         | `on`    | `on` makes a pooled `close()` flush before releasing: one committing frame per close in the store-and-forward ring, which the I/O thread commits once per commit window (`commit_rows`, `commit_interval_ms`); `off` is the opt-in that only releases the slot and buffers rows across leases until an auto-flush threshold or the housekeeper settle ships them. Note: "flush" means published to the store-and-forward ring, not acknowledged. Close-time errors are wrapped; the delegate's error is the cause; only `LineSenderServerException` keeps its type, so code that catches another `LineSenderException` subclass around a pooled `close()` must look at `getCause()`; with `on` each lease ships its own frame, and a rejection inside a window rolls back the open window, which the I/O thread replays once so the leases before the rejected frame commit; with `off` leases share frames and a rejection covers all of them |
-| `commit_rows`            | `auto_flush_rows` (`1000`) | Row bound of the commit window: the I/O thread sends release frames with the commit deferred and commits once per window, with the frame that brings the window to this many rows. `0` disables the bound; with `commit_interval_ms=0` as well every `close()` commits on its own. An auto-flush inside a lease, `flush()`, `drain()`, `awaitAckedFsn()` and closing the `QuestDB` handle commit the window at once. Applies only under `flush_on_close=on` (rejected under `off`); a `transaction=on` sender keeps its own commits and ignores it. With `sf_dir`, a crash between the server's commit and the ack can replay up to one window as duplicates (at-least-once) |
-| `commit_interval_ms`     | `auto_flush_interval` (`100`) | Age bound of the commit window in milliseconds: once the window's first frame is this old, the I/O thread commits it, with a commit-only frame when the slot is quiet. `0` disables the bound; with `commit_rows=0` as well every `close()` commits on its own. Same scope and duplicate exposure as `commit_rows` |
+| `commit_rows`            | `auto_flush_rows` (`1000`) | Row bound of the commit window: the I/O thread sends release frames with the commit deferred and commits once per window, with the frame that brings the window to this many rows. `0` disables the bound; with `commit_interval_ms=0` as well every `close()` commits on its own. Each pooled connection has its own window: an auto-flush inside a lease, `flush()`, `flushAndGetSequence()`, `drain()` and `awaitAckedFsn()` commit the window of the lease's connection at once, and closing the `QuestDB` handle commits every window. Applies only under `flush_on_close=on` (rejected under `off`); a `transaction=on` sender keeps its own commits and ignores it. With `sf_dir`, a crash between the server's commit and the ack can replay up to one window as duplicates (at-least-once); without `sf_dir`, a crash can lose up to one window of unacknowledged frames instead of about one round trip |
+| `commit_interval_ms`     | `auto_flush_interval` (`100`) | Age bound of the commit window in milliseconds: once the window's first frame is this old, the I/O thread commits it, with a commit-only frame when the slot is quiet. `0` disables the bound; with `commit_rows=0` as well every `close()` commits on its own. Same scope, window-closing calls and crash exposure as `commit_rows` |
 
 ### Query routing keys
 

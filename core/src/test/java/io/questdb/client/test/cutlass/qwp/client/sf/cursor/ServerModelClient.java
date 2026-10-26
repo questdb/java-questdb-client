@@ -28,6 +28,7 @@ import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
 import io.questdb.client.cutlass.http.client.WebSocketSendBuffer;
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketFrameWriter;
 import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.std.MemoryTag;
@@ -55,10 +56,12 @@ import java.util.List;
  * The responses queue on this instance, and each {@link #tryReceiveFrame} call
  * delivers one of them from native memory. {@link #holdResponses} keeps them
  * queued, so a test can let the loop send more frames before it sees a
- * response, and {@link #dropConnection()} models a dead link.
+ * response, {@link #dropConnection()} models a dead link, and
+ * {@link #failNextBatch()} a batch write that fails.
  * <p>
  * The send loop calls the transport methods on its I/O thread; any thread may
- * call {@link #holdResponses} and {@link #dropConnection()}.
+ * call {@link #holdResponses}, {@link #dropConnection()} and
+ * {@link #failNextBatch()}.
  */
 public final class ServerModelClient extends WebSocketClient {
     private static final int QWP_VERSION = 1;
@@ -68,6 +71,7 @@ public final class ServerModelClient extends WebSocketClient {
     private boolean hasReportedDrop;
     private volatile boolean isBatchSendSupported = true;
     private volatile boolean isDropped;
+    private volatile boolean isFailingNextBatch;
     private volatile boolean isHoldingResponses;
 
     public ServerModelClient(QwpServerModel model) {
@@ -99,6 +103,15 @@ public final class ServerModelClient extends WebSocketClient {
      */
     public void dropConnection() {
         isDropped = true;
+    }
+
+    /**
+     * Makes the next {@link #sendBinaryBatch} fail the way a socket write does:
+     * it throws a {@link LineSenderException}, records no socket write, and none
+     * of the batch's frames reaches the model. Later writes succeed.
+     */
+    public void failNextBatch() {
+        isFailingNextBatch = true;
     }
 
     @Override
@@ -153,6 +166,10 @@ public final class ServerModelClient extends WebSocketClient {
     public void sendBinaryBatch() {
         WebSocketSendBuffer buffer = getSendBuffer();
         try {
+            if (isFailingNextBatch) {
+                isFailingNextBatch = false;
+                throw new LineSenderException("injected batch write failure");
+            }
             if (isDropped) {
                 return;
             }

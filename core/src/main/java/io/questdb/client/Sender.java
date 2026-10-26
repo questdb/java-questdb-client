@@ -606,7 +606,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * share one commit. When this call returns, the frame is in the
      * store-and-forward ring as a committing frame, so recovery and replay treat
      * it like any flushed frame. Without a window, and on transports other than
-     * WebSocket, this is {@link #flush()}. The pool's release calls it.
+     * WebSocket, this is {@link #flush()}. The pool's release calls it on the
+     * pooled connection's sender; a sender borrowed from the pool (a
+     * {@code PooledSender}) treats a direct call as {@link #flush()}, so only
+     * the release ships a window member.
      *
      * @throws LineSenderException under the same conditions as {@link #flush()}
      */

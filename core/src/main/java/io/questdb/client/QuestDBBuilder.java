@@ -135,11 +135,13 @@ public final class QuestDBBuilder {
      * ring; the sender's I/O thread sends it with the commit deferred and
      * commits once per window: with the frame that brings the window to
      * {@link #commitRows(int)} rows, or with a commit-only frame once the
-     * window's first frame is this many milliseconds old. An auto-flush
-     * inside a lease, {@link Sender#flush()}, {@link Sender#drain(long)},
-     * {@link Sender#awaitAckedFsn(long, long)} and {@link QuestDB#close()}
-     * commit the window at once. 0 disables this bound; both bounds at 0 make
-     * every {@code close()} commit on its own. Defaults to
+     * window's first frame is this many milliseconds old. Each pooled
+     * connection has its own window: an auto-flush inside a lease,
+     * {@link Sender#flush()}, {@link Sender#flushAndGetSequence()},
+     * {@link Sender#drain(long)} and {@link Sender#awaitAckedFsn(long, long)}
+     * commit the window of the lease's connection at once, and
+     * {@link QuestDB#close()} commits every window. 0 disables this bound;
+     * both bounds at 0 make every {@code close()} commit on its own. Defaults to
      * {@code auto_flush_interval} (100 ms). Applies only under
      * {@code flush_on_close=on}; {@link #build()} rejects it under
      * {@code off}. A sender built with {@code transaction=on} keeps its own
@@ -147,7 +149,10 @@ public final class QuestDBBuilder {
      * <p>
      * With {@code sf_dir}, a client crash between the server's commit and
      * the arrival of its ack replays up to one window as duplicates: the
-     * delivery stays at-least-once, with a larger unit.
+     * delivery stays at-least-once, with a larger unit. Without {@code sf_dir}
+     * the ring is in memory, and a client crash can lose its unacknowledged
+     * frames: up to one window of them, against about one round trip without
+     * the window.
      */
     public QuestDBBuilder commitIntervalMillis(long millis) {
         if (millis < 0) {

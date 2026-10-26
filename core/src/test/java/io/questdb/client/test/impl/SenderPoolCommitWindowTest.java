@@ -41,6 +41,27 @@ import java.util.List;
 public class SenderPoolCommitWindowTest {
 
     @Test
+    public void testFlushAsWindowMemberOnALeaseFlushes() {
+        List<RecordingSender> built = new ArrayList<>();
+        try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(1, 1, built)) {
+            pool.setFlushOnClose(true);
+            pool.setCommitWindow(1_000, 100L);
+            try (Sender s = pool.borrow()) {
+                s.table("t").longColumn("v", 1L).atNow();
+                s.flushAsWindowMember();
+                RecordingSender d = built.get(0);
+                Assert.assertEquals("a direct call on a lease is a flush", 1, d.flushCount.get());
+                Assert.assertEquals("and ships no window member", 0, d.windowMemberFlushCount.get());
+                s.table("t").longColumn("v", 2L).atNow();
+            }
+            RecordingSender d = built.get(0);
+            Assert.assertEquals(1, d.flushCount.get());
+            Assert.assertEquals("the release ships the one window member", 1, d.windowMemberFlushCount.get());
+            Assert.assertEquals(0, d.pendingRowCount());
+        }
+    }
+
+    @Test
     public void testReleaseUnderFlushOnCloseOffChecksAutoFlush() {
         List<RecordingSender> built = new ArrayList<>();
         try (SenderPool pool = SenderPoolCloseSemanticsTest.newPool(1, 1, built)) {

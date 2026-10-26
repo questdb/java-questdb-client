@@ -399,9 +399,15 @@ public final class PooledSender implements Sender {
         return slot.live(generation).flushAndGetSequence();
     }
 
+    /**
+     * A direct call is {@link #flush()}. The commit window governs the frames the
+     * pool's release ships, one per lease ({@code ship()} calls
+     * {@link Sender#flushAsWindowMember()} on the delegate), so code inside a
+     * lease never adds a member to the delegate's commit group.
+     */
     @Override
     public void flushAsWindowMember() {
-        slot.live(generation).flushAsWindowMember();
+        flush();
     }
 
     @Override

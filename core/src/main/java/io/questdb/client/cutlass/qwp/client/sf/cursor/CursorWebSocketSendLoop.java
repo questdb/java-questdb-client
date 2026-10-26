@@ -5047,7 +5047,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 long resent = groupStart - replayStart;
                 long fromFsn = externalFsnBase + replayStart;
                 long toFsn = externalFsnBase + groupStart - 1L;
-                LOG.warn("the commit-group replay re-sends {} committed but unacknowledged frame(s) [fsn {} to {}], which the server commits again",
+                LOG.warn("the commit-group replay re-sends {} sent but unacknowledged frame(s) [fsn {} to {}], and the server commits again any it already committed",
                         resent, fromFsn, toFsn);
             }
             fail(new LineSenderException(

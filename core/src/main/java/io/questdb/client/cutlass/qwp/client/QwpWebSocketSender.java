@@ -2379,7 +2379,6 @@ public class QwpWebSocketSender implements Sender {
      */
     @Override
     public void flushAsWindowMember() {
-        checkRecycleFailure();
         flush0(true);
     }
 
@@ -5676,6 +5675,11 @@ public class QwpWebSocketSender implements Sender {
             activeBuffer.ensureCapacity(messageSize);
             activeBuffer.write(buffer.getBufferPtr(), messageSize);
             activeBuffer.incrementRowCount();
+            // markWindowMemberIfShipping() marks the frame at the buffer start, so
+            // the buffer must hold this frame alone.
+            assert activeBuffer.getBufferPos() == messageSize
+                    : "the active buffer holds more than the frame to mark [bufferPos="
+                    + activeBuffer.getBufferPos() + ", messageSize=" + messageSize + ']';
             markWindowMemberIfShipping();
             sealAndSwapBuffer();
             // The frame carrying ids up to currentBatchMaxSymbolId is now on the ring;

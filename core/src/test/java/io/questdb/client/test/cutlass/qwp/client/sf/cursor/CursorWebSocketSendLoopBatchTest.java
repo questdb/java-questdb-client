@@ -206,6 +206,58 @@ public class CursorWebSocketSendLoopBatchTest {
     }
 
     @Test
+    public void testFailedBatchWriteReplaysFrameByFrame() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            QwpServerModel model = new QwpServerModel();
+            List<ServerModelClient> clients = new CopyOnWriteArrayList<>();
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, SEGMENT_BYTES)) {
+                CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
+                        null, engine, 0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                        () -> {
+                            ServerModelClient client = new ServerModelClient(model);
+                            if (clients.isEmpty()) {
+                                // the first connection's batch write fails
+                                client.failNextBatch();
+                            }
+                            clients.add(client);
+                            return client;
+                        },
+                        1L, 5L);
+                try {
+                    loop.setCommitWindow(1000, 60_000);
+                    for (int i = 0; i < 5; i++) {
+                        WindowTestFrames.append(engine, MARKER, 1, i);
+                    }
+                    loop.start();
+                    awaitAckedFsn(engine, 4);
+
+                    assertEquals("one reconnect after the failed write", 2, clients.size());
+                    List<byte[]> frames = model.frames();
+                    List<Integer> connections = model.frameConnections();
+                    List<Integer> writes = model.socketWriteBytes();
+                    assertEquals("the failed write delivered nothing; the replay sends in FSN order",
+                            range(5), ids(frames));
+                    assertEquals("one write per replayed frame", 5, writes.size());
+                    for (int i = 0; i < 5; i++) {
+                        assertEquals("frame " + i + " arrives on connection 1", 1, (int) connections.get(i));
+                        assertEquals("replayed frame " + i + " goes alone",
+                                wireBytes(frames, i, i + 1), (int) writes.get(i));
+                        assertEquals("replayed frame " + i + " goes as stored, committing, without the marker",
+                                0, QwpServerModel.flags(frames.get(i)) & (DEFER | MARKER));
+                    }
+                    assertEquals("no frame commits twice", range(5), ids(model.committedFrames()));
+                    assertEquals(5, model.commits());
+                    assertEquals(5, loop.getTotalFramesReplayed());
+                    assertEquals("the failed write counts no frame and no write", 5, loop.getTotalFramesSent());
+                    assertEquals(5, loop.getTotalSocketWrites());
+                } finally {
+                    loop.close();
+                }
+            }
+        });
+    }
+
+    @Test
     public void testFrameAboveTheBudgetGoesAlone() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             QwpServerModel model = new QwpServerModel();

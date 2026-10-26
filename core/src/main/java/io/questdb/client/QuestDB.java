@@ -146,9 +146,11 @@ public interface QuestDB extends Closeable {
      * and commits them together, once per commit window
      * ({@code commit_rows}, default {@code auto_flush_rows}, and
      * {@code commit_interval_ms}, default {@code auto_flush_interval}), so a
-     * row becomes visible on the server up to one window after {@code close()};
-     * {@code flush()}, {@code drain()} and an auto-flush inside a lease commit
-     * at once. Set
+     * row becomes visible on the server up to one window after {@code close()}.
+     * Each pooled connection has its own window: {@code flush()},
+     * {@code flushAndGetSequence()}, {@code drain()}, {@code awaitAckedFsn()}
+     * and an auto-flush inside a lease commit the window of the lease's
+     * connection at once, and {@link #close()} commits every window. Set
      * {@code flush_on_close=off} to opt in to buffering across leases:
      * {@code close()} then only releases the slot, and its rows go out when an
      * auto-flush threshold trips on a later append or release, or when the

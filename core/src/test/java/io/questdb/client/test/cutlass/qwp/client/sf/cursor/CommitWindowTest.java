@@ -167,6 +167,22 @@ public class CommitWindowTest {
     }
 
     @Test
+    public void testOnAckedKeepsALongTailInPlace() {
+        cw.configure(3, 0);
+        for (int i = 0; i < 9; i++) {
+            cw.onMember(i, 1, 0);
+        }
+        assertFalse(cw.isGroupOpen());
+        assertEquals(3, cw.spanBackingSize());
+        // one settled span against two live ones: the head moves, nothing compacts
+        cw.onAcked(2);
+        assertEquals("the settled span stays in the backing list", 3, cw.spanBackingSize());
+        assertEquals(3, cw.groupStartBefore(4));
+        assertEquals("the settled span answers no more", -1, cw.groupStartBefore(1));
+        assertEquals(6, cw.groupStartBefore(7));
+    }
+
+    @Test
     public void testOnAckedKeepsTheSpanHistoryBounded() {
         cw.configure(2, 0);
         for (int g = 0; g < 10_000; g++) {

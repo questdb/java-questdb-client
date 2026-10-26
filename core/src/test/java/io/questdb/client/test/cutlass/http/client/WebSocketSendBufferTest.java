@@ -38,7 +38,8 @@ public class WebSocketSendBufferTest {
     @Test
     public void testAppendBinaryFrameWritesBackToBackMaskedFrames() throws Exception {
         assertMemoryLeak(() -> {
-            int size = 10 + 4 + 296;
+            int gap = 64;
+            int size = 10 + 4 + gap + 296;
             long src = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
             try (WebSocketSendBuffer buf = new WebSocketSendBuffer(64)) {
                 for (int i = 0; i < size; i++) {
@@ -46,7 +47,10 @@ public class WebSocketSendBufferTest {
                 }
                 long single = src;
                 long first = src + 10;
-                long second = src + 14;
+                // The second slice is not adjacent to the first: a frame that read
+                // its tail from first + 4 would carry the gap's bytes instead.
+                Unsafe.getUnsafe().setMemory(first + 4, gap, (byte) 0xEE);
+                long second = first + 4 + gap;
                 buf.appendBinaryFrame(single, 10, 0, 0);
                 buf.appendBinaryFrame(first, 4, second, 296);
 
@@ -54,14 +58,15 @@ public class WebSocketSendBufferTest {
                 // frame 1: FIN + binary, mask bit + 7-bit length, 4-byte mask, payload
                 assertEquals(0x82, Unsafe.getUnsafe().getByte(p) & 0xFF);
                 assertEquals(0x80 | 10, Unsafe.getUnsafe().getByte(p + 1) & 0xFF);
-                assertUnmaskedPayload(p + 2, single, 10);
+                assertUnmaskedPayload(p + 2, 0, single, 10);
                 long q = p + 2 + 4 + 10;
                 // frame 2: FIN + binary, mask bit + 126, 16-bit big-endian length, mask, payload
                 assertEquals(0x82, Unsafe.getUnsafe().getByte(q) & 0xFF);
                 assertEquals(0x80 | 126, Unsafe.getUnsafe().getByte(q + 1) & 0xFF);
                 int length = ((Unsafe.getUnsafe().getByte(q + 2) & 0xFF) << 8) | (Unsafe.getUnsafe().getByte(q + 3) & 0xFF);
                 assertEquals(300, length);
-                assertUnmaskedPayload(q + 4, first, 300);
+                assertUnmaskedPayload(q + 4, 0, first, 4);
+                assertUnmaskedPayload(q + 4, 4, second, 296);
                 assertEquals("both frames, exact-size headers", (2 + 4 + 10) + (4 + 4 + 300), buf.getWritePos());
             } finally {
                 Unsafe.free(src, size, MemoryTag.NATIVE_DEFAULT);
@@ -99,12 +104,14 @@ public class WebSocketSendBufferTest {
     }
 
     // The 4-byte mask key sits at maskAddr and the masked payload right after it;
-    // unmasking it must give back the len source bytes at expected.
-    private static void assertUnmaskedPayload(long maskAddr, long expected, int len) {
+    // unmasking payload bytes [from, from + len) must give back the len source
+    // bytes at expected.
+    private static void assertUnmaskedPayload(long maskAddr, int from, long expected, int len) {
         for (int i = 0; i < len; i++) {
-            int mask = Unsafe.getUnsafe().getByte(maskAddr + (i & 3)) & 0xFF;
-            int sent = Unsafe.getUnsafe().getByte(maskAddr + 4 + i) & 0xFF;
-            assertEquals("payload byte " + i, Unsafe.getUnsafe().getByte(expected + i) & 0xFF, sent ^ mask);
+            int pos = from + i;
+            int mask = Unsafe.getUnsafe().getByte(maskAddr + (pos & 3)) & 0xFF;
+            int sent = Unsafe.getUnsafe().getByte(maskAddr + 4 + pos) & 0xFF;
+            assertEquals("payload byte " + pos, Unsafe.getUnsafe().getByte(expected + i) & 0xFF, sent ^ mask);
         }
     }
 }
