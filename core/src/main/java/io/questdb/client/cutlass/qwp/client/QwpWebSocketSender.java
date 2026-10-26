@@ -73,6 +73,7 @@ import io.questdb.client.std.Numbers;
 import io.questdb.client.std.NumericException;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
+import io.questdb.client.std.Unsafe;
 import io.questdb.client.std.bytes.DirectByteSlice;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.TestOnly;
@@ -309,6 +310,11 @@ public class QwpWebSocketSender implements Sender {
     // Test-only lifecycle witness. close() invokes and clears it strictly after
     // publishing closed=true and before starting any drain or teardown work.
     private volatile Runnable closeStartedHook;
+    // Commit-window bounds the pool pushes (setCommitWindow); 0 disables a bound.
+    // With either above 0, flushAsWindowMember() marks its committing frame as a
+    // window member in the ring.
+    private long commitWindowIntervalMillis;
+    private int commitWindowRows;
     private boolean connected;
     private SenderConnectionDispatcher connectionDispatcher;
     // A connect-string token_provider's registry lease (TokenProviderRegistry), released when this sender
@@ -468,6 +474,9 @@ public class QwpWebSocketSender implements Sender {
     //         (Invariant B); endpoint-policy and transport failures stay
     //         contained in that loop and never reach the producer.
     private Sender.InitialConnectMode initialConnectMode = Sender.InitialConnectMode.OFF;
+    // True only while flush0(true) runs flushPendingRows for a window member:
+    // markWindowMemberIfShipping() then marks the committing frame it seals.
+    private boolean isShippingWindowMember;
     private boolean ownsCursorEngine;
     // Whether close() may let the engine reclaim the parent-anchored LOGICAL slot lock.
     // False only while an outer frame holds it: Sender.build() acquires it for the whole
@@ -2352,40 +2361,22 @@ public class QwpWebSocketSender implements Sender {
      */
     @Override
     public long flushAndGetSequence() {
-        checkNotClosed();
+        return flush0(false);
+    }
+
+    /**
+     * Same as {@link #flush()}, but the committing frame this call publishes
+     * carries {@link QwpConstants#FLAG_WINDOW_MEMBER} in the ring when a commit
+     * window is set ({@link #setCommitWindow}) and the sender is neither
+     * transactional, nor deferring commits, nor waiting for durable acks. The
+     * I/O thread clears the marker before the wire. Frames an auto-flush, a
+     * dictionary chunk, a split's leading frames or a commit message publish
+     * are never marked.
+     */
+    @Override
+    public void flushAsWindowMember() {
         checkRecycleFailure();
-        if (cursorEngine != null) {
-            cursorEngine.checkDurability();
-        }
-        ensureNoInProgressRow();
-        ensureConnected();
-
-        long beforeFsn = cursorEngine != null ? cursorEngine.publishedFsn() : -1L;
-
-        // Cursor SF: append happens on the user thread inside
-        // sealAndSwapBuffer, so by the time we reach here every encoded batch
-        // is published in its mmap'd segment. PERIODIC stable-storage barriers
-        // run independently in the manager. No processingCount to drain and no
-        // awaitPendingAcks here; just surface any I/O thread error.
-        flushPendingRows(deferCommit);
-        if (!deferCommit && hasDeferredMessages) {
-            sendCommitMessage();
-        }
-        if (activeBuffer != null && activeBuffer.hasData()) {
-            sealAndSwapBuffer();
-            if (!deferCommit) {
-                // Same residual-seal boundary update as close(): a
-                // non-deferred residual publish is commit-bearing and must be
-                // covered by close-time drains, or drainOnClose would return
-                // before its ack and memory-mode data could be lost on exit.
-                lastCommitBoundaryFsn = cursorEngine.publishedFsn();
-            }
-        }
-        cursorSendLoop.checkError();
-        checkConnectionError();
-
-        long afterFsn = cursorEngine != null ? cursorEngine.publishedFsn() : -1L;
-        return afterFsn > beforeFsn ? fsnEpochBase + afterFsn : -1L;
+        flush0(true);
     }
 
     @Override
@@ -3382,6 +3373,23 @@ public class QwpWebSocketSender implements Sender {
     @TestOnly
     public void setCloseStartedHook(Runnable hook) {
         this.closeStartedHook = hook;
+    }
+
+    /**
+     * Sets the commit-window bounds of the connection pool: a window closes once
+     * its members carry {@code rows} rows or its first member is
+     * {@code intervalMillis} old. 0 disables that bound; both 0 disables the
+     * window, and {@link #flushAsWindowMember()} then behaves as {@link #flush()}.
+     *
+     * @throws IllegalArgumentException if a bound is negative
+     */
+    public void setCommitWindow(int rows, long intervalMillis) {
+        if (rows < 0 || intervalMillis < 0) {
+            throw new IllegalArgumentException("commit window bounds must not be negative [rows="
+                    + rows + ", intervalMillis=" + intervalMillis + ']');
+        }
+        this.commitWindowRows = rows;
+        this.commitWindowIntervalMillis = intervalMillis;
     }
 
     @Override
@@ -5437,6 +5445,56 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * The body of {@link #flushAndGetSequence()} and {@link #flushAsWindowMember()}.
+     *
+     * @param isWindowMember whether the committing frame of the pending rows is a
+     *                       commit-window member; it is marked only while
+     *                       {@link #isWindowMemberShipping()} holds
+     * @return highest FSN published into the engine, or {@code -1} if no data
+     */
+    private long flush0(boolean isWindowMember) {
+        checkNotClosed();
+        checkRecycleFailure();
+        if (cursorEngine != null) {
+            cursorEngine.checkDurability();
+        }
+        ensureNoInProgressRow();
+        ensureConnected();
+
+        long beforeFsn = cursorEngine != null ? cursorEngine.publishedFsn() : -1L;
+
+        // Cursor SF: append happens on the user thread inside
+        // sealAndSwapBuffer, so by the time we reach here every encoded batch
+        // is published in its mmap'd segment. PERIODIC stable-storage barriers
+        // run independently in the manager. No processingCount to drain and no
+        // awaitPendingAcks here; just surface any I/O thread error.
+        isShippingWindowMember = isWindowMember && isWindowMemberShipping();
+        try {
+            flushPendingRows(deferCommit);
+        } finally {
+            isShippingWindowMember = false;
+        }
+        if (!deferCommit && hasDeferredMessages) {
+            sendCommitMessage();
+        }
+        if (activeBuffer != null && activeBuffer.hasData()) {
+            sealAndSwapBuffer();
+            if (!deferCommit) {
+                // Same residual-seal boundary update as close(): a
+                // non-deferred residual publish is commit-bearing and must be
+                // covered by close-time drains, or drainOnClose would return
+                // before its ack and memory-mode data could be lost on exit.
+                lastCommitBoundaryFsn = cursorEngine.publishedFsn();
+            }
+        }
+        cursorSendLoop.checkError();
+        checkConnectionError();
+
+        long afterFsn = cursorEngine != null ? cursorEngine.publishedFsn() : -1L;
+        return afterFsn > beforeFsn ? fsnEpochBase + afterFsn : -1L;
+    }
+
+    /**
      * Flushes pending rows by encoding and sending them.
      * When all tables fit in a single message, the encoder produces one
      * WebSocket frame. When the encoded size exceeds {@code serverMaxBatchSize},
@@ -5561,6 +5619,7 @@ public class QwpWebSocketSender implements Sender {
             activeBuffer.ensureCapacity(messageSize);
             activeBuffer.write(buffer.getBufferPtr(), messageSize);
             activeBuffer.incrementRowCount();
+            markWindowMemberIfShipping();
             sealAndSwapBuffer();
             // The frame carrying ids up to currentBatchMaxSymbolId is now on the ring;
             // advance the delta baseline so the next frame ships only newer ids.
@@ -5793,6 +5852,11 @@ public class QwpWebSocketSender implements Sender {
                     + ", messageSize=" + messageSize + ", serverMaxBatchSize=" + cap + ']';
 
             activeBuffer.incrementRowCount();
+            if (!deferThis) {
+                // Only the closing frame commits the split release; its leading
+                // frames stay as deferred, unmarked frames.
+                markWindowMemberIfShipping();
+            }
             sealAndSwapBuffer();
             // Frame queued: advance so the next split frame's delta starts above
             // the ids this one just registered.
@@ -5810,6 +5874,31 @@ public class QwpWebSocketSender implements Sender {
             lastCommitBoundaryFsn = cursorEngine.publishedFsn();
         }
         resetTableBuffersAfterFlush();
+    }
+
+    /**
+     * Whether a window-member flush marks its committing frame: a window bound is
+     * set and the sender is neither transactional, nor deferring commits, nor
+     * waiting for durable acks. Those senders keep their own commit semantics,
+     * so their frames are never window members.
+     */
+    private boolean isWindowMemberShipping() {
+        return (commitWindowRows > 0 || commitWindowIntervalMillis > 0)
+                && !transactional && !deferCommit && !requestDurableAck;
+    }
+
+    /**
+     * Sets {@link QwpConstants#FLAG_WINDOW_MEMBER} in the flags byte of the frame
+     * at the start of the active buffer, which the caller is about to seal, while
+     * a window-member flush ships. The record CRC the engine computes on append
+     * then covers the marked byte.
+     */
+    private void markWindowMemberIfShipping() {
+        if (isShippingWindowMember) {
+            long flagsAddr = activeBuffer.getBufferPtr() + QwpConstants.HEADER_OFFSET_FLAGS;
+            Unsafe.getUnsafe().putByte(flagsAddr,
+                    (byte) (Unsafe.getUnsafe().getByte(flagsAddr) | QwpConstants.FLAG_WINDOW_MEMBER));
+        }
     }
 
     private void onSlotLockReleased() {

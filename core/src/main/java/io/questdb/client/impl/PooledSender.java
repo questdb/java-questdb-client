@@ -405,6 +405,11 @@ public final class PooledSender implements Sender {
     }
 
     @Override
+    public void flushAsWindowMember() {
+        slot.live(generation).flushAsWindowMember();
+    }
+
+    @Override
     public long flushDeferred() {
         return slot.live(generation).flushDeferred();
     }

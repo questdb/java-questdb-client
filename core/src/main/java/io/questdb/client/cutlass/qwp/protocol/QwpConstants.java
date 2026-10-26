@@ -51,6 +51,13 @@ public final class QwpConstants {
      */
     public static final byte FLAG_GORILLA = 0x04;
     /**
+     * Flag bit, client-internal: marks the store-and-forward ring copy of a
+     * pooled release frame inside a commit window. The ring record CRC covers it
+     * like any other byte. The send loop clears it in the header it sends, so it
+     * never reaches the wire.
+     */
+    public static final byte FLAG_WINDOW_MEMBER = 0x20;
+    /**
      * Flag bit: payload region after the prelude is zstd-compressed. Set only
      * when the handshake negotiated zstd compression. Mirror of the server-side
      * constant; see the server QwpConstants for the full description.

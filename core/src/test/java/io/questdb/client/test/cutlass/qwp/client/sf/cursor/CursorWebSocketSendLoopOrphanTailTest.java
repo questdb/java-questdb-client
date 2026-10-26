@@ -34,6 +34,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
+import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.MemoryTag;
@@ -114,6 +115,26 @@ public class CursorWebSocketSendLoopOrphanTailTest {
             }
         }
         Files.remove(tmpDir);
+    }
+
+    @Test
+    public void testRecoveredWindowMembersAreNotAnOrphanTail() throws Exception {
+        // A pooled release frame carries the window-member marker in the ring but
+        // no defer flag: it is stored committing, so recovery must fold it as
+        // commit-bearing. Only the send loop may defer it, and only at send time.
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                appendFrame(engine, false); // fsn 0: commit-bearing
+                for (int i = 1; i <= 3; i++) {
+                    WindowTestFrames.append(engine, QwpConstants.FLAG_WINDOW_MEMBER, 1, i); // fsn 1..3
+                }
+            }
+            try (CursorSendEngine engine = newEngine()) {
+                assertTrue(engine.wasRecoveredFromDisk());
+                assertEquals("marked frames are not an orphan tail", -1L, engine.recoveredOrphanTipFsn());
+                assertEquals("the last marked frame is the commit boundary", 3L, engine.recoveredCommitBoundaryFsn());
+            }
+        });
     }
 
     @Test

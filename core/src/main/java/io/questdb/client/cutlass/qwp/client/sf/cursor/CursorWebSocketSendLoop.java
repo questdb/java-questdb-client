@@ -272,6 +272,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * Throttle "reconnect attempt N failed" WARN logs to one per 5 s.
      */
     private static final long RECONNECT_LOG_THROTTLE_NANOS = 5_000_000_000L;
+    // Size of wireScratchAddr: one QWP header (12 bytes), rounded up.
+    private static final int WIRE_SCRATCH_SIZE = 16;
     // Test seam: when true, recovery mirror seeding throws immediately AFTER
     // ensureSentDictCapacity has grown (and therefore taken ownership of) the mirror,
     // standing in for the copyRecoveredSymbolSuffix-adjacent failure that leaves a
@@ -627,6 +629,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // user-thread caller (flush/append/close). close() uses the instance so it
     // only suppresses errors the user already owned before close() began.
     private volatile LineSenderException synchronouslySurfacedError;
+    // Staging copy of the 12-byte QWP header of a ring frame that goes out with a
+    // rewritten flags byte (sendRingFrame), so the loop never writes to ring memory.
+    // I/O-thread owned: allocated on first use, freed with the catch-up buffer.
+    private long wireScratchAddr;
 
     /**
      * Full constructor with explicit reconnect-policy knobs. When
@@ -1506,6 +1512,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         }
         if (loopNeverRan) {
             freeCatchUpFrameBuffer();
+            freeWireScratch();
         }
     }
 
@@ -2749,6 +2756,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 releaseSentDictBytes();
             }
             freeCatchUpFrameBuffer();
+            freeWireScratch();
             shutdownLatch.countDown();
             Runnable closeCallback = delegatedClose;
             if (closeCallback != null) {
@@ -3675,6 +3683,64 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         }
     }
 
+    private void freeWireScratch() {
+        if (wireScratchAddr != 0L) {
+            Unsafe.free(wireScratchAddr, WIRE_SCRATCH_SIZE, MemoryTag.NATIVE_DEFAULT);
+            wireScratchAddr = 0L;
+        }
+    }
+
+    /**
+     * Sends one ring frame. With {@code wireFlags < 0} the frame goes out as
+     * stored. Otherwise the frame's 12-byte QWP header is copied to the wire
+     * scratch with {@code wireFlags} as its flags byte, and the frame goes out as
+     * one WebSocket message of two slices: the patched header and the stored rest.
+     * Either way the wire bytes differ from the ring bytes at most in the flags
+     * byte, and ring memory stays untouched.
+     *
+     * @param wireFlags the flags byte to send, or -1 to send the frame as stored;
+     *                  only a frame of at least {@link QwpConstants#HEADER_SIZE}
+     *                  bytes may take a rewritten flags byte
+     */
+    private void sendRingFrame(long frameAddr, int payloadLen, int wireFlags) {
+        if (wireFlags < 0) {
+            client.sendBinary(frameAddr, payloadLen);
+            return;
+        }
+        long scratch = wireScratchAddr;
+        if (scratch == 0L) {
+            scratch = Unsafe.malloc(WIRE_SCRATCH_SIZE, MemoryTag.NATIVE_DEFAULT);
+            wireScratchAddr = scratch;
+        }
+        Unsafe.getUnsafe().copyMemory(frameAddr, scratch, QwpConstants.HEADER_SIZE);
+        Unsafe.getUnsafe().putByte(scratch + QwpConstants.HEADER_OFFSET_FLAGS, (byte) wireFlags);
+        client.sendBinary(
+                scratch,
+                QwpConstants.HEADER_SIZE,
+                frameAddr + QwpConstants.HEADER_SIZE,
+                payloadLen - QwpConstants.HEADER_SIZE
+        );
+    }
+
+    /**
+     * The flags byte a ring frame goes out with when it must differ from the
+     * stored one: a QWP frame (magic checked as in {@link #isDeltaFrame}) that
+     * carries the client-internal {@link QwpConstants#FLAG_WINDOW_MEMBER} goes out
+     * with that bit cleared. Returns -1 for every other frame, which goes out as
+     * stored.
+     */
+    private static int strippedWireFlags(long frameAddr, int payloadLen) {
+        if (payloadLen < QwpConstants.HEADER_SIZE
+                || Unsafe.getUnsafe().getInt(frameAddr) != QwpConstants.MAGIC_MESSAGE) {
+            return -1;
+        }
+        int flags = Unsafe.getUnsafe().getByte(frameAddr + QwpConstants.HEADER_OFFSET_FLAGS) & 0xFF;
+        if ((flags & QwpConstants.FLAG_WINDOW_MEMBER) == 0) {
+            return -1;
+        }
+        return flags & ~QwpConstants.FLAG_WINDOW_MEMBER;
+    }
+
     private boolean tryReceiveAcks() {
         boolean any = false;
         try {
@@ -3808,7 +3874,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             return false;
         }
         try {
-            client.sendBinary(frameAddr, payloadLen);
+            sendRingFrame(frameAddr, payloadLen, strippedWireFlags(frameAddr, payloadLen));
         } catch (Throwable t) {
             fail(t);
             return false;
