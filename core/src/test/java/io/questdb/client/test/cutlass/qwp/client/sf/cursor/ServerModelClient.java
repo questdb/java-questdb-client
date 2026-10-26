@@ -45,10 +45,12 @@ import java.util.List;
  * {@link QwpServerModel#recordSocketWrite}, assembles the slices into one frame
  * and passes it to {@link QwpServerModel#receive}; the responses queue on this
  * instance, and each {@link #tryReceiveFrame} call delivers one of them from
- * native memory. {@link #dropConnection()} models a dead link.
+ * native memory. {@link #holdResponses} keeps them queued, so a test can let
+ * the loop send more frames before it sees a response, and
+ * {@link #dropConnection()} models a dead link.
  * <p>
  * The send loop calls the transport methods on its I/O thread; any thread may
- * call {@link #dropConnection()}.
+ * call {@link #holdResponses} and {@link #dropConnection()}.
  */
 public final class ServerModelClient extends WebSocketClient {
     private static final int QWP_VERSION = 1;
@@ -57,6 +59,7 @@ public final class ServerModelClient extends WebSocketClient {
     private final ArrayDeque<byte[]> responses = new ArrayDeque<>();
     private boolean hasReportedDrop;
     private volatile boolean isDropped;
+    private volatile boolean isHoldingResponses;
 
     public ServerModelClient(QwpServerModel model) {
         super(DefaultHttpClientConfiguration.INSTANCE, PlainSocketFactory.INSTANCE);
@@ -83,6 +86,15 @@ public final class ServerModelClient extends WebSocketClient {
     @Override
     public int getServerQwpVersion() {
         return QWP_VERSION;
+    }
+
+    /**
+     * While held, responses queue on this client and {@link #tryReceiveFrame}
+     * delivers none; once released, they are delivered in order. A drop is
+     * reported even while held.
+     */
+    public void holdResponses(boolean hold) {
+        isHoldingResponses = hold;
     }
 
     @Override
@@ -118,6 +130,9 @@ public final class ServerModelClient extends WebSocketClient {
             }
             handler.onClose(1001, "drop");
             return true;
+        }
+        if (isHoldingResponses) {
+            return false;
         }
         byte[] response;
         synchronized (responses) {

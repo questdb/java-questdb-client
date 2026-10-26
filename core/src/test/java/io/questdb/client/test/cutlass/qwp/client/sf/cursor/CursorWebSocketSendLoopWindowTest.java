@@ -25,9 +25,13 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.LineSenderServerException;
+import io.questdb.client.SenderError;
+import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.MemoryTag;
@@ -46,8 +50,11 @@ import java.util.concurrent.CopyOnWriteArrayList;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 /**
  * The commit window as the send loop applies it: window members go out
@@ -61,6 +68,10 @@ import static org.junit.Assert.assertTrue;
  * frames from {@link WindowTestFrames}. Tests construct the loop, set the
  * window, append and only then start it, because frames published before
  * construction count as recovered and go out as stored.
+ * <p>
+ * The rejection tests build the loop the way the sender does and report errors
+ * to a {@link SenderErrorDispatcher} with a recording handler; error FSNs are
+ * external with base 0, so they equal the ring FSNs.
  */
 public class CursorWebSocketSendLoopWindowTest {
     private static final int DEFER = QwpConstants.FLAG_DEFER_COMMIT;
@@ -186,6 +197,52 @@ public class CursorWebSocketSendLoopWindowTest {
                 } finally {
                     loop.close();
                 }
+            }
+        });
+    }
+
+    @Test
+    public void testDelayedAckBeforeATerminalRejectionDuplicatesOnlyTheCommittedGroup() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            QwpServerModel model = new QwpServerModel();
+            model.setRejector((connection, seq, frame) ->
+                    WindowTestFrames.id(frame) == 4 ? WebSocketResponse.STATUS_SCHEMA_MISMATCH : 0);
+            // The server commits group [0, 2] on connection 0, but its ack reaches the
+            // loop only after the NACK of frame 4, which the replay outruns.
+            model.delayAckUntilNextNack(0, 2);
+            List<ServerModelClient> clients = new CopyOnWriteArrayList<>();
+            List<SenderError> errors = new CopyOnWriteArrayList<>();
+            SenderErrorDispatcher dispatcher = new SenderErrorDispatcher(errors::add, 16);
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 16384)) {
+                CursorWebSocketSendLoop loop = newRejectingLoop(engine, model, clients, true,
+                        CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS, dispatcher);
+                try {
+                    loop.setCommitWindow(3, 0);
+                    for (int i = 0; i < 5; i++) {
+                        WindowTestFrames.append(engine, MARKER, 1, i);
+                    }
+                    loop.start();
+                    awaitFrames(model, 5);
+                    // member 5 closes the group [3, 5] by rows before the loop sees the NACK
+                    WindowTestFrames.append(engine, MARKER, 1, 5);
+                    awaitFrames(model, 6);
+                    clients.get(0).holdResponses(false);
+
+                    SenderError error = awaitLatchedServerError(loop);
+                    assertEquals("the duplicate is exactly the group whose ack was late",
+                            Arrays.asList(0L, 1L, 2L, 0L, 1L, 2L, 3L), committedIds(model));
+                    assertEquals(4, error.getFromFsn());
+                    assertEquals(4, error.getToFsn());
+                    assertEquals(5, engine.publishedFsn());
+                    assertEquals(3, engine.ackedFsn());
+                    assertFalse("frame 5 stays in the ring", committedIds(model).contains(5L));
+                    assertEquals(2, model.connections());
+                    assertEquals(1, loop.getTotalTerminalReplays());
+                } finally {
+                    loop.close();
+                    dispatcher.close();
+                }
+                assertEquals(1, errors.size());
             }
         });
     }
@@ -387,6 +444,39 @@ public class CursorWebSocketSendLoopWindowTest {
     }
 
     @Test
+    public void testRetriableRejectionInsideAGroupStrikesAsOnMaster() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            QwpServerModel model = new QwpServerModel();
+            model.setRejector((connection, seq, frame) ->
+                    WindowTestFrames.id(frame) == 2 ? WebSocketResponse.STATUS_INTERNAL_ERROR : 0);
+            List<SenderError> errors = new CopyOnWriteArrayList<>();
+            SenderErrorDispatcher dispatcher = new SenderErrorDispatcher(errors::add, 16);
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 16384)) {
+                CursorWebSocketSendLoop loop = newRejectingLoop(engine, model,
+                        new CopyOnWriteArrayList<ServerModelClient>(), false, 3, dispatcher);
+                try {
+                    loop.setCommitWindow(1000, 60_000);
+                    for (int i = 0; i < 3; i++) {
+                        WindowTestFrames.append(engine, MARKER, 1, i);
+                    }
+                    loop.start();
+
+                    SenderError error = awaitLatchedServerError(loop);
+                    assertEquals("the replays commit the good frames, each once",
+                            Arrays.asList(0L, 1L), committedIds(model));
+                    assertEquals(SenderError.Category.PROTOCOL_VIOLATION, error.getCategory());
+                    assertEquals(2, error.getFromFsn());
+                    assertEquals("one strike per connection", 3, model.connections());
+                    assertEquals(0, loop.getTotalTerminalReplays());
+                } finally {
+                    loop.close();
+                    dispatcher.close();
+                }
+            }
+        });
+    }
+
+    @Test
     public void testRowBoundLeavesTheRingBytesAlone() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             QwpServerModel model = new QwpServerModel();
@@ -433,6 +523,193 @@ public class CursorWebSocketSendLoopWindowTest {
                 } finally {
                     loop.close();
                 }
+            }
+        });
+    }
+
+    @Test
+    public void testTerminalNackAfterTheGroupClosedStillReplays() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            QwpServerModel model = new QwpServerModel();
+            model.setRejector((connection, seq, frame) ->
+                    WindowTestFrames.id(frame) == 1 ? WebSocketResponse.STATUS_SCHEMA_MISMATCH : 0);
+            List<ServerModelClient> clients = new CopyOnWriteArrayList<>();
+            List<SenderError> errors = new CopyOnWriteArrayList<>();
+            SenderErrorDispatcher dispatcher = new SenderErrorDispatcher(errors::add, 16);
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 16384)) {
+                CursorWebSocketSendLoop loop = newRejectingLoop(engine, model, clients, true,
+                        CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS, dispatcher);
+                try {
+                    loop.setCommitWindow(3, 0);
+                    for (int i = 0; i < 3; i++) {
+                        WindowTestFrames.append(engine, MARKER, 1, i);
+                    }
+                    loop.start();
+                    awaitFrames(model, 3);
+                    assertEquals("frame 2 closed the group before the NACK arrived",
+                            1, loop.getTotalGroupsClosedByRows());
+                    assertEquals(0, QwpServerModel.flags(model.frames().get(2)) & DEFER);
+                    clients.get(0).holdResponses(false);
+
+                    SenderError error = awaitLatchedServerError(loop);
+                    assertEquals(1, loop.getTotalTerminalReplays());
+                    assertEquals(Arrays.asList(0L), committedIds(model));
+                    assertEquals(1, error.getFromFsn());
+                    assertEquals(1, error.getToFsn());
+                    assertEquals(0, engine.ackedFsn());
+                    assertFalse("frame 2 stays in the ring", committedIds(model).contains(2L));
+                } finally {
+                    loop.close();
+                    dispatcher.close();
+                }
+                assertEquals(1, errors.size());
+            }
+        });
+    }
+
+    @Test
+    public void testTerminalRejectionAcceptedOnReplayLatchesNothing() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            QwpServerModel model = new QwpServerModel();
+            model.setRejector((connection, seq, frame) ->
+                    connection == 0 && WindowTestFrames.id(frame) == 2 ? WebSocketResponse.STATUS_SCHEMA_MISMATCH : 0);
+            List<SenderError> errors = new CopyOnWriteArrayList<>();
+            SenderErrorDispatcher dispatcher = new SenderErrorDispatcher(errors::add, 16);
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 16384)) {
+                CursorWebSocketSendLoop loop = newRejectingLoop(engine, model,
+                        new CopyOnWriteArrayList<ServerModelClient>(), false,
+                        CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS, dispatcher);
+                try {
+                    loop.setCommitWindow(1000, 60_000);
+                    for (int i = 0; i < 3; i++) {
+                        WindowTestFrames.append(engine, MARKER, 1, i);
+                    }
+                    loop.start();
+                    awaitAckedFsn(engine, 2);
+
+                    assertEquals(Arrays.asList(0L, 1L, 2L), committedIds(model));
+                    assertNull(loop.getTerminalError());
+                    assertEquals(2, model.connections());
+                    assertEquals(1, loop.getTotalTerminalReplays());
+                } finally {
+                    loop.close();
+                    dispatcher.close();
+                }
+                assertEquals("nothing is dispatched", 0, errors.size());
+            }
+        });
+    }
+
+    @Test
+    public void testTerminalRejectionInsideAGroupReplaysOnceThenLatchesTheBadFrameAlone() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            QwpServerModel model = new QwpServerModel();
+            model.setRejector((connection, seq, frame) ->
+                    WindowTestFrames.id(frame) == 2 ? WebSocketResponse.STATUS_SCHEMA_MISMATCH : 0);
+            List<SenderError> errors = new CopyOnWriteArrayList<>();
+            SenderErrorDispatcher dispatcher = new SenderErrorDispatcher(errors::add, 16);
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 16384)) {
+                CursorWebSocketSendLoop loop = newRejectingLoop(engine, model,
+                        new CopyOnWriteArrayList<ServerModelClient>(), false,
+                        CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS, dispatcher);
+                try {
+                    loop.setCommitWindow(1000, 60_000);
+                    for (int i = 0; i < 3; i++) {
+                        WindowTestFrames.append(engine, MARKER, 1, i);
+                    }
+                    loop.start();
+
+                    SenderError error = awaitLatchedServerError(loop);
+                    assertEquals(SenderError.Category.SCHEMA_MISMATCH, error.getCategory());
+                    assertEquals(2, error.getFromFsn());
+                    assertEquals(2, error.getToFsn());
+                    assertEquals(Arrays.asList(0L, 1L), committedIds(model));
+                    assertEquals(1, engine.ackedFsn());
+                    assertEquals(2, model.connections());
+                    assertEquals(1, loop.getTotalTerminalReplays());
+                } finally {
+                    loop.close();
+                    dispatcher.close();
+                }
+                assertEquals("the error is dispatched once, at the replay's rejection", 1, errors.size());
+                assertEquals(2, errors.get(0).getFromFsn());
+            }
+        });
+    }
+
+    @Test
+    public void testTerminalRejectionOfASynthesisedCommitReplaysTheGroup() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            QwpServerModel model = new QwpServerModel();
+            model.setRejector((connection, seq, frame) ->
+                    connection == 0 && QwpServerModel.tableCount(frame) == 0 ? WebSocketResponse.STATUS_SCHEMA_MISMATCH : 0);
+            List<SenderError> errors = new CopyOnWriteArrayList<>();
+            SenderErrorDispatcher dispatcher = new SenderErrorDispatcher(errors::add, 16);
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 16384)) {
+                CursorWebSocketSendLoop loop = newRejectingLoop(engine, model,
+                        new CopyOnWriteArrayList<ServerModelClient>(), false,
+                        CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS, dispatcher);
+                try {
+                    loop.setCommitWindow(1000, 200);
+                    WindowTestFrames.append(engine, MARKER, 1, 0);
+                    WindowTestFrames.append(engine, MARKER, 1, 1);
+                    loop.start();
+                    awaitAckedFsn(engine, 1);
+
+                    // The NACK names the commit-only frame, which maps to FSN 1, the last
+                    // ring frame before it and inside the closed span [0, 1].
+                    assertEquals(Arrays.asList(0L, 1L), committedIds(model));
+                    assertNull(loop.getTerminalError());
+                    assertEquals(1, loop.getTotalTerminalReplays());
+                    assertEquals(1, loop.getTotalCommitFramesSynthesised());
+                    List<byte[]> wire = model.frames();
+                    List<Integer> connections = model.frameConnections();
+                    assertEquals(5, wire.size());
+                    assertEquals("the rejected commit-only frame", 0, QwpServerModel.tableCount(wire.get(2)));
+                    for (int i = 3; i < 5; i++) {
+                        assertEquals("replayed on connection 1", 1, (int) connections.get(i));
+                        assertEquals(i - 3, WindowTestFrames.id(wire.get(i)));
+                        assertEquals("replay " + i + " goes out as stored, committing",
+                                0, QwpServerModel.flags(wire.get(i)) & (DEFER | MARKER));
+                    }
+                } finally {
+                    loop.close();
+                    dispatcher.close();
+                }
+                assertEquals("nothing is dispatched", 0, errors.size());
+            }
+        });
+    }
+
+    @Test
+    public void testTerminalRejectionOutsideAGroupLatchesAtOnce() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            QwpServerModel model = new QwpServerModel();
+            model.setRejector((connection, seq, frame) ->
+                    WindowTestFrames.id(frame) == 0 ? WebSocketResponse.STATUS_SCHEMA_MISMATCH : 0);
+            List<SenderError> errors = new CopyOnWriteArrayList<>();
+            SenderErrorDispatcher dispatcher = new SenderErrorDispatcher(errors::add, 16);
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 16384)) {
+                CursorWebSocketSendLoop loop = newRejectingLoop(engine, model,
+                        new CopyOnWriteArrayList<ServerModelClient>(), false,
+                        CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS, dispatcher);
+                try {
+                    loop.setCommitWindow(1, 0);
+                    WindowTestFrames.append(engine, MARKER, 1, 0);
+                    loop.start();
+
+                    SenderError error = awaitLatchedServerError(loop);
+                    assertEquals("member 0 went out committing",
+                            0, QwpServerModel.flags(model.frames().get(0)) & DEFER);
+                    assertEquals(0, error.getFromFsn());
+                    assertEquals(0, error.getToFsn());
+                    assertEquals(1, model.connections());
+                    assertEquals(0, loop.getTotalTerminalReplays());
+                } finally {
+                    loop.close();
+                    dispatcher.close();
+                }
+                assertEquals(1, errors.size());
             }
         });
     }
@@ -551,6 +828,19 @@ public class CursorWebSocketSendLoopWindowTest {
         }
     }
 
+    private static SenderError awaitLatchedServerError(CursorWebSocketSendLoop loop) throws InterruptedException {
+        long deadline = System.nanoTime() + 10_000_000_000L;
+        while (loop.getTerminalError() == null) {
+            if (System.nanoTime() > deadline) {
+                fail("timed out waiting for the terminal error");
+            }
+            Thread.sleep(1);
+        }
+        Throwable error = loop.getTerminalError();
+        assertTrue("a server rejection latches, got " + error, error instanceof LineSenderServerException);
+        return ((LineSenderServerException) error).getServerError();
+    }
+
     // Table-less committing frames: the commits the loop synthesised.
     private static int commitOnlyFrames(QwpServerModel model) {
         int count = 0;
@@ -605,6 +895,38 @@ public class CursorWebSocketSendLoopWindowTest {
                     return client;
                 },
                 1L, 5L);
+    }
+
+    // The loop as the sender builds it, with the given strike threshold, no
+    // escalation dwell, and the dispatcher; with holdFirstConnection, connection 0
+    // queues its responses until the test releases them.
+    private static CursorWebSocketSendLoop newRejectingLoop(
+            CursorSendEngine engine,
+            QwpServerModel model,
+            List<ServerModelClient> clients,
+            boolean holdFirstConnection,
+            int maxFrameRejections,
+            SenderErrorDispatcher dispatcher
+    ) {
+        CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
+                null, engine, 0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                () -> {
+                    ServerModelClient client = new ServerModelClient(model);
+                    if (holdFirstConnection && client.connection() == 0) {
+                        client.holdResponses(true);
+                    }
+                    clients.add(client);
+                    return client;
+                },
+                1L, 5L,
+                false,
+                0L, // no durable-ack PING: the model client has no socket
+                maxFrameRejections,
+                0L, 0L,
+                CursorWebSocketSendLoop.ReconnectPolicy.FOREGROUND,
+                0L);
+        loop.setErrorDispatcher(dispatcher);
+        return loop;
     }
 
     // A QWP frame: magic, version 1, the flags, the table count, the payload length, then the body.

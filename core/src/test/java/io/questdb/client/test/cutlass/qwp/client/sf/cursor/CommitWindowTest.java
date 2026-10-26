@@ -99,6 +99,41 @@ public class CommitWindowTest {
     }
 
     @Test
+    public void testGroupStartBeforeAfterASynthesisedClose() {
+        cw.configure(1000, 50);
+        assertEquals(DEFERRED, cw.onMember(0, 1, 0));
+        assertEquals(DEFERRED, cw.onMember(1, 1, 0));
+        assertEquals(CLOSED_BY_AGE, cw.pollQuiet(100 * MS, 1));
+        assertEquals("the synthesised commit closes the span at the last frame sent", 0, cw.groupStartBefore(1));
+        assertEquals(-1, cw.groupStartBefore(2));
+    }
+
+    @Test
+    public void testGroupStartBeforeCoversTheClosingFrame() {
+        cw.configure(3, 0);
+        assertEquals(DEFERRED, cw.onMember(0, 1, 0));
+        assertEquals(DEFERRED, cw.onMember(1, 1, 0));
+        assertEquals(CLOSED_BY_ROWS, cw.onMember(2, 1, 0));
+        assertEquals("the closing frame belongs to its group", 0, cw.groupStartBefore(2));
+        assertEquals(-1, cw.groupStartBefore(3));
+        assertEquals(DEFERRED, cw.onMember(3, 1, 0));
+        assertEquals(3, cw.groupStartBefore(4));
+        assertEquals("a closed span stays recorded until acknowledged", 0, cw.groupStartBefore(2));
+    }
+
+    @Test
+    public void testGroupStartBeforeNamesTheOpenGroup() {
+        cw.configure(1000, 0);
+        for (int i = 0; i < 3; i++) {
+            assertEquals(DEFERRED, cw.onMember(i, 1, 0));
+        }
+        assertEquals("nothing of the group precedes its first frame", -1, cw.groupStartBefore(0));
+        assertEquals(0, cw.groupStartBefore(1));
+        assertEquals(0, cw.groupStartBefore(2));
+        assertEquals("the open group's span has no end yet", 0, cw.groupStartBefore(3));
+    }
+
+    @Test
     public void testInactiveUntilABoundIsSet() {
         assertFalse(cw.isActive());
         cw.configure(0, 0);
@@ -114,6 +149,37 @@ public class CommitWindowTest {
         cw.configure(2, 0);
         assertEquals(CLOSED_BY_ROWS, cw.onMember(0, 5, 0));
         assertFalse(cw.isGroupOpen());
+    }
+
+    @Test
+    public void testOnAckedDropsSettledSpans() {
+        cw.configure(3, 0);
+        for (int i = 0; i < 6; i++) {
+            cw.onMember(i, 1, 0);
+        }
+        assertEquals(0, cw.groupStartBefore(1));
+        assertEquals(3, cw.groupStartBefore(4));
+        cw.onAcked(2);
+        assertEquals(-1, cw.groupStartBefore(1));
+        assertEquals(3, cw.groupStartBefore(4));
+        cw.onAcked(5);
+        assertEquals(-1, cw.groupStartBefore(4));
+    }
+
+    @Test
+    public void testOnAckedKeepsTheSpanHistoryBounded() {
+        cw.configure(2, 0);
+        for (int g = 0; g < 10_000; g++) {
+            long start = 2L * g;
+            assertEquals(DEFERRED, cw.onMember(start, 1, 0));
+            assertEquals(CLOSED_BY_ROWS, cw.onMember(start + 1, 1, 0));
+            // the previous group's ack arrives while this group is in flight
+            cw.onAcked(start - 1);
+            assertEquals(start, cw.groupStartBefore(start + 1));
+            assertEquals(-1, cw.groupStartBefore(start - 1));
+            assertTrue("the span history stays bounded, holds " + cw.spanBackingSize(),
+                    cw.spanBackingSize() <= 2);
+        }
     }
 
     @Test
@@ -147,6 +213,17 @@ public class CommitWindowTest {
         assertFalse(cw.isGroupOpen());
         assertEquals(NONE, cw.pollQuiet(0, 1));
         assertEquals(DEFERRED, cw.onMember(2, 1, 0));
+    }
+
+    @Test
+    public void testResetForConnectionDropsTheSpanHistory() {
+        cw.configure(3, 0);
+        for (int i = 0; i < 3; i++) {
+            cw.onMember(i, 1, 0);
+        }
+        assertEquals(0, cw.groupStartBefore(1));
+        cw.resetForConnection(5);
+        assertEquals(-1, cw.groupStartBefore(1));
     }
 
     @Test

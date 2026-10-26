@@ -70,6 +70,8 @@ public final class CursorSendCounters {
     public final AtomicLong reconnects = new AtomicLong();
     /** Non-OK / non-DURABLE_ACK frames received from the server, retriable and terminal. */
     public final AtomicLong serverErrors = new AtomicLong();
+    /** Terminal rejections inside a commit-window group that the send loop answered with one replay before latching. */
+    public final AtomicLong terminalReplays = new AtomicLong();
 
     /**
      * Folds every counter of {@code other} into this instance. Used once, when a
@@ -91,5 +93,6 @@ public final class CursorSendCounters {
         reconnectAttempts.addAndGet(other.reconnectAttempts.get());
         reconnects.addAndGet(other.reconnects.get());
         serverErrors.addAndGet(other.serverErrors.get());
+        terminalReplays.addAndGet(other.terminalReplays.get());
     }
 }

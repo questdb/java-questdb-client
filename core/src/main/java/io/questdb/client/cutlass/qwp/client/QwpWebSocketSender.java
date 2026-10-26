@@ -3129,6 +3129,15 @@ public class QwpWebSocketSender implements Sender {
         return counters.serverErrors.get();
     }
 
+    /**
+     * Terminal rejections inside a commit-window group that the I/O loop answered
+     * by replaying the group once before latching, since this sender started (see
+     * {@link #setCommitWindow}). Sender-lifetime, like the other counters.
+     */
+    public long getTotalTerminalReplays() {
+        return counters.terminalReplays.get();
+    }
+
     @Override
     public boolean hasDeferredFrames() {
         return hasDeferredMessages;

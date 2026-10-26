@@ -646,6 +646,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // user-thread caller (flush/append/close). close() uses the instance so it
     // only suppresses errors the user already owned before close() began.
     private volatile LineSenderException synchronouslySurfacedError;
+    // FSN of the frame whose terminal rejection inside a commit group made the loop
+    // replay once (handleServerRejection); a second terminal rejection of it latches.
+    // Cleared once an OK reaches it. -1 when none. I/O thread only; survives
+    // reconnects, since the replay runs on the next connection.
+    private long terminalReplayFsn = -1L;
     // Staging copy of the 12-byte QWP header of a ring frame that goes out with a
     // rewritten flags byte (sendRingFrame), so the loop never writes to ring memory.
     // I/O-thread owned: allocated on first use, freed with the catch-up buffer.
@@ -1724,6 +1729,15 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * Terminal rejections that named a frame inside a commit-window group, which
+     * the loop answered by replaying the group once before latching (see
+     * {@link #setCommitWindow}).
+     */
+    public long getTotalTerminalReplays() {
+        return counters.terminalReplays.get();
+    }
+
+    /**
      * True iff the I/O loop has at least once installed a live (connected
      * + upgraded) WebSocket client. Sticky — once true, stays true even
      * after a subsequent disconnect. Lets a {@code SenderErrorHandler}
@@ -1818,6 +1832,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * rows or its first member is {@code intervalMillis} old. 0 disables a
      * bound; both 0 disables the window and members go out committing. Callable
      * from any thread, also while the loop runs. Durable-ack mode never defers.
+     * <p>
+     * A terminal rejection of a frame that an earlier frame of its group
+     * precedes does not latch at once: the loop reconnects and replays once, as
+     * stored and committing, so the earlier frames commit, and latches when the
+     * replay rejects the same frame (see {@link #getTotalTerminalReplays}).
      *
      * @throws IllegalArgumentException if a bound is negative
      */
@@ -4554,6 +4573,13 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     poisonFsn = -1L;
                     poisonStrikes = 0;
                 }
+                // The OK commits every group span ending at or below it, and accepts the
+                // frame a terminal replay was for. Durable-ack mode records no spans: it
+                // never defers a window member.
+                commitWindow.onAcked(okFsn);
+                if (terminalReplayFsn != -1L && okFsn >= terminalReplayFsn) {
+                    terminalReplayFsn = -1L;
+                }
                 if (durableAckMode) {
                     // Durable mode: stash the (wireSeq, table_seqTxns) tuple
                     // and wait for STATUS_DURABLE_ACK to release it. Empty
@@ -4797,6 +4823,20 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             counters.serverErrors.incrementAndGet();
 
             if (policy == SenderError.Policy.TERMINAL) {
+                // A frame of an open commit group precedes the rejected one on this
+                // connection, so the rejection rolled back releases that a sender
+                // without a commit window would have committed already. Replay once,
+                // as stored and committing, so they commit one by one; the replay's
+                // own rejection of this frame then latches below with nothing
+                // uncommitted in front of it. Without reconnect plumbing the recycle
+                // would latch an untyped error instead, so latch at once there.
+                long groupStart = reconnectFactory != null && fsn != terminalReplayFsn
+                        ? commitWindow.groupStartBefore(fsn)
+                        : -1L;
+                if (groupStart >= 0) {
+                    replayGroupOnce(fsn, groupStart, category, status);
+                    return;
+                }
                 // Terminal: stash the typed payload BEFORE dispatching to the
                 // handler. The spec requires signal.terminalError to be latched
                 // before the handler is invoked so a handler that synchronously
@@ -4853,6 +4893,29 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // RTT rate for the whole window.
                 failExemptPaced(recycleCause);
             }
+        }
+
+        // The first terminal rejection of fsn inside a commit group: count it,
+        // warn, and recycle without latching or dispatching. The replay's
+        // rejection of the same frame latches and dispatches the error.
+        private void replayGroupOnce(long fsn, long groupStart, SenderError.Category category, byte status) {
+            terminalReplayFsn = fsn;
+            counters.terminalReplays.incrementAndGet();
+            String message = response.getErrorMessage();
+            String statusHex = Integer.toHexString(status & 0xFF);
+            long externalFsn = externalFsnBase + fsn;
+            LOG.warn("server rejected fsn {} (category={}, status=0x{}): {} -- terminal rejection inside an open commit group, replaying the group once before latching",
+                    externalFsn, category, statusHex, message);
+            long replayStart = engine.ackedFsn() + 1L;
+            if (groupStart > replayStart) {
+                long resent = groupStart - replayStart;
+                long fromFsn = externalFsnBase + replayStart;
+                long toFsn = externalFsnBase + groupStart - 1L;
+                LOG.warn("the commit-group replay re-sends {} committed but unacknowledged frame(s) [fsn {} to {}], which the server commits again",
+                        resent, fromFsn, toFsn);
+            }
+            fail(new LineSenderException(
+                    "replaying the open commit group once after a terminal rejection: " + message));
         }
     }
 }
