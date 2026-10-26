@@ -47,6 +47,7 @@ public class CursorSendCountersTest {
         a.reconnectAttempts.set(5);
         a.reconnects.set(6);
         a.serverErrors.set(7);
+        a.socketWrites.set(16);
         a.terminalReplays.set(15);
 
         CursorSendCounters b = new CursorSendCounters();
@@ -63,6 +64,7 @@ public class CursorSendCountersTest {
         b.reconnectAttempts.set(50);
         b.reconnects.set(60);
         b.serverErrors.set(70);
+        b.socketWrites.set(160);
         b.terminalReplays.set(150);
 
         a.addAll(b);
@@ -80,6 +82,7 @@ public class CursorSendCountersTest {
         assertEquals("reconnectAttempts must sum both sides", 55, a.reconnectAttempts.get());
         assertEquals("reconnects must sum both sides", 66, a.reconnects.get());
         assertEquals("serverErrors must sum both sides", 77, a.serverErrors.get());
+        assertEquals("socketWrites must sum both sides", 176, a.socketWrites.get());
         assertEquals("terminalReplays must sum both sides", 165, a.terminalReplays.get());
 
         assertEquals("addAll must not mutate the argument's acks", 10, b.acks.get());
@@ -95,6 +98,7 @@ public class CursorSendCountersTest {
         assertEquals("addAll must not mutate the argument's reconnectAttempts", 50, b.reconnectAttempts.get());
         assertEquals("addAll must not mutate the argument's reconnects", 60, b.reconnects.get());
         assertEquals("addAll must not mutate the argument's serverErrors", 70, b.serverErrors.get());
+        assertEquals("addAll must not mutate the argument's socketWrites", 160, b.socketWrites.get());
         assertEquals("addAll must not mutate the argument's terminalReplays", 150, b.terminalReplays.get());
     }
 }

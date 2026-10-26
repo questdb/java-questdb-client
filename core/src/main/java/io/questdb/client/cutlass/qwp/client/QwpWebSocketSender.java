@@ -3101,6 +3101,17 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Data-plane socket writes the cursor I/O loop has made since this sender
+     * started: one per single frame, per batch of consecutive frames, per
+     * dictionary catch-up chunk and per synthesised commit; pings are not
+     * counted. Below {@link #getTotalFramesSent()} once frames share writes.
+     * Sender-lifetime, like the other counters.
+     */
+    public long getTotalSocketWrites() {
+        return counters.socketWrites.get();
+    }
+
+    /**
      * Terminal rejections inside a commit-window group that the I/O loop answered
      * by replaying the group once before latching, since this sender started (see
      * {@link #setCommitWindow}). Sender-lifetime, like the other counters.

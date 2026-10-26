@@ -221,6 +221,33 @@ public class QuestDBFlushOnCloseTest {
     }
 
     @Test
+    public void testManyReleasesShareSocketWrites() throws Exception {
+        FrameLog log = new FrameLog();
+        try (TestWebSocketServer server = new TestWebSocketServer(log)) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            // no commit window: each release ships one committing frame
+            try (QuestDB db = QuestDB.connect(config(server.getPort(), "flush_on_close=on;commit_rows=0;commit_interval_ms=0;housekeeper_interval_ms=60000;"))) {
+                QwpWebSocketSender delegate = null;
+                for (int i = 0; i < 2000; i++) {
+                    try (Sender s = db.borrowSender()) {
+                        if (delegate == null) {
+                            delegate = (QwpWebSocketSender) ((PooledSender) s).getDelegateForTesting();
+                        }
+                        s.table("t").longColumn("v", i).atNow();
+                    }
+                }
+                log.awaitDataFrames(2000, 10_000);
+                Assert.assertEquals("one data frame per release", 2000, log.dataFrames());
+                long writes = delegate.getTotalSocketWrites();
+                long frames = delegate.getTotalFramesSent();
+                Assert.assertTrue("consecutive frames share socket writes: " + writes + " write(s) for " + frames + " frame(s)",
+                        writes < frames);
+            }
+        }
+    }
+
+    @Test
     public void testOverCapBatchRetiresTheSlotInsteadOfPoisoningIt() throws Exception {
         FrameLog log = new FrameLog();
         try (TestWebSocketServer server = new TestWebSocketServer(log)) {

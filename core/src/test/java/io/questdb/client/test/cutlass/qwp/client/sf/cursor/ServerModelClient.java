@@ -27,6 +27,8 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
+import io.questdb.client.cutlass.http.client.WebSocketSendBuffer;
+import io.questdb.client.cutlass.qwp.websocket.WebSocketFrameWriter;
 import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
@@ -41,13 +43,19 @@ import java.util.List;
  * see real server commit semantics without a socket.
  * <p>
  * Each instance is one model connection, opened by the constructor. Each
- * {@code sendBinary} call is one socket write: the client records it with
- * {@link QwpServerModel#recordSocketWrite}, assembles the slices into one frame
- * and passes it to {@link QwpServerModel#receive}; the responses queue on this
- * instance, and each {@link #tryReceiveFrame} call delivers one of them from
- * native memory. {@link #holdResponses} keeps them queued, so a test can let
- * the loop send more frames before it sees a response, and
- * {@link #dropConnection()} models a dead link.
+ * {@code sendBinary} call and each {@link #sendBinaryBatch} call is one socket
+ * write: the client records it with {@link QwpServerModel#recordSocketWrite},
+ * counting the bytes a socket would carry, masked WebSocket headers included,
+ * then passes each frame it carries to {@link QwpServerModel#receive}, in order.
+ * A batch is built in the real send buffer by the base class's
+ * {@code appendBinaryToBatch}, and {@link #sendBinaryBatch} decodes it frame by
+ * frame. Batching is on by default; {@link #setBatchSendSupported} turns it off,
+ * the way a client without it behaves.
+ * <p>
+ * The responses queue on this instance, and each {@link #tryReceiveFrame} call
+ * delivers one of them from native memory. {@link #holdResponses} keeps them
+ * queued, so a test can let the loop send more frames before it sees a
+ * response, and {@link #dropConnection()} models a dead link.
  * <p>
  * The send loop calls the transport methods on its I/O thread; any thread may
  * call {@link #holdResponses} and {@link #dropConnection()}.
@@ -58,6 +66,7 @@ public final class ServerModelClient extends WebSocketClient {
     private final QwpServerModel model;
     private final ArrayDeque<byte[]> responses = new ArrayDeque<>();
     private boolean hasReportedDrop;
+    private volatile boolean isBatchSendSupported = true;
     private volatile boolean isDropped;
     private volatile boolean isHoldingResponses;
 
@@ -65,6 +74,15 @@ public final class ServerModelClient extends WebSocketClient {
         super(DefaultHttpClientConfiguration.INSTANCE, PlainSocketFactory.INSTANCE);
         this.model = model;
         this.connection = model.openConnection();
+    }
+
+    /**
+     * Starts a batch in the base class's send buffer. Unlike the base class it
+     * skips the connected check: this client has no upgraded socket.
+     */
+    @Override
+    public void beginBinaryBatch() {
+        getSendBuffer().reset();
     }
 
     /**
@@ -98,12 +116,18 @@ public final class ServerModelClient extends WebSocketClient {
     }
 
     @Override
+    public boolean isBatchSendSupported() {
+        return isBatchSendSupported;
+    }
+
+    @Override
     public void sendBinary(long dataPtr, int length) {
         if (isDropped) {
             return;
         }
         byte[] frame = new byte[length];
         copyToArray(dataPtr, frame, 0, length);
+        model.recordSocketWrite(WebSocketFrameWriter.headerSize(length, true) + length);
         deliver(frame);
     }
 
@@ -112,10 +136,44 @@ public final class ServerModelClient extends WebSocketClient {
         if (isDropped) {
             return;
         }
-        byte[] frame = new byte[firstLength + secondLength];
+        int length = firstLength + secondLength;
+        byte[] frame = new byte[length];
         copyToArray(firstPtr, frame, 0, firstLength);
         copyToArray(secondPtr, frame, firstLength, secondLength);
+        model.recordSocketWrite(WebSocketFrameWriter.headerSize(length, true) + length);
         deliver(frame);
+    }
+
+    /**
+     * One socket write of the batch in the send buffer: records its byte count,
+     * then unmasks each WebSocket frame in it and passes the frames to the model
+     * in order.
+     */
+    @Override
+    public void sendBinaryBatch() {
+        WebSocketSendBuffer buffer = getSendBuffer();
+        try {
+            if (isDropped) {
+                return;
+            }
+            long ptr = buffer.getBufferPtr();
+            int length = buffer.getWritePos();
+            model.recordSocketWrite(length);
+            int pos = 0;
+            while (pos < length) {
+                pos = deliverMaskedFrame(ptr, pos, length);
+            }
+        } finally {
+            buffer.reset();
+        }
+    }
+
+    /**
+     * Whether this client sends a batch with one socket write; true by default.
+     * Set it before the loop gets the client.
+     */
+    public void setBatchSendSupported(boolean isSupported) {
+        isBatchSendSupported = isSupported;
     }
 
     @Override
@@ -168,11 +226,47 @@ public final class ServerModelClient extends WebSocketClient {
     }
 
     private void deliver(byte[] frame) {
-        model.recordSocketWrite(frame.length);
         List<byte[]> out = model.receive(connection, frame);
         synchronized (responses) {
             responses.addAll(out);
         }
+    }
+
+    // Decodes the masked binary WebSocket frame at ptr + pos, delivers its
+    // payload and returns the position just past it.
+    private int deliverMaskedFrame(long ptr, int pos, int limit) {
+        int byte0 = Unsafe.getUnsafe().getByte(ptr + pos) & 0xFF;
+        int byte1 = Unsafe.getUnsafe().getByte(ptr + pos + 1) & 0xFF;
+        if (byte0 != 0x82 || (byte1 & 0x80) == 0) {
+            throw new IllegalStateException("not a masked final binary frame at " + pos
+                    + ": " + Integer.toHexString(byte0) + ' ' + Integer.toHexString(byte1));
+        }
+        int lengthCode = byte1 & 0x7F;
+        int headerLength;
+        long payloadLength;
+        if (lengthCode == 126) {
+            payloadLength = ((Unsafe.getUnsafe().getByte(ptr + pos + 2) & 0xFF) << 8)
+                    | (Unsafe.getUnsafe().getByte(ptr + pos + 3) & 0xFF);
+            headerLength = 4;
+        } else if (lengthCode == 127) {
+            payloadLength = Long.reverseBytes(Unsafe.getUnsafe().getLong(ptr + pos + 2));
+            headerLength = 10;
+        } else {
+            payloadLength = lengthCode;
+            headerLength = 2;
+        }
+        long maskAddr = ptr + pos + headerLength;
+        long payloadAddr = maskAddr + 4;
+        if (payloadLength > Integer.MAX_VALUE || payloadAddr + payloadLength > ptr + limit) {
+            throw new IllegalStateException("frame at " + pos + " runs past the batch: " + payloadLength);
+        }
+        byte[] frame = new byte[(int) payloadLength];
+        for (int i = 0; i < frame.length; i++) {
+            byte mask = Unsafe.getUnsafe().getByte(maskAddr + (i & 3));
+            frame[i] = (byte) (Unsafe.getUnsafe().getByte(payloadAddr + i) ^ mask);
+        }
+        deliver(frame);
+        return (int) (payloadAddr + payloadLength - ptr);
     }
 
 }

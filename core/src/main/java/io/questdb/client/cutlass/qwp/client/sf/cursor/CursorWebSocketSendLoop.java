@@ -41,6 +41,7 @@ import io.questdb.client.cutlass.qwp.client.QwpVersionMismatchException;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
+import io.questdb.client.cutlass.qwp.websocket.WebSocketFrameWriter;
 import io.questdb.client.std.CharSequenceLongHashMap;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.QuietCloseable;
@@ -63,7 +64,8 @@ import java.util.concurrent.locks.LockSupport;
  * <ol>
  *   <li>Polls {@link CursorSendEngine#publishedFsn()} and walks newly-published
  *       frames from the engine's segments, sending each as one WebSocket
- *       binary frame to the server.</li>
+ *       binary frame to the server. Consecutive published frames share one
+ *       socket write of up to 64 KiB (see {@link #trySendOne}).</li>
  *   <li>Polls the WebSocket for server ACK frames; on each ACK with
  *       cumulative wire sequence {@code N}, calls
  *       {@code engine.acknowledge(fsnAtZero + N - S)}, where {@code S} counts
@@ -273,6 +275,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * Throttle "reconnect attempt N failed" WARN logs to one per 5 s.
      */
     private static final long RECONNECT_LOG_THROTTLE_NANOS = 5_000_000_000L;
+    // Socket-write budget of network batching: trySendBatch packs consecutive ring
+    // frames into one write while their bytes, WebSocket headers included, stay
+    // within it. The first frame of a batch always goes, however large.
+    private static final int SEND_BATCH_BUDGET_BYTES = 64 * 1024;
     // The commit-only frame trySendGroupCommit synthesises: a 12-byte QWP header
     // and an empty delta section [0][0].
     private static final int SYNTHETIC_COMMIT_SIZE = QwpConstants.HEADER_SIZE + 2;
@@ -1726,6 +1732,15 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      */
     public long getTotalServerErrors() {
         return counters.serverErrors.get();
+    }
+
+    /**
+     * Data-plane socket writes: a single ring frame, a batch of consecutive ring
+     * frames, a dictionary catch-up chunk or a synthesised commit; pings are not
+     * counted. Below {@link #getTotalFramesSent()} once frames share writes.
+     */
+    public long getTotalSocketWrites() {
+        return counters.socketWrites.get();
     }
 
     /**
@@ -3688,6 +3703,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         nextWireSeq++; // this catch-up chunk consumed a wire sequence
         lastFrameOrPingNanos = System.nanoTime();
         counters.framesSent.incrementAndGet();
+        counters.socketWrites.incrementAndGet();
     }
 
     @TestOnly
@@ -3835,6 +3851,23 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         return trySendOne();
     }
 
+    /**
+     * As {@link #sendRingFrame}, but appends the frame to the client's open batch
+     * instead of writing it.
+     */
+    private void appendRingFrame(long frameAddr, int payloadLen, int wireFlags) {
+        if (wireFlags < 0) {
+            client.appendBinaryToBatch(frameAddr, payloadLen);
+            return;
+        }
+        client.appendBinaryToBatch(
+                wireHeader(frameAddr, wireFlags),
+                QwpConstants.HEADER_SIZE,
+                frameAddr + QwpConstants.HEADER_SIZE,
+                payloadLen - QwpConstants.HEADER_SIZE
+        );
+    }
+
     // Counts a commit-window group close by its cause; NONE and DEFERRED count nothing here.
     private void countClose(int closeCode) {
         switch (closeCode) {
@@ -3898,6 +3931,20 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * True when the ring frame at {@code offset} of the sending segment is
+     * published whole: its frame header and its payload. A negative payload
+     * length reads as not published, leaving it to trySendOne's own check.
+     */
+    private boolean isFullyPublished(long offset) {
+        long pub = sendingSegment.publishedOffset();
+        if (offset + MmapSegment.FRAME_HEADER_SIZE > pub) {
+            return false;
+        }
+        int payloadLen = Unsafe.getUnsafe().getInt(sendingSegment.address() + offset + 4);
+        return payloadLen >= 0 && offset + MmapSegment.FRAME_HEADER_SIZE + payloadLen <= pub;
+    }
+
+    /**
      * The FSN of the next ring frame this connection sends.
      */
     private long nextFsnToSend() {
@@ -3921,11 +3968,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             client.sendBinary(frameAddr, payloadLen);
             return;
         }
-        long scratch = wireScratch();
-        Unsafe.getUnsafe().copyMemory(frameAddr, scratch, QwpConstants.HEADER_SIZE);
-        Unsafe.getUnsafe().putByte(scratch + QwpConstants.HEADER_OFFSET_FLAGS, (byte) wireFlags);
         client.sendBinary(
-                scratch,
+                wireHeader(frameAddr, wireFlags),
                 QwpConstants.HEADER_SIZE,
                 frameAddr + QwpConstants.HEADER_SIZE,
                 payloadLen - QwpConstants.HEADER_SIZE
@@ -3942,6 +3986,69 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             fail(t);
         }
         return any;
+    }
+
+    /**
+     * Sends the validated ring frame at {@code sendOffset} and the fully
+     * published frames after it in the sending segment with one socket write.
+     * Each frame stays its own WebSocket message and takes its own wire sequence,
+     * so the ack and FSN mapping are those of frame-by-frame sending. A next frame
+     * joins while the batch, WebSocket headers included, stays within
+     * {@link #SEND_BATCH_BUDGET_BYTES} and its delta start is covered by
+     * {@code sentDictCount}; the batch stops before a frame the torn-dictionary
+     * guard would reject, and the next pass rejects it.
+     * <p>
+     * Every frame takes the steps a single send gives it, in FSN order: the
+     * window decision ({@link #wireFlagsFor}), the dictionary mirror
+     * ({@link #accumulateSentDict}), and the cursor and wire-sequence advance.
+     * They run as the frame is packed, before the write, because the next frame's
+     * guard reads the mirror. A failed write goes to {@link #fail}: the reconnect
+     * re-anchors the cursor, the wire sequence and the window, and its catch-up
+     * tolerates mirror entries the server never saw.
+     *
+     * @return true if the batch went out, false if the write failed
+     */
+    private boolean trySendBatch(long frameAddr, int payloadLen, long frameEnd, int deltaStart, long nowNanos) {
+        long base = sendingSegment.address();
+        int frames = 0;
+        try {
+            client.beginBinaryBatch();
+            while (true) {
+                appendRingFrame(frameAddr, payloadLen, wireFlagsFor(frameAddr, payloadLen, nextFsnToSend(), nowNanos));
+                if (deltaStart >= 0) {
+                    accumulateSentDict(frameAddr, payloadLen, deltaStart);
+                }
+                sendOffset = frameEnd;
+                nextWireSeq++;
+                frames++;
+                if (!isFullyPublished(frameEnd)) {
+                    break;
+                }
+                int nextLen = Unsafe.getUnsafe().getInt(base + frameEnd + 4);
+                if ((long) client.getBinaryBatchBytes() + WebSocketFrameWriter.headerSize(nextLen, true) + nextLen
+                        > SEND_BATCH_BUDGET_BYTES) {
+                    break;
+                }
+                long nextAddr = base + frameEnd + MmapSegment.FRAME_HEADER_SIZE;
+                int nextDeltaStart = frameDeltaStart(nextAddr, nextLen);
+                if (nextDeltaStart > sentDictCount) {
+                    break;
+                }
+                frameAddr = nextAddr;
+                payloadLen = nextLen;
+                frameEnd += MmapSegment.FRAME_HEADER_SIZE + nextLen;
+                deltaStart = nextDeltaStart;
+            }
+            client.sendBinaryBatch();
+        } catch (Throwable t) {
+            fail(t);
+            return false;
+        }
+        dataFrameSentThisConnection = true;
+        lastFrameOrPingNanos = nowNanos;
+        counters.framesSent.addAndGet(frames);
+        counters.socketWrites.incrementAndGet();
+        return true;
     }
 
     /**
@@ -3985,6 +4092,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         syntheticWireSeqs.add(nextWireSeq);
         nextWireSeq++;
         counters.framesSent.incrementAndGet();
+        counters.socketWrites.incrementAndGet();
         counters.commitFramesSynthesised.incrementAndGet();
         countClose(closeCode);
         lastFrameOrPingNanos = nowNanos;
@@ -3992,9 +4100,18 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * Sends the next ring frame. With a client that supports batching
+     * ({@link WebSocketClient#isBatchSendSupported()}), outside a replay
+     * ({@code replayTargetFsn < 0}) and with no orphan tail pending, and when the
+     * frame after it in the same segment is already published whole, the send
+     * goes through {@link #trySendBatch}: the frame and the fully published
+     * frames after it share one socket write of at most
+     * {@link #SEND_BATCH_BUDGET_BYTES} (a single frame above the budget goes
+     * alone). Otherwise the frame goes out alone, as one socket write.
+     * <p>
      * Returns true if at least one frame was sent (caller skips the park).
-     * Bounded: sends at most one frame per call so the ACK side gets
-     * scheduling fairness.
+     * Bounded: one write per call, of at most the budget unless a single frame
+     * exceeds it, so the ACK side gets scheduling fairness.
      */
     private boolean trySendOne() {
         if (orphanSkipTipFsn >= 0 && nextFsnToSend() >= orphanSkipStartFsn) {
@@ -4112,9 +4229,15 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             return false;
         }
         long fsnSent = nextFsnToSend();
-        // One clock read per frame: the commit window's age bound and the idle
+        // One clock read per write: the commit window's age bound and the idle
         // keepalive both take it.
         long nowNanos = System.nanoTime();
+        if (replayTargetFsn < 0
+                && orphanSkipTipFsn < 0
+                && client.isBatchSendSupported()
+                && isFullyPublished(frameEnd)) {
+            return trySendBatch(frameAddr, payloadLen, frameEnd, deltaStart, nowNanos);
+        }
         try {
             sendRingFrame(frameAddr, payloadLen, wireFlagsFor(frameAddr, payloadLen, fsnSent, nowNanos));
         } catch (Throwable t) {
@@ -4142,6 +4265,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         sendOffset = frameEnd;
         nextWireSeq++;
         counters.framesSent.incrementAndGet();
+        counters.socketWrites.incrementAndGet();
         if (replayTargetFsn >= 0) {
             counters.framesReplayed.incrementAndGet();
             if (fsnSent >= replayTargetFsn) {
@@ -4201,6 +4325,18 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         }
         countClose(verdict);
         return wireFlags;
+    }
+
+    /**
+     * Copies the 12-byte QWP header of the ring frame at {@code frameAddr} to the
+     * wire scratch with {@code wireFlags} as its flags byte, and returns the
+     * scratch address. Ring memory stays untouched.
+     */
+    private long wireHeader(long frameAddr, int wireFlags) {
+        long scratch = wireScratch();
+        Unsafe.getUnsafe().copyMemory(frameAddr, scratch, QwpConstants.HEADER_SIZE);
+        Unsafe.getUnsafe().putByte(scratch + QwpConstants.HEADER_OFFSET_FLAGS, (byte) wireFlags);
+        return scratch;
     }
 
     private long wireScratch() {

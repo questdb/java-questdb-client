@@ -57,6 +57,11 @@ public class WebSocketClientLinux extends WebSocketClient {
     }
 
     @Override
+    public boolean isBatchSendSupported() {
+        return true;
+    }
+
+    @Override
     protected void ioWait(int timeout, int op) {
         final int event = op == IOOperation.WRITE ? EpollAccessor.EPOLLOUT : EpollAccessor.EPOLLIN;
         if (epoll.control(socket.getFd(), 0, EpollAccessor.EPOLL_CTL_MOD, event) < 0) {

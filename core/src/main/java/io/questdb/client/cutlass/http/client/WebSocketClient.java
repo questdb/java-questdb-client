@@ -219,6 +219,35 @@ public abstract class WebSocketClient implements QuietCloseable {
         }
     }
 
+    /**
+     * Appends one binary frame of {@code len} bytes to the batch that
+     * {@link #beginBinaryBatch()} started.
+     */
+    public void appendBinaryToBatch(long ptr, int len) {
+        sendBuffer.appendBinaryFrame(ptr, len, 0L, 0);
+    }
+
+    /**
+     * Appends one binary frame whose payload is the two slices back to back to the
+     * batch that {@link #beginBinaryBatch()} started.
+     */
+    public void appendBinaryToBatch(long firstPtr, int firstLen, long secondPtr, int secondLen) {
+        sendBuffer.appendBinaryFrame(firstPtr, firstLen, secondPtr, secondLen);
+    }
+
+    /**
+     * Starts a batch of binary frames that {@link #sendBinaryBatch()} writes to
+     * the socket in one go. Each frame stays its own WebSocket message. The batch
+     * lives in the send buffer, so no other data send may run between this call
+     * and {@link #sendBinaryBatch()}. A caller checks
+     * {@link #isBatchSendSupported()} first: a subclass that overrides only
+     * {@code sendBinary} never sees frames sent this way.
+     */
+    public void beginBinaryBatch() {
+        checkConnected();
+        sendBuffer.reset();
+    }
+
     @Override
     public void close() {
         // CAS gate: exactly one closer runs the teardown below. Closers can be
@@ -301,6 +330,14 @@ public abstract class WebSocketClient implements QuietCloseable {
         recvPos = 0;
         recvReadPos = 0;
         resetFragmentState();
+    }
+
+    /**
+     * Bytes in the current batch so far, WebSocket headers included: what
+     * {@link #sendBinaryBatch()} would write now.
+     */
+    public int getBinaryBatchBytes() {
+        return sendBuffer.getWritePos();
     }
 
     /**
@@ -404,6 +441,16 @@ public abstract class WebSocketClient implements QuietCloseable {
      */
     public int getUpgradeStatusCode() {
         return upgradeStatusCode;
+    }
+
+    /**
+     * Whether this client sends a batch ({@link #beginBinaryBatch()},
+     * {@code appendBinaryToBatch}, {@link #sendBinaryBatch()}) with one socket
+     * write. False here, so a subclass that overrides only {@code sendBinary}
+     * keeps every frame on that path; the platform clients return true.
+     */
+    public boolean isBatchSendSupported() {
+        return false;
     }
 
     /**
@@ -523,6 +570,15 @@ public abstract class WebSocketClient implements QuietCloseable {
      */
     public void sendBinary(long firstPtr, int firstLength, long secondPtr, int secondLength) {
         sendBinary(firstPtr, firstLength, secondPtr, secondLength, defaultTimeout);
+    }
+
+    /**
+     * Writes the batch to the socket with one send of the whole buffer and the
+     * default timeout, then resets the buffer.
+     */
+    public void sendBinaryBatch() {
+        doSend(sendBuffer.getBufferPtr(), sendBuffer.getWritePos(), defaultTimeout);
+        sendBuffer.reset();
     }
 
     /**

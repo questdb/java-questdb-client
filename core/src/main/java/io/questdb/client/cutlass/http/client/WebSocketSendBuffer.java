@@ -111,6 +111,35 @@ public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
     }
 
     /**
+     * Appends one complete masked binary frame at the write position, its
+     * payload the two slices back to back, with a header of exactly the size its
+     * payload length needs ({@link WebSocketFrameWriter#headerSize}). Frames
+     * appended in a row sit contiguously, so one socket write sends them all.
+     * Independent of {@link #beginFrame()} / {@link #endFrame(int)}.
+     *
+     * @param firstPtr  pointer to the first payload slice
+     * @param firstLen  first slice length
+     * @param secondPtr pointer to the second payload slice
+     * @param secondLen second slice length, may be 0
+     */
+    public void appendBinaryFrame(long firstPtr, int firstLen, long secondPtr, int secondLen) {
+        int payloadLen = firstLen + secondLen;
+        int headerSize = WebSocketFrameWriter.headerSize(payloadLen, true);
+        ensureCapacity(headerSize + payloadLen);
+        int frameStart = writePos;
+        writePos += headerSize;
+        putBlockOfBytes(firstPtr, firstLen);
+        putBlockOfBytes(secondPtr, secondLen);
+        // read bufPtr only after the growth above: growing reallocates the buffer
+        long frameAddr = bufPtr + frameStart;
+        int maskKey = rnd.nextInt();
+        WebSocketFrameWriter.writeHeader(frameAddr, true, WebSocketOpcode.BINARY, payloadLen, maskKey);
+        if (payloadLen > 0) {
+            WebSocketFrameWriter.maskPayload(frameAddr + headerSize, payloadLen, maskKey);
+        }
+    }
+
+    /**
      * Begins a new WebSocket frame. Reserves space for the maximum header size.
      * The opcode is specified later when ending the frame via {@link #endFrame(int)}.
      */

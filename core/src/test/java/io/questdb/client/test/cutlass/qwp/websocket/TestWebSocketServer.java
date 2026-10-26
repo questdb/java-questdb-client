@@ -515,7 +515,9 @@ public class TestWebSocketServer implements Closeable {
      * Handles a single WebSocket client connection.
      */
     public class ClientHandler implements Closeable {
-        private final ByteBuffer recvBuffer = ByteBuffer.allocate(65_536).order(ByteOrder.BIG_ENDIAN);
+        // 256 KiB, well above the batch a client writes: up to 64 KiB of frames back
+        // to back in one socket write.
+        private final ByteBuffer recvBuffer = ByteBuffer.allocate(262_144).order(ByteOrder.BIG_ENDIAN);
         private final AtomicBoolean running = new AtomicBoolean(false);
         private final Socket socket;
         private InputStream in;
@@ -902,7 +904,7 @@ public class TestWebSocketServer implements Closeable {
                             // append to recvBuffer
                             recvBuffer.compact();
                             if (recvBuffer.remaining() < read) {
-                                // should not happen with 64k buffer in tests
+                                // should not happen with the 256 KiB buffer in tests
                                 LOG.error("Receive buffer overflow");
                                 break;
                             }

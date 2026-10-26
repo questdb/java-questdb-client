@@ -56,6 +56,11 @@ public class WebSocketClientOsx extends WebSocketClient {
     }
 
     @Override
+    public boolean isBatchSendSupported() {
+        return true;
+    }
+
+    @Override
     protected void ioWait(int timeout, int op) {
         kqueue.setWriteOffset(0);
         if (op == IOOperation.READ) {

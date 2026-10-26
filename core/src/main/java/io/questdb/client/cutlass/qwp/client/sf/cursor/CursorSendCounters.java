@@ -70,6 +70,12 @@ public final class CursorSendCounters {
     public final AtomicLong reconnects = new AtomicLong();
     /** Non-OK / non-DURABLE_ACK frames received from the server, retriable and terminal. */
     public final AtomicLong serverErrors = new AtomicLong();
+    /**
+     * Data-plane socket writes the send loop made: a single ring frame, a batch of
+     * ring frames, a dictionary catch-up chunk or a synthesised commit; pings
+     * excluded. At most {@link #framesSent}; below it once frames share writes.
+     */
+    public final AtomicLong socketWrites = new AtomicLong();
     /** Terminal rejections inside a commit-window group that the send loop answered with one replay before latching. */
     public final AtomicLong terminalReplays = new AtomicLong();
 
@@ -93,6 +99,7 @@ public final class CursorSendCounters {
         reconnectAttempts.addAndGet(other.reconnectAttempts.get());
         reconnects.addAndGet(other.reconnects.get());
         serverErrors.addAndGet(other.serverErrors.get());
+        socketWrites.addAndGet(other.socketWrites.get());
         terminalReplays.addAndGet(other.terminalReplays.get());
     }
 }

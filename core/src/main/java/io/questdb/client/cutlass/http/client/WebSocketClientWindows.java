@@ -56,6 +56,11 @@ public class WebSocketClientWindows extends WebSocketClient {
     }
 
     @Override
+    public boolean isBatchSendSupported() {
+        return true;
+    }
+
+    @Override
     protected void ioWait(int timeout, int op) {
         final long readAddr;
         final long writeAddr;
