@@ -67,6 +67,9 @@ public final class JavaTlsClientSocket implements Socket {
     private int state = STATE_EMPTY;
     private long unwrapInputBufferPtr;
     private long unwrapOutputBufferPtr;
+    // A complete TLS record was left in unwrapInputBuffer because the caller's
+    // buffer was full; see hasBufferedInput().
+    private boolean unprocessedRecordPending;
     private long wrapOutputBufferPtr;
 
     JavaTlsClientSocket(NetworkFacade nf, Logger log, ClientTlsConfiguration tlsConfig) {
@@ -173,6 +176,11 @@ public final class JavaTlsClientSocket implements Socket {
     }
 
     @Override
+    public boolean hasBufferedInput() {
+        return unwrapOutputBuffer.position() != 0 || unprocessedRecordPending;
+    }
+
+    @Override
     public int recv(long bufferPtr, int bufferLen) {
         assert sslEngine != null;
 
@@ -181,6 +189,7 @@ public final class JavaTlsClientSocket implements Socket {
             if (unwrapOutputBuffer.position() != 0) {
                 return drainUnwrapOutputBuffer(bufferPtr, bufferLen);
             }
+            unprocessedRecordPending = false;
 
             // Fast path: have the SSLEngine decrypt straight into the caller's buffer. We only fall
             // back to the internal spill buffer if a single TLS record does not fit in the caller's
@@ -222,11 +231,16 @@ public final class JavaTlsClientSocket implements Socket {
                         if (output.position() != 0) {
                             return spilling ? drainUnwrapOutputBuffer(bufferPtr, bufferLen) : output.position();
                         }
-                        return 0;
+                        // The stream ended inside a record, which can now never complete:
+                        // report the disconnect. Returning 0 would read as "no data yet"
+                        // while the fd stays readable at EOF, spinning a readiness wait.
+                        return n < 0 ? n : 0;
                     case BUFFER_OVERFLOW:
                         if (output.position() != 0) {
                             // Output already has plaintext: hand it to the caller and let the
-                            // unprocessed record be picked up on the next recv() call.
+                            // unprocessed record be picked up on the next recv() call. The fd may
+                            // be empty by then, so record that we hold progress the kernel cannot see.
+                            unprocessedRecordPending = true;
                             return spilling ? drainUnwrapOutputBuffer(bufferPtr, bufferLen) : output.position();
                         }
                         if (spilling) {

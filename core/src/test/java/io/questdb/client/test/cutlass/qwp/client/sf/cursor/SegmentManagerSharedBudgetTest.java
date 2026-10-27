@@ -28,6 +28,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentBudget;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
+import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.tools.TestUtils;
@@ -36,6 +37,7 @@ import org.junit.Test;
 
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 
@@ -47,7 +49,6 @@ import java.util.function.BooleanSupplier;
 public class SegmentManagerSharedBudgetTest {
 
     private static final int FRAME_PAYLOAD = 64;
-    private static final long POLL_NANOS = 200_000L;
     // Exactly two frames per segment, so the rotation arithmetic below is exact.
     private static final long SEGMENT_SIZE = MmapSegment.HEADER_SIZE
             + 2 * (MmapSegment.FRAME_HEADER_SIZE + FRAME_PAYLOAD);
@@ -57,8 +58,8 @@ public class SegmentManagerSharedBudgetTest {
         TestUtils.assertMemoryLeak(() -> {
             // Producers on four managers race for one budget while acks trim behind
             // them. tryCharge must never let the budget exceed its capacity by more
-            // than the minimum working sets the managers grant unconditionally, and
-            // once every ring is deregistered nothing may remain charged.
+            // than the minimum working sets the provisioners grant unconditionally,
+            // and once every ring is deregistered nothing may remain charged.
             final int ringCount = 4;
             final SegmentBudget budget = new SegmentBudget(6 * SEGMENT_SIZE);
             final long bound = budget.getCapacityBytes() + ringCount * 2 * SEGMENT_SIZE;
@@ -70,7 +71,7 @@ public class SegmentManagerSharedBudgetTest {
             try {
                 for (int i = 0; i < ringCount; i++) {
                     rings[i] = newRing();
-                    managers[i] = new SegmentManager(SEGMENT_SIZE, POLL_NANOS, budget);
+                    managers[i] = new SegmentManager(SEGMENT_SIZE, budget);
                     managers[i].start();
                     managers[i].register(rings[i], null);
                 }
@@ -148,8 +149,8 @@ public class SegmentManagerSharedBudgetTest {
             long buf = Unsafe.malloc(FRAME_PAYLOAD, MemoryTag.NATIVE_DEFAULT);
             try (SegmentRing busy = newRing();
                  SegmentRing sibling = newRing();
-                 SegmentManager busyManager = new SegmentManager(SEGMENT_SIZE, POLL_NANOS, budget);
-                 SegmentManager siblingManager = new SegmentManager(SEGMENT_SIZE, POLL_NANOS, budget)) {
+                 SegmentManager busyManager = new SegmentManager(SEGMENT_SIZE, budget);
+                 SegmentManager siblingManager = new SegmentManager(SEGMENT_SIZE, budget)) {
                 busyManager.start();
                 siblingManager.start();
 
@@ -162,9 +163,9 @@ public class SegmentManagerSharedBudgetTest {
                 Assert.assertEquals(4 * SEGMENT_SIZE, budget.getSegmentBytes());
 
                 // A ring on ANOTHER manager finds the budget spent. It still gets its
-                // minimum working set -- the active segment plus one spare, four
-                // frames -- but nothing beyond: a private budget of the same size
-                // would have let it grow to four segments of its own.
+                // minimum working set -- the active segment plus the one it rotates
+                // into, four frames -- but nothing beyond: a private budget of the
+                // same size would have let it grow to four segments of its own.
                 siblingManager.register(sibling, null);
                 appendFrames(sibling, buf, 4);
                 assertCapped(sibling, buf);
@@ -176,9 +177,7 @@ public class SegmentManagerSharedBudgetTest {
                 // the room they leave -- up to the whole budget, and no further.
                 busyManager.deregister(busy);
                 Assert.assertTrue(busyManager.awaitRingQuiescence(busy));
-                Assert.assertTrue("the sibling must get a spare once the budget has room",
-                        waitFor(() -> !sibling.needsHotSpare()));
-                Assert.assertEquals(3 * SEGMENT_SIZE, budget.getSegmentBytes());
+                Assert.assertEquals(2 * SEGMENT_SIZE, budget.getSegmentBytes());
                 appendFrames(sibling, buf, 4);
                 assertCapped(sibling, buf);
                 Assert.assertEquals(4 * SEGMENT_SIZE, sibling.totalSegmentBytes());
@@ -187,6 +186,43 @@ public class SegmentManagerSharedBudgetTest {
                 siblingManager.deregister(sibling);
                 Assert.assertTrue(siblingManager.awaitRingQuiescence(sibling));
                 Assert.assertEquals(0, budget.getSegmentBytes());
+            } finally {
+                Unsafe.free(buf, FRAME_PAYLOAD, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    /**
+     * Room another manager frees is taken by a refused producer on its very
+     * next append: no wake, no timer, nothing for the starved ring's manager
+     * to do (its clock runs backwards so no timed pass can help).
+     */
+    @Test
+    public void testSiblingDeregisterFreesRoomForRefusedProducer() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            SegmentBudget budget = new SegmentBudget(4 * SEGMENT_SIZE);
+            AtomicLong clock = new AtomicLong();
+            long buf = Unsafe.malloc(FRAME_PAYLOAD, MemoryTag.NATIVE_DEFAULT);
+            try (SegmentRing busy = newRing();
+                 SegmentRing starved = newRing();
+                 SegmentManager busyManager = new SegmentManager(SEGMENT_SIZE, budget);
+                 SegmentManager starvedManager = new SegmentManager(SEGMENT_SIZE, budget, FilesFacade.INSTANCE,
+                         () -> clock.addAndGet(-TimeUnit.SECONDS.toNanos(10)))) {
+                busyManager.start();
+                starvedManager.start();
+                busyManager.register(busy, null);
+                appendFrames(busy, buf, 8);
+                assertCapped(busy, buf);
+                starvedManager.register(starved, null);
+                appendFrames(starved, buf, 4);
+                assertCapped(starved, buf);
+
+                busyManager.deregister(busy);
+                Assert.assertTrue("freed budget must let the refused producer rotate at once",
+                        starved.appendOrFsn(buf, FRAME_PAYLOAD) >= 0);
+                Assert.assertTrue(busyManager.awaitRingQuiescence(busy));
+                starvedManager.deregister(starved);
+                Assert.assertTrue(starvedManager.awaitRingQuiescence(starved));
             } finally {
                 Unsafe.free(buf, FRAME_PAYLOAD, MemoryTag.NATIVE_DEFAULT);
             }
@@ -207,10 +243,7 @@ public class SegmentManagerSharedBudgetTest {
         }
     }
 
-    private static void assertCapped(SegmentRing ring, long buf) throws InterruptedException {
-        // Ample time for a manager worker to (wrongly) provision past the budget.
-        Thread.sleep(100);
-        Assert.assertTrue("the budget must refuse this ring another spare", ring.needsHotSpare());
+    private static void assertCapped(SegmentRing ring, long buf) {
         Assert.assertEquals(SegmentRing.BACKPRESSURE_NO_SPARE, ring.appendOrFsn(buf, FRAME_PAYLOAD));
     }
 
