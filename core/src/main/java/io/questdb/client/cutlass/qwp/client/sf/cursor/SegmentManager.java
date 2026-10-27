@@ -516,7 +516,8 @@ public final class SegmentManager implements QuietCloseable {
                     // Reverse the ring's charge to the budget: the seed from
                     // register() plus every segment the producer created
                     // since, minus the trims -- all of it is
-                    // totalSegmentBytes() now.
+                    // totalSegmentBytes() now, including a segment the
+                    // provisioner holds after a failed rotation.
                     e.deregister();
                     budget.release(ring.totalSegmentBytes());
                     if (e.sideFileBytes != null) {

@@ -50,6 +50,16 @@ public interface SegmentSource extends QuietCloseable {
      */
     void discard(MmapSegment segment);
 
+    /**
+     * Bytes of segments the source holds for the ring's next rotation (a
+     * segment handed back through {@link #discard}). They stay charged to the
+     * budget, so {@link SegmentRing#totalSegmentBytes()} counts them and a
+     * deregister releases them with the rest of the ring.
+     */
+    default long heldBytes() {
+        return 0L;
+    }
+
     /** Releases whatever the source still holds; the owning ring calls this from its own close. */
     @Override
     void close();

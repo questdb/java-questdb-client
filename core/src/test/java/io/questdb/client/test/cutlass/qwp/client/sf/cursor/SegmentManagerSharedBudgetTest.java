@@ -25,12 +25,14 @@
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegmentException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentBudget;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
 import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
+import io.questdb.client.test.tools.DelegatingFilesFacade;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
@@ -143,6 +145,89 @@ public class SegmentManagerSharedBudgetTest {
     }
 
     @Test
+    public void testFailedRotationThenDeregisterReleasesTheHeldSegment() throws Exception {
+        // A rotation whose manifest fsync fails hands its new segment back to
+        // the provisioner, still charged. A sender that is closed at that point
+        // (what a pool does with a sender whose flush threw) must give that
+        // charge back to the shared budget along with the rest of the ring.
+        String dir = TestUtils.createTmpDir("qdb-sf-shared-budget-");
+        try {
+            TestUtils.assertMemoryLeak(() -> {
+                ManifestFsyncFaultFacade ff = new ManifestFsyncFaultFacade(dir);
+                SegmentBudget budget = new SegmentBudget(8 * SEGMENT_SIZE);
+                long buf = Unsafe.malloc(FRAME_PAYLOAD, MemoryTag.NATIVE_DEFAULT);
+                try (SegmentRing ring = newDiskRing(ff, dir);
+                     SegmentManager manager = new SegmentManager(SEGMENT_SIZE, budget, ff, System::nanoTime)) {
+                    manager.start();
+                    manager.register(ring, dir);
+                    Assert.assertEquals(SEGMENT_SIZE, budget.getSegmentBytes());
+                    appendFrames(ring, buf, 2);
+
+                    ff.failManifestFsync = true;
+                    assertRotationFails(ring, buf);
+                    Assert.assertEquals("the handed-back segment stays charged",
+                            2 * SEGMENT_SIZE, budget.getSegmentBytes());
+                    Assert.assertEquals("the ring accounts for the held segment",
+                            2 * SEGMENT_SIZE, ring.totalSegmentBytes());
+
+                    manager.deregister(ring);
+                    Assert.assertTrue(manager.awaitRingQuiescence(ring));
+                    Assert.assertEquals("deregister must release the held segment too",
+                            0, budget.getSegmentBytes());
+                    ring.close();
+                    Assert.assertEquals("closing the ring must not release it a second time",
+                            0, budget.getSegmentBytes());
+                } finally {
+                    Unsafe.free(buf, FRAME_PAYLOAD, MemoryTag.NATIVE_DEFAULT);
+                }
+            });
+        } finally {
+            TestUtils.removeTmpDir(dir);
+        }
+    }
+
+    @Test
+    public void testFailedRotationRetriesReuseTheHeldSegment() throws Exception {
+        // Repeated manifest failures keep handing back and reusing ONE charged
+        // segment, and the rotation that finally commits takes it over without
+        // a second charge: deregister then releases exactly what was charged.
+        String dir = TestUtils.createTmpDir("qdb-sf-shared-budget-");
+        try {
+            TestUtils.assertMemoryLeak(() -> {
+                ManifestFsyncFaultFacade ff = new ManifestFsyncFaultFacade(dir);
+                SegmentBudget budget = new SegmentBudget(8 * SEGMENT_SIZE);
+                long buf = Unsafe.malloc(FRAME_PAYLOAD, MemoryTag.NATIVE_DEFAULT);
+                try (SegmentRing ring = newDiskRing(ff, dir);
+                     SegmentManager manager = new SegmentManager(SEGMENT_SIZE, budget, ff, System::nanoTime)) {
+                    manager.start();
+                    manager.register(ring, dir);
+                    appendFrames(ring, buf, 2);
+
+                    ff.failManifestFsync = true;
+                    for (int i = 0; i < 3; i++) {
+                        assertRotationFails(ring, buf);
+                        Assert.assertEquals("retry " + i + " must not charge another segment",
+                                2 * SEGMENT_SIZE, budget.getSegmentBytes());
+                    }
+
+                    ff.failManifestFsync = false;
+                    appendFrames(ring, buf, 1);
+                    Assert.assertEquals(2 * SEGMENT_SIZE, ring.totalSegmentBytes());
+                    Assert.assertEquals(2 * SEGMENT_SIZE, budget.getSegmentBytes());
+
+                    manager.deregister(ring);
+                    Assert.assertTrue(manager.awaitRingQuiescence(ring));
+                    Assert.assertEquals(0, budget.getSegmentBytes());
+                } finally {
+                    Unsafe.free(buf, FRAME_PAYLOAD, MemoryTag.NATIVE_DEFAULT);
+                }
+            });
+        } finally {
+            TestUtils.removeTmpDir(dir);
+        }
+    }
+
+    @Test
     public void testRingsOfDifferentManagersShareOneBudget() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             SegmentBudget budget = new SegmentBudget(4 * SEGMENT_SIZE);
@@ -247,8 +332,60 @@ public class SegmentManagerSharedBudgetTest {
         Assert.assertEquals(SegmentRing.BACKPRESSURE_NO_SPARE, ring.appendOrFsn(buf, FRAME_PAYLOAD));
     }
 
+    private static void assertRotationFails(SegmentRing ring, long buf) {
+        try {
+            ring.appendOrFsn(buf, FRAME_PAYLOAD);
+            Assert.fail("rotation must surface the manifest fsync failure");
+        } catch (MmapSegmentException e) {
+            TestUtils.assertContains(e.getMessage(), "could not sync SF manifest");
+        }
+    }
+
+    // A disk ring with a manifest: one empty segment recovered from dir.
+    private static SegmentRing newDiskRing(FilesFacade ff, String dir) {
+        MmapSegment.create(ff, dir + "/sf-initial.sfa", 0, SEGMENT_SIZE).close();
+        SegmentRing ring = SegmentRing.openExisting(ff, dir, SEGMENT_SIZE);
+        Assert.assertNotNull(ring);
+        return ring;
+    }
+
     private static SegmentRing newRing() {
         return new SegmentRing(MmapSegment.createInMemory(0, SEGMENT_SIZE), SEGMENT_SIZE);
+    }
+
+    private static final class ManifestFsyncFaultFacade extends DelegatingFilesFacade {
+        private final String manifestPath;
+        private volatile boolean failManifestFsync;
+        private volatile int manifestFd = -1;
+
+        private ManifestFsyncFaultFacade(String dir) {
+            this.manifestPath = dir + "/sf-manifest.bin";
+        }
+
+        @Override
+        public int fsync(int fd) {
+            if (failManifestFsync && fd == manifestFd) {
+                return -1;
+            }
+            return super.fsync(fd);
+        }
+
+        @Override
+        public int openRW(String path) {
+            return track(path, super.openRW(path));
+        }
+
+        @Override
+        public int openRWExclusive(String path) {
+            return track(path, super.openRWExclusive(path));
+        }
+
+        private int track(String path, int fd) {
+            if (manifestPath.equals(path)) {
+                manifestFd = fd;
+            }
+            return fd;
+        }
     }
 
     private static boolean waitFor(BooleanSupplier condition) throws InterruptedException {

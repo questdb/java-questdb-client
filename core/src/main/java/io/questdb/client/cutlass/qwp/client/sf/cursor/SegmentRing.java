@@ -1710,20 +1710,24 @@ public final class SegmentRing implements QuietCloseable {
         clearSyncRequestIfActiveDurable();
     }
 
-    /**
-     * Total mmap'd bytes the ring currently owns: active + every sealed
-     * segment. Used by {@code SegmentManager}
-     * to seed its {@code totalBytes} accounting at register time and to
-     * reverse the contribution at deregister time. Synchronized against
-     * rotation so we never read a half-resized sealed list.
-     */
     /** Live segments: the active plus every sealed one, including those hidden for a pending trim. */
     public synchronized int liveSegmentCount() {
         return (active != null ? 1 : 0) + (sealedSegments.size() - sealedHead) + pendingTrims.size();
     }
 
+    /**
+     * Total mmap'd bytes the ring currently owns: active + every sealed
+     * segment (pending trims included) + whatever its {@link SegmentSource}
+     * holds for the next rotation (a segment a failed rotation handed back).
+     * Used by {@code SegmentManager} to seed its budget charge at register
+     * time and to reverse the ring's whole charge at deregister time.
+     * Synchronized against rotation so we never read a half-resized sealed
+     * list.
+     */
     public synchronized long totalSegmentBytes() {
         long total = 0L;
+        SegmentSource source = segmentSource;
+        if (source != null) total += source.heldBytes();
         MmapSegment a = active;
         if (a != null) total += a.sizeBytes();
         for (int i = sealedHead, n = sealedSegments.size(); i < n; i++) {

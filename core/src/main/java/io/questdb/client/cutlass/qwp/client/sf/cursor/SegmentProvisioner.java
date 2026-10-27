@@ -73,9 +73,11 @@ public final class SegmentProvisioner implements SegmentSource {
     // A segment handed back by discard(): the rotation's manifest update
     // failed after its record may already have reached the page cache, so
     // the file must stay (recovery would otherwise find the manifest naming
-    // a base with no segment and quarantine the slot). Still charged; the
-    // next rotation at the same base reuses it.
-    private MmapSegment retained;
+    // a base with no segment and quarantine the slot). Still charged, and
+    // counted by heldBytes() so a deregister releases it; the next rotation
+    // at the same base reuses it. Volatile: deregister reads it from the
+    // closing thread.
+    private volatile MmapSegment retained;
     private long retryAtNanos;
 
     SegmentProvisioner(SegmentRing ring, String dir, long firstGeneration, long segmentSizeBytes,
@@ -92,7 +94,9 @@ public final class SegmentProvisioner implements SegmentSource {
     public void close() {
         // Every segment it created belongs to the ring, except a retained
         // one. Its file stays: an empty segment at a base the manifest may
-        // name, which recovery accepts either way.
+        // name, which recovery accepts either way. Its budget charge is not
+        // released here: SegmentManager.deregister already released it as
+        // part of the ring's totalSegmentBytes() (see heldBytes()).
         if (retained != null) {
             MmapSegment r = retained;
             retained = null;
@@ -103,6 +107,12 @@ public final class SegmentProvisioner implements SegmentSource {
     @Override
     public void discard(MmapSegment segment) {
         retained = segment;
+    }
+
+    @Override
+    public long heldBytes() {
+        MmapSegment r = retained;
+        return r == null ? 0L : r.sizeBytes();
     }
 
     @Override
