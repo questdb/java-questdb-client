@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.test.tools.TestWebSocketClient;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.LineSenderServerException;
@@ -216,7 +217,7 @@ public class SymbolDictRecycleLoopTerminalTest {
                 },
                 /* reconnectInitialBackoffMillis */ 1_000L,
                 /* reconnectMaxBackoffMillis */ 5_000L,
-                false
+                DurableAckTiers.NONE
         );
     }
 

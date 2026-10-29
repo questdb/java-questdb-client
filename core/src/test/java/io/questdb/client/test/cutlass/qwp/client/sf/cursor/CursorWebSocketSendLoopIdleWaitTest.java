@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.cutlass.http.client.HttpClientException;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
@@ -96,7 +97,7 @@ public class CursorWebSocketSendLoopIdleWaitTest {
                         client, engine, 0L,
                         BlockingDoorbellClient::new,
                         100L, 1_000L,
-                        false,
+                        DurableAckTiers.NONE,
                         CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                         CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS);
                 try {
@@ -156,7 +157,7 @@ public class CursorWebSocketSendLoopIdleWaitTest {
                         first, engine, 0L,
                         () -> replacement,
                         1L, 10L,
-                        false,
+                        DurableAckTiers.NONE,
                         CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                         CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS);
                 try {
@@ -193,7 +194,7 @@ public class CursorWebSocketSendLoopIdleWaitTest {
                         first, engine, 0L,
                         () -> replacement,
                         1L, 10L,
-                        true,
+                        DurableAckTiers.REPLICATED,
                         CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                         CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS);
                 try {
@@ -235,7 +236,7 @@ public class CursorWebSocketSendLoopIdleWaitTest {
                         client, engine, 0L,
                         BlockingDoorbellClient::new,
                         100L, 1_000L,
-                        false,
+                        DurableAckTiers.NONE,
                         CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                         CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS);
                 try {
@@ -282,7 +283,7 @@ public class CursorWebSocketSendLoopIdleWaitTest {
                         client, engine, 0L,
                         BlockingDoorbellClient::new,
                         100L, 1_000L,
-                        false,
+                        DurableAckTiers.NONE,
                         CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                         CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS);
                 try {

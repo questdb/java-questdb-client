@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.test.tools.TestWebSocketClient;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
@@ -83,7 +84,7 @@ public class CursorWebSocketSendLoopGracefulCloseTest {
                     factory,
                     1_000L,
                     5_000L,
-                    false
+                    DurableAckTiers.NONE
             );
             // Far beyond the test timeout: waiting it out here would fail the test.
             loop.setGracefulStopMillis(TimeUnit.MINUTES.toMillis(5));
@@ -125,7 +126,7 @@ public class CursorWebSocketSendLoopGracefulCloseTest {
                     null,
                     1_000L,
                     5_000L,
-                    false
+                    DurableAckTiers.NONE
             );
             // Far above any scheduling delay, so a loaded machine cannot flip the outcome.
             loop.setGracefulStopMillis(TimeUnit.SECONDS.toMillis(20));

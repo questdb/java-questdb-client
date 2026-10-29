@@ -661,96 +661,17 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // only suppresses errors the user already owned before close() began.
     private volatile LineSenderException synchronouslySurfacedError;
 
-    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero,
-                                   ReconnectFactory reconnectFactory,
-                                   long reconnectInitialBackoffMillis,
-                                   long reconnectMaxBackoffMillis,
-                                   boolean durableAckMode) {
-        this(client, engine, fsnAtZero, reconnectFactory,
-                reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
-                durableAckMode ? DurableAckTiers.REPLICATED : DurableAckTiers.NONE);
-    }
-
-    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero,
-                                   ReconnectFactory reconnectFactory,
-                                   long reconnectInitialBackoffMillis,
-                                   long reconnectMaxBackoffMillis,
-                                   boolean durableAckMode,
-                                   long durableAckKeepaliveIntervalMillis) {
-        this(client, engine, fsnAtZero, reconnectFactory,
-                reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
-                durableAckMode ? DurableAckTiers.REPLICATED : DurableAckTiers.NONE,
-                durableAckKeepaliveIntervalMillis);
-    }
-
-    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero,
-                                   ReconnectFactory reconnectFactory,
-                                   long reconnectInitialBackoffMillis,
-                                   long reconnectMaxBackoffMillis,
-                                   boolean durableAckMode,
-                                   long durableAckKeepaliveIntervalMillis,
-                                   int maxHeadFrameRejections) {
-        this(client, engine, fsnAtZero, reconnectFactory,
-                reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
-                durableAckMode ? DurableAckTiers.REPLICATED : DurableAckTiers.NONE,
-                durableAckKeepaliveIntervalMillis, maxHeadFrameRejections);
-    }
-
-    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero,
-                                   ReconnectFactory reconnectFactory,
-                                   long reconnectInitialBackoffMillis,
-                                   long reconnectMaxBackoffMillis,
-                                   boolean durableAckMode,
-                                   long durableAckKeepaliveIntervalMillis,
-                                   int maxHeadFrameRejections,
-                                   long poisonMinEscalationWindowMillis) {
-        this(client, engine, fsnAtZero, reconnectFactory,
-                reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
-                durableAckMode ? DurableAckTiers.REPLICATED : DurableAckTiers.NONE,
-                durableAckKeepaliveIntervalMillis, maxHeadFrameRejections,
-                poisonMinEscalationWindowMillis);
-    }
-
-    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero,
-                                   ReconnectFactory reconnectFactory,
-                                   long reconnectInitialBackoffMillis,
-                                   long reconnectMaxBackoffMillis,
-                                   boolean durableAckMode,
-                                   long durableAckKeepaliveIntervalMillis,
-                                   int maxHeadFrameRejections,
-                                   long poisonMinEscalationWindowMillis,
-                                   long catchUpCapGapMinEscalationWindowMillis) {
-        this(client, engine, fsnAtZero, reconnectFactory,
-                reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
-                durableAckMode ? DurableAckTiers.REPLICATED : DurableAckTiers.NONE,
-                durableAckKeepaliveIntervalMillis, maxHeadFrameRejections,
-                poisonMinEscalationWindowMillis, catchUpCapGapMinEscalationWindowMillis);
-    }
-
-    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero,
-                                   ReconnectFactory reconnectFactory,
-                                   long reconnectInitialBackoffMillis,
-                                   long reconnectMaxBackoffMillis,
-                                   boolean durableAckMode,
-                                   long durableAckKeepaliveIntervalMillis,
-                                   int maxHeadFrameRejections,
-                                   long poisonMinEscalationWindowMillis,
-                                   long catchUpCapGapMinEscalationWindowMillis,
-                                   ReconnectPolicy reconnectPolicy) {
-        this(client, engine, fsnAtZero, reconnectFactory,
-                reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
-                durableAckMode ? DurableAckTiers.REPLICATED : DurableAckTiers.NONE,
-                durableAckKeepaliveIntervalMillis, maxHeadFrameRejections,
-                poisonMinEscalationWindowMillis, catchUpCapGapMinEscalationWindowMillis,
-                reconnectPolicy, 0L);
-    }
-
+    /**
+     * Policy-aware master constructor. A foreground sender fails fast while
+     * establishing its first connection, then retries endpoint-policy failures
+     * indefinitely after it has been live. An orphan drainer returns such failures
+     * to its owner so the slot can follow its settle/quarantine policy.
+     * <p>
+     * {@code externalFsnBase} is the additive offset this loop folds into every
+     * user-visible FSN it produces (progress-dispatcher advances and
+     * {@link SenderError} spans) -- see {@link #externalFsnBase}. Pass {@code 0L}
+     * unless the caller is replacing an engine a symbol-dict recycle rebuilt.
+     */
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
                                    long fsnAtZero,
                                    ReconnectFactory reconnectFactory,
@@ -798,12 +719,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
-     * Same as the seven-arg constructor but with explicit control over
+     * Same as the six-arg constructor but with explicit control over
      * durable-ack-driven trim. A non-empty {@code durableAckTiers} set
      * ({@link DurableAckTiers}) switches the loop to trim only on the
      * strongest requested tier's ack frames; OK
      * frames are queued until their per-table seqTxns are covered by a durable
-     * watermark. The default (false) preserves the historical OK-driven trim
+     * watermark. The default (NONE) preserves the historical OK-driven trim
      * and ignores any durable-ack frames that arrive (logging a warning, since
      * a server should not emit them when the client did not opt in).
      */
@@ -840,7 +761,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
-     * Ten-arg overload — omits the poison-escalation dwell window, which
+     * Nine-arg overload — omits the poison-escalation dwell window, which
      * defaults to {@code 0} (legacy: escalate as soon as maxHeadFrameRejections
      * strikes accrue, with no minimum wall-clock). The user-facing 5s default
      * ({@link #DEFAULT_POISON_MIN_ESCALATION_WINDOW_MILLIS}) is applied at the
@@ -863,8 +784,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
-     * Eleven-arg overload — omits the symbol-dict cap-gap escalation dwell, which
-     * defaults to {@code 0}. This and the twelve-arg overload use the foreground-safe
+     * Ten-arg overload — omits the symbol-dict cap-gap escalation dwell, which
+     * defaults to {@code 0}. This and the eleven-arg overload use the foreground-safe
      * retry-forever policy; orphan drainers opt into count-and-dwell escalation through
      * the policy-aware master constructor.
      */
@@ -885,7 +806,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
-     * Twelve-arg overload. Catch-up cap gaps are retried indefinitely, which is the
+     * Eleven-arg overload. Catch-up cap gaps are retried indefinitely, which is the
      * required policy for a foreground store-and-forward sender. Orphan drainers use the
      * policy-aware overload below to opt into bounded terminal escalation.
      * <p>
@@ -1144,235 +1065,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 durableAckKeepaliveIntervalMillis, maxHeadFrameRejections,
                 poisonMinEscalationWindowMillis, catchUpCapGapMinEscalationWindowMillis,
                 reconnectPolicy, 0L);
-    }
-
-    /**
-     * Policy-aware master constructor. A foreground sender fails fast while
-     * establishing its first connection, then retries endpoint-policy failures
-     * indefinitely after it has been live. An orphan drainer returns such failures
-     * to its owner so the slot can follow its settle/quarantine policy.
-     * <p>
-     * {@code externalFsnBase} is the additive offset this loop folds into every
-     * user-visible FSN it produces (progress-dispatcher advances and
-     * {@link SenderError} spans) -- see {@link #externalFsnBase}. Pass {@code 0L}
-     * unless the caller is replacing an engine a symbol-dict recycle rebuilt.
-     */
-    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero,
-                                   ReconnectFactory reconnectFactory,
-                                   long reconnectInitialBackoffMillis,
-                                   long reconnectMaxBackoffMillis,
-                                   boolean durableAckMode,
-                                   long durableAckKeepaliveIntervalMillis,
-                                   int maxHeadFrameRejections,
-                                   long poisonMinEscalationWindowMillis,
-                                   long catchUpCapGapMinEscalationWindowMillis,
-                                   ReconnectPolicy reconnectPolicy,
-                                   long externalFsnBase) {
-        this(client, engine, fsnAtZero, reconnectFactory,
-                reconnectInitialBackoffMillis,
-                reconnectMaxBackoffMillis,
-                durableAckMode ? DurableAckTiers.REPLICATED : DurableAckTiers.NONE,
-                durableAckKeepaliveIntervalMillis, maxHeadFrameRejections,
-                poisonMinEscalationWindowMillis, catchUpCapGapMinEscalationWindowMillis,
-                reconnectPolicy, externalFsnBase);
-    }
-
-    /**
-     * The 1.3.x constructors, with the {@code parkNanos} the loop no longer
-     * uses. Kept so callers compiled against a released jar keep linking.
-     *
-     * @deprecated use the overload without {@code parkNanos}.
-     */
-    @Deprecated
-    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero, long parkNanos,
-                                   ReconnectFactory reconnectFactory,
-                                   long reconnectInitialBackoffMillis,
-                                   long reconnectMaxBackoffMillis) {
-        this(client, engine, fsnAtZero, reconnectFactory, reconnectInitialBackoffMillis, reconnectMaxBackoffMillis);
-    }
-
-    @Deprecated
-    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero, long parkNanos,
-                                   ReconnectFactory reconnectFactory,
-                                   long reconnectInitialBackoffMillis,
-                                   long reconnectMaxBackoffMillis,
-                                   boolean durableAckMode) {
-        this(client, engine, fsnAtZero, reconnectFactory, reconnectInitialBackoffMillis, reconnectMaxBackoffMillis, durableAckMode);
-    }
-
-    @Deprecated
-    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero, long parkNanos,
-                                   ReconnectFactory reconnectFactory,
-                                   long reconnectInitialBackoffMillis,
-                                   long reconnectMaxBackoffMillis,
-                                   boolean durableAckMode,
-                                   long durableAckKeepaliveIntervalMillis) {
-        this(client, engine, fsnAtZero, reconnectFactory, reconnectInitialBackoffMillis, reconnectMaxBackoffMillis, durableAckMode, durableAckKeepaliveIntervalMillis);
-    }
-
-    @Deprecated
-    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero, long parkNanos,
-                                   ReconnectFactory reconnectFactory,
-                                   long reconnectInitialBackoffMillis,
-                                   long reconnectMaxBackoffMillis,
-                                   boolean durableAckMode,
-                                   long durableAckKeepaliveIntervalMillis,
-                                   int maxHeadFrameRejections) {
-        this(client, engine, fsnAtZero, reconnectFactory, reconnectInitialBackoffMillis, reconnectMaxBackoffMillis, durableAckMode, durableAckKeepaliveIntervalMillis, maxHeadFrameRejections);
-    }
-
-    @Deprecated
-    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero, long parkNanos,
-                                   ReconnectFactory reconnectFactory,
-                                   long reconnectInitialBackoffMillis,
-                                   long reconnectMaxBackoffMillis,
-                                   boolean durableAckMode,
-                                   long durableAckKeepaliveIntervalMillis,
-                                   int maxHeadFrameRejections,
-                                   long poisonMinEscalationWindowMillis) {
-        this(client, engine, fsnAtZero, reconnectFactory, reconnectInitialBackoffMillis, reconnectMaxBackoffMillis, durableAckMode, durableAckKeepaliveIntervalMillis, maxHeadFrameRejections, poisonMinEscalationWindowMillis);
-    }
-
-    @Deprecated
-    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero, long parkNanos,
-                                   ReconnectFactory reconnectFactory,
-                                   long reconnectInitialBackoffMillis,
-                                   long reconnectMaxBackoffMillis,
-                                   boolean durableAckMode,
-                                   long durableAckKeepaliveIntervalMillis,
-                                   int maxHeadFrameRejections,
-                                   long poisonMinEscalationWindowMillis,
-                                   long catchUpCapGapMinEscalationWindowMillis) {
-        this(client, engine, fsnAtZero, reconnectFactory, reconnectInitialBackoffMillis, reconnectMaxBackoffMillis, durableAckMode, durableAckKeepaliveIntervalMillis, maxHeadFrameRejections, poisonMinEscalationWindowMillis, catchUpCapGapMinEscalationWindowMillis);
-    }
-
-    @Deprecated
-    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero, long parkNanos,
-                                   ReconnectFactory reconnectFactory,
-                                   long reconnectInitialBackoffMillis,
-                                   long reconnectMaxBackoffMillis,
-                                   boolean durableAckMode,
-                                   long durableAckKeepaliveIntervalMillis,
-                                   int maxHeadFrameRejections,
-                                   long poisonMinEscalationWindowMillis,
-                                   long catchUpCapGapMinEscalationWindowMillis,
-                                   ReconnectPolicy reconnectPolicy) {
-        this(client, engine, fsnAtZero, reconnectFactory, reconnectInitialBackoffMillis, reconnectMaxBackoffMillis, durableAckMode, durableAckKeepaliveIntervalMillis, maxHeadFrameRejections, poisonMinEscalationWindowMillis, catchUpCapGapMinEscalationWindowMillis, reconnectPolicy);
-    }
-
-    @Deprecated
-    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero, long parkNanos,
-                                   ReconnectFactory reconnectFactory,
-                                   long reconnectInitialBackoffMillis,
-                                   long reconnectMaxBackoffMillis,
-                                   int durableAckTiers,
-                                   long durableAckKeepaliveIntervalMillis,
-                                   int maxHeadFrameRejections,
-                                   long poisonMinEscalationWindowMillis,
-                                   long catchUpCapGapMinEscalationWindowMillis,
-                                   ReconnectPolicy reconnectPolicy,
-                                   long externalFsnBase) {
-        this(client, engine, fsnAtZero, reconnectFactory, reconnectInitialBackoffMillis, reconnectMaxBackoffMillis, durableAckTiers, durableAckKeepaliveIntervalMillis, maxHeadFrameRejections, poisonMinEscalationWindowMillis, catchUpCapGapMinEscalationWindowMillis, reconnectPolicy, externalFsnBase);
-    }
-
-    @Deprecated
-    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero, long parkNanos,
-                                   ReconnectFactory reconnectFactory,
-                                   long reconnectInitialBackoffMillis,
-                                   long reconnectMaxBackoffMillis,
-                                   int durableAckTiers) {
-        this(client, engine, fsnAtZero, reconnectFactory, reconnectInitialBackoffMillis, reconnectMaxBackoffMillis, durableAckTiers);
-    }
-
-    @Deprecated
-    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero, long parkNanos,
-                                   ReconnectFactory reconnectFactory,
-                                   long reconnectInitialBackoffMillis,
-                                   long reconnectMaxBackoffMillis,
-                                   int durableAckTiers,
-                                   long durableAckKeepaliveIntervalMillis) {
-        this(client, engine, fsnAtZero, reconnectFactory, reconnectInitialBackoffMillis, reconnectMaxBackoffMillis, durableAckTiers, durableAckKeepaliveIntervalMillis);
-    }
-
-    @Deprecated
-    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero, long parkNanos,
-                                   ReconnectFactory reconnectFactory,
-                                   long reconnectInitialBackoffMillis,
-                                   long reconnectMaxBackoffMillis,
-                                   int durableAckTiers,
-                                   long durableAckKeepaliveIntervalMillis,
-                                   int maxHeadFrameRejections) {
-        this(client, engine, fsnAtZero, reconnectFactory, reconnectInitialBackoffMillis, reconnectMaxBackoffMillis, durableAckTiers, durableAckKeepaliveIntervalMillis, maxHeadFrameRejections);
-    }
-
-    @Deprecated
-    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero, long parkNanos,
-                                   ReconnectFactory reconnectFactory,
-                                   long reconnectInitialBackoffMillis,
-                                   long reconnectMaxBackoffMillis,
-                                   int durableAckTiers,
-                                   long durableAckKeepaliveIntervalMillis,
-                                   int maxHeadFrameRejections,
-                                   long poisonMinEscalationWindowMillis) {
-        this(client, engine, fsnAtZero, reconnectFactory, reconnectInitialBackoffMillis, reconnectMaxBackoffMillis, durableAckTiers, durableAckKeepaliveIntervalMillis, maxHeadFrameRejections, poisonMinEscalationWindowMillis);
-    }
-
-    @Deprecated
-    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero, long parkNanos,
-                                   ReconnectFactory reconnectFactory,
-                                   long reconnectInitialBackoffMillis,
-                                   long reconnectMaxBackoffMillis,
-                                   int durableAckTiers,
-                                   long durableAckKeepaliveIntervalMillis,
-                                   int maxHeadFrameRejections,
-                                   long poisonMinEscalationWindowMillis,
-                                   long catchUpCapGapMinEscalationWindowMillis) {
-        this(client, engine, fsnAtZero, reconnectFactory, reconnectInitialBackoffMillis, reconnectMaxBackoffMillis, durableAckTiers, durableAckKeepaliveIntervalMillis, maxHeadFrameRejections, poisonMinEscalationWindowMillis, catchUpCapGapMinEscalationWindowMillis);
-    }
-
-    @Deprecated
-    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero, long parkNanos,
-                                   ReconnectFactory reconnectFactory,
-                                   long reconnectInitialBackoffMillis,
-                                   long reconnectMaxBackoffMillis,
-                                   int durableAckTiers,
-                                   long durableAckKeepaliveIntervalMillis,
-                                   int maxHeadFrameRejections,
-                                   long poisonMinEscalationWindowMillis,
-                                   long catchUpCapGapMinEscalationWindowMillis,
-                                   ReconnectPolicy reconnectPolicy) {
-        this(client, engine, fsnAtZero, reconnectFactory, reconnectInitialBackoffMillis, reconnectMaxBackoffMillis, durableAckTiers, durableAckKeepaliveIntervalMillis, maxHeadFrameRejections, poisonMinEscalationWindowMillis, catchUpCapGapMinEscalationWindowMillis, reconnectPolicy);
-    }
-
-    @Deprecated
-    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero, long parkNanos,
-                                   ReconnectFactory reconnectFactory,
-                                   long reconnectInitialBackoffMillis,
-                                   long reconnectMaxBackoffMillis,
-                                   boolean durableAckMode,
-                                   long durableAckKeepaliveIntervalMillis,
-                                   int maxHeadFrameRejections,
-                                   long poisonMinEscalationWindowMillis,
-                                   long catchUpCapGapMinEscalationWindowMillis,
-                                   ReconnectPolicy reconnectPolicy,
-                                   long externalFsnBase) {
-        this(client, engine, fsnAtZero, reconnectFactory, reconnectInitialBackoffMillis, reconnectMaxBackoffMillis, durableAckMode, durableAckKeepaliveIntervalMillis, maxHeadFrameRejections, poisonMinEscalationWindowMillis, catchUpCapGapMinEscalationWindowMillis, reconnectPolicy, externalFsnBase);
     }
 
     private static CatchUpCapGapPolicy catchUpPolicyFor(ReconnectPolicy reconnectPolicy) {
