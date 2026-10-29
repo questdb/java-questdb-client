@@ -67,7 +67,7 @@ public class CloseOwnershipRaceTest {
                 // policy intentionally retries this state forever, while orphan
                 // policy must hand it back to the quarantine owner.
                 CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
-                        null, engine, 0, 1_000_000L,
+                        null, engine, 0,
                         () -> {
                             throw new QwpAuthFailedException(401, "localhost", 1);
                         },

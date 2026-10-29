@@ -26,38 +26,32 @@ package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.std.Files;
 import io.questdb.client.std.FilesFacade;
-import io.questdb.client.std.Numbers;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
-import io.questdb.client.std.str.DirectUtf8Sink;
 import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.LongSupplier;
 
 /**
- * Background worker that keeps every registered {@link SegmentRing} supplied
- * with a hot-spare segment and trims segments after their frames have been
- * ACK'd by the server. Off the user-thread / I/O-thread hot path entirely:
- * the expensive {@code openCleanRW + allocate + mmap} for spare creation and
- * {@code munmap + unlink} for trim happen on this thread, never on the
- * latency-sensitive paths.
+ * Background worker that trims every registered {@link SegmentRing}'s
+ * segments after their frames have been ACK'd by the server, and runs the
+ * disk barriers (periodic sync, the watermark sync before an unlink). The
+ * {@code munmap + unlink + fsync} of a trim happen on this thread, never on
+ * the user-thread / I/O-thread paths. The ring's next segment is created by
+ * the producer itself at rotation ({@link SegmentProvisioner}).
  * <p>
  * One instance can serve many rings (typically all {@code Sender} instances
- * in a JVM). Polls each ring on a configurable tick (default 1 ms) — short
- * enough that a producer rarely sees {@link SegmentRing#BACKPRESSURE_NO_SPARE}
- * in the steady state, long enough that an idle JVM doesn't burn CPU.
+ * in a JVM). The worker parks until work is signalled or a periodic-sync
+ * or trim-retry deadline is due.
  */
 public final class SegmentManager implements QuietCloseable {
 
-    public static final long DEFAULT_POLL_NANOS = 1_000_000L; // 1 ms
-    public static final long DISK_FULL_LOG_THROTTLE_NANOS = 30_000_000_000L; // 30 s
     public static final long UNLIMITED_TOTAL_BYTES = Long.MAX_VALUE;
     private static final int ENTRY_DEREGISTERED = 3;
     private static final int ENTRY_DEREGISTERED_IN_SERVICE = 2;
@@ -69,11 +63,6 @@ public final class SegmentManager implements QuietCloseable {
             AtomicIntegerFieldUpdater.newUpdater(RingEntry.class, "state");
     private static final Logger LOG = LoggerFactory.getLogger(SegmentManager.class);
     private static final int MAX_TRIMS_PER_RING_PASS = 64;
-    // The minimum working set a ring needs to keep making progress: the active
-    // segment plus one hot spare to rotate into. Below this a producer cannot
-    // advance at all, so the cap check must never hold a ring here (see
-    // livenessFloorBytes).
-    private static final int MIN_LIVE_SEGMENTS = 2;
     private static final long TRIM_RETRY_INITIAL_NANOS = 4_000_000L;
     private static final long TRIM_RETRY_MAX_NANOS = 1_024_000_000L;
     private static final int TRIM_RETRY_NONE = 0;
@@ -87,36 +76,10 @@ public final class SegmentManager implements QuietCloseable {
     // budget to several managers -- a sender pool does, so sf_max_total_bytes
     // caps all of its senders together.
     private final SegmentBudget budget;
-    private final AtomicLong fileGeneration = new AtomicLong();
     private final FilesFacade filesFacade;
-    // Per-ring segment bytes below which the cap check never refuses to
-    // provision: MIN_LIVE_SEGMENTS * segmentSizeBytes, clamped against
-    // overflow. Segment bytes are reclaimable by ACK-driven trim, so refusing
-    // on them is productive backpressure that clears itself. Side-file bytes
-    // are NOT -- the .symbol-dict is lifetime-monotonic and nothing shrinks it
-    // -- so once they alone pushed a ring under the cap, no ack could ever
-    // free the shortfall and the producer stalled permanently, across
-    // restarts, with the disk-full warning pointing at a trim that cannot
-    // help. Guaranteeing the minimum working set turns that deadlock into
-    // ordinary backpressure: the ring cycles between one and two segments as
-    // acks arrive, ingestion continues, and the cap degrades to best-effort by
-    // exactly the dictionary's overshoot rather than stopping the pipeline.
-    // A budget shared with other managers needs the floor for the same reason:
-    // a sibling ring whose connection is down can hold the whole budget, and
-    // only the floor keeps this ring cycling through its own two segments.
-    private final long livenessFloorBytes;
     private final Object lock = new Object();
-    // Reused by the manager worker thread to build spare-segment paths
-    // directly into native memory. Each rotation writes the path bytes plus
-    // a trailing NUL terminator into the same buffer, and passes the
-    // pointer to the long-ptr Files / MmapSegment overloads -- eliminating
-    // the byte[] + native malloc pair that Files.pathPtr(String) would
-    // otherwise allocate per call. Sized for typical SF directory paths;
-    // grows on demand if a longer path is registered. Closed in close().
-    private final DirectUtf8Sink pathScratch = new DirectUtf8Sink(256);
-    private final long pollNanos;
-    // Reused by the worker thread each tick to snapshot `rings` under the
-    // lock without per-tick allocation. Owned exclusively by workerLoop().
+    // Reused by the worker to snapshot rings under the lock without allocating
+    // a new list on every pass. Owned exclusively by workerLoop().
     private final ObjList<RingEntry> ringSnapshot = new ObjList<>();
     private final ObjList<RingEntry> rings = new ObjList<>();
     private final long segmentSizeBytes;
@@ -128,6 +91,8 @@ public final class SegmentManager implements QuietCloseable {
     // prefix here until the post-unlink directory barrier succeeds avoids both
     // per-pass allocation and publishing logical removal before it is durable.
     private final MmapSegment[] trimBatch = new MmapSegment[MAX_TRIMS_PER_RING_PASS];
+    // Handed to each ring: rotation and pin release may make a segment trimmable.
+    private final Runnable workerWakeup = this::wakeWorker;
     // Test seam: runs after a deferred ring-pass cleanup returns. Null in
     // production; public sender/pool lifecycle tests use it to observe exact
     // callback completion without sleeps or polling.
@@ -139,13 +104,6 @@ public final class SegmentManager implements QuietCloseable {
     // live. Callers must treat such a throw as "worker state unknown",
     // never as the exact false return meaning the worker loop has exited.
     private volatile Runnable beforeExitCleanupRegistrationHook;
-    // Test seam: runs on the worker thread just before the install path's
-    // synchronized(lock) entry (the one that performs installHotSpare and
-    // keeps the spare's budget charge). Null in production; tests use it to
-    // pause after the worker has snapshotted a RingEntry and created a spare,
-    // but before ownership/accounting commit. Callers may inject a deregister
-    // or hold this stale worker snapshot while caller-side cleanup runs.
-    private volatile Runnable beforeInstallSyncHook;
     // Test seam: records entry into the per-ring quiescence wait. Null in
     // production; owned-engine close tests use it to prove they take only the
     // stronger whole-manager join path, not two sequential timeout budgets.
@@ -154,8 +112,7 @@ public final class SegmentManager implements QuietCloseable {
     // synchronized(lock) entry. Null in production; only
     // SegmentManagerTrimDeregisterRaceTest installs it, to deterministically
     // inject a deregister(ring) call into the exact race window that the
-    // entry-state check inside the trim block closes for watermark writes and
-    // budget accounting.
+    // entry-state check inside the trim block closes for budget accounting.
     private volatile Runnable beforeTrimSyncHook;
     // Test seam invoked exactly when a retry transition/recovery is logged.
     // Null in production; persistent-failure tests use it to prove log bounds
@@ -180,20 +137,8 @@ public final class SegmentManager implements QuietCloseable {
     // timed-out-close handoff never allocates an ObjList or grows a backing
     // array. Guarded by lock and consumed on worker-loop exit outside lock.
     private Runnable ownedEngineExitCleanup;
-    private long lastDiskFullLogNs;
     private volatile boolean running;
-    // pathScratch free-exactly-once coordination between a timed-out close()
-    // and the worker's exit path. All three are guarded by {@link #lock}.
-    // When close() gives up on the join while the worker loop has not yet
-    // exited, it hands scratch ownership to the worker
-    // (scratchHandedToWorker=true) and the worker frees the buffer in its
-    // exit block; in every other case close() frees it. Without the handoff,
-    // a worker that outlives the bounded join leaks the native scratch
-    // buffer forever, because nobody retries manager cleanup after close()
-    // returns.
-    private boolean scratchFreed;
-    private boolean scratchHandedToWorker;
-    private volatile long shortestSyncIntervalNanos = Long.MAX_VALUE;
+    // Guarded by lock: set by the worker when it leaves its service loop.
     private boolean workerLoopExited;
     // volatile: read by awaitRingQuiescence() from arbitrary caller threads
     // while the @TestOnly setter may run on another.
@@ -204,87 +149,49 @@ public final class SegmentManager implements QuietCloseable {
     private volatile Thread workerThread;
 
     public SegmentManager(long segmentSizeBytes) {
-        this(segmentSizeBytes, DEFAULT_POLL_NANOS, UNLIMITED_TOTAL_BYTES);
-    }
-
-    public SegmentManager(long segmentSizeBytes, long pollNanos) {
-        this(segmentSizeBytes, pollNanos, UNLIMITED_TOTAL_BYTES);
+        this(segmentSizeBytes, new SegmentBudget(UNLIMITED_TOTAL_BYTES));
     }
 
     /**
-     * Full constructor.
-     *
      * @param segmentSizeBytes per-segment file size in bytes
-     * @param pollNanos        how often the worker polls each registered ring;
-     *                         default {@link #DEFAULT_POLL_NANOS}
-     * @param maxTotalBytes    upper bound on total bytes the manager tracks
-     *                         across all registered rings — counts every segment
-     *                         the ring owns (initial active + sealed + hot
-     *                         spare), including bytes already on disk at
-     *                         register-time (e.g. after recovery or orphan
-     *                         adoption). When provisioning a hot spare would
-     *                         exceed this, the manager skips the install — the
-     *                         requesting ring stays in the
-     *                         {@link SegmentRing#BACKPRESSURE_NO_SPARE} state
-     *                         until ACK-driven trim frees space. Pass
-     *                         {@link #UNLIMITED_TOTAL_BYTES} to disable. Must be
-     *                         at least one {@code segmentSizeBytes}; a sensible
-     *                         lower bound for a single ring is
-     *                         {@code 2 × segmentSizeBytes} so the manager can
-     *                         hold an initial active plus one hot spare.
+     * @param budget           shared accounting for every ring-owned segment,
+     *                         including recovered and retained segments. See
+     *                         {@link SegmentProvisioner} for backpressure and
+     *                         the per-ring liveness floor.
      */
-    public SegmentManager(long segmentSizeBytes, long pollNanos, long maxTotalBytes) {
-        this(segmentSizeBytes, pollNanos, new SegmentBudget(maxTotalBytes), FilesFacade.INSTANCE, System::nanoTime);
-    }
-
-    /**
-     * As {@link #SegmentManager(long, long, long)}, but charging
-     * {@code budget}, which other managers may share: its capacity then caps
-     * the rings of all of them together. The capacity must allow at least one
-     * {@code segmentSizeBytes}.
-     */
-    public SegmentManager(long segmentSizeBytes, long pollNanos, SegmentBudget budget) {
-        this(segmentSizeBytes, pollNanos, budget, FilesFacade.INSTANCE, System::nanoTime);
+    public SegmentManager(long segmentSizeBytes, SegmentBudget budget) {
+        this(segmentSizeBytes, budget, FilesFacade.INSTANCE, System::nanoTime);
     }
 
     @TestOnly
-    public SegmentManager(long segmentSizeBytes, long pollNanos, long maxTotalBytes, FilesFacade filesFacade) {
-        this(segmentSizeBytes, pollNanos, new SegmentBudget(maxTotalBytes), filesFacade, System::nanoTime);
+    public SegmentManager(long segmentSizeBytes, long maxTotalBytes, FilesFacade filesFacade) {
+        this(segmentSizeBytes, new SegmentBudget(maxTotalBytes), filesFacade, System::nanoTime);
     }
 
     @TestOnly
     public SegmentManager(
             long segmentSizeBytes,
-            long pollNanos,
             long maxTotalBytes,
             FilesFacade filesFacade,
             LongSupplier ticks
     ) {
-        this(segmentSizeBytes, pollNanos, new SegmentBudget(maxTotalBytes), filesFacade, ticks);
+        this(segmentSizeBytes, new SegmentBudget(maxTotalBytes), filesFacade, ticks);
     }
 
     @TestOnly
     public SegmentManager(
             long segmentSizeBytes,
-            long pollNanos,
             SegmentBudget budget,
             FilesFacade filesFacade,
             LongSupplier ticks
     ) {
-        // The pathScratch field initializer has already allocated its native
-        // buffer by the time this body runs, so a validation throw must free
-        // it or every failed construction leaks 256 bytes of native memory
-        // (e.g. a drainer retry loop hitting the same bad config).
         if (segmentSizeBytes < MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + 1) {
-            pathScratch.close();
             throw new IllegalArgumentException("segmentSizeBytes too small: " + segmentSizeBytes);
         }
         if (budget == null) {
-            pathScratch.close();
             throw new IllegalArgumentException("budget must not be null");
         }
         if (budget.getCapacityBytes() < segmentSizeBytes) {
-            pathScratch.close();
             throw new IllegalArgumentException(
                     "maxTotalBytes (" + budget.getCapacityBytes() + ") must allow at least one segment of "
                             + segmentSizeBytes + " bytes");
@@ -292,14 +199,6 @@ public final class SegmentManager implements QuietCloseable {
         this.budget = budget;
         this.filesFacade = filesFacade;
         this.segmentSizeBytes = segmentSizeBytes;
-        this.pollNanos = pollNanos;
-        // Clamp rather than multiply blind: segmentSizeBytes is user-supplied
-        // and only bounded below, so a pathological value would wrap the
-        // product negative and make the floor test trivially false -- silently
-        // restoring the deadlock this field exists to remove.
-        this.livenessFloorBytes = segmentSizeBytes > Long.MAX_VALUE / MIN_LIVE_SEGMENTS
-                ? Long.MAX_VALUE
-                : segmentSizeBytes * MIN_LIVE_SEGMENTS;
         this.ticks = ticks;
     }
 
@@ -339,15 +238,10 @@ public final class SegmentManager implements QuietCloseable {
             if (t.isAlive()) {
                 synchronized (lock) {
                     if (!workerLoopExited) {
-                        // Hand pathScratch ownership to the worker: its exit
-                        // block frees the buffer under the same lock, so the
-                        // native allocation is reclaimed even though this
-                        // close() could not confirm termination. workerThread
-                        // stays set so isWorkerReaped() reports the incomplete
-                        // shutdown and a later close() can retry the join.
-                        scratchHandedToWorker = true;
-                        LOG.warn("SegmentManager worker did not stop before close wait completed; "
-                                + "worker frees its native scratch buffer on exit");
+                        // workerThread stays set so isWorkerReaped() reports
+                        // the incomplete shutdown and a later close() can
+                        // retry the join.
+                        LOG.warn("SegmentManager worker did not stop before close wait completed");
                         return;
                     }
                 }
@@ -397,17 +291,6 @@ public final class SegmentManager implements QuietCloseable {
                 // best-effort behaviour before this second join existed.
             }
             workerThread = null;
-        }
-        // Free the rotation-path native scratch buffer only after worker
-        // termination (or worker-loop exit) has been observed. The worker is
-        // the only thread that touches the buffer; the scratchFreed flag
-        // (shared with the worker's exit block) makes the free exactly-once
-        // no matter which side runs last.
-        synchronized (lock) {
-            if (!scratchFreed) {
-                scratchFreed = true;
-                pathScratch.close();
-            }
         }
     }
 
@@ -585,10 +468,7 @@ public final class SegmentManager implements QuietCloseable {
     }
 
     /**
-     * Stop tracking {@code ring}. Pending spares for the ring are NOT
-     * created after this returns, but already-installed spares stay with
-     * the ring (the ring closes them on its own {@link SegmentRing#close}).
-     * Idempotent; safe to call from any thread.
+     * Stop tracking {@code ring}. Idempotent; safe to call from any thread.
      * <p>
      * Non-blocking: a worker service pass already in flight for this ring
      * may still be running when this returns. Callers about to release
@@ -602,13 +482,11 @@ public final class SegmentManager implements QuietCloseable {
             for (int i = 0, n = rings.size(); i < n; i++) {
                 RingEntry e = rings.get(i);
                 if (e.ring == ring) {
-                    // Reverse the ring's charge to the budget —
-                    // mirrors the seed in register(). Any spares the
-                    // manager provisioned during the ring's lifetime
-                    // are also part of totalSegmentBytes() now, so a
-                    // single subtraction covers both the initial seed
-                    // and the net manager activity (provisions minus
-                    // trims) for this ring.
+                    // Reverse the ring's charge to the budget: the seed from
+                    // register() plus every segment the producer created
+                    // since, minus the trims -- all of it is
+                    // totalSegmentBytes() now, including a segment the
+                    // provisioner holds after a failed rotation.
                     e.deregister();
                     budget.release(ring.totalSegmentBytes());
                     if (e.sideFileBytes != null) {
@@ -622,25 +500,25 @@ public final class SegmentManager implements QuietCloseable {
     }
 
     /**
-     * Register a ring for ongoing spare-creation + trim. {@code dir} is the
-     * filesystem directory the ring's segments live in — used by the manager
-     * both for creating spare files and unlinking trimmed ones. The ring
-     * MUST already have its initial active segment in place.
+     * Register a ring for trim and disk barriers, and give it a
+     * {@link SegmentProvisioner} that creates its segments in {@code dir}
+     * ({@code null} = memory mode) on the producer thread, charged to this
+     * manager's budget. The ring MUST already have its initial active segment
+     * in place.
      * <p>
-     * Also wires the ring's "I need a spare" wakeup callback to
-     * {@link #wakeWorker()}, so the producer thread can preempt the polling
-     * tick the moment a rotation consumes the spare or the active crosses
-     * the high-water mark — no waiting on the next tick.
+     * Also wires the ring's wakeup callback to {@link #wakeWorker()}, so a
+     * rotation or a pin release that makes a segment trimmable wakes the
+     * parked worker.
      */
     public void register(SegmentRing ring, String dir) {
         register(ring, dir, null, 0L);
     }
 
     /**
-     * Same as {@link #register(SegmentRing, String)} but also wires an
-     * {@link AckWatermark} the manager will keep up to date on every
-     * tick. The watermark is owned by the caller (typically
-     * {@link CursorSendEngine}); the manager only writes through it
+     * Same as {@link #register(SegmentRing, String)} but also wires the
+     * {@link AckWatermark} the manager syncs before it unlinks a trimmed
+     * segment. The watermark is owned and written by the caller (typically
+     * {@link CursorSendEngine}, on every ACK); the manager only syncs it
      * and never closes it. {@code null} watermark falls back to the
      * legacy behaviour: no on-disk watermark, recovery seeds from
      * {@code lowestSurvivingBaseSeq - 1}.
@@ -660,15 +538,14 @@ public final class SegmentManager implements QuietCloseable {
     /**
      * Same as {@link #register(SegmentRing, String, AckWatermark, long)} but
      * also wires a live gauge of the slot's {@code .symbol-dict} side-file
-     * bytes. The manager reads the gauge at every provisioning cap check so
+     * bytes. The budget reads the gauge at every provisioning cap check so
      * the dictionary counts against {@code sf_max_total_bytes} alongside the
      * {@code .sfa} segments; a {@code null} gauge contributes zero (memory
      * mode, degraded full-dict sessions).
      * <p>
      * The gauge is invoked under the {@link SegmentBudget}'s monitor, so it
-     * must be wait-free and must not throw: a throwing gauge terminates the
-     * worker of every manager charging that budget, and a blocking gauge
-     * stalls register/deregister and provisioning for all of their slots.
+     * must be wait-free and must not throw. A blocking gauge stalls budget
+     * operations for every slot sharing that budget.
      */
     public void register(SegmentRing ring, String dir, AckWatermark watermark, long syncIntervalNanos, LongSupplier sideFileBytes) {
         if (syncIntervalNanos < 0L) {
@@ -677,28 +554,30 @@ public final class SegmentManager implements QuietCloseable {
         if (syncIntervalNanos > 0L && dir == null) {
             throw new IllegalArgumentException("periodic sync requires a segment directory");
         }
-        // Account for bytes the ring already owns when it joins. A recovered
-        // ring (post-restart, orphan adoption) can come up at-or-above the cap;
-        // without this seed, the budget stays at 0 and the per-tick cap check
-        // at serviceRing would let the manager keep provisioning new spares on
-        // top of the recovered set, effectively doubling the documented cap.
+        if (ring.maxBytesPerSegment() != segmentSizeBytes) {
+            // The ring's oversized-payload check assumes the segments this
+            // manager's provisioner creates are maxBytesPerSegment large.
+            throw new IllegalArgumentException("ring segment size " + ring.maxBytesPerSegment()
+                    + " does not match the manager's " + segmentSizeBytes);
+        }
+        // Charge bytes the ring already owns, including recovered segments,
+        // before the provisioner can charge for new segments.
         long ringBytes = ring.totalSegmentBytes();
-        // Skip the file-generation counter past whatever's already on disk in
-        // this slot. Without this, on recovery the manager would mint a new
-        // spare at sf-0000000000000000.sfa — and openCleanRW would truncate the
-        // user's existing active file out from under the I/O loop, scrambling
-        // the in-flight mmap. Memory-mode rings have no dir; nothing to scan.
-        long minNextGeneration = dir == null ? -1L : scanMaxGeneration(dir) + 1L;
-        Runnable managerWakeup = this::wakeWorker;
+        // Start the file-generation counter past whatever's already on disk in
+        // this slot, or on recovery the first rotation would try to create
+        // sf-0000000000000000.sfa, collide with the recovered active (O_EXCL
+        // refuses it) and backpressure the producer on every retry.
+        // Memory-mode rings have no dir; nothing to scan.
+        if (!ring.hasSegmentSource()) {
+            long firstGeneration = dir == null ? 0L : scanMaxGeneration(dir) + 1L;
+            ring.setSegmentSource(new SegmentProvisioner(ring, dir, firstGeneration, segmentSizeBytes, budget, filesFacade));
+        }
         RingEntry e = new RingEntry(ring, dir, watermark, sideFileBytes, syncIntervalNanos, ticks.getAsLong());
         // ObjList.add either throws before storing e or makes the entry visible.
         // Once visible, only non-throwing state commits may remain, so the gauge
         // (whose list can also throw on growth) is added first and withdrawn if
         // the entry cannot be published.
         synchronized (lock) {
-            if (dir != null) {
-                advanceFileGeneration(minNextGeneration);
-            }
             if (sideFileBytes != null) {
                 budget.addSideFileGauge(sideFileBytes);
             }
@@ -713,22 +592,14 @@ public final class SegmentManager implements QuietCloseable {
             budget.charge(ringBytes);
             if (syncIntervalNanos > 0L) {
                 ring.enablePeriodicSync();
-                if (syncIntervalNanos < shortestSyncIntervalNanos) {
-                    shortestSyncIntervalNanos = syncIntervalNanos;
-                }
             }
         }
-        ring.setManagerWakeup(managerWakeup);
+        ring.setManagerWakeup(workerWakeup);
         // Nudge the worker so it picks up the new ring on its very next
-        // iteration. Without this, register-after-start has a race window:
-        // start() schedules the worker thread, and if that thread reaches
-        // workerLoop and takes `lock` before this method does, it observes
-        // an empty `rings` snapshot, services nothing, then parkNanos
-        // (potentially seconds). A new ring whose first append does not
-        // cross the high-water mark fires no producer-side wakeup either,
-        // leaving the ring without a spare for the full poll interval.
-        // wakeWorker is cheap (a single LockSupport.unpark) and a no-op
-        // when the worker has not been started yet.
+        // iteration: a recovered ring may already hold trimmable segments,
+        // and the first periodic-sync pass runs immediately. wakeWorker is
+        // cheap (a single LockSupport.unpark) and a no-op when the worker has
+        // not been started yet.
         wakeWorker();
     }
 
@@ -751,13 +622,6 @@ public final class SegmentManager implements QuietCloseable {
     @TestOnly
     public Thread getWorkerThreadForTesting() {
         return workerThread;
-    }
-
-    @TestOnly
-    public boolean isPathScratchAllocatedForTesting() {
-        synchronized (lock) {
-            return !scratchFreed;
-        }
     }
 
     @TestOnly
@@ -792,11 +656,6 @@ public final class SegmentManager implements QuietCloseable {
     }
 
     @TestOnly
-    public void setBeforeInstallSyncHook(Runnable hook) {
-        this.beforeInstallSyncHook = hook;
-    }
-
-    @TestOnly
     public void setBeforeRingQuiescenceAwaitHook(Runnable hook) {
         this.beforeRingQuiescenceAwaitHook = hook;
     }
@@ -827,7 +686,7 @@ public final class SegmentManager implements QuietCloseable {
     }
 
     /**
-     * Unparks the worker thread out of its poll-park so it processes
+     * Unparks the worker thread out of its idle park so it processes
      * registered rings on the very next loop iteration. Cheap — a single
      * {@code LockSupport.unpark}; safe to call from any thread; idempotent
      * (multiple unparks coalesce into a single permit). No-op if the worker
@@ -879,43 +738,6 @@ public final class SegmentManager implements QuietCloseable {
         return max;
     }
 
-    private void advanceFileGeneration(long minNext) {
-        while (true) {
-            long cur = fileGeneration.get();
-            if (cur >= minNext) break;
-            if (fileGeneration.compareAndSet(cur, minNext)) break;
-        }
-    }
-
-    /**
-     * Spare files are named with a JVM-wide monotonic generation counter
-     * rather than a baseSeq-derived name, because the spare's baseSeq is
-     * provisional at create time (SegmentRing.appendOrFsn rebases it at
-     * rotation). Pattern: {@code <dir>/sf-<gen:016x>.sfa}. Recovery
-     * discovers segments by extension + header magic, not by filename.
-     * <p>
-     * Builds the path bytes directly into {@link #pathScratch} and writes
-     * a trailing NUL so the same buffer can be handed to the long-ptr
-     * {@link FilesFacade} overloads (no per-rotation byte[] + native
-     * malloc). The String returned is the same path without the NUL --
-     * captured before terminating so it is suitable for {@link MmapSegment#path()}
-     * and exception messages.
-     */
-    private String nextSparePath(String dir) {
-        pathScratch.clear();
-        pathScratch.putAscii(dir).putAscii("/sf-");
-        Numbers.appendHex(pathScratch, fileGeneration.getAndIncrement(), true);
-        pathScratch.putAscii(".sfa");
-        String displayPath = pathScratch.toString();
-        // Trailing NUL must be appended AFTER toString() captures the path
-        // text -- DirectUtf8Sink.toString reads the full sink contents and
-        // would otherwise include the terminator in the result. Use putAny
-        // so the assertion in DirectUtf8Sink.put(byte) does not trip on a
-        // non-negative byte.
-        pathScratch.putAny((byte) 0);
-        return displayPath;
-    }
-
     private boolean serviceRing(RingEntry e) {
         // Publish before the CAS so deregister + await can always find the
         // entry. The state CAS is the ownership decision: if deregister won,
@@ -965,158 +787,11 @@ public final class SegmentManager implements QuietCloseable {
         if (!memoryMode) {
             servicePeriodicSync(e, ticks.getAsLong());
         }
+        return trimAcked(e, memoryMode);
+    }
 
-        // 1. Provision a hot spare if the ring needs one AND we have headroom
-        //    under the disk-total cap. Cap check is per-tick; if we're capped
-        //    here, the ring stays in BACKPRESSURE_NO_SPARE until trim (step 2)
-        //    on this or a subsequent tick frees space. Logged at most once per
-        //    DISK_FULL_LOG_THROTTLE_NANOS so a sustained-disk-full state
-        //    doesn't drown the log.
-        if (e.ring.needsHotSpare()) {
-            // Charge the spare BEFORE provisioning it, as one atomic check-and-
-            // charge against everything else on the budget, live side-file bytes
-            // included. A snapshot-then-commit check would let two managers that
-            // share the budget both see room for its last segment and both take
-            // it. Installing the spare keeps the charge; every other outcome
-            // below releases it.
-            boolean withinCap = budget.tryCharge(segmentSizeBytes);
-            // Liveness floor. Refusing on segment bytes is productive -- an ack
-            // trims a sealed segment and the shortfall clears. Refusing on
-            // side-file bytes is not: the dictionary never shrinks, so a ring
-            // held below its minimum working set by them would never rotate
-            // again, on this run or any later one. Nor is refusing on the
-            // segments of OTHER rings that share the budget: their acks may
-            // never come (a sibling whose connection is down). Provision anyway
-            // while this ring is under the floor, and charge it honestly.
-            long ringSegmentBytes = withinCap ? 0L : e.ring.totalSegmentBytes();
-            boolean belowLivenessFloor = !withinCap && ringSegmentBytes < livenessFloorBytes;
-            if (belowLivenessFloor) {
-                budget.charge(segmentSizeBytes);
-            }
-            if (!withinCap && !belowLivenessFloor) {
-                long now = System.nanoTime();
-                if (now - lastDiskFullLogNs >= DISK_FULL_LOG_THROTTLE_NANOS) {
-                    long sideFileBytes = budget.getSideFileBytes();
-                    LOG.warn("SF {}: cannot provision spare in {} "
-                                    + "(totalBytes={}, sideFileBytes={}, cap={}, segmentSize={}). "
-                                    + "Producer is backpressured until ACK-driven trim frees segment "
-                                    + "space; side-file bytes are not reclaimed by trim.",
-                            memoryMode ? "memory cap reached" : "disk-full",
-                            memoryMode ? "<memory>" : e.dir, budget.getSegmentBytes() + sideFileBytes,
-                            sideFileBytes, budget.getCapacityBytes(), segmentSizeBytes);
-                    lastDiskFullLogNs = now;
-                }
-            } else {
-                if (belowLivenessFloor) {
-                    // Exceeding a configured cap is worth saying out loud, and
-                    // saying WHY: the operator's remedy is to raise
-                    // sf_max_total_bytes, or shrink the symbol dictionary or the
-                    // number of senders sharing the budget, never to wait for a
-                    // trim.
-                    long now = System.nanoTime();
-                    if (now - lastDiskFullLogNs >= DISK_FULL_LOG_THROTTLE_NANOS) {
-                        long sideFileBytes = budget.getSideFileBytes();
-                        LOG.warn("SF {}: provisioning past sf_max_total_bytes to keep the slot "
-                                        + "usable (totalBytes={}, sideFileBytes={}, cap={}, "
-                                        + "segmentSize={}, ringSegmentBytes={}, minWorkingSet={}). "
-                                        + "The rest of the budget -- symbol dictionaries, which trim "
-                                        + "cannot reclaim, and the segments of other senders sharing "
-                                        + "it -- leaves no room for this slot's active segment plus "
-                                        + "one spare; raise sf_max_total_bytes, or reduce symbol "
-                                        + "cardinality or the number of pooled senders.",
-                                memoryMode ? "<memory>" : e.dir, budget.getSegmentBytes() + sideFileBytes,
-                                sideFileBytes, budget.getCapacityBytes(), segmentSizeBytes,
-                                ringSegmentBytes, livenessFloorBytes);
-                        lastDiskFullLogNs = now;
-                    }
-                }
-                MmapSegment spare = null;
-                String path = null;
-                boolean installed = false;
-                try {
-                    // Null if the ring closed between this tick's snapshot and now:
-                    // close() nulls it under the ring's own monitor with no
-                    // coordination with the manager thread. A closed ring rejects
-                    // installHotSpare regardless, so there is nothing to provision
-                    // this tick; skip cleanly rather than provision a spare that will
-                    // be abandoned.
-                    MmapSegment active = e.ring.getActive();
-                    if (active != null) {
-                        // baseSeq is provisional -- SegmentRing.appendOrFsn calls
-                        // rebaseSeq() at rotation time to pin the real value. We
-                        // pass the manager's best guess (nextSeqHint at this
-                        // instant), which is fine since it's overwritten anyway.
-                        if (memoryMode) {
-                            spare = MmapSegment.createInMemory(e.ring.nextSeqHint(), segmentSizeBytes);
-                        } else {
-                            path = nextSparePath(e.dir);
-                            // Native path bytes (NUL-terminated) live in pathScratch
-                            // from the call above. Hand them straight to MmapSegment.create
-                            // via its long-ptr overload, bypassing the byte[] + native
-                            // malloc that the String overload would incur on every
-                            // rotation.
-                            spare = MmapSegment.create(filesFacade,
-                                    pathScratch.ptr(), path,
-                                    e.ring.nextSeqHint(), segmentSizeBytes, true);
-                        }
-                        Runnable installHook = beforeInstallSyncHook;
-                        if (installHook != null) {
-                            installHook.run();
-                        }
-                        if (!memoryMode) {
-                            spare.syncHeader();
-                            if (filesFacade.fsyncDir(e.dir) != 0) {
-                                throw new MmapSegmentException(
-                                        "could not sync hot-spare directory " + e.dir);
-                            }
-                        }
-                        // Install under the manager lock, gated on the entry
-                        // still being registered. If `e.ring` was deregistered
-                        // since the charge above, abandoning the spare here is
-                        // the only way to keep the budget consistent:
-                        // deregister already released ring.totalSegmentBytes()
-                        // (without the spare, since it wasn't installed yet), so
-                        // installing now would keep the spare's charge with no
-                        // future releaser. By holding `lock` across the
-                        // registration check AND installHotSpare, deregister is
-                        // forced to either observe the spare in the ring (and
-                        // release it) or run before installation (so no install
-                        // happens and the !installed path releases the charge).
-                        synchronized (lock) {
-                            if (e.isRegistered()) {
-                                e.ring.installHotSpare(spare);
-                                installed = true;
-                            }
-                        }
-                    }
-                } catch (Throwable t) {
-                    LOG.warn("Failed to provision hot spare in {} (will retry next tick)",
-                            memoryMode ? "<memory>" : e.dir, t);
-                }
-                if (!installed) {
-                    budget.release(segmentSizeBytes);
-                    if (spare != null) {
-                        try {
-                            spare.close();
-                        } catch (Throwable ignored) {
-                        }
-                    }
-                    // Only remove the file when the spare object exists, i.e.
-                    // MmapSegment.create succeeded and ownership is ours but
-                    // installation was rejected (ring deregistered/closed).
-                    // When create() itself threw, its catch already removed
-                    // anything it put on disk -- and with exclusive create
-                    // (O_EXCL) a failure can also mean the path was ALREADY
-                    // occupied by a file some other lifecycle owns, which a
-                    // blanket unlink here would destroy.
-                    if (path != null && spare != null) {
-                        filesFacade.remove(path);
-                    }
-                }
-            }
-        }
-
-        // 2. Trim fully ACKed segments. The ring first transfers one bounded,
+    private boolean trimAcked(RingEntry e, boolean memoryMode) {
+        // Trim fully ACKed segments. The ring first transfers one bounded,
         //    unpinned prefix out of live traversal and into hidden pending
         //    ownership. Only then may this worker unmap it. Disk mode keeps the
         //    pending prefix until unlink + directory fsync are durable; memory
@@ -1129,17 +804,6 @@ public final class SegmentManager implements QuietCloseable {
         int pendingCount = e.ring.pendingTrimCount();
         MmapSegment first = pendingCount == 0 ? e.ring.firstTrimmable() : null;
         if (pendingCount == 0 && first == null) {
-            // Preserve the cheap mmap-only watermark cadence for ACKs that do
-            // not yet cover a complete, unpinned sealed segment.
-            synchronized (lock) {
-                if (e.isRegistered() && e.watermark != null) {
-                    long currentAck = e.ring.ackedFsn();
-                    if (currentAck > e.lastPersistedAck) {
-                        e.watermark.write(currentAck);
-                        e.lastPersistedAck = currentAck;
-                    }
-                }
-            }
             return false;
         }
 
@@ -1186,9 +850,14 @@ public final class SegmentManager implements QuietCloseable {
             return false;
         }
 
-        // Every attempt repeats the cheap covering barrier. Besides keeping
-        // the latest cumulative ACK durable, this preserves the same strict
-        // pre-unlink/post-unlink directory ordering on pending retries.
+        // Every attempt repeats the cheap covering barrier. The trim itself
+        // is protected by the fsync'd manifest head, not by the watermark:
+        // recovery skips files below the head and seeds at least headBase-1.
+        // The sync only makes the watermark the I/O thread has written so far
+        // (possibly one ACK behind durableAck, or torn by a racing write)
+        // as durable as it can be, so recovery replays fewer duplicates, and
+        // it preserves the same strict pre-unlink/post-unlink directory
+        // ordering on pending retries.
         if (e.watermark == null) {
             if (!e.missingWatermarkLogged) {
                 e.missingWatermarkLogged = true;
@@ -1202,10 +871,6 @@ public final class SegmentManager implements QuietCloseable {
                 return false;
             }
             durableAck = e.ring.ackedFsn();
-            if (durableAck > e.lastPersistedAck) {
-                e.watermark.write(durableAck);
-                e.lastPersistedAck = durableAck;
-            }
         }
         try {
             e.watermark.sync();
@@ -1389,8 +1054,8 @@ public final class SegmentManager implements QuietCloseable {
         try {
             while (running) {
                 // Snapshot the rings under the lock so we don't hold it through the
-                // (potentially slow) syscalls during creation/unlink. ringSnapshot
-                // is a thread-confined field — no per-tick allocation.
+                // (potentially slow) syscalls during unlink. ringSnapshot is a
+                // thread-confined field reused between service passes.
                 ringSnapshot.clear();
                 synchronized (lock) {
                     for (int i = 0, n = rings.size(); i < n; i++) {
@@ -1404,28 +1069,41 @@ public final class SegmentManager implements QuietCloseable {
                         hasMoreTrimmable = true;
                     }
                 }
+                // Event-driven idle: every state change the worker services
+                // wakes it (register/deregister, rotation, pin release, an ACK
+                // that completes a sealed segment). Timed work: periodic sync
+                // and a failed trim's retry. Otherwise park indefinitely.
+                long parkNanos = Long.MAX_VALUE;
+                if (!hasMoreTrimmable) {
+                    long now = ticks.getAsLong();
+                    for (int i = 0, n = ringSnapshot.size(); i < n; i++) {
+                        RingEntry e = ringSnapshot.getQuick(i);
+                        if (e.syncIntervalNanos > 0L) {
+                            parkNanos = Math.min(parkNanos, Math.max(0L, e.nextDataSyncNanos - now));
+                        }
+                        if (e.trimRetryDelayNanos != 0L) {
+                            parkNanos = Math.min(parkNanos, Math.max(0L, e.trimRetryAtNanos - now));
+                        }
+                    }
+                }
                 // Drop strong refs so a deregistered ring becomes collectable
-                // before the next tick (otherwise the snapshot pins it for up
-                // to pollNanos after deregister).
+                // before the next wait (otherwise the snapshot pins it until
+                // the next wakeup).
                 ringSnapshot.clear();
                 if (!running) break;
                 if (!hasMoreTrimmable) {
-                    LockSupport.parkNanos(Math.min(pollNanos, shortestSyncIntervalNanos));
+                    if (parkNanos == Long.MAX_VALUE) {
+                        LockSupport.park(this);
+                    } else if (parkNanos > 0L) {
+                        LockSupport.parkNanos(this, parkNanos);
+                    }
                 }
             }
         } finally {
-            // If a timed-out close() abandoned the reap, it handed
-            // pathScratch ownership to this thread (see close()). Freeing it
-            // here reclaims the native buffer even when the worker outlives
-            // every close() attempt — nobody else retries manager cleanup.
             ObjList<Runnable> cleanups;
             Runnable ownedEngineCleanup;
             synchronized (lock) {
                 workerLoopExited = true;
-                if (scratchHandedToWorker && !scratchFreed) {
-                    scratchFreed = true;
-                    pathScratch.close();
-                }
                 cleanups = exitCleanups;
                 exitCleanups = null;
                 ownedEngineCleanup = ownedEngineExitCleanup;
@@ -1469,17 +1147,12 @@ public final class SegmentManager implements QuietCloseable {
         final LongSupplier sideFileBytes;
         final long syncIntervalNanos;
         // Engine-owned ack watermark for this slot, or null in memory
-        // mode and for callers that didn't supply one. Manager-thread
-        // only after register; never closed here (owner closes).
+        // mode and for callers that didn't supply one. The owner's I/O
+        // thread writes it; the worker only syncs it before a trim and
+        // never closes it.
         final AckWatermark watermark;
-        // Highest FSN this entry has written to its watermark. Manager-
-        // thread only -- no concurrent access. Initialized to -1 so the
-        // first observed acked FSN (>= 0) triggers the first write.
-        // Survives across multiple serviceRing ticks and avoids a
-        // write-storm when ackedFsn is steady.
-        long lastPersistedAck = -1L;
         // Prevents a legacy disk registration without a watermark from
-        // flooding the log on every manager tick.
+        // flooding the log on every manager pass.
         boolean missingWatermarkLogged;
         long nextDataSyncNanos;
         boolean syncFailureLogged;

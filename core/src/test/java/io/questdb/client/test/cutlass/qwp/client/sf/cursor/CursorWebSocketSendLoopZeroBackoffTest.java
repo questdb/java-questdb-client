@@ -103,7 +103,7 @@ public class CursorWebSocketSendLoopZeroBackoffTest {
         try (CursorSendEngine engine = new CursorSendEngine(
                 sfDir.getRoot().getAbsolutePath(), 16_384)) {
             CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
-                    null, engine, 0, 1_000_000L,
+                    null, engine, 0,
                     () -> {
                         // Plain connect failure: retried forever under
                         // Invariant B — never terminal, never latched.
@@ -147,7 +147,7 @@ public class CursorWebSocketSendLoopZeroBackoffTest {
         try (CursorSendEngine engine = new CursorSendEngine(
                 sfDir.getRoot().getAbsolutePath(), 16_384)) {
             CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
-                    null, engine, 0, 1_000_000L,
+                    null, engine, 0,
                     () -> {
                         throw new IOException("connection refused (test)");
                     },

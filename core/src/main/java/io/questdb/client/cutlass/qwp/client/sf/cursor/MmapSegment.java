@@ -28,9 +28,12 @@ import io.questdb.client.std.Crc32c;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.Misc;
+import io.questdb.client.std.Numbers;
 import io.questdb.client.std.Os;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
+import io.questdb.client.std.str.StringSink;
 import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -78,7 +81,11 @@ public final class MmapSegment implements QuietCloseable {
     private static final int RECOVERY_BUFFER_SIZE = 64 * 1024;
 
     private final FilesFacade filesFacade;
-    private final String path;
+    // Generation-named files retain their identity without constructing a
+    // filename String on the producer. Trim/diagnostics materialize it lazily.
+    private final String directory;
+    private final long fileGeneration;
+    private volatile String path;
     private final long sizeBytes;
     // memoryBacked: true when the segment buffer lives in malloc'd native
     // memory rather than an mmap'd file. The "non-SF async" path uses
@@ -88,10 +95,9 @@ public final class MmapSegment implements QuietCloseable {
     // appendCursor: written only by the producer thread, never read by anyone else
     // — it's the reservation cursor. Plain field is fine.
     private long appendCursor;
-    // baseSeq: provisional at create time, finalized by rebaseSeq() at rotation
-    // time. Mutable to support the cursor engine's hot-spare design — the
-    // segment manager pre-creates spares before the producer knows the exact
-    // baseSeq the new active will need.
+    // baseSeq: final when the producer creates the segment at rotation;
+    // rebaseSeq() exists for a segment created ahead of its rotation (tests,
+    // and files an older client left behind) whose base was a guess.
     private long baseSeq;
     // Highest published byte offset covered by a successful data barrier.
     // The manager writes this after msync+fsync; the producer reads it before
@@ -136,9 +142,11 @@ public final class MmapSegment implements QuietCloseable {
 
     private MmapSegment(FilesFacade filesFacade, String path, int fd, long mmapAddress, long sizeBytes,
                         long baseSeq, long initialCursor, long frameCount,
-                        boolean memoryBacked, long tornTailBytes) {
+                        boolean memoryBacked, long tornTailBytes, String directory, long fileGeneration) {
         this.filesFacade = filesFacade;
         this.path = path;
+        this.directory = directory;
+        this.fileGeneration = fileGeneration;
         this.fd = fd;
         this.mmapAddress = mmapAddress;
         this.sizeBytes = sizeBytes;
@@ -154,7 +162,7 @@ public final class MmapSegment implements QuietCloseable {
     /**
      * Convenience overload of {@link #create(FilesFacade, String, long, long)}
      * that uses {@link FilesFacade#INSTANCE} (production default). Tests that
-     * need to fault-inject filesystem failures (ENOSPC at openCleanRW or
+     * need to fault-inject filesystem failures (ENOSPC at openRWExclusive or
      * allocate) should call the facade-aware overload directly.
      */
     public static MmapSegment create(String path, long baseSeq, long sizeBytes) {
@@ -166,7 +174,7 @@ public final class MmapSegment implements QuietCloseable {
      * {@code sizeBytes} bytes of real disk blocks and mmapping the whole
      * region RW. Writes the 24-byte header and positions the cursor
      * immediately after it. Throws {@link MmapSegmentException} on any I/O
-     * failure (file already exists, openCleanRW failed, ENOSPC during
+     * failure (file already exists, openRWExclusive failed, ENOSPC during
      * pre-allocation, mmap rejected).
      * <p>
      * Pre-allocation uses {@link FilesFacade#allocate(int, long)} so that
@@ -179,14 +187,9 @@ public final class MmapSegment implements QuietCloseable {
      * that filesystem only.
      */
     public static MmapSegment create(FilesFacade ff, String path, long baseSeq, long sizeBytes) {
-        return create(ff, path, baseSeq, sizeBytes, false);
-    }
-
-    static MmapSegment create(FilesFacade ff, String path, long baseSeq, long sizeBytes,
-                              boolean manifestRequired) {
         long pathPtr = ff.allocNativePath(path);
         try {
-            return create(ff, pathPtr, path, baseSeq, sizeBytes, manifestRequired);
+            return create(ff, pathPtr, path, baseSeq, sizeBytes, false, null, 0);
         } finally {
             ff.freeNativePath(pathPtr);
         }
@@ -202,18 +205,23 @@ public final class MmapSegment implements QuietCloseable {
      */
     public static MmapSegment create(FilesFacade ff, long pathPtr, String displayPath, long baseSeq,
                                      long sizeBytes) {
-        return create(ff, pathPtr, displayPath, baseSeq, sizeBytes, false);
+        return create(ff, pathPtr, displayPath, baseSeq, sizeBytes, false, null, 0);
     }
 
-    static MmapSegment create(FilesFacade ff, long pathPtr, String displayPath, long baseSeq, long sizeBytes,
-                              boolean manifestRequired) {
+    static MmapSegment createGenerated(FilesFacade ff, long pathPtr, String directory, long generation,
+                                       long baseSeq, long sizeBytes) {
+        return create(ff, pathPtr, null, baseSeq, sizeBytes, true, directory, generation);
+    }
+
+    private static MmapSegment create(FilesFacade ff, long pathPtr, String displayPath, long baseSeq,
+                                      long sizeBytes, boolean manifestRequired, String directory, long generation) {
         if (sizeBytes < HEADER_SIZE + FRAME_HEADER_SIZE + 1) {
             throw new IllegalArgumentException(
                     "sizeBytes too small for header + one minimal frame: " + sizeBytes);
         }
         int fd = ff.openRWExclusive(pathPtr);
         if (fd < 0) {
-            throw new MmapSegmentException("exclusive create failed for " + displayPath);
+            throw new MmapSegmentException("exclusive create failed for " + pathForError(displayPath, pathPtr));
         }
         // Reserve real disk blocks and advance EOF to sizeBytes in one
         // call. ENOSPC surfaces here, before the producer thread starts
@@ -222,18 +230,15 @@ public final class MmapSegment implements QuietCloseable {
         // the JVM).
         if (!ff.allocate(fd, sizeBytes)) {
             ff.close(fd);
-            // Unlink the partially-created file so a sf_max_segment_bytes-sized
-            // empty file does not survive the failure. Under sustained
-            // disk-full pressure with the manager polling, hundreds would
-            // otherwise accumulate.
+            // Remove the partial file so repeated failures do not leave empty segments.
             ff.remove(pathPtr);
-            throw new MmapSegmentException("pre-allocation failed for " + displayPath);
+            throw new MmapSegmentException("pre-allocation failed for " + pathForError(displayPath, pathPtr));
         }
         long addr = Files.FAILED_MMAP_ADDRESS;
         try {
             addr = ff.mmap(fd, sizeBytes, 0, Files.MAP_RW, MemoryTag.MMAP_DEFAULT);
             if (addr == Files.FAILED_MMAP_ADDRESS) {
-                throw new MmapSegmentException("mmap failed for " + displayPath);
+                throw new MmapSegmentException("mmap failed for " + pathForError(displayPath, pathPtr));
             }
             // Header goes straight into the mapping — no separate write syscall.
             Unsafe.getUnsafe().putInt(addr, FILE_MAGIC);
@@ -243,7 +248,7 @@ public final class MmapSegment implements QuietCloseable {
             Unsafe.getUnsafe().putLong(addr + 8, baseSeq);
             Unsafe.getUnsafe().putLong(addr + 16, Os.currentTimeMicros());
             return new MmapSegment(ff, displayPath, fd, addr, sizeBytes, baseSeq,
-                    HEADER_SIZE, 0, false, 0L);
+                    HEADER_SIZE, 0, false, 0L, directory, generation);
         } catch (Throwable t) {
             if (addr != Files.FAILED_MMAP_ADDRESS) {
                 ff.munmap(addr, sizeBytes, MemoryTag.MMAP_DEFAULT);
@@ -281,11 +286,15 @@ public final class MmapSegment implements QuietCloseable {
             Unsafe.getUnsafe().putLong(addr + 8, baseSeq);
             Unsafe.getUnsafe().putLong(addr + 16, Os.currentTimeMicros());
             return new MmapSegment(null, null, -1, addr, sizeBytes, baseSeq,
-                    HEADER_SIZE, 0, true, 0L);
+                    HEADER_SIZE, 0, true, 0L, null, 0);
         } catch (Throwable t) {
             Unsafe.free(addr, sizeBytes, MemoryTag.NATIVE_DEFAULT);
             throw t;
         }
+    }
+
+    private static String pathForError(String path, long pathPtr) {
+        return path != null ? path : Files.utf8ToString(pathPtr);
     }
 
     /**
@@ -457,7 +466,9 @@ public final class MmapSegment implements QuietCloseable {
                     scan.lastGood,
                     scan.frameCount,
                     false,
-                    scan.tornTailBytes
+                    scan.tornTailBytes,
+                    null,
+                    0
             );
         } catch (Throwable t) {
             if (addr != Files.FAILED_MMAP_ADDRESS) {
@@ -519,7 +530,7 @@ public final class MmapSegment implements QuietCloseable {
             return;
         }
         if (filesFacade.msync(mmapAddress, HEADER_SIZE, false) != 0 || filesFacade.fsync(fd) != 0) {
-            throw new MmapSegmentException("could not sync segment header " + path);
+            throw new MmapSegmentException("could not sync segment header " + path());
         }
         if (durableCursor < HEADER_SIZE) {
             durableCursor = HEADER_SIZE;
@@ -588,17 +599,17 @@ public final class MmapSegment implements QuietCloseable {
         boolean locked = filesFacade.mlock(lockAddr, lockLen) == 0;
         if (!locked && MLOCK_REFUSAL_WARNED.compareAndSet(false, true)) {
             LOG.warn("mlock refused for SF barrier range in {} (degrading to re-dirty-only retry protection); "
-                    + "raise RLIMIT_MEMLOCK or grant CAP_IPC_LOCK to close the post-failure reclaim window", path);
+                    + "raise RLIMIT_MEMLOCK or grant CAP_IPC_LOCK to close the post-failure reclaim window", path());
         }
         boolean durable = false;
         try {
             if (filesFacade.msync(mmapAddress, published, false) != 0) {
-                throw new MmapSegmentException("could not sync segment data " + path);
+                throw new MmapSegmentException("could not sync segment data " + path());
             }
             // FlushViewOfFile alone is not power-loss durable on Windows. Keep the
             // fd barrier on every platform so this method has one portable contract.
             if (filesFacade.fsync(fd) != 0) {
-                throw new MmapSegmentException("could not sync segment file " + path);
+                throw new MmapSegmentException("could not sync segment file " + path());
             }
             durable = true;
             durableCursor = published;
@@ -642,9 +653,18 @@ public final class MmapSegment implements QuietCloseable {
         return publishedCursor;
     }
 
-    /** The on-disk file path this segment was created from / opened against. */
+    /** The on-disk file path; generation-named paths are materialized on first access. */
     public String path() {
-        return path;
+        String result = path;
+        if (result == null && directory != null) {
+            StringSink sink = Misc.getThreadLocalSink();
+            sink.put(directory).put("/sf-");
+            Numbers.appendHex(sink, fileGeneration, true);
+            sink.put(".sfa");
+            result = sink.toString();
+            path = result;
+        }
+        return result;
     }
 
     /**
@@ -741,7 +761,10 @@ public final class MmapSegment implements QuietCloseable {
         if (payloadLen > 0) {
             Unsafe.getUnsafe().copyMemory(payloadAddr, mmapAddress + offset + FRAME_HEADER_SIZE, payloadLen);
         }
-        int crc = Crc32c.update(Crc32c.INIT, lenAddr, 4L + payloadLen);
+        // Only recovery reads the CRC, and a memory-backed segment is never
+        // recovered: it would be a pass over every byte for nothing. The field
+        // stays, zeroed, so both backings keep one frame layout.
+        int crc = memoryBacked ? 0 : Crc32c.update(Crc32c.INIT, lenAddr, 4L + payloadLen);
         Unsafe.getUnsafe().putInt(mmapAddress + offset, crc);
         appendCursor = offset + total;
         // Plain read + write of the volatile field. `frameCount++` would
@@ -833,20 +856,20 @@ public final class MmapSegment implements QuietCloseable {
         long residueStart = sizeBytes - tornTailBytes;
         if (appendCursor != residueStart) {
             throw new MmapSegmentException(
-                    "torn tail must be sanitized before appends resume in " + path
+                    "torn tail must be sanitized before appends resume in " + path()
                             + " [appendCursor=" + appendCursor
                             + ", residueStart=" + residueStart + ']');
         }
         Unsafe.getUnsafe().setMemory(mmapAddress + residueStart, tornTailBytes, (byte) 0);
         if (filesFacade.msync(mmapAddress, sizeBytes, false) != 0 || filesFacade.fsync(fd) != 0) {
             throw new MmapSegmentException(
-                    "could not sync zeroed torn tail in " + path
+                    "could not sync zeroed torn tail in " + path()
                             + " [errno=" + Os.errno() + ']');
         }
         tornTailSanitized = true;
         LOG.warn("SF segment {}: zeroed {} bytes of torn-tail residue at offset {}; "
                         + "frames past the tear (if any) are discarded",
-                path, tornTailBytes, residueStart);
+                path(), tornTailBytes, residueStart);
     }
 
     /**

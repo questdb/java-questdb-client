@@ -24,8 +24,8 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.test.tools.TestWebSocketClient;
 import io.questdb.client.DefaultHttpClientConfiguration;
-import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
 import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
 import io.questdb.client.cutlass.qwp.client.NativeBufferWriter;
@@ -651,7 +651,7 @@ public class CursorWebSocketSendLoopOrphanTailTest {
      * for the highest wire seq seen. sendBinary and tryReceiveFrame both run
      * on the I/O thread; sentCount is volatile for test-thread assertions.
      */
-    private static final class AckingClient extends WebSocketClient {
+    private static final class AckingClient extends TestWebSocketClient {
         private int ackedUpTo;
         private volatile int sentCount;
 
@@ -842,7 +842,7 @@ public class CursorWebSocketSendLoopOrphanTailTest {
 
     private CursorWebSocketSendLoop newLoop(CursorSendEngine engine, List<AckingClient> clients) {
         return new CursorWebSocketSendLoop(
-                null, engine, 0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                null, engine, 0L,
                 () -> {
                     AckingClient c = new AckingClient();
                     synchronized (clients) {

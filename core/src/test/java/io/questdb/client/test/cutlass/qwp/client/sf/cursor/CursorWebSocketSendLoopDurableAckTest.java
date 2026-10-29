@@ -24,9 +24,9 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
-import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.LineSenderServerException;
 import io.questdb.client.SenderError;
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
@@ -830,7 +830,7 @@ public class CursorWebSocketSendLoopDurableAckTest {
 
     private CursorWebSocketSendLoop newLoop(CursorSendEngine engine, int durableAckTiers) {
         return new CursorWebSocketSendLoop(
-                null, engine, 0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                null, engine, 0L,
                 () -> {
                     throw new UnsupportedOperationException("test loop is never started");
                 },

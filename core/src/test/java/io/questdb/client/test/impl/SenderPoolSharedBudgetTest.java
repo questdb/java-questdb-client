@@ -50,8 +50,8 @@ public class SenderPoolSharedBudgetTest {
 
     private static final long SEGMENT_BYTES = 64 * 1024;
     private static final long BUDGET_BYTES = 16 * SEGMENT_BYTES;
-    // Every live sender is always granted its active segment plus one spare,
-    // budget or not.
+    // Every live sender is always granted its active segment plus the one it
+    // rotates into, budget or not.
     private static final long MIN_WORKING_SET_BYTES = 2 * SEGMENT_BYTES;
     private static final int POOL_SIZE = 4;
 
@@ -105,8 +105,11 @@ public class SenderPoolSharedBudgetTest {
                         for (int i = 0; i < POOL_SIZE; i++) {
                             senders[i] = pool.borrow();
                         }
-                        // Every sender is built and holds its starting segments, so
-                        // from here on native memory grows only by buffered data.
+                        // Every sender is built and holds its active segment, so from
+                        // here on native memory grows only by buffered data: the rest of
+                        // the budget, plus the one segment past the cap the floor grants
+                        // each sender that found the budget spent, plus socket and write
+                        // buffers (well under two segments).
                         long nativeBefore = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_DEFAULT);
                         long bufferedBefore = budget.getSegmentBytes();
                         for (int i = 0; i < POOL_SIZE; i++) {
@@ -117,7 +120,7 @@ public class SenderPoolSharedBudgetTest {
                         long nativeGrowth = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_DEFAULT) - nativeBefore;
                         Assert.assertTrue("native memory must grow by no more than the rest of the one budget "
                                         + "[growth=" + nativeGrowth + ", bufferedBefore=" + bufferedBefore + ']',
-                                nativeGrowth <= BUDGET_BYTES - bufferedBefore + 4 * SEGMENT_BYTES);
+                                nativeGrowth <= BUDGET_BYTES - bufferedBefore + (POOL_SIZE + 2) * SEGMENT_BYTES);
                         long buffered = budget.getSegmentBytes();
                         Assert.assertTrue("the senders together must fill the budget [buffered=" + buffered + ']',
                                 buffered >= BUDGET_BYTES - SEGMENT_BYTES);

@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
@@ -147,12 +148,12 @@ public class SymbolDictRecycleArmingTest {
                 CursorSendEngine engine = new CursorSendEngine(
                         slot, 4L * 1024 * 1024, 64L * 1024 * 1024,
                         CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, ff);
-                QwpWebSocketSender sender = QwpWebSocketSender.connect(
+                QwpWebSocketSender sender = QwpWebSocketSender.connectWithCredentialSupplier(
                         Collections.singletonList(new QwpWebSocketSender.Endpoint("localhost", port)),
                         null, // tlsConfig
                         0, 0, 0L, // autoFlushRows, autoFlushBytes, autoFlushIntervalNanos
-                        null, // authorizationHeader
-                        false, // requestDurableAck
+                        QwpWebSocketSender.fixedAuthHeader(null), // authorizationHeader
+                        DurableAckTiers.NONE, // durableAckTiers
                         engine,
                         5_000L, // closeFlushTimeoutMillis
                         CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_DURATION_MILLIS,
@@ -171,7 +172,8 @@ public class SymbolDictRecycleArmingTest {
                         CursorWebSocketSendLoop.DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS,
                         true, // symbolDictResetEnabled
                         3, // symbolDictResetThresholdSymbols -- low, deliberately crossed below
-                        QwpWebSocketSender.DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS);
+                        QwpWebSocketSender.DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS,
+                        CursorWebSocketSendLoop.DEFAULT_KEEPALIVE_INTERVAL_MILLIS);
                 try {
                     ff.armed = true; // next dictionary mmap growth raises a recognised fault
                     sender.table("m").symbol("s", "a").longColumn("v", 1L).atNow();
@@ -379,12 +381,12 @@ public class SymbolDictRecycleArmingTest {
             long maxWaitMillis
     ) {
         try {
-            QwpWebSocketSender.connect(
+            QwpWebSocketSender.connectWithCredentialSupplier(
                     Collections.singletonList(new QwpWebSocketSender.Endpoint("localhost", 1)),
                     null, // tlsConfig
                     0, 0, 0L, // autoFlushRows, autoFlushBytes, autoFlushIntervalNanos
-                    null, // authorizationHeader
-                    false, // requestDurableAck
+                    QwpWebSocketSender.fixedAuthHeader(null), // authorizationHeader
+                    DurableAckTiers.NONE, // durableAckTiers
                     null, // cursorEngine
                     5_000L, // closeFlushTimeoutMillis
                     CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_DURATION_MILLIS,
@@ -403,7 +405,8 @@ public class SymbolDictRecycleArmingTest {
                     CursorWebSocketSendLoop.DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS,
                     resetEnabled, // symbolDictResetEnabled
                     thresholdSymbols,
-                    maxWaitMillis).close();
+                    maxWaitMillis,
+                    CursorWebSocketSendLoop.DEFAULT_KEEPALIVE_INTERVAL_MILLIS).close();
             Assert.fail("expected the connect to throw: " + expectedMessage);
         } catch (LineSenderException e) {
             TestUtils.assertContains(e.getMessage(), expectedMessage);

@@ -1132,7 +1132,7 @@ public final class BackgroundDrainer implements Runnable {
             while (!stopRequested) {
                 loop = new CursorWebSocketSendLoop(
                         client, engine,
-                        0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                        0L,
                         clientFactory,
                         reconnectInitialBackoffMillis,
                         reconnectMaxBackoffMillis,
