@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.test.tools.TestWebSocketClient;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
@@ -154,7 +155,7 @@ public class CursorWebSocketSendLoopConnectPhaseCloseTest {
                     factory,
                     /* reconnectInitialBackoffMillis */ 1_000L,
                     /* reconnectMaxBackoffMillis */ 5_000L,
-                    false
+                    DurableAckTiers.NONE
             );
             // Shrink the bounded-await backstop so the timeout branch fires fast
             // (no multi-second real wait); production uses the 30s default.
@@ -271,7 +272,7 @@ public class CursorWebSocketSendLoopConnectPhaseCloseTest {
                     factory,
                     /* reconnectInitialBackoffMillis */ 1_000L,
                     /* reconnectMaxBackoffMillis */ 5_000L,
-                    false
+                    DurableAckTiers.NONE
             );
 
             final AtomicReference<Throwable> closeFailure = new AtomicReference<>();

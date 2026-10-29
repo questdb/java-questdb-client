@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.test.tools.TestWebSocketClient;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.cutlass.line.LineSenderException;
@@ -56,7 +57,7 @@ public class CursorWebSocketSendLoopBlockedSendCloseTest {
                     null,
                     1_000L,
                     5_000L,
-                    false
+                    DurableAckTiers.NONE
             );
             long payload = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
             Thread closer = null;
@@ -131,7 +132,7 @@ public class CursorWebSocketSendLoopBlockedSendCloseTest {
                     null,
                     1_000L,
                     5_000L,
-                    false
+                    DurableAckTiers.NONE
             );
             long payload = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
             Thread closer = null;

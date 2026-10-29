@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.test.tools.TestWebSocketClient;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
@@ -108,7 +109,7 @@ public class CursorWebSocketSendLoopInterruptedCloseLeakTest {
                         null /* async-initial-connect: the I/O thread drives the connect */,
                         engine, 0L,
                         stuckConnect,
-                        100L, 5_000L, false);
+                        100L, 5_000L, DurableAckTiers.NONE);
                 loop.start();
                 Assert.assertTrue("I/O thread never reached the reconnect factory",
                         enteredReconnect.await(5, TimeUnit.SECONDS));

@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.test.tools.TestWebSocketClient;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.SenderError;
@@ -1541,7 +1542,7 @@ public class BackgroundDrainerDurableAckRetryTest {
                 reconnectMaxDurationMillis,
                 backoffInitMillis,
                 backoffMaxMillis,
-                /* requestDurableAck */ true,
+                /* durableAckTiers */ DurableAckTiers.REPLICATED,
                 /* durableAckKeepaliveIntervalMillis */ 200L);
     }
 
