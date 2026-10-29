@@ -47,9 +47,8 @@ import java.util.function.LongSupplier;
  * the producer itself at rotation ({@link SegmentProvisioner}).
  * <p>
  * One instance can serve many rings (typically all {@code Sender} instances
- * in a JVM). Polls each ring on a configurable tick (default 1 ms) — short
- * enough that a producer rarely sees {@link SegmentRing#BACKPRESSURE_NO_SPARE}
- * in the steady state, long enough that an idle JVM doesn't burn CPU.
+ * in a JVM). The worker parks until work is signalled or a periodic-sync
+ * or trim-retry deadline is due.
  */
 public final class SegmentManager implements QuietCloseable {
 
@@ -79,8 +78,8 @@ public final class SegmentManager implements QuietCloseable {
     private final SegmentBudget budget;
     private final FilesFacade filesFacade;
     private final Object lock = new Object();
-    // Reused by the worker thread each tick to snapshot `rings` under the
-    // lock without per-tick allocation. Owned exclusively by workerLoop().
+    // Reused by the worker to snapshot rings under the lock without allocating
+    // a new list on every pass. Owned exclusively by workerLoop().
     private final ObjList<RingEntry> ringSnapshot = new ObjList<>();
     private final ObjList<RingEntry> rings = new ObjList<>();
     private final long segmentSizeBytes;
@@ -155,22 +154,10 @@ public final class SegmentManager implements QuietCloseable {
 
     /**
      * @param segmentSizeBytes per-segment file size in bytes
-     * @param budget           charged for every segment the manager tracks, and
-     *                         shareable between managers (a sender pool does, so
-     *                         sf_max_total_bytes caps all of its senders
-     *                         together). Its capacity is the upper bound on total
-     *                         bytes across all registered rings — counts every segment
-     *                         the ring owns (active + sealed), including bytes
-     *                         already on disk at register-time (e.g. after
-     *                         recovery or orphan adoption). When a rotation's
-     *                         segment would exceed this, the producer stays in the
-     *                         {@link SegmentRing#BACKPRESSURE_NO_SPARE} state
-     *                         until ACK-driven trim frees space. Pass
-     *                         {@link #UNLIMITED_TOTAL_BYTES} to disable. Must be
-     *                         at least one {@code segmentSizeBytes}; a sensible
-     *                         lower bound for a single ring is
-     *                         {@code 2 × segmentSizeBytes}, the active segment
-     *                         plus the one it rotates into.
+     * @param budget           shared accounting for every ring-owned segment,
+     *                         including recovered and retained segments. See
+     *                         {@link SegmentProvisioner} for backpressure and
+     *                         the per-ring liveness floor.
      */
     public SegmentManager(long segmentSizeBytes, SegmentBudget budget) {
         this(segmentSizeBytes, budget, FilesFacade.INSTANCE, System::nanoTime);
@@ -551,15 +538,14 @@ public final class SegmentManager implements QuietCloseable {
     /**
      * Same as {@link #register(SegmentRing, String, AckWatermark, long)} but
      * also wires a live gauge of the slot's {@code .symbol-dict} side-file
-     * bytes. The manager reads the gauge at every provisioning cap check so
+     * bytes. The budget reads the gauge at every provisioning cap check so
      * the dictionary counts against {@code sf_max_total_bytes} alongside the
      * {@code .sfa} segments; a {@code null} gauge contributes zero (memory
      * mode, degraded full-dict sessions).
      * <p>
      * The gauge is invoked under the {@link SegmentBudget}'s monitor, so it
-     * must be wait-free and must not throw: a throwing gauge terminates the
-     * worker of every manager charging that budget, and a blocking gauge
-     * stalls register/deregister and provisioning for all of their slots.
+     * must be wait-free and must not throw. A blocking gauge stalls budget
+     * operations for every slot sharing that budget.
      */
     public void register(SegmentRing ring, String dir, AckWatermark watermark, long syncIntervalNanos, LongSupplier sideFileBytes) {
         if (syncIntervalNanos < 0L) {
@@ -574,11 +560,8 @@ public final class SegmentManager implements QuietCloseable {
             throw new IllegalArgumentException("ring segment size " + ring.maxBytesPerSegment()
                     + " does not match the manager's " + segmentSizeBytes);
         }
-        // Account for bytes the ring already owns when it joins. A recovered
-        // ring (post-restart, orphan adoption) can come up at-or-above the cap;
-        // without this seed, the budget stays at 0 and the per-tick cap check
-        // at serviceRing would let the manager keep provisioning new spares on
-        // top of the recovered set, effectively doubling the documented cap.
+        // Charge bytes the ring already owns, including recovered segments,
+        // before the provisioner can charge for new segments.
         long ringBytes = ring.totalSegmentBytes();
         // Start the file-generation counter past whatever's already on disk in
         // this slot, or on recovery the first rotation would try to create
@@ -1072,7 +1055,7 @@ public final class SegmentManager implements QuietCloseable {
             while (running) {
                 // Snapshot the rings under the lock so we don't hold it through the
                 // (potentially slow) syscalls during unlink. ringSnapshot is a
-                // thread-confined field — no per-tick allocation.
+                // thread-confined field reused between service passes.
                 ringSnapshot.clear();
                 synchronized (lock) {
                     for (int i = 0, n = rings.size(); i < n; i++) {
@@ -1104,7 +1087,7 @@ public final class SegmentManager implements QuietCloseable {
                     }
                 }
                 // Drop strong refs so a deregistered ring becomes collectable
-                // before the next tick (otherwise the snapshot pins it until
+                // before the next wait (otherwise the snapshot pins it until
                 // the next wakeup).
                 ringSnapshot.clear();
                 if (!running) break;
@@ -1169,7 +1152,7 @@ public final class SegmentManager implements QuietCloseable {
         // never closes it.
         final AckWatermark watermark;
         // Prevents a legacy disk registration without a watermark from
-        // flooding the log on every manager tick.
+        // flooding the log on every manager pass.
         boolean missingWatermarkLogged;
         long nextDataSyncNanos;
         boolean syncFailureLogged;

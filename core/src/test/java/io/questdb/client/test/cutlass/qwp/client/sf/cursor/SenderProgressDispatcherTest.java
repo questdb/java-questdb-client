@@ -188,14 +188,14 @@ public class SenderProgressDispatcherTest {
                     d.getWorkerThreadForTesting());
             d.setHandler(fsn -> {
                 last.set(fsn);
-                if (fsn == 1001) {
+                if (fsn == 1000) {
                     gotNewest.countDown();
                 }
             });
-            Assert.assertTrue(d.offer(1001));
+            // No later offer: setHandler() must start delivery of the saved watermark.
             Assert.assertTrue("real handler must receive the newest watermark",
                     gotNewest.await(1, TimeUnit.SECONDS));
-            Assert.assertEquals(1001L, last.get());
+            Assert.assertEquals(1000L, last.get());
             Assert.assertNotNull(d.getWorkerThreadForTesting());
         }
     }

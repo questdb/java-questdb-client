@@ -92,9 +92,8 @@ public final class CursorSendEngine implements QuietCloseable {
     // instance via adoptCounters(), so a symbol-dictionary recycle's rebuilt
     // engine keeps counting where the outgoing one stopped.
     private CursorSendCounters counters = new CursorSendCounters();
-    // Constructed before an owned manager acquires its native path scratch, so
-    // callback allocation failure cannot orphan manager resources. A timed-out
-    // close can then hand it to either manager path without allocating.
+    // Allocated before the engine acquires native or disk resources, so a
+    // timed-out close can delegate cleanup to the manager without allocating.
     private final Runnable deferredClose;
     // Facade for the persisted symbol dictionary only. Separate from
     // filesFacade (which the manager supplies for segments, watermark and
@@ -263,8 +262,8 @@ public final class CursorSendEngine implements QuietCloseable {
     /**
      * Creates an engine with a private, non-shared {@link SegmentManager}
      * capped at {@code maxTotalBytes} of cursor-allocated memory/disk
-     * (active + spare + sealed). Producer's {@link #appendBlocking} blocks
-     * up to {@code appendDeadlineNanos} when the cap is full and ACKs
+     * (active, sealed, and retained segments). Producer's {@link #appendBlocking}
+     * blocks up to {@code appendDeadlineNanos} when the cap is full and ACKs
      * haven't drained sealed segments; on deadline expiry it throws.
      */
     public CursorSendEngine(String sfDir, long segmentSizeBytes,
@@ -311,9 +310,10 @@ public final class CursorSendEngine implements QuietCloseable {
      * engine's private {@link SegmentManager} charges its segments to
      * {@code budget} instead of to a budget of its own. Engines built on one
      * budget share its capacity: together they never hold more than it, apart
-     * from the minimum working set (the active segment plus one spare) each
-     * ring is always granted. A sender pool builds every sender this way, so
-     * {@code sf_max_total_bytes} caps the pool rather than each pooled sender.
+     * from the minimum working set (the active segment plus the one being
+     * rotated into) each ring is always granted. A sender pool builds every
+     * sender this way, so {@code sf_max_total_bytes} caps the pool rather than
+     * each pooled sender.
      */
     public CursorSendEngine(String sfDir, long segmentSizeBytes, SegmentBudget budget,
                             long appendDeadlineNanos, long syncIntervalNanos) {
@@ -356,10 +356,8 @@ public final class CursorSendEngine implements QuietCloseable {
                              boolean ownsManager, SegmentBudget budget, long appendDeadlineNanos,
                              long syncIntervalNanos, FilesFacade dictFf) {
         this.dictFf = dictFf;
-        // Allocate the bound callback before constructing an owned manager.
-        // Field initializers have completed, but no engine-owned native/disk
-        // resource exists yet. If callback allocation throws, construction
-        // stops without a manager whose native path scratch could be orphaned.
+        // Allocate the bound callback before acquiring native or disk resources.
+        // A timed-out close can then delegate cleanup without allocating.
         this.deferredClose = createDeferredClose();
 
         // sfDir == null  → memory-only mode (non-SF async ingest). Same
@@ -368,7 +366,7 @@ public final class CursorSendEngine implements QuietCloseable {
         // sfDir != null  → store-and-forward mode. Segments are mmap'd files
         //                  under sfDir, recoverable across sender restarts.
         boolean memoryMode = sfDir == null;
-        // Validate before an owned manager allocates its native path scratch.
+        // Validate before acquiring the slot lock or allocating segments.
         if (syncIntervalNanos < 0L) {
             throw new IllegalArgumentException("syncIntervalNanos must not be negative");
         }
@@ -393,8 +391,8 @@ public final class CursorSendEngine implements QuietCloseable {
                 acquiredLock = SlotLock.acquire(sfDir, syncIntervalNanos > 0L);
             } catch (Throwable t) {
                 // Callback creation and owned-manager construction have already
-                // completed. A slot-lock failure must close the owned manager's
-                // native path scratch before propagating.
+                // completed. Close the owned manager before propagating a
+                // slot-lock failure.
                 if (ownsManager) {
                     try {
                         manager.close();
@@ -827,7 +825,7 @@ public final class CursorSendEngine implements QuietCloseable {
             // up to one window.
             // The gauge outlives close() safely: it is a pair of wait-free
             // volatile reads that take no lock and never touch the fd, so a
-            // manager tick racing engine shutdown observes the final values.
+            // manager pass racing engine shutdown observes the final values.
             // It must not become synchronized -- see sideFileBytesLocked().
             manager.register(ringInProgress, sfDir, watermarkInProgress, syncIntervalNanos,
                     persistedDictInProgress == null ? null : persistedDictInProgress::occupiedDiskBytes);
@@ -841,9 +839,8 @@ public final class CursorSendEngine implements QuietCloseable {
             // Stop an owned manager before freeing the ring and watermark it may
             // touch, then release the slot lock. Each cleanup is in its own
             // try/catch so a single failure doesn't strand later cleanups.
-            // Closing an owned-but-never-started manager is safe (no worker to
-            // join) and required: skipping it leaked the manager's native
-            // path-scratch sink whenever construction failed before start().
+            // Closing an owned-but-never-started manager is safe: there is no
+            // worker to join.
             if (ownsManager) {
                 try {
                     manager.close();
@@ -1002,8 +999,7 @@ public final class CursorSendEngine implements QuietCloseable {
             return fsn;
         }
         // Backpressure: spin briefly, then return so the caller decides.
-        // The spin tightens the gap between manager-installs-spare and
-        // producer-consumes-spare — usually a few µs on an idle manager thread.
+        // Retry briefly for budget space or a pending sync barrier to clear.
         while (System.nanoTime() < spinDeadlineNanos) {
             Compat.onSpinWait();
             fsn = ring.appendOrFsn(payloadAddr, payloadLen);
@@ -1114,7 +1110,7 @@ public final class CursorSendEngine implements QuietCloseable {
         }
         // Quiescence barrier. deregister alone only removes the entry
         // from the registry — the worker may still be mid service pass
-        // for this ring (creating a spare file, trimming, unlinking).
+        // for this ring (syncing or trimming segments).
         boolean workerQuiescent = false;
         if (ownsManager) {
             // Stopping and reaping a private manager is a stronger barrier

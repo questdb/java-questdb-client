@@ -123,7 +123,7 @@ public class SegmentManagerUnlinkFailureTest {
                 Assert.assertEquals(0L, ring.appendOrFsn(payload, 32));
                 QueueSegmentSource.install(ring, MmapSegment.create(dir + "/sf-0000000000000001.sfa", 1L, segmentSize));
                 Assert.assertEquals(1L, ring.appendOrFsn(payload, 32));
-                // A spare is already in place, so provisioning schedules no retry of its own.
+                // Pre-create the next segment so the test exercises only the unlink retry.
                 QueueSegmentSource.install(ring, MmapSegment.create(dir + "/sf-0000000000000002.sfa", 2L, segmentSize));
                 ring.acknowledge(0L);
                 FailingFilesFacade facade = new FailingFilesFacade(failedPath, null, null);
