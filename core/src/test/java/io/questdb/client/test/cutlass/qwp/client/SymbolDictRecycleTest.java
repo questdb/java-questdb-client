@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.ConnectionHealth;
 import io.questdb.client.Sender;
 import io.questdb.client.SenderConnectionEvent;
@@ -179,12 +180,12 @@ public class SymbolDictRecycleTest {
                 CursorSendEngine engine = new CursorSendEngine(
                         null, 4L * 1024 * 1024, 128L * 1024 * 1024,
                         CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS);
-                QwpWebSocketSender sender = QwpWebSocketSender.connect(
+                QwpWebSocketSender sender = QwpWebSocketSender.connectWithCredentialSupplier(
                         Collections.singletonList(new QwpWebSocketSender.Endpoint("localhost", port)),
                         null, // tlsConfig
                         0, 0, 0L, // autoFlushRows, autoFlushBytes, autoFlushIntervalNanos
-                        null, // authorizationHeader
-                        false, // requestDurableAck
+                        QwpWebSocketSender.fixedAuthHeader(null), // authorizationHeader
+                        DurableAckTiers.NONE, // durableAckTiers
                         engine,
                         5_000L, // closeFlushTimeoutMillis
                         CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_DURATION_MILLIS,
@@ -203,7 +204,8 @@ public class SymbolDictRecycleTest {
                         CursorWebSocketSendLoop.DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS,
                         true, // symbolDictResetEnabled
                         2, // symbolDictResetThresholdSymbols -- low, deliberately crossed below
-                        QwpWebSocketSender.DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS);
+                        QwpWebSocketSender.DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS,
+                        CursorWebSocketSendLoop.DEFAULT_KEEPALIVE_INTERVAL_MILLIS);
                 try {
                     sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
                     sender.table("t").symbol("s", "b").longColumn("v", 1L).atNow();

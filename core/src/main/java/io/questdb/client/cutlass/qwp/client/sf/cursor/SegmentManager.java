@@ -176,24 +176,6 @@ public final class SegmentManager implements QuietCloseable {
         this(segmentSizeBytes, budget, FilesFacade.INSTANCE, System::nanoTime);
     }
 
-    /**
-     * @deprecated {@code pollNanos} is ignored, the worker is event-driven. Kept
-     * so callers compiled against 1.3.x keep linking; {@code (long, long)} must
-     * keep this meaning, so a byte cap goes through {@link SegmentBudget}.
-     */
-    @Deprecated
-    public SegmentManager(long segmentSizeBytes, long pollNanos) {
-        this(segmentSizeBytes);
-    }
-
-    /**
-     * @deprecated see {@link #SegmentManager(long, long)}.
-     */
-    @Deprecated
-    public SegmentManager(long segmentSizeBytes, long pollNanos, long maxTotalBytes) {
-        this(segmentSizeBytes, new SegmentBudget(maxTotalBytes));
-    }
-
     @TestOnly
     public SegmentManager(long segmentSizeBytes, long maxTotalBytes, FilesFacade filesFacade) {
         this(segmentSizeBytes, new SegmentBudget(maxTotalBytes), filesFacade, System::nanoTime);

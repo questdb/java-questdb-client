@@ -71,7 +71,6 @@ import java.util.concurrent.locks.LockSupport;
  */
 public final class SenderProgressDispatcher implements QuietCloseable {
 
-    public static final int DEFAULT_CAPACITY = 256;
     private static final long DRAIN_DEADLINE_NANOS = 100_000_000L; // 100 ms
     private static final Logger LOG = LoggerFactory.getLogger(SenderProgressDispatcher.class);
     // Sentinel for "no value ever offered". Real FSNs are non-negative, so
@@ -100,19 +99,13 @@ public final class SenderProgressDispatcher implements QuietCloseable {
     // subsumes any prior undelivered value.
     private volatile long latestFsn = EMPTY;
 
-    public SenderProgressDispatcher(SenderProgressHandler handler, int capacity) {
-        this(handler, capacity, "qdb-sf-progress-dispatcher");
+    public SenderProgressDispatcher(SenderProgressHandler handler) {
+        this(handler, "qdb-sf-progress-dispatcher");
     }
 
-    public SenderProgressDispatcher(SenderProgressHandler handler, int capacity, String threadName) {
+    public SenderProgressDispatcher(SenderProgressHandler handler, String threadName) {
         if (handler == null) {
             throw new IllegalArgumentException("handler must be non-null");
-        }
-        // Capacity is retained on the constructor for API compatibility but
-        // the mailbox is single-slot by design (see class doc). The bound is
-        // still validated so misconfiguration surfaces at construction.
-        if (capacity < 1) {
-            throw new IllegalArgumentException("capacity must be >= 1, was " + capacity);
         }
         this.handler = handler;
         this.threadName = threadName;

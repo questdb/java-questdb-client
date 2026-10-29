@@ -29,7 +29,6 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpDurableAckMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
-import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.std.Files;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
@@ -135,25 +134,30 @@ public class DurableAckIntegrationTest {
     }
 
     @Test
-    public void testBooleanConnectOverloadRequestsLegacyTier() throws Exception {
-        // The boolean connect overloads map true onto the legacy request:
-        // the upgrade header carries "true" and the "enabled" grant is
-        // accepted. Callers linked against the boolean signatures keep the
-        // pre-tier wire behavior. (ExportedApiCompatibilityTest pins the
-        // signatures; this pins what they do.)
+    public void testBooleanBuilderRequestsLegacyTier() throws Exception {
+        assertBooleanBuilderRequest(true, "true");
+    }
+
+    @Test
+    public void testBooleanBuilderDisablesDurableAck() throws Exception {
+        assertBooleanBuilderRequest(false, "");
+    }
+
+    private void assertBooleanBuilderRequest(boolean enabled, String expectedHeader) throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            Assert.assertEquals(0, Files.mkdir(sfDir, Files.DIR_MODE_DEFAULT));
             DurableAckCapableHandler handler = new DurableAckCapableHandler();
-            try (TestWebSocketServer server = new TestWebSocketServer(handler, true)) {
+            try (TestWebSocketServer server = new TestWebSocketServer(handler, enabled)) {
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-                int port = server.getPort();
-
-                CursorSendEngine engine = new CursorSendEngine(sfDir, 16384);
-                try (Sender ignored = QwpWebSocketSender.connect(
-                        "localhost", port, null, 0, 0, 0L, null, true, engine)) {
-                    Assert.assertEquals("true",
-                            server.pollDurableAckRequest(5, TimeUnit.SECONDS));
+                // The public boolean API must retain the legacy true/enabled
+                // handshake; false must work against a server with no durable-ack support.
+                try (Sender ignored = Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address("localhost:" + server.getPort())
+                        .requestDurableAck(enabled)
+                        .storeAndForwardDir(sfDir)
+                        .build()) {
+                    Assert.assertEquals(expectedHeader,
+                            server.pollDurableAckRequest(100, TimeUnit.MILLISECONDS));
                 }
             }
         });
