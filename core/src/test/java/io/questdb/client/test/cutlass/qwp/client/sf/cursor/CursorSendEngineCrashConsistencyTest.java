@@ -400,6 +400,10 @@ public class CursorSendEngineCrashConsistencyTest {
             return INSTANCE.fsyncDir(dir);
         }
         @Override
+        public int fsyncDir(long dirPtr) {
+            return fsyncDir(Files.utf8ToString(dirPtr));
+        }
+        @Override
         public long length(int fd) { return INSTANCE.length(fd); }
         @Override
         public long length(String path) { return INSTANCE.length(path); }

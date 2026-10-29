@@ -25,6 +25,9 @@
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.std.FilesFacade;
+import io.questdb.client.std.Numbers;
+import io.questdb.client.std.str.DirectUtf8Sink;
+import io.questdb.client.std.str.Utf8s;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -66,6 +69,9 @@ public final class SegmentProvisioner implements SegmentSource {
     // null = memory mode
     private final String dir;
     private final FilesFacade ff;
+    // Producer-owned, sized at registration for the full UTF-8 filename and
+    // NUL terminator. Ring close frees it after manager/I/O quiescence.
+    private final DirectUtf8Sink pathScratch;
     private final SegmentRing ring;
     private final long segmentSizeBytes;
     private long lastLogNs;
@@ -88,6 +94,7 @@ public final class SegmentProvisioner implements SegmentSource {
         this.segmentSizeBytes = segmentSizeBytes;
         this.budget = budget;
         this.ff = ff;
+        this.pathScratch = dir == null ? null : new DirectUtf8Sink(Utf8s.utf8Bytes(dir) + 25L);
     }
 
     @Override
@@ -97,10 +104,16 @@ public final class SegmentProvisioner implements SegmentSource {
         // name, which recovery accepts either way. Its budget charge is not
         // released here: SegmentManager.deregister already released it as
         // part of the ring's totalSegmentBytes() (see heldBytes()).
-        if (retained != null) {
-            MmapSegment r = retained;
-            retained = null;
-            r.close();
+        try {
+            if (retained != null) {
+                MmapSegment r = retained;
+                retained = null;
+                r.close();
+            }
+        } finally {
+            if (pathScratch != null) {
+                pathScratch.close();
+            }
         }
     }
 
@@ -158,7 +171,6 @@ public final class SegmentProvisioner implements SegmentSource {
             }
         }
         MmapSegment segment = null;
-        String path = null;
         try {
             if (dir == null) {
                 segment = MmapSegment.createInMemory(baseSeq, segmentSizeBytes);
@@ -166,12 +178,18 @@ public final class SegmentProvisioner implements SegmentSource {
                 // Generation-named, not baseSeq-named: recovery discovers
                 // segments by extension and header magic, and a name that
                 // never repeats within the directory is all unlink needs.
-                path = dir + "/sf-" + String.format("%016x", nextGeneration++) + ".sfa";
-                segment = MmapSegment.create(ff, path, baseSeq, segmentSizeBytes, true);
+                long generation = nextGeneration++;
+                pathScratch.clear();
+                pathScratch.put(dir).putAscii("/sf-");
+                Numbers.appendHex(pathScratch, generation, true);
+                pathScratch.putAscii(".sfa").putAscii('\0');
+                segment = MmapSegment.createGenerated(ff, pathScratch.ptr(), dir, generation, baseSeq, segmentSizeBytes);
                 // Header and directory entry durable before the ring's
                 // manifest can name this segment.
                 segment.syncHeader();
-                if (ff.fsyncDir(dir) != 0) {
+                pathScratch.clear();
+                pathScratch.put(dir).putAscii('\0');
+                if (ff.fsyncDir(pathScratch.ptr()) != 0) {
                     throw new MmapSegmentException("could not sync segment directory " + dir);
                 }
             }
@@ -186,8 +204,8 @@ public final class SegmentProvisioner implements SegmentSource {
                 }
                 // create() removes its own file when it throws; only a
                 // segment that exists needs unlinking here.
-                if (path != null) {
-                    ff.remove(path);
+                if (dir != null) {
+                    ff.remove(segment.path());
                 }
             }
             retryAtNanos = now + CREATE_RETRY_NANOS;
