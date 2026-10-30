@@ -53,6 +53,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderProgressHandl
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegmentException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.ProgressNotifier;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderConnectionDispatcher;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher;
@@ -271,6 +272,9 @@ public class QwpWebSocketSender implements Sender {
     // QuestDBFlushOnCloseTest.testResetAfterACrossingRowAloneInItsTableDropsTheColumnItAdded
     // relies on that.
     private final ObjList<QwpTableBuffer> pendingTables = new ObjList<>();
+    // Wakes the producer-side ack waits (awaitAckedFsn, drainOnClose). One instance for the sender's whole
+    // life: every engine and loop it creates, symbol-dictionary recycles included, signals through it.
+    private final ProgressNotifier progressNotifier = new ProgressNotifier();
     private final IntList splitFrameBodyBytes = new IntList();
     // Every buffer in tableBuffers, in creation order, so markSavepoint(), reset() and
     // resetToSavepoint() walk a plain list instead of probing the hash map per table.
@@ -1555,7 +1559,9 @@ public class QwpWebSocketSender implements Sender {
 
     /**
      * Blocks until {@link #getAckedFsn()} {@code >= targetFsn}, or until
-     * {@code timeoutMillis} elapses. Polls on a 50us park; surfaces I/O loop
+     * {@code timeoutMillis} elapses. Parks on the sender's progress notifier
+     * until the I/O thread reports an ack or a terminal error, capped at 10 ms
+     * per park so a missed wake-up costs at most one cap; surfaces I/O loop
      * errors synchronously via {@code cursorSendLoop.checkError()}.
      * <p>
      * Every pass re-reads the epoch base and the cursor engine through
@@ -1595,14 +1601,18 @@ public class QwpWebSocketSender implements Sender {
             return false;
         }
         long deadlineNanos = System.nanoTime() + timeoutMillis * 1_000_000L;
-        while (getAckedFsn() < targetFsn) {
+        while (true) {
+            long generation = progressNotifier.generation();
+            if (getAckedFsn() >= targetFsn) {
+                return true;
+            }
             checkAwaitAckedFsnErrors();
-            if (System.nanoTime() >= deadlineNanos) {
+            long remainingNanos = deadlineNanos - System.nanoTime();
+            if (remainingNanos <= 0L) {
                 return false;
             }
-            java.util.concurrent.locks.LockSupport.parkNanos(50_000L);
+            progressNotifier.awaitChange(generation, remainingNanos);
         }
-        return true;
     }
 
     /**
@@ -3385,6 +3395,15 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * The notifier the producer-side ack waits park on, so tests can count
+     * how often a wait parked.
+     */
+    @TestOnly
+    public ProgressNotifier progressNotifierForTest() {
+        return progressNotifier;
+    }
+
+    /**
      * Test seam: installs the per-attempt WebSocket client factory override
      * consulted by {@code newWebSocketClient()} inside the connect walk.
      * Production code never sets it.
@@ -3589,6 +3608,9 @@ public class QwpWebSocketSender implements Sender {
             throw new LineSenderException("CursorSendEngine is already attached");
         }
         this.cursorEngine = engine;
+        if (engine != null) {
+            engine.setProgressNotifier(progressNotifier);
+        }
         this.ownsCursorEngine = takeOwnership && engine != null;
         // Delta encoding is available in memory-mode (in-process catch-up) and in
         // file-mode when the persisted dictionary opened (recovery / orphan-drain
@@ -3636,6 +3658,7 @@ public class QwpWebSocketSender implements Sender {
         loop.setConnectionDispatcher(connectionDispatcher);
         loop.setErrorDispatcher(errorDispatcher);
         loop.setProgressDispatcher(progressDispatcher);
+        loop.setProgressNotifier(progressNotifier);
     }
 
     /**
@@ -5208,7 +5231,11 @@ public class QwpWebSocketSender implements Sender {
         long deadlineNanos = System.nanoTime() + closeFlushTimeoutMillis * 1_000_000L;
         restoreInterrupt[0] |= Thread.interrupted();
         try {
-            while (cursorEngine.ackedFsn() < target) {
+            while (true) {
+                long generation = progressNotifier.generation();
+                if (cursorEngine.ackedFsn() >= target) {
+                    break;
+                }
                 // PoolHousekeeper.stop() escalates to interrupt when this close runs past its join budget. A carried
                 // interrupt makes parkNanos return immediately without clearing the flag, turning the remainder of a
                 // close drain (up to 60s by default) into a full-core spin. Consume any later interrupt before the
@@ -5247,7 +5274,7 @@ public class QwpWebSocketSender implements Sender {
                                     ? " pending batches; data may be lost (use larger closeFlushTimeoutMillis or smaller batches)"
                                     : " pending batches; the wire is not draining: " + outage.getMessage());
                 }
-                java.util.concurrent.locks.LockSupport.parkNanos(50_000L);
+                progressNotifier.awaitChange(generation, deadlineNanos - System.nanoTime());
             }
         } finally {
             // Close the last-iteration race: an interrupt can land after the loop observes its final ACK but
@@ -5395,6 +5422,7 @@ public class QwpWebSocketSender implements Sender {
                 progressDispatcher = new SenderProgressDispatcher(progressHandler, SenderProgressDispatcher.DEFAULT_CAPACITY);
             }
             cursorSendLoop.setProgressDispatcher(progressDispatcher);
+            cursorSendLoop.setProgressNotifier(progressNotifier);
             // Connection-event dispatcher: lets the cursor I/O loop fire
             // DISCONNECTED on outage entry. Sender-side fire points
             // (buildAndConnect) write directly to connectionDispatcher; this
@@ -6276,6 +6304,7 @@ public class QwpWebSocketSender implements Sender {
         deltaDictEnabled = rebuilt.isDeltaDictEnabled();
         rebuilt.adoptCounters(counters);
         cursorEngine = rebuilt;
+        rebuilt.setProgressNotifier(progressNotifier);
         ownsCursorEngine = true;
         cursorEngine.setSlotLockReleaseListener(this::onSlotLockReleased);
         recycleResume = RecycleResume.NONE;

@@ -902,9 +902,9 @@ public class CloseDrainTest {
     }
 
     /** Acks every binary frame after a fixed delay, so we can observe close() blocking. */
-    private static class DelayingAckHandler implements TestWebSocketServer.WebSocketServerHandler {
+    static class DelayingAckHandler implements TestWebSocketServer.WebSocketServerHandler {
         private final long delayMs;
-        private final AtomicLong nextSeq = new AtomicLong(0);
+        final AtomicLong nextSeq = new AtomicLong(0);
 
         DelayingAckHandler(long delayMs) {
             this.delayMs = delayMs;
