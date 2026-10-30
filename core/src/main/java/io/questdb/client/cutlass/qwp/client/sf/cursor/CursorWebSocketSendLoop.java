@@ -562,6 +562,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private long lastUncappedOversizeWarnNanos;
     private long nextWireSeq;
     private volatile SenderProgressDispatcher progressDispatcher;
+    private volatile ProgressNotifier progressNotifier;
     // Frames sent during the post-reconnect catch-up window — i.e. frames
     // whose FSN completed a send on an earlier connection. A non-zero
     // value confirms replay is working; a sustained nonzero rate means
@@ -1917,6 +1918,16 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * Plug the notifier the sender's ack waits park on. The loop signals it
+     * after every acked-watermark advance and after the terminal error latch.
+     * Set once before {@link #start()}; null (the default) means nobody waits
+     * and the signal sites do nothing.
+     */
+    public void setProgressNotifier(ProgressNotifier notifier) {
+        this.progressNotifier = notifier;
+    }
+
+    /**
      * Test seam: shrink the {@link #close()} bounded-await backstop
      * (default {@link #DEFAULT_CLOSE_SHUTDOWN_AWAIT_MILLIS}) so a test can
      * exercise the timeout branch deterministically without a multi-second
@@ -2623,6 +2634,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         if (d != null) {
             d.offer(externalFsnBase + ackedFsn);
         }
+        signalProgress();
     }
 
     /**
@@ -3003,6 +3015,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         } else {
             LOG.error("Cursor I/O loop failure: {}", t.getMessage(), t);
         }
+        signalProgress();
     }
 
     private void releasePendingEntry(PendingDurableEntry e) {
@@ -3062,6 +3075,13 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * interrupts catch-up so the remaining frames still count as re-sends on
      * the following connection.
      */
+    private void signalProgress() {
+        ProgressNotifier n = progressNotifier;
+        if (n != null) {
+            n.signal();
+        }
+    }
+
     private void snapshotReplayTarget() {
         if (hasEverConnected && nextWireSeq > 0L) {
             long lastSentFsn = fsnOfWireSeq(nextWireSeq - 1L);

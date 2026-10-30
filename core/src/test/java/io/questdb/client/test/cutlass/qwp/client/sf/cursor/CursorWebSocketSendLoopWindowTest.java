@@ -828,7 +828,7 @@ public class CursorWebSocketSendLoopWindowTest {
         }
     }
 
-    private static SenderError awaitLatchedServerError(CursorWebSocketSendLoop loop) throws InterruptedException {
+    static SenderError awaitLatchedServerError(CursorWebSocketSendLoop loop) throws InterruptedException {
         long deadline = System.nanoTime() + 10_000_000_000L;
         while (loop.getTerminalError() == null) {
             if (System.nanoTime() > deadline) {
@@ -900,7 +900,7 @@ public class CursorWebSocketSendLoopWindowTest {
     // The loop as the sender builds it, with the given strike threshold, no
     // escalation dwell, and the dispatcher; with holdFirstConnection, connection 0
     // queues its responses until the test releases them.
-    private static CursorWebSocketSendLoop newRejectingLoop(
+    static CursorWebSocketSendLoop newRejectingLoop(
             CursorSendEngine engine,
             QwpServerModel model,
             List<ServerModelClient> clients,

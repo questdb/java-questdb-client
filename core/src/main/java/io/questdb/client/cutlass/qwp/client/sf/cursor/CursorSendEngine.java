@@ -1649,6 +1649,16 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
+     * Plug the notifier the sender's ack waits park on; the ring signals it
+     * when the segment manager latches a durability failure. Called by the
+     * sender before the engine goes live; null (the default) means nobody
+     * waits and the signal site does nothing.
+     */
+    public void setProgressNotifier(ProgressNotifier notifier) {
+        ring.setProgressNotifier(notifier);
+    }
+
+    /**
      * Registers a callback for confirmed SF slot-lock release. If release
      * already completed, invokes the callback before returning.
      */

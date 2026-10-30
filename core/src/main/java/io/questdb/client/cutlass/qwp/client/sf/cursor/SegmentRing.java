@@ -151,6 +151,7 @@ public final class SegmentRing implements QuietCloseable {
     private Runnable managerWakeup;
     private long nextSeq;
     private boolean periodicSyncEnabled;
+    private volatile ProgressNotifier progressNotifier;
     private volatile long publishedFsn;
     private volatile boolean syncRequested;
     // Plain (producer-thread-only) flag; set to true the first time we ask
@@ -1219,7 +1220,15 @@ public final class SegmentRing implements QuietCloseable {
                     durabilityFailure = wrapped;
                 }
             }
+            ProgressNotifier n = progressNotifier;
+            if (n != null) {
+                n.signal();
+            }
         }
+    }
+
+    void setProgressNotifier(ProgressNotifier notifier) {
+        this.progressNotifier = notifier;
     }
 
     @Override
