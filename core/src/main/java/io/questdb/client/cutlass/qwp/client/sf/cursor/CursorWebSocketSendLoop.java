@@ -3067,6 +3067,13 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         }
     }
 
+    private void signalProgress() {
+        ProgressNotifier n = progressNotifier;
+        if (n != null) {
+            n.signal();
+        }
+    }
+
     /**
      * Freezes the highest FSN that completed a send on the connection which
      * just failed. Frames published before the first connection, or while a
@@ -3075,13 +3082,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * interrupts catch-up so the remaining frames still count as re-sends on
      * the following connection.
      */
-    private void signalProgress() {
-        ProgressNotifier n = progressNotifier;
-        if (n != null) {
-            n.signal();
-        }
-    }
-
     private void snapshotReplayTarget() {
         if (hasEverConnected && nextWireSeq > 0L) {
             long lastSentFsn = fsnOfWireSeq(nextWireSeq - 1L);

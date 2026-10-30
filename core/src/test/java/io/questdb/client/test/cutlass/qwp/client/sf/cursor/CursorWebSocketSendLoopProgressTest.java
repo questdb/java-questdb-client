@@ -107,6 +107,7 @@ public class CursorWebSocketSendLoopProgressTest {
                     assertTrue(engine.ackedFsn() < 0);
                     clients.get(0).holdResponses(false);
                     awaitAckedFsn(engine, 0);
+                    awaitGenerationAbove(notifier, gen0);
                     assertTrue(notifier.generation() > gen0);
                 } finally {
                     loop.close();
@@ -154,6 +155,7 @@ public class CursorWebSocketSendLoopProgressTest {
                     long gen0 = notifier.generation();
                     loop.start();
                     CursorWebSocketSendLoopWindowTest.awaitLatchedServerError(loop);
+                    awaitGenerationAbove(notifier, gen0);
                     assertTrue(notifier.generation() > gen0);
                 } finally {
                     loop.close();
@@ -168,6 +170,16 @@ public class CursorWebSocketSendLoopProgressTest {
         while (engine.ackedFsn() < target) {
             if (System.nanoTime() > deadline) {
                 assertEquals("timed out waiting for ackedFsn", target, engine.ackedFsn());
+            }
+            Thread.sleep(1);
+        }
+    }
+
+    private static void awaitGenerationAbove(ProgressNotifier notifier, long gen0) throws InterruptedException {
+        long deadline = System.nanoTime() + 10_000_000_000L;
+        while (notifier.generation() <= gen0) {
+            if (System.nanoTime() > deadline) {
+                fail("timed out waiting for the generation to pass " + gen0 + ", last seen " + notifier.generation());
             }
             Thread.sleep(1);
         }
