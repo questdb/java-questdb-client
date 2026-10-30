@@ -1650,9 +1650,10 @@ public final class CursorSendEngine implements QuietCloseable {
 
     /**
      * Plug the notifier the sender's ack waits park on; the ring signals it
-     * when the segment manager latches a durability failure. Called by the
-     * sender before the engine goes live; null (the default) means nobody
-     * waits and the signal site does nothing.
+     * when the segment manager latches a durability failure. The sender plugs
+     * it right after construction; a failure latched before the plug is
+     * reported by {@link #checkDurability()} on the waiter's next pass. Null
+     * (the default) means nobody waits and the signal site does nothing.
      */
     public void setProgressNotifier(ProgressNotifier notifier) {
         ring.setProgressNotifier(notifier);

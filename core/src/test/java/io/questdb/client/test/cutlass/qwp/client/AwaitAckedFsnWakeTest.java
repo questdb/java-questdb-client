@@ -52,6 +52,7 @@ public class AwaitAckedFsnWakeTest {
                 long fsn = sender.flushAndGetSequence();
                 ProgressNotifier notifier = sender.progressNotifierForTest();
                 long calls0 = notifier.awaitCount();
+                long generation0 = notifier.generation();
                 long t0 = System.nanoTime();
                 Assert.assertTrue(sender.awaitAckedFsn(fsn, 10_000L));
                 long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
@@ -59,6 +60,7 @@ public class AwaitAckedFsnWakeTest {
                 long calls = notifier.awaitCount() - calls0;
                 // 300 ms / 10 ms cap = 30; a 50 us poll would make ~6000
                 Assert.assertTrue("polled instead of parking: " + calls, calls <= 40L);
+                Assert.assertTrue("the ack did not signal the notifier", notifier.generation() > generation0);
             }
         }
     }
@@ -76,10 +78,13 @@ public class AwaitAckedFsnWakeTest {
                 sender.flush();
                 ProgressNotifier notifier = sender.progressNotifierForTest();
                 long calls0 = notifier.awaitCount();
+                long generation0 = notifier.generation();
                 sender.close();
                 Assert.assertTrue(handler.nextSeq.get() >= 1L);
                 long calls = notifier.awaitCount() - calls0;
+                Assert.assertTrue("close drain never waited on the notifier: " + calls, calls >= 1L);
                 Assert.assertTrue("polled instead of parking: " + calls, calls <= 60L);
+                Assert.assertTrue("the ack did not signal the notifier", notifier.generation() > generation0);
             } finally {
                 sender.close();
             }
@@ -88,38 +93,50 @@ public class AwaitAckedFsnWakeTest {
 
     @Test
     public void testUnrelatedAcksDoNotExtendTheTimeout() throws Exception {
-        FirstAckOnlyHandler handler = new FirstAckOnlyHandler();
+        FirstFrameDelayedAckHandler handler = new FirstFrameDelayedAckHandler(100L);
         try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
             String cfg = "ws::addr=localhost:" + server.getPort() + ";close_flush_timeout_millis=0;";
             try (QwpWebSocketSender sender = (QwpWebSocketSender) Sender.fromConfig(cfg)) {
                 sender.table("t").longColumn("v", 1).atNow();
-                long fsn0 = sender.flushAndGetSequence();
-                Assert.assertTrue(sender.awaitAckedFsn(fsn0, 5_000L));
-                sender.table("t").longColumn("v", 2).atNow();
                 long fsn1 = sender.flushAndGetSequence();
+                sender.table("t").longColumn("v", 2).atNow();
+                long fsn2 = sender.flushAndGetSequence();
+                Assert.assertTrue(fsn2 > fsn1);
+                ProgressNotifier notifier = sender.progressNotifierForTest();
+                long generation0 = notifier.generation();
                 long t0 = System.nanoTime();
-                Assert.assertFalse(sender.awaitAckedFsn(fsn1, 200L));
+                Assert.assertFalse(sender.awaitAckedFsn(fsn2, 200L));
                 long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
                 Assert.assertTrue("returned early: " + elapsedMs, elapsedMs >= 200L);
                 Assert.assertTrue("overshot: " + elapsedMs, elapsedMs < 2_000L);
+                Assert.assertTrue("the unrelated ack did not wake the waiter", notifier.generation() > generation0);
+                Assert.assertTrue("acked: " + sender.getAckedFsn(), sender.getAckedFsn() >= fsn1);
+                Assert.assertEquals("frames seen by the server", 2L, handler.nextSeq.get());
             }
         }
     }
 
     /**
-     * Acks the first frame at once and never acks a later one.
+     * Acks the first frame after a delay and never acks a later one.
      */
-    private static class FirstAckOnlyHandler implements TestWebSocketServer.WebSocketServerHandler {
+    private static class FirstFrameDelayedAckHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private final long delayMs;
         private final AtomicLong nextSeq = new AtomicLong(0);
+
+        private FirstFrameDelayedAckHandler(long delayMs) {
+            this.delayMs = delayMs;
+        }
 
         @Override
         public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
             if (nextSeq.getAndIncrement() == 0) {
                 try {
+                    Thread.sleep(delayMs);
                     client.sendBinary(CloseDrainTest.buildAck(0));
-                } catch (IOException e) {
+                } catch (IOException | InterruptedException e) {
+                    Thread.currentThread().interrupt();
                     throw new RuntimeException(e);
                 }
             }

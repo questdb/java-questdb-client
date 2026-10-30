@@ -3607,10 +3607,10 @@ public class QwpWebSocketSender implements Sender {
         if (cursorEngine != null) {
             throw new LineSenderException("CursorSendEngine is already attached");
         }
-        this.cursorEngine = engine;
         if (engine != null) {
             engine.setProgressNotifier(progressNotifier);
         }
+        this.cursorEngine = engine;
         this.ownsCursorEngine = takeOwnership && engine != null;
         // Delta encoding is available in memory-mode (in-process catch-up) and in
         // file-mode when the persisted dictionary opened (recovery / orphan-drain
@@ -6103,11 +6103,11 @@ public class QwpWebSocketSender implements Sender {
      * syscall past {@code SegmentManager}'s bounded join, the close instead
      * returned with the slot flock retained and its release deferred to the
      * worker's exit path -- exactly the transient disk stall the
-     * deferred-close machinery exists to survive. Park (the same
-     * {@code awaitAckedFsn}-shaped wait the starvation policy uses) until the
-     * deferred cleanup confirms the release; each pass also re-arms the
-     * shared flock-release retry driver for the close-ran-but-release-failed
-     * case, mirroring {@link #isSlotLockReleased()}'s re-probe.
+     * deferred-close machinery exists to survive. Park until the
+     * deferred cleanup confirms the release; this wait still polls on a 50 us
+     * park because the deferred engine close has no progress signal. Each pass
+     * also re-arms the shared flock-release retry driver for the
+     * close-ran-but-release-failed case, mirroring {@link #isSlotLockReleased()}'s re-probe.
      * <p>
      * Exhausting {@link #recycleDeferredCloseMaxWaitMillis} throws; the
      * recycle stays pending ({@link RecycleResume#REBUILD}) and the next send
@@ -6303,8 +6303,8 @@ public class QwpWebSocketSender implements Sender {
         // again on its first append (SymbolDictRecycleHealingTest).
         deltaDictEnabled = rebuilt.isDeltaDictEnabled();
         rebuilt.adoptCounters(counters);
-        cursorEngine = rebuilt;
         rebuilt.setProgressNotifier(progressNotifier);
+        cursorEngine = rebuilt;
         ownsCursorEngine = true;
         cursorEngine.setSlotLockReleaseListener(this::onSlotLockReleased);
         recycleResume = RecycleResume.NONE;
@@ -6429,7 +6429,11 @@ public class QwpWebSocketSender implements Sender {
         // loop-close join clears and restores a carried flag itself).
         boolean wasInterrupted = false;
         try {
-            while (!isRingDrained()) {
+            while (true) {
+                long generation = progressNotifier.generation();
+                if (isRingDrained()) {
+                    break;
+                }
                 cursorEngine.checkDurability();
                 if (cursorSendLoop != null) {
                     cursorSendLoop.checkError();
@@ -6441,7 +6445,7 @@ public class QwpWebSocketSender implements Sender {
                             + "staying armed", resetMaxWaitMillis);
                     return;
                 }
-                java.util.concurrent.locks.LockSupport.parkNanos(50_000L);
+                progressNotifier.awaitChange(generation, deadlineNanos - System.nanoTime());
                 wasInterrupted |= Thread.interrupted();
             }
         } finally {

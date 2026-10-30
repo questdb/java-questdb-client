@@ -39,9 +39,11 @@ import java.util.concurrent.locks.LockSupport;
  * write) and only then reads the waiter slot (a volatile read). The waiter
  * CASes itself into the slot (a volatile write) and only then re-reads the
  * generation (a volatile read). All four accesses are volatile, hence totally
- * ordered. If the signaller's slot read does not see the waiter, then the
- * waiter's CAS is ordered after that read, and so after the increment, so the
- * waiter's generation read sees the change and it does not park. Otherwise the
+ * ordered. If the signaller's slot read does not see the waiter, then either
+ * the waiter's CAS is ordered after that read, and so after the increment, so
+ * the waiter's generation read sees the change and it does not park, or the
+ * waiter already CASed in and out before that read, so its park has ended and
+ * its caller re-checks the predicate on the next pass. Otherwise the
  * signaller sees the waiter and unparks it; a permit granted before the park
  * makes the park return immediately. A stale permit left over from an earlier
  * signal only makes a later park return early, so callers must re-check their
@@ -92,7 +94,9 @@ public final class ProgressNotifier {
                 WAITER.compareAndSet(this, self, null);
             }
         } else {
-            LockSupport.parkNanos(this, Math.min(maxParkNanos, CONTENDED_PARK_NANOS));
+            if (generation.get() == expectedGeneration) {
+                LockSupport.parkNanos(this, Math.min(maxParkNanos, CONTENDED_PARK_NANOS));
+            }
         }
         return generation.get() != expectedGeneration;
     }

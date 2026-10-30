@@ -1,9 +1,9 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
  *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
- *    \__\_\__,_|\___||___/\__|____/|____/
+ *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
  *  Copyright (c) 2019-2026 QuestDB
@@ -28,6 +28,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.ProgressNotifier;
 import org.junit.Test;
 
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.LockSupport;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -38,6 +39,8 @@ public class ProgressNotifierTest {
     @Test
     public void testNoSignalReturnsFalseWithinTheCap() {
         ProgressNotifier n = new ProgressNotifier();
+        // drain a stale unpark permit left on this thread by an earlier test
+        LockSupport.parkNanos(1L);
         long t0 = System.nanoTime();
         assertFalse(n.awaitChange(n.generation(), 2_000_000_000L));
         long elapsed = System.nanoTime() - t0;

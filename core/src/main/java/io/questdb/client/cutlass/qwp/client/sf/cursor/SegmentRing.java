@@ -1227,6 +1227,8 @@ public final class SegmentRing implements QuietCloseable {
         }
     }
 
+    // the notifier the segment manager signals when a durability failure latches;
+    // the engine plugs it right after construction, null means nobody waits
     void setProgressNotifier(ProgressNotifier notifier) {
         this.progressNotifier = notifier;
     }

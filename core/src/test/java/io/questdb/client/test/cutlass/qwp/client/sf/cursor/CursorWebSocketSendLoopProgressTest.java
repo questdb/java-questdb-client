@@ -175,21 +175,21 @@ public class CursorWebSocketSendLoopProgressTest {
         }
     }
 
-    private static void awaitGenerationAbove(ProgressNotifier notifier, long gen0) throws InterruptedException {
-        long deadline = System.nanoTime() + 10_000_000_000L;
-        while (notifier.generation() <= gen0) {
-            if (System.nanoTime() > deadline) {
-                fail("timed out waiting for the generation to pass " + gen0 + ", last seen " + notifier.generation());
-            }
-            Thread.sleep(1);
-        }
-    }
-
     private static void awaitFrames(QwpServerModel model, int count) throws InterruptedException {
         long deadline = System.nanoTime() + 10_000_000_000L;
         while (model.frames().size() < count) {
             if (System.nanoTime() > deadline) {
                 assertEquals("timed out waiting for wire frames", count, model.frames().size());
+            }
+            Thread.sleep(1);
+        }
+    }
+
+    private static void awaitGenerationAbove(ProgressNotifier notifier, long gen0) throws InterruptedException {
+        long deadline = System.nanoTime() + 10_000_000_000L;
+        while (notifier.generation() <= gen0) {
+            if (System.nanoTime() > deadline) {
+                fail("timed out waiting for the generation to pass " + gen0 + ", last seen " + notifier.generation());
             }
             Thread.sleep(1);
         }
