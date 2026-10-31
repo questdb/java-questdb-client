@@ -247,7 +247,12 @@ public class SymbolDictRecycleFsnContinuityTest {
                 sender.setErrorHandler(e -> asyncError.compareAndSet(null, e));
                 try {
                     sender.table("foo").longColumn("v", 1L).atNow();
-                    sender.flush();
+                    try {
+                        sender.flush();
+                    } catch (LineSenderServerException ignored) {
+                        // The terminal NACK may arrive before flush() checks for errors.
+                        // The error is sticky, so the next batch below must still throw it.
+                    }
 
                     waitFor(() -> handler.totalBinaryReceived.get() >= 1, 5_000);
                     waitFor(() -> sender.getLastTerminalError() != null, 5_000);
@@ -349,7 +354,12 @@ public class SymbolDictRecycleFsnContinuityTest {
                 QwpWebSocketSender sender2 = createRolledSender(server, fsn1);
                 try {
                     sender2.table("foo").longColumn("v", 2L).atNow();
-                    sender2.flush();
+                    try {
+                        sender2.flush();
+                    } catch (LineSenderException ignored) {
+                        // The terminal NACK may arrive before flush() checks for errors.
+                        // The error is sticky, so awaitAckedFsn() below must still throw.
+                    }
                     waitFor(() -> sender2.getLastTerminalError() != null, 5_000);
 
                     LineSenderException thrown = null;
