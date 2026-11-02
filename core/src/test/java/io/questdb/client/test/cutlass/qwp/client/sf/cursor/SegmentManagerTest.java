@@ -300,13 +300,18 @@ public class SegmentManagerTest {
                 ring.appendOrFsn(buf, 64);
                 ring.appendOrFsn(buf, 64);
                 assertEquals(2L, ring.appendOrFsn(buf, 64)); // rotation 1
-                assertEquals(2 * segSize, mgr.getTotalBytesForTesting());
-                // Fill segment 2, rotate into segment 3 → 3*segSize. At cap.
+                // The worker pre-creates segment 3 while the cap has room for it
+                // → 3*segSize. At cap.
+                assertTrue("the worker must pre-create the next segment",
+                        waitFor(() -> ring.totalSegmentBytes() == 3 * segSize, 2000));
+                assertEquals(3 * segSize, mgr.getTotalBytesForTesting());
+                // Fill segment 2, rotate into the pre-created segment 3: no new charge.
                 ring.appendOrFsn(buf, 64);
                 assertEquals(4L, ring.appendOrFsn(buf, 64)); // rotation 2
                 assertEquals(3 * segSize, mgr.getTotalBytesForTesting());
-                // Fill segment 3. The next rotation would make 4*segSize > cap:
-                // refused, and the producer is backpressured.
+                // Fill segment 3. Nothing is pre-created at the cap, and the next
+                // rotation would make 4*segSize > cap: refused, and the producer
+                // is backpressured.
                 ring.appendOrFsn(buf, 64);
                 assertEquals(SegmentRing.BACKPRESSURE_NO_SPARE, ring.appendOrFsn(buf, 64));
                 assertEquals(3 * segSize, mgr.getTotalBytesForTesting());

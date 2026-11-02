@@ -1062,24 +1062,37 @@ public final class SegmentRing implements QuietCloseable {
             if (spare == null) {
                 return BACKPRESSURE_NO_SPARE;
             }
+            try {
+                // A segment created ahead of its rotation (the manager's
+                // prefetch, tests) carries a guessed base. Pin it, and make
+                // the header durable BEFORE the manifest references it: an OS
+                // crash could otherwise leave a durable manifest naming
+                // baseSeq=actualBase while the on-disk header still carries
+                // the guess, and recovery would fail a startup that lost
+                // nothing. Keyed on header durability, not on the base: a
+                // retry after a failed sync finds the base already pinned in
+                // memory but not on disk. Outside the monitor: the segment is
+                // not visible to any other thread yet.
+                if (spare.baseSeq() != actualBase) {
+                    spare.rebaseSeq(actualBase);
+                }
+                if (manifest != null && !spare.isHeaderDurable()) {
+                    spare.syncHeader();
+                }
+            } catch (Throwable t) {
+                try {
+                    source.discard(spare);
+                } catch (Throwable suppressed) {
+                    t.addSuppressed(suppressed);
+                }
+                throw t;
+            }
             // Publish the successor before the volatile active promotion. The
             // same monitor protects the sealed list and nextSealedAfter's trim
             // fallback, while the volatile link also remains readable from a
             // current segment after the manager removes and closes it.
             synchronized (this) {
                 try {
-                    if (spare.baseSeq() != actualBase) {
-                        // A source that pre-created the segment (tests) guessed
-                        // the base. Pin it, and make it durable BEFORE the
-                        // manifest references it: an OS crash could otherwise
-                        // leave a durable manifest naming baseSeq=actualBase
-                        // while the on-disk header still carries the guess, and
-                        // recovery would fail a startup that lost nothing.
-                        spare.rebaseSeq(actualBase);
-                        if (manifest != null) {
-                            spare.syncHeader();
-                        }
-                    }
                     if (manifest != null) {
                         // Inside the monitor: serialized with the trim path's
                         // advanceManifestHeadPast so neither writer publishes a
@@ -1112,6 +1125,8 @@ public final class SegmentRing implements QuietCloseable {
             }
             // The sealed segment may already be fully acked (the ACK landed
             // while it was still active, so it woke nothing): let trim look.
+            // In disk mode the worker also pre-creates the next successor.
+            source.rotated();
             Runnable wakeup = managerWakeup;
             if (wakeup != null) {
                 wakeup.run();

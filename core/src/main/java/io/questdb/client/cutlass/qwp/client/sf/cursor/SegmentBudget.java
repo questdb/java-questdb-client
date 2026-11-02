@@ -31,7 +31,8 @@ import java.util.function.LongSupplier;
 /**
  * The {@code sf_max_total_bytes} budget: an upper bound on the bytes the
  * cursor rings charged to it may hold -- every segment a ring owns (active
- * and sealed), in memory or on disk, plus each slot's live side-file bytes.
+ * and sealed, plus on disk the one pre-created for its next rotation), in
+ * memory or on disk, plus each slot's live side-file bytes.
  * <p>
  * A {@code Sender} built on its own charges a private budget. A sender pool
  * hands one budget to every sender it builds, so {@code sf_max_total_bytes}
@@ -40,7 +41,8 @@ import java.util.function.LongSupplier;
  * the budget as it provisions and trims segments.
  * <p>
  * The cap is enforced when a ring's {@link SegmentProvisioner} creates the
- * segment a rotation needs; bytes a ring already owns when it registers (a
+ * segment a rotation needs, and a pre-created one only ever takes free room;
+ * bytes a ring already owns when it registers (a
  * recovered slot) are charged even when they exceed it. A ring below its
  * minimum working set -- the active segment plus the one it rotates into --
  * is charged past the cap, so a budget shared by {@code n} rings can be

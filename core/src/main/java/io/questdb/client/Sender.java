@@ -3004,7 +3004,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
 
         /**
          * Hard cap on cursor-allocated bytes: active + sealed segments, plus
-         * the symbol-dictionary side-file with {@code sf_dir}.
+         * with {@code sf_dir} the symbol-dictionary side-file and the segment
+         * pre-created for the next rotation (taken only while there is room).
          * When the cap is reached, the producer's {@code Sender.flush()}
          * blocks until ACK-driven trim frees space; if the cap is exhausted
          * past the configured deadline (default 30 s), {@code flush()} throws.

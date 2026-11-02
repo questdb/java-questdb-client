@@ -43,8 +43,9 @@ import java.util.function.LongSupplier;
  * segments after their frames have been ACK'd by the server, and runs the
  * disk barriers (periodic sync, the watermark sync before an unlink). The
  * {@code munmap + unlink + fsync} of a trim happen on this thread, never on
- * the user-thread / I/O-thread paths. The ring's next segment is created by
- * the producer itself at rotation ({@link SegmentProvisioner}).
+ * the user-thread / I/O-thread paths. In disk mode it also pre-creates the
+ * segment a ring's next rotation needs, after each rotation; when none is
+ * ready, the producer creates it itself at rotation ({@link SegmentProvisioner}).
  * <p>
  * One instance can serve many rings (typically all {@code Sender} instances
  * in a JVM). The worker parks until work is signalled or a periodic-sync
@@ -114,6 +115,10 @@ public final class SegmentManager implements QuietCloseable {
     // inject a deregister(ring) call into the exact race window that the
     // entry-state check inside the trim block closes for budget accounting.
     private volatile Runnable beforeTrimSyncHook;
+    // Test seam: runs on the worker between a prefetch's create and its
+    // install under the manager lock. Null in production; tests use it to
+    // deregister or close the ring inside that window.
+    private volatile Runnable beforePrefetchInstallHook;
     // Test seam invoked exactly when a retry transition/recovery is logged.
     // Null in production; persistent-failure tests use it to prove log bounds
     // without binding to a particular SLF4J backend.
@@ -501,14 +506,15 @@ public final class SegmentManager implements QuietCloseable {
 
     /**
      * Register a ring for trim and disk barriers, and give it a
-     * {@link SegmentProvisioner} that creates its segments in {@code dir}
-     * ({@code null} = memory mode) on the producer thread, charged to this
-     * manager's budget. The ring MUST already have its initial active segment
-     * in place.
+     * {@link SegmentProvisioner} that supplies its segments in {@code dir}
+     * ({@code null} = memory mode), charged to this manager's budget: in disk
+     * mode pre-created by this worker after each rotation, otherwise created
+     * on the producer thread at rotation. The ring MUST already have its
+     * initial active segment in place.
      * <p>
      * Also wires the ring's wakeup callback to {@link #wakeWorker()}, so a
-     * rotation or a pin release that makes a segment trimmable wakes the
-     * parked worker.
+     * rotation or a pin release that makes a segment trimmable, or a rotation
+     * that wants its successor pre-created, wakes the parked worker.
      */
     public void register(SegmentRing ring, String dir) {
         register(ring, dir, null, 0L);
@@ -568,11 +574,13 @@ public final class SegmentManager implements QuietCloseable {
         // sf-0000000000000000.sfa, collide with the recovered active (O_EXCL
         // refuses it) and backpressure the producer on every retry.
         // Memory-mode rings have no dir; nothing to scan.
+        SegmentProvisioner provisioner = null;
         if (!ring.hasSegmentSource()) {
             long firstGeneration = dir == null ? 0L : scanMaxGeneration(dir) + 1L;
-            ring.setSegmentSource(new SegmentProvisioner(ring, dir, firstGeneration, segmentSizeBytes, budget, filesFacade));
+            provisioner = new SegmentProvisioner(ring, dir, firstGeneration, segmentSizeBytes, budget, filesFacade);
+            ring.setSegmentSource(provisioner);
         }
-        RingEntry e = new RingEntry(ring, dir, watermark, sideFileBytes, syncIntervalNanos, ticks.getAsLong());
+        RingEntry e = new RingEntry(ring, dir, watermark, sideFileBytes, syncIntervalNanos, ticks.getAsLong(), provisioner);
         // ObjList.add either throws before storing e or makes the entry visible.
         // Once visible, only non-throwing state commits may remain, so the gauge
         // (whose list can also throw on growth) is added first and withdrawn if
@@ -653,6 +661,11 @@ public final class SegmentManager implements QuietCloseable {
     @TestOnly
     public void setBeforeExitCleanupRegistrationHook(Runnable hook) {
         this.beforeExitCleanupRegistrationHook = hook;
+    }
+
+    @TestOnly
+    public void setBeforePrefetchInstallHook(Runnable hook) {
+        this.beforePrefetchInstallHook = hook;
     }
 
     @TestOnly
@@ -787,7 +800,50 @@ public final class SegmentManager implements QuietCloseable {
         if (!memoryMode) {
             servicePeriodicSync(e, ticks.getAsLong());
         }
-        return trimAcked(e, memoryMode);
+        boolean hasMoreTrimmable = trimAcked(e, memoryMode);
+        if (!memoryMode) {
+            // Last: the barriers and trims above are what other threads wait
+            // on, a pre-created segment is only a head start.
+            prefetchNextSegment(e);
+        }
+        return hasMoreTrimmable;
+    }
+
+    /**
+     * Pre-creates the segment the ring's next rotation will need, off the
+     * producer thread (see {@link SegmentProvisioner}). Runs inside the ring's
+     * in-service window, so deregister + {@link #awaitRingQuiescence} and the
+     * engine's close-time unlink are ordered after any file this creates.
+     * Optional by design: it never waits, retries on a timer or reports more
+     * work. If it is not done by the next rotation, the producer creates the
+     * segment itself.
+     */
+    private void prefetchNextSegment(RingEntry e) {
+        SegmentProvisioner provisioner = e.provisioner;
+        if (provisioner == null || !provisioner.prefetchWanted()) {
+            return;
+        }
+        // The ring's next FSN is a fine guess for the base; the ring rebases
+        // the segment at rotation either way.
+        MmapSegment segment = provisioner.createPrefetch(e.ring.nextSeqHint());
+        if (segment == null) {
+            return;
+        }
+        Runnable hook = beforePrefetchInstallHook;
+        if (hook != null) {
+            hook.run();
+        }
+        // Under the manager lock, gated on the entry still being registered:
+        // deregister releases ring.totalSegmentBytes() under the same lock, so
+        // it either sees the installed segment (via heldBytes()) and releases
+        // it, or runs first and the segment is abandoned here, charge and all.
+        boolean installed;
+        synchronized (lock) {
+            installed = e.isRegistered() && provisioner.installPrefetch(segment);
+        }
+        if (!installed) {
+            provisioner.abandonPrefetch(segment);
+        }
     }
 
     private boolean trimAcked(RingEntry e, boolean memoryMode) {
@@ -1139,6 +1195,10 @@ public final class SegmentManager implements QuietCloseable {
 
     private static final class RingEntry {
         final String dir;
+        // The provisioner register() installed as the ring's segment source,
+        // or null when the caller supplied its own source (tests): the worker
+        // prefetches only for its own provisioner.
+        final SegmentProvisioner provisioner;
         final SegmentRing ring;
         // Live gauge of the slot's .symbol-dict side-file bytes, or null when
         // the slot has no dictionary (memory mode, degraded full-dict
@@ -1179,9 +1239,11 @@ public final class SegmentManager implements QuietCloseable {
                 AckWatermark watermark,
                 LongSupplier sideFileBytes,
                 long syncIntervalNanos,
-                long now
+                long now,
+                SegmentProvisioner provisioner
         ) {
             this.ring = ring;
+            this.provisioner = provisioner;
             this.dir = dir;
             this.watermark = watermark;
             this.sideFileBytes = sideFileBytes;

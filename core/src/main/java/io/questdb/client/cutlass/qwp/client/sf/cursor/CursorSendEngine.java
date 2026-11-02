@@ -262,7 +262,7 @@ public final class CursorSendEngine implements QuietCloseable {
     /**
      * Creates an engine with a private, non-shared {@link SegmentManager}
      * capped at {@code maxTotalBytes} of cursor-allocated memory/disk
-     * (active, sealed, and retained segments). Producer's {@link #appendBlocking}
+     * (active, sealed, retained and pre-created segments). Producer's {@link #appendBlocking}
      * blocks up to {@code appendDeadlineNanos} when the cap is full and ACKs
      * haven't drained sealed segments; on deadline expiry it throws.
      */
@@ -1995,10 +1995,15 @@ public final class CursorSendEngine implements QuietCloseable {
      * Ascending removal rank of a segment file name for
      * {@link #unlinkAllSegmentFiles(String)}. {@code sf-initial.sfa} is
      * always the fresh-start segment at baseSeq 0, so it ranks first.
-     * Spare files carry a monotonic generation ({@code sf-<gen:016x>.sfa})
-     * assigned in creation == rotation == baseSeq order, so the parsed
-     * generation ranks them. Anything else with the extension is not a
-     * live segment and ranks last.
+     * Generation-named files ({@code sf-<gen:016x>.sfa}) rank by the parsed
+     * generation, i.e. creation order. That is baseSeq order except for a
+     * segment the manager pre-created before a producer fallback create
+     * minted the next generation; the pre-created one then serves the
+     * rotation after it. This client creates segments only in slots with a
+     * manifest, whose drain commits {@code head == active} before the first
+     * unlink, so removal order is not load-bearing there; a legacy slot
+     * without one holds files an older client created in rotation order.
+     * Anything else with the extension is not a live segment and ranks last.
      */
     private static long segmentCleanupRank(String name) {
         if ("sf-initial.sfa".equals(name)) {

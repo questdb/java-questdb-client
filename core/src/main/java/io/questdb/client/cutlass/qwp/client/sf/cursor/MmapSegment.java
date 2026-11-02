@@ -96,9 +96,16 @@ public final class MmapSegment implements QuietCloseable {
     // — it's the reservation cursor. Plain field is fine.
     private long appendCursor;
     // baseSeq: final when the producer creates the segment at rotation;
-    // rebaseSeq() exists for a segment created ahead of its rotation (tests,
-    // and files an older client left behind) whose base was a guess.
+    // rebaseSeq() pins it for a segment created ahead of its rotation (the
+    // manager's prefetch, tests) whose base was a guess.
     private long baseSeq;
+    // True once syncHeader() succeeded and the header has not changed since:
+    // rebaseSeq() clears it. SegmentRing keys the header barrier before a
+    // manifest update on this, not on whether the base changed: after a
+    // rebase whose sync failed the in-memory base is already final while the
+    // on-disk header may still hold the guess. Plain field: set before the
+    // segment is handed to the producer (prefetch CAS) or on the producer.
+    private boolean headerDurable;
     // Highest published byte offset covered by a successful data barrier.
     // The manager writes this after msync+fsync; the producer reads it before
     // allowing rotation to seal the segment.
@@ -521,6 +528,7 @@ public final class MmapSegment implements QuietCloseable {
         if (memoryBacked || manifestRequired()) {
             return;
         }
+        headerDurable = false;
         Unsafe.getUnsafe().putByte(mmapAddress + 5, MANIFEST_REQUIRED_FLAG);
         syncHeader();
     }
@@ -532,9 +540,15 @@ public final class MmapSegment implements QuietCloseable {
         if (filesFacade.msync(mmapAddress, HEADER_SIZE, false) != 0 || filesFacade.fsync(fd) != 0) {
             throw new MmapSegmentException("could not sync segment header " + path());
         }
+        headerDurable = true;
         if (durableCursor < HEADER_SIZE) {
             durableCursor = HEADER_SIZE;
         }
+    }
+
+    /** True when the header is known durable: synced, and unchanged since. */
+    boolean isHeaderDurable() {
+        return headerDurable;
     }
 
     public boolean isFull() {
@@ -668,19 +682,21 @@ public final class MmapSegment implements QuietCloseable {
     }
 
     /**
-     * Re-stamps the segment's baseSeq, both in memory and in the on-disk
-     * header at offset 8. Used by {@code SegmentRing} at rotation time to
+     * Re-stamps the segment's baseSeq, both in memory and in the mapped
+     * header at offset 8, and marks the header not durable until the next
+     * {@link #syncHeader()}. Used by {@code SegmentRing} at rotation time to
      * pin the segment's identity once the active's frame count is final
-     * (the segment manager pre-creates spares with a provisional baseSeq
-     * that may be stale by rotation time). Throws {@link IllegalStateException}
-     * if any frames have already been appended — a rebase after first
-     * append would corrupt the FSN sequence.
+     * (the segment manager pre-creates the next segment with a provisional
+     * baseSeq). Throws {@link IllegalStateException} if any frames have
+     * already been appended — a rebase after first append would corrupt the
+     * FSN sequence.
      */
     public void rebaseSeq(long newBaseSeq) {
         if (frameCount > 0) {
             throw new IllegalStateException(
                     "cannot rebase: segment has " + frameCount + " frame(s) already appended");
         }
+        headerDurable = false;
         this.baseSeq = newBaseSeq;
         Unsafe.getUnsafe().putLong(mmapAddress + 8, newBaseSeq);
     }

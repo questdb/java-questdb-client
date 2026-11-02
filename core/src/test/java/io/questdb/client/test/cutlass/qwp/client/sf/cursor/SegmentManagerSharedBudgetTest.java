@@ -212,8 +212,12 @@ public class SegmentManagerSharedBudgetTest {
 
                     ff.failManifestFsync = false;
                     appendFrames(ring, buf, 1);
-                    Assert.assertEquals(2 * SEGMENT_SIZE, ring.totalSegmentBytes());
-                    Assert.assertEquals(2 * SEGMENT_SIZE, budget.getSegmentBytes());
+                    // The committed rotation took the held segment over without a
+                    // second charge; only the next segment, which the worker
+                    // pre-creates after it, adds one.
+                    Assert.assertEquals(2L, ring.getActive().baseSeq());
+                    Assert.assertTrue(waitFor(() -> ring.totalSegmentBytes() == 3 * SEGMENT_SIZE));
+                    Assert.assertEquals(3 * SEGMENT_SIZE, budget.getSegmentBytes());
 
                     manager.deregister(ring);
                     Assert.assertTrue(manager.awaitRingQuiescence(ring));

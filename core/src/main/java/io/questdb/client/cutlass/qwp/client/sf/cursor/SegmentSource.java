@@ -60,6 +60,14 @@ public interface SegmentSource extends QuietCloseable {
         return 0L;
     }
 
+    /**
+     * Called on the producer thread after a rotation committed the segment
+     * {@link #next} returned, just before the ring wakes its manager. A source
+     * that prepares segments ahead of time asks for the next one here.
+     */
+    default void rotated() {
+    }
+
     /** Releases whatever the source still holds; the owning ring calls this from its own close. */
     @Override
     void close();
