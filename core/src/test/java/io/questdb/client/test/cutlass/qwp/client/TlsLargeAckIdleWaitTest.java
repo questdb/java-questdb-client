@@ -44,28 +44,50 @@ import java.util.concurrent.atomic.AtomicLong;
  * loop must not block on the fd while such input is pending, or the ACK is
  * never processed and {@code awaitAckedFsn}/{@code close()} time out. Plain
  * ws is the control.
+ * <p>
+ * The TLS record size picks which user-space buffer holds the input:
+ * <ul>
+ * <li>One write: ~16 KiB records. Each fill leaves the receive buffer less
+ * than 1 KiB free, so it grows before the next read, and the record that did
+ * not fit stays undecrypted in the TLS input buffer.</li>
+ * <li>10,000-byte writes: six records fill 60,000 bytes of the 64 KiB buffer,
+ * and the remaining 5,536 bytes cannot take the next record. It is decrypted
+ * into the internal spill buffer and only partly handed over; the rest stays
+ * there, decrypted, with nothing left on the fd.</li>
+ * </ul>
  */
 public class TlsLargeAckIdleWaitTest {
 
     @Test(timeout = 60_000L)
     public void testLargeAckOverTlsIsProcessedWhileIdle() throws Exception {
-        run(true, 150 * 1024);
+        run(true, 150 * 1024, 0);
+    }
+
+    @Test(timeout = 60_000L)
+    public void testLargeAckInSmallTlsRecordsIsProcessedWhileIdle() throws Exception {
+        run(true, 150 * 1024, 10_000);
     }
 
     @Test(timeout = 60_000L)
     public void testLargeAckOverPlainWsIsProcessedWhileIdle() throws Exception {
-        run(false, 150 * 1024);
+        run(false, 150 * 1024, 0);
     }
 
-    private static void run(boolean tls, int ackBytes) throws Exception {
+    /**
+     * @param chunkBytes server socket write size, or 0 to write the frame at once
+     */
+    private static void run(boolean tls, int ackBytes, int chunkBytes) throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            BigAckHandler handler = new BigAckHandler(ackBytes);
+            BigAckHandler handler = new BigAckHandler(ackBytes, chunkBytes);
             try (TestWebSocketServer server = tls ? TestWebSocketServer.tls(handler) : new TestWebSocketServer(handler)) {
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
                 String cfg = (tls ? "wss::addr=localhost:" + server.getPort() + ";tls_verify=unsafe_off;"
                         : "ws::addr=localhost:" + server.getPort() + ";")
-                        + "auto_flush_bytes=off;auto_flush_rows=1000000;auto_flush_interval=60000;";
+                        + "auto_flush_bytes=off;auto_flush_rows=1000000;auto_flush_interval=60000;"
+                        // On failure close() would otherwise drain past the test timeout
+                        // and mask the assertion below.
+                        + "close_flush_timeout_millis=1000;";
                 try (QwpWebSocketSender sender = (QwpWebSocketSender) Sender.fromConfig(cfg)) {
                     sender.table("t").longColumn("v", 1L).atNow();
                     long fsn = sender.flushAndGetSequence();
@@ -85,16 +107,23 @@ public class TlsLargeAckIdleWaitTest {
      */
     private static final class BigAckHandler implements TestWebSocketServer.WebSocketServerHandler {
         private final int ackBytes;
+        private final int chunkBytes;
         private final AtomicLong seq = new AtomicLong();
 
-        BigAckHandler(int ackBytes) {
+        BigAckHandler(int ackBytes, int chunkBytes) {
             this.ackBytes = ackBytes;
+            this.chunkBytes = chunkBytes;
         }
 
         @Override
         public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
             try {
-                client.sendBinary(buildAck(seq.getAndIncrement(), ackBytes));
+                byte[] ack = buildAck(seq.getAndIncrement(), ackBytes);
+                if (chunkBytes > 0) {
+                    client.sendBinaryInChunks(ack, chunkBytes);
+                } else {
+                    client.sendBinary(ack);
+                }
             } catch (IOException e) {
                 throw new RuntimeException(e);
             }

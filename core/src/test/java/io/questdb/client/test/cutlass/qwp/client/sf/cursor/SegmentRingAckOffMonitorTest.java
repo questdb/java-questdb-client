@@ -38,6 +38,8 @@ import org.junit.Test;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * {@link SegmentRing#acknowledge} runs on the I/O thread for every server
@@ -79,7 +81,17 @@ public class SegmentRingAckOffMonitorTest {
                     Assert.assertTrue(ring.appendOrFsn(payload, PAYLOAD) >= 0);
                 }
                 ff.stall = true;
-                Thread producer = new Thread(() -> Assert.assertEquals(4L, ring.appendOrFsn(payload, PAYLOAD)), "producer");
+                // An assertion thrown on this thread would not fail the test:
+                // hand the outcome back and check it after join().
+                AtomicLong producerFsn = new AtomicLong(Long.MIN_VALUE);
+                AtomicReference<Throwable> producerError = new AtomicReference<>();
+                Thread producer = new Thread(() -> {
+                    try {
+                        producerFsn.set(ring.appendOrFsn(payload, PAYLOAD));
+                    } catch (Throwable t) {
+                        producerError.set(t);
+                    }
+                }, "producer");
                 producer.start();
                 Assert.assertTrue("rotation must reach the manifest fsync", ff.inFsync.await(5, TimeUnit.SECONDS));
                 // The rotation now holds the ring monitor inside the stalled fsync.
@@ -88,6 +100,10 @@ public class SegmentRingAckOffMonitorTest {
                 long tookMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
                 producer.join();
                 ff.stall = false;
+                if (producerError.get() != null) {
+                    throw new AssertionError("rotating append failed", producerError.get());
+                }
+                Assert.assertEquals("rotating append must return the new segment's first FSN", 4L, producerFsn.get());
                 Assert.assertTrue("acknowledge waited " + tookMs + " ms behind the manifest fsync", tookMs < 50);
 
                 // The sealed segment holds seqs 0..3. The ACK that completes it
