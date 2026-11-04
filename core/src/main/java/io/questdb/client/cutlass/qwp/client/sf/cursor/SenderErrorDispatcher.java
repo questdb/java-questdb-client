@@ -32,7 +32,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.concurrent.LinkedBlockingDeque;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -151,14 +150,12 @@ public final class SenderErrorDispatcher implements QuietCloseable {
                 return;
             }
             closed = true;
-            // Wake the dispatcher even if the inbox is empty — POISON also
-            // forces it past any pending poll() without losing real entries
-            // already queued (they're delivered before POISON since the
-            // queue is FIFO). The offer's return value is intentionally
-            // ignored: if the inbox is at capacity the dispatcher will
-            // still wake on its 100ms poll timeout and re-check `closed`,
-            // so failure to enqueue POISON only adds at most one tick of
-            // shutdown latency — not a correctness issue.
+            // Wake the dispatcher even if the inbox is empty — POISON ends
+            // its blocking take() without losing real entries already queued
+            // (they're delivered before POISON since the queue is FIFO). The
+            // offer's return value is intentionally ignored: an inbox at
+            // capacity means the dispatcher is awake draining it, and its
+            // loop condition re-checks `closed` once the inbox is empty.
             //noinspection ResultOfMethodCallIgnored
             inbox.offer(POISON);
             Thread t = dispatcherThread;
@@ -310,7 +307,7 @@ public final class SenderErrorDispatcher implements QuietCloseable {
         while (!closed || !inbox.isEmpty()) {
             SenderError err;
             try {
-                err = inbox.poll(100, TimeUnit.MILLISECONDS);
+                err = inbox.take(); // close() enqueues POISON, so blocking here cannot wedge shutdown
             } catch (InterruptedException e) {
                 if (closed) {
                     return;

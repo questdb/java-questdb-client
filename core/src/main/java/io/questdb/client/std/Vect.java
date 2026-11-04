@@ -25,7 +25,21 @@
 package io.questdb.client.std;
 
 public final class Vect {
+    private static final int SMALL_COPY_MAX = 64;
+
     public static void memcpy(long dst, long src, long len) {
+        if (len <= SMALL_COPY_MAX) {
+            // A column of one row is a few bytes: word moves beat the copy
+            // stub's call and dispatch.
+            long i = 0;
+            for (; i + 8 <= len; i += 8) {
+                Unsafe.getUnsafe().putLong(dst + i, Unsafe.getUnsafe().getLong(src + i));
+            }
+            for (; i < len; i++) {
+                Unsafe.getUnsafe().putByte(dst + i, Unsafe.getUnsafe().getByte(src + i));
+            }
+            return;
+        }
         // the split length was determined experimentally
         // using 'MemCopyBenchmark' bench
         if (len < 4096) {

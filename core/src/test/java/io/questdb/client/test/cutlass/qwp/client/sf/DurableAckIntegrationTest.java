@@ -29,7 +29,6 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpDurableAckMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
-import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.std.Files;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
@@ -44,6 +43,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Paths;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -134,25 +134,30 @@ public class DurableAckIntegrationTest {
     }
 
     @Test
-    public void testBooleanConnectOverloadRequestsLegacyTier() throws Exception {
-        // The boolean connect overloads map true onto the legacy request:
-        // the upgrade header carries "true" and the "enabled" grant is
-        // accepted. Callers linked against the boolean signatures keep the
-        // pre-tier wire behavior. (ExportedApiCompatibilityTest pins the
-        // signatures; this pins what they do.)
+    public void testBooleanBuilderRequestsLegacyTier() throws Exception {
+        assertBooleanBuilderRequest(true, "true");
+    }
+
+    @Test
+    public void testBooleanBuilderDisablesDurableAck() throws Exception {
+        assertBooleanBuilderRequest(false, "");
+    }
+
+    private void assertBooleanBuilderRequest(boolean enabled, String expectedHeader) throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            Assert.assertEquals(0, Files.mkdir(sfDir, Files.DIR_MODE_DEFAULT));
             DurableAckCapableHandler handler = new DurableAckCapableHandler();
-            try (TestWebSocketServer server = new TestWebSocketServer(handler, true)) {
+            try (TestWebSocketServer server = new TestWebSocketServer(handler, enabled)) {
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-                int port = server.getPort();
-
-                CursorSendEngine engine = new CursorSendEngine(sfDir, 16384);
-                try (Sender ignored = QwpWebSocketSender.connect(
-                        "localhost", port, null, 0, 0, 0L, null, true, engine)) {
-                    Assert.assertEquals("true",
-                            server.pollDurableAckRequest(5, TimeUnit.SECONDS));
+                // The public boolean API must retain the legacy true/enabled
+                // handshake; false must work against a server with no durable-ack support.
+                try (Sender ignored = Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address("localhost:" + server.getPort())
+                        .requestDurableAck(enabled)
+                        .storeAndForwardDir(sfDir)
+                        .build()) {
+                    Assert.assertEquals(expectedHeader,
+                            server.pollDurableAckRequest(100, TimeUnit.MILLISECONDS));
                 }
             }
         });
@@ -403,6 +408,69 @@ public class DurableAckIntegrationTest {
                 // ran to completion. If the loop had not been wired through,
                 // close would have timed out waiting on a watermark that
                 // never advances.
+            }
+        });
+    }
+
+    @Test
+    public void testIdleLocalAckWakesParkedWaiter() throws Exception {
+        assertIdleDurableAckWakesWaiter("local", true);
+    }
+
+    @Test
+    public void testIdleBothTiersWaiterNeedsReplicatedAck() throws Exception {
+        assertIdleDurableAckWakesWaiter("local,replicated", false);
+    }
+
+    private void assertIdleDurableAckWakesWaiter(String tiers, boolean localAckTrims) throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            DurableAckCapableHandler handler = new DurableAckCapableHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler, true)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                String config = "ws::addr=localhost:" + server.getPort() + ";sf_dir=" + sfDir
+                        + ";request_durable_ack=" + tiers + ";close_flush_timeout_millis=0;"
+                        + "keepalive_interval_millis=0;durable_ack_keepalive_interval_millis=0;";
+                try (Sender sender = Sender.fromConfig(config)) {
+                    sender.table("trades").longColumn("v", 1L).atNow();
+                    long target = sender.flushAndGetSequence();
+                    handler.awaitOkBatches(1);
+                    FutureTask<Boolean> result = new FutureTask<>(() -> sender.awaitAckedFsn(target, 5000));
+                    Thread waiter = new Thread(result, "test-durable-ack-waiter");
+                    waiter.start();
+                    try {
+                        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                        while (waiter.getState() != Thread.State.TIMED_WAITING
+                                && !result.isDone() && System.nanoTime() < deadline) {
+                            Thread.sleep(1);
+                        }
+                        Assert.assertEquals("waiter must park before the ack arrives",
+                                Thread.State.TIMED_WAITING, waiter.getState());
+                        Assert.assertEquals("OK alone must not trim", -1L, sender.getAckedFsn());
+
+                        // No further publishes or PINGs: inbound durability frames must
+                        // wake the idle transport and then the parked ACK waiter.
+                        handler.emitLocalDurableAckForAll();
+                        if (!localAckTrims) {
+                            CursorWebSocketSendLoop loop = ((QwpWebSocketSender) sender).cursorSendLoopForTest();
+                            deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                            while (loop.getTotalLocalDurableAcks() == 0 && System.nanoTime() < deadline) {
+                                Thread.sleep(1);
+                            }
+                            Assert.assertTrue("local ack must be received while idle", loop.getTotalLocalDurableAcks() > 0);
+                            Assert.assertEquals("local progress must not satisfy replicated durability",
+                                    -1L, sender.getAckedFsn());
+                            Assert.assertFalse("waiter must still need the replicated ack", result.isDone());
+                            handler.emitDurableAckForAll();
+                        }
+                        Assert.assertTrue("durable ack must wake the waiter before its deadline",
+                                result.get(1, TimeUnit.SECONDS));
+                    } finally {
+                        sender.close();
+                        waiter.join(5000);
+                        Assert.assertFalse("ack waiter leaked", waiter.isAlive());
+                    }
+                }
             }
         });
     }

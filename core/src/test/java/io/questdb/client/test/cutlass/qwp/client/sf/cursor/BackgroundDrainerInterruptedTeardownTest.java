@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
+import io.questdb.client.test.tools.TestWebSocketClient;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
@@ -260,7 +261,7 @@ public class BackgroundDrainerInterruptedTeardownTest {
      * only. Every send throws, so handing it to a live loop deterministically
      * drives the I/O thread into its reconnect path without native I/O.
      */
-    private static final class StubWebSocketClient extends WebSocketClient {
+    private static final class StubWebSocketClient extends TestWebSocketClient {
         StubWebSocketClient() {
             super(DefaultHttpClientConfiguration.INSTANCE, PlainSocketFactory.INSTANCE);
         }

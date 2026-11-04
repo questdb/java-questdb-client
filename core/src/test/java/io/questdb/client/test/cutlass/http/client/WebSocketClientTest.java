@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.http.client;
 
+import io.questdb.client.test.tools.TestWebSocketClient;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.cutlass.http.client.HttpClientException;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
@@ -512,7 +513,7 @@ public class WebSocketClientTest {
         }
     }
 
-    private static class CapturingWebSocketClient extends WebSocketClient {
+    private static class CapturingWebSocketClient extends TestWebSocketClient {
 
         CapturingWebSocketClient(CapturingSocket socket) {
             super(DefaultHttpClientConfiguration.INSTANCE, (nf, log) -> socket);
@@ -598,7 +599,7 @@ public class WebSocketClientTest {
      * sends always succeed. Used to drive a real tryReceiveFrame ->
      * tryParseFrame -> handler dispatch on the test thread.
      */
-    private static class FrameFeedWebSocketClient extends WebSocketClient {
+    private static class FrameFeedWebSocketClient extends TestWebSocketClient {
 
         FrameFeedWebSocketClient(byte[] frames) {
             super(DefaultHttpClientConfiguration.INSTANCE, (nf, log) -> new FrameFeedSocket(frames));
@@ -619,7 +620,7 @@ public class WebSocketClientTest {
      * WebSocketClient subclass with a fake socket that always returns 0
      * from recv(), forcing the ioWait path in recvOrTimeout().
      */
-    private static class RecvTestWebSocketClient extends WebSocketClient {
+    private static class RecvTestWebSocketClient extends TestWebSocketClient {
         Runnable ioWaitAction;
 
         RecvTestWebSocketClient() {
@@ -641,7 +642,7 @@ public class WebSocketClientTest {
      * Minimal concrete WebSocketClient that throws on any I/O,
      * allowing us to test buffer management without a real socket.
      */
-    private static class StubWebSocketClient extends WebSocketClient {
+    private static class StubWebSocketClient extends TestWebSocketClient {
 
         StubWebSocketClient() {
             super(DefaultHttpClientConfiguration.INSTANCE, PlainSocketFactory.INSTANCE);

@@ -104,6 +104,11 @@ public interface FilesFacade {
         return Files.fsyncDir(dir);
     }
 
+    /** Native-path variant of {@link #fsyncDir(String)}. */
+    default int fsyncDir(long dirPtr) {
+        return Files.fsyncDir(dirPtr);
+    }
+
     /**
      * Whether callers should use this facade's mmap path. The production facade
      * returns {@code true}; wrapping fault facades retain positioned I/O unless

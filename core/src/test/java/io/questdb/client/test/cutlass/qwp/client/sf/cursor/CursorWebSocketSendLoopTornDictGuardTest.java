@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.test.tools.TestWebSocketClient;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
@@ -141,7 +142,7 @@ public class CursorWebSocketSendLoopTornDictGuardTest {
     // because no reconnect is expected before the guard latches its terminal.
     private CursorWebSocketSendLoop newLoop(CursorSendEngine engine, WebSocketClient client) {
         return new CursorWebSocketSendLoop(
-                client, engine, 0, 1_000_000L,
+                client, engine, 0,
                 () -> {
                     throw new IOException("no reconnect in this test");
                 },
@@ -185,7 +186,7 @@ public class CursorWebSocketSendLoopTornDictGuardTest {
 
     // Frame-counting stub transport: completes no real I/O. If the guard ever lets a
     // gapped frame through, sendBinary bumps framesSent and the test fails.
-    private static final class CountingClient extends WebSocketClient {
+    private static final class CountingClient extends TestWebSocketClient {
         private int framesSent;
 
         CountingClient() {

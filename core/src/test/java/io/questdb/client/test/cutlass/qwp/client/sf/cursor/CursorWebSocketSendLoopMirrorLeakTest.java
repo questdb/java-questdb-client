@@ -88,7 +88,7 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
                 long persistedAddr = pd.loadedEntriesAddr();
 
                 CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
-                        null, engine, 0, 1_000_000L,
+                        null, engine, 0,
                         () -> {
                             throw new IOException("no reconnect in this test");
                         },
@@ -208,7 +208,7 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
                 CursorWebSocketSendLoop.forceMirrorSeedFailureForTest = true;
                 try {
                     new CursorWebSocketSendLoop(
-                            null, engine, 0, 1_000_000L,
+                            null, engine, 0,
                             () -> {
                                 throw new IOException("no reconnect in this test");
                             },
@@ -242,7 +242,7 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
                 Assert.assertTrue("recovery must retain c@2 above the persisted [a,b] prefix",
                         engine.recoverySymbolNativeCapacity() > 0);
                 CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
-                        null, engine, 0, 1_000_000L,
+                        null, engine, 0,
                         () -> {
                             throw new IOException("no reconnect in this test");
                         },
@@ -336,7 +336,7 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
     // reconnect factory is never invoked.
     private static CursorWebSocketSendLoop newRecoveryLoop(CursorSendEngine engine) {
         return new CursorWebSocketSendLoop(
-                null, engine, 0, 1_000_000L,
+                null, engine, 0,
                 () -> {
                     throw new IOException("no reconnect in this test");
                 },
@@ -350,7 +350,7 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
         // builds an ORPHAN loop, which borrows by construction and so would not exercise
         // the foreground path this test exists for.
         return new CursorWebSocketSendLoop(
-                null, engine, 0, 1_000_000L,
+                null, engine, 0,
                 () -> {
                     throw new IOException("no reconnect in this test");
                 },

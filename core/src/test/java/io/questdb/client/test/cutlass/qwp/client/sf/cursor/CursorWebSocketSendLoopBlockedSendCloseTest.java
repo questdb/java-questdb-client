@@ -25,8 +25,8 @@
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
+import io.questdb.client.test.tools.TestWebSocketClient;
 import io.questdb.client.DefaultHttpClientConfiguration;
-import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
@@ -54,7 +54,6 @@ public class CursorWebSocketSendLoopBlockedSendCloseTest {
                     client,
                     engine,
                     0L,
-                    CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                     null,
                     1_000L,
                     5_000L,
@@ -130,7 +129,6 @@ public class CursorWebSocketSendLoopBlockedSendCloseTest {
                     client,
                     engine,
                     0L,
-                    CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                     null,
                     1_000L,
                     5_000L,
@@ -192,7 +190,7 @@ public class CursorWebSocketSendLoopBlockedSendCloseTest {
         });
     }
 
-    private static final class BlockingSendClient extends WebSocketClient {
+    private static final class BlockingSendClient extends TestWebSocketClient {
         private final AtomicBoolean cleanupClaimed = new AtomicBoolean();
         private final AtomicInteger cleanupCount = new AtomicInteger();
         private final CountDownLatch cleanupDone = new CountDownLatch(1);

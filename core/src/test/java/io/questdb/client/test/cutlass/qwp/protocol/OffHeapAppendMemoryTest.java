@@ -317,6 +317,40 @@ public class OffHeapAppendMemoryTest {
     }
 
     @Test
+    public void testPutUtf8MatchesTheJavaEncoderOnRandomStrings() throws Exception {
+        assertMemoryLeak(() -> {
+            // ASCII, 2- and 3-byte chars, a surrogate pair, and lone high and low
+            // surrogates (Java's encoder writes '?' for those), so every run mixes
+            // the ASCII fast path with the general one in every order.
+            final String[] pieces = {"a", "Z", "7", " ", "\u00e9", "\u20ac", "\uD83D\uDE00", "\uD800", "\uDC00"};
+            final java.util.Random rnd = new java.util.Random(42);
+            try (OffHeapAppendMemory mem = new OffHeapAppendMemory()) {
+                java.io.ByteArrayOutputStream expected = new java.io.ByteArrayOutputStream();
+                for (int n = 0; n < 2000; n++) {
+                    StringBuilder sb = new StringBuilder();
+                    for (int k = rnd.nextInt(40); k > 0; k--) {
+                        sb.append(pieces[rnd.nextInt(pieces.length)]);
+                    }
+                    String value = sb.toString();
+                    // String and a non-String CharSequence take the same path
+                    if ((n & 1) == 0) {
+                        mem.putUtf8(value);
+                    } else {
+                        mem.putUtf8(sb);
+                    }
+                    byte[] utf8 = value.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                    expected.write(utf8, 0, utf8.length);
+                }
+                byte[] want = expected.toByteArray();
+                assertEquals(want.length, mem.getAppendOffset());
+                for (int i = 0; i < want.length; i++) {
+                    assertEquals("byte " + i, want[i], Unsafe.getUnsafe().getByte(mem.addressOf(i)));
+                }
+            }
+        });
+    }
+
+    @Test
     public void testPutUtf8MultiByte() throws Exception {
         assertMemoryLeak(() -> {
             try (OffHeapAppendMemory mem = new OffHeapAppendMemory()) {

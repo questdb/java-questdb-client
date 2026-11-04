@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
@@ -371,12 +372,12 @@ public class SymbolDictRecycleHealingTest {
      */
     private static QwpWebSocketSender buildSender(int port, CursorSendEngine engine, int thresholdSymbols)
             throws Exception {
-        return QwpWebSocketSender.connect(
+        return QwpWebSocketSender.connectWithCredentialSupplier(
                 Collections.singletonList(new QwpWebSocketSender.Endpoint("localhost", port)),
                 null, // tlsConfig
                 0, 0, 0L, // autoFlushRows, autoFlushBytes, autoFlushIntervalNanos
-                null, // authorizationHeader
-                false, // requestDurableAck
+                QwpWebSocketSender.fixedAuthHeader(null), // authorizationHeader
+                DurableAckTiers.NONE, // durableAckTiers
                 engine,
                 5_000L, // closeFlushTimeoutMillis
                 CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_DURATION_MILLIS,
@@ -395,7 +396,8 @@ public class SymbolDictRecycleHealingTest {
                 CursorWebSocketSendLoop.DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS,
                 true, // symbolDictResetEnabled
                 thresholdSymbols,
-                QwpWebSocketSender.DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS);
+                QwpWebSocketSender.DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS,
+                CursorWebSocketSendLoop.DEFAULT_KEEPALIVE_INTERVAL_MILLIS);
     }
 
     /** {@code [deltaStart, deltaCount]} read from a frame that must carry a symbol-dict delta. */
