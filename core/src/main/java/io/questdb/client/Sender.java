@@ -3561,9 +3561,14 @@ public interface Sender extends Closeable, ArraySender<Sender> {
 
             int actualAutoFlushRows = autoFlushRows == PARAMETER_NOT_SET_EXPLICITLY ? DEFAULT_WS_AUTO_FLUSH_ROWS : autoFlushRows;
             int actualAutoFlushBytes = autoFlushBytes == PARAMETER_NOT_SET_EXPLICITLY ? DEFAULT_WS_AUTO_FLUSH_BYTES : autoFlushBytes;
-            long actualAutoFlushIntervalNanos = autoFlushIntervalMillis == PARAMETER_NOT_SET_EXPLICITLY
-                    ? DEFAULT_WS_AUTO_FLUSH_INTERVAL_NANOS
-                    : TimeUnit.MILLISECONDS.toNanos(autoFlushIntervalMillis);
+            long actualAutoFlushIntervalNanos;
+            if (autoFlushIntervalMillis == PARAMETER_NOT_SET_EXPLICITLY) {
+                actualAutoFlushIntervalNanos = DEFAULT_WS_AUTO_FLUSH_INTERVAL_NANOS;
+            } else if (autoFlushIntervalMillis == Integer.MAX_VALUE) {
+                actualAutoFlushIntervalNanos = 0; // explicit off: QwpWebSocketSender treats 0 as disabled
+            } else {
+                actualAutoFlushIntervalNanos = TimeUnit.MILLISECONDS.toNanos(autoFlushIntervalMillis);
+            }
 
             Supplier<String> wsAuthHeader = buildWebSocketAuthHeader(tokenProvider);
 
@@ -5056,9 +5061,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 }
                 if (protocolVersion != PARAMETER_NOT_SET_EXPLICITLY) {
                     throw new LineSenderException("protocol version is not supported for WebSocket protocol");
-                }
-                if (autoFlushIntervalMillis == Integer.MAX_VALUE) {
-                    throw new LineSenderException("disabling auto-flush is not supported for WebSocket protocol");
                 }
                 if ((sfDurability == SfDurability.FLUSH || sfDurability == SfDurability.APPEND)) {
                     throw new LineSenderException(

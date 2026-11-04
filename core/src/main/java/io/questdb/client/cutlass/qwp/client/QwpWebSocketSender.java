@@ -2457,7 +2457,7 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Returns the auto-flush interval in nanoseconds.
+     * Returns the auto-flush interval in nanoseconds (0 = interval-based auto-flush disabled).
      */
     public long getAutoFlushIntervalNanos() {
         return autoFlushIntervalNanos;
@@ -7141,7 +7141,8 @@ public class QwpWebSocketSender implements Sender {
         long bufferedNow = currentTableBuffer.nextRow(
                 currentTableBufferSnapshotBytes, cap > 0 ? cap : Long.MAX_VALUE);
 
-        if (pendingRowCount == 0) {
+        // Interval off (0): no clock read on the row path at all.
+        if (pendingRowCount == 0 && autoFlushIntervalNanos > 0) {
             firstPendingRowTimeNanos = nanoClock.getAsLong();
         }
         pendingRowCount++;

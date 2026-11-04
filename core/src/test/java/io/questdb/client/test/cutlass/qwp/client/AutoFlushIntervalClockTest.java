@@ -44,6 +44,22 @@ public class AutoFlushIntervalClockTest {
     private static final int N = 1000;
 
     @Test
+    public void testDefaultIntervalWhenKeyAbsentAndZeroWhenOff() throws Exception {
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = startAckingServer()) {
+                try (Sender sender = Sender.fromConfig(cfg(server))) {
+                    Assert.assertEquals("ws:: without auto_flush_interval keeps the 100 ms default",
+                            TimeUnit.MILLISECONDS.toNanos(100),
+                            ((QwpWebSocketSender) sender).getAutoFlushIntervalNanos());
+                }
+                try (Sender sender = Sender.fromConfig(cfg(server) + "auto_flush_interval=off;")) {
+                    Assert.assertEquals(0L, ((QwpWebSocketSender) sender).getAutoFlushIntervalNanos());
+                }
+            }
+        });
+    }
+
+    @Test
     public void testIntervalFlushesOnSecondRowOfAgedBatch() throws Exception {
         assertMemoryLeak(() -> {
             try (TestWebSocketServer server = startAckingServer();
@@ -61,6 +77,50 @@ public class AutoFlushIntervalClockTest {
                 sender.table("t").longColumn("v", 2L).atNow();
                 Assert.assertTrue("batch older than the interval must auto-flush on its second row",
                         ws.getCursorEngineForTesting().publishedFsn() > fsn0);
+            }
+        });
+    }
+
+    @Test
+    public void testIntervalOffReadsNoClock() throws Exception {
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = startAckingServer();
+                 Sender sender = Sender.fromConfig(cfg(server) + "auto_flush_interval=off;")) {
+                AtomicLong reads = new AtomicLong();
+                ((QwpWebSocketSender) sender).setNanoClockForTesting(() -> reads.incrementAndGet() * 1_000L);
+                for (int i = 0; i < N; i++) {
+                    sender.table("t").longColumn("v", i).atNow();
+                    sender.flush();
+                }
+                Assert.assertEquals("auto_flush_interval=off must not read the clock on the row path",
+                        0L, reads.get());
+            }
+        });
+    }
+
+    @Test
+    public void testIntervalOffKeepsRowCapAndExplicitFlush() throws Exception {
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = startAckingServer();
+                 Sender sender = Sender.fromConfig(cfg(server) + "auto_flush_interval=off;auto_flush_rows=10;")) {
+                QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                long fsn0 = ws.getCursorEngineForTesting().publishedFsn();
+                for (int i = 0; i < 9; i++) {
+                    sender.table("t").longColumn("v", i).atNow();
+                }
+                Assert.assertEquals("9 rows stay below the row cap",
+                        fsn0, ws.getCursorEngineForTesting().publishedFsn());
+                sender.table("t").longColumn("v", 9L).atNow();
+                long fsn1 = ws.getCursorEngineForTesting().publishedFsn();
+                Assert.assertTrue("the 10th row must trigger the row-cap flush", fsn1 > fsn0);
+
+                for (int i = 0; i < 3; i++) {
+                    sender.table("t").longColumn("v", i).atNow();
+                }
+                Assert.assertEquals(fsn1, ws.getCursorEngineForTesting().publishedFsn());
+                sender.flush();
+                Assert.assertTrue("explicit flush() must send the partial batch",
+                        ws.getCursorEngineForTesting().publishedFsn() > fsn1);
             }
         });
     }
