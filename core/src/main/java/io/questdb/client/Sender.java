@@ -1864,8 +1864,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * <p>
          * It is essential to ensure the maximum buffer capacity is sufficient to accommodate all locally buffered data.
          * <p>
-         * This method should only be used when communicating via the HTTP protocol. Calling this method is illegal when
-         * communicating over the TCP protocol.
+         * This method is supported for the HTTP and WebSocket (QWP) protocols. Calling this method is illegal when
+         * communicating over the TCP protocol. On WebSocket, {@link Sender#close()} still flushes pending rows.
          *
          * @return this instance for method chaining
          * @see #autoFlushRows(int)
