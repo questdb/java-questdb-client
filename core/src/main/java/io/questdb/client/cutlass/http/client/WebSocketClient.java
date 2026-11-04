@@ -1145,18 +1145,23 @@ public abstract class WebSocketClient implements QuietCloseable {
     private void doSend(long ptr, int len, int timeout) {
         long startTime = System.nanoTime();
         recvDrained = false;
+        // Send first, poll only on backpressure (mirrors recvOrDie): the
+        // socket is non-blocking, and a pre-send ioWait would cost an
+        // epoll_ctl + epoll_wait per frame even when it is writable.
         while (len > 0) {
-            int remainingTimeout = getRemainingTimeOrThrow(timeout, startTime);
-            ioWait(remainingTimeout, IOOperation.WRITE);
             int sent = dieIfNegative(socket.send(ptr, len));
             while (socket.wantsTlsWrite()) {
-                remainingTimeout = getRemainingTimeOrThrow(timeout, startTime);
+                int remainingTimeout = getRemainingTimeOrThrow(timeout, startTime);
                 ioWait(remainingTimeout, IOOperation.WRITE);
                 dieIfNegative(socket.tlsIO(Socket.WRITE_FLAG));
             }
             if (sent > 0) {
                 ptr += sent;
                 len -= sent;
+            } else {
+                // send returned ERETRY (0): socket full, park until writable
+                int remainingTimeout = getRemainingTimeOrThrow(timeout, startTime);
+                ioWait(remainingTimeout, IOOperation.WRITE);
             }
         }
     }

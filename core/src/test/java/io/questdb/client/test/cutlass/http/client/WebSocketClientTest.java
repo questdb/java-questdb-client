@@ -30,6 +30,7 @@ import io.questdb.client.cutlass.http.client.HttpClientException;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
 import io.questdb.client.cutlass.http.client.WebSocketSendBuffer;
+import io.questdb.client.network.IOOperation;
 import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.network.Socket;
 import io.questdb.client.network.SocketReadinessWaiter;
@@ -40,6 +41,7 @@ import org.junit.Test;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.util.Arrays;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -349,6 +351,21 @@ public class WebSocketClientTest {
         });
     }
 
+    /**
+     * doSend() must try send() first and poll for writability only when the
+     * socket reports full (send returns 0 / ERETRY); a pre-send ioWait costs
+     * an epoll_ctl + epoll_wait per frame even when the socket is writable.
+     */
+    @Test
+    public void testSendPollsForWritabilityOnlyOnBackpressure() throws Exception {
+        assertMemoryLeak(() -> {
+            // whole frame accepted by the first send(): no poll
+            assertSendBinaryWriteWaits(new CapturingSocket(), 0);
+            // 2 bytes accepted, socket full once, then the rest: exactly one poll
+            assertSendBinaryWriteWaits(new CapturingSocket(2, 0), 1);
+        });
+    }
+
     @Test
     public void testSendCloseFrameDoesNotClobberSendBuffer() throws Exception {
         assertMemoryLeak(() -> {
@@ -408,6 +425,31 @@ public class WebSocketClientTest {
                 );
             }
         });
+    }
+
+    private static void assertSendBinaryWriteWaits(CapturingSocket socket, int expectedWriteWaits) throws Exception {
+        long payload = Unsafe.malloc(7, MemoryTag.NATIVE_DEFAULT);
+        try (CapturingWebSocketClient client = new CapturingWebSocketClient(socket)) {
+            setUpgradedTrue(client);
+            for (int i = 0; i < 7; i++) {
+                Unsafe.getUnsafe().putByte(payload + i, (byte) (i + 1));
+            }
+
+            client.sendBinary(payload, 7);
+
+            byte[] frame = socket.sent;
+            Assert.assertEquals(2 + 4 + 7, frame.length);
+            Assert.assertEquals((byte) 0x82, frame[0]);
+            Assert.assertEquals((byte) (0x80 | 7), frame[1]);
+            byte[] unmasked = new byte[7];
+            for (int i = 0; i < unmasked.length; i++) {
+                unmasked[i] = (byte) (frame[6 + i] ^ frame[2 + (i & 3)]);
+            }
+            Assert.assertArrayEquals(new byte[]{1, 2, 3, 4, 5, 6, 7}, unmasked);
+            Assert.assertEquals(expectedWriteWaits, client.writeWaits);
+        } finally {
+            Unsafe.free(payload, 7, MemoryTag.NATIVE_DEFAULT);
+        }
     }
 
     private static int getIntField(Object obj, String name) throws Exception {
@@ -500,20 +542,35 @@ public class WebSocketClientTest {
         }
     }
 
+    /**
+     * Accumulates every byte send() accepts. The i-th send() call accepts at
+     * most acceptLimits[i] bytes (0 = socket full); calls past the script
+     * accept everything.
+     */
     private static class CapturingSocket extends FakeSocket {
-        private byte[] sent;
+        private final int[] acceptLimits;
+        private byte[] sent = new byte[0];
+        private int sendCalls;
+
+        CapturingSocket(int... acceptLimits) {
+            this.acceptLimits = acceptLimits;
+        }
 
         @Override
         public int send(long bufferPtr, int bufferLen) {
-            sent = new byte[bufferLen];
-            for (int i = 0; i < bufferLen; i++) {
-                sent[i] = Unsafe.getUnsafe().getByte(bufferPtr + i);
+            int n = sendCalls < acceptLimits.length ? Math.min(acceptLimits[sendCalls], bufferLen) : bufferLen;
+            sendCalls++;
+            int offset = sent.length;
+            sent = Arrays.copyOf(sent, offset + n);
+            for (int i = 0; i < n; i++) {
+                sent[offset + i] = Unsafe.getUnsafe().getByte(bufferPtr + i);
             }
-            return bufferLen;
+            return n;
         }
     }
 
     private static class CapturingWebSocketClient extends TestWebSocketClient {
+        private int writeWaits;
 
         CapturingWebSocketClient(CapturingSocket socket) {
             super(DefaultHttpClientConfiguration.INSTANCE, (nf, log) -> socket);
@@ -521,6 +578,9 @@ public class WebSocketClientTest {
 
         @Override
         protected void ioWait(int timeout, int op) {
+            if (op == IOOperation.WRITE) {
+                writeWaits++;
+            }
         }
 
         @Override
