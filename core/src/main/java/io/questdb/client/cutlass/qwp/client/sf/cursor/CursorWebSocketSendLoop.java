@@ -311,6 +311,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // when BOTH tiers are requested. Progress observability only -- the trim
     // path never reads it (the replicated ack drives the trim). In local-only
     // mode local acks feed durableTableWatermarks directly instead.
+    // Guarded by the map's monitor because progress readers run off the I/O thread.
     private final CharSequenceLongHashMap localDurableTableWatermarks = new CharSequenceLongHashMap();
     // Pre-converted to nanos. Consulted only by the orphan terminal policy. Zero disables
     // the dwell entirely (count-only escalation at MAX_CATCHUP_CAP_GAP_ATTEMPTS); the
@@ -1747,7 +1748,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * this map stays empty.
      */
     public long getLocalDurableTableWatermark(CharSequence tableName) {
-        return localDurableTableWatermarks.get(tableName);
+        synchronized (localDurableTableWatermarks) {
+            return localDurableTableWatermarks.get(tableName);
+        }
     }
 
     /**
@@ -2047,13 +2050,15 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * observability only: the trim path is driven by the replicated ack.
      */
     private void applyLocalDurableAckProgress() {
-        int n = response.getTableEntryCount();
-        for (int i = 0; i < n; i++) {
-            String name = response.getTableName(i);
-            long seqTxn = response.getTableSeqTxn(i);
-            long current = localDurableTableWatermarks.get(name);
-            if (seqTxn > current) {
-                localDurableTableWatermarks.put(name, seqTxn);
+        synchronized (localDurableTableWatermarks) {
+            int n = response.getTableEntryCount();
+            for (int i = 0; i < n; i++) {
+                String name = response.getTableName(i);
+                long seqTxn = response.getTableSeqTxn(i);
+                long current = localDurableTableWatermarks.get(name);
+                if (seqTxn > current) {
+                    localDurableTableWatermarks.put(name, seqTxn);
+                }
             }
         }
     }
@@ -2106,7 +2111,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             releasePendingEntry(pendingDurable.pollFirst());
         }
         durableTableWatermarks.clear();
-        localDurableTableWatermarks.clear();
+        synchronized (localDurableTableWatermarks) {
+            localDurableTableWatermarks.clear();
+        }
     }
 
     private static boolean isCatchUpCapGap(Throwable t) {
@@ -4405,7 +4412,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     LOG.warn("received STATUS_LOCAL_DURABLE_ACK frame without opt-in -- ignoring");
                     return;
                 }
-                totalLocalDurableAcks.incrementAndGet();
                 if (isLocalAckTrimming) {
                     // Local is the strongest requested tier, so its ack is
                     // this connection's trim trigger -- same watermark and
@@ -4416,6 +4422,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     // local ack is an early progress signal only.
                     applyLocalDurableAckProgress();
                 }
+                // Publish the count only after this frame's watermarks are visible.
+                totalLocalDurableAcks.incrementAndGet();
                 return;
             }
             // Application-layer rejection by the server. Classify by status
