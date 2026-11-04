@@ -517,6 +517,7 @@ public abstract class WebSocketClient implements QuietCloseable {
             }
 
             // Ensure buffer has space
+            compactRecvBuffer();
             if (recvPos >= recvBufSize - 1024) {
                 growRecvBuffer();
             }
@@ -702,6 +703,7 @@ public abstract class WebSocketClient implements QuietCloseable {
         }
 
         // Try one non-blocking recv
+        compactRecvBuffer();
         if (recvPos >= recvBufSize - 1024) {
             growRecvBuffer();
         }
@@ -1453,8 +1455,13 @@ public abstract class WebSocketClient implements QuietCloseable {
             // Advance read position
             recvReadPos += consumed;
 
-            // Compact buffer if needed
-            compactRecvBuffer();
+            // Rewind once drained; a partial tail stays put until the next
+            // recv compacts it. Compacting here, per frame, memmoved the rest
+            // of a burst once per frame: quadratic in the burst.
+            if (recvReadPos == recvPos) {
+                recvReadPos = 0;
+                recvPos = 0;
+            }
 
             return PARSE_OK;
         }
