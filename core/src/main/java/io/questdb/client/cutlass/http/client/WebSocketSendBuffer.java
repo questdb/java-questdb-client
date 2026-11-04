@@ -111,6 +111,32 @@ public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
     }
 
     /**
+     * Appends one complete masked binary frame at the write position. Unlike
+     * {@link #beginFrame()}/{@link #endFrame(int)}, which reserve
+     * {@code MAX_HEADER_SIZE} and leave a gap before a shorter header, the
+     * header here is exact-size, so consecutive frames are contiguous and the
+     * whole buffer can go out in one write.
+     *
+     * @param payloadPtr pointer to the payload
+     * @param payloadLen payload length
+     */
+    public void appendMaskedBinaryFrame(long payloadPtr, int payloadLen) {
+        int headerSize = WebSocketFrameWriter.headerSize(payloadLen, true);
+        long requiredCapacity = (long) writePos + headerSize + payloadLen;
+        if (requiredCapacity > bufCapacity) {
+            grow(requiredCapacity);
+        }
+        int maskKey = rnd.nextInt();
+        long payload = bufPtr + writePos + WebSocketFrameWriter.writeHeader(
+                bufPtr + writePos, true, WebSocketOpcode.BINARY, payloadLen, maskKey);
+        if (payloadLen > 0) {
+            Vect.memcpy(payload, payloadPtr, payloadLen);
+            WebSocketFrameWriter.maskPayload(payload, payloadLen, maskKey);
+        }
+        writePos += headerSize + payloadLen;
+    }
+
+    /**
      * Begins a new WebSocket frame. Reserves space for the maximum header size.
      * The opcode is specified later when ending the frame via {@link #endFrame(int)}.
      */

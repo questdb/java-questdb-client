@@ -50,6 +50,63 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 public class WebSocketClientTest {
 
     /**
+     * Batched frames go out back to back in ONE send(), each a well-formed
+     * masked binary frame with an exact-size header (no MAX_HEADER_SIZE gap
+     * between frames); an empty flush writes nothing.
+     */
+    @Test
+    public void testBatchFlushSendsAppendedFramesInOneWrite() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingSocket socket = new CapturingSocket();
+            // 7: 7-bit length, 200: 16-bit length, 0: empty payload
+            int[] lens = {7, 200, 0};
+            long payload = Unsafe.malloc(200, MemoryTag.NATIVE_DEFAULT);
+            try (CapturingWebSocketClient client = new CapturingWebSocketClient(socket)) {
+                setUpgradedTrue(client);
+                for (int i = 0; i < 200; i++) {
+                    Unsafe.getUnsafe().putByte(payload + i, (byte) i);
+                }
+
+                client.batchFlush();
+                Assert.assertEquals("an empty flush must not write", 0, socket.sendCalls);
+
+                for (int len : lens) {
+                    client.batchAppendBinary(payload, len);
+                }
+                Assert.assertEquals("appending must not write", 0, socket.sendCalls);
+                client.batchFlush();
+                Assert.assertEquals("the whole batch must be one write", 1, socket.sendCalls);
+
+                byte[] wire = socket.sent;
+                int pos = 0;
+                for (int len : lens) {
+                    Assert.assertEquals("FIN + BINARY", (byte) 0x82, wire[pos]);
+                    int maskPos;
+                    if (len <= 125) {
+                        Assert.assertEquals((byte) (0x80 | len), wire[pos + 1]);
+                        maskPos = pos + 2;
+                    } else {
+                        Assert.assertEquals((byte) (0x80 | 126), wire[pos + 1]);
+                        Assert.assertEquals(len, ((wire[pos + 2] & 0xFF) << 8) | (wire[pos + 3] & 0xFF));
+                        maskPos = pos + 4;
+                    }
+                    int payloadPos = maskPos + 4;
+                    for (int i = 0; i < len; i++) {
+                        Assert.assertEquals((byte) i, (byte) (wire[payloadPos + i] ^ wire[maskPos + (i & 3)]));
+                    }
+                    pos = payloadPos + len;
+                }
+                Assert.assertEquals("no bytes beyond the 3 frames", wire.length, pos);
+
+                client.batchFlush();
+                Assert.assertEquals("a flushed batch is empty", 1, socket.sendCalls);
+            } finally {
+                Unsafe.free(payload, 200, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    /**
      * close() frees native memory (recv/fragment buffers, send buffers), so
      * its guard must be a CAS, not a volatile check-then-act: two concurrent
      * closers passing the flag check together would both run

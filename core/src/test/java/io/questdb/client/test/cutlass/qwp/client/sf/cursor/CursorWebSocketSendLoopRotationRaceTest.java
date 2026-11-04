@@ -42,7 +42,7 @@ import org.junit.Test;
 
 /**
  * Probabilistic regression test for the send-loop rotation race fixed in
- * {@code CursorWebSocketSendLoop.trySendOne()} (PR #41): the loop could observe
+ * {@code CursorWebSocketSendLoop.trySendBatch()} (PR #41): the loop could observe
  * a segment rotation without observing the final frame published into that
  * segment, and advance past it — silently dropping the frame.
  * <p>
@@ -85,7 +85,7 @@ public class CursorWebSocketSendLoopRotationRaceTest {
             SegmentManager manager = new SegmentManager(
                     SEGMENT_BYTES, new SegmentBudget(SegmentManager.UNLIMITED_TOTAL_BYTES));
             manager.start();
-            // sfDir == null => memory-only segments (no files/fds); same trySendOne() path.
+            // sfDir == null => memory-only segments (no files/fds); same trySendBatch() path.
             CursorSendEngine engine = new CursorSendEngine(null, SEGMENT_BYTES, manager);
             RecordingClient client = new RecordingClient(n);
             CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
@@ -137,7 +137,7 @@ public class CursorWebSocketSendLoopRotationRaceTest {
     }
 
     /**
-     * In-memory transport, and nothing more: {@code sendBinary} captures the fsn
+     * In-memory transport, and nothing more: {@code batchAppendBinary} captures the fsn
      * carried by each frame the loop ships. The other callbacks are inert — this
      * test never receives ACKs and never reconnects. Only {@code sentCount} is
      * read cross-thread (by the test, for progress) and so is volatile.
@@ -153,7 +153,7 @@ public class CursorWebSocketSendLoopRotationRaceTest {
         }
 
         @Override
-        public void sendBinary(long dataPtr, int length) {
+        public void batchAppendBinary(long dataPtr, int length) {
             if (recordedCount < recorded.length) {
                 recorded[recordedCount++] = Unsafe.getUnsafe().getLong(dataPtr);
             }

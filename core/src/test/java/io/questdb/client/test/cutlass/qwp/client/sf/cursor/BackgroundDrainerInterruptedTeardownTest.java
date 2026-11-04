@@ -267,7 +267,7 @@ public class BackgroundDrainerInterruptedTeardownTest {
         }
 
         @Override
-        public void sendBinary(long dataPtr, int length) {
+        public void batchAppendBinary(long dataPtr, int length) {
             throw new IllegalStateException("stub: wire down");
         }
 

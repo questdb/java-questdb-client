@@ -241,6 +241,40 @@ public abstract class WebSocketClient implements QuietCloseable {
         }
     }
 
+    /**
+     * Appends one binary frame to the send batch, back to back with any frame
+     * already appended. Nothing reaches the wire until {@link #batchFlush()}.
+     * Grows the send buffer if the frame does not fit; a caller bounding the
+     * batch checks {@link #batchCapacity()} first. The batch shares the send
+     * buffer with {@link #sendBinary}, so do not interleave the two.
+     */
+    public void batchAppendBinary(long dataPtr, int length) {
+        checkConnected();
+        sendBuffer.appendMaskedBinaryFrame(dataPtr, length);
+    }
+
+    /**
+     * Bytes the send batch holds without growing the send buffer.
+     */
+    public int batchCapacity() {
+        return sendBuffer.getCapacity();
+    }
+
+    /**
+     * Writes every frame appended since the last flush with one send. No-op
+     * when nothing was appended. The batch is empty afterwards, even on failure.
+     */
+    public void batchFlush() {
+        int len = sendBuffer.getWritePos();
+        if (len > 0) {
+            try {
+                doSend(sendBuffer.getBufferPtr(), len, defaultTimeout);
+            } finally {
+                sendBuffer.reset();
+            }
+        }
+    }
+
     @Override
     public void close() {
         // CAS gate: exactly one closer runs the teardown below. Closers can be

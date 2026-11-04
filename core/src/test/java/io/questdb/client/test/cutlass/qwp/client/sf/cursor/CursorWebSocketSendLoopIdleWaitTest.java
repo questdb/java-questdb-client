@@ -218,6 +218,43 @@ public class CursorWebSocketSendLoopIdleWaitTest {
     }
 
     /**
+     * A batch never outgrows the send buffer: it ends before the frame that
+     * would not fit, so the ACK side gets a turn per buffer's worth of bytes
+     * and the buffer is never grown towards its maximum by a backlog.
+     */
+    @Test
+    public void testBurstIsSplitAtSendBufferCapacity() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 1 << 20)) {
+                BlockingDoorbellClient client = new BlockingDoorbellClient();
+                final int frames = 16;
+                final int payloadLen = 8192;
+                final int wireLen = payloadLen + 8; // 2-byte header + 16-bit length + 4-byte mask key
+                int framesPerWrite = client.batchCapacity() / wireLen;
+                assertTrue("test needs several frames per write", framesPerWrite > 1 && framesPerWrite < frames);
+                publishBurstToHeldLoop(engine, client, frames, payloadLen);
+                assertEquals("batches must be cut at the send buffer's capacity",
+                        (frames + framesPerWrite - 1) / framesPerWrite, client.writes.get());
+            }
+        });
+    }
+
+    /**
+     * Frames already published when the loop reaches them share one socket
+     * write, instead of costing a send() (plus an EAGAIN recv()) each.
+     */
+    @Test
+    public void testBurstOfPublishedFramesGoesOutInOneWrite() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 16384)) {
+                BlockingDoorbellClient client = new BlockingDoorbellClient();
+                publishBurstToHeldLoop(engine, client, 8, 16);
+                assertEquals("8 published frames must share one write", 1, client.writes.get());
+            }
+        });
+    }
+
+    /**
      * The publish hook rings the doorbell only while the I/O thread is parked
      * (or committing to park). A loop that is busy -- here, inside the
      * transport's receive -- picks the frames up on its next iteration, so a
@@ -265,7 +302,7 @@ public class CursorWebSocketSendLoopIdleWaitTest {
 
     /**
      * The idle decision re-checks the engine's publish stamp after committing
-     * to park: a publish that lands after trySendOne found nothing but before
+     * to park: a publish that lands after trySendBatch found nothing but before
      * ioParked is set rings no doorbell, so without the re-check the loop
      * would block on an untimed wait with the frame stranded behind it. The
      * transport's receive, which runs inside that window, is gated so the
@@ -292,7 +329,7 @@ public class CursorWebSocketSendLoopIdleWaitTest {
                     assertTrue("loop never reached the idle-decision window",
                             client.receiveHeld.await(5, TimeUnit.SECONDS));
                     assertEquals(1, client.sentFrames.get());
-                    // The loop is between trySendOne (found nothing) and the
+                    // The loop is between trySendBatch (found nothing) and the
                     // park decision: this publish rings no doorbell.
                     int wakesBefore = client.wakes.get();
                     appendFrame(engine);
@@ -325,6 +362,50 @@ public class CursorWebSocketSendLoopIdleWaitTest {
         }
     }
 
+    private static void appendZeroFrame(CursorSendEngine engine, int len) {
+        long buf = Unsafe.calloc(len, MemoryTag.NATIVE_DEFAULT);
+        try {
+            engine.appendBlocking(buf, len);
+        } finally {
+            Unsafe.free(buf, len, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    /**
+     * Holds the loop in its first receive, publishes the frames, releases it
+     * and waits until the loop has counted them all as sent.
+     */
+    private static void publishBurstToHeldLoop(
+            CursorSendEngine engine, BlockingDoorbellClient client, int frames, int payloadLen
+    ) throws Exception {
+        CountDownLatch gate = new CountDownLatch(1);
+        client.receiveGate = gate;
+        CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
+                client, engine, 0L,
+                BlockingDoorbellClient::new,
+                100L, 1_000L,
+                DurableAckTiers.NONE,
+                CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
+                CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS);
+        try {
+            loop.start();
+            assertTrue("loop never entered the held receive", client.receiveHeld.await(5, TimeUnit.SECONDS));
+            for (int i = 0; i < frames; i++) {
+                appendZeroFrame(engine, payloadLen);
+            }
+            gate.countDown();
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (loop.getTotalFramesSent() < frames && System.nanoTime() < deadline) {
+                Thread.sleep(1);
+            }
+            assertEquals("not every published frame was sent", frames, loop.getTotalFramesSent());
+            assertEquals(frames, client.sentFrames.get());
+        } finally {
+            gate.countDown();
+            loop.close();
+        }
+    }
+
     /**
      * A transport whose idle wait really blocks (no bounded park), like the
      * real one, with a stateful doorbell.
@@ -335,6 +416,7 @@ public class CursorWebSocketSendLoopIdleWaitTest {
         final AtomicInteger waits = new AtomicInteger();
         final AtomicInteger pingAttempts = new AtomicInteger();
         final AtomicInteger wakes = new AtomicInteger();
+        final AtomicInteger writes = new AtomicInteger();
         // Counted down once the receive below is held at receiveGate.
         final CountDownLatch receiveHeld = new CountDownLatch(1);
         volatile boolean failFirstSend;
@@ -345,7 +427,7 @@ public class CursorWebSocketSendLoopIdleWaitTest {
         // One-shot: the receive that takes the gate blocks on it (5 s cap).
         // Plain: the very first receive. gateInIdleWindow: the second
         // receive after the first send, i.e. the one that runs after
-        // trySendOne found nothing and before the park decision.
+        // trySendBatch found nothing and before the park decision.
         volatile CountDownLatch receiveGate;
         volatile boolean gateInIdleWindow;
         private boolean okDelivered;
@@ -381,13 +463,26 @@ public class CursorWebSocketSendLoopIdleWaitTest {
         }
 
         @Override
-        public void sendBinary(long dataPtr, int length) {
+        public void batchAppendBinary(long dataPtr, int length) {
             if (failFirstSend) {
                 failFirstSend = false;
                 throw new HttpClientException("peer disconnect [errno=104]");
             }
             sentFrames.incrementAndGet();
             receivesSinceSend = 0;
+        }
+
+        // One socket write per flush, like the real client.
+        @Override
+        public void batchFlush() {
+            writes.incrementAndGet();
+        }
+
+        // The one-frame-per-write path: one frame, one write.
+        @Override
+        public void sendBinary(long dataPtr, int length) {
+            batchAppendBinary(dataPtr, length);
+            batchFlush();
         }
 
         @Override

@@ -231,7 +231,12 @@ public class CursorWebSocketSendLoopBlockedSendCloseTest {
         }
 
         @Override
-        public void sendBinary(long dataPtr, int length, int timeout) {
+        public void batchAppendBinary(long dataPtr, int length) {
+            // the frame goes out (and blocks) in batchFlush
+        }
+
+        @Override
+        public void batchFlush() {
             sendThread.set(Thread.currentThread());
             sendEntered.countDown();
             try {
