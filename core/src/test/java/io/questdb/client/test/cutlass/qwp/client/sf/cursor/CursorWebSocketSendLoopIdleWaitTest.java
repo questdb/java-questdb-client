@@ -218,23 +218,49 @@ public class CursorWebSocketSendLoopIdleWaitTest {
     }
 
     /**
-     * A batch never outgrows the send buffer: it ends before the frame that
-     * would not fit, so the ACK side gets a turn per buffer's worth of bytes
+     * A batch never outgrows the byte cap: it ends before the frame that
+     * would not fit, so the ACK side gets a turn per cap's worth of bytes
      * and the buffer is never grown towards its maximum by a backlog.
      */
     @Test
-    public void testBurstIsSplitAtSendBufferCapacity() throws Exception {
+    public void testBurstIsSplitAtBatchByteCap() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 1 << 20)) {
                 BlockingDoorbellClient client = new BlockingDoorbellClient();
                 final int frames = 16;
                 final int payloadLen = 8192;
                 final int wireLen = payloadLen + 8; // 2-byte header + 16-bit length + 4-byte mask key
-                int framesPerWrite = client.batchCapacity() / wireLen;
+                int framesPerWrite = client.batchByteCap() / wireLen;
                 assertTrue("test needs several frames per write", framesPerWrite > 1 && framesPerWrite < frames);
-                publishBurstToHeldLoop(engine, client, frames, payloadLen);
-                assertEquals("batches must be cut at the send buffer's capacity",
+                publishBurstToHeldLoop(engine, client, 0, frames, payloadLen);
+                assertEquals("batches must be cut at the batch byte cap",
                         (frames + framesPerWrite - 1) / framesPerWrite, client.writes.get());
+            }
+        });
+    }
+
+    /**
+     * The byte cap is fixed, not the send buffer's live capacity: a frame
+     * larger than the cap goes out alone and grows the buffer, and the burst
+     * behind it is still cut at the cap. A cap that followed the grown buffer
+     * would let the burst ride along in one or two writes, widening the
+     * ACK-fairness window for the rest of the connection.
+     */
+    @Test
+    public void testBatchByteCapDoesNotFollowSendBufferGrowth() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 1 << 20)) {
+                BlockingDoorbellClient client = new BlockingDoorbellClient();
+                final int leadPayloadLen = 200 * 1024;
+                final int frames = 32;
+                final int payloadLen = 8192 - 8; // wire frame of exactly 8 KiB
+                int framesPerWrite = client.batchByteCap() / (payloadLen + 8);
+                assertEquals("test assumes eight 8 KiB frames per 64 KiB cap", 8, framesPerWrite);
+                publishBurstToHeldLoop(engine, client, leadPayloadLen, frames, payloadLen);
+                assertTrue("the lead frame must have grown the send buffer past the cap",
+                        client.maxBufferCapacity > client.batchByteCap());
+                assertEquals("lead frame alone, then the burst cut at the fixed cap",
+                        1 + frames / framesPerWrite, client.writes.get());
             }
         });
     }
@@ -248,7 +274,7 @@ public class CursorWebSocketSendLoopIdleWaitTest {
         TestUtils.assertMemoryLeak(() -> {
             try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 16384)) {
                 BlockingDoorbellClient client = new BlockingDoorbellClient();
-                publishBurstToHeldLoop(engine, client, 8, 16);
+                publishBurstToHeldLoop(engine, client, 0, 8, 16);
                 assertEquals("8 published frames must share one write", 1, client.writes.get());
             }
         });
@@ -372,11 +398,12 @@ public class CursorWebSocketSendLoopIdleWaitTest {
     }
 
     /**
-     * Holds the loop in its first receive, publishes the frames, releases it
+     * Holds the loop in its first receive, publishes the frames (behind one
+     * lead frame of leadPayloadLen bytes when that is positive), releases it
      * and waits until the loop has counted them all as sent.
      */
     private static void publishBurstToHeldLoop(
-            CursorSendEngine engine, BlockingDoorbellClient client, int frames, int payloadLen
+            CursorSendEngine engine, BlockingDoorbellClient client, int leadPayloadLen, int frames, int payloadLen
     ) throws Exception {
         CountDownLatch gate = new CountDownLatch(1);
         client.receiveGate = gate;
@@ -390,16 +417,21 @@ public class CursorWebSocketSendLoopIdleWaitTest {
         try {
             loop.start();
             assertTrue("loop never entered the held receive", client.receiveHeld.await(5, TimeUnit.SECONDS));
+            int total = frames;
+            if (leadPayloadLen > 0) {
+                appendZeroFrame(engine, leadPayloadLen);
+                total++;
+            }
             for (int i = 0; i < frames; i++) {
                 appendZeroFrame(engine, payloadLen);
             }
             gate.countDown();
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-            while (loop.getTotalFramesSent() < frames && System.nanoTime() < deadline) {
+            while (loop.getTotalFramesSent() < total && System.nanoTime() < deadline) {
                 Thread.sleep(1);
             }
-            assertEquals("not every published frame was sent", frames, loop.getTotalFramesSent());
-            assertEquals(frames, client.sentFrames.get());
+            assertEquals("not every published frame was sent", total, loop.getTotalFramesSent());
+            assertEquals(total, client.sentFrames.get());
         } finally {
             gate.countDown();
             loop.close();
@@ -430,6 +462,8 @@ public class CursorWebSocketSendLoopIdleWaitTest {
         // trySendBatch found nothing and before the park decision.
         volatile CountDownLatch receiveGate;
         volatile boolean gateInIdleWindow;
+        // Largest send buffer capacity seen at a flush.
+        volatile int maxBufferCapacity;
         private boolean okDelivered;
         private int receivesSinceSend;
         private final Semaphore doorbell = new Semaphore(0);
@@ -468,6 +502,8 @@ public class CursorWebSocketSendLoopIdleWaitTest {
                 failFirstSend = false;
                 throw new HttpClientException("peer disconnect [errno=104]");
             }
+            // Through the real send buffer, so a large frame grows it.
+            getSendBuffer().appendMaskedBinaryFrame(dataPtr, length);
             sentFrames.incrementAndGet();
             receivesSinceSend = 0;
         }
@@ -476,6 +512,8 @@ public class CursorWebSocketSendLoopIdleWaitTest {
         @Override
         public void batchFlush() {
             writes.incrementAndGet();
+            maxBufferCapacity = Math.max(maxBufferCapacity, getSendBuffer().getCapacity());
+            getSendBuffer().reset();
         }
 
         // The one-frame-per-write path: one frame, one write.

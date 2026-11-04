@@ -3879,9 +3879,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     /**
      * Returns true if at least one frame was sent (caller skips the park).
      * Sends every fully published frame of the current segment in one write,
-     * up to the send buffer's capacity, so the ACK side still gets a turn
-     * every buffer's worth of bytes and the buffer never grows mid-batch (a
-     * single frame larger than the buffer goes alone and grows it).
+     * up to the client's fixed batch byte cap (the default send buffer size,
+     * not the buffer's live capacity), so the ACK side still gets a turn every
+     * cap's worth of bytes and the buffer never grows mid-batch (a single
+     * frame larger than the cap goes alone and grows the buffer).
      * <p>
      * Every per-frame check runs per frame, in the old order. A frame that is
      * not a plain send (orphan tail, corrupt length, torn dictionary, segment
@@ -3992,8 +3993,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 break; // payload not fully published yet
             }
             long wireLen = WebSocketFrameWriter.headerSize(payloadLen, true) + (long) payloadLen;
-            if (batchFrames > 0 && batchBytes + wireLen > client.batchCapacity()) {
-                break; // byte cap: the next call carries on from this frame
+            if (batchFrames > 0 && batchBytes + wireLen > client.batchByteCap()) {
+                break; // fixed byte cap: the next call carries on from this frame
             }
             long frameAddr = base + sendOffset + MmapSegment.FRAME_HEADER_SIZE;
             // Torn-dictionary guard. sentDictCount is this loop's model of how many ids the
