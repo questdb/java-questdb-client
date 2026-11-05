@@ -91,6 +91,14 @@ jobs:
           cp target/classes/io/questdb/client/bin-local/libquestdb.so \
              "src/main/resources/io/questdb/client/bin/${{ matrix.platform }}/libquestdb.so"
 
+      - name: Test native memory accounting with C1
+        if: matrix.jdk_arch == 'aarch64'
+        run: >-
+          mvn -B -ntp -pl core -Dtest=UnsafeMemoryAccountingTest
+          '-DargLine=-ea -Dfile.encoding=UTF-8 -XX:+UseParallelGC
+          -Dslf4j.provider=ch.qos.logback.classic.spi.LogbackServiceProvider
+          -XX:+TieredCompilation -XX:TieredStopAtLevel=1' test
+
       - name: Compile, test, and build javadoc
         env:
           JAVA11_HOME: ${{ steps.jdk11.outputs.path }}

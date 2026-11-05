@@ -120,16 +120,29 @@ public final class Unsafe {
         return UNSAFE;
     }
 
+    // Keep unaffected calls direct: newer C1 versions may not inline an atomic wrapper.
     public static void incrFreeCount() {
-        UNSAFE.getAndAddLong(null, FREE_COUNT_ADDR, 1);
+        if (NativeAtomicLong.IS_CAS_REQUIRED) {
+            NativeAtomicLong.getAndAdd(UNSAFE, FREE_COUNT_ADDR, 1);
+        } else {
+            UNSAFE.getAndAddLong(null, FREE_COUNT_ADDR, 1);
+        }
     }
 
     public static void incrMallocCount() {
-        UNSAFE.getAndAddLong(null, MALLOC_COUNT_ADDR, 1);
+        if (NativeAtomicLong.IS_CAS_REQUIRED) {
+            NativeAtomicLong.getAndAdd(UNSAFE, MALLOC_COUNT_ADDR, 1);
+        } else {
+            UNSAFE.getAndAddLong(null, MALLOC_COUNT_ADDR, 1);
+        }
     }
 
     public static void incrReallocCount() {
-        UNSAFE.getAndAddLong(null, REALLOC_COUNT_ADDR, 1);
+        if (NativeAtomicLong.IS_CAS_REQUIRED) {
+            NativeAtomicLong.getAndAdd(UNSAFE, REALLOC_COUNT_ADDR, 1);
+        } else {
+            UNSAFE.getAndAddLong(null, REALLOC_COUNT_ADDR, 1);
+        }
     }
 
     /**
@@ -190,10 +203,14 @@ public final class Unsafe {
         assert memoryTag >= 0 && memoryTag < MemoryTag.SIZE;
         COUNTERS[memoryTag].add(size);
         if (memoryTag >= MemoryTag.NATIVE_DEFAULT) {
-            final long mem = UNSAFE.getAndAddLong(null, RSS_MEM_USED_ADDR, size) + size;
+            final long mem = (NativeAtomicLong.IS_CAS_REQUIRED
+                    ? NativeAtomicLong.getAndAdd(UNSAFE, RSS_MEM_USED_ADDR, size)
+                    : UNSAFE.getAndAddLong(null, RSS_MEM_USED_ADDR, size)) + size;
             assert mem >= 0 : "unexpected RSS mem: " + mem + ", size: " + size + ", memoryTag:" + memoryTag;
         } else {
-            final long mem = UNSAFE.getAndAddLong(null, NON_RSS_MEM_USED_ADDR, size) + size;
+            final long mem = (NativeAtomicLong.IS_CAS_REQUIRED
+                    ? NativeAtomicLong.getAndAdd(UNSAFE, NON_RSS_MEM_USED_ADDR, size)
+                    : UNSAFE.getAndAddLong(null, NON_RSS_MEM_USED_ADDR, size)) + size;
             assert mem >= 0 : "unexpected non-RSS mem: " + mem + ", size: " + size + ", memoryTag:" + memoryTag;
         }
     }

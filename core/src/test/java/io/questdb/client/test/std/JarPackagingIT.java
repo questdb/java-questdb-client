@@ -50,7 +50,9 @@ import java.util.jar.JarFile;
  */
 public class JarPackagingIT {
     private static final String FD_BIG_ENTRY = "io/questdb/client/std/FdBig.class";
+    private static final String NATIVE_ATOMIC_ENTRY = "io/questdb/client/std/NativeAtomicLong.class";
     private static final String VERSIONED_FD_BIG_ENTRY = "META-INF/versions/11/" + FD_BIG_ENTRY;
+    private static final String VERSIONED_NATIVE_ATOMIC_ENTRY = "META-INF/versions/11/" + NATIVE_ATOMIC_ENTRY;
 
     @Test
     public void testDoubleFormattingAgainstPackagedJar() throws Exception {
@@ -124,6 +126,9 @@ public class JarPackagingIT {
                         "META-INF/versions/11 must carry the java11 Compat shim",
                         jar.getEntry("META-INF/versions/11/io/questdb/client/std/Compat.class")
                 );
+                Assert.assertTrue("Java 8 must carry the native atomic fallback",
+                        classReferences(jar, NATIVE_ATOMIC_ENTRY, "compareAndSwapLong"));
+                assertNativeAtomicFastPath(jar, VERSIONED_NATIVE_ATOMIC_ENTRY);
                 // every source in src/main/java11 must ship in versions/11 -- a file added
                 // to the source root but missed by the packaging step would recreate the
                 // NoClassDefFoundError class of bug on Java 9+
@@ -141,8 +146,16 @@ public class JarPackagingIT {
                         classReferences(jar, FD_BIG_ENTRY, "jdk.internal.math.FDBigInteger")
                 );
                 Assert.assertNotNull("module-info.class missing", jar.getEntry("module-info.class"));
+                assertNativeAtomicFastPath(jar, NATIVE_ATOMIC_ENTRY);
             }
         }
+    }
+
+    private static void assertNativeAtomicFastPath(JarFile jar, String entry) throws IOException {
+        Assert.assertTrue("Java 11+ must retain the atomic intrinsic",
+                classReferences(jar, entry, "getAndAddLong"));
+        Assert.assertFalse("Java 11+ must not use the CAS fallback",
+                classReferences(jar, entry, "compareAndSwapLong"));
     }
 
     private static java.util.List<String> collectJavaSources(File dir, String prefix) {
