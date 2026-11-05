@@ -3342,10 +3342,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             return;
         }
         if (required > MAX_SENT_DICT_BYTES) {
-            // Latch a terminal, do NOT just throw: accumulateSentDict runs AFTER
-            // the frame's sendBinary, so a bare throw unwinds to ioLoop -> fail()
-            // -> connectLoop, which (running still true) reconnects and replays the
-            // same frame, which re-overflows the never-shrinking mirror -- an
+            // Latch a terminal, do NOT just throw: accumulateSentDict runs after
+            // batchAppendBinary, before batchFlush. A bare throw unwinds to
+            // ioLoop -> fail() -> connectLoop, which (running still true) reconnects
+            // and retries the same frame, re-overflowing the never-shrinking mirror -- an
             // unbounded reconnect livelock rather than the "fails loudly" the
             // MAX_SENT_DICT_BYTES ceiling promises. recordFatal flips running=false
             // so connectLoop's !running guard winds the loop down and checkError()
@@ -3378,13 +3378,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 sentDictBytesOwned = true;
             }
         } catch (Throwable t) {
-            // Latch for exactly the reason the MAX_SENT_DICT_BYTES arm above does, and it
-            // was asymmetric until now: accumulateSentDict runs AFTER the frame's
-            // sendBinary, so a bare throw unwinds to ioLoop -> fail() -> connectLoop,
-            // which (running still true) reconnects and replays the same frame, which
-            // re-attempts the same allocation. A genuine out-of-memory therefore became an
-            // unbounded reconnect livelock instead of the loud failure the ceiling arm
-            // promises. recordFatal flips running=false so connectLoop winds down and
+            // Latch for the same reason as the MAX_SENT_DICT_BYTES arm above:
+            // accumulateSentDict runs after batchAppendBinary, before batchFlush.
+            // A bare throw unwinds to ioLoop -> fail() -> connectLoop, which
+            // (running still true) reconnects and retries the same allocation.
+            // recordFatal flips running=false so connectLoop winds down and
             // checkError() surfaces it; the throw still unwinds past the pending copy.
             recordFatal(t);
             throw t;
