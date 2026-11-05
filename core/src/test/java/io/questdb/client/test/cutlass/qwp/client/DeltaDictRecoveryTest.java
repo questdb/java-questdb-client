@@ -1118,6 +1118,8 @@ public class DeltaDictRecoveryTest {
                 // atNow() and throws from there instead of from the flush() this test
                 // brackets. The batch and the branch under test are identical either way;
                 // only the throw site moves, so parking the thresholds costs no coverage.
+                // (WebSocket rejects auto_flush=off outright, hence the large finite
+                // interval.)
                 String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
                         + ";sf_max_segment_bytes=1024"
                         + ";auto_flush_bytes=off;auto_flush_rows=1000000;auto_flush_interval=60000;";

@@ -1118,6 +1118,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private final IntList ports = new IntList();
         private long authTimeoutMillis = QwpWebSocketSender.DEFAULT_AUTH_TIMEOUT_MS;
         private int autoFlushBytes = PARAMETER_NOT_SET_EXPLICITLY;
+        // Set by disableAutoFlush(). auto_flush_interval=off also stores the interval as
+        // Integer.MAX_VALUE, so the WebSocket validation keys on this flag to reject only the
+        // full disable and accept the interval-only opt-out.
+        private boolean autoFlushDisabled;
         private int autoFlushIntervalMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private int autoFlushRows = PARAMETER_NOT_SET_EXPLICITLY;
         private int bufferCapacity = PARAMETER_NOT_SET_EXPLICITLY;
@@ -1864,8 +1868,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * <p>
          * It is essential to ensure the maximum buffer capacity is sufficient to accommodate all locally buffered data.
          * <p>
-         * This method is supported for the HTTP and WebSocket (QWP) protocols. Calling this method is illegal when
-         * communicating over the TCP protocol. On WebSocket, {@link Sender#close()} still flushes pending rows.
+         * This method should only be used when communicating via the HTTP protocol. Calling this method is illegal when
+         * communicating over the TCP or WebSocket protocol. On WebSocket, {@code auto_flush_interval=off} turns off
+         * only the time-based trigger.
          *
          * @return this instance for method chaining
          * @see #autoFlushRows(int)
@@ -1883,6 +1888,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
 
             this.autoFlushRows = AUTO_FLUSH_DISABLED;
             this.autoFlushIntervalMillis = Integer.MAX_VALUE;
+            this.autoFlushDisabled = true;
             return this;
         }
 
@@ -5061,6 +5067,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 }
                 if (protocolVersion != PARAMETER_NOT_SET_EXPLICITLY) {
                     throw new LineSenderException("protocol version is not supported for WebSocket protocol");
+                }
+                if (autoFlushDisabled) {
+                    throw new LineSenderException("disabling auto-flush is not supported for WebSocket protocol");
                 }
                 if ((sfDurability == SfDurability.FLUSH || sfDurability == SfDurability.APPEND)) {
                     throw new LineSenderException(

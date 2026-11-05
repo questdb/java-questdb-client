@@ -392,7 +392,8 @@ public class SymbolDictRecycleFsnContinuityTest {
      * "greater than" check but fails the exact equalities below. Arming uses
      * resetSymbolDictionary() so the test does not depend on threshold or
      * anti-thrash floor arithmetic; auto-flush stays off so no interval
-     * flush can inject frames on a slow CI box. This pins the same
+     * flush can inject frames on a slow CI box. WebSocket rejects
+     * {@code auto_flush=off} outright, so this pins the same
      * large-finite-interval idiom already
      * used by {@code DeltaDictRecoveryTest} / {@code SelfSufficientFramesTest}
      * to fully suppress auto-flush on WS.

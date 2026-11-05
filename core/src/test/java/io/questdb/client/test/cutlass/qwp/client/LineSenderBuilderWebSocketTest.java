@@ -425,21 +425,12 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
-    public void testDisableAutoFlush_supportedForWebSocket() throws Exception {
-        assertMemoryLeak(() -> {
-            try (TestWebSocketServer server = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
-            })) {
-                server.start();
-                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-                try (QwpWebSocketSender sender = (QwpWebSocketSender) Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address(LOCALHOST + ":" + server.getPort())
-                        .disableAutoFlush()
-                        .build()) {
-                    Assert.assertEquals(0, sender.getAutoFlushRows());
-                    Assert.assertEquals(0L, sender.getAutoFlushIntervalNanos());
-                }
-            }
-        });
+    public void testDisableAutoFlush_notSupportedForWebSocket() {
+        assertThrowsAny(
+                Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address(LOCALHOST)
+                        .disableAutoFlush(),
+                "not supported for WebSocket");
     }
 
     @Test
