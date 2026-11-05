@@ -1682,7 +1682,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * Cumulative count of frames re-sent during post-reconnect catch-up
      * windows. One increment per replayed frame. Zero in steady state; a
      * sustained nonzero rate signals flapping where every reconnect replays
-     * meaningful work.
+     * meaningful work. Failed batch flushes neither increase this count nor
+     * establish a replay boundary, even if some bytes were written.
      */
     public long getTotalFramesReplayed() {
         return counters.framesReplayed.get();
@@ -3109,11 +3110,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
 
     /**
      * Freezes the highest FSN that completed a send on the connection which
-     * just failed. Frames published before the first connection, or while a
-     * reconnect is in progress, have not been sent and therefore do not belong
-     * to the replay metric. Keep an older, higher target when another failure
-     * interrupts catch-up so the remaining frames still count as re-sends on
-     * the following connection.
+     * just failed. A batch counts only when its entire flush succeeds, even
+     * if a failed flush wrote some bytes. Frames published before the first
+     * connection, or while a reconnect is in progress, have not been sent and
+     * therefore do not belong to the replay metric. Keep an older, higher
+     * target when another failure interrupts catch-up so the remaining frames
+     * still count as re-sends on the following connection.
      */
     private void snapshotReplayTarget() {
         if (hasEverConnected && nextWireSeq > 0L) {
@@ -3891,6 +3893,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * one-frame-per-call path did after its previous frame went out.
      */
     private boolean trySendBatch() {
+        // Appending advances these speculatively; reconnect must snapshot only
+        // completed flushes and retain any older replay target after a failure.
+        final long batchStartWireSeq = nextWireSeq;
+        final long batchStartReplayTargetFsn = replayTargetFsn;
         int batchFrames = 0;
         int batchReplayed = 0;
         long batchBytes = 0;
@@ -4028,6 +4034,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             try {
                 client.batchAppendBinary(frameAddr, payloadLen);
             } catch (Throwable t) {
+                nextWireSeq = batchStartWireSeq;
+                replayTargetFsn = batchStartReplayTargetFsn;
                 fail(t);
                 return false;
             }
@@ -4072,6 +4080,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         try {
             client.batchFlush();
         } catch (Throwable t) {
+            nextWireSeq = batchStartWireSeq;
+            replayTargetFsn = batchStartReplayTargetFsn;
             fail(t);
             return false;
         }

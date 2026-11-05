@@ -2917,6 +2917,8 @@ public class QwpWebSocketSender implements Sender {
      * Count of frames re-sent during post-reconnect catch-up windows since
      * this sender started. Zero in steady state; a sustained nonzero rate
      * signals flapping where every reconnect replays meaningful work.
+     * A frame counts as replayed only if an earlier send completed successfully.
+     * Failed batch flushes do not count, even if some bytes were written.
      * Sender-lifetime: carried across symbol-dictionary recycles and retained
      * after {@link #close()}.
      */
@@ -2925,8 +2927,10 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Binary frames the cursor I/O loop has issued to the wire since this
-     * sender started, replays included. Sender-lifetime: carried across
+     * Binary frames the cursor I/O loop has successfully sent since this
+     * sender started, replays included. A batch contributes only when its
+     * entire flush succeeds; failed flushes contribute no frames, even if
+     * some bytes were written. Sender-lifetime: carried across
      * symbol-dictionary recycles and retained after {@link #close()}.
      */
     public long getTotalFramesSent() {
