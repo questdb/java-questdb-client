@@ -189,64 +189,14 @@ public class WebSocketClientTest {
         Assert.assertEquals(16 * 1024 * 1024, invokeExtractMaxBatchSize(response));
     }
 
-    /**
-     * One recv delivering a burst of small frames (the shape of a server's
-     * cumulative ACKs) must be parsed in place: compacting the unread tail
-     * after every frame memmoved the rest of the burst once per frame. The
-     * burst fills the 64 KiB buffer and ends mid-frame, so the next recv must
-     * compact that tail BEFORE the grow check -- a tail left at the buffer end
-     * would read as "full" and grow the buffer for no reason.
-     */
     @Test
     public void testFrameBurstIsParsedInPlace() throws Exception {
-        assertMemoryLeak(() -> {
-            final int frameLen = 13; // FIN|BINARY, len=11
-            final int frameCount = 5100; // > 64 KiB, so the first recv ends mid-frame
-            byte[] data = new byte[frameLen * frameCount];
-            for (int i = 0; i < frameCount; i++) {
-                data[i * frameLen] = (byte) 0x82;
-                data[i * frameLen + 1] = 11;
-                data[i * frameLen + 2] = (byte) i;
-                data[i * frameLen + 3] = (byte) (i >> 8);
-            }
-            try (FrameFeedWebSocketClient client = new FrameFeedWebSocketClient(data)) {
-                setUpgradedTrue(client);
-                final int bufSize = getIntField(client, "recvBufSize");
-                final long[] payload = {0, 0}; // first, last
-                final int[] frames = {0};
-                WebSocketFrameHandler handler = new WebSocketFrameHandler() {
-                    @Override
-                    public void onBinaryMessage(long payloadPtr, int payloadLen) {
-                        Assert.assertEquals(11, payloadLen);
-                        int tag = (Unsafe.getUnsafe().getByte(payloadPtr) & 0xFF)
-                                | (Unsafe.getUnsafe().getByte(payloadPtr + 1) & 0xFF) << 8;
-                        Assert.assertEquals(frames[0], tag);
-                        if (frames[0]++ == 0) {
-                            payload[0] = payloadPtr;
-                        }
-                        payload[1] = payloadPtr;
-                    }
+        assertFrameBurstIsParsedInPlace(false);
+    }
 
-                    @Override
-                    public void onClose(int code, String reason) {
-                        Assert.fail("unexpected close frame");
-                    }
-                };
-
-                int firstRecvFrames = bufSize / frameLen;
-                for (int i = 0; i < firstRecvFrames; i++) {
-                    Assert.assertTrue(client.tryReceiveFrame(handler));
-                    Assert.assertEquals("frame " + i + " must be parsed where recv put it",
-                            (long) i * frameLen, payload[1] - payload[0]);
-                }
-                for (int i = firstRecvFrames; i < frameCount; i++) {
-                    Assert.assertTrue(client.tryReceiveFrame(handler));
-                }
-                Assert.assertEquals(frameCount, frames[0]);
-                Assert.assertEquals("partial tail must not grow the recv buffer",
-                        bufSize, getIntField(client, "recvBufSize"));
-            }
-        });
+    @Test
+    public void testFrameBurstIsParsedInPlaceWithBlockingReceive() throws Exception {
+        assertFrameBurstIsParsedInPlace(true);
     }
 
     /**
@@ -544,6 +494,69 @@ public class WebSocketClientTest {
         });
     }
 
+    /**
+     * One recv delivering a burst of small frames (the shape of a server's
+     * cumulative ACKs) must be parsed in place: compacting the unread tail
+     * after every frame memmoved the rest of the burst once per frame. The
+     * burst fills the 64 KiB buffer and ends mid-frame, so the next recv must
+     * compact that tail BEFORE the grow check -- a tail left at the buffer end
+     * would read as "full" and grow the buffer for no reason.
+     */
+    private static void assertFrameBurstIsParsedInPlace(boolean blocking) throws Exception {
+        assertMemoryLeak(() -> {
+            final int frameLen = 13; // FIN|BINARY, len=11
+            final int frameCount = 5100; // > 64 KiB, so the first recv ends mid-frame
+            byte[] data = new byte[frameLen * frameCount];
+            for (int i = 0; i < frameCount; i++) {
+                data[i * frameLen] = (byte) 0x82;
+                data[i * frameLen + 1] = 11;
+                data[i * frameLen + 2] = (byte) i;
+                data[i * frameLen + 3] = (byte) (i >> 8);
+            }
+            try (FrameFeedWebSocketClient client = new FrameFeedWebSocketClient(data)) {
+                setUpgradedTrue(client);
+                final int bufSize = getIntField(client, "recvBufSize");
+                final long[] payload = {0, 0}; // first, last
+                final int[] frames = {0};
+                WebSocketFrameHandler handler = new WebSocketFrameHandler() {
+                    @Override
+                    public void onBinaryMessage(long payloadPtr, int payloadLen) {
+                        Assert.assertEquals(11, payloadLen);
+                        int tag = (Unsafe.getUnsafe().getByte(payloadPtr) & 0xFF)
+                                | (Unsafe.getUnsafe().getByte(payloadPtr + 1) & 0xFF) << 8;
+                        Assert.assertEquals(frames[0], tag);
+                        if (frames[0]++ == 0) {
+                            payload[0] = payloadPtr;
+                        }
+                        payload[1] = payloadPtr;
+                    }
+
+                    @Override
+                    public void onClose(int code, String reason) {
+                        Assert.fail("unexpected close frame");
+                    }
+                };
+
+                int firstRecvFrames = bufSize / frameLen;
+                for (int i = 0; i < firstRecvFrames; i++) {
+                    Assert.assertTrue(blocking
+                            ? client.receiveFrame(handler, 1000)
+                            : client.tryReceiveFrame(handler));
+                    Assert.assertEquals("frame " + i + " must be parsed where recv put it",
+                            (long) i * frameLen, payload[1] - payload[0]);
+                }
+                for (int i = firstRecvFrames; i < frameCount; i++) {
+                    Assert.assertTrue(blocking
+                            ? client.receiveFrame(handler, 1000)
+                            : client.tryReceiveFrame(handler));
+                }
+                Assert.assertEquals(frameCount, frames[0]);
+                Assert.assertEquals("partial tail must not grow the recv buffer",
+                        bufSize, getIntField(client, "recvBufSize"));
+            }
+        });
+    }
+
     private static void assertSendBinaryWriteWaits(CapturingSocket socket, int expectedWriteWaits) throws Exception {
         long payload = Unsafe.malloc(7, MemoryTag.NATIVE_DEFAULT);
         try (CapturingWebSocketClient client = new CapturingWebSocketClient(socket)) {
@@ -773,8 +786,8 @@ public class WebSocketClientTest {
 
     /**
      * WebSocketClient over a socket pre-loaded with canned server frames;
-     * sends always succeed. Used to drive a real tryReceiveFrame ->
-     * tryParseFrame -> handler dispatch on the test thread.
+     * sends always succeed. Drives both receive APIs through real parsing
+     * and handler dispatch on the test thread.
      */
     private static class FrameFeedWebSocketClient extends TestWebSocketClient {
 
