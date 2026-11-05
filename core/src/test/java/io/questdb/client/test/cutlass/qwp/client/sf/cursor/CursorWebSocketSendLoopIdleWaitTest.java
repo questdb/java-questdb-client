@@ -516,13 +516,6 @@ public class CursorWebSocketSendLoopIdleWaitTest {
             getSendBuffer().reset();
         }
 
-        // The one-frame-per-write path: one frame, one write.
-        @Override
-        public void sendBinary(long dataPtr, int length) {
-            batchAppendBinary(dataPtr, length);
-            batchFlush();
-        }
-
         @Override
         public void sendPing() {
             pingAttempts.incrementAndGet();
