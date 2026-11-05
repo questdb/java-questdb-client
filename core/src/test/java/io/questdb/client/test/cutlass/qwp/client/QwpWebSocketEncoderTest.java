@@ -1424,6 +1424,34 @@ public class QwpWebSocketEncoderTest {
     }
 
     @Test
+    public void testTableHeaderMatchesTheWireLayout() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 QwpTableBuffer buffer = new QwpTableBuffer("trades")) {
+                for (int i = 0; i < 300; i++) {
+                    buffer.getOrCreateColumn("price", TYPE_DOUBLE, false).addDouble(i);
+                    buffer.getOrCreateColumn("qty", TYPE_LONG, false).addLong(i);
+                    buffer.nextRow();
+                }
+
+                encoder.encode(buffer);
+
+                byte[] expected = {
+                        6, 't', 'r', 'a', 'd', 'e', 's',
+                        (byte) 0xAC, 0x02,
+                        2,
+                        5, 'p', 'r', 'i', 'c', 'e', TYPE_DOUBLE,
+                        3, 'q', 't', 'y', TYPE_LONG
+                };
+                long ptr = encoder.getBuffer().getBufferPtr();
+                for (int i = 0; i < expected.length; i++) {
+                    Assert.assertEquals("byte " + i, expected[i], Unsafe.getUnsafe().getByte(ptr + 12 + i));
+                }
+            }
+        });
+    }
+
+    @Test
     public void testVersionByteInHeader() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
