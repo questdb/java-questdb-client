@@ -279,10 +279,6 @@ public class DurableAckIntegrationTest {
 
     @Test
     public void testEndToEndBothTiersLocalAckIsProgressOnly() throws Exception {
-        // request_durable_ack=local,replicated: the replicated ack is the trim
-        // trigger; local acks surface early per-table progress without popping
-        // anything. The loop's counters and the per-table local watermark are
-        // the observable surface for that split.
         TestUtils.assertMemoryLeak(() -> {
             DurableAckCapableHandler handler = new DurableAckCapableHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(handler, true)) {
@@ -293,42 +289,35 @@ public class DurableAckIntegrationTest {
                 String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
                         + ";request_durable_ack=local,replicated;close_flush_timeout_millis=5000;";
                 try (Sender sender = Sender.fromConfig(config)) {
-                    for (int i = 0; i < 10; i++) {
-                        sender.table("trades").longColumn("v", i).atNow();
-                    }
-                    sender.flush(); // one batch -> one OK
+                    sender.table("trades").longColumn("v", 1L).atNow();
+                    sender.flush();
                     handler.awaitOkBatches(1);
-                    long batches = 1;
 
                     CursorWebSocketSendLoop loop =
                             ((QwpWebSocketSender) sender).cursorSendLoopForTest();
                     Assert.assertNotNull(loop);
 
-                    // Release local acks covering everything OK'd, then nudge
-                    // the connection with extra rows until the I/O thread has
-                    // observed one -- the local ack alone must not trim.
                     handler.emitLocalDurableAckForAll();
-                    long deadline = System.currentTimeMillis() + 5000;
-                    while (loop.getTotalLocalDurableAcks() == 0
-                            && System.currentTimeMillis() < deadline) {
-                        sender.table("trades").longColumn("v", -1L).atNow();
+                    try {
+                        // The follow-up OK publishes the preceding local ACK's updates.
+                        // No more local ACKs are sent before reading the watermark.
+                        sender.table("trades").longColumn("v", 2L).atNow();
                         sender.flush();
-                        batches++;
-                        Thread.sleep(10);
+                        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                        while (loop.getTotalAcks() < 2 && System.nanoTime() < deadline) {
+                            Thread.sleep(10);
+                        }
+                        Assert.assertEquals("follow-up OK not observed", 2L, loop.getTotalAcks());
+                        Assert.assertEquals("local ack not observed", 1L, loop.getTotalLocalDurableAcks());
+                        Assert.assertEquals("local watermark tracks the first batch's fsync frontier",
+                                0L, loop.getLocalDurableTableWatermark("trades"));
+                        Assert.assertEquals(
+                                "local acks must not advance trim when replicated is requested",
+                                0L, loop.getTotalDurableTrimAdvances());
+                        Assert.assertEquals("neither batch is replicated yet", -1L, sender.getAckedFsn());
+                    } finally {
+                        handler.emitDurableAckForAll();
                     }
-                    Assert.assertTrue("local ack never observed",
-                            loop.getTotalLocalDurableAcks() > 0);
-                    Assert.assertTrue("local watermark tracks the fsync frontier",
-                            loop.getLocalDurableTableWatermark("trades") >= 0);
-                    Assert.assertEquals(
-                            "local acks must not advance trim when replicated is requested",
-                            0L, loop.getTotalDurableTrimAdvances());
-
-                    // Cover every batch sent (nudges included) with a
-                    // replicated ack so close() drains on the actual trim
-                    // trigger.
-                    handler.awaitOkBatches(batches);
-                    handler.emitDurableAckForAll();
                 }
             }
         });

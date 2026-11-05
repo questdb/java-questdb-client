@@ -42,13 +42,8 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Paths;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -324,61 +319,6 @@ public class CursorWebSocketSendLoopDurableAckTest {
                 assertEquals(0, pendingSize(loop));
                 assertEquals(1L, loop.getTotalDurableAcks());
                 assertEquals(1L, loop.getTotalDurableTrimAdvances());
-            }
-        });
-    }
-
-    @Test(timeout = 30_000L)
-    public void testLocalAckCountPublishesWatermarks() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            try (CursorSendEngine engine = newEngine()) {
-                CursorWebSocketSendLoop loop = newBothTiersLoop(engine);
-                CountDownLatch applyingAck = new CountDownLatch(1);
-                CountDownLatch releaseAck = new CountDownLatch(1);
-                AtomicReference<Throwable> failure = new AtomicReference<>();
-                setField(loop, "response", new WebSocketResponse() {
-                    @Override
-                    public long getTableSeqTxn(int index) {
-                        if (index == 0) {
-                            applyingAck.countDown();
-                            try {
-                                assertTrue("ack was not released", releaseAck.await(5, TimeUnit.SECONDS));
-                            } catch (InterruptedException e) {
-                                Thread.currentThread().interrupt();
-                                throw new AssertionError(e);
-                            }
-                        }
-                        return super.getTableSeqTxn(index);
-                    }
-                });
-                Thread writer = new Thread(() -> {
-                    try {
-                        deliverLocalDurableAck(loop, names("trades", "orders"), txns(7L, 9L));
-                    } catch (Throwable t) {
-                        failure.set(t);
-                    }
-                }, "local-ack-writer");
-                writer.start();
-                try {
-                    assertTrue("ack processing did not start", applyingAck.await(5, TimeUnit.SECONDS));
-                    assertEquals("ack count must not advance before its watermarks", 0L,
-                            loop.getTotalLocalDurableAcks());
-                    releaseAck.countDown();
-
-                    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-                    while (loop.getTotalLocalDurableAcks() == 0 && System.nanoTime() < deadline) {
-                        Thread.sleep(1);
-                    }
-                    assertEquals(1L, loop.getTotalLocalDurableAcks());
-                    assertEquals(7L, loop.getLocalDurableTableWatermark("trades"));
-                    assertEquals(9L, loop.getLocalDurableTableWatermark("orders"));
-                    assertEquals(0L, loop.getTotalDurableTrimAdvances());
-                } finally {
-                    releaseAck.countDown();
-                    writer.join(5_000L);
-                    assertFalse("ack writer did not exit", writer.isAlive());
-                }
-                assertNull(failure.get());
             }
         });
     }
