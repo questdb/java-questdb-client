@@ -1107,7 +1107,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
      * varints. deltaStart 0 is the self-sufficient full-dict frame a degraded producer
      * ships; deltaStart > 0 is a delta frame that depends on the ids below it.
      */
-    private static void appendDeltaDictFrame(CursorSendEngine engine, int deltaStart, char... symbols) {
+    static void appendDeltaDictFrame(CursorSendEngine engine, int deltaStart, char... symbols) {
         int size = QwpConstants.HEADER_SIZE + 2 + symbols.length * 2;
         long buf = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
         try {
@@ -1682,7 +1682,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         }
 
         @Override
-        public void sendBinary(long dataPtr, int length) {
+        public void batchAppendBinary(long dataPtr, int length) {
             recordSend();
             capture(dataPtr, length, 0L, 0);
         }

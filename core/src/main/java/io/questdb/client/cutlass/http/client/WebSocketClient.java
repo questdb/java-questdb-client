@@ -241,6 +241,42 @@ public abstract class WebSocketClient implements QuietCloseable {
         }
     }
 
+    /**
+     * Appends one binary frame to the send batch, back to back with any frame
+     * already appended. Nothing reaches the wire until {@link #batchFlush()}.
+     * Grows the send buffer if the frame does not fit; a caller bounding the
+     * batch checks {@link #batchByteCap()} first. The batch shares the send
+     * buffer with {@link #sendBinary}, so do not interleave the two.
+     */
+    public void batchAppendBinary(long dataPtr, int length) {
+        checkConnected();
+        sendBuffer.appendMaskedBinaryFrame(dataPtr, length);
+    }
+
+    /**
+     * Byte budget for one send batch: the default send buffer size, fixed for
+     * the connection. It does not follow the buffer's capacity, which only
+     * grows, so one large frame cannot widen every later batch.
+     */
+    public int batchByteCap() {
+        return DEFAULT_SEND_BUFFER_SIZE;
+    }
+
+    /**
+     * Writes every frame appended since the last flush with one send. No-op
+     * when nothing was appended. The batch is empty afterwards, even on failure.
+     */
+    public void batchFlush() {
+        int len = sendBuffer.getWritePos();
+        if (len > 0) {
+            try {
+                doSend(sendBuffer.getBufferPtr(), len, defaultTimeout);
+            } finally {
+                sendBuffer.reset();
+            }
+        }
+    }
+
     @Override
     public void close() {
         // CAS gate: exactly one closer runs the teardown below. Closers can be
@@ -483,6 +519,7 @@ public abstract class WebSocketClient implements QuietCloseable {
             }
 
             // Ensure buffer has space
+            compactRecvBuffer();
             if (recvPos >= recvBufSize - 1024) {
                 growRecvBuffer();
             }
@@ -668,6 +705,7 @@ public abstract class WebSocketClient implements QuietCloseable {
         }
 
         // Try one non-blocking recv
+        compactRecvBuffer();
         if (recvPos >= recvBufSize - 1024) {
             growRecvBuffer();
         }
@@ -1145,18 +1183,23 @@ public abstract class WebSocketClient implements QuietCloseable {
     private void doSend(long ptr, int len, int timeout) {
         long startTime = System.nanoTime();
         recvDrained = false;
+        // Send first, poll only on backpressure (mirrors recvOrDie): the
+        // socket is non-blocking, and a pre-send ioWait would cost an
+        // epoll_ctl + epoll_wait per frame even when it is writable.
         while (len > 0) {
-            int remainingTimeout = getRemainingTimeOrThrow(timeout, startTime);
-            ioWait(remainingTimeout, IOOperation.WRITE);
             int sent = dieIfNegative(socket.send(ptr, len));
             while (socket.wantsTlsWrite()) {
-                remainingTimeout = getRemainingTimeOrThrow(timeout, startTime);
+                int remainingTimeout = getRemainingTimeOrThrow(timeout, startTime);
                 ioWait(remainingTimeout, IOOperation.WRITE);
                 dieIfNegative(socket.tlsIO(Socket.WRITE_FLAG));
             }
             if (sent > 0) {
                 ptr += sent;
                 len -= sent;
+            } else {
+                // send returned ERETRY (0): socket full, park until writable
+                int remainingTimeout = getRemainingTimeOrThrow(timeout, startTime);
+                ioWait(remainingTimeout, IOOperation.WRITE);
             }
         }
     }
@@ -1414,8 +1457,13 @@ public abstract class WebSocketClient implements QuietCloseable {
             // Advance read position
             recvReadPos += consumed;
 
-            // Compact buffer if needed
-            compactRecvBuffer();
+            // Rewind once drained; a partial tail stays put until the next
+            // recv compacts it. Compacting here, per frame, memmoved the rest
+            // of a burst once per frame: quadratic in the burst.
+            if (recvReadPos == recvPos) {
+                recvReadPos = 0;
+                recvPos = 0;
+            }
 
             return PARSE_OK;
         }

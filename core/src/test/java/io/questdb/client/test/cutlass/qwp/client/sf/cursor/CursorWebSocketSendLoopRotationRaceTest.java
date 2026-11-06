@@ -33,7 +33,9 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentBudget;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SfManifest;
 import io.questdb.client.network.PlainSocketFactory;
+import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.tools.TestUtils;
@@ -41,8 +43,8 @@ import org.junit.Assert;
 import org.junit.Test;
 
 /**
- * Probabilistic regression test for the send-loop rotation race fixed in
- * {@code CursorWebSocketSendLoop.trySendOne()} (PR #41): the loop could observe
+ * Regression tests for segment handoffs. The live-rotation test covers the race fixed in
+ * {@code CursorWebSocketSendLoop.trySendBatch()} (PR #41): the loop could observe
  * a segment rotation without observing the final frame published into that
  * segment, and advance past it — silently dropping the frame.
  * <p>
@@ -85,7 +87,7 @@ public class CursorWebSocketSendLoopRotationRaceTest {
             SegmentManager manager = new SegmentManager(
                     SEGMENT_BYTES, new SegmentBudget(SegmentManager.UNLIMITED_TOTAL_BYTES));
             manager.start();
-            // sfDir == null => memory-only segments (no files/fds); same trySendOne() path.
+            // sfDir == null => memory-only segments (no files/fds); same trySendBatch() path.
             CursorSendEngine engine = new CursorSendEngine(null, SEGMENT_BYTES, manager);
             RecordingClient client = new RecordingClient(n);
             CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
@@ -119,6 +121,44 @@ public class CursorWebSocketSendLoopRotationRaceTest {
 
             // The I/O thread is joined, so its writes to recorded[] are visible here.
             assertContiguous(client, n);
+            Assert.assertEquals(n, loop.getTotalFramesSent());
+        });
+    }
+
+    @Test
+    public void testRecoveredSealedSegmentsFlushBeforeEmptyActive() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final int sealedSegments = 3;
+            final int framesPerSegment = 20;
+            final int frames = sealedSegments * framesPerSegment;
+            String sfDir = TestUtils.createTmpDir("qdb-recovered-batch-");
+            try {
+                writeRecoveredSegments(sfDir, sealedSegments, framesPerSegment);
+                try (CursorSendEngine engine = new CursorSendEngine(sfDir, SEGMENT_BYTES);
+                     RecordingClient client = new RecordingClient(frames);
+                     CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
+                             client, engine, 0L, null, 0L, 0L)) {
+                    Assert.assertTrue(engine.wasRecoveredFromDisk());
+                    Assert.assertEquals(frames - 1, engine.publishedFsn());
+                    Assert.assertEquals(frames, engine.activeSegment().baseSeq());
+                    Assert.assertEquals(MmapSegment.HEADER_SIZE, engine.activeSegment().publishedOffset());
+                    loop.setRunningForTest(true);
+                    loop.positionCursorForStartForTest();
+
+                    // Each sealed segment needs a send pass and an advance pass.
+                    // No producer publishes into the empty active to trigger a later flush.
+                    for (int i = 0; i < 2 * sealedSegments + 1; i++) {
+                        loop.trySendBatchForTest();
+                        loop.checkError();
+                    }
+
+                    assertContiguous(client, frames);
+                    Assert.assertEquals(frames, loop.getTotalFramesSent());
+                    Assert.assertFalse(loop.trySendBatchForTest());
+                }
+            } finally {
+                TestUtils.removeTmpDirRec(sfDir);
+            }
         });
     }
 
@@ -126,25 +166,48 @@ public class CursorWebSocketSendLoopRotationRaceTest {
         int count = client.recordedCount;
         for (int i = 0; i < count; i++) {
             if (client.recorded[i] != i) {
-                Assert.fail("rotation race reordered/dropped a frame — "
+                Assert.fail("send loop reordered/dropped a frame — "
                         + "fsn " + i + " on the wire was " + client.recorded[i]);
             }
         }
         if (count != expected) {
-            Assert.fail("rotation race dropped a frame — expected " + expected
+            Assert.fail("send loop dropped a frame — expected " + expected
                     + " frames on the wire, got " + count);
         }
     }
 
+    private static void writeRecoveredSegments(String sfDir, int sealedSegments, int framesPerSegment) {
+        long payload = Unsafe.malloc(PAYLOAD_LEN, MemoryTag.NATIVE_DEFAULT);
+        try {
+            for (int s = 0; s <= sealedSegments; s++) {
+                String name = s == 0 ? "sf-initial.sfa" : String.format("sf-%016x.sfa", s);
+                long baseFsn = (long) s * framesPerSegment;
+                try (MmapSegment segment = MmapSegment.create(sfDir + "/" + name, baseFsn, SEGMENT_BYTES)) {
+                    // The last segment is the empty active left by a crash after rotation.
+                    if (s < sealedSegments) {
+                        for (int i = 0; i < framesPerSegment; i++) {
+                            Unsafe.getUnsafe().putLong(payload, baseFsn + i);
+                            Assert.assertTrue(segment.tryAppend(payload, PAYLOAD_LEN) >= 0);
+                        }
+                    }
+                }
+            }
+            SfManifest.create(FilesFacade.INSTANCE, sfDir, 0, (long) sealedSegments * framesPerSegment).close();
+        } finally {
+            Unsafe.free(payload, PAYLOAD_LEN, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
     /**
-     * In-memory transport, and nothing more: {@code sendBinary} captures the fsn
-     * carried by each frame the loop ships. The other callbacks are inert — this
+     * In-memory transport: {@code batchAppendBinary} buffers each fsn and
+     * {@code batchFlush} publishes the delivered count. The other callbacks are inert — this
      * test never receives ACKs and never reconnects. Only {@code sentCount} is
      * read cross-thread (by the test, for progress) and so is volatile.
      */
     private static final class RecordingClient extends TestWebSocketClient {
         final long[] recorded;
         volatile long sentCount;
+        private int appendedCount;
         private int recordedCount;
 
         RecordingClient(int capacity) {
@@ -153,10 +216,14 @@ public class CursorWebSocketSendLoopRotationRaceTest {
         }
 
         @Override
-        public void sendBinary(long dataPtr, int length) {
-            if (recordedCount < recorded.length) {
-                recorded[recordedCount++] = Unsafe.getUnsafe().getLong(dataPtr);
-            }
+        public void batchAppendBinary(long dataPtr, int length) {
+            Assert.assertTrue("more frames than expected", appendedCount < recorded.length);
+            recorded[appendedCount++] = Unsafe.getUnsafe().getLong(dataPtr);
+        }
+
+        @Override
+        public void batchFlush() {
+            recordedCount = appendedCount;
             sentCount = recordedCount;
         }
 

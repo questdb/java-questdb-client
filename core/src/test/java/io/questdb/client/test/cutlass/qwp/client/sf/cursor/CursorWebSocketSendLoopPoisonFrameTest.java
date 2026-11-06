@@ -893,7 +893,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
         }
 
         @Override
-        public void sendBinary(long dataPtr, int length) {
+        public void batchAppendBinary(long dataPtr, int length) {
             sentCount++;
         }
 
@@ -940,7 +940,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
         }
 
         @Override
-        public void sendBinary(long dataPtr, int length) {
+        public void batchAppendBinary(long dataPtr, int length) {
             sentCount++;
         }
 
@@ -978,7 +978,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
         }
 
         @Override
-        public void sendBinary(long dataPtr, int length) {
+        public void batchAppendBinary(long dataPtr, int length) {
         }
 
         @Override
@@ -1016,7 +1016,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
         }
 
         @Override
-        public void sendBinary(long dataPtr, int length) {
+        public void batchAppendBinary(long dataPtr, int length) {
         }
 
         @Override

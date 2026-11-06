@@ -42,6 +42,7 @@ import io.questdb.client.cutlass.qwp.client.QwpVersionMismatchException;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
+import io.questdb.client.cutlass.qwp.websocket.WebSocketFrameWriter;
 import io.questdb.client.std.CharSequenceLongHashMap;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.QuietCloseable;
@@ -367,7 +368,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // ALWAYS active -- in memory mode, in disk mode, and (critically) even when the
     // per-slot persisted dictionary failed to open. sentDictCount is this loop's model
     // of how many ids the CURRENT server has been told about, and the torn-dict guard
-    // in trySendOne reads it, so it must track the wire in every mode; gating it on
+    // in trySendBatch reads it, so it must track the wire in every mode; gating it on
     // engine.isDeltaDictEnabled() is what once froze it at 0 and terminal'd a slot
     // whose frames replay perfectly from id 0 (see the constructor). On a recovered /
     // orphan-drained slot the constructor SEEDS sentDict* from the persisted
@@ -434,8 +435,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // the upgrade + catch-up then closes) would be mistaken for a deterministic
     // head-frame rejection and escalate to a PROTOCOL_VIOLATION terminal -- breaking
     // the store-and-forward "retry a transient outage forever" contract. Reset per
-    // connection in setWireBaselineWithCatchUp; set in trySendOne after a successful
-    // send.
+    // connection in setWireBaselineWithCatchUp; set in trySendBatch when a data frame
+    // joins the batch (the flush follows in the same call; a failed flush recycles).
     private boolean dataFrameSentThisConnection;
     private volatile WebSocketClient client;
     // Optional: when non-null, every server-rejection error (retriable and
@@ -559,7 +560,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // rethrows always deliver the same instance.
     private volatile LineSenderException terminalError;
     // Wall clock of the last outbound activity on the wire -- a sent frame
-    // (trySendOne) or a keepalive PING (sendPingIfDue).
+    // (trySendBatch) or a keepalive PING (sendPingIfDue).
     // Throttles the keepalive PINGs so they fire only when the
     // configured interval has elapsed since the most recent outbound event.
     // Set when the I/O loop starts.
@@ -575,7 +576,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // value confirms replay is working; a sustained nonzero rate means
     // the connection is flapping and replay is doing real work each cycle.
     // Snapshotted when an established connection enters reconnect; cleared
-    // back to -1 once trySendOne has caught up past it. Used to count replay
+    // back to -1 once trySendBatch has caught up past it. Used to count replay
     // frames without a per-frame branch on the steady-state path.
     private long replayTargetFsn = -1L;
     // Recovered orphaned deferred tail: frames [orphanSkipStartFsn ..
@@ -583,7 +584,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // -- a transaction whose commit was never published (producer crashed or
     // closed mid-transaction). They must never reach the wire: a
     // commit-bearing frame from THIS session would commit them server-side
-    // and resurrect a partial transaction. trySendOne stops the cursor at the
+    // and resurrect a partial transaction. trySendBatch stops the cursor at the
     // tail; tryRetireOrphanTail retires it with a cumulative self-acknowledge
     // once everything below is server-acked. -1 when none/retired. Written by
     // the constructor and start() (user thread, before the I/O thread exists)
@@ -1681,7 +1682,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * Cumulative count of frames re-sent during post-reconnect catch-up
      * windows. One increment per replayed frame. Zero in steady state; a
      * sustained nonzero rate signals flapping where every reconnect replays
-     * meaningful work.
+     * meaningful work. Failed batch flushes neither increase this count nor
+     * establish a replay boundary, even if some bytes were written.
      */
     public long getTotalFramesReplayed() {
         return counters.framesReplayed.get();
@@ -2760,15 +2762,15 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // Snapshot before the send attempt: a publish after this point is
                 // caught by the re-check below, so the idle decision cannot race it.
                 long publishedBeforeWork = engine.publishStamp();
-                boolean didWork = trySendOne();
+                boolean didWork = trySendBatch();
                 // 1. Try to send next frame(s).
                 // 2. Try to receive ACKs.
                 if (tryReceiveAcks()) {
                     didWork = true;
                 }
-                // A reconnect anywhere in this iteration (inside trySendOne,
+                // A reconnect anywhere in this iteration (inside trySendBatch,
                 // tryReceiveAcks or a previous awaitIdle) repositioned the cursor:
-                // go straight back to trySendOne instead of blocking.
+                // go straight back to trySendBatch instead of blocking.
                 if (recycledThisIteration) {
                     recycledThisIteration = false;
                     didWork = true;
@@ -2794,7 +2796,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 //    setIoWakeup), close() rings it, or the next PING is due.
                 //    No spinning: an idle connection costs zero CPU. A PING that
                 //    failed in 3/4 reconnected and rewound the cursor, which set
-                //    recycledThisIteration again: go back to trySendOne instead.
+                //    recycledThisIteration again: go back to trySendBatch instead.
                 if (!didWork && running && !recycledThisIteration) {
                     ioParked = true;
                     try {
@@ -2914,7 +2916,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             // barrier. If it saw the new frame bytes, the frameCount write that
             // makes targetFsn discoverable is also visible, so a second lookup
             // must now find it. If the producer publishes later, sendOffset is
-            // still at the old tip and trySendOne() will send the frame normally.
+            // still at the old tip and trySendBatch() will send the frame normally.
             seg = engine.pinSegmentContaining(targetFsn);
             if (seg != null) {
                 positionCursorInSegment(seg, targetFsn);
@@ -3108,11 +3110,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
 
     /**
      * Freezes the highest FSN that completed a send on the connection which
-     * just failed. Frames published before the first connection, or while a
-     * reconnect is in progress, have not been sent and therefore do not belong
-     * to the replay metric. Keep an older, higher target when another failure
-     * interrupts catch-up so the remaining frames still count as re-sends on
-     * the following connection.
+     * just failed. A batch counts only when its entire flush succeeds, even
+     * if a failed flush wrote some bytes. Frames published before the first
+     * connection, or while a reconnect is in progress, have not been sent and
+     * therefore do not belong to the replay metric. Keep an older, higher
+     * target when another failure interrupts catch-up so the remaining frames
+     * still count as re-sends on the following connection.
      */
     private void snapshotReplayTarget() {
         if (hasEverConnected && nextWireSeq > 0L) {
@@ -3127,7 +3130,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * Reset wire state for a fresh connection: install the new client,
      * realign {@code fsnAtZero} to the next unacked FSN, restart wire
      * sequencing from 0, and reposition the cursor so the next
-     * {@link #trySendOne} call replays the first unacked frame.
+     * {@link #trySendBatch} call replays the first unacked frame.
      */
     private void swapClient(WebSocketClient newClient) {
         WebSocketClient old = this.client;
@@ -3270,7 +3273,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // The mirror holds ids [0, sentDictCount). Accumulate ONLY the part of this
         // frame's delta [deltaStart, deltaStart+deltaCount) that extends past the
         // tip -- ids [sentDictCount, deltaStart+deltaCount). Cases:
-        //   - deltaStart > sentDictCount: a gap. trySendOne's torn-dictionary guard
+        //   - deltaStart > sentDictCount: a gap. trySendBatch's torn-dictionary guard
         //     rejects it before send, so it never reaches here; bail defensively
         //     rather than accumulate past a hole.
         //   - deltaEnd <= sentDictCount: a pure replay/overlap we already hold --
@@ -3339,10 +3342,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             return;
         }
         if (required > MAX_SENT_DICT_BYTES) {
-            // Latch a terminal, do NOT just throw: accumulateSentDict runs AFTER
-            // the frame's sendBinary, so a bare throw unwinds to ioLoop -> fail()
-            // -> connectLoop, which (running still true) reconnects and replays the
-            // same frame, which re-overflows the never-shrinking mirror -- an
+            // Latch a terminal, do NOT just throw: accumulateSentDict runs after
+            // batchAppendBinary, before batchFlush. A bare throw unwinds to
+            // ioLoop -> fail() -> connectLoop, which (running still true) reconnects
+            // and retries the same frame, re-overflowing the never-shrinking mirror -- an
             // unbounded reconnect livelock rather than the "fails loudly" the
             // MAX_SENT_DICT_BYTES ceiling promises. recordFatal flips running=false
             // so connectLoop's !running guard winds the loop down and checkError()
@@ -3375,13 +3378,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 sentDictBytesOwned = true;
             }
         } catch (Throwable t) {
-            // Latch for exactly the reason the MAX_SENT_DICT_BYTES arm above does, and it
-            // was asymmetric until now: accumulateSentDict runs AFTER the frame's
-            // sendBinary, so a bare throw unwinds to ioLoop -> fail() -> connectLoop,
-            // which (running still true) reconnects and replays the same frame, which
-            // re-attempts the same allocation. A genuine out-of-memory therefore became an
-            // unbounded reconnect livelock instead of the loud failure the ceiling arm
-            // promises. recordFatal flips running=false so connectLoop winds down and
+            // Latch for the same reason as the MAX_SENT_DICT_BYTES arm above:
+            // accumulateSentDict runs after batchAppendBinary, before batchFlush.
+            // A bare throw unwinds to ioLoop -> fail() -> connectLoop, which
+            // (running still true) reconnects and retries the same allocation.
+            // recordFatal flips running=false so connectLoop winds down and
             // checkError() surfaces it; the throw still unwinds past the pending copy.
             recordFatal(t);
             throw t;
@@ -3834,8 +3835,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     @TestOnly
-    public boolean trySendOneForTest() {
-        return trySendOne();
+    public boolean trySendBatchForTest() {
+        return trySendBatch();
     }
 
     private void ensureCatchUpFrameCapacity(int required) {
@@ -3877,157 +3878,215 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
 
     /**
      * Returns true if at least one frame was sent (caller skips the park).
-     * Bounded: sends at most one frame per call so the ACK side gets
-     * scheduling fairness.
+     * Sends every fully published frame of the current segment in one write,
+     * up to the client's fixed batch byte cap (the default send buffer size,
+     * not the buffer's live capacity), so the ACK side still gets a turn every
+     * cap's worth of bytes and the buffer never grows mid-batch (a single
+     * frame larger than the cap goes alone and grows the buffer).
+     * <p>
+     * Every per-frame check runs per frame, in the old order. A frame that is
+     * not a plain send (orphan tail, corrupt length, torn dictionary, segment
+     * hand-off) ends a non-empty batch BEFORE it: the batch is flushed and the
+     * next call meets that frame with an empty batch, exactly as the
+     * one-frame-per-call path did after its previous frame went out.
      */
-    private boolean trySendOne() {
-        if (orphanSkipTipFsn >= 0 && fsnAtZero + nextWireSeq >= orphanSkipStartFsn) {
-            // The send cursor reached the orphaned deferred tail. Its frames
-            // belong to an aborted transaction and must never be transmitted
-            // (a commit-bearing frame from this session would commit them --
-            // partial-transaction resurrection).
-            if (!tryRetireOrphanTail()) {
-                // Frames below the tail still await server acks; keep ticking
-                // (tryReceiveAcks runs every loop iteration) until the ack
-                // watermark reaches the tail's lower edge.
-                return false;
-            }
-            if (nextWireSeq == 0) {
-                // Reached only when the tail was NOT retirable at connection setup --
-                // both setup sites (swapClient, positionCursorForStart) call
-                // tryRetireOrphanTail first -- which means frames below it still needed
-                // acks, which means they were SENT on this connection. So nextWireSeq is
-                // never 0 here in practice and this arm is effectively dead; it is kept
-                // as a cheap correctness guard rather than removed.
-                //
-                // NB the mapping is untouched only while NO wire sequence has been
-                // consumed. A dictionary catch-up consumes sequences 0..n-1 before any
-                // data frame, so after one this test is false and the recycle below --
-                // which re-anchors the mapping from scratch -- is the correct path, not
-                // an avoidable cost.
-                try {
-                    positionCursorForStart();
-                } catch (CatchUpSendException e) {
-                    // Re-anchor's catch-up send failed. fail() here is a fresh,
-                    // non-re-entrant connectLoop entry from the I/O loop body --
-                    // the same recovery a normal trySendOne send failure takes.
-                    // Preserve the wrapper on a cap gap so connectLoop's
-                    // isCatchUpCapGap keeps the orphan settle episode (attempt count
-                    // + dwell anchor) alive across the re-anchor recycle; an ordinary
-                    // failure unwraps to the raw cause and restarts the episode, like
-                    // any normal send failure.
-                    fail(isCatchUpCapGap(e) ? e : e.getCause());
+    private boolean trySendBatch() {
+        // Appending advances these speculatively; reconnect must snapshot only
+        // completed flushes and retain any older replay target after a failure.
+        final long batchStartWireSeq = nextWireSeq;
+        final long batchStartReplayTargetFsn = replayTargetFsn;
+        int batchFrames = 0;
+        int batchReplayed = 0;
+        long batchBytes = 0;
+        while (true) {
+            if (orphanSkipTipFsn >= 0 && fsnAtZero + nextWireSeq >= orphanSkipStartFsn) {
+                if (batchFrames > 0) {
+                    break;
+                }
+                // The send cursor reached the orphaned deferred tail. Its frames
+                // belong to an aborted transaction and must never be transmitted
+                // (a commit-bearing frame from this session would commit them --
+                // partial-transaction resurrection).
+                if (!tryRetireOrphanTail()) {
+                    // Frames below the tail still await server acks; keep ticking
+                    // (tryReceiveAcks runs every loop iteration) until the ack
+                    // watermark reaches the tail's lower edge.
                     return false;
                 }
-                return true;
-            }
-            // Frames were already sent on this connection: the linear
-            // fsnAtZero + wireSeq mapping cannot express the gap the retired
-            // tail leaves behind. Recycle; swapClient re-anchors the mapping
-            // at ackedFsn + 1 = the first frame past the tail. One reconnect,
-            // once per recovery -- and only on the slow path (unacked
-            // committed frames existed below the tail).
-            fail(new LineSenderException(
-                    "recycling connection after retiring orphaned deferred tail (wire-seq realignment)"));
-            return false;
-        }
-        long pub = sendingSegment.publishedOffset();
-        if (sendOffset >= pub) {
-            // Nothing more in the current segment. If it's a sealed segment
-            // (no longer the live active), advance to the next one.
-            if (sendingSegment != engine.activeSegment()) {
-                // The producer can publish the current segment's last frame
-                // between our first publishedOffset() read and the active
-                // segment check above. Re-read before leaving the segment, or
-                // that frame is skipped permanently.
-                pub = sendingSegment.publishedOffset();
-                if (sendOffset >= pub) {
-                    MmapSegment next = advanceSegment();
-                    if (next != sendingSegment) {
-                        sendingSegment = next;
-                        return true; // let the next iteration try sending
+                if (nextWireSeq == 0) {
+                    // Reached only when the tail was NOT retirable at connection setup --
+                    // both setup sites (swapClient, positionCursorForStart) call
+                    // tryRetireOrphanTail first -- which means frames below it still needed
+                    // acks, which means they were SENT on this connection. So nextWireSeq is
+                    // never 0 here in practice and this arm is effectively dead; it is kept
+                    // as a cheap correctness guard rather than removed.
+                    //
+                    // NB the mapping is untouched only while NO wire sequence has been
+                    // consumed. A dictionary catch-up consumes sequences 0..n-1 before any
+                    // data frame, so after one this test is false and the recycle below --
+                    // which re-anchors the mapping from scratch -- is the correct path, not
+                    // an avoidable cost.
+                    try {
+                        positionCursorForStart();
+                    } catch (CatchUpSendException e) {
+                        // Re-anchor's catch-up send failed. fail() here is a fresh,
+                        // non-re-entrant connectLoop entry from the I/O loop body --
+                        // the same recovery a normal trySendBatch send failure takes.
+                        // Preserve the wrapper on a cap gap so connectLoop's
+                        // isCatchUpCapGap keeps the orphan settle episode (attempt count
+                        // + dwell anchor) alive across the re-anchor recycle; an ordinary
+                        // failure unwraps to the raw cause and restarts the episode, like
+                        // any normal send failure.
+                        fail(isCatchUpCapGap(e) ? e : e.getCause());
+                        return false;
                     }
+                    return true;
                 }
-            } else {
+                // Frames were already sent on this connection: the linear
+                // fsnAtZero + wireSeq mapping cannot express the gap the retired
+                // tail leaves behind. Recycle; swapClient re-anchors the mapping
+                // at ackedFsn + 1 = the first frame past the tail. One reconnect,
+                // once per recovery -- and only on the slow path (unacked
+                // committed frames existed below the tail).
+                fail(new LineSenderException(
+                        "recycling connection after retiring orphaned deferred tail (wire-seq realignment)"));
                 return false;
             }
+            long pub = sendingSegment.publishedOffset();
+            if (sendOffset >= pub) {
+                // Nothing more in the current segment. If it's a sealed segment
+                // (no longer the live active), advance to the next one.
+                if (sendingSegment != engine.activeSegment()) {
+                    // The producer can publish the current segment's last frame
+                    // between our first publishedOffset() read and the active
+                    // segment check above. Re-read before leaving the segment, or
+                    // that frame is skipped permanently.
+                    pub = sendingSegment.publishedOffset();
+                    if (sendOffset >= pub) {
+                        if (batchFrames > 0) {
+                            break;
+                        }
+                        MmapSegment next = advanceSegment();
+                        if (next != sendingSegment) {
+                            sendingSegment = next;
+                            return true; // let the next iteration try sending
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+            // At least the frame header is published; check we have the full frame.
+            if (sendOffset + MmapSegment.FRAME_HEADER_SIZE > pub) {
+                break;
+            }
+            long base = sendingSegment.address();
+            // Frame layout: [u32 crc][u32 payloadLen][payload].
+            int payloadLen = Unsafe.getUnsafe().getInt(base + sendOffset + 4);
+            if (payloadLen < 0) {
+                if (batchFrames > 0) {
+                    break;
+                }
+                fail(new LineSenderException(
+                        "negative payloadLen at offset " + sendOffset
+                                + " in segment baseSeq=" + sendingSegment.baseSeq()));
+                return false;
+            }
+            long frameEnd = sendOffset + MmapSegment.FRAME_HEADER_SIZE + payloadLen;
+            if (frameEnd > pub) {
+                break; // payload not fully published yet
+            }
+            long wireLen = WebSocketFrameWriter.headerSize(payloadLen, true) + (long) payloadLen;
+            if (batchFrames > 0 && batchBytes + wireLen > client.batchByteCap()) {
+                break; // fixed byte cap: the next call carries on from this frame
+            }
+            long frameAddr = base + sendOffset + MmapSegment.FRAME_HEADER_SIZE;
+            // Torn-dictionary guard. sentDictCount is this loop's model of how many ids the
+            // CURRENT server has been told about. A frame whose delta starts ABOVE that
+            // coverage references ids the server was never given, and the server now rejects
+            // such a frame with STATUS_DICTIONARY_GAP rather than null-padding the hole. That
+            // rejection is retriable -- a wire recycle re-registers from id 0 -- but this
+            // frame cannot become sendable without one, and against a server old enough to
+            // null-pad it would land rows with silently NULL symbols. Fail terminally here,
+            // where the unreplayable range is still attributable.
+            //
+            // The guard, the mirror and the catch-up are ONE mechanism and are all
+            // ungated (see the constructor). A frame at deltaStart == sentDictCount is
+            // contiguous and extends the coverage, so a slot whose frames start at id 0
+            // replays cleanly with no persisted dictionary at all -- which is exactly why
+            // the mirror below must keep advancing even when the dictionary is missing.
+            // A gap here therefore means genuine loss: a host/power crash tore the
+            // unsynced .symbol-dict below the ids the surviving frames still reference
+            // (SF is process-crash but not host-crash durable).
+            int deltaStart = frameDeltaStart(frameAddr, payloadLen);
+            if (deltaStart > sentDictCount) {
+                if (batchFrames > 0) {
+                    break;
+                }
+                recordFatal(new LineSenderException(
+                        "recovered store-and-forward symbol dictionary is incomplete (likely a host crash): "
+                                + "frame delta start " + deltaStart + " exceeds recovered dictionary size "
+                                + sentDictCount + "; cannot replay without corrupting data -- resend required"));
+                return false;
+            }
+            try {
+                client.batchAppendBinary(frameAddr, payloadLen);
+            } catch (Throwable t) {
+                nextWireSeq = batchStartWireSeq;
+                replayTargetFsn = batchStartReplayTargetFsn;
+                fail(t);
+                return false;
+            }
+            // The bookkeeping below runs at append time, before the flush: the next
+            // frame's torn-dictionary guard needs this frame's coverage. If the flush
+            // fails, fail() re-anchors the wire state at ackedFsn + 1 on a fresh
+            // client, so an appended-but-unflushed frame is just another unacked
+            // frame; the persistent dictionary mirror is replayed by the catch-up.
+            //
+            // A real ring frame (data or commit) is going out on this connection,
+            // as opposed to only the dictionary catch-up. onClose / handleServerRejection
+            // key their poison-strike vs pre-send decision off this, not off nextWireSeq
+            // (which the catch-up advances).
+            dataFrameSentThisConnection = true;
+            if (deltaStart >= 0) {
+                // Mirror the symbols this frame just registered on the server, so a later
+                // reconnect can rebuild the whole dictionary and the guard above keeps an
+                // accurate view of the server's coverage. Idempotent on replay: a frame
+                // whose delta we already hold advances nothing.
+                //
+                // Ungated (see the constructor): this is the ONLY thing that advances
+                // sentDictCount from the frames themselves, so gating it while leaving the
+                // guard ungated froze the coverage at 0 and terminal'd a slot that replays
+                // perfectly from id 0.
+                accumulateSentDict(frameAddr, payloadLen, deltaStart);
+            }
+            sendOffset = frameEnd;
+            long fsnSent = fsnAtZero + nextWireSeq;
+            nextWireSeq++;
+            batchFrames++;
+            batchBytes += wireLen;
+            if (replayTargetFsn >= 0) {
+                batchReplayed++;
+                if (fsnSent >= replayTargetFsn) {
+                    replayTargetFsn = -1L; // catch-up complete
+                }
+            }
         }
-        // At least the frame header is published; check we have the full frame.
-        if (sendOffset + MmapSegment.FRAME_HEADER_SIZE > pub) {
-            return false;
-        }
-        long base = sendingSegment.address();
-        // Frame layout: [u32 crc][u32 payloadLen][payload].
-        int payloadLen = Unsafe.getUnsafe().getInt(base + sendOffset + 4);
-        if (payloadLen < 0) {
-            fail(new LineSenderException(
-                    "negative payloadLen at offset " + sendOffset
-                            + " in segment baseSeq=" + sendingSegment.baseSeq()));
-            return false;
-        }
-        long frameEnd = sendOffset + MmapSegment.FRAME_HEADER_SIZE + payloadLen;
-        if (frameEnd > pub) {
-            return false; // payload not fully published yet
-        }
-        long frameAddr = base + sendOffset + MmapSegment.FRAME_HEADER_SIZE;
-        // Torn-dictionary guard. sentDictCount is this loop's model of how many ids the
-        // CURRENT server has been told about. A frame whose delta starts ABOVE that
-        // coverage references ids the server was never given, and the server now rejects
-        // such a frame with STATUS_DICTIONARY_GAP rather than null-padding the hole. That
-        // rejection is retriable -- a wire recycle re-registers from id 0 -- but this
-        // frame cannot become sendable without one, and against a server old enough to
-        // null-pad it would land rows with silently NULL symbols. Fail terminally here,
-        // where the unreplayable range is still attributable.
-        //
-        // The guard, the mirror and the catch-up are ONE mechanism and are all
-        // ungated (see the constructor). A frame at deltaStart == sentDictCount is
-        // contiguous and extends the coverage, so a slot whose frames start at id 0
-        // replays cleanly with no persisted dictionary at all -- which is exactly why
-        // the mirror below must keep advancing even when the dictionary is missing.
-        // A gap here therefore means genuine loss: a host/power crash tore the
-        // unsynced .symbol-dict below the ids the surviving frames still reference
-        // (SF is process-crash but not host-crash durable).
-        int deltaStart = frameDeltaStart(frameAddr, payloadLen);
-        if (deltaStart > sentDictCount) {
-            recordFatal(new LineSenderException(
-                    "recovered store-and-forward symbol dictionary is incomplete (likely a host crash): "
-                            + "frame delta start " + deltaStart + " exceeds recovered dictionary size "
-                            + sentDictCount + "; cannot replay without corrupting data -- resend required"));
+        if (batchFrames == 0) {
             return false;
         }
         try {
-            client.sendBinary(frameAddr, payloadLen);
+            client.batchFlush();
         } catch (Throwable t) {
+            nextWireSeq = batchStartWireSeq;
+            replayTargetFsn = batchStartReplayTargetFsn;
             fail(t);
             return false;
         }
-        // A real ring frame (data or commit) has now gone out on this connection,
-        // as opposed to only the dictionary catch-up. onClose / handleServerRejection
-        // key their poison-strike vs pre-send decision off this, not off nextWireSeq
-        // (which the catch-up advances).
-        dataFrameSentThisConnection = true;
-        if (deltaStart >= 0) {
-            // Mirror the symbols this frame just registered on the server, so a later
-            // reconnect can rebuild the whole dictionary and the guard above keeps an
-            // accurate view of the server's coverage. Idempotent on replay: a frame
-            // whose delta we already hold advances nothing.
-            //
-            // Ungated (see the constructor): this is the ONLY thing that advances
-            // sentDictCount from the frames themselves, so gating it while leaving the
-            // guard ungated froze the coverage at 0 and terminal'd a slot that replays
-            // perfectly from id 0.
-            accumulateSentDict(frameAddr, payloadLen, deltaStart);
-        }
         lastFrameOrPingNanos = System.nanoTime();
-        sendOffset = frameEnd;
-        long fsnSent = fsnAtZero + nextWireSeq;
-        nextWireSeq++;
-        counters.framesSent.incrementAndGet();
-        if (replayTargetFsn >= 0) {
-            counters.framesReplayed.incrementAndGet();
-            if (fsnSent >= replayTargetFsn) {
-                replayTargetFsn = -1L; // catch-up complete
-            }
+        counters.framesSent.addAndGet(batchFrames);
+        if (batchReplayed > 0) {
+            counters.framesReplayed.addAndGet(batchReplayed);
         }
         return true;
     }
@@ -4288,7 +4347,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * current connection. Thrown by {@link #sendDictCatchUp}/{@link
      * #sendCatchUpChunk} instead of calling {@link #fail}: the catch-up runs
      * inside {@link #connectLoop} (via {@link #swapClient}) and, on the initial
-     * connect, inside {@link #start()} / {@link #trySendOne} on the caller
+     * connect, inside {@link #start()} / {@link #trySendBatch} on the caller
      * thread. Calling {@code fail()} from there would re-enter {@code
      * connectLoop} -- corrupting the {@code fsnAtZero}/{@code nextWireSeq} wire
      * mapping (a subsequent ACK then trims un-acked frames) and growing the
@@ -4297,7 +4356,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * thread and block {@code Sender} construction indefinitely. Each catch
      * site instead turns it into ONE non-re-entrant reconnect: {@code
      * connectLoop}'s own retry catch (swapClient path), a fresh {@code fail()}
-     * from the I/O loop body (trySendOne path), or dropping the dead client so
+     * from the I/O loop body (trySendBatch path), or dropping the dead client so
      * the I/O thread reconnects (start path). A JVM {@code Error} is never
      * wrapped -- it must stay terminal. The {@code capGap} marker lets the reconnect
      * loop preserve only consecutive incompatible-cap observations; ordinary catch-up
@@ -4607,7 +4666,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // NACK is for a dictionary catch-up frame -- which occupies the
                 // already-acked wire sequences below replayStart -- not a data frame
                 // this connection sent. (dataFrameSentThisConnection can be true here
-                // because trySendOne ships the head data frame before tryReceiveAcks
+                // because trySendBatch ships the head data frame before tryReceiveAcks
                 // reads the catch-up's NACK in the same loop iteration.) Attributing
                 // it a data FSN would key recordHeadRejectionStrike() off a
                 // below-baseline FSN -- negative when replayStart < catchUpFrames --

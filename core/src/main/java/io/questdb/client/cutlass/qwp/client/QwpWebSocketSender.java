@@ -86,6 +86,7 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
 /**
@@ -374,6 +375,9 @@ public class QwpWebSocketSender implements Sender {
     private SenderErrorHandler errorHandler = DefaultSenderErrorHandler.INSTANCE;
     private int errorInboxCapacity = SenderErrorDispatcher.DEFAULT_CAPACITY;
     private long firstPendingRowTimeNanos;
+    // Clock for the auto-flush age check only (sendRow / shouldAutoFlush).
+    // Test seam: setNanoClockForTesting swaps it to count or steer the reads.
+    private LongSupplier nanoClock = System::nanoTime;
     // Additive offset applied to every user-visible FSN this sender reports
     // (flushAndGetSequence, awaitAckedFsn's target, getAckedFsn, drain's
     // watermark, and every FSN the I/O loop surfaces through the progress
@@ -2453,7 +2457,7 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Returns the auto-flush interval in nanoseconds.
+     * Returns the auto-flush interval in nanoseconds (0 = interval-based auto-flush disabled).
      */
     public long getAutoFlushIntervalNanos() {
         return autoFlushIntervalNanos;
@@ -2525,6 +2529,11 @@ public class QwpWebSocketSender implements Sender {
     @TestOnly
     public void setChunkPublishFaultForTesting(Runnable fault) {
         this.chunkPublishFaultForTesting = fault;
+    }
+
+    @TestOnly
+    public void setNanoClockForTesting(LongSupplier nanoClock) {
+        this.nanoClock = nanoClock;
     }
 
     /**
@@ -2908,6 +2917,8 @@ public class QwpWebSocketSender implements Sender {
      * Count of frames re-sent during post-reconnect catch-up windows since
      * this sender started. Zero in steady state; a sustained nonzero rate
      * signals flapping where every reconnect replays meaningful work.
+     * A frame counts as replayed only if an earlier send completed successfully.
+     * Failed batch flushes do not count, even if some bytes were written.
      * Sender-lifetime: carried across symbol-dictionary recycles and retained
      * after {@link #close()}.
      */
@@ -2916,8 +2927,10 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Binary frames the cursor I/O loop has issued to the wire since this
-     * sender started, replays included. Sender-lifetime: carried across
+     * Binary frames the cursor I/O loop has successfully sent since this
+     * sender started, replays included. A batch contributes only when its
+     * entire flush succeeds; failed flushes contribute no frames, even if
+     * some bytes were written. Sender-lifetime: carried across
      * symbol-dictionary recycles and retained after {@link #close()}.
      */
     public long getTotalFramesSent() {
@@ -7132,8 +7145,9 @@ public class QwpWebSocketSender implements Sender {
         long bufferedNow = currentTableBuffer.nextRow(
                 currentTableBufferSnapshotBytes, cap > 0 ? cap : Long.MAX_VALUE);
 
-        if (pendingRowCount == 0) {
-            firstPendingRowTimeNanos = System.nanoTime();
+        // Interval off (0): no clock read on the row path at all.
+        if (pendingRowCount == 0 && autoFlushIntervalNanos > 0) {
+            firstPendingRowTimeNanos = nanoClock.getAsLong();
         }
         pendingRowCount++;
 
@@ -7164,8 +7178,11 @@ public class QwpWebSocketSender implements Sender {
         if (effectiveAutoFlushBytes > 0 && getPendingBytes() >= effectiveAutoFlushBytes) {
             return true;
         }
-        if (autoFlushIntervalNanos > 0) {
-            long ageNanos = System.nanoTime() - firstPendingRowTimeNanos;
+        // pendingRowCount == 1: sendRow() just timestamped this very row, so its
+        // age is ~0 and can never reach the (>= 1 ms) interval. Skipping the
+        // clock read there saves one nanoTime() per flush for per-row flushers.
+        if (autoFlushIntervalNanos > 0 && pendingRowCount > 1) {
+            long ageNanos = nanoClock.getAsLong() - firstPendingRowTimeNanos;
             return ageNanos >= autoFlushIntervalNanos;
         }
         return false;
