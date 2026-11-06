@@ -607,6 +607,21 @@ public class TestWebSocketServer implements Closeable {
         }
 
         /**
+         * Writes a binary frame in socket writes of at most {@code chunkBytes}.
+         * Over TLS every write becomes its own record (records cap at 16 KiB),
+         * so this controls the record sizes the client has to decrypt.
+         */
+        public synchronized void sendBinaryInChunks(byte[] data, int chunkBytes) throws IOException {
+            ByteArrayOutputStream frame = new ByteArrayOutputStream(data.length + 14);
+            appendUnmaskedFrame(frame, WebSocketOpcode.BINARY, data);
+            byte[] bytes = frame.toByteArray();
+            for (int off = 0; off < bytes.length; off += chunkBytes) {
+                out.write(bytes, off, Math.min(chunkBytes, bytes.length - off));
+            }
+            out.flush();
+        }
+
+        /**
          * Writes a binary frame and then a close frame with one socket write,
          * so the client reads the close right behind the binary frame -- the
          * way a server answering its last frame on the way out flushes both.

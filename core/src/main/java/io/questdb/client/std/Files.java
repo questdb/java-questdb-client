@@ -467,6 +467,11 @@ public final class Files {
         }
     }
 
+    /** Syncs a directory named by a NUL-terminated native UTF-8 path. */
+    public static int fsyncDir(long dirPtr) {
+        return fsyncDir0(dirPtr);
+    }
+
     /**
      * Forces the directory entry naming {@code path} to durable storage by
      * syncing its absolute parent directory.

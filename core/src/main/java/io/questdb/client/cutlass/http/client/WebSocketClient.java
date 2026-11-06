@@ -31,6 +31,7 @@ import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketFrameParser;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketOpcode;
 import io.questdb.client.network.IOOperation;
+import io.questdb.client.network.Net;
 import io.questdb.client.network.NetworkFacade;
 import io.questdb.client.network.Socket;
 import io.questdb.client.network.SocketFactory;
@@ -105,6 +106,14 @@ public abstract class WebSocketClient implements QuietCloseable {
     // (not a bare volatile check-then-act) so concurrent closers cannot both
     // enter close() and double-run disconnect()/Unsafe.free.
     private final AtomicBoolean closed = new AtomicBoolean();
+    // See awaitReadableOrWake/wake. wakeLock serialises wake() with close().
+    private final Object wakeLock = new Object();
+    private int doorbell = -1;
+    // True after a recv() found nothing. Until the next send or
+    // awaitReadableOrWake, tryReceiveFrame answers false without a syscall:
+    // the I/O loop's pre-park receive pass otherwise repeats the EAGAIN it got
+    // on the previous iteration. I/O-thread-only, like the recv buffer.
+    private boolean recvDrained;
     // Upper bound (ms) on the TCP connect. <= 0 disables the application-level
     // timeout and falls back to the OS connect timeout. Seeded from the
     // configuration; the QWP sender may override it via setConnectTimeout().
@@ -214,7 +223,13 @@ public abstract class WebSocketClient implements QuietCloseable {
             this.rnd = new SecureRnd();
             this.upgraded = false;
             this.closed.set(false);
+
+            this.doorbell = Net.doorbellCreate();
+            if (doorbell < 0) {
+                throw new HttpClientException("could not create doorbell [errno=").put(nf.errno()).put(']');
+            }
         } catch (Throwable t) {
+            closeDoorbell();
             if (recvBufPtr != 0) {
                 Unsafe.free(recvBufPtr, recvBufSize, MemoryTag.NATIVE_DEFAULT);
                 recvBufPtr = 0;
@@ -257,6 +272,7 @@ public abstract class WebSocketClient implements QuietCloseable {
                 Unsafe.free(recvBufPtr, recvBufSize, MemoryTag.NATIVE_DEFAULT);
                 recvBufPtr = 0;
             }
+            closeDoorbell();
         }
     }
 
@@ -644,6 +660,13 @@ public abstract class WebSocketClient implements QuietCloseable {
             return result == PARSE_OK;
         }
 
+        if (recvDrained) {
+            // The last recv found nothing and nothing has been sent or waited
+            // for since: a repeat recv would be another EAGAIN. Bytes that land
+            // meanwhile end the next awaitReadableOrWake at once (level-triggered).
+            return false;
+        }
+
         // Try one non-blocking recv
         if (recvPos >= recvBufSize - 1024) {
             growRecvBuffer();
@@ -654,6 +677,7 @@ public abstract class WebSocketClient implements QuietCloseable {
             throw new HttpClientException("peer disconnect [errno=").errno(nf.errno()).put(']');
         }
         if (n == 0) {
+            recvDrained = true;
             return false; // No data available
         }
         recvPos += n;
@@ -1120,6 +1144,7 @@ public abstract class WebSocketClient implements QuietCloseable {
 
     private void doSend(long ptr, int len, int timeout) {
         long startTime = System.nanoTime();
+        recvDrained = false;
         while (len > 0) {
             int remainingTimeout = getRemainingTimeOrThrow(timeout, startTime);
             ioWait(remainingTimeout, IOOperation.WRITE);
@@ -1499,4 +1524,49 @@ public abstract class WebSocketClient implements QuietCloseable {
      * Sets up platform-specific I/O wait mechanism after connection.
      */
     protected abstract void setupIoWait();
+
+    /**
+     * Blocks until the socket becomes readable, another thread calls
+     * {@link #wake()}, or {@code timeoutMillis} elapses ({@code -1} = no
+     * timeout). Returns {@code true} unless it timed out; spurious returns are
+     * possible and callers re-check their inputs. The doorbell is stateful: a
+     * wake that lands before the wait begins ends it at once. Independent of
+     * the readiness queue {@link #ioWait} uses, so a pending wake never leaks
+     * into a handshake or send wait.
+     */
+    public boolean awaitReadableOrWake(int timeoutMillis) {
+        recvDrained = false;
+        if (socket.hasBufferedInput()) {
+            // TLS: decrypted or undecrypted input already sits in user space,
+            // invisible to poll(2). Report readable without blocking.
+            return true;
+        }
+        int n = Net.awaitReadableOrRing(socket.getFd(), doorbell, timeoutMillis);
+        if (n < 0) {
+            throw new HttpClientException("internal error: poll failure [errno=").put(nf.errno()).put(']');
+        }
+        return n > 0;
+    }
+
+    /**
+     * Wakes a thread blocked in {@link #awaitReadableOrWake}; with nobody
+     * waiting the wake is remembered until the next wait. Safe from any thread,
+     * including concurrently with {@link #close()}.
+     */
+    public void wake() {
+        synchronized (wakeLock) {
+            if (doorbell >= 0) {
+                Net.doorbellRing(doorbell);
+            }
+        }
+    }
+
+    private void closeDoorbell() {
+        synchronized (wakeLock) {
+            if (doorbell >= 0) {
+                Net.doorbellClose(doorbell);
+                doorbell = -1;
+            }
+        }
+    }
 }

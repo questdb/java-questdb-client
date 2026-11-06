@@ -194,7 +194,7 @@ public class CursorWebSocketSendLoopDurableAckFuzzTest {
                         engine.appendBlocking(buf, 8);
                     }
                     CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
-                            null, engine, 0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                            null, engine, 0L,
                             () -> {
                                 throw new UnsupportedOperationException();
                             },

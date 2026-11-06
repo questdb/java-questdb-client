@@ -25,12 +25,13 @@
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
+import io.questdb.client.test.tools.TestWebSocketClient;
 import io.questdb.client.DefaultHttpClientConfiguration;
-import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentBudget;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.std.MemoryTag;
@@ -56,8 +57,8 @@ import org.junit.Test;
  * The one non-obvious knob: segments hold enough frames that the producer never
  * out-runs the hot-spare manager. With tiny segments it parks ~50&nbsp;µs on
  * every rotation, and that gap lets the consumer observe the tail frame before
- * the rotation — masking the race. Larger segments plus a microsecond
- * spare-provision poll keep a spare ready so the seal follows the last publish
+ * the rotation — masking the race. Larger segments, with the manager woken on
+ * every rotation, keep a spare ready so the seal follows the last publish
  * back-to-back, which is the only arrangement that opens the window.
  */
 public class CursorWebSocketSendLoopRotationRaceTest {
@@ -70,7 +71,6 @@ public class CursorWebSocketSendLoopRotationRaceTest {
     // rescans the sealed list (~FRAMES/FRAMES_PER_SEGMENT entries) on every
     // rotation — keep the product small enough that scan stays cheap.
     private static final int FRAMES = 50_000;
-    private static final long MANAGER_POLL_NANOS = 1_000L; // 1us: keep a hot spare ready
     // Upper bound on the drain wait. A healthy run exits the instant the last
     // frame lands, so this only caps how long a *failing* (frame-dropped) run
     // takes — set high enough that a stalled, overloaded CI box is never
@@ -83,13 +83,13 @@ public class CursorWebSocketSendLoopRotationRaceTest {
             final int n = FRAMES;
 
             SegmentManager manager = new SegmentManager(
-                    SEGMENT_BYTES, MANAGER_POLL_NANOS, SegmentManager.UNLIMITED_TOTAL_BYTES);
+                    SEGMENT_BYTES, new SegmentBudget(SegmentManager.UNLIMITED_TOTAL_BYTES));
             manager.start();
             // sfDir == null => memory-only segments (no files/fds); same trySendOne() path.
             CursorSendEngine engine = new CursorSendEngine(null, SEGMENT_BYTES, manager);
             RecordingClient client = new RecordingClient(n);
             CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
-                    client, engine, 0L, 0L /* busy-spin so the consumer sits on the active tip */,
+                    client, engine, 0L,
                     () -> {
                         throw new UnsupportedOperationException("no reconnect in this test");
                     },
@@ -142,7 +142,7 @@ public class CursorWebSocketSendLoopRotationRaceTest {
      * test never receives ACKs and never reconnects. Only {@code sentCount} is
      * read cross-thread (by the test, for progress) and so is volatile.
      */
-    private static final class RecordingClient extends WebSocketClient {
+    private static final class RecordingClient extends TestWebSocketClient {
         final long[] recorded;
         volatile long sentCount;
         private int recordedCount;
