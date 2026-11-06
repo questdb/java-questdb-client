@@ -31,18 +31,16 @@ import java.lang.reflect.Field;
 import java.util.concurrent.atomic.LongAdder;
 
 public final class Unsafe {
-    // The various _ADDR fields are `long` in Java, but they are `* mut usize` in Rust, or `size_t*` in C.
-    // These are off-heap allocated atomic counters for memory usage tracking.
-
     public static final long BYTE_OFFSET;
     private static final LongAdder[] COUNTERS = new LongAdder[MemoryTag.SIZE];
-    private static final long FREE_COUNT_ADDR;
-    private static final long MALLOC_COUNT_ADDR;
-    private static final long[] NATIVE_MEM_COUNTER_ADDRS = new long[MemoryTag.SIZE];
-    private static final long NON_RSS_MEM_USED_ADDR;
+    private static final long FREE_COUNT_OFFSET;
+    // An object base keeps atomic offsets small, including on Java 8 AArch64 C1.
+    private static final long[] GLOBAL_COUNTERS = new long[5];
+    private static final long MALLOC_COUNT_OFFSET;
+    private static final long NON_RSS_MEM_USED_OFFSET;
     private static final long OVERRIDE;
-    private static final long REALLOC_COUNT_ADDR;
-    private static final long RSS_MEM_USED_ADDR;
+    private static final long REALLOC_COUNT_OFFSET;
+    private static final long RSS_MEM_USED_OFFSET;
     private static final sun.misc.Unsafe UNSAFE;
 
     private Unsafe() {
@@ -87,11 +85,11 @@ public final class Unsafe {
     }
 
     public static long getFreeCount() {
-        return UNSAFE.getLongVolatile(null, FREE_COUNT_ADDR);
+        return UNSAFE.getLongVolatile(GLOBAL_COUNTERS, FREE_COUNT_OFFSET);
     }
 
     public static long getMallocCount() {
-        return UNSAFE.getLongVolatile(null, MALLOC_COUNT_ADDR);
+        return UNSAFE.getLongVolatile(GLOBAL_COUNTERS, MALLOC_COUNT_OFFSET);
     }
 
     /**
@@ -99,50 +97,37 @@ public final class Unsafe {
      * and that assigned to memory mapped files.
      */
     public static long getMemUsed() {
-        return UNSAFE.getLongVolatile(null, NON_RSS_MEM_USED_ADDR) +
-                UNSAFE.getLongVolatile(null, RSS_MEM_USED_ADDR);
+        return UNSAFE.getLongVolatile(GLOBAL_COUNTERS, NON_RSS_MEM_USED_OFFSET) +
+                UNSAFE.getLongVolatile(GLOBAL_COUNTERS, RSS_MEM_USED_OFFSET);
     }
 
     public static long getMemUsedByTag(int memoryTag) {
         assert memoryTag >= 0 && memoryTag < MemoryTag.SIZE;
-        return COUNTERS[memoryTag].sum() + UNSAFE.getLongVolatile(null, NATIVE_MEM_COUNTER_ADDRS[memoryTag]);
+        return COUNTERS[memoryTag].sum();
     }
 
     public static long getReallocCount() {
-        return UNSAFE.getLongVolatile(null, REALLOC_COUNT_ADDR);
+        return UNSAFE.getLongVolatile(GLOBAL_COUNTERS, REALLOC_COUNT_OFFSET);
     }
 
     public static long getRssMemUsed() {
-        return UNSAFE.getLongVolatile(null, RSS_MEM_USED_ADDR);
+        return UNSAFE.getLongVolatile(GLOBAL_COUNTERS, RSS_MEM_USED_OFFSET);
     }
 
     public static sun.misc.Unsafe getUnsafe() {
         return UNSAFE;
     }
 
-    // Keep unaffected calls direct: newer C1 versions may not inline an atomic wrapper.
     public static void incrFreeCount() {
-        if (NativeAtomicLong.IS_CAS_REQUIRED) {
-            NativeAtomicLong.getAndAdd(UNSAFE, FREE_COUNT_ADDR, 1);
-        } else {
-            UNSAFE.getAndAddLong(null, FREE_COUNT_ADDR, 1);
-        }
+        UNSAFE.getAndAddLong(GLOBAL_COUNTERS, FREE_COUNT_OFFSET, 1);
     }
 
     public static void incrMallocCount() {
-        if (NativeAtomicLong.IS_CAS_REQUIRED) {
-            NativeAtomicLong.getAndAdd(UNSAFE, MALLOC_COUNT_ADDR, 1);
-        } else {
-            UNSAFE.getAndAddLong(null, MALLOC_COUNT_ADDR, 1);
-        }
+        UNSAFE.getAndAddLong(GLOBAL_COUNTERS, MALLOC_COUNT_OFFSET, 1);
     }
 
     public static void incrReallocCount() {
-        if (NativeAtomicLong.IS_CAS_REQUIRED) {
-            NativeAtomicLong.getAndAdd(UNSAFE, REALLOC_COUNT_ADDR, 1);
-        } else {
-            UNSAFE.getAndAddLong(null, REALLOC_COUNT_ADDR, 1);
-        }
+        UNSAFE.getAndAddLong(GLOBAL_COUNTERS, REALLOC_COUNT_OFFSET, 1);
     }
 
     /**
@@ -203,14 +188,10 @@ public final class Unsafe {
         assert memoryTag >= 0 && memoryTag < MemoryTag.SIZE;
         COUNTERS[memoryTag].add(size);
         if (memoryTag >= MemoryTag.NATIVE_DEFAULT) {
-            final long mem = (NativeAtomicLong.IS_CAS_REQUIRED
-                    ? NativeAtomicLong.getAndAdd(UNSAFE, RSS_MEM_USED_ADDR, size)
-                    : UNSAFE.getAndAddLong(null, RSS_MEM_USED_ADDR, size)) + size;
+            final long mem = UNSAFE.getAndAddLong(GLOBAL_COUNTERS, RSS_MEM_USED_OFFSET, size) + size;
             assert mem >= 0 : "unexpected RSS mem: " + mem + ", size: " + size + ", memoryTag:" + memoryTag;
         } else {
-            final long mem = (NativeAtomicLong.IS_CAS_REQUIRED
-                    ? NativeAtomicLong.getAndAdd(UNSAFE, NON_RSS_MEM_USED_ADDR, size)
-                    : UNSAFE.getAndAddLong(null, NON_RSS_MEM_USED_ADDR, size)) + size;
+            final long mem = UNSAFE.getAndAddLong(GLOBAL_COUNTERS, NON_RSS_MEM_USED_OFFSET, size) + size;
             assert mem >= 0 : "unexpected non-RSS mem: " + mem + ", size: " + size + ", memoryTag:" + memoryTag;
         }
     }
@@ -260,28 +241,17 @@ public final class Unsafe {
             throw new ExceptionInInitializerError(e);
         }
 
-        // A single allocation for all the off-heap native memory counters.
-        // Might help with locality, given they're often incremented together.
-        // All initial values set to 0.
-        final long nativeMemCountersArraySize = (5 + COUNTERS.length) * 8;
-        final long nativeMemCountersArray = UNSAFE.allocateMemory(nativeMemCountersArraySize);
-        long ptr = nativeMemCountersArray;
-        Vect.memset(nativeMemCountersArray, nativeMemCountersArraySize, 0);
-
-        RSS_MEM_USED_ADDR = ptr;
-        ptr += 8;
-        MALLOC_COUNT_ADDR = ptr;
-        ptr += 8;
-        REALLOC_COUNT_ADDR = ptr;
-        ptr += 8;
-        FREE_COUNT_ADDR = ptr;
-        ptr += 8;
-        NON_RSS_MEM_USED_ADDR = ptr;
-        ptr += 8;
+        long base = UNSAFE.arrayBaseOffset(long[].class);
+        long scale = UNSAFE.arrayIndexScale(long[].class);
+        RSS_MEM_USED_OFFSET = base;
+        MALLOC_COUNT_OFFSET = base + scale;
+        REALLOC_COUNT_OFFSET = base + 2 * scale;
+        FREE_COUNT_OFFSET = base + 3 * scale;
+        NON_RSS_MEM_USED_OFFSET = base + 4 * scale;
         for (int i = 0; i < COUNTERS.length; i++) {
             COUNTERS[i] = new LongAdder();
-            NATIVE_MEM_COUNTER_ADDRS[i] = ptr;
-            ptr += 8;
         }
+        // Preserve native-library initialization before any allocation can succeed.
+        Os.init();
     }
 }
