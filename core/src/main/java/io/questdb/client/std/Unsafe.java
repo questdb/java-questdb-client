@@ -34,7 +34,6 @@ public final class Unsafe {
     public static final long BYTE_OFFSET;
     private static final LongAdder[] COUNTERS = new LongAdder[MemoryTag.SIZE];
     private static final long FREE_COUNT_OFFSET;
-    // An object base keeps atomic offsets small, including on Java 8 AArch64 C1.
     private static final long[] GLOBAL_COUNTERS = new long[5];
     private static final long MALLOC_COUNT_OFFSET;
     private static final long NON_RSS_MEM_USED_OFFSET;
@@ -251,7 +250,7 @@ public final class Unsafe {
         for (int i = 0; i < COUNTERS.length; i++) {
             COUNTERS[i] = new LongAdder();
         }
-        // Preserve native-library initialization before any allocation can succeed.
+        // Preserve the eager native-library load previously triggered by Vect.memset.
         Os.init();
     }
 }
