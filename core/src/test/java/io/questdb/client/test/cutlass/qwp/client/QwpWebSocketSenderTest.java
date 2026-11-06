@@ -24,10 +24,12 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.Sender;
 import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
+import io.questdb.client.cutlass.qwp.client.BatchTooLargeForCapException;
 import io.questdb.client.cutlass.qwp.client.MicrobatchBuffer;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
@@ -41,9 +43,13 @@ import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.io.IOException;
 import java.lang.reflect.Field;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
@@ -284,6 +290,82 @@ public class QwpWebSocketSenderTest {
     }
 
     @Test
+    public void testCancelledRowDoesNotShipItsTable() throws Exception {
+        assertMemoryLeak(() -> {
+            FrameCapture capture = new FrameCapture();
+            try (TestWebSocketServer server = new TestWebSocketServer(capture)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                        + ";auto_flush_interval=60000;")) {
+                    sender.table("alpha").longColumn("v", 1).atNow();
+                    sender.table("bravo").longColumn("v", 2);
+                    sender.cancelRow();
+                    sender.flush();
+                    capture.awaitFrames(1, 5_000);
+                    Assert.assertEquals(1, capture.tableCount(0));
+                    byte[] frame0 = capture.frame(0);
+                    Assert.assertTrue("frame 0 carries alpha", indexOf(frame0, "alpha") >= 0);
+                    Assert.assertEquals("frame 0 carries no bravo", -1, indexOf(frame0, "bravo"));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testCapRejectedFlushThenResetNeverShipsTheDroppedTable() throws Exception {
+        assertMemoryLeak(() -> {
+            FrameCapture capture = new FrameCapture();
+            try (TestWebSocketServer server = new TestWebSocketServer(capture)) {
+                server.setAdvertisedMaxBatchSize(4 * 1024);
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                // no row or byte trigger: the whole batch reaches the explicit flush(), whose split
+                // pre-flight rejects it before publishing anything
+                try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                        + ";auto_flush_rows=off;auto_flush_bytes=off;auto_flush_interval=60000;")) {
+                    // warm-up, so the cap is known
+                    sender.table("w").longColumn("v", 1).atNow();
+                    sender.flush();
+                    capture.awaitFrames(1, 5_000);
+
+                    sender.table("alpha").longColumn("v", 2).atNow();
+                    sender.table("bravo").longColumn("v", 3).atNow();
+                    // three 1.5 KB rows take charlie_dropped's block over the 4 KiB cap
+                    String wide = wideValue(1500);
+                    for (int i = 0; i < 3; i++) {
+                        sender.table("charlie_dropped").stringColumn("s", wide).atNow();
+                    }
+                    try {
+                        sender.flush();
+                        Assert.fail("the batch exceeds the 4 KiB cap");
+                    } catch (BatchTooLargeForCapException expected) {
+                        // thrown before anything was published
+                    }
+
+                    // the three tables stay listed after reset(); only the ones that get rows again ship
+                    sender.reset();
+                    sender.table("alpha").longColumn("v", 4).atNow();
+                    sender.table("bravo").longColumn("v", 5).atNow();
+                    sender.flush();
+                    capture.awaitFrames(2, 5_000);
+                    Assert.assertEquals(2, capture.tableCount(1));
+                    byte[] frame1 = capture.frame(1);
+                    int alphaAt = indexOf(frame1, "alpha");
+                    int bravoAt = indexOf(frame1, "bravo");
+                    Assert.assertTrue("frame 1 carries alpha", alphaAt >= 0);
+                    Assert.assertTrue("frame 1 carries bravo", bravoAt >= 0);
+                    Assert.assertTrue("tables ship in first-row order", alphaAt < bravoAt);
+                    for (int i = 0, n = capture.frameCount(); i < n; i++) {
+                        Assert.assertEquals("frame " + i + " must not carry the dropped table",
+                                -1, indexOf(capture.frame(i), "charlie_dropped"));
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
     public void testCloseIdemponent() throws Exception {
         assertMemoryLeak(() -> {
             QwpWebSocketSender sender = createUnconnectedSender();
@@ -334,6 +416,39 @@ public class QwpWebSocketSenderTest {
     }
 
     @Test
+    public void testFlushAfterResetShipsOnlyTablesWithNewRows() throws Exception {
+        assertMemoryLeak(() -> {
+            FrameCapture capture = new FrameCapture();
+            try (TestWebSocketServer server = new TestWebSocketServer(capture)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                        + ";auto_flush_interval=60000;")) {
+                    sender.table("alpha").longColumn("v", 1).atNow();
+                    sender.table("bravo").longColumn("v", 2).atNow();
+                    // both tables stay listed after reset(); the flush skips the one without rows
+                    sender.reset();
+                    sender.table("bravo").longColumn("v", 3).atNow();
+                    sender.flush();
+                    capture.awaitFrames(1, 5_000);
+                    Assert.assertEquals("only bravo has rows", 1, capture.tableCount(0));
+                    byte[] frame0 = capture.frame(0);
+                    Assert.assertTrue("frame 0 carries bravo", indexOf(frame0, "bravo") >= 0);
+                    Assert.assertEquals("frame 0 carries no alpha", -1, indexOf(frame0, "alpha"));
+
+                    sender.table("alpha").longColumn("v", 4).atNow();
+                    sender.flush();
+                    capture.awaitFrames(2, 5_000);
+                    Assert.assertEquals("only alpha has rows", 1, capture.tableCount(1));
+                    byte[] frame1 = capture.frame(1);
+                    Assert.assertTrue("frame 1 carries alpha", indexOf(frame1, "alpha") >= 0);
+                    Assert.assertEquals("frame 1 carries no bravo", -1, indexOf(frame1, "bravo"));
+                }
+            }
+        });
+    }
+
+    @Test
     public void testFlushAppendFailureDoesNotLeaveMicrobatchBufferInUse() throws Exception {
         assertMemoryLeak(() -> {
             try (TestWebSocketServer server = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
@@ -374,6 +489,56 @@ public class QwpWebSocketSenderTest {
                 // test. The bug under test is about microbatch buffer
                 // state, not about close() being lenient toward residual
                 // unflushed rows — swallow the predictable rethrow here.
+            }
+        });
+    }
+
+    @Test
+    public void testFlushShipsOnlyTablesWithPendingRows() throws Exception {
+        assertMemoryLeak(() -> {
+            FrameCapture capture = new FrameCapture();
+            try (TestWebSocketServer server = new TestWebSocketServer(capture)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                        + ";auto_flush_interval=60000;")) {
+                    sender.table("alpha").longColumn("v", 1).atNow();
+                    sender.table("bravo").longColumn("v", 2).atNow();
+                    sender.table("alpha").longColumn("v", 3).atNow();
+                    sender.flush();
+                    capture.awaitFrames(1, 5_000);
+                    Assert.assertEquals(2, capture.tableCount(0));
+                    byte[] frame0 = capture.frame(0);
+                    int alphaAt = indexOf(frame0, "alpha");
+                    int bravoAt = indexOf(frame0, "bravo");
+                    Assert.assertTrue("frame 0 carries alpha", alphaAt >= 0);
+                    Assert.assertTrue("frame 0 carries bravo", bravoAt >= 0);
+                    Assert.assertTrue("tables ship in first-row order", alphaAt < bravoAt);
+
+                    sender.table("charlie").longColumn("v", 4).atNow();
+                    sender.flush();
+                    capture.awaitFrames(2, 5_000);
+                    Assert.assertEquals("only charlie has rows", 1, capture.tableCount(1));
+
+                    sender.table("bravo").longColumn("v", 5).atNow();
+                    sender.flush();
+                    capture.awaitFrames(3, 5_000);
+                    Assert.assertEquals("only bravo has rows", 1, capture.tableCount(2));
+                    byte[] frame2 = capture.frame(2);
+                    Assert.assertTrue("frame 2 carries bravo", indexOf(frame2, "bravo") >= 0);
+                    Assert.assertEquals("frame 2 carries no alpha", -1, indexOf(frame2, "alpha"));
+                    Assert.assertEquals("frame 2 carries no charlie", -1, indexOf(frame2, "charlie"));
+
+                    // bravo was created after alpha but gets its row first in this batch
+                    sender.table("bravo").longColumn("v", 6).atNow();
+                    sender.table("alpha").longColumn("v", 7).atNow();
+                    sender.flush();
+                    capture.awaitFrames(4, 5_000);
+                    Assert.assertEquals(2, capture.tableCount(3));
+                    byte[] frame3 = capture.frame(3);
+                    Assert.assertTrue("tables ship in first-row order, not creation order",
+                            indexOf(frame3, "bravo") < indexOf(frame3, "alpha"));
+                }
             }
         });
     }
@@ -864,6 +1029,26 @@ public class QwpWebSocketSenderTest {
         return (MicrobatchBuffer) field.get(sender);
     }
 
+    private static int indexOf(byte[] frame, String ascii) {
+        int n = ascii.length();
+        for (int i = 0, last = frame.length - n; i <= last; i++) {
+            int j = 0;
+            while (j < n && frame[i + j] == (byte) ascii.charAt(j)) {
+                j++;
+            }
+            if (j == n) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private static String wideValue(int length) {
+        char[] chars = new char[length];
+        Arrays.fill(chars, 'x');
+        return new String(chars);
+    }
+
     /**
      * Creates a sender without connecting.
      * For unit tests that don't need actual connectivity.
@@ -872,4 +1057,61 @@ public class QwpWebSocketSenderTest {
         return QwpWebSocketSender.createForTesting("localhost", 9000);
     }
 
+    /**
+     * Records every QWP frame the server receives, in arrival order, and acks each
+     * binary message up to the last frame it carried.
+     */
+    private static final class FrameCapture implements TestWebSocketServer.WebSocketServerHandler {
+        private static final int HEADER_SIZE = 12;
+        private static final int OFFSET_PAYLOAD_LENGTH = 8;
+        private static final int OFFSET_TABLE_COUNT = 6;
+        private final List<byte[]> frames = new ArrayList<>();
+        private long nextSeq;
+
+        void awaitFrames(int atLeast, long timeoutMillis) throws InterruptedException {
+            long deadline = System.currentTimeMillis() + timeoutMillis;
+            while (frameCount() < atLeast && System.currentTimeMillis() < deadline) {
+                Thread.sleep(10);
+            }
+            Assert.assertTrue("expected at least " + atLeast + " frame(s) within " + timeoutMillis
+                    + " ms, got " + frameCount(), frameCount() >= atLeast);
+        }
+
+        synchronized byte[] frame(int index) {
+            return frames.get(index);
+        }
+
+        synchronized int frameCount() {
+            return frames.size();
+        }
+
+        @Override
+        public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            int pos = 0;
+            int framesInMessage = 0;
+            while (pos + HEADER_SIZE <= data.length) {
+                int payloadLength = (data[pos + OFFSET_PAYLOAD_LENGTH] & 0xFF)
+                        | ((data[pos + OFFSET_PAYLOAD_LENGTH + 1] & 0xFF) << 8)
+                        | ((data[pos + OFFSET_PAYLOAD_LENGTH + 2] & 0xFF) << 16)
+                        | ((data[pos + OFFSET_PAYLOAD_LENGTH + 3] & 0xFF) << 24);
+                if (payloadLength < 0 || pos + HEADER_SIZE + payloadLength > data.length) {
+                    break;
+                }
+                frames.add(Arrays.copyOfRange(data, pos, pos + HEADER_SIZE + payloadLength));
+                framesInMessage++;
+                pos += HEADER_SIZE + payloadLength;
+            }
+            nextSeq += Math.max(1, framesInMessage);
+            try {
+                client.sendBinary(CloseDrainTest.buildAck(nextSeq - 1));
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        }
+
+        synchronized int tableCount(int index) {
+            byte[] frame = frames.get(index);
+            return (frame[OFFSET_TABLE_COUNT] & 0xFF) | ((frame[OFFSET_TABLE_COUNT + 1] & 0xFF) << 8);
+        }
+    }
 }
