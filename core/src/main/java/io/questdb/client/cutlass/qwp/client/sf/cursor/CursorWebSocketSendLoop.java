@@ -31,6 +31,7 @@ import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
 import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.cutlass.qwp.client.NativeBufferWriter;
 import io.questdb.client.cutlass.qwp.client.QwpAuthFailedException;
 import io.questdb.client.cutlass.qwp.client.QwpCredentialUnavailableException;
@@ -41,6 +42,7 @@ import io.questdb.client.cutlass.qwp.client.QwpVersionMismatchException;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
+import io.questdb.client.cutlass.qwp.websocket.WebSocketFrameWriter;
 import io.questdb.client.std.CharSequenceLongHashMap;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.QuietCloseable;
@@ -61,13 +63,13 @@ import java.util.concurrent.locks.LockSupport;
 /**
  * The cursor-engine I/O loop. Owns one I/O thread that:
  * <ol>
- *   <li>Polls {@link CursorSendEngine#publishedFsn()} and walks newly-published
- *       frames from the engine's segments, sending each as one WebSocket
- *       binary frame to the server.</li>
- *   <li>Polls the WebSocket for server ACK frames; on each ACK with
- *       cumulative wire sequence {@code N}, calls
- *       {@code engine.acknowledge(fsnAtZero + N)} so the segment manager
- *       can trim fully-acked segments.</li>
+ *   <li>Walks newly-published frames (past {@link CursorSendEngine#publishedFsn()})
+ *       from the engine's segments, sending each as one WebSocket binary frame
+ *       to the server.</li>
+ *   <li>Receives server ACK frames; on each ACK with cumulative wire sequence
+ *       {@code N}, calls {@code engine.acknowledge(fsnAtZero + N)} so the
+ *       segment manager can trim fully-acked segments and the engine's
+ *       ack-state listener wakes any ack waiters.</li>
  *   <li>On wire failure, runs the configured reconnect policy: capped
  *       exponential backoff with jitter, retried indefinitely (Invariant B --
  *       a store-and-forward drainer never gives up on a wall-clock budget).
@@ -79,9 +81,14 @@ import java.util.concurrent.locks.LockSupport;
  *       has ever come up). On reconnect success, repositions the cursor at
  *       {@code ackedFsn+1} and replays.</li>
  * </ol>
- * No locks on the steady-state path. The producer thread (user) writes
- * into the engine; this thread reads. {@code engine.publishedFsn()} is
- * the volatile publish barrier.
+ * No locks and no polling on the steady-state path. The producer thread (user)
+ * writes into the engine; this thread reads. {@code engine.publishedFsn()} is
+ * the volatile publish barrier. With nothing to send and nothing on the wire
+ * the thread blocks in one poll(2) on the socket and a doorbell
+ * ({@link WebSocketClient#awaitReadableOrWake}); the engine rings the
+ * doorbell when it publishes while the loop is parked ({@link CursorSendEngine#setIoWakeup}),
+ * inbound bytes end the wait on their own, and the only timers are the PING
+ * deadlines. An idle connection therefore costs no CPU.
  * <p>
  * Errors are reported via {@link #getTerminalError()}; the I/O thread sets it
  * and exits. Producers polling {@link #checkError()} surface the failure.
@@ -148,7 +155,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * disables it. Opt-in: off by default, {@code 30000} suits an AWS ALB.
      */
     public static final long DEFAULT_KEEPALIVE_INTERVAL_MILLIS = 0L;
-    public static final long DEFAULT_PARK_NANOS = 50_000L; // 50us idle backoff
+    // Connect-gate and close-race sleeps only; the idle path blocks in awaitIdle().
+    private static final long PARK_NANOS = 50_000L;
     /**
      * Default initial reconnect backoff (100 ms).
      */
@@ -294,6 +302,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // (default), the loop trims on OK as it always has and ignores any
     // STATUS_DURABLE_ACK frames that might still arrive (logs a warning).
     private final boolean durableAckMode;
+    // True when the local tier is requested without the replicated one: the
+    // trim trigger is then STATUS_LOCAL_DURABLE_ACK. Any request including
+    // the replicated tier trims on STATUS_DURABLE_ACK (strongest requested
+    // wins) and treats local acks as progress signals only.
+    private final boolean isLocalAckTrimming;
     // Per-table cumulative durable-upload watermarks, populated only when
     // durableAckMode is true. Updated from STATUS_DURABLE_ACK frame entries
     // (each entry is monotonically non-decreasing per spec). Reset on every
@@ -301,13 +314,17 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // by the server -- holding stale watermarks across the wire boundary
     // would falsely advance trim before re-confirmation.
     private final CharSequenceLongHashMap durableTableWatermarks = new CharSequenceLongHashMap();
+    // Per-table local-fsync watermarks from STATUS_LOCAL_DURABLE_ACK frames
+    // when BOTH tiers are requested. Progress observability only -- the trim
+    // path never reads it (the replicated ack drives the trim). In local-only
+    // mode local acks feed durableTableWatermarks directly instead.
+    private final CharSequenceLongHashMap localDurableTableWatermarks = new CharSequenceLongHashMap();
     // Pre-converted to nanos. Consulted only by the orphan terminal policy. Zero disables
     // the dwell entirely (count-only escalation at MAX_CATCHUP_CAP_GAP_ATTEMPTS); the
     // user-facing 5-minute default is applied at the config layer.
     private final long catchUpCapGapMinEscalationWindowNanos;
     private final CatchUpCapGapPolicy catchUpCapGapPolicy;
     private final CursorSendEngine engine;
-    private final long parkNanos;
     private final ReconnectPolicy reconnectPolicy;
     // FIFO of OK-acked batches awaiting durable-upload confirmation. Used only
     // when durableAckMode is true. Each entry binds a wireSeq to the per-table
@@ -336,6 +353,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // Counters for observability of the durable-ack path. Both are zero
     // when durableAckMode is false.
     private final AtomicLong totalDurableAcks = new AtomicLong();
+    private final AtomicLong totalLocalDurableAcks = new AtomicLong();
     private final AtomicLong totalDurableTrimAdvances = new AtomicLong();
     // Sender-lifetime observability counters: acks, frames sent/replayed,
     // reconnect attempts and successes, server errors. A fresh instance per
@@ -350,7 +368,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // ALWAYS active -- in memory mode, in disk mode, and (critically) even when the
     // per-slot persisted dictionary failed to open. sentDictCount is this loop's model
     // of how many ids the CURRENT server has been told about, and the torn-dict guard
-    // in trySendOne reads it, so it must track the wire in every mode; gating it on
+    // in trySendBatch reads it, so it must track the wire in every mode; gating it on
     // engine.isDeltaDictEnabled() is what once froze it at 0 and terminal'd a slot
     // whose frames replay perfectly from id 0 (see the constructor). On a recovered /
     // orphan-drained slot the constructor SEEDS sentDict* from the persisted
@@ -417,8 +435,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // the upgrade + catch-up then closes) would be mistaken for a deterministic
     // head-frame rejection and escalate to a PROTOCOL_VIOLATION terminal -- breaking
     // the store-and-forward "retry a transient outage forever" contract. Reset per
-    // connection in setWireBaselineWithCatchUp; set in trySendOne after a successful
-    // send.
+    // connection in setWireBaselineWithCatchUp; set in trySendBatch when a data frame
+    // joins the batch (the flush follows in the same call; a failed flush recycles).
     private boolean dataFrameSentThisConnection;
     private volatile WebSocketClient client;
     // Optional: when non-null, every server-rejection error (retriable and
@@ -487,6 +505,22 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // is why a revoked token surfaced to operators as "sf_max_total_bytes too small".
     private volatile Throwable lastReconnectError;
     private volatile Thread ioThread;
+    // Run on every ack advance, on a terminal latch and on close(): the Sender
+    // installs AckWaiters::signal so threads waiting for acks never poll.
+    private volatile Runnable ackProgressListener;
+    // True while the I/O thread is committed to blocking in awaitIdle(). The
+    // engine's publish hook rings the doorbell only when this is set, so a busy
+    // loop costs the producer no syscall per flush. Dekker-ordered with the
+    // publishStamp re-check in ioLoop: the I/O thread sets the flag BEFORE its
+    // final publishStamp read, the producer completes the publish (FSN, bytes,
+    // stamp) BEFORE reading the flag, so a publish that misses the flag is seen
+    // by the re-check and vice versa.
+    private volatile boolean ioParked;
+    // I/O-thread-only. Set by swapClient(): a reconnect rewinds the send cursor
+    // to ackedFsn+1, which creates sendable work from inside the I/O thread --
+    // no producer publish and no inbound byte will announce it. The loop treats
+    // the recycle as work done, so it never blocks on a cursor it just rewound.
+    private boolean recycledThisIteration;
     // Typed marker for a ROTATING-credential auth terminal (401/403): set (before the
     // terminalError latch, so a checkError() caller that observes the latch is guaranteed to
     // observe this marker too) when a mid-drain reconnect sweep on an ORPHAN drainer whose
@@ -526,7 +560,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // rethrows always deliver the same instance.
     private volatile LineSenderException terminalError;
     // Wall clock of the last outbound activity on the wire -- a sent frame
-    // (trySendOne) or a keepalive PING (sendPingIfDue).
+    // (trySendBatch) or a keepalive PING (sendPingIfDue).
     // Throttles the keepalive PINGs so they fire only when the
     // configured interval has elapsed since the most recent outbound event.
     // Set when the I/O loop starts.
@@ -542,7 +576,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // value confirms replay is working; a sustained nonzero rate means
     // the connection is flapping and replay is doing real work each cycle.
     // Snapshotted when an established connection enters reconnect; cleared
-    // back to -1 once trySendOne has caught up past it. Used to count replay
+    // back to -1 once trySendBatch has caught up past it. Used to count replay
     // frames without a per-frame branch on the steady-state path.
     private long replayTargetFsn = -1L;
     // Recovered orphaned deferred tail: frames [orphanSkipStartFsn ..
@@ -550,7 +584,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // -- a transaction whose commit was never published (producer crashed or
     // closed mid-transaction). They must never reach the wire: a
     // commit-bearing frame from THIS session would commit them server-side
-    // and resurrect a partial transaction. trySendOne stops the cursor at the
+    // and resurrect a partial transaction. trySendBatch stops the cursor at the
     // tail; tryRetireOrphanTail retires it with a cumulative self-acknowledge
     // once everything below is server-acked. -1 when none/retired. Written by
     // the constructor and start() (user thread, before the I/O thread exists)
@@ -629,6 +663,36 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private volatile LineSenderException synchronouslySurfacedError;
 
     /**
+     * Policy-aware master constructor. A foreground sender fails fast while
+     * establishing its first connection, then retries endpoint-policy failures
+     * indefinitely after it has been live. An orphan drainer returns such failures
+     * to its owner so the slot can follow its settle/quarantine policy.
+     * <p>
+     * {@code externalFsnBase} is the additive offset this loop folds into every
+     * user-visible FSN it produces (progress-dispatcher advances and
+     * {@link SenderError} spans) -- see {@link #externalFsnBase}. Pass {@code 0L}
+     * unless the caller is replacing an engine a symbol-dict recycle rebuilt.
+     */
+    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
+                                   long fsnAtZero,
+                                   ReconnectFactory reconnectFactory,
+                                   long reconnectInitialBackoffMillis,
+                                   long reconnectMaxBackoffMillis,
+                                   int durableAckTiers,
+                                   long durableAckKeepaliveIntervalMillis,
+                                   int maxHeadFrameRejections,
+                                   long poisonMinEscalationWindowMillis,
+                                   long catchUpCapGapMinEscalationWindowMillis,
+                                   ReconnectPolicy reconnectPolicy,
+                                   long externalFsnBase) {
+        this(client, engine, fsnAtZero, reconnectFactory,
+                reconnectInitialBackoffMillis, reconnectMaxBackoffMillis, durableAckTiers,
+                durableAckKeepaliveIntervalMillis, maxHeadFrameRejections,
+                poisonMinEscalationWindowMillis, catchUpCapGapMinEscalationWindowMillis,
+                catchUpPolicyFor(reconnectPolicy), externalFsnBase);
+    }
+
+    /**
      * Full constructor with explicit reconnect-policy knobs. When
      * {@code reconnectFactory} is non-null, the I/O thread treats wire
      * failures (send/receive errors, server-initiated close) as recoverable:
@@ -646,33 +710,34 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * performs its fail-fast policy before constructing this loop.
      */
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero, long parkNanos,
+                                   long fsnAtZero,
                                    ReconnectFactory reconnectFactory,
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis) {
-        this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
+        this(client, engine, fsnAtZero, reconnectFactory,
                 reconnectInitialBackoffMillis,
-                reconnectMaxBackoffMillis, false);
+                reconnectMaxBackoffMillis, DurableAckTiers.NONE);
     }
 
     /**
-     * Same as the seven-arg constructor but with explicit control over
-     * durable-ack-driven trim. {@code durableAckMode = true} switches the loop
-     * to trim only on {@link WebSocketResponse#STATUS_DURABLE_ACK} frames; OK
+     * Same as the six-arg constructor but with explicit control over
+     * durable-ack-driven trim. A non-empty {@code durableAckTiers} set
+     * ({@link DurableAckTiers}) switches the loop to trim only on the
+     * strongest requested tier's ack frames; OK
      * frames are queued until their per-table seqTxns are covered by a durable
-     * watermark. The default (false) preserves the historical OK-driven trim
+     * watermark. The default (NONE) preserves the historical OK-driven trim
      * and ignores any durable-ack frames that arrive (logging a warning, since
      * a server should not emit them when the client did not opt in).
      */
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero, long parkNanos,
+                                   long fsnAtZero,
                                    ReconnectFactory reconnectFactory,
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis,
-                                   boolean durableAckMode) {
-        this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
+                                   int durableAckTiers) {
+        this(client, engine, fsnAtZero, reconnectFactory,
                 reconnectInitialBackoffMillis,
-                reconnectMaxBackoffMillis, durableAckMode,
+                reconnectMaxBackoffMillis, durableAckTiers,
                 DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS);
     }
 
@@ -684,20 +749,20 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * data, or by accepting indefinite waits on idle connections).
      */
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero, long parkNanos,
+                                   long fsnAtZero,
                                    ReconnectFactory reconnectFactory,
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis,
-                                   boolean durableAckMode,
+                                   int durableAckTiers,
                                    long durableAckKeepaliveIntervalMillis) {
-        this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
+        this(client, engine, fsnAtZero, reconnectFactory,
                 reconnectInitialBackoffMillis,
-                reconnectMaxBackoffMillis, durableAckMode,
+                reconnectMaxBackoffMillis, durableAckTiers,
                 durableAckKeepaliveIntervalMillis, DEFAULT_MAX_HEAD_FRAME_REJECTIONS);
     }
 
     /**
-     * Ten-arg overload — omits the poison-escalation dwell window, which
+     * Nine-arg overload — omits the poison-escalation dwell window, which
      * defaults to {@code 0} (legacy: escalate as soon as maxHeadFrameRejections
      * strikes accrue, with no minimum wall-clock). The user-facing 5s default
      * ({@link #DEFAULT_POISON_MIN_ESCALATION_WINDOW_MILLIS}) is applied at the
@@ -706,43 +771,43 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * strike-count escalation.
      */
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero, long parkNanos,
+                                   long fsnAtZero,
                                    ReconnectFactory reconnectFactory,
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis,
-                                   boolean durableAckMode,
+                                   int durableAckTiers,
                                    long durableAckKeepaliveIntervalMillis,
                                    int maxHeadFrameRejections) {
-        this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
+        this(client, engine, fsnAtZero, reconnectFactory,
                 reconnectInitialBackoffMillis,
-                reconnectMaxBackoffMillis, durableAckMode,
+                reconnectMaxBackoffMillis, durableAckTiers,
                 durableAckKeepaliveIntervalMillis, maxHeadFrameRejections, 0L);
     }
 
     /**
-     * Eleven-arg overload — omits the symbol-dict cap-gap escalation dwell, which
-     * defaults to {@code 0}. This and the twelve-arg overload use the foreground-safe
+     * Ten-arg overload — omits the symbol-dict cap-gap escalation dwell, which
+     * defaults to {@code 0}. This and the eleven-arg overload use the foreground-safe
      * retry-forever policy; orphan drainers opt into count-and-dwell escalation through
      * the policy-aware master constructor.
      */
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero, long parkNanos,
+                                   long fsnAtZero,
                                    ReconnectFactory reconnectFactory,
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis,
-                                   boolean durableAckMode,
+                                   int durableAckTiers,
                                    long durableAckKeepaliveIntervalMillis,
                                    int maxHeadFrameRejections,
                                    long poisonMinEscalationWindowMillis) {
-        this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
+        this(client, engine, fsnAtZero, reconnectFactory,
                 reconnectInitialBackoffMillis,
-                reconnectMaxBackoffMillis, durableAckMode,
+                reconnectMaxBackoffMillis, durableAckTiers,
                 durableAckKeepaliveIntervalMillis, maxHeadFrameRejections,
                 poisonMinEscalationWindowMillis, 0L);
     }
 
     /**
-     * Twelve-arg overload. Catch-up cap gaps are retried indefinitely, which is the
+     * Eleven-arg overload. Catch-up cap gaps are retried indefinitely, which is the
      * required policy for a foreground store-and-forward sender. Orphan drainers use the
      * policy-aware overload below to opt into bounded terminal escalation.
      * <p>
@@ -759,18 +824,18 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * {@link CatchUpCapGapPolicy#TERMINAL_AFTER_SETTLE_BUDGET}.
      */
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero, long parkNanos,
+                                   long fsnAtZero,
                                    ReconnectFactory reconnectFactory,
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis,
-                                   boolean durableAckMode,
+                                   int durableAckTiers,
                                    long durableAckKeepaliveIntervalMillis,
                                    int maxHeadFrameRejections,
                                    long poisonMinEscalationWindowMillis,
                                    long catchUpCapGapMinEscalationWindowMillis) {
-        this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
+        this(client, engine, fsnAtZero, reconnectFactory,
                 reconnectInitialBackoffMillis,
-                reconnectMaxBackoffMillis, durableAckMode,
+                reconnectMaxBackoffMillis, durableAckTiers,
                 durableAckKeepaliveIntervalMillis, maxHeadFrameRejections,
                 poisonMinEscalationWindowMillis, catchUpCapGapMinEscalationWindowMillis,
                 CatchUpCapGapPolicy.RETRY_FOREVER, 0L);
@@ -782,11 +847,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * and maps it onto the {@link CatchUpCapGapPolicy} this constructor takes.
      */
     private CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero, long parkNanos,
+                                   long fsnAtZero,
                                    ReconnectFactory reconnectFactory,
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis,
-                                   boolean durableAckMode,
+                                   int durableAckTiers,
                                    long durableAckKeepaliveIntervalMillis,
                                    int maxHeadFrameRejections,
                                    long poisonMinEscalationWindowMillis,
@@ -945,11 +1010,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // (ensureSentDictCapacity), and releaseSentDictBytes frees only what the loop owns.
         this.fsnAtZero = fsnAtZero;
         this.externalFsnBase = externalFsnBase;
-        this.parkNanos = parkNanos;
         this.reconnectFactory = reconnectFactory;
         this.reconnectInitialBackoffMillis = reconnectInitialBackoffMillis;
         this.reconnectMaxBackoffMillis = reconnectMaxBackoffMillis;
-        this.durableAckMode = durableAckMode;
+        this.durableAckMode = durableAckTiers != DurableAckTiers.NONE;
+        this.isLocalAckTrimming = DurableAckTiers.isTrimOnLocalAck(durableAckTiers);
         // Saturate, never multiply raw -- the same hazard the cap-gap dwell above
         // guards. A raw multiply wraps a large millisecond value NEGATIVE, and both of
         // these read as "elapsed >= window", so a negative makes the gate trivially
@@ -982,59 +1047,25 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
-     * The policy-aware constructor as released in 1.3.x: equivalent to the overload
-     * below with {@code externalFsnBase = 0L}, the value every caller outside a
-     * symbol-dictionary recycle passes. Kept so callers compiled against a released
-     * jar keep linking.
+     * Tier-aware policy constructor with no external FSN offset.
      */
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero, long parkNanos,
+                                   long fsnAtZero,
                                    ReconnectFactory reconnectFactory,
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis,
-                                   boolean durableAckMode,
+                                   int durableAckTiers,
                                    long durableAckKeepaliveIntervalMillis,
                                    int maxHeadFrameRejections,
                                    long poisonMinEscalationWindowMillis,
                                    long catchUpCapGapMinEscalationWindowMillis,
                                    ReconnectPolicy reconnectPolicy) {
-        this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
+        this(client, engine, fsnAtZero, reconnectFactory,
                 reconnectInitialBackoffMillis,
-                reconnectMaxBackoffMillis, durableAckMode,
+                reconnectMaxBackoffMillis, durableAckTiers,
                 durableAckKeepaliveIntervalMillis, maxHeadFrameRejections,
                 poisonMinEscalationWindowMillis, catchUpCapGapMinEscalationWindowMillis,
                 reconnectPolicy, 0L);
-    }
-
-    /**
-     * Policy-aware master constructor. A foreground sender fails fast while
-     * establishing its first connection, then retries endpoint-policy failures
-     * indefinitely after it has been live. An orphan drainer returns such failures
-     * to its owner so the slot can follow its settle/quarantine policy.
-     * <p>
-     * {@code externalFsnBase} is the additive offset this loop folds into every
-     * user-visible FSN it produces (progress-dispatcher advances and
-     * {@link SenderError} spans) -- see {@link #externalFsnBase}. Pass {@code 0L}
-     * unless the caller is replacing an engine a symbol-dict recycle rebuilt.
-     */
-    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero, long parkNanos,
-                                   ReconnectFactory reconnectFactory,
-                                   long reconnectInitialBackoffMillis,
-                                   long reconnectMaxBackoffMillis,
-                                   boolean durableAckMode,
-                                   long durableAckKeepaliveIntervalMillis,
-                                   int maxHeadFrameRejections,
-                                   long poisonMinEscalationWindowMillis,
-                                   long catchUpCapGapMinEscalationWindowMillis,
-                                   ReconnectPolicy reconnectPolicy,
-                                   long externalFsnBase) {
-        this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
-                reconnectInitialBackoffMillis,
-                reconnectMaxBackoffMillis, durableAckMode,
-                durableAckKeepaliveIntervalMillis, maxHeadFrameRejections,
-                poisonMinEscalationWindowMillis, catchUpCapGapMinEscalationWindowMillis,
-                catchUpPolicyFor(reconnectPolicy), externalFsnBase);
     }
 
     private static CatchUpCapGapPolicy catchUpPolicyFor(ReconnectPolicy reconnectPolicy) {
@@ -1366,8 +1397,15 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // that free never happens and a seeded (recovery / orphan-drain) mirror
         // would leak. Capture that here; free it below, after client teardown.
         boolean loopNeverRan = t == null;
+        // The engine's wake hook is deliberately left in place: a replacement
+        // loop over the same engine (connection recycle) may already have
+        // installed its own, and a stale hook into a closed loop is a no-op
+        // (wakeIo() finds a null or closed client).
         if (t != null) {
             LockSupport.unpark(t);
+            // The I/O thread may be blocked in the transport wait, not a park.
+            wakeIo();
+            signalAckProgress();
             // Only await the shutdown latch if the I/O thread actually ran.
             // If start() failed after assigning ioThread but before t.start()
             // succeeded (e.g. native stack OOM), ioLoop never ran and its
@@ -1608,6 +1646,28 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * Total {@code STATUS_LOCAL_DURABLE_ACK} frames received since the loop
+     * started. Always 0 unless the local tier was requested. In local-only
+     * mode these frames drive the trim; with both tiers requested they are
+     * progress signals and the count grows independently of trims.
+     */
+    public long getTotalLocalDurableAcks() {
+        return totalLocalDurableAcks.get();
+    }
+
+    /**
+     * The highest local-fsync seqTxn reported for the table via
+     * {@code STATUS_LOCAL_DURABLE_ACK}, or -1 when none arrived. Meaningful
+     * when both tiers are requested: the local frontier runs ahead of the
+     * replicated trim, and this exposes that early progress per table. In
+     * local-only mode the local acks feed the trim watermarks directly and
+     * this map stays empty.
+     */
+    public long getLocalDurableTableWatermark(CharSequence tableName) {
+        return localDurableTableWatermarks.get(tableName);
+    }
+
+    /**
      * Total times a durable-ack frame caused {@link CursorSendEngine#acknowledge}
      * to advance. Always 0 when {@code durableAckMode} is false. A non-zero
      * value bounded below {@code getTotalDurableAcks} is normal -- many
@@ -1622,7 +1682,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * Cumulative count of frames re-sent during post-reconnect catch-up
      * windows. One increment per replayed frame. Zero in steady state; a
      * sustained nonzero rate signals flapping where every reconnect replays
-     * meaningful work.
+     * meaningful work. Failed batch flushes neither increase this count nor
+     * establish a replay boundary, even if some bytes were written.
      */
     public long getTotalFramesReplayed() {
         return counters.framesReplayed.get();
@@ -1839,6 +1900,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         }
         Thread t = new Thread(this::ioLoop, "qdb-cursor-ws-io");
         t.setDaemon(true);
+        engine.setIoWakeup(this::wakeIoIfParked);
         try {
             t.start();
         } catch (Throwable th) {
@@ -1899,6 +1961,23 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * Records per-table local-fsync watermarks from a
+     * STATUS_LOCAL_DURABLE_ACK frame when both tiers are requested. Progress
+     * observability only: the trim path is driven by the replicated ack.
+     */
+    private void applyLocalDurableAckProgress() {
+        int n = response.getTableEntryCount();
+        for (int i = 0; i < n; i++) {
+            String name = response.getTableName(i);
+            long seqTxn = response.getTableSeqTxn(i);
+            long current = localDurableTableWatermarks.get(name);
+            if (seqTxn > current) {
+                localDurableTableWatermarks.put(name, seqTxn);
+            }
+        }
+    }
+
+    /**
      * Drives the very first connect attempt on the I/O thread, used in the
      * async-initial-connect mode (constructed with {@code client == null}).
      * Reuses the same retry+backoff machinery as {@link #fail(Throwable)}.
@@ -1946,6 +2025,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             releasePendingEntry(pendingDurable.pollFirst());
         }
         durableTableWatermarks.clear();
+        localDurableTableWatermarks.clear();
     }
 
     private static boolean isCatchUpCapGap(Throwable t) {
@@ -1976,7 +2056,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             if (connectGate == CONNECT_GATE_STOP_CLAIMED) {
                 // close() is running or imminent and unparks this thread.
                 while (running) {
-                    LockSupport.parkNanos(parkNanos);
+                    LockSupport.parkNanos(PARK_NANOS);
                 }
                 return;
             }
@@ -2495,6 +2575,22 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         }
     }
 
+    private void signalAckProgress() {
+        Runnable l = ackProgressListener;
+        if (l != null) {
+            l.run();
+        }
+    }
+
+    /**
+     * Installs the callback run on a terminal latch and on {@link #close()}.
+     * Ack advances signal from the engine ({@link CursorSendEngine#setAckStateListener}),
+     * which also covers acks the loop never sees; see {@link AckWaiters}.
+     */
+    public void setAckProgressListener(Runnable listener) {
+        this.ackProgressListener = listener;
+    }
+
     /**
      * Pop every head entry whose tables are all covered by the durable
      * watermarks and call {@link CursorSendEngine#acknowledge} once with
@@ -2663,10 +2759,20 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             // keepalive clock here rather than pinging on the first idle pass.
             lastFrameOrPingNanos = System.nanoTime();
             while (running) {
-                boolean didWork = trySendOne();
+                // Snapshot before the send attempt: a publish after this point is
+                // caught by the re-check below, so the idle decision cannot race it.
+                long publishedBeforeWork = engine.publishStamp();
+                boolean didWork = trySendBatch();
                 // 1. Try to send next frame(s).
                 // 2. Try to receive ACKs.
                 if (tryReceiveAcks()) {
+                    didWork = true;
+                }
+                // A reconnect anywhere in this iteration (inside trySendBatch,
+                // tryReceiveAcks or a previous awaitIdle) repositioned the cursor:
+                // go straight back to trySendBatch instead of blocking.
+                if (recycledThisIteration) {
+                    recycledThisIteration = false;
                     didWork = true;
                 }
                 // 3. In durable-ack mode, prod the server with a keepalive
@@ -2685,8 +2791,21 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 if (!didWork && running && keepaliveIntervalNanos > 0L) {
                     sendPingIfDue(keepaliveIntervalNanos);
                 }
-                if (!didWork && running) {
-                    LockSupport.parkNanos(parkNanos);
+                // 5. Nothing to do: block until the socket has bytes (an ACK),
+                //    a producer publishes a frame (engine rings the doorbell via
+                //    setIoWakeup), close() rings it, or the next PING is due.
+                //    No spinning: an idle connection costs zero CPU. A PING that
+                //    failed in 3/4 reconnected and rewound the cursor, which set
+                //    recycledThisIteration again: go back to trySendBatch instead.
+                if (!didWork && running && !recycledThisIteration) {
+                    ioParked = true;
+                    try {
+                        if (engine.publishStamp() == publishedBeforeWork) {
+                            awaitIdle();
+                        }
+                    } finally {
+                        ioParked = false;
+                    }
                 }
             }
         } catch (Throwable t) {
@@ -2797,7 +2916,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             // barrier. If it saw the new frame bytes, the frameCount write that
             // makes targetFsn discoverable is also visible, so a second lookup
             // must now find it. If the producer publishes later, sendOffset is
-            // still at the old tip and trySendOne() will send the frame normally.
+            // still at the old tip and trySendBatch() will send the frame normally.
             seg = engine.pinSegmentContaining(targetFsn);
             if (seg != null) {
                 positionCursorInSegment(seg, targetFsn);
@@ -2848,6 +2967,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             terminalError = t instanceof LineSenderException
                     ? (LineSenderException) t
                     : new LineSenderException("I/O thread failed: " + t.getMessage(), t);
+            // A producer waiting for acks must see the terminal now, not at its deadline.
+            signalAckProgress();
             // Tell the async dispatcher which SenderError IS the terminal, so
             // close() can distinguish "the custom handler owns THIS terminal"
             // from "the custom handler saw some earlier DROP_AND_CONTINUE".
@@ -2891,6 +3012,74 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * Blocks the I/O thread until there is something to do: socket readable,
+     * doorbell rung, or the earliest PING deadline (none = no timeout). The
+     * doorbell is stateful, so a wake that landed before this call returns
+     * immediately.
+     */
+    private void awaitIdle() {
+        WebSocketClient c = client;
+        if (c == null) {
+            // close() racing the final iterations: running is already false.
+            LockSupport.parkNanos(PARK_NANOS);
+            return;
+        }
+        try {
+            c.awaitReadableOrWake(idleTimeoutMillis());
+        } catch (Throwable t) {
+            fail(t);
+        }
+    }
+
+    /**
+     * Milliseconds until the next PING is due, or -1 when no PING is
+     * configured (or none is pending), i.e. wait without a timeout.
+     */
+    private int idleTimeoutMillis() {
+        long sinceLastNanos = System.nanoTime() - lastFrameOrPingNanos;
+        long remainingNanos = Long.MAX_VALUE;
+        if (keepaliveIntervalNanos > 0L) {
+            remainingNanos = keepaliveIntervalNanos - sinceLastNanos;
+        }
+        if (durableAckMode && durableAckKeepaliveIntervalNanos > 0L && !pendingDurable.isEmpty()) {
+            remainingNanos = Math.min(remainingNanos, durableAckKeepaliveIntervalNanos - sinceLastNanos);
+        }
+        if (remainingNanos == Long.MAX_VALUE) {
+            return -1;
+        }
+        if (remainingNanos <= 0L) {
+            return 0;
+        }
+        // Round up so a due PING is never missed by a sub-millisecond early wake.
+        long millis = (remainingNanos + 999_999L) / 1_000_000L;
+        return (int) Math.min(Integer.MAX_VALUE, millis);
+    }
+
+    /**
+     * Rings the current transport's doorbell so a blocked {@link #awaitIdle}
+     * returns. Called by the engine after every publish and by close().
+     * Safe from any thread; a wake aimed at a connection being swapped is
+     * harmless, because the loop re-reads the engine on every iteration.
+     */
+    public void wakeIo() {
+        WebSocketClient c = client;
+        if (c != null) {
+            c.wake();
+        }
+    }
+
+    /**
+     * The engine's publish hook: rings the doorbell only when the I/O thread is
+     * parked (or about to park), see {@link #ioParked}. A busy loop picks the
+     * frame up on its next iteration without any syscall from the producer.
+     */
+    private void wakeIoIfParked() {
+        if (ioParked) {
+            wakeIo();
+        }
+    }
+
+    /**
      * Send a WebSocket PING, but only when {@code intervalNanos} has elapsed
      * since the last outbound activity -- a sent frame or a prior PING.
      * Serves two callers: the idle keepalive, and the durable-ack keepalive
@@ -2921,11 +3110,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
 
     /**
      * Freezes the highest FSN that completed a send on the connection which
-     * just failed. Frames published before the first connection, or while a
-     * reconnect is in progress, have not been sent and therefore do not belong
-     * to the replay metric. Keep an older, higher target when another failure
-     * interrupts catch-up so the remaining frames still count as re-sends on
-     * the following connection.
+     * just failed. A batch counts only when its entire flush succeeds, even
+     * if a failed flush wrote some bytes. Frames published before the first
+     * connection, or while a reconnect is in progress, have not been sent and
+     * therefore do not belong to the replay metric. Keep an older, higher
+     * target when another failure interrupts catch-up so the remaining frames
+     * still count as re-sends on the following connection.
      */
     private void snapshotReplayTarget() {
         if (hasEverConnected && nextWireSeq > 0L) {
@@ -2940,11 +3130,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * Reset wire state for a fresh connection: install the new client,
      * realign {@code fsnAtZero} to the next unacked FSN, restart wire
      * sequencing from 0, and reposition the cursor so the next
-     * {@link #trySendOne} call replays the first unacked frame.
+     * {@link #trySendBatch} call replays the first unacked frame.
      */
     private void swapClient(WebSocketClient newClient) {
         WebSocketClient old = this.client;
         this.client = newClient;
+        recycledThisIteration = true;
         this.lastReconnectError = null;
         if (old != null) {
             try {
@@ -3082,7 +3273,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // The mirror holds ids [0, sentDictCount). Accumulate ONLY the part of this
         // frame's delta [deltaStart, deltaStart+deltaCount) that extends past the
         // tip -- ids [sentDictCount, deltaStart+deltaCount). Cases:
-        //   - deltaStart > sentDictCount: a gap. trySendOne's torn-dictionary guard
+        //   - deltaStart > sentDictCount: a gap. trySendBatch's torn-dictionary guard
         //     rejects it before send, so it never reaches here; bail defensively
         //     rather than accumulate past a hole.
         //   - deltaEnd <= sentDictCount: a pure replay/overlap we already hold --
@@ -3151,10 +3342,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             return;
         }
         if (required > MAX_SENT_DICT_BYTES) {
-            // Latch a terminal, do NOT just throw: accumulateSentDict runs AFTER
-            // the frame's sendBinary, so a bare throw unwinds to ioLoop -> fail()
-            // -> connectLoop, which (running still true) reconnects and replays the
-            // same frame, which re-overflows the never-shrinking mirror -- an
+            // Latch a terminal, do NOT just throw: accumulateSentDict runs after
+            // batchAppendBinary, before batchFlush. A bare throw unwinds to
+            // ioLoop -> fail() -> connectLoop, which (running still true) reconnects
+            // and retries the same frame, re-overflowing the never-shrinking mirror -- an
             // unbounded reconnect livelock rather than the "fails loudly" the
             // MAX_SENT_DICT_BYTES ceiling promises. recordFatal flips running=false
             // so connectLoop's !running guard winds the loop down and checkError()
@@ -3187,13 +3378,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 sentDictBytesOwned = true;
             }
         } catch (Throwable t) {
-            // Latch for exactly the reason the MAX_SENT_DICT_BYTES arm above does, and it
-            // was asymmetric until now: accumulateSentDict runs AFTER the frame's
-            // sendBinary, so a bare throw unwinds to ioLoop -> fail() -> connectLoop,
-            // which (running still true) reconnects and replays the same frame, which
-            // re-attempts the same allocation. A genuine out-of-memory therefore became an
-            // unbounded reconnect livelock instead of the loud failure the ceiling arm
-            // promises. recordFatal flips running=false so connectLoop winds down and
+            // Latch for the same reason as the MAX_SENT_DICT_BYTES arm above:
+            // accumulateSentDict runs after batchAppendBinary, before batchFlush.
+            // A bare throw unwinds to ioLoop -> fail() -> connectLoop, which
+            // (running still true) reconnects and retries the same allocation.
+            // recordFatal flips running=false so connectLoop winds down and
             // checkError() surfaces it; the throw still unwinds past the pending copy.
             recordFatal(t);
             throw t;
@@ -3646,8 +3835,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     @TestOnly
-    public boolean trySendOneForTest() {
-        return trySendOne();
+    public boolean trySendBatchForTest() {
+        return trySendBatch();
     }
 
     private void ensureCatchUpFrameCapacity(int required) {
@@ -3689,157 +3878,215 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
 
     /**
      * Returns true if at least one frame was sent (caller skips the park).
-     * Bounded: sends at most one frame per call so the ACK side gets
-     * scheduling fairness.
+     * Sends every fully published frame of the current segment in one write,
+     * up to the client's fixed batch byte cap (the default send buffer size,
+     * not the buffer's live capacity), so the ACK side still gets a turn every
+     * cap's worth of bytes and the buffer never grows mid-batch (a single
+     * frame larger than the cap goes alone and grows the buffer).
+     * <p>
+     * Every per-frame check runs per frame, in the old order. A frame that is
+     * not a plain send (orphan tail, corrupt length, torn dictionary, segment
+     * hand-off) ends a non-empty batch BEFORE it: the batch is flushed and the
+     * next call meets that frame with an empty batch, exactly as the
+     * one-frame-per-call path did after its previous frame went out.
      */
-    private boolean trySendOne() {
-        if (orphanSkipTipFsn >= 0 && fsnAtZero + nextWireSeq >= orphanSkipStartFsn) {
-            // The send cursor reached the orphaned deferred tail. Its frames
-            // belong to an aborted transaction and must never be transmitted
-            // (a commit-bearing frame from this session would commit them --
-            // partial-transaction resurrection).
-            if (!tryRetireOrphanTail()) {
-                // Frames below the tail still await server acks; keep ticking
-                // (tryReceiveAcks runs every loop iteration) until the ack
-                // watermark reaches the tail's lower edge.
-                return false;
-            }
-            if (nextWireSeq == 0) {
-                // Reached only when the tail was NOT retirable at connection setup --
-                // both setup sites (swapClient, positionCursorForStart) call
-                // tryRetireOrphanTail first -- which means frames below it still needed
-                // acks, which means they were SENT on this connection. So nextWireSeq is
-                // never 0 here in practice and this arm is effectively dead; it is kept
-                // as a cheap correctness guard rather than removed.
-                //
-                // NB the mapping is untouched only while NO wire sequence has been
-                // consumed. A dictionary catch-up consumes sequences 0..n-1 before any
-                // data frame, so after one this test is false and the recycle below --
-                // which re-anchors the mapping from scratch -- is the correct path, not
-                // an avoidable cost.
-                try {
-                    positionCursorForStart();
-                } catch (CatchUpSendException e) {
-                    // Re-anchor's catch-up send failed. fail() here is a fresh,
-                    // non-re-entrant connectLoop entry from the I/O loop body --
-                    // the same recovery a normal trySendOne send failure takes.
-                    // Preserve the wrapper on a cap gap so connectLoop's
-                    // isCatchUpCapGap keeps the orphan settle episode (attempt count
-                    // + dwell anchor) alive across the re-anchor recycle; an ordinary
-                    // failure unwraps to the raw cause and restarts the episode, like
-                    // any normal send failure.
-                    fail(isCatchUpCapGap(e) ? e : e.getCause());
+    private boolean trySendBatch() {
+        // Appending advances these speculatively; reconnect must snapshot only
+        // completed flushes and retain any older replay target after a failure.
+        final long batchStartWireSeq = nextWireSeq;
+        final long batchStartReplayTargetFsn = replayTargetFsn;
+        int batchFrames = 0;
+        int batchReplayed = 0;
+        long batchBytes = 0;
+        while (true) {
+            if (orphanSkipTipFsn >= 0 && fsnAtZero + nextWireSeq >= orphanSkipStartFsn) {
+                if (batchFrames > 0) {
+                    break;
+                }
+                // The send cursor reached the orphaned deferred tail. Its frames
+                // belong to an aborted transaction and must never be transmitted
+                // (a commit-bearing frame from this session would commit them --
+                // partial-transaction resurrection).
+                if (!tryRetireOrphanTail()) {
+                    // Frames below the tail still await server acks; keep ticking
+                    // (tryReceiveAcks runs every loop iteration) until the ack
+                    // watermark reaches the tail's lower edge.
                     return false;
                 }
-                return true;
-            }
-            // Frames were already sent on this connection: the linear
-            // fsnAtZero + wireSeq mapping cannot express the gap the retired
-            // tail leaves behind. Recycle; swapClient re-anchors the mapping
-            // at ackedFsn + 1 = the first frame past the tail. One reconnect,
-            // once per recovery -- and only on the slow path (unacked
-            // committed frames existed below the tail).
-            fail(new LineSenderException(
-                    "recycling connection after retiring orphaned deferred tail (wire-seq realignment)"));
-            return false;
-        }
-        long pub = sendingSegment.publishedOffset();
-        if (sendOffset >= pub) {
-            // Nothing more in the current segment. If it's a sealed segment
-            // (no longer the live active), advance to the next one.
-            if (sendingSegment != engine.activeSegment()) {
-                // The producer can publish the current segment's last frame
-                // between our first publishedOffset() read and the active
-                // segment check above. Re-read before leaving the segment, or
-                // that frame is skipped permanently.
-                pub = sendingSegment.publishedOffset();
-                if (sendOffset >= pub) {
-                    MmapSegment next = advanceSegment();
-                    if (next != sendingSegment) {
-                        sendingSegment = next;
-                        return true; // let the next iteration try sending
+                if (nextWireSeq == 0) {
+                    // Reached only when the tail was NOT retirable at connection setup --
+                    // both setup sites (swapClient, positionCursorForStart) call
+                    // tryRetireOrphanTail first -- which means frames below it still needed
+                    // acks, which means they were SENT on this connection. So nextWireSeq is
+                    // never 0 here in practice and this arm is effectively dead; it is kept
+                    // as a cheap correctness guard rather than removed.
+                    //
+                    // NB the mapping is untouched only while NO wire sequence has been
+                    // consumed. A dictionary catch-up consumes sequences 0..n-1 before any
+                    // data frame, so after one this test is false and the recycle below --
+                    // which re-anchors the mapping from scratch -- is the correct path, not
+                    // an avoidable cost.
+                    try {
+                        positionCursorForStart();
+                    } catch (CatchUpSendException e) {
+                        // Re-anchor's catch-up send failed. fail() here is a fresh,
+                        // non-re-entrant connectLoop entry from the I/O loop body --
+                        // the same recovery a normal trySendBatch send failure takes.
+                        // Preserve the wrapper on a cap gap so connectLoop's
+                        // isCatchUpCapGap keeps the orphan settle episode (attempt count
+                        // + dwell anchor) alive across the re-anchor recycle; an ordinary
+                        // failure unwraps to the raw cause and restarts the episode, like
+                        // any normal send failure.
+                        fail(isCatchUpCapGap(e) ? e : e.getCause());
+                        return false;
                     }
+                    return true;
                 }
-            } else {
+                // Frames were already sent on this connection: the linear
+                // fsnAtZero + wireSeq mapping cannot express the gap the retired
+                // tail leaves behind. Recycle; swapClient re-anchors the mapping
+                // at ackedFsn + 1 = the first frame past the tail. One reconnect,
+                // once per recovery -- and only on the slow path (unacked
+                // committed frames existed below the tail).
+                fail(new LineSenderException(
+                        "recycling connection after retiring orphaned deferred tail (wire-seq realignment)"));
                 return false;
             }
+            long pub = sendingSegment.publishedOffset();
+            if (sendOffset >= pub) {
+                // Nothing more in the current segment. If it's a sealed segment
+                // (no longer the live active), advance to the next one.
+                if (sendingSegment != engine.activeSegment()) {
+                    // The producer can publish the current segment's last frame
+                    // between our first publishedOffset() read and the active
+                    // segment check above. Re-read before leaving the segment, or
+                    // that frame is skipped permanently.
+                    pub = sendingSegment.publishedOffset();
+                    if (sendOffset >= pub) {
+                        if (batchFrames > 0) {
+                            break;
+                        }
+                        MmapSegment next = advanceSegment();
+                        if (next != sendingSegment) {
+                            sendingSegment = next;
+                            return true; // let the next iteration try sending
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+            // At least the frame header is published; check we have the full frame.
+            if (sendOffset + MmapSegment.FRAME_HEADER_SIZE > pub) {
+                break;
+            }
+            long base = sendingSegment.address();
+            // Frame layout: [u32 crc][u32 payloadLen][payload].
+            int payloadLen = Unsafe.getUnsafe().getInt(base + sendOffset + 4);
+            if (payloadLen < 0) {
+                if (batchFrames > 0) {
+                    break;
+                }
+                fail(new LineSenderException(
+                        "negative payloadLen at offset " + sendOffset
+                                + " in segment baseSeq=" + sendingSegment.baseSeq()));
+                return false;
+            }
+            long frameEnd = sendOffset + MmapSegment.FRAME_HEADER_SIZE + payloadLen;
+            if (frameEnd > pub) {
+                break; // payload not fully published yet
+            }
+            long wireLen = WebSocketFrameWriter.headerSize(payloadLen, true) + (long) payloadLen;
+            if (batchFrames > 0 && batchBytes + wireLen > client.batchByteCap()) {
+                break; // fixed byte cap: the next call carries on from this frame
+            }
+            long frameAddr = base + sendOffset + MmapSegment.FRAME_HEADER_SIZE;
+            // Torn-dictionary guard. sentDictCount is this loop's model of how many ids the
+            // CURRENT server has been told about. A frame whose delta starts ABOVE that
+            // coverage references ids the server was never given, and the server now rejects
+            // such a frame with STATUS_DICTIONARY_GAP rather than null-padding the hole. That
+            // rejection is retriable -- a wire recycle re-registers from id 0 -- but this
+            // frame cannot become sendable without one, and against a server old enough to
+            // null-pad it would land rows with silently NULL symbols. Fail terminally here,
+            // where the unreplayable range is still attributable.
+            //
+            // The guard, the mirror and the catch-up are ONE mechanism and are all
+            // ungated (see the constructor). A frame at deltaStart == sentDictCount is
+            // contiguous and extends the coverage, so a slot whose frames start at id 0
+            // replays cleanly with no persisted dictionary at all -- which is exactly why
+            // the mirror below must keep advancing even when the dictionary is missing.
+            // A gap here therefore means genuine loss: a host/power crash tore the
+            // unsynced .symbol-dict below the ids the surviving frames still reference
+            // (SF is process-crash but not host-crash durable).
+            int deltaStart = frameDeltaStart(frameAddr, payloadLen);
+            if (deltaStart > sentDictCount) {
+                if (batchFrames > 0) {
+                    break;
+                }
+                recordFatal(new LineSenderException(
+                        "recovered store-and-forward symbol dictionary is incomplete (likely a host crash): "
+                                + "frame delta start " + deltaStart + " exceeds recovered dictionary size "
+                                + sentDictCount + "; cannot replay without corrupting data -- resend required"));
+                return false;
+            }
+            try {
+                client.batchAppendBinary(frameAddr, payloadLen);
+            } catch (Throwable t) {
+                nextWireSeq = batchStartWireSeq;
+                replayTargetFsn = batchStartReplayTargetFsn;
+                fail(t);
+                return false;
+            }
+            // The bookkeeping below runs at append time, before the flush: the next
+            // frame's torn-dictionary guard needs this frame's coverage. If the flush
+            // fails, fail() re-anchors the wire state at ackedFsn + 1 on a fresh
+            // client, so an appended-but-unflushed frame is just another unacked
+            // frame; the persistent dictionary mirror is replayed by the catch-up.
+            //
+            // A real ring frame (data or commit) is going out on this connection,
+            // as opposed to only the dictionary catch-up. onClose / handleServerRejection
+            // key their poison-strike vs pre-send decision off this, not off nextWireSeq
+            // (which the catch-up advances).
+            dataFrameSentThisConnection = true;
+            if (deltaStart >= 0) {
+                // Mirror the symbols this frame just registered on the server, so a later
+                // reconnect can rebuild the whole dictionary and the guard above keeps an
+                // accurate view of the server's coverage. Idempotent on replay: a frame
+                // whose delta we already hold advances nothing.
+                //
+                // Ungated (see the constructor): this is the ONLY thing that advances
+                // sentDictCount from the frames themselves, so gating it while leaving the
+                // guard ungated froze the coverage at 0 and terminal'd a slot that replays
+                // perfectly from id 0.
+                accumulateSentDict(frameAddr, payloadLen, deltaStart);
+            }
+            sendOffset = frameEnd;
+            long fsnSent = fsnAtZero + nextWireSeq;
+            nextWireSeq++;
+            batchFrames++;
+            batchBytes += wireLen;
+            if (replayTargetFsn >= 0) {
+                batchReplayed++;
+                if (fsnSent >= replayTargetFsn) {
+                    replayTargetFsn = -1L; // catch-up complete
+                }
+            }
         }
-        // At least the frame header is published; check we have the full frame.
-        if (sendOffset + MmapSegment.FRAME_HEADER_SIZE > pub) {
-            return false;
-        }
-        long base = sendingSegment.address();
-        // Frame layout: [u32 crc][u32 payloadLen][payload].
-        int payloadLen = Unsafe.getUnsafe().getInt(base + sendOffset + 4);
-        if (payloadLen < 0) {
-            fail(new LineSenderException(
-                    "negative payloadLen at offset " + sendOffset
-                            + " in segment baseSeq=" + sendingSegment.baseSeq()));
-            return false;
-        }
-        long frameEnd = sendOffset + MmapSegment.FRAME_HEADER_SIZE + payloadLen;
-        if (frameEnd > pub) {
-            return false; // payload not fully published yet
-        }
-        long frameAddr = base + sendOffset + MmapSegment.FRAME_HEADER_SIZE;
-        // Torn-dictionary guard. sentDictCount is this loop's model of how many ids the
-        // CURRENT server has been told about. A frame whose delta starts ABOVE that
-        // coverage references ids the server was never given, and the server now rejects
-        // such a frame with STATUS_DICTIONARY_GAP rather than null-padding the hole. That
-        // rejection is retriable -- a wire recycle re-registers from id 0 -- but this
-        // frame cannot become sendable without one, and against a server old enough to
-        // null-pad it would land rows with silently NULL symbols. Fail terminally here,
-        // where the unreplayable range is still attributable.
-        //
-        // The guard, the mirror and the catch-up are ONE mechanism and are all
-        // ungated (see the constructor). A frame at deltaStart == sentDictCount is
-        // contiguous and extends the coverage, so a slot whose frames start at id 0
-        // replays cleanly with no persisted dictionary at all -- which is exactly why
-        // the mirror below must keep advancing even when the dictionary is missing.
-        // A gap here therefore means genuine loss: a host/power crash tore the
-        // unsynced .symbol-dict below the ids the surviving frames still reference
-        // (SF is process-crash but not host-crash durable).
-        int deltaStart = frameDeltaStart(frameAddr, payloadLen);
-        if (deltaStart > sentDictCount) {
-            recordFatal(new LineSenderException(
-                    "recovered store-and-forward symbol dictionary is incomplete (likely a host crash): "
-                            + "frame delta start " + deltaStart + " exceeds recovered dictionary size "
-                            + sentDictCount + "; cannot replay without corrupting data -- resend required"));
+        if (batchFrames == 0) {
             return false;
         }
         try {
-            client.sendBinary(frameAddr, payloadLen);
+            client.batchFlush();
         } catch (Throwable t) {
+            nextWireSeq = batchStartWireSeq;
+            replayTargetFsn = batchStartReplayTargetFsn;
             fail(t);
             return false;
         }
-        // A real ring frame (data or commit) has now gone out on this connection,
-        // as opposed to only the dictionary catch-up. onClose / handleServerRejection
-        // key their poison-strike vs pre-send decision off this, not off nextWireSeq
-        // (which the catch-up advances).
-        dataFrameSentThisConnection = true;
-        if (deltaStart >= 0) {
-            // Mirror the symbols this frame just registered on the server, so a later
-            // reconnect can rebuild the whole dictionary and the guard above keeps an
-            // accurate view of the server's coverage. Idempotent on replay: a frame
-            // whose delta we already hold advances nothing.
-            //
-            // Ungated (see the constructor): this is the ONLY thing that advances
-            // sentDictCount from the frames themselves, so gating it while leaving the
-            // guard ungated froze the coverage at 0 and terminal'd a slot that replays
-            // perfectly from id 0.
-            accumulateSentDict(frameAddr, payloadLen, deltaStart);
-        }
         lastFrameOrPingNanos = System.nanoTime();
-        sendOffset = frameEnd;
-        long fsnSent = fsnAtZero + nextWireSeq;
-        nextWireSeq++;
-        counters.framesSent.incrementAndGet();
-        if (replayTargetFsn >= 0) {
-            counters.framesReplayed.incrementAndGet();
-            if (fsnSent >= replayTargetFsn) {
-                replayTargetFsn = -1L; // catch-up complete
-            }
+        counters.framesSent.addAndGet(batchFrames);
+        if (batchReplayed > 0) {
+            counters.framesReplayed.addAndGet(batchReplayed);
         }
         return true;
     }
@@ -4100,7 +4347,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * current connection. Thrown by {@link #sendDictCatchUp}/{@link
      * #sendCatchUpChunk} instead of calling {@link #fail}: the catch-up runs
      * inside {@link #connectLoop} (via {@link #swapClient}) and, on the initial
-     * connect, inside {@link #start()} / {@link #trySendOne} on the caller
+     * connect, inside {@link #start()} / {@link #trySendBatch} on the caller
      * thread. Calling {@code fail()} from there would re-enter {@code
      * connectLoop} -- corrupting the {@code fsnAtZero}/{@code nextWireSeq} wire
      * mapping (a subsequent ACK then trims un-acked frames) and growing the
@@ -4109,7 +4356,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * thread and block {@code Sender} construction indefinitely. Each catch
      * site instead turns it into ONE non-re-entrant reconnect: {@code
      * connectLoop}'s own retry catch (swapClient path), a fresh {@code fail()}
-     * from the I/O loop body (trySendOne path), or dropping the dead client so
+     * from the I/O loop body (trySendBatch path), or dropping the dead client so
      * the I/O thread reconnects (start path). A JVM {@code Error} is never
      * wrapped -- it must stay terminal. The {@code capGap} marker lets the reconnect
      * loop preserve only consecutive incompatible-cap observations; ordinary catch-up
@@ -4237,6 +4484,24 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 }
                 totalDurableAcks.incrementAndGet();
                 applyDurableAck();
+                return;
+            }
+            if (response.isLocalDurableAck()) {
+                if (!durableAckMode) {
+                    LOG.warn("received STATUS_LOCAL_DURABLE_ACK frame without opt-in -- ignoring");
+                    return;
+                }
+                totalLocalDurableAcks.incrementAndGet();
+                if (isLocalAckTrimming) {
+                    // Local is the strongest requested tier, so its ack is
+                    // this connection's trim trigger -- same watermark and
+                    // drain path the replicated ack drives otherwise.
+                    applyDurableAck();
+                } else {
+                    // Both tiers requested: the replicated ack trims; the
+                    // local ack is an early progress signal only.
+                    applyLocalDurableAckProgress();
+                }
                 return;
             }
             // Application-layer rejection by the server. Classify by status
@@ -4401,7 +4666,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // NACK is for a dictionary catch-up frame -- which occupies the
                 // already-acked wire sequences below replayStart -- not a data frame
                 // this connection sent. (dataFrameSentThisConnection can be true here
-                // because trySendOne ships the head data frame before tryReceiveAcks
+                // because trySendBatch ships the head data frame before tryReceiveAcks
                 // reads the catch-up's NACK in the same loop iteration.) Attributing
                 // it a data FSN would key recordHeadRejectionStrike() off a
                 // below-baseline FSN -- negative when replayStart < catchUpFrames --

@@ -83,7 +83,7 @@ public class SegmentManagerManifestFsyncTest {
                 watermark = openWatermark(ff, tmpDir);
                 Assert.assertNotNull(watermark);
                 try (SegmentManager manager = new SegmentManager(
-                        SEGMENT_SIZE, TimeUnit.SECONDS.toNanos(60), SEGMENT_SIZE * 8L, ff)) {
+                        SEGMENT_SIZE, SEGMENT_SIZE * 8L, ff)) {
                     manager.register(ring, tmpDir, watermark);
                     ff.active = true;
                     manager.start();

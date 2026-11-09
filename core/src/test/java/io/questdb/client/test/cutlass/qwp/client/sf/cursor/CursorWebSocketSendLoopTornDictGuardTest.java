@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.test.tools.TestWebSocketClient;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
@@ -51,7 +52,7 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
 /**
  * White-box coverage of the send loop's torn-dictionary guard
- * ({@code trySendOne}: {@code deltaStart > sentDictCount}) firing on a genuine gap.
+ * ({@code trySendBatch}: {@code deltaStart > sentDictCount}) firing on a genuine gap.
  * <p>
  * That guard is the drainer path's SOLE defense: an orphan drainer adopts a slot
  * without running {@code Sender.build()}'s seed-time guard, so on a slot whose
@@ -83,6 +84,48 @@ public class CursorWebSocketSendLoopTornDictGuardTest {
         TestUtils.removeTmpDirRec(sfDir);
     }
 
+    /**
+     * A gapped frame behind good frames ends the batch BEFORE it: the good frames
+     * are flushed first, and the guard fires on the next pass with nothing
+     * pending -- as when each frame had its own send. Firing mid-batch would latch
+     * the terminal with the good frames appended but never written.
+     */
+    @Test
+    public void testGuardFiresOnlyAfterFramesAheadOfTheGapAreFlushed() throws Exception {
+        assertMemoryLeak(() -> {
+            CountingClient client = new CountingClient();
+            try (CursorSendEngine engine = new CursorSendEngine(null, 16_384)) {
+                CursorWebSocketSendLoopCatchUpAlignmentTest.appendDeltaDictFrame(engine, 0, 'a');
+                CursorWebSocketSendLoopCatchUpAlignmentTest.appendDeltaDictFrame(engine, 1, 'b');
+                // the server only ever learns ids 0..1, so a delta starting at 5 is a gap
+                CursorWebSocketSendLoopCatchUpAlignmentTest.appendDeltaDictFrame(engine, 5, 'f');
+                CursorWebSocketSendLoop loop = newLoop(engine, client);
+                try {
+                    loop.setRunningForTest(true);
+                    loop.positionCursorForStartForTest();
+
+                    Assert.assertTrue("the frames ahead of the gap must be sent", loop.trySendBatchForTest());
+                    Assert.assertEquals(2, client.framesSent);
+                    Assert.assertEquals("the frames ahead of the gap must be flushed", 1, client.flushes);
+                    Assert.assertEquals(2, loop.getTotalFramesSent());
+                    loop.checkError(); // no terminal yet
+
+                    Assert.assertFalse("the gapped frame must be refused", loop.trySendBatchForTest());
+                    Assert.assertEquals("no frame may reach the server through a gap", 2, client.framesSent);
+                    try {
+                        loop.checkError();
+                        Assert.fail("the guard must latch a terminal error");
+                    } catch (LineSenderException e) {
+                        Assert.assertTrue("unexpected terminal: " + e.getMessage(),
+                                e.getMessage().contains("incomplete"));
+                    }
+                } finally {
+                    loop.close();
+                }
+            }
+        });
+    }
+
     @Test
     public void testGuardFiresOnGenuineGapAndShipsNoFrame() throws Exception {
         assertMemoryLeak(() -> {
@@ -103,7 +146,7 @@ public class CursorWebSocketSendLoopTornDictGuardTest {
                     // before its first send (no catch-up: the mirror is empty).
                     loop.positionCursorForStartForTest();
 
-                    boolean sent = loop.trySendOneForTest();
+                    boolean sent = loop.trySendBatchForTest();
 
                     Assert.assertFalse("the torn-dict guard must refuse to send the gapped frame", sent);
                     Assert.assertEquals("no frame may reach the server through a gap",
@@ -137,11 +180,11 @@ public class CursorWebSocketSendLoopTornDictGuardTest {
     }
 
     // Constructs a recovery send loop that is never started -- the test drives
-    // positionCursorForStart + trySendOne directly. The reconnect factory throws
+    // positionCursorForStart + trySendBatch directly. The reconnect factory throws
     // because no reconnect is expected before the guard latches its terminal.
     private CursorWebSocketSendLoop newLoop(CursorSendEngine engine, WebSocketClient client) {
         return new CursorWebSocketSendLoop(
-                client, engine, 0, 1_000_000L,
+                client, engine, 0,
                 () -> {
                     throw new IOException("no reconnect in this test");
                 },
@@ -184,8 +227,9 @@ public class CursorWebSocketSendLoopTornDictGuardTest {
     }
 
     // Frame-counting stub transport: completes no real I/O. If the guard ever lets a
-    // gapped frame through, sendBinary bumps framesSent and the test fails.
-    private static final class CountingClient extends WebSocketClient {
+    // gapped frame through, batchAppendBinary bumps framesSent and the test fails.
+    private static final class CountingClient extends TestWebSocketClient {
+        private int flushes;
         private int framesSent;
 
         CountingClient() {
@@ -203,8 +247,13 @@ public class CursorWebSocketSendLoopTornDictGuardTest {
         }
 
         @Override
-        public void sendBinary(long dataPtr, int length) {
+        public void batchAppendBinary(long dataPtr, int length) {
             framesSent++;
+        }
+
+        @Override
+        public void batchFlush() {
+            flushes++;
         }
 
         @Override

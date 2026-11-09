@@ -24,6 +24,8 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
+import io.questdb.client.test.tools.TestWebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpHostHealthTracker;
@@ -184,7 +186,7 @@ public class QwpWebSocketSenderJvmErrorCleanupTest {
         // tail -- narrowing the try block later trips one of the two.
         QwpWebSocketSender sender = newBareSender();
         QwpHostHealthTracker tracker = wireEndpoints(sender, 1);
-        setField(sender, "requestDurableAck", true);
+        setField(sender, "durableAckTiers", DurableAckTiers.REPLICATED | DurableAckTiers.LEGACY_TRUE);
         OutOfMemoryError oom = new OutOfMemoryError("simulated allocation failure");
         StubClient stub = newStubClient();
         stub.durableAckCheckError = oom;
@@ -301,7 +303,7 @@ public class QwpWebSocketSenderJvmErrorCleanupTest {
      * constructor never ran. Fields rely on zero-defaults; tests assign them
      * post-allocation.
      */
-    private static final class StubClient extends WebSocketClient {
+    private static final class StubClient extends TestWebSocketClient {
         int closeCalls;
         Error connectError;
         RuntimeException connectRuntimeError;
@@ -365,7 +367,7 @@ public class QwpWebSocketSenderJvmErrorCleanupTest {
         }
 
         @Override
-        public void setQwpRequestDurableAck(boolean enabled) {
+        public void setQwpDurableAckTiers(int tiers) {
         }
 
         @Override

@@ -638,11 +638,11 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         // releaseBuffer offers the token that unblocks this take.
         //
         // Wait uninterruptibly: if close() interrupts us here we MUST NOT
-        // unwind back to tryParseFrame, because tryParseFrame's tail
-        // advances recvReadPos and runs compactRecvBuffer (Vect.memmove)
-        // over the bytes the user's column pointers still alias inside
-        // recv-buf. A premature unwind on interrupt is the close()-during-
-        // onBatch UAF: the user thread's onBatch reads garbage mid-call.
+        // unwind back to tryParseFrame, because the next receive's
+        // compactRecvBuffer (Vect.memmove) and recv write over the bytes the
+        // user's column pointers still alias inside recv-buf. A premature
+        // unwind on interrupt is the close()-during-onBatch UAF: the user
+        // thread's onBatch reads garbage mid-call.
         // Stay parked; close()'s 5-second join timeout will abandon the
         // I/O thread (the documented timeout-leak path), but only AFTER
         // the user's onBatch has finished -- no UAF.

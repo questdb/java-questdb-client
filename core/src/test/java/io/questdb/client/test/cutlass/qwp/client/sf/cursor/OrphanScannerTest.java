@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.std.Files;
@@ -363,7 +364,7 @@ public class OrphanScannerTest {
             BackgroundDrainer drainer = new BackgroundDrainer(
                     slot, 1024, 8192, () -> {
                 throw new AssertionError("a stale candidate must not connect");
-            }, 1000, 1, 10, true, 0);
+            }, 1000, 1, 10, DurableAckTiers.REPLICATED, 0);
             drainer.run();
 
             assertEquals(BackgroundDrainer.DrainOutcome.SUCCESS, drainer.outcome());

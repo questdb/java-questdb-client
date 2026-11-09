@@ -213,22 +213,34 @@ public class QuestDBBuilderTest {
     }
 
     @Test
+    public void testAutoFlushIntervalOffAcceptedAtBuildWithMinZero() {
+        // auto_flush_interval=off turns off only the time-based trigger and is legal on
+        // WebSocket, alone or with the row trigger off too (only auto_flush=off is rejected).
+        QuestDB.builder().fromConfig(
+                "ws::addr=127.0.0.1:1;auto_flush_interval=off;sender_pool_min=0;query_pool_min=0;").build().close();
+        QuestDB.builder().fromConfig(
+                "ws::addr=127.0.0.1:1;auto_flush_rows=off;auto_flush_interval=off;auto_flush_bytes=65536;"
+                        + "sender_pool_min=0;query_pool_min=0;").build().close();
+    }
+
+    @Test
     public void testMalformedIngressConfigRejectedAtBuildWithMinZero() {
         // sender_pool_min=0 pre-warms nothing, so build() never constructs a
         // Sender -- yet it must still reject a malformed ingress key in the
         // single cluster config up front. Covers a typed enum (tls_verify), a
         // registry-STRING value that only the real Sender parse validates
-        // (auto_flush_rows), and WebSocket build-time checks: auto_flush=off and
-        // auto_flush_interval=off both disable auto-flush (unsupported on
-        // WebSocket), and sf_durability=flush is not yet supported.
+        // (auto_flush_rows), and WebSocket build-time checks: auto_flush=off disables
+        // auto-flush (unsupported on WebSocket), also when auto_flush_bytes is set, and
+        // sf_durability=flush is not yet supported.
         assertBuildRejected(
                 "wss::addr=127.0.0.1:1;tls_verify=strict;sender_pool_min=0;query_pool_min=0;", "tls_verify");
         assertBuildRejected(
                 "ws::addr=127.0.0.1:1;auto_flush_rows=abc;sender_pool_min=0;query_pool_min=0;", "auto_flush_rows");
         assertBuildRejected(
-                "ws::addr=127.0.0.1:1;auto_flush_interval=off;sender_pool_min=0;query_pool_min=0;", "auto-flush");
-        assertBuildRejected(
                 "ws::addr=127.0.0.1:1;auto_flush=off;sender_pool_min=0;query_pool_min=0;", "auto-flush");
+        assertBuildRejected(
+                "ws::addr=127.0.0.1:1;auto_flush=off;auto_flush_bytes=65536;sender_pool_min=0;query_pool_min=0;",
+                "auto-flush");
         assertBuildRejected(
                 "ws::addr=127.0.0.1:1;sf_durability=flush;sender_pool_min=0;query_pool_min=0;", "not yet supported");
     }

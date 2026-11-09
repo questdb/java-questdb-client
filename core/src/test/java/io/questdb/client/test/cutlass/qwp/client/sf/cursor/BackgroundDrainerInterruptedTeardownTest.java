@@ -24,6 +24,8 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
+import io.questdb.client.test.tools.TestWebSocketClient;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
@@ -171,7 +173,7 @@ public class BackgroundDrainerInterruptedTeardownTest {
 
             final BackgroundDrainer drainer = new BackgroundDrainer(
                     tmpDir, SEGMENT_BYTES, Long.MAX_VALUE, factory,
-                    5_000L, 10L, 50L, false, 0L);
+                    5_000L, 10L, 50L, DurableAckTiers.NONE, 0L);
 
             Thread runner = new Thread(drainer::run, "drainer-runner");
             runner.setDaemon(true);
@@ -259,13 +261,13 @@ public class BackgroundDrainerInterruptedTeardownTest {
      * only. Every send throws, so handing it to a live loop deterministically
      * drives the I/O thread into its reconnect path without native I/O.
      */
-    private static final class StubWebSocketClient extends WebSocketClient {
+    private static final class StubWebSocketClient extends TestWebSocketClient {
         StubWebSocketClient() {
             super(DefaultHttpClientConfiguration.INSTANCE, PlainSocketFactory.INSTANCE);
         }
 
         @Override
-        public void sendBinary(long dataPtr, int length) {
+        public void batchAppendBinary(long dataPtr, int length) {
             throw new IllegalStateException("stub: wire down");
         }
 

@@ -667,17 +667,64 @@ public class CursorSendEngineTest {
         });
     }
 
+    /**
+     * A watermark rejected as past publishedFsn (a host crash in MEMORY
+     * durability leaves one after a trim msync) must be overwritten at
+     * recovery. Nothing else writes it until the next ACK advance, which
+     * during an outage is never, and once new frames push publishedFsn past
+     * the stale value a later recovery would accept it and skip them.
+     */
+    @Test(timeout = 60_000L)
+    public void testRejectedWatermarkIsOverwrittenAtRecovery() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE + 4 * (MmapSegment.FRAME_HEADER_SIZE + 64);
+            long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.getUnsafe().setMemory(buf, 64, (byte) 0);
+            try {
+                // Session 1: three 4-frame segments, ACK 3 so the first one is trimmed.
+                try (CursorSendEngine e = new CursorSendEngine(tmpDir, segSize)) {
+                    for (int i = 0; i < 12; i++) {
+                        e.appendBlocking(buf, 64);
+                    }
+                    assertTrue(e.acknowledge(3L));
+                    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+                    while (Files.exists(tmpDir + "/sf-initial.sfa") && System.nanoTime() < deadline) {
+                        LockSupport.parkNanos(1_000_000L);
+                    }
+                    assertFalse("trim did not happen", Files.exists(tmpDir + "/sf-initial.sfa"));
+                }
+                try (AckWatermark w = AckWatermark.open(tmpDir)) {
+                    assertNotNull(w);
+                    w.write(100L);
+                }
+                // Session 2: 100 > publishedFsn 11 is rejected, seed is 3. The
+                // server is unreachable: frames up to 120 are appended, none acked.
+                try (CursorSendEngine e = new CursorSendEngine(tmpDir, segSize)) {
+                    assertEquals(3L, e.ackedFsn());
+                    assertEquals(11L, e.publishedFsn());
+                    while (e.publishedFsn() < 120L) {
+                        e.appendBlocking(buf, 64);
+                    }
+                }
+                // Session 3: nothing above FSN 3 was ever acknowledged.
+                try (CursorSendEngine e = new CursorSendEngine(tmpDir, segSize)) {
+                    assertEquals(120L, e.publishedFsn());
+                    assertEquals("frames 12..100 were never acknowledged", 3L, e.ackedFsn());
+                }
+            } finally {
+                Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
     @Test(timeout = 30_000L)
     public void testManagerPersistedWatermarkSurvivesRestart() throws Exception {
         // Positive twin of testRecoveryAdvancesAckedFsnPastWatermark. That test
-        // FORGES the .ack-watermark by hand; this one drives a real, started
-        // SegmentManager to PERSIST it from real acks, then proves a second
-        // session recovers the manager-written value. Without this, a regression
-        // that silently stopped the manager's trim-path watermark.write() (e.g.
-        // an inverted `registered` gate) would pass the whole suite: the durable-
-        // ack tests assert on the in-memory engine.ackedFsn(), and the recovery
-        // tests forge the watermark, so nothing observes the manager doing the
-        // write.
+        // FORGES the .ack-watermark by hand; this one lets a real ack write it
+        // (engine.acknowledge, the I/O thread's path), then proves a second
+        // session recovers that value. The durable-ack tests assert on the
+        // in-memory engine.ackedFsn() and the recovery tests forge the file,
+        // so nothing else observes the ACK path doing the write.
         TestUtils.assertMemoryLeak(() -> {
             long segSize = MmapSegment.HEADER_SIZE
                     + 4 * (MmapSegment.FRAME_HEADER_SIZE + 64);
@@ -699,7 +746,7 @@ public class CursorSendEngineTest {
                     // watermark to disk. If the trim-path write were gated off this
                     // never reaches 2 and the helper fails with a clear message,
                     // rather than the test flaking on a close()-before-tick race.
-                    awaitManagerPersistedWatermark(tmpDir, 2L);
+                    awaitPersistedWatermark(tmpDir, 2L);
                 }
                 // Session 2: recovery must seed ackedFsn from the manager-written
                 // watermark (2), not the bare segment-derived seed (-1).
@@ -1052,12 +1099,17 @@ public class CursorSendEngineTest {
     }
 
     private static void poisonRegisterGeneration(SegmentManager manager) throws Exception {
-        // register() advances fileGeneration before publishing the ring. Nulling
-        // it forces a deterministic constructor failure after the ring and
-        // watermark exist, without adding a production test hook.
-        Field f = SegmentManager.class.getDeclaredField("fileGeneration");
+        // register() adds the slot's side-file gauge to the budget before it
+        // publishes the ring. Nulling the budget's gauge list forces a
+        // deterministic constructor failure after the ring and watermark
+        // exist, without adding a production test hook; the worker never
+        // touches that list, so a shared manager keeps running.
+        Field b = SegmentManager.class.getDeclaredField("budget");
+        b.setAccessible(true);
+        Object budget = b.get(manager);
+        Field f = budget.getClass().getDeclaredField("sideFileGauges");
         f.setAccessible(true);
-        f.set(manager, null);
+        f.set(budget, null);
     }
 
     private static Thread workerThread(SegmentManager manager) throws Exception {
@@ -1067,10 +1119,10 @@ public class CursorSendEngineTest {
     }
 
     // Polls the on-disk watermark until it reads {@code expected}, or fails after
-    // a bounded wait. The probe is a second mapping of the same file the manager
-    // worker writes through; its MAP_SHARED reads observe the worker's writes, and
-    // it is closed before the next session opens the slot.
-    private static void awaitManagerPersistedWatermark(String slotDir, long expected) {
+    // a bounded wait. The probe is a second mapping of the same file the engine
+    // writes through; its MAP_SHARED reads observe those writes, and it is
+    // closed before the next session opens the slot.
+    private static void awaitPersistedWatermark(String slotDir, long expected) {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
         long last = AckWatermark.INVALID;
         try (AckWatermark probe = AckWatermark.open(slotDir)) {
@@ -1083,7 +1135,7 @@ public class CursorSendEngineTest {
                 LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(2));
             }
         }
-        fail("manager did not persist watermark=" + expected
+        fail("watermark=" + expected + " was not persisted"
                 + " within 10s (last on-disk read=" + last + ")");
     }
 

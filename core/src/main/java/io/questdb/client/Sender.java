@@ -36,6 +36,7 @@ import io.questdb.client.cutlass.line.LineTcpSenderV3;
 import io.questdb.client.cutlass.line.http.AbstractLineHttpSender;
 import io.questdb.client.cutlass.line.tcp.DelegatingTlsChannel;
 import io.questdb.client.cutlass.line.tcp.PlainTcpLineChannel;
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.cutlass.qwp.client.QwpUdpSender;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
@@ -1047,7 +1048,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private static final int DEFAULT_MAXIMUM_BUFFER_CAPACITY = 100 * 1024 * 1024;
         private static final int DEFAULT_MAX_BACKGROUND_DRAINERS = 4;
         private static final int DEFAULT_MAX_BACKOFF_MILLIS = 1_000;
-        // Default ceiling on cursor-allocated bytes (active + spare + sealed).
+        // Default ceiling on cursor-allocated bytes (active + sealed segments).
         // RAM is precious; if you're not persisting to disk, you don't get
         // to balloon. Memory mode = 128 MiB (32 segments at default size).
         private static final long DEFAULT_MAX_BYTES_MEMORY = 128L * 1024 * 1024;
@@ -1117,6 +1118,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private final IntList ports = new IntList();
         private long authTimeoutMillis = QwpWebSocketSender.DEFAULT_AUTH_TIMEOUT_MS;
         private int autoFlushBytes = PARAMETER_NOT_SET_EXPLICITLY;
+        // Set by disableAutoFlush(). auto_flush_interval=off also stores the interval as
+        // Integer.MAX_VALUE, so the WebSocket validation keys on this flag to reject only the
+        // full disable and accept the interval-only opt-out.
+        private boolean autoFlushDisabled;
         private int autoFlushIntervalMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private int autoFlushRows = PARAMETER_NOT_SET_EXPLICITLY;
         private int bufferCapacity = PARAMETER_NOT_SET_EXPLICITLY;
@@ -1227,7 +1232,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         // max backoff (default 5_000) for the cursor I/O loop's exponential
         // retry-with-jitter loop.
         private long reconnectMaxDurationMillis = PARAMETER_NOT_SET_EXPLICITLY;
-        private boolean requestDurableAck;
+        private int durableAckTiers = DurableAckTiers.NONE;
         private int retryTimeoutMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private boolean transactional;
         private String senderId = DEFAULT_SENDER_ID;
@@ -1864,7 +1869,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * It is essential to ensure the maximum buffer capacity is sufficient to accommodate all locally buffered data.
          * <p>
          * This method should only be used when communicating via the HTTP protocol. Calling this method is illegal when
-         * communicating over the TCP protocol.
+         * communicating over the TCP or WebSocket protocol. On WebSocket, {@code auto_flush_interval=off} turns off
+         * only the time-based trigger.
          *
          * @return this instance for method chaining
          * @see #autoFlushRows(int)
@@ -1882,6 +1888,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
 
             this.autoFlushRows = AUTO_FLUSH_DISABLED;
             this.autoFlushIntervalMillis = Integer.MAX_VALUE;
+            this.autoFlushDisabled = true;
             return this;
         }
 
@@ -2693,9 +2700,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
-         * Opts the connection in for STATUS_DURABLE_ACK frames. When enabled,
-         * servers with primary replication will emit per-table durable-upload
-         * watermarks as WAL data reaches the object store.
+         * Opts the connection in for STATUS_DURABLE_ACK frames, using the
+         * legacy "true" request token. Equivalent to
+         * {@code requestDurableAck("on")}: requests the replicated tier, so
+         * servers without primary replication deny the request and the
+         * sender fails at connect.
          * <p>
          * This setting is only supported for WebSocket transport.
          *
@@ -2703,10 +2712,48 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * @return this instance for method chaining
          */
         public LineSenderBuilder requestDurableAck(boolean enabled) {
+            return requestDurableAckTiers(enabled
+                    ? DurableAckTiers.REPLICATED | DurableAckTiers.LEGACY_TRUE
+                    : DurableAckTiers.NONE);
+        }
+
+        /**
+         * Requests durable-ack streams by tier set. Accepted values:
+         * {@code off}, {@code on} (legacy alias for the replicated tier),
+         * {@code local}, {@code replicated}, {@code local,replicated}.
+         * <ul>
+         *   <li>{@code local} -- the server emits STATUS_LOCAL_DURABLE_ACK
+         *       frames once commits are fdatasync-durable on its disk; the
+         *       sender trims its store-and-forward copy on them.</li>
+         *   <li>{@code replicated} -- the server emits STATUS_DURABLE_ACK
+         *       frames once commits reach the object store; the sender trims
+         *       on them.</li>
+         *   <li>{@code local,replicated} -- both streams; the sender trims on
+         *       the replicated ack (the strongest requested guarantee) and
+         *       receives local acks as early progress signals.</li>
+         * </ul>
+         * The server grants the full requested set or denies the request
+         * entirely (the sender then fails at connect); it never substitutes
+         * a weaker guarantee.
+         * <p>
+         * This setting is only supported for WebSocket transport.
+         *
+         * @param tiers the requested tier set
+         * @return this instance for method chaining
+         */
+        public LineSenderBuilder requestDurableAck(CharSequence tiers) {
+            int parsed = DurableAckTiers.parseConfigValue(tiers);
+            if (parsed < 0) {
+                throw new LineSenderException("invalid request_durable_ack [value=").put(tiers).put(", allowed-values=[on, off, local, replicated, local,replicated]]");
+            }
+            return requestDurableAckTiers(parsed);
+        }
+
+        private LineSenderBuilder requestDurableAckTiers(int tiers) {
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
                 throw new LineSenderException("request_durable_ack is only supported for WebSocket transport");
             }
-            this.requestDurableAck = enabled;
+            this.durableAckTiers = tiers;
             return this;
         }
 
@@ -2962,8 +3009,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
-         * Hard cap on cursor-allocated bytes: active + spare + sealed
-         * segments, plus the symbol-dictionary side-file with {@code sf_dir}.
+         * Hard cap on cursor-allocated bytes: active + sealed segments, plus
+         * with {@code sf_dir} the symbol-dictionary side-file and the segment
+         * pre-created for the next rotation (taken only while there is room).
          * When the cap is reached, the producer's {@code Sender.flush()}
          * blocks until ACK-driven trim frees space; if the cap is exhausted
          * past the configured deadline (default 30 s), {@code flush()} throws.
@@ -2992,7 +3040,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * every other sender built on it, instead of to a private budget of
          * {@code sf_max_total_bytes}. Together those senders never hold more
          * than the budget's capacity, except that each is always granted its
-         * minimum working set: the active segment plus one spare. This
+         * minimum working set: the active segment plus the one it rotates
+         * into. This
          * sender's own {@code sf_max_total_bytes} then caps only the
          * background orphan drainers it starts. The connection pool behind
          * {@link QuestDB} builds every sender this way. WebSocket transport
@@ -3518,9 +3567,14 @@ public interface Sender extends Closeable, ArraySender<Sender> {
 
             int actualAutoFlushRows = autoFlushRows == PARAMETER_NOT_SET_EXPLICITLY ? DEFAULT_WS_AUTO_FLUSH_ROWS : autoFlushRows;
             int actualAutoFlushBytes = autoFlushBytes == PARAMETER_NOT_SET_EXPLICITLY ? DEFAULT_WS_AUTO_FLUSH_BYTES : autoFlushBytes;
-            long actualAutoFlushIntervalNanos = autoFlushIntervalMillis == PARAMETER_NOT_SET_EXPLICITLY
-                    ? DEFAULT_WS_AUTO_FLUSH_INTERVAL_NANOS
-                    : TimeUnit.MILLISECONDS.toNanos(autoFlushIntervalMillis);
+            long actualAutoFlushIntervalNanos;
+            if (autoFlushIntervalMillis == PARAMETER_NOT_SET_EXPLICITLY) {
+                actualAutoFlushIntervalNanos = DEFAULT_WS_AUTO_FLUSH_INTERVAL_NANOS;
+            } else if (autoFlushIntervalMillis == Integer.MAX_VALUE) {
+                actualAutoFlushIntervalNanos = 0; // explicit off: QwpWebSocketSender treats 0 as disabled
+            } else {
+                actualAutoFlushIntervalNanos = TimeUnit.MILLISECONDS.toNanos(autoFlushIntervalMillis);
+            }
 
             Supplier<String> wsAuthHeader = buildWebSocketAuthHeader(tokenProvider);
 
@@ -3695,7 +3749,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                                 actualAutoFlushBytes,
                                 actualAutoFlushIntervalNanos,
                                 wsAuthHeader,
-                                requestDurableAck,
+                                durableAckTiers,
                                 cursorEngine,
                                 actualCloseFlushTimeoutMillis,
                                 actualReconnectMaxDurationMillis,
@@ -4162,13 +4216,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         throw new LineSenderException("request_durable_ack is only supported for WebSocket transport");
                     }
                     pos = getValue(configurationString, pos, sink, "request_durable_ack");
-                    if (Chars.equalsIgnoreCase("on", sink)) {
-                        requestDurableAck(true);
-                    } else if (Chars.equalsIgnoreCase("off", sink)) {
-                        requestDurableAck(false);
-                    } else {
-                        throw new LineSenderException("invalid request_durable_ack [value=").put(sink).put(", allowed-values=[on, off]]");
+                    int tiers = DurableAckTiers.parseConfigValue(sink);
+                    if (tiers < 0) {
+                        throw new LineSenderException("invalid request_durable_ack [value=").put(sink).put(", allowed-values=[on, off, local, replicated, local,replicated]]");
                     }
+                    requestDurableAckTiers(tiers);
                 } else if (Chars.equals("transaction", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException("transaction is only supported for WebSocket transport");
@@ -4636,13 +4688,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 }
                 s = view.getStr("request_durable_ack");
                 if (s != null) {
-                    if (s.equalsIgnoreCase("on")) {
-                        requestDurableAck(true);
-                    } else if (s.equalsIgnoreCase("off")) {
-                        requestDurableAck(false);
-                    } else {
-                        throw new LineSenderException("invalid request_durable_ack [value=").put(s).put(", allowed-values=[on, off]]");
+                    int tiers = DurableAckTiers.parseConfigValue(s);
+                    if (tiers < 0) {
+                        throw new LineSenderException("invalid request_durable_ack [value=").put(s).put(", allowed-values=[on, off, local, replicated, local,replicated]]");
                     }
+                    requestDurableAckTiers(tiers);
                 }
                 s = view.getStr("drain_orphans");
                 if (s != null) {
@@ -4772,7 +4822,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             m.put("auto_flush_interval", autoFlushIntervalMillis);
             m.put("max_name_len", maxNameLength);
             m.put("transaction", transactional);
-            m.put("request_durable_ack", requestDurableAck);
+            m.put("request_durable_ack", DurableAckTiers.configValue(durableAckTiers));
             m.put("sender_id", senderId);
             m.put("sf_dir", sfDir);
             m.put("sf_max_segment_bytes", sfMaxSegmentBytes);
@@ -4892,7 +4942,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         .put(", requestedCapacity=").put(bufferCapacity)
                         .put("]");
             }
-            if (requestDurableAck && protocol != PROTOCOL_WEBSOCKET) {
+            if (durableAckTiers != DurableAckTiers.NONE && protocol != PROTOCOL_WEBSOCKET) {
                 throw new LineSenderException("request_durable_ack is only supported for WebSocket transport");
             }
             if (protocol == PROTOCOL_HTTP) {
@@ -5018,7 +5068,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 if (protocolVersion != PARAMETER_NOT_SET_EXPLICITLY) {
                     throw new LineSenderException("protocol version is not supported for WebSocket protocol");
                 }
-                if (autoFlushIntervalMillis == Integer.MAX_VALUE) {
+                if (autoFlushDisabled) {
                     throw new LineSenderException("disabling auto-flush is not supported for WebSocket protocol");
                 }
                 if ((sfDurability == SfDurability.FLUSH || sfDurability == SfDurability.APPEND)) {
