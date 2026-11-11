@@ -24,8 +24,9 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
+import io.questdb.client.test.tools.TestWebSocketClient;
 import io.questdb.client.DefaultHttpClientConfiguration;
-import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
@@ -53,11 +54,10 @@ public class CursorWebSocketSendLoopBlockedSendCloseTest {
                     client,
                     engine,
                     0L,
-                    CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                     null,
                     1_000L,
                     5_000L,
-                    false
+                    DurableAckTiers.NONE
             );
             long payload = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
             Thread closer = null;
@@ -129,11 +129,10 @@ public class CursorWebSocketSendLoopBlockedSendCloseTest {
                     client,
                     engine,
                     0L,
-                    CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                     null,
                     1_000L,
                     5_000L,
-                    false
+                    DurableAckTiers.NONE
             );
             long payload = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
             Thread closer = null;
@@ -191,7 +190,7 @@ public class CursorWebSocketSendLoopBlockedSendCloseTest {
         });
     }
 
-    private static final class BlockingSendClient extends WebSocketClient {
+    private static final class BlockingSendClient extends TestWebSocketClient {
         private final AtomicBoolean cleanupClaimed = new AtomicBoolean();
         private final AtomicInteger cleanupCount = new AtomicInteger();
         private final CountDownLatch cleanupDone = new CountDownLatch(1);
@@ -232,7 +231,12 @@ public class CursorWebSocketSendLoopBlockedSendCloseTest {
         }
 
         @Override
-        public void sendBinary(long dataPtr, int length, int timeout) {
+        public void batchAppendBinary(long dataPtr, int length) {
+            // the frame goes out (and blocks) in batchFlush
+        }
+
+        @Override
+        public void batchFlush() {
             sendThread.set(Thread.currentThread());
             sendEntered.countDown();
             try {

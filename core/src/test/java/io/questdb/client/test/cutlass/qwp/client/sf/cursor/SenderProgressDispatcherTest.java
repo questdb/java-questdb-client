@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderProgressHandler;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderProgressDispatcher;
 import org.junit.Assert;
 import org.junit.Test;
@@ -58,8 +59,7 @@ public class SenderProgressDispatcherTest {
                     } else {
                         lastDelivered.set(fsn);
                     }
-                },
-                4);
+                });
         Assert.assertTrue(d.offer(10));
         Assert.assertTrue("first delivery should start",
                 firstDelivered.await(2, TimeUnit.SECONDS));
@@ -79,7 +79,7 @@ public class SenderProgressDispatcherTest {
 
     @Test
     public void testCloseIsIdempotent() {
-        SenderProgressDispatcher d = new SenderProgressDispatcher(fsn -> { /* no-op */ }, 4);
+        SenderProgressDispatcher d = new SenderProgressDispatcher(fsn -> { /* no-op */ });
         d.offer(1);
         d.close();
         d.close();
@@ -87,25 +87,9 @@ public class SenderProgressDispatcherTest {
     }
 
     @Test
-    public void testConstructorRejectsBadCapacity() {
-        try {
-            new SenderProgressDispatcher(fsn -> { /* no-op */ }, 0).close();
-            Assert.fail("expected IllegalArgumentException");
-        } catch (IllegalArgumentException expected) {
-            Assert.assertTrue(expected.getMessage().contains("capacity"));
-        }
-        try {
-            new SenderProgressDispatcher(fsn -> { /* no-op */ }, -1).close();
-            Assert.fail("expected IllegalArgumentException");
-        } catch (IllegalArgumentException expected) {
-            // ok
-        }
-    }
-
-    @Test
     public void testConstructorRejectsNullHandler() {
         try {
-            new SenderProgressDispatcher(null, 4).close();
+            new SenderProgressDispatcher(null).close();
             Assert.fail("expected IllegalArgumentException");
         } catch (IllegalArgumentException expected) {
             Assert.assertTrue(expected.getMessage().contains("handler"));
@@ -122,7 +106,7 @@ public class SenderProgressDispatcherTest {
             synchronized (received) {
                 received.add(fsn);
             }
-        }, 16)) {
+        })) {
             d.offer(5);
             waitForDelivered(d, 1);
             // Re-offers of equal-or-lower values must not produce additional
@@ -167,7 +151,7 @@ public class SenderProgressDispatcherTest {
                 Thread.currentThread().interrupt();
             }
             delivered.incrementAndGet();
-        }, 4)) {
+        })) {
             Assert.assertTrue(d.offer(1));
             Assert.assertTrue("handler must enter before pile-up",
                     firstDelivered.await(2, TimeUnit.SECONDS));
@@ -190,6 +174,33 @@ public class SenderProgressDispatcherTest {
     }
 
     @Test
+    public void testHandlerInstalledAfterSkippedOffersDelivers() throws Exception {
+        // Offers skipped under the no-op default must not be lost: once a
+        // real handler is installed, the newest watermark reaches it.
+        AtomicLong last = new AtomicLong(-1);
+        CountDownLatch gotNewest = new CountDownLatch(1);
+        try (SenderProgressDispatcher d = new SenderProgressDispatcher(
+                DefaultSenderProgressHandler.INSTANCE, "late-handler-progress-test")) {
+            for (int i = 1; i <= 1000; i++) {
+                Assert.assertTrue(d.offer(i));
+            }
+            Assert.assertNull("no-op handler must not start the dispatcher thread",
+                    d.getWorkerThreadForTesting());
+            d.setHandler(fsn -> {
+                last.set(fsn);
+                if (fsn == 1000) {
+                    gotNewest.countDown();
+                }
+            });
+            // No later offer: setHandler() must start delivery of the saved watermark.
+            Assert.assertTrue("real handler must receive the newest watermark",
+                    gotNewest.await(1, TimeUnit.SECONDS));
+            Assert.assertEquals(1000L, last.get());
+            Assert.assertNotNull(d.getWorkerThreadForTesting());
+        }
+    }
+
+    @Test
     public void testHandlerThrowDoesNotKillDispatcher() throws Exception {
         // A handler that throws on the first call must not poison the
         // dispatcher; subsequent offers must still deliver.
@@ -202,7 +213,7 @@ public class SenderProgressDispatcherTest {
             if (fsn == 3) {
                 reachedThird.countDown();
             }
-        }, 4)) {
+        })) {
             Assert.assertTrue(d.offer(1));
             // Ensure the throwing call has happened before queuing the next
             // values, otherwise overwrite-collapse may swallow them.
@@ -221,8 +232,7 @@ public class SenderProgressDispatcherTest {
     public void testLazyStartOnFirstOffer() throws Exception {
         // No thread should exist before the first offer; workloads with zero
         // acks pay zero thread cost.
-        try (SenderProgressDispatcher d = new SenderProgressDispatcher(fsn -> { /* no-op */ },
-                16, "lazy-start-progress-test")) {
+        try (SenderProgressDispatcher d = new SenderProgressDispatcher(fsn -> { /* no-op */ }, "lazy-start-progress-test")) {
             Assert.assertNull("dispatcher thread must not exist before first offer",
                     findThreadByName("lazy-start-progress-test"));
             Assert.assertTrue(d.offer(0));
@@ -238,8 +248,26 @@ public class SenderProgressDispatcherTest {
     }
 
     @Test
+    public void testNoOpHandlerDoesNotStartDispatcherThread() {
+        // The vast majority of senders never install a progress handler.
+        // For them an ACK must cost nothing on the dispatcher path: no
+        // thread start, no unpark.
+        try (SenderProgressDispatcher d = new SenderProgressDispatcher(
+                DefaultSenderProgressHandler.INSTANCE, "noop-progress-test")) {
+            for (int i = 0; i < 1000; i++) {
+                Assert.assertTrue(d.offer(i));
+            }
+            Assert.assertNull("no-op handler must not start the dispatcher thread",
+                    d.getWorkerThreadForTesting());
+            Assert.assertNull(findThreadByName("noop-progress-test"));
+            Assert.assertEquals(0L, d.getTotalDelivered());
+            Assert.assertEquals(0L, d.getDroppedNotifications());
+        }
+    }
+
+    @Test
     public void testOfferAfterCloseReturnsFalse() {
-        SenderProgressDispatcher d = new SenderProgressDispatcher(fsn -> { /* no-op */ }, 4);
+        SenderProgressDispatcher d = new SenderProgressDispatcher(fsn -> { /* no-op */ });
         d.close();
         Assert.assertFalse(d.offer(1));
         Assert.assertEquals(0L, d.getDroppedNotifications());
@@ -253,7 +281,7 @@ public class SenderProgressDispatcherTest {
             if (fsn == 3) {
                 reachedLast.countDown();
             }
-        }, 4)) {
+        })) {
             d.offer(1);
             // Wait for delivery before issuing the next, to avoid 1 and 2
             // collapsing into a single delivery.

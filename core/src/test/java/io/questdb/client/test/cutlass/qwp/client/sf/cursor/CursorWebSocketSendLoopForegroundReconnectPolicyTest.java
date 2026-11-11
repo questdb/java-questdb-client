@@ -24,6 +24,8 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
+import io.questdb.client.test.tools.TestWebSocketClient;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketClientFactory;
@@ -91,16 +93,16 @@ public class CursorWebSocketSendLoopForegroundReconnectPolicyTest {
                         null,
                         engine,
                         0L,
-                        CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                         factory,
                         1L,
                         4L,
-                        false,
+                        DurableAckTiers.NONE,
                         0L,
                         CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
                         0L,
                         0L,
-                        CursorWebSocketSendLoop.ReconnectPolicy.FOREGROUND);
+                        CursorWebSocketSendLoop.ReconnectPolicy.FOREGROUND,
+                        0L);
                 try {
                     seedMirror(loop, "sym0"); // non-empty mirror => swapClient runs the catch-up
                     appendFrame(engine, (byte) 1);
@@ -161,16 +163,16 @@ public class CursorWebSocketSendLoopForegroundReconnectPolicyTest {
                         null,
                         engine,
                         0L,
-                        CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                         factory,
                         1L,
                         4L,
-                        durableAck,
+                        durableAck ? DurableAckTiers.REPLICATED | DurableAckTiers.LEGACY_TRUE : DurableAckTiers.NONE,
                         durableAck ? 10L : 0L,
                         CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
                         0L,
                         0L,
-                        CursorWebSocketSendLoop.ReconnectPolicy.FOREGROUND);
+                        CursorWebSocketSendLoop.ReconnectPolicy.FOREGROUND,
+                        0L);
                 try {
                     appendFrame(engine, (byte) 1);
                     loop.start();
@@ -218,16 +220,16 @@ public class CursorWebSocketSendLoopForegroundReconnectPolicyTest {
                         initialClient,
                         engine,
                         0L,
-                        CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                         factory,
                         1L,
                         4L,
-                        durableAck,
+                        durableAck ? DurableAckTiers.REPLICATED | DurableAckTiers.LEGACY_TRUE : DurableAckTiers.NONE,
                         durableAck ? 10L : 0L,
                         CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
                         0L,
                         0L,
-                        CursorWebSocketSendLoop.ReconnectPolicy.FOREGROUND);
+                        CursorWebSocketSendLoop.ReconnectPolicy.FOREGROUND,
+                        0L);
                 // Wire an error sink. Retrying is what the store-and-forward contract
                 // demands, but until dispatchRetriedEndpointPolicyFailure existed the retry
                 // was programmatically INVISIBLE: dispatchError ran only in the terminal
@@ -296,7 +298,9 @@ public class CursorWebSocketSendLoopForegroundReconnectPolicyTest {
         WebSocketClient client = WebSocketClientFactory.newPlainTextInstance();
         try {
             client.setQwpMaxVersion(1);
-            client.setQwpRequestDurableAck(durableAck);
+            client.setQwpDurableAckTiers(durableAck
+                    ? DurableAckTiers.REPLICATED | DurableAckTiers.LEGACY_TRUE
+                    : DurableAckTiers.NONE);
             client.setConnectTimeout(5_000);
             client.connect("localhost", port);
             client.upgrade("/write/v4", 5_000, null);
@@ -471,7 +475,7 @@ public class CursorWebSocketSendLoopForegroundReconnectPolicyTest {
         }
     }
 
-    private static final class FailingSendClient extends WebSocketClient {
+    private static final class FailingSendClient extends TestWebSocketClient {
         private FailingSendClient() {
             super(DefaultHttpClientConfiguration.INSTANCE, PlainSocketFactory.INSTANCE);
         }
@@ -487,7 +491,7 @@ public class CursorWebSocketSendLoopForegroundReconnectPolicyTest {
         }
 
         @Override
-        public void sendBinary(long dataPtr, int length) {
+        public void batchAppendBinary(long dataPtr, int length) {
             throw new RuntimeException("transient wire failure during catch-up");
         }
 

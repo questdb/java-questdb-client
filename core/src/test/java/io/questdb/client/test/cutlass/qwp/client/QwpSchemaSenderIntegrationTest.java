@@ -2873,6 +2873,43 @@ public class QwpSchemaSenderIntegrationTest {
         }
     }
 
+    @Test(timeout = 20_000)
+    public void testSymbolDictRecycleKeepsSchemaContractAndCache() throws Exception {
+        assertMemoryLeak(() -> {
+            for (String mode : new String[]{"strict", "auto"}) {
+                SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 41, 73);
+                try (TestWebSocketServer server = schemaServer(handler);
+                     Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                             + ";schema_mode=" + mode + ";auto_flush_rows=2147483647;auto_flush_bytes=0;"
+                             + "auto_flush_interval=2147483646;close_flush_timeout_millis=0;")) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    sender.table("events").stringColumn("id", "11121314-1516-1718-0102-030405060708").atNow();
+                    Assert.assertTrue(mode, sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+                    Assert.assertEquals(mode, 1, handler.describeRequests.get());
+
+                    // The backlog is acknowledged, so this table() call runs the recycle,
+                    // which rebuilds the I/O loop and connects it in the background. The
+                    // rebuilt loop must keep the schema contract and the cached schema.
+                    sender.resetSymbolDictionary();
+                    sender.table("events");
+                    Assert.assertEquals(mode, 1, ws.getSymbolDictEpoch());
+                    sender.stringColumn("id", "21222324-2526-2728-3132-333435363738").atNow();
+                    Assert.assertTrue(mode, sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+                    Assert.assertEquals(mode, 2, server.handshakeCount());
+
+                    // A legacy row would ship the text as a VARCHAR column instead.
+                    FrameReader reader = new FrameReader(handler.awaitDataFrames(2).get(1));
+                    reader.schemaTable("events", 41, 73, 1, "id", QwpConstants.TYPE_UUID);
+                    Assert.assertEquals(mode, 0, reader.u8());
+                    Assert.assertEquals(mode, 0x3132333435363738L, reader.i64());
+                    Assert.assertEquals(mode, 0x2122232425262728L, reader.i64());
+                    reader.eof();
+                    Assert.assertEquals(mode, 1, handler.describeRequests.get());
+                }
+            }
+        });
+    }
+
     private static TestWebSocketServer legacyServer(SchemaHandler handler) throws Exception {
         TestWebSocketServer server = new TestWebSocketServer(handler);
         try {

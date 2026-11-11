@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentBudget;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
 import io.questdb.client.std.Files;
@@ -85,7 +86,7 @@ public class SegmentManagerRecoveryCapTest {
             SegmentRing ring = SegmentRing.openExisting(slotDir, SEGMENT_SIZE);
             Assert.assertNotNull("recovery should produce a ring", ring);
 
-            SegmentManager manager = new SegmentManager(SEGMENT_SIZE, 1_000_000L /* 1ms */, cap);
+            SegmentManager manager = new SegmentManager(SEGMENT_SIZE, new SegmentBudget(cap));
             try (SegmentManager ignored = manager) {
                 manager.start();
                 manager.register(ring, slotDir);

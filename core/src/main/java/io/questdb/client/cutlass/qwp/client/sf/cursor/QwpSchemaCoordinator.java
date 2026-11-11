@@ -13,6 +13,7 @@ import io.questdb.client.cutlass.qwp.protocol.QwpSchemaResponse;
 import io.questdb.client.std.Chars;
 
 import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 import static io.questdb.client.LineSenderSchemaException.Reason.ACCESS_DENIED;
@@ -23,10 +24,16 @@ final class QwpSchemaCoordinator {
     // Bounded by the tables this sender writes, like its per-table buffers,
     // each far heavier than an entry, so it needs no eviction.
     private final HashMap<String, QwpSchemaResponse> cache = new HashMap<>();
+    // Ends the I/O loop's idle wait; see resolve().
+    private final Runnable ioWakeup;
     private volatile boolean closed;
     private volatile boolean hasPendingRequest;
     private long nextRequestId = 1;
     private Request request;
+
+    QwpSchemaCoordinator(Runnable ioWakeup) {
+        this.ioWakeup = ioWakeup;
+    }
 
     QwpSchemaResponse resolve(CharSequence tableName, long timeoutMillis, boolean refresh) {
         final long startNanos = System.nanoTime();
@@ -60,9 +67,12 @@ final class QwpSchemaCoordinator {
             }
             Request own = new Request(key, tableName.toString(), startNanos, timeoutNanos);
             request = own;
-            // The I/O loop polls hasPendingRequest on every pass; waking it would
-            // cut its reconnect backoff short while the wire is down.
             hasPendingRequest = true;
+            // The I/O loop blocks without a timeout when idle. It raises its parked
+            // flag before it checks hasUnsentRequest(), so it either sees this
+            // request or gets this wake. The wake ends only the idle wait, never a
+            // reconnect backoff.
+            ioWakeup.run();
             while (!own.done) {
                 try {
                     await(own, key);
@@ -106,6 +116,15 @@ final class QwpSchemaCoordinator {
 
     boolean hasPendingRequest() {
         return hasPendingRequest;
+    }
+
+    /**
+     * Whether a request waits for the I/O thread to send it. A request already
+     * on the wire does not count: its reply arrives as inbound bytes, which end
+     * the I/O thread's idle wait on their own.
+     */
+    synchronized boolean hasUnsentRequest() {
+        return request != null && !request.done && request.sentClient == null;
     }
 
     synchronized boolean isLiveResponse(WebSocketClient client, long requestId) {
@@ -214,6 +233,20 @@ final class QwpSchemaCoordinator {
         return true;
     }
 
+    synchronized void exportCache(Map<String, QwpSchemaResponse> sink) {
+        sink.putAll(cache);
+    }
+
+    /**
+     * Seeds the cache with schemas another coordinator exported. ACK feedback on
+     * the new connection refreshes any entry that went stale meanwhile.
+     */
+    synchronized void importCache(Map<String, QwpSchemaResponse> source) {
+        if (!closed) {
+            cache.putAll(source);
+        }
+    }
+
     synchronized void clearCache() {
         if (!closed) {
             cache.clear();
@@ -240,8 +273,9 @@ final class QwpSchemaCoordinator {
     }
 
     synchronized void close() {
+        // Keeps the cache: every read path checks closed first, and a
+        // symbol-dictionary recycle exports the entries after close.
         closed = true;
-        cache.clear();
         if (request != null) {
             complete(request, null, failure(SCHEMA_UNAVAILABLE, request.key, "schema coordinator is closed"));
         }

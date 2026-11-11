@@ -316,7 +316,7 @@ public class CursorWebSocketSchemaLifecycleTest {
             CursorWebSocketSendLoop loop = null;
             try {
                 loop = new CursorWebSocketSendLoop(connect(server.getPort()), engine, 0,
-                        CursorWebSocketSendLoop.DEFAULT_PARK_NANOS, reconnect, 200, 200);
+                        reconnect, 200, 200);
                 loop.start();
                 server.close();
                 Assert.assertTrue(reconnect.firstAttempt.await(5, TimeUnit.SECONDS));
@@ -496,7 +496,7 @@ public class CursorWebSocketSchemaLifecycleTest {
             CursorWebSocketSendLoop.ReconnectFactory reconnect
     ) {
         return new CursorWebSocketSendLoop(
-                client, engine, 0, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS, reconnect, 1, 4);
+                client, engine, 0, reconnect, 1, 4);
     }
 
     private static Lookup lookup(

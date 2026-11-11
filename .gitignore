@@ -9,6 +9,7 @@ core/target
 utils/target
 utils/dependency-reduced-pom.xml
 examples/target
+azure/target
 compat/target
 core/node
 deploy*.bat
@@ -26,6 +27,7 @@ core/CMakeCache.txt
 **/.project
 **/.settings
 **/.classpath
+**/.factorypath
 **/build
 **/CMakeFiles
 .envrc

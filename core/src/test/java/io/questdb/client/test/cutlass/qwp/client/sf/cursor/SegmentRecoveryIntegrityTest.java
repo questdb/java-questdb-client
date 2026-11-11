@@ -549,7 +549,7 @@ public class SegmentRecoveryIntegrityTest {
     public void testSingleSectorTearLeavesPriorManifestRecordRecoverable() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             long segmentSize = MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + 64;
-            long payload = Unsafe.malloc(65, MemoryTag.NATIVE_DEFAULT);
+            long payload = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
             try {
                 MmapSegment initial = MmapSegment.create(
                         tmpDir + "/sf-initial.sfa", 0, segmentSize);
@@ -562,16 +562,13 @@ public class SegmentRecoveryIntegrityTest {
                 SegmentRing ring = SegmentRing.openExisting(
                         FilesFacade.INSTANCE, tmpDir, segmentSize);
                 Assert.assertNotNull(ring);
-                try {
-                    MmapSegment spare = MmapSegment.create(
-                            tmpDir + "/sf-0000000000000001.sfa", 1, segmentSize);
-                    ring.installHotSpare(spare);
-                    Assert.assertEquals("oversized append must rotate but leave the new active empty",
-                            SegmentRing.PAYLOAD_TOO_LARGE, ring.appendOrFsn(payload, 65));
-                    Assert.assertEquals(0L, ring.publishedFsn());
-                    Assert.assertEquals(1L, ring.getActive().baseSeq());
-                } finally {
-                    ring.close();
+                ring.close();
+                // A rotation that committed its manifest record, then died before
+                // writing the first frame into the empty successor.
+                MmapSegment.create(tmpDir + "/sf-0000000000000001.sfa", 1, segmentSize).close();
+                try (SfManifest manifest = SfManifest.open(FilesFacade.INSTANCE, tmpDir)) {
+                    Assert.assertNotNull(manifest);
+                    manifest.update(0, 1);
                 }
 
                 String manifestPath = tmpDir + "/" + MANIFEST_NAME;
@@ -592,7 +589,7 @@ public class SegmentRecoveryIntegrityTest {
                 Assert.assertFalse("a surviving record must prevent manifest quarantine",
                         Files.exists(tmpDir + "/" + MANIFEST_NAME + ".corrupt"));
             } finally {
-                Unsafe.free(payload, 65, MemoryTag.NATIVE_DEFAULT);
+                Unsafe.free(payload, 64, MemoryTag.NATIVE_DEFAULT);
             }
         });
     }
@@ -611,7 +608,7 @@ public class SegmentRecoveryIntegrityTest {
                 }
             };
             SegmentManager manager = new SegmentManager(
-                    SEGMENT_SIZE, SegmentManager.DEFAULT_POLL_NANOS,
+                    SEGMENT_SIZE,
                     SegmentManager.UNLIMITED_TOTAL_BYTES, facade);
             manager.start();
             try {
@@ -643,7 +640,7 @@ public class SegmentRecoveryIntegrityTest {
                 }
             };
             SegmentManager manager = new SegmentManager(
-                    SEGMENT_SIZE, SegmentManager.DEFAULT_POLL_NANOS,
+                    SEGMENT_SIZE,
                     SegmentManager.UNLIMITED_TOTAL_BYTES, facade);
             manager.start();
             try {

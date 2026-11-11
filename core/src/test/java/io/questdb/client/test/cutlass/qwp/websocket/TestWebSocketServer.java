@@ -29,6 +29,7 @@ import io.questdb.client.cutlass.qwp.websocket.WebSocketOpcode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.InputStream;
@@ -49,6 +50,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.ToIntFunction;
 
 /**
  * A simple WebSocket server for client integration testing.
@@ -57,9 +59,17 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class TestWebSocketServer implements Closeable {
     private static final Logger LOG = LoggerFactory.getLogger(TestWebSocketServer.class);
     private static final String WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    // Number of upgrades the authorization validator rejected, over the server's lifetime.
+    private final AtomicInteger authRejectCount = new AtomicInteger();
+    // Number of well-formed upgrade requests received, accepted or rejected, over the server's lifetime.
+    private final AtomicInteger upgradeRequestCount = new AtomicInteger();
     // Authorization header value captured from each well-formed upgrade request ("" when absent), in
     // arrival order. Tests poll this to assert the token a provider supplied at each (re)handshake.
     private final BlockingQueue<String> capturedAuthHeaders = new LinkedBlockingQueue<>();
+    // X-QWP-Request-Durable-Ack header value captured from each well-formed upgrade request
+    // ("" when absent), in arrival order. Tests poll this to assert the exact request token
+    // the client sent for a configured tier set ("true", "local", "local,replicated", ...).
+    private final BlockingQueue<String> capturedDurableAckRequests = new LinkedBlockingQueue<>();
     private final List<ClientHandler> clients = new CopyOnWriteArrayList<>();
     private final boolean emitDurableAckHeader;
     private final WebSocketServerHandler handler;
@@ -84,6 +94,12 @@ public class TestWebSocketServer implements Closeable {
     // connected even after they have all disconnected.
     private final AtomicInteger totalHandshakes = new AtomicInteger();
     private Thread acceptThread;
+    // When non-null, decides every upgrade from its Authorization header value ("" when absent): a positive
+    // return is the HTTP status to reject with (e.g. 401, 403), zero or less accepts. Lets a test model a
+    // server that validates tokens - expired, revoked or rotated - rather than one that rejects blindly.
+    private volatile ToIntFunction<String> authorizationValidator;
+    // WWW-Authenticate value sent with a 401 reject (validator or setRejectWithStatus), or null for none.
+    private volatile String rejectWwwAuthenticate;
     // X-QuestDB-Role value to emit on handshake responses. null = omit the
     // header (legacy behavior for tests written before role-aware failover).
     // The server emits the header on both the 101 success path and (when
@@ -115,6 +131,11 @@ public class TestWebSocketServer implements Closeable {
     // Live-updatable via setSuppressDurableAckHeader(), so a test can start
     // in the gap and later let the cluster "settle".
     private volatile boolean suppressDurableAckHeader;
+    // When non-null, 101 upgrade responses carry this exact X-QWP-Durable-Ack value
+    // instead of the granted-set echo -- simulating a server that grants a set other
+    // than the one requested (e.g. "enabled" to a client asking for "local"). The
+    // client must treat any token other than its expected one as a denial.
+    private volatile String durableAckHeaderValue;
     // When > 0, the next handshake responds with this status code + the
     // reason phrase from {@link #rejectingStatusReason}. Used to simulate
     // 401, 403, 404, 426, 503, etc. that the failover loop should
@@ -170,6 +191,12 @@ public class TestWebSocketServer implements Closeable {
     public TestWebSocketServer(WebSocketServerHandler handler,
                                boolean emitDurableAckHeader, String advertisedRole,
                                int requestedPort) throws IOException {
+        this(handler, emitDurableAckHeader, advertisedRole, requestedPort, false);
+    }
+
+    private TestWebSocketServer(WebSocketServerHandler handler,
+                                boolean emitDurableAckHeader, String advertisedRole,
+                                int requestedPort, boolean tls) throws IOException {
         this.handler = handler;
         this.emitDurableAckHeader = emitDurableAckHeader;
         this.advertisedRole = advertisedRole;
@@ -179,9 +206,19 @@ public class TestWebSocketServer implements Closeable {
         // which another process could grab a pre-selected port before start()
         // binds it. Pinning to loopback keeps client "localhost" connections
         // routed here rather than to a wildcard listener on the same port.
-        serverSocket = new ServerSocket(requestedPort, 50, java.net.InetAddress.getLoopbackAddress());
+        serverSocket = tls
+                ? TestTls.serverSocketFactory().createServerSocket(requestedPort, 50, java.net.InetAddress.getLoopbackAddress())
+                : new ServerSocket(requestedPort, 50, java.net.InetAddress.getLoopbackAddress());
         serverSocket.setSoTimeout(100);
         this.port = serverSocket.getLocalPort();
+    }
+
+    /**
+     * A server that speaks WebSocket over TLS with a self-signed certificate (see {@link TestTls}). Connect
+     * with {@code wss::...;tls_verify=unsafe_off;}.
+     */
+    public static TestWebSocketServer tls(WebSocketServerHandler handler) throws IOException {
+        return new TestWebSocketServer(handler, false, null, 0, true);
     }
 
     public boolean awaitRoleReject(long timeout, TimeUnit unit) throws InterruptedException {
@@ -242,6 +279,46 @@ public class TestWebSocketServer implements Closeable {
      */
     public int handshakeCount() {
         return totalHandshakes.get();
+    }
+
+    /**
+     * Number of upgrades the authorization validator rejected over the server's lifetime.
+     */
+    public int authRejectCount() {
+        return authRejectCount.get();
+    }
+
+    /**
+     * Closes every live client connection while the listener keeps accepting, so connected clients see a
+     * dropped connection and reconnect.
+     */
+    public void dropAllConnections() {
+        for (ClientHandler client : clients) {
+            client.close();
+        }
+    }
+
+    /**
+     * Number of well-formed upgrade requests received over the server's lifetime, whatever the answer.
+     */
+    public int upgradeRequestCount() {
+        return upgradeRequestCount.get();
+    }
+
+    /**
+     * Installs a validator that decides every upgrade from its {@code Authorization} header value ({@code ""}
+     * when absent): a positive return is the HTTP status to reject with, zero or less accepts. Pass null to
+     * remove it. Runs before the role and status rejects.
+     */
+    public void setAuthorizationValidator(ToIntFunction<String> validator) {
+        this.authorizationValidator = validator;
+    }
+
+    /**
+     * {@code WWW-Authenticate} value to send with a {@code 401} reject, or null for none.
+     */
+    public void setRejectWwwAuthenticate(String value) {
+        this.rejectWwwAuthenticate = value;
     }
 
     /**
@@ -331,6 +408,25 @@ public class TestWebSocketServer implements Closeable {
      * advertising, the way a rolling upgrade eventually settles. The setting
      * applies to every new handshake until cleared.
      */
+    /**
+     * Blocks up to {@code timeout} for the next captured X-QWP-Request-Durable-Ack
+     * header value ("" when the upgrade request carried none). Values arrive in
+     * handshake order, one per well-formed upgrade request.
+     */
+    public String pollDurableAckRequest(long timeout, TimeUnit unit) throws InterruptedException {
+        return capturedDurableAckRequests.poll(timeout, unit);
+    }
+
+    /**
+     * Forces 101 upgrade responses to carry this exact {@code X-QWP-Durable-Ack}
+     * value instead of echoing the client's requested set. Pass null to restore
+     * the echo behavior. Only takes effect on a server constructed with
+     * {@code emitDurableAckHeader}.
+     */
+    public void setDurableAckHeaderValue(String value) {
+        this.durableAckHeaderValue = value;
+    }
+
     public void setSuppressDurableAckHeader(boolean suppressDurableAckHeader) {
         this.suppressDurableAckHeader = suppressDurableAckHeader;
     }
@@ -376,6 +472,24 @@ public class TestWebSocketServer implements Closeable {
         return bb.array();
     }
 
+    private static void appendUnmaskedFrame(ByteArrayOutputStream frames, int opcode, byte[] payload) {
+        frames.write(0x80 | (opcode & 0x0F));
+        int length = payload.length;
+        if (length <= 125) {
+            frames.write(length);
+        } else if (length <= 65_535) {
+            frames.write(126);
+            frames.write((length >> 8) & 0xFF);
+            frames.write(length & 0xFF);
+        } else {
+            frames.write(127);
+            for (int shift = 56; shift >= 0; shift -= 8) {
+                frames.write((int) (((long) length >>> shift) & 0xFF));
+            }
+        }
+        frames.write(payload, 0, length);
+    }
+
     private static boolean isReadPath(String path) {
         return path != null && path.startsWith("/read");
     }
@@ -408,6 +522,7 @@ public class TestWebSocketServer implements Closeable {
             while (running.get()) {
                 try {
                     Socket clientSocket = serverSocket.accept();
+                    clientSocket.setTcpNoDelay(true);
                     ClientHandler clientHandler = new ClientHandler(clientSocket);
                     clients.add(clientHandler);
                     clientHandler.start();
@@ -434,6 +549,9 @@ public class TestWebSocketServer implements Closeable {
         }
 
         default void onPong(ClientHandler client, byte[] data) {
+        }
+
+        default void onPing(ClientHandler client) {
         }
     }
 
@@ -462,15 +580,40 @@ public class TestWebSocketServer implements Closeable {
         public void close() {
             running.set(false);
             try {
+                // FIN after the frames already written, never an RST: closing with unread input
+                // resets the connection and purges anything still queued for the peer.
+                socket.shutdownOutput();
+                if (readThread == Thread.currentThread()) {
+                    drainInput();
+                }
+            } catch (IOException e) {
+                // ignore
+            }
+            try {
                 socket.close();
             } catch (IOException e) {
                 // ignore
             }
-            if (readThread != null) {
+            if (readThread != null && readThread != Thread.currentThread()) {
                 try {
                     readThread.join(5000);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
+                }
+            }
+        }
+
+        private void drainInput() throws IOException {
+            socket.setSoTimeout(20);
+            byte[] scratch = new byte[8192];
+            long deadlineNanos = System.nanoTime() + 200_000_000L;
+            while (System.nanoTime() < deadlineNanos) {
+                try {
+                    if (in.read(scratch) < 0) {
+                        return;
+                    }
+                } catch (SocketTimeoutException e) {
+                    return;
                 }
             }
         }
@@ -481,6 +624,40 @@ public class TestWebSocketServer implements Closeable {
 
         public synchronized void sendPing(byte[] data) throws IOException {
             writeFrame(WebSocketOpcode.PING, data, data.length);
+        }
+
+        /**
+         * Writes a binary frame in socket writes of at most {@code chunkBytes}.
+         * Over TLS every write becomes its own record (records cap at 16 KiB),
+         * so this controls the record sizes the client has to decrypt.
+         */
+        public synchronized void sendBinaryInChunks(byte[] data, int chunkBytes) throws IOException {
+            ByteArrayOutputStream frame = new ByteArrayOutputStream(data.length + 14);
+            appendUnmaskedFrame(frame, WebSocketOpcode.BINARY, data);
+            byte[] bytes = frame.toByteArray();
+            for (int off = 0; off < bytes.length; off += chunkBytes) {
+                out.write(bytes, off, Math.min(chunkBytes, bytes.length - off));
+            }
+            out.flush();
+        }
+
+        /**
+         * Writes a binary frame and then a close frame with one socket write,
+         * so the client reads the close right behind the binary frame -- the
+         * way a server answering its last frame on the way out flushes both.
+         */
+        public synchronized void sendBinaryThenClose(byte[] data, int code, String reason) throws IOException {
+            byte[] reasonBytes = (reason != null && !reason.isEmpty())
+                    ? reason.getBytes(StandardCharsets.UTF_8) : new byte[0];
+            byte[] closePayload = new byte[2 + reasonBytes.length];
+            closePayload[0] = (byte) ((code >> 8) & 0xFF);
+            closePayload[1] = (byte) (code & 0xFF);
+            System.arraycopy(reasonBytes, 0, closePayload, 2, reasonBytes.length);
+            ByteArrayOutputStream frames = new ByteArrayOutputStream(data.length + closePayload.length + 20);
+            appendUnmaskedFrame(frames, WebSocketOpcode.BINARY, data);
+            appendUnmaskedFrame(frames, WebSocketOpcode.CLOSE, closePayload);
+            out.write(frames.toByteArray());
+            out.flush();
         }
 
         public synchronized void sendClose(int code, String reason) throws IOException {
@@ -557,6 +734,7 @@ public class TestWebSocketServer implements Closeable {
                         handler.onBinaryMessage(this, payload);
                         break;
                     case WebSocketOpcode.PING:
+                        handler.onPing(this);
                         try {
                             writeFrame(WebSocketOpcode.PONG, payload, payload.length);
                         } catch (IOException e) {
@@ -606,6 +784,7 @@ public class TestWebSocketServer implements Closeable {
 
             String key = null;
             String authorization = "";
+            String durableAckRequest = "";
             String[] lines = request.toString().split("\r\n");
             if (lines.length > 0) {
                 // GET <path> HTTP/1.1
@@ -620,13 +799,17 @@ public class TestWebSocketServer implements Closeable {
                     key = line.substring(18).trim();
                 } else if (lower.startsWith("authorization:")) {
                     authorization = line.substring("authorization:".length()).trim();
+                } else if (lower.startsWith("x-qwp-request-durable-ack:")) {
+                    durableAckRequest = line.substring("x-qwp-request-durable-ack:".length()).trim();
                 }
             }
 
             if (key == null) {
                 return false;
             }
+            upgradeRequestCount.incrementAndGet();
             capturedAuthHeaders.add(authorization);
+            capturedDurableAckRequests.add(durableAckRequest);
             hasRequestedSchema |= request.toString().toLowerCase(java.util.Locale.ROOT)
                     .contains("x-qwp-request-schema: true\r\n");
 
@@ -637,18 +820,25 @@ public class TestWebSocketServer implements Closeable {
                 return false;
             }
 
+            // Token-validating reject path: the validator inspects the presented credential.
+            ToIntFunction<String> validator = authorizationValidator;
+            if (validator != null) {
+                int status = validator.applyAsInt(authorization);
+                if (status > 0) {
+                    // Count before the client can observe the reject: a test reads authRejectCount() as soon as the
+                    // client has handled the response, and counting after the flush races that read.
+                    authRejectCount.incrementAndGet();
+                    writeStatusReject(status, status == 401 ? "Unauthorized" : status == 403 ? "Forbidden" : "Rejected");
+                    return false;
+                }
+            }
+
             // Arbitrary-status reject path: tests use setRejectWithStatus
             // to drive the failover loop's terminal-vs-transient
             // classification (failover.md §6).
             int customStatus = rejectingStatusCode;
             if (customStatus > 0) {
-                String reason = rejectingStatusReason != null ? rejectingStatusReason : "";
-                String sb = "HTTP/1.1 " + customStatus + ' ' + reason + "\r\n" +
-                        "Connection: close\r\n" +
-                        "Content-Length: 0\r\n" +
-                        "\r\n";
-                out.write(sb.getBytes(StandardCharsets.US_ASCII));
-                out.flush();
+                writeStatusReject(customStatus, rejectingStatusReason != null ? rejectingStatusReason : "");
                 statusRejectCount.incrementAndGet();
                 return false;
             }
@@ -680,7 +870,18 @@ public class TestWebSocketServer implements Closeable {
                     .append("Connection: Upgrade\r\n")
                     .append("Sec-WebSocket-Accept: ").append(acceptKey).append("\r\n");
             if (emitDurableAckHeader && !suppressDurableAckHeader) {
-                sb.append("X-QWP-Durable-Ack: enabled\r\n");
+                String granted = durableAckHeaderValue;
+                if (granted == null) {
+                    // Grant exactly what the client asked for: the legacy "true"
+                    // request is confirmed with the "enabled" token, an explicit
+                    // tier list is echoed verbatim. A client that did not ask
+                    // still sees "enabled" -- it ignores the header without the
+                    // opt-in.
+                    granted = durableAckRequest.isEmpty() || "true".equalsIgnoreCase(durableAckRequest)
+                            ? "enabled"
+                            : durableAckRequest;
+                }
+                sb.append("X-QWP-Durable-Ack: ").append(granted).append("\r\n");
             }
             if (advertiseSchema && request.toString().toLowerCase(java.util.Locale.ROOT).contains("x-qwp-request-schema: true\r\n")) {
                 sb.append("X-QWP-Schema: enabled\r\n");
@@ -698,6 +899,20 @@ public class TestWebSocketServer implements Closeable {
             out.flush();
 
             return true;
+        }
+
+        private void writeStatusReject(int status, String reason) throws IOException {
+            StringBuilder sb = new StringBuilder()
+                    .append("HTTP/1.1 ").append(status).append(' ').append(reason).append("\r\n")
+                    .append("Connection: close\r\n")
+                    .append("Content-Length: 0\r\n");
+            String challenge = rejectWwwAuthenticate;
+            if (status == 401 && challenge != null) {
+                sb.append("WWW-Authenticate: ").append(challenge).append("\r\n");
+            }
+            sb.append("\r\n");
+            out.write(sb.toString().getBytes(StandardCharsets.US_ASCII));
+            out.flush();
         }
 
         private synchronized void writeFrame(int opcode, byte[] payload, int length) throws IOException {
@@ -730,6 +945,12 @@ public class TestWebSocketServer implements Closeable {
 
             readThread = new Thread(() -> {
                 try {
+                    if (socket instanceof javax.net.ssl.SSLSocket) {
+                        // finish the TLS handshake under a generous timeout before the short polling
+                        // timeout below applies to every read
+                        socket.setSoTimeout(10_000);
+                        ((javax.net.ssl.SSLSocket) socket).startHandshake();
+                    }
                     socket.setSoTimeout(100);
 
                     in = socket.getInputStream();

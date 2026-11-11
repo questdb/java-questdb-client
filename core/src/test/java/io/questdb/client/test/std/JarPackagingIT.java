@@ -110,6 +110,10 @@ public class JarPackagingIT {
                         "root Compat of a JDK 8 build must use the Java 8 ManagementFactory variant",
                         classReferences(jar, COMPAT_ENTRY, "java/lang/management/ManagementFactory")
                 );
+                Assert.assertNull("JDK 8 must not load a root module descriptor", jar.getEntry("module-info.class"));
+                Assert.assertTrue("the released descriptor must declare the token-provider service use",
+                        classReferences(jar, "META-INF/versions/11/module-info.class",
+                                "io/questdb/client/cutlass/auth/TokenProviderFactory"));
                 Assert.assertNotNull(
                         "META-INF/versions/11 must carry the java11 Compat shim",
                         jar.getEntry(VERSIONED_COMPAT_ENTRY)

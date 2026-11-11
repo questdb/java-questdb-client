@@ -24,6 +24,8 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
+import io.questdb.client.test.tools.TestWebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpHostHealthTracker;
@@ -184,7 +186,7 @@ public class QwpWebSocketSenderJvmErrorCleanupTest {
         // tail -- narrowing the try block later trips one of the two.
         QwpWebSocketSender sender = newBareSender();
         QwpHostHealthTracker tracker = wireEndpoints(sender, 1);
-        setField(sender, "requestDurableAck", true);
+        setField(sender, "durableAckTiers", DurableAckTiers.REPLICATED | DurableAckTiers.LEGACY_TRUE);
         OutOfMemoryError oom = new OutOfMemoryError("simulated allocation failure");
         StubClient stub = newStubClient();
         stub.durableAckCheckError = oom;
@@ -239,13 +241,14 @@ public class QwpWebSocketSenderJvmErrorCleanupTest {
      * needed. The connect walk dereferences only the fields wired below plus
      * primitives whose zero-defaults are valid here (field initializers do
      * not run under {@code Unsafe.allocateInstance}), plus the connect-walk
-     * lock, which buildAndConnect acquires unconditionally and is therefore
-     * wired here.
+     * lock and the connection-health tracker, which buildAndConnect uses
+     * unconditionally on a foreground walk and are therefore wired here.
      */
     private static QwpWebSocketSender newBareSender() throws Exception {
         QwpWebSocketSender sender = (QwpWebSocketSender) Unsafe.getUnsafe()
                 .allocateInstance(QwpWebSocketSender.class);
         setField(sender, "connectWalkLock", new java.util.concurrent.locks.ReentrantLock());
+        setField(sender, "healthTracker", new io.questdb.client.cutlass.qwp.client.QwpConnectionHealthTracker());
         return sender;
     }
 
@@ -300,7 +303,7 @@ public class QwpWebSocketSenderJvmErrorCleanupTest {
      * constructor never ran. Fields rely on zero-defaults; tests assign them
      * post-allocation.
      */
-    private static final class StubClient extends WebSocketClient {
+    private static final class StubClient extends TestWebSocketClient {
         int closeCalls;
         Error connectError;
         RuntimeException connectRuntimeError;
@@ -364,7 +367,7 @@ public class QwpWebSocketSenderJvmErrorCleanupTest {
         }
 
         @Override
-        public void setQwpRequestDurableAck(boolean enabled) {
+        public void setQwpDurableAckTiers(int tiers) {
         }
 
         @Override

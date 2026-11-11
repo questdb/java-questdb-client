@@ -192,6 +192,10 @@ public final class QuestDBBuilder {
             throw new IllegalArgumentException(
                     "httpTokenProvider cannot be combined with token, username, or password in the configuration");
         }
+        if (httpTokenProvider != null && view.has("token_provider")) {
+            throw new IllegalArgumentException(
+                    "httpTokenProvider cannot be combined with token_provider in the configuration");
+        }
         // Validate the single cluster config exactly as both pools will, but
         // without connecting: the full Sender parse plus validateParameters
         // (ingress value keys are registry-STRING, so only the real parse
@@ -400,6 +404,11 @@ public final class QuestDBBuilder {
 
     /**
      * Maximum sender-pool size. Defaults to 4.
+     * <p>
+     * The pooled senders share one {@code sf_max_total_bytes} budget for data
+     * the server has not acknowledged yet, so a larger pool adds connections,
+     * not buffer memory -- apart from the minimum working set of two segments
+     * every live sender keeps.
      */
     public QuestDBBuilder senderPoolMax(int max) {
         if (max < 1) {

@@ -9,6 +9,7 @@ import io.questdb.client.LineSenderSchemaException;
 import io.questdb.client.cairo.ColumnType;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketClientFactory;
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
@@ -329,8 +330,8 @@ public class CursorWebSocketSchemaCoordinatorTest {
     }
 
     private static CursorWebSocketSendLoop loop(WebSocketClient client, CursorSendEngine engine, boolean durable) {
-        return new CursorWebSocketSendLoop(client, engine, 0,
-                CursorWebSocketSendLoop.DEFAULT_PARK_NANOS, null, 1, 4, durable);
+        return new CursorWebSocketSendLoop(client, engine, 0, null, 1, 4,
+                durable ? DurableAckTiers.REPLICATED | DurableAckTiers.LEGACY_TRUE : DurableAckTiers.NONE);
     }
 
     private void assertRemoteReason(int result, LineSenderSchemaException.Reason reason, String directory) throws Exception {
@@ -374,7 +375,9 @@ public class CursorWebSocketSchemaCoordinatorTest {
         if (schema) {
             client.requestQwpSchema();
         }
-        client.setQwpRequestDurableAck(durable);
+        client.setQwpDurableAckTiers(durable
+                ? DurableAckTiers.REPLICATED | DurableAckTiers.LEGACY_TRUE
+                : DurableAckTiers.NONE);
         client.upgrade("/write/v4", 5_000, null);
         return client;
     }

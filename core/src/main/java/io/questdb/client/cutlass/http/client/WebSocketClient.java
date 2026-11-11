@@ -25,11 +25,13 @@
 package io.questdb.client.cutlass.http.client;
 
 import io.questdb.client.HttpClientConfiguration;
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.cutlass.qwp.client.QwpVersionMismatchException;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketFrameParser;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketOpcode;
 import io.questdb.client.network.IOOperation;
+import io.questdb.client.network.Net;
 import io.questdb.client.network.NetworkFacade;
 import io.questdb.client.network.Socket;
 import io.questdb.client.network.SocketFactory;
@@ -80,7 +82,6 @@ public abstract class WebSocketClient implements QuietCloseable {
     private static final String QUESTDB_ROLE_HEADER_NAME = "X-QuestDB-Role:";
     private static final String QUESTDB_ZONE_HEADER_NAME = "X-QuestDB-Zone:";
     private static final String QWP_CONTENT_ENCODING_HEADER_NAME = "X-QWP-Content-Encoding:";
-    private static final String QWP_DURABLE_ACK_ENABLED_VALUE = "enabled";
     private static final String QWP_DURABLE_ACK_HEADER_NAME = "X-QWP-Durable-Ack:";
     private static final String QWP_MAX_BATCH_SIZE_HEADER_NAME = "X-QWP-Max-Batch-Size:";
     private static final String QWP_SCHEMA_ENABLED_VALUE = "enabled";
@@ -107,6 +108,14 @@ public abstract class WebSocketClient implements QuietCloseable {
     // (not a bare volatile check-then-act) so concurrent closers cannot both
     // enter close() and double-run disconnect()/Unsafe.free.
     private final AtomicBoolean closed = new AtomicBoolean();
+    // See awaitReadableOrWake/wake. wakeLock serialises wake() with close().
+    private final Object wakeLock = new Object();
+    private int doorbell = -1;
+    // True after a recv() found nothing. Until the next send or
+    // awaitReadableOrWake, tryReceiveFrame answers false without a syscall:
+    // the I/O loop's pre-park receive pass otherwise repeats the EAGAIN it got
+    // on the previous iteration. I/O-thread-only, like the recv buffer.
+    private boolean recvDrained;
     // Upper bound (ms) on the TCP connect. <= 0 disables the application-level
     // timeout and falls back to the OS connect timeout. Seeded from the
     // configuration; the QWP sender may override it via setConnectTimeout().
@@ -138,8 +147,9 @@ public abstract class WebSocketClient implements QuietCloseable {
     // down to its own hard limit.
     private int qwpMaxBatchRows;
     private int qwpMaxVersion = 1;
-    // Opt-in for STATUS_DURABLE_ACK frames; sent as X-QWP-Request-Durable-Ack: true
-    private boolean qwpRequestDurableAck;
+    // Requested durable-ack tier set (DurableAckTiers bitmask), sent as
+    // X-QWP-Request-Durable-Ack: <DurableAckTiers.requestHeaderValue>
+    private int qwpDurableAckTiers = DurableAckTiers.NONE;
     // Schema negotiation is deliberately opt-in at this low-level client layer.
     // The public Sender does not activate it until schema-directed encoding is available.
     private boolean qwpRequestSchema;
@@ -148,11 +158,17 @@ public abstract class WebSocketClient implements QuietCloseable {
     private int recvBufSize;
     private int recvPos;      // Write position
     private int recvReadPos;  // Read position
+    // Raw X-QWP-Durable-Ack value from the 101 upgrade response, or null when
+    // the server sent no such header. Reported in the durable-ack mismatch
+    // error so an operator sees what the server answered.
+    private String serverDurableAckEcho;
     // Set during upgrade response validation when the server echoed
-    // X-QWP-Durable-Ack: enabled. Tells the sender it landed on a server that
-    // will actually emit STATUS_DURABLE_ACK frames, so its store-and-forward
-    // path can rely on durable-ack-driven trim. Absence (after opting in via
-    // setQwpRequestDurableAck) is the early-fail signal.
+    // X-QWP-Durable-Ack with the token DurableAckTiers.expectedConfirmToken
+    // expects for the requested set (the set itself, or "enabled" for a
+    // legacy request). Tells the sender it landed on a server that will emit
+    // the requested ack frames, so its store-and-forward path can rely on
+    // durable-ack-driven trim. Absence (after requesting tiers via
+    // setQwpDurableAckTiers) is the early-fail signal.
     private boolean serverDurableAckEnabled;
     private boolean serverQwpSchemaEnabled;
     // Server's hard cap on ingest QWP message payload bytes, extracted from
@@ -169,6 +185,11 @@ public abstract class WebSocketClient implements QuietCloseable {
     private int serverNegotiatedZstdLevel;
     private int serverQwpVersion = 1;
     private String upgradeRejectRole;
+    // WWW-Authenticate value(s) from the most recent rejected upgrade, joined with ", " when the server sent
+    // several, or null when absent. Lets a 401 carrying "Bearer error=insufficient_scope" be told apart from an
+    // expired token, so a dynamic credential is refreshed only when a new token can help. Reset to null on every
+    // upgrade() invocation.
+    private String upgradeRejectWwwAuthenticate;
     // Server-advertised zone identifier from the most recent rejected upgrade,
     // captured from the X-QuestDB-Zone response header on a 421. Null when the
     // header was absent or empty. Per failover.md §5 servers SHOULD emit this
@@ -208,7 +229,13 @@ public abstract class WebSocketClient implements QuietCloseable {
             this.rnd = new SecureRnd();
             this.upgraded = false;
             this.closed.set(false);
+
+            this.doorbell = Net.doorbellCreate();
+            if (doorbell < 0) {
+                throw new HttpClientException("could not create doorbell [errno=").put(nf.errno()).put(']');
+            }
         } catch (Throwable t) {
+            closeDoorbell();
             if (recvBufPtr != 0) {
                 Unsafe.free(recvBufPtr, recvBufSize, MemoryTag.NATIVE_DEFAULT);
                 recvBufPtr = 0;
@@ -217,6 +244,42 @@ public abstract class WebSocketClient implements QuietCloseable {
             Misc.free(sendBuf);
             Misc.free(socket);
             throw t;
+        }
+    }
+
+    /**
+     * Appends one binary frame to the send batch, back to back with any frame
+     * already appended. Nothing reaches the wire until {@link #batchFlush()}.
+     * Grows the send buffer if the frame does not fit; a caller bounding the
+     * batch checks {@link #batchByteCap()} first. The batch shares the send
+     * buffer with {@link #sendBinary}, so do not interleave the two.
+     */
+    public void batchAppendBinary(long dataPtr, int length) {
+        checkConnected();
+        sendBuffer.appendMaskedBinaryFrame(dataPtr, length);
+    }
+
+    /**
+     * Byte budget for one send batch: the default send buffer size, fixed for
+     * the connection. It does not follow the buffer's capacity, which only
+     * grows, so one large frame cannot widen every later batch.
+     */
+    public int batchByteCap() {
+        return DEFAULT_SEND_BUFFER_SIZE;
+    }
+
+    /**
+     * Writes every frame appended since the last flush with one send. No-op
+     * when nothing was appended. The batch is empty afterwards, even on failure.
+     */
+    public void batchFlush() {
+        int len = sendBuffer.getWritePos();
+        if (len > 0) {
+            try {
+                doSend(sendBuffer.getBufferPtr(), len, defaultTimeout);
+            } finally {
+                sendBuffer.reset();
+            }
         }
     }
 
@@ -251,6 +314,7 @@ public abstract class WebSocketClient implements QuietCloseable {
                 Unsafe.free(recvBufPtr, recvBufSize, MemoryTag.NATIVE_DEFAULT);
                 recvBufPtr = 0;
             }
+            closeDoorbell();
         }
     }
 
@@ -337,6 +401,15 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
+     * Raw {@code X-QWP-Durable-Ack} value from the most recent 101 upgrade
+     * response, trimmed, or null when the server sent no such header.
+     * Meaningful only after {@link #upgrade} returns.
+     */
+    public String getServerDurableAckEcho() {
+        return serverDurableAckEcho;
+    }
+
+    /**
      * Server-advertised hard cap on QWP ingest payload bytes, taken from the
      * {@code X-QWP-Max-Batch-Size} response header on the 101 upgrade. Returns
      * {@code 0} when the server did not advertise the header, in which case
@@ -382,6 +455,14 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
+     * {@code WWW-Authenticate} value(s) on the most recent rejected upgrade, joined with {@code ", "} when the
+     * server sent several, or null when absent.
+     */
+    public String getUpgradeRejectWwwAuthenticate() {
+        return upgradeRejectWwwAuthenticate;
+    }
+
+    /**
      * Zone identifier from {@code X-QuestDB-Zone} on the most recent rejected
      * upgrade, or null when the header was absent or empty (after trimming).
      * Per {@code failover.md} §5 this is the upgrade-time companion to
@@ -408,10 +489,13 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
-     * Returns true when the server echoed X-QWP-Durable-Ack: enabled in the
-     * 101 upgrade response. Meaningful only after {@link #upgrade} returns;
-     * always false when the client did not opt in via
-     * {@link #setQwpRequestDurableAck}.
+     * Returns true when the server granted the requested durable-ack tier set:
+     * the 101 upgrade response carried {@code X-QWP-Durable-Ack} with the
+     * token {@link DurableAckTiers#expectedConfirmToken} expects (the
+     * requested set, such as {@code local} or {@code local,replicated}, or
+     * {@code enabled} for a legacy request). Meaningful only after
+     * {@link #upgrade} returns; always false when no tier was requested via
+     * {@link #setQwpDurableAckTiers}.
      */
     public boolean isServerDurableAckEnabled() {
         return serverDurableAckEnabled;
@@ -447,6 +531,7 @@ public abstract class WebSocketClient implements QuietCloseable {
             }
 
             // Ensure buffer has space
+            compactRecvBuffer();
             if (recvPos >= recvBufSize - 1024) {
                 growRecvBuffer();
             }
@@ -551,14 +636,14 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
-     * Sends a ping frame.
+     * Sends a ping frame with the same timeout as data frames.
      */
-    public void sendPing(int timeout) {
+    public void sendPing() {
         checkConnected();
         controlFrameBuffer.reset();
         WebSocketSendBuffer.FrameInfo frame = controlFrameBuffer.writePingFrame();
         try {
-            doSend(controlFrameBuffer.getBufferPtr() + frame.offset, frame.length, timeout);
+            doSend(controlFrameBuffer.getBufferPtr() + frame.offset, frame.length, defaultTimeout);
         } finally {
             controlFrameBuffer.reset();
         }
@@ -611,13 +696,14 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
-     * Enables the opt-in X-QWP-Request-Durable-Ack upgrade header. When set,
-     * servers with primary replication configured will additionally emit
-     * STATUS_DURABLE_ACK frames as the WAL containing committed client
-     * messages reaches the object store.
+     * Sets the requested durable-ack tier set ({@link DurableAckTiers}
+     * bitmask) for the opt-in X-QWP-Request-Durable-Ack upgrade header. When
+     * granted, the server emits STATUS_DURABLE_ACK frames (replicated tier)
+     * and/or STATUS_LOCAL_DURABLE_ACK frames (local tier) as commits reach
+     * the corresponding durability frontier.
      */
-    public void setQwpRequestDurableAck(boolean enabled) {
-        this.qwpRequestDurableAck = enabled;
+    public void setQwpDurableAckTiers(int tiers) {
+        this.qwpDurableAckTiers = tiers;
     }
 
     /**
@@ -644,7 +730,15 @@ public abstract class WebSocketClient implements QuietCloseable {
             return result == PARSE_OK;
         }
 
+        if (recvDrained) {
+            // The last recv found nothing and nothing has been sent or waited
+            // for since: a repeat recv would be another EAGAIN. Bytes that land
+            // meanwhile end the next awaitReadableOrWake at once (level-triggered).
+            return false;
+        }
+
         // Try one non-blocking recv
+        compactRecvBuffer();
         if (recvPos >= recvBufSize - 1024) {
             growRecvBuffer();
         }
@@ -654,6 +748,7 @@ public abstract class WebSocketClient implements QuietCloseable {
             throw new HttpClientException("peer disconnect [errno=").errno(nf.errno()).put(']');
         }
         if (n == 0) {
+            recvDrained = true;
             return false; // No data available
         }
         recvPos += n;
@@ -681,6 +776,7 @@ public abstract class WebSocketClient implements QuietCloseable {
             return; // Already upgraded
         }
         upgradeRejectRole = null;
+        upgradeRejectWwwAuthenticate = null;
         upgradeRejectZone = null;
         upgradeStatusCode = 0;
         serverQwpSchemaEnabled = false;
@@ -728,8 +824,10 @@ public abstract class WebSocketClient implements QuietCloseable {
             sendBuffer.putAscii(Integer.toString(qwpMaxBatchRows));
             sendBuffer.putAscii("\r\n");
         }
-        if (qwpRequestDurableAck) {
-            sendBuffer.putAscii("X-QWP-Request-Durable-Ack: true\r\n");
+        if (qwpDurableAckTiers != DurableAckTiers.NONE) {
+            sendBuffer.putAscii("X-QWP-Request-Durable-Ack: ");
+            sendBuffer.putAscii(DurableAckTiers.requestHeaderValue(qwpDurableAckTiers));
+            sendBuffer.putAscii("\r\n");
         }
         if (qwpRequestSchema) {
             sendBuffer.putAscii("X-QWP-Request-Schema: true\r\n");
@@ -857,7 +955,7 @@ public abstract class WebSocketClient implements QuietCloseable {
         return 0;
     }
 
-    private static boolean extractDurableAckEnabled(String response) {
+    private static String extractDurableAckEcho(String response) {
         int headerLen = QWP_DURABLE_ACK_HEADER_NAME.length();
         int responseLen = response.length();
         for (int i = 0; i <= responseLen - headerLen; i++) {
@@ -867,11 +965,10 @@ public abstract class WebSocketClient implements QuietCloseable {
                 if (lineEnd < 0) {
                     lineEnd = responseLen;
                 }
-                String value = response.substring(valueStart, lineEnd).trim();
-                return value.equalsIgnoreCase(QWP_DURABLE_ACK_ENABLED_VALUE);
+                return response.substring(valueStart, lineEnd).trim();
             }
         }
-        return false;
+        return null;
     }
 
     private static int extractMaxBatchSize(String response) {
@@ -935,6 +1032,34 @@ public abstract class WebSocketClient implements QuietCloseable {
             lineStart = response.indexOf("\r\n", hStart);
         }
         return null;
+    }
+
+    // Every value of the named header, joined with ", " (RFC 7230 section 3.2.2), or null when absent.
+    private static String extractHeaderValues(String response, String headerName) {
+        int headerLen = headerName.length();
+        int responseLen = response.length();
+        StringBuilder values = null;
+        int lineStart = response.indexOf("\r\n");
+        while (lineStart >= 0 && lineStart + 2 + headerLen <= responseLen) {
+            int hStart = lineStart + 2;
+            if (response.regionMatches(true, hStart, headerName, 0, headerLen)) {
+                int valueStart = hStart + headerLen;
+                int lineEnd = response.indexOf('\r', valueStart);
+                if (lineEnd < 0) {
+                    lineEnd = responseLen;
+                }
+                String value = response.substring(valueStart, lineEnd).trim();
+                if (!value.isEmpty()) {
+                    if (values == null) {
+                        values = new StringBuilder(value);
+                    } else {
+                        values.append(", ").append(value);
+                    }
+                }
+            }
+            lineStart = response.indexOf("\r\n", hStart);
+        }
+        return values == null ? null : values.toString();
     }
 
     private static String extractZoneHeader(String response) {
@@ -1116,18 +1241,24 @@ public abstract class WebSocketClient implements QuietCloseable {
 
     private void doSend(long ptr, int len, int timeout) {
         long startTime = System.nanoTime();
+        recvDrained = false;
+        // Send first, poll only on backpressure (mirrors recvOrDie): the
+        // socket is non-blocking, and a pre-send ioWait would cost an
+        // epoll_ctl + epoll_wait per frame even when it is writable.
         while (len > 0) {
-            int remainingTimeout = getRemainingTimeOrThrow(timeout, startTime);
-            ioWait(remainingTimeout, IOOperation.WRITE);
             int sent = dieIfNegative(socket.send(ptr, len));
             while (socket.wantsTlsWrite()) {
-                remainingTimeout = getRemainingTimeOrThrow(timeout, startTime);
+                int remainingTimeout = getRemainingTimeOrThrow(timeout, startTime);
                 ioWait(remainingTimeout, IOOperation.WRITE);
                 dieIfNegative(socket.tlsIO(Socket.WRITE_FLAG));
             }
             if (sent > 0) {
                 ptr += sent;
                 len -= sent;
+            } else {
+                // send returned ERETRY (0): socket full, park until writable
+                int remainingTimeout = getRemainingTimeOrThrow(timeout, startTime);
+                ioWait(remainingTimeout, IOOperation.WRITE);
             }
         }
     }
@@ -1385,8 +1516,13 @@ public abstract class WebSocketClient implements QuietCloseable {
             // Advance read position
             recvReadPos += consumed;
 
-            // Compact buffer if needed
-            compactRecvBuffer();
+            // Rewind once drained; a partial tail stays put until the next
+            // recv compacts it. Compacting here, per frame, memmoved the rest
+            // of a burst once per frame: quadratic in the burst.
+            if (recvReadPos == recvPos) {
+                recvReadPos = 0;
+                recvPos = 0;
+            }
 
             return PARSE_OK;
         }
@@ -1405,6 +1541,9 @@ public abstract class WebSocketClient implements QuietCloseable {
         if (!response.startsWith("HTTP/1.1 101")) {
             String statusLine = response.split("\r\n")[0];
             upgradeStatusCode = parseStatusCode(statusLine);
+            if (upgradeStatusCode == 401) {
+                upgradeRejectWwwAuthenticate = extractHeaderValues(response, "WWW-Authenticate:");
+            }
             if (upgradeStatusCode == 421) {
                 upgradeRejectRole = extractRoleHeader(response);
                 upgradeRejectZone = extractZoneHeader(response);
@@ -1444,12 +1583,18 @@ public abstract class WebSocketClient implements QuietCloseable {
             throw new QwpVersionMismatchException(serverQwpVersion, qwpMaxVersion);
         }
 
-        // Extract X-QWP-Durable-Ack confirmation (optional, absent on servers
-        // without primary replication or when the client did not opt in).
-        // Only meaningful when qwpRequestDurableAck is true; the sender
-        // checks this value to fail at connect rather than silently
-        // missing trim signals.
-        serverDurableAckEnabled = extractDurableAckEnabled(response);
+        // Extract X-QWP-Durable-Ack confirmation (optional, absent when the
+        // server cannot grant the requested tier set or the client requested
+        // none). Only meaningful when qwpDurableAckTiers is not NONE; the
+        // sender checks this value to fail at connect rather than silently
+        // missing trim signals. The server echoes the granted set verbatim
+        // (or the "enabled" token for a legacy "true" request); anything
+        // else is a partial or foreign grant and counts as a denial --
+        // all-or-nothing, never a silent downgrade.
+        serverDurableAckEcho = extractDurableAckEcho(response);
+        String expectedDurableAckToken = DurableAckTiers.expectedConfirmToken(qwpDurableAckTiers);
+        serverDurableAckEnabled = expectedDurableAckToken != null
+                && expectedDurableAckToken.equalsIgnoreCase(serverDurableAckEcho);
 
         // An absent confirmation means an older server. A present value is a
         // protocol assertion, so a requested handshake must reject anything
@@ -1497,4 +1642,49 @@ public abstract class WebSocketClient implements QuietCloseable {
      * Sets up platform-specific I/O wait mechanism after connection.
      */
     protected abstract void setupIoWait();
+
+    /**
+     * Blocks until the socket becomes readable, another thread calls
+     * {@link #wake()}, or {@code timeoutMillis} elapses ({@code -1} = no
+     * timeout). Returns {@code true} unless it timed out; spurious returns are
+     * possible and callers re-check their inputs. The doorbell is stateful: a
+     * wake that lands before the wait begins ends it at once. Independent of
+     * the readiness queue {@link #ioWait} uses, so a pending wake never leaks
+     * into a handshake or send wait.
+     */
+    public boolean awaitReadableOrWake(int timeoutMillis) {
+        recvDrained = false;
+        if (socket.hasBufferedInput()) {
+            // TLS: decrypted or undecrypted input already sits in user space,
+            // invisible to poll(2). Report readable without blocking.
+            return true;
+        }
+        int n = Net.awaitReadableOrRing(socket.getFd(), doorbell, timeoutMillis);
+        if (n < 0) {
+            throw new HttpClientException("internal error: poll failure [errno=").put(nf.errno()).put(']');
+        }
+        return n > 0;
+    }
+
+    /**
+     * Wakes a thread blocked in {@link #awaitReadableOrWake}; with nobody
+     * waiting the wake is remembered until the next wait. Safe from any thread,
+     * including concurrently with {@link #close()}.
+     */
+    public void wake() {
+        synchronized (wakeLock) {
+            if (doorbell >= 0) {
+                Net.doorbellRing(doorbell);
+            }
+        }
+    }
+
+    private void closeDoorbell() {
+        synchronized (wakeLock) {
+            if (doorbell >= 0) {
+                Net.doorbellClose(doorbell);
+                doorbell = -1;
+            }
+        }
+    }
 }

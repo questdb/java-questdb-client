@@ -58,13 +58,12 @@ public class SegmentManagerPeriodicSyncTest {
                 MmapSegment active = MmapSegment.create(
                         filesFacade, dir + "/active.sfa", 0L, segmentSize);
                 ring = new SegmentRing(active, segmentSize);
-                ring.installHotSpare(MmapSegment.create(
+                QueueSegmentSource.install(ring, MmapSegment.create(
                         filesFacade, dir + "/spare.sfa", 1L, segmentSize));
                 assertEquals(0L, ring.appendOrFsn(payload, 16));
 
                 manager = new SegmentManager(
                         segmentSize,
-                        SegmentManager.DEFAULT_POLL_NANOS,
                         segmentSize * 4L,
                         filesFacade,
                         ticks::get);
@@ -145,11 +144,10 @@ public class SegmentManagerPeriodicSyncTest {
                 MmapSegment active = MmapSegment.create(
                         filesFacade, dir + "/active.sfa", 0L, segmentSize);
                 ring = new SegmentRing(active, segmentSize);
-                ring.installHotSpare(MmapSegment.create(
+                QueueSegmentSource.install(ring, MmapSegment.create(
                         filesFacade, dir + "/spare.sfa", 2L, segmentSize));
                 manager = new SegmentManager(
                         segmentSize,
-                        SegmentManager.DEFAULT_POLL_NANOS,
                         segmentSize * 4L,
                         filesFacade,
                         ticks::get);
@@ -245,12 +243,11 @@ public class SegmentManagerPeriodicSyncTest {
                 // Pre-install the hot spare so the service pass does not
                 // provision one mid-test: its header write would pollute the
                 // exact barrier-call accounting below.
-                ring.installHotSpare(MmapSegment.create(
+                QueueSegmentSource.install(ring, MmapSegment.create(
                         filesFacade, dir + "/spare.sfa", 3L, segmentSize));
 
                 manager = new SegmentManager(
                         segmentSize,
-                        SegmentManager.DEFAULT_POLL_NANOS,
                         segmentSize * 8L,
                         filesFacade,
                         ticks::get);
@@ -344,7 +341,6 @@ public class SegmentManagerPeriodicSyncTest {
 
                 manager = new SegmentManager(
                         segmentSize,
-                        SegmentManager.DEFAULT_POLL_NANOS,
                         segmentSize * 8L,
                         filesFacade,
                         ticks::get);
@@ -401,13 +397,12 @@ public class SegmentManagerPeriodicSyncTest {
                 MmapSegment active = MmapSegment.create(
                         filesFacade, dir + "/active.sfa", 0L, segmentSize);
                 ring = new SegmentRing(active, segmentSize);
-                ring.installHotSpare(MmapSegment.create(
+                QueueSegmentSource.install(ring, MmapSegment.create(
                         filesFacade, dir + "/spare.sfa", 1L, segmentSize));
                 assertEquals(0L, ring.appendOrFsn(payload, 16));
 
                 manager = new SegmentManager(
                         segmentSize,
-                        SegmentManager.DEFAULT_POLL_NANOS,
                         segmentSize * 4L,
                         filesFacade,
                         ticks::get);
@@ -549,13 +544,12 @@ public class SegmentManagerPeriodicSyncTest {
                 MmapSegment active = MmapSegment.create(
                         filesFacade, dir + "/active.sfa", 0L, segmentSize);
                 ring = new SegmentRing(active, segmentSize);
-                ring.installHotSpare(MmapSegment.create(
+                QueueSegmentSource.install(ring, MmapSegment.create(
                         filesFacade, dir + "/spare.sfa", 1L, segmentSize));
                 assertEquals(0L, ring.appendOrFsn(payload, 16));
 
                 manager = new SegmentManager(
                         segmentSize,
-                        SegmentManager.DEFAULT_POLL_NANOS,
                         segmentSize * 4L,
                         filesFacade,
                         ticks::get);

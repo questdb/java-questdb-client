@@ -338,7 +338,10 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
             // (or any abnormal exit) while a user thread is mid-execute() would let
             // takeEvent() block forever -- once the I/O thread is gone, no further
             // events arrive on the queue.
-            if (!currentQueryDone) {
+            // Publish on shutdown even if idle: the dispatch thread can submit a request just as
+            // this loop exits, before it observes the client's sticky stop request. It must still
+            // find a terminal event rather than wait forever on an I/O thread that has already gone.
+            if (!currentQueryDone || shutdown) {
                 String msg = shutdown
                         ? "I/O thread shut down with query in flight"
                         : "I/O thread terminated with query in flight";
@@ -635,11 +638,11 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         // releaseBuffer offers the token that unblocks this take.
         //
         // Wait uninterruptibly: if close() interrupts us here we MUST NOT
-        // unwind back to tryParseFrame, because tryParseFrame's tail
-        // advances recvReadPos and runs compactRecvBuffer (Vect.memmove)
-        // over the bytes the user's column pointers still alias inside
-        // recv-buf. A premature unwind on interrupt is the close()-during-
-        // onBatch UAF: the user thread's onBatch reads garbage mid-call.
+        // unwind back to tryParseFrame, because the next receive's
+        // compactRecvBuffer (Vect.memmove) and recv write over the bytes the
+        // user's column pointers still alias inside recv-buf. A premature
+        // unwind on interrupt is the close()-during-onBatch UAF: the user
+        // thread's onBatch reads garbage mid-call.
         // Stay parked; close()'s 5-second join timeout will abandon the
         // I/O thread (the documented timeout-leak path), but only AFTER
         // the user's onBatch has finished -- no UAF.

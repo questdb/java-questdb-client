@@ -22,9 +22,23 @@ jobs:
   # longer committed, so this job compiles libquestdb.so from source (hence the
   # zstd submodule + cmake/nasm/build-essential toolchain) before the tests run.
   build-jdk8:
-    name: Build, test & javadoc (JDK 8)
-    runs-on: ubuntu-latest
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Build, test & javadoc (JDK 8)
+            os: ubuntu-latest
+            jdk_arch: x64
+            platform: linux-x86-64
+            cmake_args: ""
+          - name: Build, test & javadoc (JDK 8, ARM64)
+            os: ubuntu-22.04-arm
+            jdk_arch: aarch64
+            platform: linux-aarch64
+            cmake_args: "-DCMAKE_TOOLCHAIN_FILE=./src/main/c/toolchains/linux-arm64.cmake"
     steps:
       - name: Check out
         uses: actions/checkout@v4
@@ -33,13 +47,14 @@ jobs:
           submodules: recursive
 
       - name: Set up JDK 11 (MRJAR versioned classes)
-        # Exports JAVA_HOME_11_X64. The JDK 8 build compiles src/main/java11 with
-        # it into META-INF/versions/11 (see the antrun execution in core/pom.xml);
-        # JDK 8 javac cannot compile that source root.
+        # Keep its path before JDK 8 replaces JAVA_HOME. The JDK 8 build uses
+        # this compiler for META-INF/versions/11 on either architecture.
+        id: jdk11
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "11"
+          architecture: ${{ matrix.jdk_arch }}
 
       - name: Set up JDK 8
         # Last setup-java call wins JAVA_HOME: the build itself runs on JDK 8.
@@ -47,7 +62,14 @@ jobs:
         with:
           distribution: temurin
           java-version: "8"
+          architecture: ${{ matrix.jdk_arch }}
           cache: maven
+
+      - name: Show test runtime
+        run: |
+          java -version
+          mvn -version
+          uname -m
 
       - name: Install native build toolchain
         run: sudo apt-get update && sudo apt-get install -y cmake nasm build-essential
@@ -57,24 +79,38 @@ jobs:
         # Java 8 JNI headers -- the artifact's Java floor. Copy it into src
         # resources (not target/) so it survives the `mvn clean` in the next step
         # and gets packaged + loaded via the production bin/<platform> path.
-        # NOTE: this builds on ubuntu-latest for FUNCTIONAL testing only; the
+        # NOTE: this builds on the Ubuntu runners for FUNCTIONAL testing only; the
         # library's glibc runtime floor is validated separately by the
         # `glibc-floor` job, which rebuilds in the release low-glibc container.
         run: |
           cd core
-          cmake -DCMAKE_BUILD_TYPE=Release -B cmake-build-release -S.
+          cmake ${{ matrix.cmake_args }} -DCMAKE_BUILD_TYPE=Release -B cmake-build-release -S.
           cmake --build cmake-build-release --config Release
           test -f target/classes/io/questdb/client/bin-local/libquestdb.so
-          mkdir -p src/main/resources/io/questdb/client/bin/linux-x86-64
+          mkdir -p "src/main/resources/io/questdb/client/bin/${{ matrix.platform }}"
           cp target/classes/io/questdb/client/bin-local/libquestdb.so \
-             src/main/resources/io/questdb/client/bin/linux-x86-64/libquestdb.so
+             "src/main/resources/io/questdb/client/bin/${{ matrix.platform }}/libquestdb.so"
 
       - name: Compile, test, and build javadoc
         env:
-          JAVA11_HOME: ${{ env.JAVA_HOME_11_X64 }}
+          JAVA11_HOME: ${{ steps.jdk11.outputs.path }}
         run: mvn -B -ntp -P javadoc clean install
 
+      - name: Upload test failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jdk8-diagnostics-${{ matrix.platform }}
+          path: |
+            core/hs_err_pid*.log
+            core/target/surefire-reports/
+            core/target/failsafe-reports/
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: Upload client jar for the cross-JDK smoke job
+        # The downstream smoke job runs on x64; upload only its matching jar.
+        if: matrix.jdk_arch == 'x64'
         uses: actions/upload-artifact@v4
         with:
           name: questdb-client-jar
@@ -86,11 +122,13 @@ jobs:
           if-no-files-found: error
 
   # Takes the JDK 8-built jar (the shipped artifact) from build-jdk8 and runs it
-  # on every newer JDK the client must work on, asserting (a) the automatic
-  # module name is io.questdb.client and (b) slow-path double formatting
-  # resolves the META-INF/versions/11 bridge. These are only observable in the
-  # PACKAGED jar on a modern JDK, and each regression here was invisible to the
-  # other jobs until the jar was EXECUTED on the right JDK/flags:
+  # on every newer JDK the client must work on, asserting (a) the versioned
+  # module descriptor names io.questdb.client and has no mandatory requires
+  # beyond java.base, jdk.unsupported and org.slf4j, and (b) slow-path double
+  # formatting resolves the META-INF/versions/11 bridge. These are only
+  # observable in the PACKAGED jar on a modern JDK, and each regression here
+  # was invisible to the other jobs until the jar was EXECUTED on the right
+  # JDK/flags:
   #   * 1.3.5-1.3.7: FdBig linked sun.misc.FDBigInteger (gone since Java 9) and
   #     the module name degraded to the filename-derived "questdb.client".
   #   * issue #96: JDK 26 made FDBigInteger package-private (passed 8/11/25).
@@ -134,8 +172,17 @@ jobs:
         run: |
           jar_file=(client-jar/questdb-client-*.jar)
           jar_file="${jar_file[0]}"
-          jar --describe-module --file "$jar_file" | tee module.txt
+          jar --describe-module --file "$jar_file" --release 11 | tee module.txt
           grep -q '^io\.questdb\.client@' module.txt
+          # A mandatory requires that the application's runtime image lacks fails
+          # module resolution at startup. A jlink image built from the client's
+          # jdeps output has java.base, jdk.unsupported and at most java.desktop,
+          # so any other platform module the client uses must be a static requires.
+          mandatory="$(awk '$1 == "requires" && !/ static( |$)/ {print $2}' module.txt | sort | tr '\n' ' ')"
+          if [ "$mandatory" != "java.base jdk.unsupported org.slf4j " ]; then
+            echo "::error::unexpected mandatory requires in the released module descriptor: ${mandatory}"
+            exit 1
+          fi
           javac -cp "$jar_file" -d smoke-classes \
             core/src/test/java/io/questdb/client/test/std/DoubleFormatSmoke.java
           # The FdBig double formatter reaches jdk.internal.math.FDBigInteger by

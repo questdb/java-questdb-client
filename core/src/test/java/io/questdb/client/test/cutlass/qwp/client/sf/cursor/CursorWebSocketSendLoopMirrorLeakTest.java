@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
@@ -87,7 +88,7 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
                 long persistedAddr = pd.loadedEntriesAddr();
 
                 CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
-                        null, engine, 0, 1_000_000L,
+                        null, engine, 0,
                         () -> {
                             throw new IOException("no reconnect in this test");
                         },
@@ -207,7 +208,7 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
                 CursorWebSocketSendLoop.forceMirrorSeedFailureForTest = true;
                 try {
                     new CursorWebSocketSendLoop(
-                            null, engine, 0, 1_000_000L,
+                            null, engine, 0,
                             () -> {
                                 throw new IOException("no reconnect in this test");
                             },
@@ -241,7 +242,7 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
                 Assert.assertTrue("recovery must retain c@2 above the persisted [a,b] prefix",
                         engine.recoverySymbolNativeCapacity() > 0);
                 CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
-                        null, engine, 0, 1_000_000L,
+                        null, engine, 0,
                         () -> {
                             throw new IOException("no reconnect in this test");
                         },
@@ -335,13 +336,13 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
     // reconnect factory is never invoked.
     private static CursorWebSocketSendLoop newRecoveryLoop(CursorSendEngine engine) {
         return new CursorWebSocketSendLoop(
-                null, engine, 0, 1_000_000L,
+                null, engine, 0,
                 () -> {
                     throw new IOException("no reconnect in this test");
                 },
                 0, 1,
-                false, 0L, 3, 0L, 0L,
-                CursorWebSocketSendLoop.ReconnectPolicy.ORPHAN);
+                DurableAckTiers.NONE, 0L, 3, 0L, 0L,
+                CursorWebSocketSendLoop.ReconnectPolicy.ORPHAN, 0L);
     }
 
     private static CursorWebSocketSendLoop newForegroundLoop(CursorSendEngine engine) {
@@ -349,7 +350,7 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
         // builds an ORPHAN loop, which borrows by construction and so would not exercise
         // the foreground path this test exists for.
         return new CursorWebSocketSendLoop(
-                null, engine, 0, 1_000_000L,
+                null, engine, 0,
                 () -> {
                     throw new IOException("no reconnect in this test");
                 },

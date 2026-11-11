@@ -24,6 +24,7 @@
 
 package io.questdb.client.impl;
 
+import io.questdb.client.ConnectionHealth;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
@@ -277,6 +278,11 @@ public final class PooledSender implements Sender {
     }
 
     @Override
+    public ConnectionHealth health() {
+        return slot.live(generation).health();
+    }
+
+    @Override
     public Sender intColumn(CharSequence name, int value) {
         slot.live(generation).intColumn(name, value);
         return this;
@@ -333,6 +339,11 @@ public final class PooledSender implements Sender {
     @Override
     public void reset() {
         slot.live(generation).reset();
+    }
+
+    @Override
+    public void resetSymbolDictionary() {
+        slot.live(generation).resetSymbolDictionary();
     }
 
     @Override

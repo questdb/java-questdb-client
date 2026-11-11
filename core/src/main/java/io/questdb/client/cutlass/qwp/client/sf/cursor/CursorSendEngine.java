@@ -84,15 +84,16 @@ public final class CursorSendEngine implements QuietCloseable {
     private static volatile ThreadFactory flockReleaseRetryThreadFactory =
             DEFAULT_FLOCK_RELEASE_RETRY_THREAD_FACTORY;
     private final long appendDeadlineNanos;
-    // Number of times appendBlocking observed BACKPRESSURE_NO_SPARE on its first
-    // ring.appendOrFsn attempt. One increment per blocking-call that had to wait
-    // for the manager (or for ACKs) — not one per spin-park. Producer-thread
-    // writer; volatile because the user may sample it from any thread.
-    private final java.util.concurrent.atomic.AtomicLong backpressureStallCount =
-            new java.util.concurrent.atomic.AtomicLong();
-    // Constructed before an owned manager acquires its native path scratch, so
-    // callback allocation failure cannot orphan manager resources. A timed-out
-    // close can then hand it to either manager path without allocating.
+    // Sender-lifetime observability counters; only backpressureStalls is used
+    // here: one increment per blocking appendBlocking call that had to wait
+    // for the manager (or for ACKs), not one per spin-park. Producer-thread
+    // writer; any thread may read it. A fresh instance by default;
+    // QwpWebSocketSender hands every engine it attaches its own shared
+    // instance via adoptCounters(), so a symbol-dictionary recycle's rebuilt
+    // engine keeps counting where the outgoing one stopped.
+    private CursorSendCounters counters = new CursorSendCounters();
+    // Allocated before the engine acquires native or disk resources, so a
+    // timed-out close can delegate cleanup to the manager without allocating.
     private final Runnable deferredClose;
     // Facade for the persisted symbol dictionary only. Separate from
     // filesFacade (which the manager supplies for segments, watermark and
@@ -160,8 +161,9 @@ public final class CursorSendEngine implements QuietCloseable {
     // disk mode fails construction unless the watermark is usable because
     // segment-derived recovery cannot distinguish acknowledged residue from
     // replayable frames. Lifetime tied to the engine: opened in the
-    // constructor, closed by {@link #close()}. The segment manager writes
-    // through this on every tick where ackedFsn has advanced.
+    // constructor, closed by {@link #close()}. Written by the I/O thread on
+    // every ACK advance ({@link #acknowledge}); the segment manager only
+    // syncs it before a trim.
     private final AckWatermark watermark;
     // Engine-owned per-slot symbol dictionary file (disk mode only; {@code null}
     // in memory mode and if open() failed). Enables delta-encoded SF frames:
@@ -193,6 +195,10 @@ public final class CursorSendEngine implements QuietCloseable {
     // isCloseCompleted() from pool threads re-probing a retired slot (see the
     // getter for why it must not synchronize).
     private volatile boolean closeCompleted;
+    // Rings the I/O loop's doorbell after a frame is published, so the loop
+    // can block instead of polling publishedFsn().
+    // Installed by CursorWebSocketSendLoop; null until a loop attaches.
+    private volatile Runnable ioWakeup;
     // Invoked after closeCompleted publishes a confirmed flock release. Used
     // by an owning sender pool to wake capacity-starved borrowers immediately.
     private volatile Runnable slotLockReleaseListener;
@@ -212,7 +218,10 @@ public final class CursorSendEngine implements QuietCloseable {
     // lock file, which would otherwise free the pathname while the caller
     // still holds the flock on it. Latched by close(boolean) before any
     // cleanup runs; volatile because finishClose can run later on the manager
-    // worker's exit thread or the shared flock-release retry driver.
+    // worker's exit thread or the shared flock-release retry driver. The
+    // symbol-dictionary recycle is another such caller: it also holds the
+    // lock across its whole swap and closes the outgoing and healing engines
+    // with false.
     private volatile boolean reclaimLogicalSlotLock = true;
     // Published before deferredClose is registered. The manager lock provides
     // the callback handoff fence; volatile also covers a direct test/retry read.
@@ -253,8 +262,8 @@ public final class CursorSendEngine implements QuietCloseable {
     /**
      * Creates an engine with a private, non-shared {@link SegmentManager}
      * capped at {@code maxTotalBytes} of cursor-allocated memory/disk
-     * (active + spare + sealed). Producer's {@link #appendBlocking} blocks
-     * up to {@code appendDeadlineNanos} when the cap is full and ACKs
+     * (active, sealed, retained and pre-created segments). Producer's {@link #appendBlocking}
+     * blocks up to {@code appendDeadlineNanos} when the cap is full and ACKs
      * haven't drained sealed segments; on deadline expiry it throws.
      */
     public CursorSendEngine(String sfDir, long segmentSizeBytes,
@@ -281,7 +290,7 @@ public final class CursorSendEngine implements QuietCloseable {
     @TestOnly
     public CursorSendEngine(String sfDir, long segmentSizeBytes,
                             long maxTotalBytes, long appendDeadlineNanos, FilesFacade dictFf) {
-        this(sfDir, segmentSizeBytes, null, true, maxTotalBytes,
+        this(sfDir, segmentSizeBytes, null, true, new SegmentBudget(maxTotalBytes),
                 appendDeadlineNanos, 0L, dictFf);
     }
 
@@ -292,8 +301,24 @@ public final class CursorSendEngine implements QuietCloseable {
     public CursorSendEngine(String sfDir, long segmentSizeBytes,
                             long maxTotalBytes, long appendDeadlineNanos,
                             long syncIntervalNanos) {
-        this(sfDir, segmentSizeBytes, null, true, maxTotalBytes,
-                appendDeadlineNanos, syncIntervalNanos);
+        this(sfDir, segmentSizeBytes, null, true, new SegmentBudget(maxTotalBytes),
+                appendDeadlineNanos, syncIntervalNanos, FilesFacade.INSTANCE);
+    }
+
+    /**
+     * As {@link #CursorSendEngine(String, long, long, long, long)}, but the
+     * engine's private {@link SegmentManager} charges its segments to
+     * {@code budget} instead of to a budget of its own. Engines built on one
+     * budget share its capacity: together they never hold more than it, apart
+     * from the minimum working set (the active segment plus the one being
+     * rotated into) each ring is always granted. A sender pool builds every
+     * sender this way, so {@code sf_max_total_bytes} caps the pool rather than
+     * each pooled sender.
+     */
+    public CursorSendEngine(String sfDir, long segmentSizeBytes, SegmentBudget budget,
+                            long appendDeadlineNanos, long syncIntervalNanos) {
+        this(sfDir, segmentSizeBytes, null, true, budget,
+                appendDeadlineNanos, syncIntervalNanos, FilesFacade.INSTANCE);
     }
 
     /**
@@ -319,25 +344,20 @@ public final class CursorSendEngine implements QuietCloseable {
     private CursorSendEngine(String sfDir, long segmentSizeBytes, SegmentManager manager,
                              boolean ownsManager, long appendDeadlineNanos,
                              long syncIntervalNanos) {
-        this(sfDir, segmentSizeBytes, manager, ownsManager,
-                SegmentManager.UNLIMITED_TOTAL_BYTES, appendDeadlineNanos, syncIntervalNanos);
-    }
-
-    private CursorSendEngine(String sfDir, long segmentSizeBytes, SegmentManager manager,
-                             boolean ownsManager, long maxTotalBytes, long appendDeadlineNanos,
-                             long syncIntervalNanos) {
-        this(sfDir, segmentSizeBytes, manager, ownsManager, maxTotalBytes,
+        // A caller-supplied manager already charges its own budget.
+        this(sfDir, segmentSizeBytes, manager, ownsManager, null,
                 appendDeadlineNanos, syncIntervalNanos, FilesFacade.INSTANCE);
     }
 
+    // budget is what an owned manager (ownsManager && manager == null) charges
+    // its segments to; unused, and may be null, when the caller supplies the
+    // manager.
     private CursorSendEngine(String sfDir, long segmentSizeBytes, SegmentManager manager,
-                             boolean ownsManager, long maxTotalBytes, long appendDeadlineNanos,
+                             boolean ownsManager, SegmentBudget budget, long appendDeadlineNanos,
                              long syncIntervalNanos, FilesFacade dictFf) {
         this.dictFf = dictFf;
-        // Allocate the bound callback before constructing an owned manager.
-        // Field initializers have completed, but no engine-owned native/disk
-        // resource exists yet. If callback allocation throws, construction
-        // stops without a manager whose native path scratch could be orphaned.
+        // Allocate the bound callback before acquiring native or disk resources.
+        // A timed-out close can then delegate cleanup without allocating.
         this.deferredClose = createDeferredClose();
 
         // sfDir == null  → memory-only mode (non-SF async ingest). Same
@@ -346,7 +366,7 @@ public final class CursorSendEngine implements QuietCloseable {
         // sfDir != null  → store-and-forward mode. Segments are mmap'd files
         //                  under sfDir, recoverable across sender restarts.
         boolean memoryMode = sfDir == null;
-        // Validate before an owned manager allocates its native path scratch.
+        // Validate before acquiring the slot lock or allocating segments.
         if (syncIntervalNanos < 0L) {
             throw new IllegalArgumentException("syncIntervalNanos must not be negative");
         }
@@ -355,7 +375,7 @@ public final class CursorSendEngine implements QuietCloseable {
         }
         if (ownsManager && manager == null) {
             manager = new SegmentManager(
-                    segmentSizeBytes, SegmentManager.DEFAULT_POLL_NANOS, maxTotalBytes);
+                    segmentSizeBytes, budget);
         }
         SlotLock acquiredLock = null;
         if (!memoryMode) {
@@ -371,8 +391,8 @@ public final class CursorSendEngine implements QuietCloseable {
                 acquiredLock = SlotLock.acquire(sfDir, syncIntervalNanos > 0L);
             } catch (Throwable t) {
                 // Callback creation and owned-manager construction have already
-                // completed. A slot-lock failure must close the owned manager's
-                // native path scratch before propagating.
+                // completed. Close the owned manager before propagating a
+                // slot-lock failure.
                 if (ownsManager) {
                     try {
                         manager.close();
@@ -428,22 +448,6 @@ public final class CursorSendEngine implements QuietCloseable {
                 // not exist on disk if earlier segments have been trimmed,
                 // causing it to fall through to the active segment's tip
                 // and skip the unacked sealed segments entirely.
-                //
-                // Then check the persisted ack watermark. If present and
-                // larger than the segment-derived seed, prefer it: it
-                // captures durable-acks that landed inside the lowest
-                // surviving sealed segment before the previous sender
-                // crashed. Without this, those already-acked frames would
-                // be re-replayed on reconnect, producing row-level
-                // duplicates unless the target table dedupes them.
-                // max(lowestBase - 1, watermark) absorbs both write
-                // orderings of the manager's "persist then trim" tick:
-                //   - persist crashed before trim: segments still on disk
-                //     are >= lowest, watermark is correct; max picks
-                //     watermark.
-                //   - trim ran before persist: segments are gone (so
-                //     lowestBase is higher than watermark), watermark is
-                //     stale; max picks lowestBase - 1.
                 MmapSegment first = recovered.firstSealed();
                 long lowestBase = first != null
                         ? first.baseSeq()
@@ -454,15 +458,14 @@ public final class CursorSendEngine implements QuietCloseable {
                 // surviving sealed segment -- without it, those frames
                 // get re-replayed across process restart, producing
                 // row-level duplicates unless the target table dedupes
-                // them. max(lowestBase - 1, watermark) absorbs both
-                // write orderings of the manager's "persist then trim"
-                // tick:
-                //   - persist crashed before trim: segments still on
-                //     disk are >= lowest, watermark is correct; max
-                //     picks watermark.
-                //   - trim ran before persist: segments are gone (so
-                //     lowestBase is higher than watermark), watermark
-                //     is stale; max picks lowestBase - 1.
+                // them. max(lowestBase - 1, watermark) absorbs a watermark
+                // that is behind the trim (the I/O thread writes it per ACK,
+                // the manager syncs it before unlinking; a crash between the
+                // two, or a torn record, leaves it stale or invalid):
+                //   - watermark durable, segments still on disk: max picks
+                //     the watermark.
+                //   - segments gone, watermark stale: lowestBase is higher
+                //     than the watermark; max picks lowestBase - 1.
                 // Segment-derived state cannot tell whether frames in the
                 // lowest surviving segment were acknowledged. Starting
                 // without the watermark would therefore expose acknowledged
@@ -509,20 +512,32 @@ public final class CursorSendEngine implements QuietCloseable {
                 }
                 long baseSeed = lowestBase - 1;
                 long watermarkFsn = watermarkInProgress.read();
-                // Reject watermarks past publishedFsn: a correctly
-                // operating prior session cannot have produced one, so
-                // a value above the on-disk frame ceiling is corruption
-                // (torn write on a non-atomic filesystem, hardware
-                // fault, manual edit). Trusting it would seed ackedFsn
+                // Reject watermarks past publishedFsn. A host crash in MEMORY
+                // or PERIODIC durability produces one routinely: a trim
+                // msyncs the watermark while the segment data pages it
+                // covers are still dirty. Trusting it would seed ackedFsn
                 // = publishedFsn after ring.acknowledge clamps it, and
                 // the cursor would position past every un-acked frame
                 // -- silent data loss. Fall back to the segment-derived
                 // seed so the un-acked tail still replays.
                 long publishedFsn = recovered.publishedFsn();
                 long candidate = Math.max(watermarkFsn, baseSeed);
-                long seed = candidate > publishedFsn ? baseSeed : candidate;
+                boolean rejected = candidate > publishedFsn;
+                long seed = rejected ? baseSeed : candidate;
                 if (seed >= 0) {
                     recovered.acknowledge(seed);
+                }
+                // Bring the file in line with the seed now: the I/O thread
+                // writes it only on the next ACK advance, which during an
+                // outage may be never, and a rejected value left on disk
+                // would be accepted by a later recovery once new frames push
+                // publishedFsn past it. Durable in the rejected case so a
+                // host crash cannot resurrect it.
+                if (seed != watermarkFsn) {
+                    watermarkInProgress.write(seed);
+                    if (rejected) {
+                        watermarkInProgress.sync();
+                    }
                 }
                 // Fold the whole recovered ring once. The result checkpoints all
                 // running metadata and raw symbol bytes at each commit-bearing
@@ -810,7 +825,7 @@ public final class CursorSendEngine implements QuietCloseable {
             // up to one window.
             // The gauge outlives close() safely: it is a pair of wait-free
             // volatile reads that take no lock and never touch the fd, so a
-            // manager tick racing engine shutdown observes the final values.
+            // manager pass racing engine shutdown observes the final values.
             // It must not become synchronized -- see sideFileBytesLocked().
             manager.register(ringInProgress, sfDir, watermarkInProgress, syncIntervalNanos,
                     persistedDictInProgress == null ? null : persistedDictInProgress::occupiedDiskBytes);
@@ -824,9 +839,8 @@ public final class CursorSendEngine implements QuietCloseable {
             // Stop an owned manager before freeing the ring and watermark it may
             // touch, then release the slot lock. Each cleanup is in its own
             // try/catch so a single failure doesn't strand later cleanups.
-            // Closing an owned-but-never-started manager is safe (no worker to
-            // join) and required: skipping it leaked the manager's native
-            // path-scratch sink whenever construction failed before start().
+            // Closing an owned-but-never-started manager is safe: there is no
+            // worker to join.
             if (ownsManager) {
                 try {
                     manager.close();
@@ -884,7 +898,25 @@ public final class CursorSendEngine implements QuietCloseable {
      * at publishedFsn).
      */
     public boolean acknowledge(long seq) {
-        return ring.acknowledge(seq);
+        if (!ring.acknowledge(seq)) {
+            return false;
+        }
+        // Single writer of the watermark: a store into the mmap, no syscall.
+        // The manager msyncs it before it unlinks a trimmed segment, and a
+        // crash replays only what landed after the last store.
+        if (watermark != null) {
+            watermark.write(ring.ackedFsn());
+        }
+        return true;
+    }
+
+    /**
+     * Installs the callback run after every ack advance -- from any caller of
+     * {@link #acknowledge}, including the orphan-tail retirement self-ack --
+     * and after a durability failure is latched. See {@link AckWaiters}.
+     */
+    public void setAckStateListener(Runnable listener) {
+        ring.setAckStateListener(listener);
     }
 
     /**
@@ -917,13 +949,13 @@ public final class CursorSendEngine implements QuietCloseable {
      */
     public long appendBlocking(long payloadAddr, int payloadLen) {
         long fsn = ring.appendOrFsn(payloadAddr, payloadLen);
-        if (fsn >= 0) return fsn;
+        if (fsn >= 0) return published(fsn);
         if (fsn == SegmentRing.PAYLOAD_TOO_LARGE) {
             throw new MmapSegmentException("payload too large for segment");
         }
         // First miss → record one stall (not one per spin) and start the
         // deadline clock.
-        backpressureStallCount.incrementAndGet();
+        counters.backpressureStalls.incrementAndGet();
         long deadlineNs = System.nanoTime() + appendDeadlineNanos;
         while (true) {
             long now = System.nanoTime();
@@ -937,11 +969,11 @@ public final class CursorSendEngine implements QuietCloseable {
                 lastBackpressureLogNs = now;
                 LOG.warn("cursor producer backpressured ({} stalls so far); waiting for I/O or periodic disk sync; "
                                 + "will throw after {} ms",
-                        backpressureStallCount.get(), appendDeadlineNanos / 1_000_000L);
+                        counters.backpressureStalls.get(), appendDeadlineNanos / 1_000_000L);
             }
             LockSupport.parkNanos(50_000L); // 50 µs
             fsn = ring.appendOrFsn(payloadAddr, payloadLen);
-            if (fsn >= 0) return fsn;
+            if (fsn >= 0) return published(fsn);
             if (fsn == SegmentRing.PAYLOAD_TOO_LARGE) {
                 throw new MmapSegmentException("payload too large for segment");
             }
@@ -949,8 +981,8 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
-     * User-thread append path. Spins briefly while waiting for the segment
-     * manager to provision a hot spare; if backpressure persists past
+     * User-thread append path. Spins briefly while backpressured (budget
+     * exhausted, periodic-sync barrier pending); if backpressure persists past
      * {@code spinDeadlineNanos}, returns {@link SegmentRing#BACKPRESSURE_NO_SPARE}
      * so the caller can decide whether to {@code parkNanos} or surface the
      * pressure to the user.
@@ -961,22 +993,40 @@ public final class CursorSendEngine implements QuietCloseable {
     public long appendOrFsn(long payloadAddr, int payloadLen, long spinDeadlineNanos) {
         long fsn = ring.appendOrFsn(payloadAddr, payloadLen);
         if (fsn >= 0) {
-            return fsn;
+            return published(fsn);
         }
         if (fsn == SegmentRing.PAYLOAD_TOO_LARGE) {
             return fsn;
         }
         // Backpressure: spin briefly, then return so the caller decides.
-        // The spin tightens the gap between manager-installs-spare and
-        // producer-consumes-spare — usually a few µs on an idle manager thread.
+        // Retry briefly for budget space or a pending sync barrier to clear.
         while (System.nanoTime() < spinDeadlineNanos) {
             Compat.onSpinWait();
             fsn = ring.appendOrFsn(payloadAddr, payloadLen);
-            if (fsn >= 0 || fsn == SegmentRing.PAYLOAD_TOO_LARGE) {
+            if (fsn >= 0) {
+                return published(fsn);
+            }
+            if (fsn == SegmentRing.PAYLOAD_TOO_LARGE) {
                 return fsn;
             }
         }
         return SegmentRing.BACKPRESSURE_NO_SPARE;
+    }
+
+    /**
+     * Callback run after every successful append; every producer path goes
+     * through the append methods, so this is the single wake point.
+     */
+    public void setIoWakeup(Runnable wakeup) {
+        this.ioWakeup = wakeup;
+    }
+
+    private long published(long fsn) {
+        Runnable w = ioWakeup;
+        if (w != null) {
+            w.run();
+        }
+        return fsn;
     }
 
     public void checkDurability() {
@@ -999,7 +1049,9 @@ public final class CursorSendEngine implements QuietCloseable {
      * lock file while build() still holds the flock on it. On POSIX that frees the
      * pathname without releasing the lock, so the next {@code acquireLogical} creates
      * a SECOND inode and locks it successfully: two parties owning a lock whose only
-     * job is serialising the quarantine close-&gt;rename-&gt;recreate window.
+     * job is serialising the quarantine close-&gt;rename-&gt;recreate window. The
+     * symbol-dictionary recycle is the other such caller: it holds the lock across
+     * its whole swap and closes the outgoing and healing engines with {@code false}.
      */
     public synchronized void close(boolean reclaimLogicalSlotLock) {
         // Latch before the early return: a retried close() must not widen a
@@ -1058,7 +1110,7 @@ public final class CursorSendEngine implements QuietCloseable {
         }
         // Quiescence barrier. deregister alone only removes the entry
         // from the registry — the worker may still be mid service pass
-        // for this ring (creating a spare file, trimming, unlinking).
+        // for this ring (syncing or trimming segments).
         boolean workerQuiescent = false;
         if (ownsManager) {
             // Stopping and reaping a private manager is a stronger barrier
@@ -1202,19 +1254,18 @@ public final class CursorSendEngine implements QuietCloseable {
                 throw e;
             }
         }
-        // On a fully-drained close, persist the final acked FSN through the
-        // still-mapped watermark BEFORE closing the ring/watermark and BEFORE
-        // unlinking any segment file. The manager persists the watermark only
-        // on its own tick, so it may lag the final ack. If any part of this
-        // covering barrier fails, retain the ring, watermark and slot flock:
+        // On a fully-drained close, make the final acked FSN durable through
+        // the still-mapped watermark BEFORE closing the ring/watermark and
+        // BEFORE unlinking any segment file. The I/O thread wrote it on the
+        // final ACK but only the manager's trim syncs it, so it may not be
+        // durable yet. If any part of this covering barrier fails, retain the
+        // ring, watermark and slot flock:
         // publishing the slot would let a successor recover acknowledged
         // residue from a stale durable watermark. The shared retry driver owns
         // convergence after the one-shot public close reports the failure.
         if (fullyDrained && watermark != null) {
             try {
-                long finalAckedFsn = ring.ackedFsn();
-                if (finalAckedFsn >= 0) {
-                    watermark.write(finalAckedFsn);
+                if (ring.ackedFsn() >= 0) {
                     watermark.sync();
                     if (filesFacade.fsyncDir(sfDir) != 0) {
                         throw new IllegalStateException(
@@ -1236,9 +1287,9 @@ public final class CursorSendEngine implements QuietCloseable {
                 ring.close();
             } catch (Throwable ignored) {
             }
-            // Close the watermark mmap/fd after the manager (which
-            // writes through it) is gone but before the slot lock is
-            // released. On fully-drained close, also unlink the file
+            // Close the watermark mmap/fd after the I/O loop (which writes
+            // it) and the manager (which syncs it) are gone but before the
+            // slot lock is released. On fully-drained close, also unlink the file
             // -- a stale watermark with no segments behind it would
             // confuse a future recovery cycle if (it wouldn't actually
             // confuse current recovery, which only reads the watermark
@@ -1347,6 +1398,11 @@ public final class CursorSendEngine implements QuietCloseable {
     @TestOnly
     public SlotLock getSlotLockForTesting() {
         return slotLock;
+    }
+
+    @TestOnly
+    public Runnable getSlotLockReleaseListenerForTesting() {
+        return slotLockReleaseListener;
     }
 
     @TestOnly
@@ -1624,6 +1680,32 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
+     * Replaces this engine's counters with the sender's shared, sender-lifetime
+     * instance, folding this engine's own backpressure-stall count into it
+     * (the other counters are the loop's, and an engine handed between
+     * senders must not carry a previous sender's totals). Producer thread
+     * only, before the first {@link #appendBlocking} on this engine -- the
+     * same attach window {@link #setSlotLockReleaseListener} uses.
+     */
+    public void adoptCounters(CursorSendCounters shared) {
+        if (shared == counters) {
+            return;
+        }
+        shared.backpressureStalls.addAndGet(counters.backpressureStalls.get());
+        counters = shared;
+    }
+
+    /**
+     * The engine's current counters holder -- the DEFAULT instance until
+     * {@link #adoptCounters} replaces it. Test-only seam to observe what
+     * {@link #adoptCounters} folds and what it leaves alone.
+     */
+    @TestOnly
+    public CursorSendCounters getCountersForTesting() {
+        return counters;
+    }
+
+    /**
      * Re-arms the shared terminal retry for an engine whose final watermark
      * barrier or confirmed flock release is still pending and no longer
      * scheduled because the retry driver thread failed to start (e.g. OOM at
@@ -1749,10 +1831,12 @@ public final class CursorSendEngine implements QuietCloseable {
      * Number of times {@link #appendBlocking} hit
      * {@link SegmentRing#BACKPRESSURE_NO_SPARE} on its first attempt and
      * had to wait for the segment manager (or for ACKs) to free space.
-     * One increment per blocking-call, not per spin-park. Cumulative.
+     * One increment per blocking-call, not per spin-park. Cumulative, and
+     * carried across a symbol-dictionary recycle once the owning sender has
+     * adopted this engine (see {@link #adoptCounters}).
      */
     public long getTotalBackpressureStalls() {
-        return backpressureStallCount.get();
+        return counters.backpressureStalls.get();
     }
 
     /**
@@ -1787,6 +1871,15 @@ public final class CursorSendEngine implements QuietCloseable {
      */
     public long publishedFsn() {
         return ring.publishedFsn();
+    }
+
+    /**
+     * I/O thread accessor: changes after every completed publish (FSN and
+     * bytes). The idle re-check in the I/O loop keys on this, see
+     * {@link SegmentRing#publishStamp()}.
+     */
+    public long publishStamp() {
+        return ring.publishStamp();
     }
 
     /**
@@ -1902,10 +1995,15 @@ public final class CursorSendEngine implements QuietCloseable {
      * Ascending removal rank of a segment file name for
      * {@link #unlinkAllSegmentFiles(String)}. {@code sf-initial.sfa} is
      * always the fresh-start segment at baseSeq 0, so it ranks first.
-     * Spare files carry a monotonic generation ({@code sf-<gen:016x>.sfa})
-     * assigned in creation == rotation == baseSeq order, so the parsed
-     * generation ranks them. Anything else with the extension is not a
-     * live segment and ranks last.
+     * Generation-named files ({@code sf-<gen:016x>.sfa}) rank by the parsed
+     * generation, i.e. creation order. That is baseSeq order except for a
+     * segment the manager pre-created before a producer fallback create
+     * minted the next generation; the pre-created one then serves the
+     * rotation after it. This client creates segments only in slots with a
+     * manifest, whose drain commits {@code head == active} before the first
+     * unlink, so removal order is not load-bearing there; a legacy slot
+     * without one holds files an older client created in rotation order.
+     * Anything else with the extension is not a live segment and ranks last.
      */
     private static long segmentCleanupRank(String name) {
         if ("sf-initial.sfa".equals(name)) {

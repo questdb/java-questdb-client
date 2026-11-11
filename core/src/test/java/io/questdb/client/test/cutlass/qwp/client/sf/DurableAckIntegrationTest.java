@@ -27,6 +27,9 @@ package io.questdb.client.test.cutlass.qwp.client.sf;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpDurableAckMismatchException;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
+import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.std.Files;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
@@ -40,6 +43,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Paths;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -120,7 +124,235 @@ public class DurableAckIntegrationTest {
                 } catch (QwpDurableAckMismatchException e) {
                     Assert.assertEquals("localhost", e.getHost());
                     Assert.assertEquals(port, e.getPort());
+                    Assert.assertEquals(
+                            "WebSocket upgrade failed: server does not support durable ack [host=localhost, port=" + port
+                                    + ", requested=on, echoed=<no X-QWP-Durable-Ack header>]",
+                            e.getMessage());
                 }
+            }
+        });
+    }
+
+    @Test
+    public void testBooleanBuilderRequestsLegacyTier() throws Exception {
+        assertBooleanBuilderRequest(true, "true");
+    }
+
+    @Test
+    public void testBooleanBuilderDisablesDurableAck() throws Exception {
+        assertBooleanBuilderRequest(false, "");
+    }
+
+    private void assertBooleanBuilderRequest(boolean enabled, String expectedHeader) throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            DurableAckCapableHandler handler = new DurableAckCapableHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler, enabled)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                // The public boolean API must retain the legacy true/enabled
+                // handshake; false must work against a server with no durable-ack support.
+                try (Sender ignored = Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address("localhost:" + server.getPort())
+                        .requestDurableAck(enabled)
+                        .storeAndForwardDir(sfDir)
+                        .build()) {
+                    Assert.assertEquals(expectedHeader,
+                            server.pollDurableAckRequest(100, TimeUnit.MILLISECONDS));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testBuilderInvalidTierValueRejected() {
+        // The programmatic CharSequence overload applies the same parse as the
+        // config string: a typo must throw, naming the key and the value.
+        try {
+            Sender.builder(Sender.Transport.WEBSOCKET).requestDurableAck("yes");
+            Assert.fail("expected LineSenderException for invalid tier value");
+        } catch (LineSenderException e) {
+            Assert.assertTrue(
+                    "message names the offending key+value, was: " + e.getMessage(),
+                    e.getMessage().contains("request_durable_ack")
+                            && e.getMessage().contains("yes"));
+        }
+    }
+
+    @Test
+    public void testBuilderRejectsTiersOnHttpTransport() {
+        // Durable-ack streams exist only on the WebSocket transport; asking
+        // for a tier on an HTTP builder must fail fast at configuration time.
+        try {
+            Sender.builder(Sender.Transport.HTTP).requestDurableAck("local");
+            Assert.fail("expected LineSenderException for HTTP transport");
+        } catch (LineSenderException e) {
+            Assert.assertTrue("was: " + e.getMessage(),
+                    e.getMessage().contains("only supported for WebSocket"));
+        }
+    }
+
+    @Test
+    public void testConnectStringLocalRequiresServerSupport() throws Exception {
+        // Tier requests keep the all-or-nothing contract of the legacy opt-in:
+        // a server that does not confirm the durable-ack grant (no
+        // X-QWP-Durable-Ack header) must fail the connect, not leave the
+        // store-and-forward log growing while waiting on acks that never come.
+        TestUtils.assertMemoryLeak(() -> {
+            DurableAckCapableHandler handler = new DurableAckCapableHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler, false)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                int port = server.getPort();
+                String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";request_durable_ack=local;";
+                try (Sender ignored = Sender.fromConfig(config)) {
+                    Assert.fail("expected connect to fail with QwpDurableAckMismatchException");
+                } catch (QwpDurableAckMismatchException e) {
+                    Assert.assertEquals("localhost", e.getHost());
+                    Assert.assertEquals(port, e.getPort());
+                    // The message names the requested set and that the server
+                    // answered with no confirmation header at all.
+                    Assert.assertEquals(
+                            "WebSocket upgrade failed: server does not support durable ack [host=localhost, port=" + port
+                                    + ", requested=local, echoed=<no X-QWP-Durable-Ack header>]",
+                            e.getMessage());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testLocalRequestDeniedWhenServerGrantsDifferentSet() throws Exception {
+        // A server that answers a "local" request with the legacy "enabled"
+        // token granted a set other than the one requested. The client must
+        // read any token except its expected one as a denial -- trimming on a
+        // foreign grant could otherwise drop data on a guarantee weaker than
+        // the caller configured.
+        TestUtils.assertMemoryLeak(() -> {
+            DurableAckCapableHandler handler = new DurableAckCapableHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler, true)) {
+                server.setDurableAckHeaderValue("enabled");
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                int port = server.getPort();
+                String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";request_durable_ack=local;";
+                try (Sender ignored = Sender.fromConfig(config)) {
+                    Assert.fail("expected connect to fail with QwpDurableAckMismatchException");
+                } catch (QwpDurableAckMismatchException e) {
+                    Assert.assertEquals(port, e.getPort());
+                    // The message names both sides of the mismatch: the
+                    // requested set and the foreign token the server echoed.
+                    Assert.assertEquals(
+                            "WebSocket upgrade failed: server does not support durable ack [host=localhost, port=" + port
+                                    + ", requested=local, echoed=enabled]",
+                            e.getMessage());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testRequestHeaderCarriesConfiguredTierSet() throws Exception {
+        // The upgrade request must carry the exact token for each configured
+        // set: the legacy "on" travels as "true" (the request value
+        // tier-unaware servers recognize), explicit sets travel verbatim.
+        // No rows are sent, so close() returns without waiting on acks.
+        TestUtils.assertMemoryLeak(() -> {
+            DurableAckCapableHandler handler = new DurableAckCapableHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler, true)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                int port = server.getPort();
+
+                String[][] cases = {
+                        {"on", "true"},
+                        {"local", "local"},
+                        {"replicated", "replicated"},
+                        {"local,replicated", "local,replicated"},
+                };
+                for (String[] c : cases) {
+                    String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                            + ";request_durable_ack=" + c[0] + ";";
+                    Sender.fromConfig(config).close();
+                    Assert.assertEquals("config value " + c[0],
+                            c[1], server.pollDurableAckRequest(5, TimeUnit.SECONDS));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testEndToEndBothTiersLocalAckIsProgressOnly() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            DurableAckCapableHandler handler = new DurableAckCapableHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler, true)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                int port = server.getPort();
+                String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";request_durable_ack=local,replicated;close_flush_timeout_millis=5000;";
+                try (Sender sender = Sender.fromConfig(config)) {
+                    sender.table("trades").longColumn("v", 1L).atNow();
+                    sender.flush();
+                    handler.awaitOkBatches(1);
+
+                    CursorWebSocketSendLoop loop =
+                            ((QwpWebSocketSender) sender).cursorSendLoopForTest();
+                    Assert.assertNotNull(loop);
+
+                    handler.emitLocalDurableAckForAll();
+                    try {
+                        // The follow-up OK publishes the preceding local ACK's updates.
+                        // No more local ACKs are sent before reading the watermark.
+                        sender.table("trades").longColumn("v", 2L).atNow();
+                        sender.flush();
+                        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                        while (loop.getTotalAcks() < 2 && System.nanoTime() < deadline) {
+                            Thread.sleep(10);
+                        }
+                        Assert.assertEquals("follow-up OK not observed", 2L, loop.getTotalAcks());
+                        Assert.assertEquals("local ack not observed", 1L, loop.getTotalLocalDurableAcks());
+                        Assert.assertEquals("local watermark tracks the first batch's fsync frontier",
+                                0L, loop.getLocalDurableTableWatermark("trades"));
+                        Assert.assertEquals(
+                                "local acks must not advance trim when replicated is requested",
+                                0L, loop.getTotalDurableTrimAdvances());
+                        Assert.assertEquals("neither batch is replicated yet", -1L, sender.getAckedFsn());
+                    } finally {
+                        handler.emitDurableAckForAll();
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testEndToEndLocalTrimDefersUntilLocalAck() throws Exception {
+        // request_durable_ack=local: OK frames alone never trim; the
+        // STATUS_LOCAL_DURABLE_ACK stream is the trim trigger. close() drains
+        // only once the local ack covers everything sent -- the local-tier
+        // mirror of testEndToEndDurableTrimDefersUntilUploadAck.
+        TestUtils.assertMemoryLeak(() -> {
+            DurableAckCapableHandler handler = new DurableAckCapableHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler, true)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                int port = server.getPort();
+                String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";request_durable_ack=local;close_flush_timeout_millis=5000;";
+                try (Sender sender = Sender.fromConfig(config)) {
+                    for (int i = 0; i < 50; i++) {
+                        sender.table("trades").longColumn("v", i).atNow();
+                    }
+                    sender.flush(); // one batch -> one OK
+                    handler.awaitOkBatches(1);
+                    handler.emitLocalDurableAckForAll();
+                }
+                // close() returned without timing out: the local ack drove the
+                // trim to completion.
             }
         });
     }
@@ -147,12 +379,12 @@ public class DurableAckIntegrationTest {
                     }
                     sender.flush();
 
-                    // Wait for the server to OK every batch so we know the OK
-                    // watermark is fully advanced. Without a durable-ack the
-                    // client's ackedFsn must still be behind publishedFsn --
+                    // Wait for the server to OK the flushed batch so we know
+                    // the OK watermark is fully advanced. Without a durable-ack
+                    // the client's ackedFsn must still be behind publishedFsn --
                     // we don't assert on internals here, just observe that
                     // the contract holds at the boundary check below.
-                    handler.awaitOks();
+                    handler.awaitOkBatches(1);
 
                     // Release a cumulative durable-ack covering everything that
                     // has been OK'd so far. The client's I/O thread reads new
@@ -169,10 +401,75 @@ public class DurableAckIntegrationTest {
         });
     }
 
-    private static byte[] buildDurableAckFrame(long seqTxn) {
+    @Test
+    public void testIdleLocalAckWakesParkedWaiter() throws Exception {
+        assertIdleDurableAckWakesWaiter("local", true);
+    }
+
+    @Test
+    public void testIdleBothTiersWaiterNeedsReplicatedAck() throws Exception {
+        assertIdleDurableAckWakesWaiter("local,replicated", false);
+    }
+
+    private void assertIdleDurableAckWakesWaiter(String tiers, boolean localAckTrims) throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            DurableAckCapableHandler handler = new DurableAckCapableHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler, true)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                String config = "ws::addr=localhost:" + server.getPort() + ";sf_dir=" + sfDir
+                        + ";request_durable_ack=" + tiers + ";close_flush_timeout_millis=0;"
+                        + "keepalive_interval_millis=0;durable_ack_keepalive_interval_millis=0;";
+                try (Sender sender = Sender.fromConfig(config)) {
+                    sender.table("trades").longColumn("v", 1L).atNow();
+                    long target = sender.flushAndGetSequence();
+                    handler.awaitOkBatches(1);
+                    FutureTask<Boolean> result = new FutureTask<>(() -> sender.awaitAckedFsn(target, 5000));
+                    Thread waiter = new Thread(result, "test-durable-ack-waiter");
+                    waiter.start();
+                    try {
+                        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                        while (waiter.getState() != Thread.State.TIMED_WAITING
+                                && !result.isDone() && System.nanoTime() < deadline) {
+                            Thread.sleep(1);
+                        }
+                        Assert.assertEquals("waiter must park before the ack arrives",
+                                Thread.State.TIMED_WAITING, waiter.getState());
+                        Assert.assertEquals("OK alone must not trim", -1L, sender.getAckedFsn());
+
+                        // No further publishes or PINGs: inbound durability frames must
+                        // wake the idle transport and then the parked ACK waiter.
+                        handler.emitLocalDurableAckForAll();
+                        if (!localAckTrims) {
+                            CursorWebSocketSendLoop loop = ((QwpWebSocketSender) sender).cursorSendLoopForTest();
+                            deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                            while (loop.getTotalLocalDurableAcks() == 0 && System.nanoTime() < deadline) {
+                                Thread.sleep(1);
+                            }
+                            Assert.assertTrue("local ack must be received while idle", loop.getTotalLocalDurableAcks() > 0);
+                            Assert.assertEquals("local progress must not satisfy replicated durability",
+                                    -1L, sender.getAckedFsn());
+                            Assert.assertFalse("waiter must still need the replicated ack", result.isDone());
+                            handler.emitDurableAckForAll();
+                        }
+                        Assert.assertTrue("durable ack must wake the waiter before its deadline",
+                                result.get(1, TimeUnit.SECONDS));
+                    } finally {
+                        sender.close();
+                        waiter.join(5000);
+                        Assert.assertFalse("ack waiter leaked", waiter.isAlive());
+                    }
+                }
+            }
+        });
+    }
+
+    private static byte[] buildDurableAckFrame(byte status, long seqTxn) {
+        // STATUS_DURABLE_ACK and STATUS_LOCAL_DURABLE_ACK share the layout:
+        // status(1) + tableCount(2) + nameLen(2) + name + seqTxn(8).
         byte[] name = DurableAckCapableHandler.TABLE_NAME.getBytes(StandardCharsets.UTF_8);
         ByteBuffer bb = ByteBuffer.allocate(1 + 2 + 2 + name.length + 8).order(ByteOrder.LITTLE_ENDIAN);
-        bb.put((byte) 0x02); // STATUS_DURABLE_ACK
+        bb.put(status);
         bb.putShort((short) 1); // tableCount
         bb.putShort((short) name.length);
         bb.put(name);
@@ -230,20 +527,36 @@ public class DurableAckIntegrationTest {
             }
         }
 
-        void awaitOks() throws InterruptedException {
+        void awaitOkBatches(long count) throws InterruptedException {
+            // One OK frame per QWP batch (i.e. per flush), NOT per row. A
+            // silent return on timeout would let the caller proceed on a
+            // watermark that never advanced, so this fails loudly instead.
             long deadline = System.currentTimeMillis() + (long) 5000;
-            while (totalOks() < (long) 50 && System.currentTimeMillis() < deadline) {
+            while (totalOks() < count && System.currentTimeMillis() < deadline) {
                 Thread.sleep(10);
             }
+            Assert.assertTrue(
+                    "server never OK'd " + count + " batch(es), got " + totalOks(),
+                    totalOks() >= count);
         }
 
         void emitDurableAckForAll() throws IOException {
             // Cumulative durable-ack: every OK already issued is now durable.
             // Single-table handler so one entry suffices.
+            emitAckForAll(WebSocketResponse.STATUS_DURABLE_ACK);
+        }
+
+        void emitLocalDurableAckForAll() throws IOException {
+            // Cumulative local-durability ack: every OK already issued is now
+            // fdatasync-durable on the "server".
+            emitAckForAll(WebSocketResponse.STATUS_LOCAL_DURABLE_ACK);
+        }
+
+        private void emitAckForAll(byte status) throws IOException {
             TestWebSocketServer.ClientHandler c = activeClient;
             if (c != null) {
                 long seqTxn = Math.max(0L, nextSeqTxn.get() - 1L);
-                c.sendBinary(buildDurableAckFrame(seqTxn));
+                c.sendBinary(buildDurableAckFrame(status, seqTxn));
             }
         }
 

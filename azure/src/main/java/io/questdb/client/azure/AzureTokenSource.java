@@ -1,0 +1,330 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.client.azure;
+
+import com.azure.core.credential.AccessToken;
+import com.azure.core.credential.TokenCredential;
+import com.azure.core.credential.TokenRequestContext;
+import com.azure.core.exception.HttpResponseException;
+import com.azure.core.http.HttpResponse;
+import com.azure.identity.ChainedTokenCredential;
+import com.azure.identity.CredentialUnavailableException;
+import com.microsoft.aad.msal4j.MsalServiceException;
+import io.questdb.client.cutlass.auth.ExpiringToken;
+import io.questdb.client.cutlass.auth.TokenSource;
+import io.questdb.client.cutlass.auth.TokenUnavailableException;
+
+import java.net.SocketException;
+import java.net.SocketTimeoutException;
+import java.net.UnknownHostException;
+import java.nio.file.NoSuchFileException;
+import java.time.Duration;
+import java.time.OffsetDateTime;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * A {@link TokenSource} that obtains Microsoft Entra ID access tokens from an Azure Identity
+ * {@link TokenCredential} - by default a {@code DefaultAzureCredential} - for the scope
+ * {@code <resource>/.default} (design/qwp-token-provider-spec.md, section 7.5).
+ * <p>
+ * Use it directly to put an Azure credential of your choice behind a
+ * {@link io.questdb.client.cutlass.auth.RefreshingTokenProvider}:
+ * <pre>{@code
+ * TokenCredential credential = new ClientCertificateCredentialBuilder()...build();
+ * RefreshingTokenProvider tokens = RefreshingTokenProvider.builder(
+ *         new AzureTokenSource(credential, "api://<questdb-app-id>")).build();
+ * }</pre>
+ * or let a connect string select {@code token_provider=azure}, whose {@code azure_credential} key picks the
+ * credential (see {@link AzureTokenProviderFactory}).
+ * <p>
+ * Expiry and the refresh hint come from the library's {@link AccessToken}. Failures are classified as section
+ * 7.5 prescribes, the same way whichever credential is used:
+ * <ul>
+ *   <li>permanent - no credential available ({@link CredentialUnavailableException}): a credential chain that
+ *   found nothing, or a credential whose configuration or credential file is missing or whose certificate cannot
+ *   be parsed; a managed identity that is not assigned to this host, which a managed-identity credential used alone
+ *   reports only in a nested cause; and
+ *   authentication failures Entra reports: an HTTP 400 or 401 from the token endpoint, or a known AADSTS
+ *   configuration error such as an invalid client or an application that does not exist;</li>
+ *   <li>retryable - network errors, timeouts, throttling, 5xx responses, and anything else. A
+ *   {@code Retry-After} in seconds is passed on, and the error names the socket-level cause of a network
+ *   failure, such as a refused connection, which a managed identity otherwise hides behind a generic message.</li>
+ * </ul>
+ * Each attempt is bounded (30 s by default). Library exceptions never travel as a cause - their response
+ * objects reference the raw HTTP request, which can carry a client secret. Diagnostics name only safe failure
+ * reasons, failure types, HTTP status, known configuration error codes and socket-level causes; SDK messages can
+ * embed raw bodies.
+ */
+public final class AzureTokenSource implements TokenSource {
+    /**
+     * The bound on one token request.
+     */
+    public static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(30);
+    // Azure Identity wraps certificate-loading I/O/security failures in a plain RuntimeException with this prefix.
+    // Recognize that failure without treating unrelated I/O errors as permanent or exposing the SDK message.
+    private static final String CERTIFICATE_PARSE_FAILURE = "Failed to parse the certificate for the credential:";
+    private static final String DEFAULT_SCOPE_SUFFIX = "/.default";
+    // A managed identity that is not assigned to this host, or does not exist: IMDS answers 400 "Identity not
+    // found". Inside a chain that arrives as a CredentialUnavailableException, but a ManagedIdentityCredential used
+    // alone wraps it in a generic ClientAuthenticationException and keeps the reason only in the message of a
+    // nested MSAL exception, which has no status code. Without this rule a configuration error would be retried
+    // for a whole connect budget. Pinned against the real library by AzureManagedIdentityLibraryTest.
+    private static final String IDENTITY_NOT_ASSIGNED = "has not been assigned to this resource";
+    private static final int MAX_CAUSE_DEPTH = 16;
+    // Entra (AADSTS) errors that a retry cannot fix: the configuration is wrong, an operator must act.
+    private static final String[] PERMANENT_AADSTS = {
+            "AADSTS700016", // application not found in the directory
+            "AADSTS7000215", // invalid client secret
+            "AADSTS7000222", // client secret expired
+            "AADSTS700027", // client assertion signature invalid
+            "AADSTS70011", // invalid scope
+            "AADSTS500011", // resource principal not found: azure_resource is wrong
+            "AADSTS90002", // tenant not found
+            "AADSTS700213", // no matching federated identity record
+            "AADSTS70021", // no matching federated identity record
+            "AADSTS7000112", // application disabled
+            "AADSTS50049", // unknown or invalid instance
+    };
+    private final TokenRequestContext context;
+    private final TokenCredential credential;
+    // whether the credential is a chain, such as DefaultAzureCredential: only the wording of errors depends on it
+    private final boolean isChain;
+    private final String scope;
+    private final Duration timeout;
+
+    /**
+     * @param credential the Azure Identity credential
+     * @param resource   the application ID URI ({@code api://<app-id>}) or client ID of the QuestDB app
+     *                   registration; a trailing {@code /.default} is accepted
+     */
+    public AzureTokenSource(TokenCredential credential, String resource) {
+        this(credential, resource, DEFAULT_TIMEOUT);
+    }
+
+    /**
+     * @param credential the Azure Identity credential
+     * @param resource   the application ID URI ({@code api://<app-id>}) or client ID of the QuestDB app
+     *                   registration; a trailing {@code /.default} is accepted
+     * @param timeout    the bound on one token request
+     */
+    public AzureTokenSource(TokenCredential credential, String resource, Duration timeout) {
+        if (credential == null) {
+            throw new IllegalArgumentException("credential must not be null");
+        }
+        if (resource == null || resource.isEmpty()) {
+            throw new IllegalArgumentException("resource must not be empty");
+        }
+        if (timeout == null || timeout.isNegative() || timeout.isZero()) {
+            throw new IllegalArgumentException("timeout must be positive");
+        }
+        this.credential = credential;
+        this.isChain = credential instanceof ChainedTokenCredential;
+        this.scope = resource.endsWith(DEFAULT_SCOPE_SUFFIX) ? resource : resource + DEFAULT_SCOPE_SUFFIX;
+        this.context = new TokenRequestContext().addScopes(scope);
+        this.timeout = timeout;
+    }
+
+    /**
+     * Classifies a failure from Azure Identity per section 7.5. Never attaches the library exception.
+     */
+    static TokenUnavailableException classify(Throwable failure, String scope, boolean isChain) {
+        final String description = describe(failure);
+        boolean hasCertificateParseFailure = false;
+        long retryAfterMillis = TokenUnavailableException.NO_RETRY_AFTER;
+        Throwable t = failure;
+        for (int depth = 0; t != null && depth < MAX_CAUSE_DEPTH; depth++, t = t.getCause()) {
+            if (t instanceof NoSuchFileException) {
+                return TokenUnavailableException.permanent("credential file is missing for " + scope);
+            }
+            if (t instanceof CredentialUnavailableException) {
+                return TokenUnavailableException.permanent("no credential available "
+                        + (isChain ? "in the Azure Identity chain " : "") + "for " + scope + ": " + description);
+            }
+            if (t instanceof HttpResponseException) {
+                final HttpResponse response = ((HttpResponseException) t).getResponse();
+                if (response != null) {
+                    final int status = response.getStatusCode();
+                    if (status == 400 || status == 401) {
+                        return TokenUnavailableException.permanent(
+                                "Entra rejected the token request for " + scope + " with HTTP " + status + ": " + description);
+                    }
+                    return TokenUnavailableException.retryable(
+                            "the token request for " + scope + " failed with HTTP " + status + ": " + description,
+                            retryAfterMillis(response));
+                }
+            }
+            final String message = t.getMessage();
+            if (message != null) {
+                if (t.getClass() == RuntimeException.class && message.startsWith(CERTIFICATE_PARSE_FAILURE)) {
+                    hasCertificateParseFailure = true;
+                }
+                for (String code : PERMANENT_AADSTS) {
+                    if (message.contains(code)) {
+                        return TokenUnavailableException.permanent(
+                                "Entra rejected the token request for " + scope + " (" + code + "): " + description);
+                    }
+                }
+                if (message.contains(IDENTITY_NOT_ASSIGNED)) {
+                    // the library's reason, never its message: that also carries the raw response
+                    return TokenUnavailableException.permanent("managed identity unavailable for " + scope
+                            + ": the requested identity has not been assigned to this resource");
+                }
+            }
+            if (t instanceof MsalServiceException) {
+                // Service-principal credentials expose status and headers through MSAL, not HttpResponseException.
+                final MsalServiceException msal = (MsalServiceException) t;
+                final Integer status = msal.statusCode();
+                if (status != null && (status == 400 || status == 401)) {
+                    return TokenUnavailableException.permanent(
+                            "Entra rejected the token request for " + scope + " with HTTP " + status + ": " + description);
+                }
+                if (retryAfterMillis == TokenUnavailableException.NO_RETRY_AFTER) {
+                    retryAfterMillis = retryAfterMillis(msal.headers());
+                }
+            }
+        }
+        if (hasCertificateParseFailure) {
+            // Keep more specific nested reasons, such as NoSuchFileException, ahead of the parsing fallback.
+            return TokenUnavailableException.permanent("credential certificate could not be parsed for " + scope);
+        }
+        return TokenUnavailableException.retryable("the token request for " + scope + " failed: "
+                + withNetworkCause(failure, description), retryAfterMillis);
+    }
+
+    private static String describe(Throwable t) {
+        // Even the outer SDK message can contain the complete token-endpoint response. Keep only the type;
+        // classify() adds safe status/error codes, and withNetworkCause() names socket-level failures.
+        final String name = t.getClass().getSimpleName();
+        return name.isEmpty() ? t.getClass().getName() : name;
+    }
+
+    // The outermost socket-level failure among the causes: a refused or reset connection, an unreachable or
+    // unknown host, a socket timeout. Only these are named: their text is a host, a port and an OS error, while
+    // other library messages (MSAL's, a JSON parser's) can embed a raw response.
+    private static Throwable networkCause(Throwable failure) {
+        Throwable t = failure;
+        for (int depth = 0; t != null && depth < MAX_CAUSE_DEPTH; depth++, t = t.getCause()) {
+            if (t instanceof SocketException || t instanceof UnknownHostException || t instanceof SocketTimeoutException) {
+                return t;
+            }
+        }
+        return null;
+    }
+
+    private static long parseRetryAfterMillis(String value) {
+        if (value == null) {
+            return TokenUnavailableException.NO_RETRY_AFTER;
+        }
+        try {
+            // delta-seconds only; an HTTP-date is ignored and the provider's own backoff applies
+            return TimeUnit.SECONDS.toMillis(Long.parseLong(value.trim()));
+        } catch (NumberFormatException e) {
+            return TokenUnavailableException.NO_RETRY_AFTER;
+        }
+    }
+
+    private static long refreshAtMillis(AccessToken token) {
+        try {
+            final OffsetDateTime refreshAt = token.getRefreshAt();
+            return refreshAt == null ? ExpiringToken.NO_REFRESH_AT : refreshAt.toInstant().toEpochMilli();
+        } catch (NoSuchMethodError e) {
+            // an azure-core older than the refresh hint
+            return ExpiringToken.NO_REFRESH_AT;
+        }
+    }
+
+    private static long retryAfterMillis(HttpResponse response) {
+        try {
+            return parseRetryAfterMillis(response.getHeaderValue("Retry-After"));
+        } catch (RuntimeException e) {
+            return TokenUnavailableException.NO_RETRY_AFTER;
+        }
+    }
+
+    private static long retryAfterMillis(Map<String, List<String>> headers) {
+        if (headers != null) {
+            for (Map.Entry<String, List<String>> header : headers.entrySet()) {
+                if ("Retry-After".equalsIgnoreCase(header.getKey())) {
+                    final List<String> values = header.getValue();
+                    return values == null || values.isEmpty()
+                            ? TokenUnavailableException.NO_RETRY_AFTER
+                            : parseRetryAfterMillis(values.get(0));
+                }
+            }
+        }
+        return TokenUnavailableException.NO_RETRY_AFTER;
+    }
+
+    // Lead with the socket-level cause so it survives the provider's error-text cap. Only socket failures
+    // contribute message text; other SDK/parser messages can contain the token-endpoint response.
+    private static String withNetworkCause(Throwable failure, String description) {
+        final Throwable network = networkCause(failure);
+        if (network == null) {
+            return description;
+        }
+        final String reason = network.getMessage();
+        final String networkDescription = describe(network) + (reason == null ? "" : ": " + reason);
+        return network == failure ? networkDescription : networkDescription + "; " + description;
+    }
+
+    @Override
+    public ExpiringToken fetchToken() {
+        final AccessToken token;
+        try {
+            token = credential.getToken(context).block(timeout);
+        } catch (RuntimeException e) {
+            throw classify(e, scope, isChain);
+        }
+        if (token == null) {
+            throw TokenUnavailableException.retryable("Azure Identity returned no token for " + scope);
+        }
+        final OffsetDateTime expiresAt = token.getExpiresAt();
+        if (token.getToken() == null || expiresAt == null) {
+            // the shape of the problem only, never the response
+            throw TokenUnavailableException.retryable("Azure Identity returned a token for " + scope
+                    + " without " + (token.getToken() == null ? "a value" : "an expiry"));
+        }
+        try {
+            return new ExpiringToken(token.getToken(), expiresAt.toInstant().toEpochMilli(), refreshAtMillis(token));
+        } catch (IllegalArgumentException e) {
+            throw TokenUnavailableException.retryable("Azure Identity returned an unusable token for " + scope
+                    + ": " + e.getMessage());
+        }
+    }
+
+    /**
+     * @return the requested scope, {@code <resource>/.default}
+     */
+    public String getScope() {
+        return scope;
+    }
+
+    @Override
+    public String toString() {
+        return "AzureTokenSource{scope=" + scope + ", credential=" + credential.getClass().getSimpleName() + '}';
+    }
+}

@@ -24,8 +24,8 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.test.tools.TestWebSocketClient;
 import io.questdb.client.DefaultHttpClientConfiguration;
-import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
 import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
 import io.questdb.client.cutlass.qwp.client.NativeBufferWriter;
@@ -192,7 +192,7 @@ public class CursorWebSocketSendLoopOrphanTailTest {
      * dictionary, so nothing pinned that adding a catch-up -- which consumes wire
      * sequences before any data frame -- leaves the start()-time retirement intact.
      * <p>
-     * This deliberately does NOT pin trySendOne's in-place re-anchor arm: both connection
+     * This deliberately does NOT pin trySendBatch's in-place re-anchor arm: both connection
      * setup sites call tryRetireOrphanTail first, so that arm is only reached when frames
      * below the tail still needed acks -- which means they were sent on this connection.
      * Verified by reverting its guard: this test still passes.
@@ -362,7 +362,7 @@ public class CursorWebSocketSendLoopOrphanTailTest {
     @Test
     public void testRecoveredMaxSymbolIdExcludesOrphanTailFrames() throws Exception {
         // recoveredMaxSymbolId must reflect only COMMITTED (transmitted) frames, not
-        // the aborted orphan-tail frames trySendOne retires without ever sending. A
+        // the aborted orphan-tail frames trySendBatch retires without ever sending. A
         // host crash that tears the persisted dictionary down to the committed ids
         // while an orphan-tail frame introduced a HIGHER id must NOT over-reject the
         // resume: the producer never reuses an orphan id on the wire (the tail retires
@@ -648,10 +648,10 @@ public class CursorWebSocketSendLoopOrphanTailTest {
     /**
      * In-memory transport emulating a healthy server: counts sends and
      * answers every received frame with a cumulative empty-table STATUS_OK
-     * for the highest wire seq seen. sendBinary and tryReceiveFrame both run
+     * for the highest wire seq seen. batchAppendBinary and tryReceiveFrame both run
      * on the I/O thread; sentCount is volatile for test-thread assertions.
      */
-    private static final class AckingClient extends WebSocketClient {
+    private static final class AckingClient extends TestWebSocketClient {
         private int ackedUpTo;
         private volatile int sentCount;
 
@@ -660,7 +660,7 @@ public class CursorWebSocketSendLoopOrphanTailTest {
         }
 
         @Override
-        public void sendBinary(long dataPtr, int length) {
+        public void batchAppendBinary(long dataPtr, int length) {
             sentCount++;
         }
 
@@ -842,7 +842,7 @@ public class CursorWebSocketSendLoopOrphanTailTest {
 
     private CursorWebSocketSendLoop newLoop(CursorSendEngine engine, List<AckingClient> clients) {
         return new CursorWebSocketSendLoop(
-                null, engine, 0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                null, engine, 0L,
                 () -> {
                     AckingClient c = new AckingClient();
                     synchronized (clients) {

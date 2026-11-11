@@ -45,16 +45,24 @@ import java.security.CodeSource;
  * satisfied during module RESOLUTION, before a single line of client code runs, so on a runtime image
  * without {@code java.desktop} the JVM failed at startup with {@code FindException} and the
  * {@code LinkageError} catch in {@code openBrowser()} - the thing that implements the promise - never got
- * to run. The published artifact is built on JDK 8 and carries no descriptor, so it is an automatic module
- * and was never affected; a build from this source is.
+ * to run. The published artifact is built on JDK 8 and carries this descriptor in
+ * {@code META-INF/versions/11}, so on Java 11+ it is affected exactly like a build from this source.
  * <p>
- * The test runs a second JVM with the client on the MODULE path and {@code --limit-modules} naming only
- * the client, which limits the universe to the client plus the closure of its mandatory requires. A
- * {@code requires static} is not part of that closure, so {@code java.desktop} is absent and the child
- * proves three things at once: the module resolved without it, {@code java.awt.Desktop} really is
- * unreachable (see {@link DesktopFreePromptMain}, which fails the run if it is not - this is what catches
- * a revert to a mandatory requires, since the closure would then drag {@code java.desktop} back in), and
- * the default prompt still renders the challenge and returns.
+ * The desktop-free tests run a second JVM with the client on the MODULE path and {@code --limit-modules}
+ * naming only the client, which limits the universe to the client plus the closure of its mandatory
+ * requires. A {@code requires static} is not part of that closure, so {@code java.desktop} is absent and
+ * the child proves three things at once: the module resolved without it, {@code java.awt.Desktop} really
+ * is unreachable (see {@link DesktopFreePromptMain}, which fails the run if it is not - this is what
+ * catches a revert to a mandatory requires, since the closure would then drag {@code java.desktop} back
+ * in), and the default prompt still renders the challenge and returns.
+ * <p>
+ * Any other mandatory requires fails the same way on an image that lacks the module. A jlink image built
+ * from what {@code jdeps} reports for the client holds {@code java.base}, {@code jdk.unsupported} and the
+ * optional {@code java.desktop}, and {@code requires java.sql} and {@code requires jdk.management}, which no
+ * client code uses, failed startup there. {@link #testTheModuleResolvesWithOnlyItsRequiredPlatformModules()}
+ * limits the universe to those two platform modules and adds the client as a root, whose requires
+ * {@code --limit-modules} does not close over, so any other mandatory platform requires fails the child's
+ * resolution.
  * <p>
  * Java 8 source level, and no {@code java.lang.module} API: the JDK 8 release profile compiles this test
  * tree, only excluding {@code module-info.java}.
@@ -84,6 +92,16 @@ public class DesktopFreeModulePathTest {
         Assert.assertTrue("the user code must still be printed:\n" + output, output.contains("WDJB-MJHT"));
     }
 
+    @Test(timeout = 60_000)
+    public void testTheModuleResolvesWithOnlyItsRequiredPlatformModules() throws Exception {
+        // java.base and jdk.unsupported are the only platform modules client code needs; org.slf4j is its one
+        // library dependency. A further mandatory requires is unobservable here and fails resolution.
+        String output = runOnModulePath(DesktopFreePromptMain.class, "java.base,jdk.unsupported",
+                "io.questdb.client,org.slf4j");
+        Assert.assertTrue("the child never reached the end of the prompt:\n" + output,
+                output.contains(DesktopFreePromptMain.SUCCESS_MARKER));
+    }
+
     private static File locationOf(Class<?> type) {
         CodeSource source = type.getProtectionDomain().getCodeSource();
         Assert.assertNotNull("no code source for " + type.getName(), source);
@@ -91,16 +109,29 @@ public class DesktopFreeModulePathTest {
     }
 
     /**
-     * Runs {@code main} in a second JVM that has the client on the MODULE path and no {@code java.desktop},
-     * and returns its merged stdout/stderr. Asserts a clean exit, so a child that failed its own
-     * preconditions reports through its printed reason rather than through a silent skip.
+     * Runs {@code main} in a second JVM that has the client on the MODULE path and no {@code java.desktop}:
+     * the universe is io.questdb.client and the closure of its MANDATORY requires, and nothing else. That
+     * closure is also what makes a mandatory {@code requires java.desktop} visible, because it would then
+     * include java.desktop.
      */
     private static String runInDesktopFreeJvm(Class<?> main) throws Exception {
+        return runOnModulePath(main, "io.questdb.client", "io.questdb.client");
+    }
+
+    /**
+     * Runs {@code main} in a second JVM that has the client on the MODULE path, the universe limited to
+     * {@code limitModules} and the closure of their mandatory requires plus the {@code rootModules}, and
+     * returns its merged stdout/stderr. A root is observable, but {@code --limit-modules} does not close over
+     * its requires. Asserts a clean exit, so a child that failed its own preconditions reports through its
+     * printed reason rather than through a silent skip.
+     */
+    private static String runOnModulePath(Class<?> main, String limitModules, String rootModules)
+            throws Exception {
         File clientLocation = locationOf(DeviceCodePrompt.class);
         Assume.assumeFalse("the module system arrived in Java 9; nothing to resolve on a Java 8 runtime",
                 "1.8".equals(System.getProperty("java.specification.version")));
-        // A JDK 8 build produces no module-info.class: the artifact is then an automatic module, which
-        // reads every observable module and is exactly the configuration this defect never reached.
+        // A JDK 8 build compiles no root module-info.class, so target/classes is no explicit module there:
+        // its descriptor goes into META-INF/versions/11 of the packaged jar only, after the tests run.
         Assume.assumeTrue("no module descriptor next to " + clientLocation + " (a JDK 8 build)",
                 new File(clientLocation, "module-info.class").isFile());
 
@@ -116,12 +147,9 @@ public class DesktopFreeModulePathTest {
                 // test - headless changes what Desktop ANSWERS, not whether the class reference links.
                 "-Djava.awt.headless=true",
                 "--module-path", clientLocation.getPath() + File.pathSeparator + slf4jLocation.getPath(),
-                // the universe: io.questdb.client and the closure of its MANDATORY requires, and nothing
-                // else. This is what makes the child desktop-free - and what makes a mandatory
-                // `requires java.desktop` visible, because the closure would then include it.
-                "--limit-modules", "io.questdb.client",
+                "--limit-modules", limitModules,
                 // the main class runs from the class path, so the client is not a root by default
-                "--add-modules", "io.questdb.client",
+                "--add-modules", rootModules,
                 "-classpath", testClasses.getPath(),
                 main.getName());
         // deliberately NOT setting questdb.client.oidc.open.browser here: the kill-switch returns before
@@ -132,7 +160,7 @@ public class DesktopFreeModulePathTest {
         Process process = pb.start();
         String output = readFully(process.getInputStream());
         int exitCode = process.waitFor();
-        Assert.assertEquals("the desktop-free module-path run of " + main.getSimpleName() + " failed:\n"
+        Assert.assertEquals("the module-path run of " + main.getSimpleName() + " failed:\n"
                 + output, 0, exitCode);
         return output;
     }

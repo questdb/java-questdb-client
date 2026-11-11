@@ -712,6 +712,7 @@ public class QwpQueryClientFromConfigTest {
                 "durable_ack_keepalive_interval_millis=200",
                 "error_inbox_capacity=256",
                 "initial_connect_retry=on",
+                "keepalive_interval_millis=30000",
                 "max_background_drainers=4",
                 "max_name_len=127",
                 "reconnect_initial_backoff_millis=100",

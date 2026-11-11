@@ -25,26 +25,48 @@
 package io.questdb.client.cutlass.qwp.client;
 
 import io.questdb.client.cutlass.http.client.HttpClientException;
+import org.jetbrains.annotations.Nullable;
 
 /**
- * The client opted in via {@code request_durable_ack=on} but the server cannot
- * honour it. Terminal: retrying the same configured endpoints will not turn a
- * non-primary node into a durable-ack-capable primary, so the connect path
- * fails fast instead of burning the full reconnect budget.
+ * The client requested durable-ack tiers via {@code request_durable_ack}
+ * ({@code local}, {@code replicated}, {@code local,replicated}, or the legacy
+ * {@code on}) but the server did not grant that exact set. Terminal: retrying
+ * the same configured endpoints will not turn a server that cannot grant the
+ * set into one that can, so the connect path fails fast instead of burning the
+ * full reconnect budget.
  * <p>
- * Two flavours collapse into this exception:
- * <ul>
- *   <li>The server completed the upgrade but did not echo
- *       {@code X-QWP-Durable-Ack: enabled} -- {@link #getRole()} is {@code null}.</li>
- *   <li>Every configured endpoint role-rejected the upgrade (replica only),
- *       so no primary was reached -- {@link #getRole()} carries the last
- *       reject's role.</li>
- * </ul>
+ * The server grants all of the requested tiers or none of them: it confirms a
+ * grant by echoing the requested token set in {@code X-QWP-Durable-Ack}
+ * ({@code enabled} for a legacy {@code on} request). A missing header, or an
+ * echo other than the expected token, is a denial. The message names the
+ * requested set and what the server echoed, or that it sent no header.
+ * {@link #getRole()} is {@code null} for this denial.
  */
 public final class QwpDurableAckMismatchException extends HttpClientException {
     private final String host;
     private final int port;
     private final String role;
+
+    /**
+     * The upgrade completed but the server did not grant the requested tier
+     * set. {@code serverEcho} is the server's {@code X-QWP-Durable-Ack} header
+     * value, or {@code null} when the server sent no such header.
+     */
+    public QwpDurableAckMismatchException(String host, int port, int requestedTiers, @Nullable String serverEcho) {
+        super("WebSocket upgrade failed: server does not support durable ack [host=");
+        put(host).put(", port=").put(port)
+                .put(", requested=").put(DurableAckTiers.configValue(requestedTiers))
+                .put(", echoed=");
+        if (serverEcho != null) {
+            put(serverEcho);
+        } else {
+            put("<no X-QWP-Durable-Ack header>");
+        }
+        put(']');
+        this.host = host;
+        this.port = port;
+        this.role = null;
+    }
 
     public QwpDurableAckMismatchException(String host, int port, String role) {
         super("WebSocket upgrade failed: server does not support durable ack [host=");
@@ -67,9 +89,9 @@ public final class QwpDurableAckMismatchException extends HttpClientException {
     }
 
     /**
-     * Server role from the rejecting endpoint when the failure stemmed from a
-     * cluster of role-rejecting nodes; {@code null} when the failure was that a
-     * single primary completed the upgrade without advertising durable ack.
+     * Server role passed to {@link #QwpDurableAckMismatchException(String, int, String)};
+     * {@code null} when the failure was that the server completed the upgrade
+     * without granting the requested tier set.
      */
     public String getRole() {
         return role;

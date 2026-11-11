@@ -24,6 +24,7 @@
 
 package io.questdb.client.impl;
 
+import io.questdb.client.ConnectionHealth;
 import io.questdb.client.HttpTokenProvider;
 import io.questdb.client.QuestDB;
 import io.questdb.client.Query;
@@ -204,6 +205,14 @@ public final class QuestDBImpl implements QuestDB {
     @Override
     public Sender borrowSender() {
         return senderPool.borrow();
+    }
+
+    @Override
+    public ConnectionHealth.Aggregate health() {
+        java.util.List<ConnectionHealth> healths = new java.util.ArrayList<>();
+        senderPool.collectHealth(healths);
+        queryPool.collectHealth(healths);
+        return ConnectionHealth.Aggregate.of(healths);
     }
 
     // synchronized so concurrent close() callers serialize THROUGH the bounded

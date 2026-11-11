@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import org.junit.Assert;
@@ -52,14 +53,13 @@ public class CursorWebSocketSendLoopJvmErrorTest {
                     null,
                     engine,
                     0L,
-                    CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                     () -> {
                         attempts.incrementAndGet();
                         throw injected;
                     },
                     1L,
                     4L,
-                    false
+                    DurableAckTiers.NONE
             );
             try {
                 loop.start();

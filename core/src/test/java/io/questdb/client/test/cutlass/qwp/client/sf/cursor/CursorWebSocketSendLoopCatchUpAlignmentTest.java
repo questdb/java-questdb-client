@@ -24,6 +24,8 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
+import io.questdb.client.test.tools.TestWebSocketClient;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.line.LineSenderException;
@@ -1105,7 +1107,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
      * varints. deltaStart 0 is the self-sufficient full-dict frame a degraded producer
      * ships; deltaStart > 0 is a delta frame that depends on the ids below it.
      */
-    private static void appendDeltaDictFrame(CursorSendEngine engine, int deltaStart, char... symbols) {
+    static void appendDeltaDictFrame(CursorSendEngine engine, int deltaStart, char... symbols) {
         int size = QwpConstants.HEADER_SIZE + 2 + symbols.length * 2;
         long buf = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
         try {
@@ -1144,7 +1146,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
             CursorWebSocketSendLoop[] loopRef = new CursorWebSocketSendLoop[1];
             try (CursorSendEngine engine = newEngine()) {
                 CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
-                        null, engine, 0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                        null, engine, 0L,
                         () -> {
                             int call = ++reconnectCalls[0];
                             if (call < maxAttempts) {
@@ -1173,11 +1175,11 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                             }
                             throw new AssertionError("unexpected reconnect call " + call);
                         },
-                        0L, 0L, false,
+                        0L, 0L, DurableAckTiers.NONE,
                         CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                         CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
                         0L, TimeUnit.HOURS.toMillis(1),
-                        CursorWebSocketSendLoop.ReconnectPolicy.ORPHAN);
+                        CursorWebSocketSendLoop.ReconnectPolicy.ORPHAN, 0L);
                 loopRef[0] = loop;
                 try {
                     seedMirror(loop, TestUtils.repeat("x", 200));
@@ -1323,15 +1325,15 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
             CursorSendEngine engine, WebSocketClient client, long capGapWindowMillis
     ) {
         return new CursorWebSocketSendLoop(
-                client, engine, 0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                client, engine, 0L,
                 () -> {
                     throw new UnsupportedOperationException("test loop is never started");
                 },
-                100L, 5_000L, false,
+                100L, 5_000L, DurableAckTiers.NONE,
                 CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                 CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
                 0L, capGapWindowMillis,
-                CursorWebSocketSendLoop.ReconnectPolicy.ORPHAN);
+                CursorWebSocketSendLoop.ReconnectPolicy.ORPHAN, 0L);
     }
 
     private CursorWebSocketSendLoop newForegroundLoop(
@@ -1340,11 +1342,11 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         // Deliberately use the compatibility overload: its safe default must remain the
         // foreground RETRY_FOREVER policy for external callers.
         return new CursorWebSocketSendLoop(
-                client, engine, 0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                client, engine, 0L,
                 () -> {
                     throw new UnsupportedOperationException("test loop is never started");
                 },
-                100L, 5_000L, false,
+                100L, 5_000L, DurableAckTiers.NONE,
                 CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                 CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
                 0L, 0L);
@@ -1425,7 +1427,6 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                         // A 160-byte cap against a 200-byte mirror entry: the catch-up
                         // cannot re-register it, which is a genuine cap gap.
                         new CatchUpCapturingClient(160), engine, 0L,
-                        CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                         () -> {
                             // First point after the entry guard; the no-cap client lets
                             // the ensuing catch-up succeed so the loop exits promptly.
@@ -1433,11 +1434,11 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                             observedAnchor[0] = loopRef[0].catchUpCapGapFirstNanos();
                             return new CatchUpCapturingClient(0);
                         },
-                        100L, 5_000L, false,
+                        100L, 5_000L, DurableAckTiers.NONE,
                         CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                         CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
                         0L, 0L,
-                        CursorWebSocketSendLoop.ReconnectPolicy.ORPHAN);
+                        CursorWebSocketSendLoop.ReconnectPolicy.ORPHAN, 0L);
                 loopRef[0] = loop;
                 try {
                     seedMirror(loop, TestUtils.repeat("x", 200));
@@ -1642,7 +1643,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
     // catch-up split; sendBinary counts the frames the catch-up emitted, or --
     // when throwOnSend is set -- raises a transient wire error to model the fresh
     // connection dropping mid-catch-up.
-    private static final class CatchUpCapturingClient extends WebSocketClient {
+    private static final class CatchUpCapturingClient extends TestWebSocketClient {
         // Mutable so a test can model a rolling-cap cluster: raise it for a node that
         // accepts the dictionary, lower it for a smaller-cap node that cap-gaps.
         private int cap;
@@ -1681,7 +1682,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         }
 
         @Override
-        public void sendBinary(long dataPtr, int length) {
+        public void batchAppendBinary(long dataPtr, int length) {
             recordSend();
             capture(dataPtr, length, 0L, 0);
         }

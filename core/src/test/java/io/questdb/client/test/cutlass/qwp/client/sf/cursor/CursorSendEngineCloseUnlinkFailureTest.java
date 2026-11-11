@@ -43,25 +43,26 @@ import java.nio.file.Paths;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.util.Set;
-import java.util.concurrent.TimeUnit;
 
 /**
  * Regression for the close-time segment cleanup on a fully-drained slot.
  * <p>
- * {@code CursorSendEngine.finishClose} unlinks the acknowledged {@code .sfa}
- * files and then removes the ack watermark. When the unlink fails (transient
- * I/O error, permission problem), the residual segment files hold rows the
- * server already acknowledged. If the watermark does not cover them, a
- * successor engine on the same slot seeds recovery from {@code lowestBase - 1}
- * and replays every acknowledged row — duplicates on a non-DEDUP table.
+ * {@code CursorSendEngine.finishClose} syncs the ack watermark, unlinks the
+ * acknowledged {@code .sfa} files and then removes the watermark. When the
+ * unlink fails (transient I/O error, permission problem), the residual segment
+ * files hold rows the server already acknowledged. If the watermark does not
+ * cover them, a successor engine on the same slot seeds recovery from
+ * {@code lowestBase - 1} and replays every acknowledged row — duplicates on a
+ * non-DEDUP table. The final ACK wrote the watermark; this guards that close
+ * keeps it ahead of the residue.
  * <p>
  * The test injects the unlink failure by dropping write permission on the
  * slot directory (POSIX: unlink requires a writable parent directory), so it
  * is skipped on Windows and when permissions are not enforced (root).
  * The shared {@link SegmentManager} is deliberately never started: no worker
- * thread exists, so no manager tick can persist the watermark behind the
- * test's back, and the close-path quiescence barrier is trivially satisfied —
- * fully deterministic, no timing coordination needed.
+ * thread exists, so no trim can run behind the test's back, and the
+ * close-path quiescence barrier is trivially satisfied — fully deterministic,
+ * no timing coordination needed.
  */
 public class CursorSendEngineCloseUnlinkFailureTest {
 
@@ -88,7 +89,7 @@ public class CursorSendEngineCloseUnlinkFailureTest {
             String slot = tmpDir + "/slot";
             Path slotPath = Paths.get(slot);
             long payload = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
-            SegmentManager manager = new SegmentManager(segmentSize, TimeUnit.SECONDS.toNanos(60));
+            SegmentManager manager = new SegmentManager(segmentSize);
             CursorSendEngine pred = null;
             CursorSendEngine succ = null;
             boolean slotDirReadOnly = false;

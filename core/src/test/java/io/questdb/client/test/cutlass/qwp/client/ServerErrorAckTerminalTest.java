@@ -78,7 +78,12 @@ public class ServerErrorAckTerminalTest {
             Sender sender = Sender.fromConfig(cfg);
             try {
                 sender.table("foo").longColumn("v", 1L).atNow();
-                sender.flush();
+                try {
+                    sender.flush();
+                } catch (LineSenderException ignored) {
+                    // The error ACK may arrive before flush() checks for errors.
+                    // The terminal error is sticky; the next call must still throw.
+                }
 
                 // Wait for the server to actually receive the batch and
                 // for the error-ACK round-trip to complete.
@@ -173,7 +178,11 @@ public class ServerErrorAckTerminalTest {
                     .build();
             try {
                 sender.table("foo").longColumn("v", 1L).atNow();
-                sender.flush();
+                try {
+                    sender.flush();
+                } catch (LineSenderException ignored) {
+                    // The poison escalation may latch before flush() checks for errors.
+                }
 
                 // Each NACK counts one poison strike and triggers a
                 // reconnect+replay; after DEFAULT_MAX_HEAD_FRAME_REJECTIONS strikes
@@ -262,7 +271,11 @@ public class ServerErrorAckTerminalTest {
             Sender sender = Sender.fromConfig(cfg);
             try {
                 sender.table("foo").longColumn("v", 1L).atNow();
-                sender.flush();
+                try {
+                    sender.flush();
+                } catch (LineSenderException ignored) {
+                    // The poison escalation may latch before flush() checks for errors.
+                }
 
                 waitFor(() -> handler.totalBinaryReceived.get() >= 2, 10_000);
                 QwpWebSocketSender wss = (QwpWebSocketSender) sender;

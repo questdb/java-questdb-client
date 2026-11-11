@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
@@ -92,7 +93,7 @@ public class BackgroundDrainerUnreplayableSlotQuarantineTest {
                         throw new AssertionError(
                                 "recovery failure must be caught before any connect attempt");
                     },
-                    5_000L, 1L, 5L, true, 200L);
+                    5_000L, 1L, 5L, DurableAckTiers.REPLICATED, 200L);
 
             List<SenderError> captured = Collections.synchronizedList(new ArrayList<SenderError>());
             drainer1.setErrorSink(captured::add);
@@ -135,7 +136,7 @@ public class BackgroundDrainerUnreplayableSlotQuarantineTest {
                         connectAttempts.incrementAndGet();
                         throw new AssertionError("a quarantined slot must never be re-adopted");
                     },
-                    5_000L, 1L, 5L, true, 200L);
+                    5_000L, 1L, 5L, DurableAckTiers.REPLICATED, 200L);
 
             drainer2.run();
 

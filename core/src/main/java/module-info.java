@@ -23,10 +23,14 @@
  ******************************************************************************/
 
 open module io.questdb.client {
+    // Every mandatory requires must be in the application's runtime image, or the module fails to resolve
+    // before any code runs - and the released jar ships this descriptor in META-INF/versions/11. Keep the
+    // mandatory ones to what client code uses: java.sql and jdk.management, which it never did, failed
+    // startup on jlink images built from the client's jdeps output. DesktopFreeModulePathTest and the CI
+    // MRJAR smoke job pin the set.
     requires transitive jdk.unsupported;
     requires static org.jetbrains.annotations;
     requires static java.management;
-    requires jdk.management;
     // STATIC, not mandatory: the only java.desktop reference is BrowserLauncher's java.awt.Desktop, used
     // best-effort by the default DeviceCodePrompt.openBrowser() to pop the verification URL. A mandatory
     // requires is resolved BEFORE any code runs, so on a runtime without java.desktop - a jlink image, a
@@ -39,7 +43,6 @@ open module io.questdb.client {
     // including every class-path application, is unaffected because java.desktop is resolved there by
     // default. See DeviceCodePrompt#openBrowser().
     requires static java.desktop;
-    requires java.sql;
     requires org.slf4j;
 
     exports io.questdb.client;
@@ -71,4 +74,8 @@ open module io.questdb.client {
     exports io.questdb.client.cutlass.qwp.client.sf.cursor;
     exports io.questdb.client.cutlass.qwp.protocol;
     exports io.questdb.client.cutlass.qwp.websocket;
+
+    // token_provider=<name> in a connect string resolves through this SPI; the optional questdb-client-azure
+    // artifact provides the "azure" factory (design/qwp-token-provider-spec.md, section 7).
+    uses io.questdb.client.cutlass.auth.TokenProviderFactory;
 }

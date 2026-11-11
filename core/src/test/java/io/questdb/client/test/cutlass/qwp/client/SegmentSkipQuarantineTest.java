@@ -288,9 +288,8 @@ public class SegmentSkipQuarantineTest {
      * the append path itself performs a genuine rotation -- {@code SegmentRing.appendOrFsn}
      * only rotates when {@code tryAppend} reports the active segment full. Without this, the
      * setup's old {@code > 1} segment-file precondition could be satisfied by nothing more than
-     * the empty hot spare {@code SegmentManager} provisions asynchronously the moment the ring
-     * registers ({@code SegmentRing.needsHotSpare} is simply {@code hotSpare == null}, independent
-     * of bytes written) -- a background-thread race against this method's {@code Sender} closing,
+     * the empty hot spare an earlier {@code SegmentManager} provisioned asynchronously the moment
+     * the ring registered -- a background-thread race against this method's {@code Sender} closing,
      * observed to fail consistently on Windows CI and to coin-flip on the JDK 8 Linux leg. Forcing
      * a genuine rotation makes the precondition -- and the corruption scenario it sets up, a skip
      * among data-bearing survivors -- true by construction rather than by timing.
