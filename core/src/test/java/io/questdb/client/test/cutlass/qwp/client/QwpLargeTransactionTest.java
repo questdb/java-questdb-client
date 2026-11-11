@@ -250,6 +250,56 @@ public class QwpLargeTransactionTest {
     }
 
     @Test
+    public void testPooledStrictLeaseCloseWithOnlyPendingRowsKeepsConnection() throws Exception {
+        // Nothing reached the server yet: returning the lease drops the pending
+        // rows without a rollback frame and keeps the connection pooled.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                try (QuestDB db = QuestDB.connect(conf(server) + "transaction=strict;query_pool_min=0;")) {
+                    Sender lease = db.borrowSender();
+                    writeRows(lease, "t", 0, 10);
+                    lease.close();
+                    Sender next = db.borrowSender();
+                    writeRows(next, "t", 0, 5);
+                    next.flush();
+                    Assert.assertTrue(next.drain(5_000));
+                    next.close();
+                }
+                Assert.assertEquals(1, h.frames.size());
+                Assert.assertTrue(h.frames.get(0).isCommit());
+                Assert.assertEquals(1, server.upgradeRequestCount());
+            }
+        });
+    }
+
+    @Test
+    public void testStrictMultiTableFlushSplitsWithinTheCap() throws Exception {
+        // Ten tables in one batch carry ten schemas, so the batch the byte trigger
+        // cuts outgrows the cap and splits per table. Every split frame of the
+        // open transaction stays deferred.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, 4_096)) {
+                try (Sender s = Sender.fromConfig(conf(server) + "transaction=strict;")) {
+                    for (int i = 0; i < 400; i++) {
+                        s.table("table_with_a_long_name_" + (i % 10))
+                                .longColumn("first_long_column_name", i)
+                                .longColumn("second_long_column_name", i)
+                                .stringColumn("s", "abc")
+                                .atNow();
+                    }
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                }
+                assertFramesWithinCap(h, 4_096);
+                assertOneTransaction(h);
+                Assert.assertTrue(h.frames.size() > 10);
+            }
+        });
+    }
+
+    @Test
     public void testResetAbortsStrictTransactionWithoutServerRollback() throws Exception {
         assertMemoryLeak(() -> {
             TxnServer h = new TxnServer();
