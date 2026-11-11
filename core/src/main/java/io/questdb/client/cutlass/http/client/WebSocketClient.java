@@ -150,8 +150,8 @@ public abstract class WebSocketClient implements QuietCloseable {
     // Requested durable-ack tier set (DurableAckTiers bitmask), sent as
     // X-QWP-Request-Durable-Ack: <DurableAckTiers.requestHeaderValue>
     private int qwpDurableAckTiers = DurableAckTiers.NONE;
-    // Schema negotiation is deliberately opt-in at this low-level client layer.
-    // The public Sender does not activate it until schema-directed encoding is available.
+    // Sent as X-QWP-Request-Schema: true. Off by default; QwpWebSocketSender
+    // turns it on unless schema_mode=off.
     private boolean qwpRequestSchema;
     // Receive buffer (native memory)
     private long recvBufPtr;
@@ -707,8 +707,8 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
-     * Requests schema control support on subsequent WebSocket upgrades.
-     * This operation is intentionally one-way; there is no low-level disable method.
+     * Requests schema control support on subsequent WebSocket upgrades. There is
+     * no way to turn the request off again.
      */
     public void requestQwpSchema() {
         this.qwpRequestSchema = true;

@@ -25,11 +25,9 @@
 package io.questdb.client.std;
 
 /**
- * Port of the QuestDB server's {@code io.questdb.std.RyuDouble}, kept
- * byte-compatible with it so that client-side and server-side formatting of
- * the same double produce identical text.
- * Ryu algorithm for converting IEEE 754 double-precision floating-point numbers
- * to their shortest decimal representation.
+ * Ryu conversion of IEEE 754 doubles to their shortest decimal representation,
+ * ported from the server's {@code io.questdb.std.RyuDouble}. It stays
+ * byte-compatible with the server, so both sides format a double to the same text.
  * <p>
  * Based on the paper "Ryu: Fast Float-to-String Conversion" by Ulf Adams (2018).
  * This implementation uses 128-bit arithmetic via {@link Compat#multiplyHigh},

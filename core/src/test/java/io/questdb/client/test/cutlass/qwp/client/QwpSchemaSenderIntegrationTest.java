@@ -78,7 +78,7 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.flush();
 
                 new FrameReader(handler.awaitDataFrame()).decimal64Table(
-                        "events", 921, 931, 2, 120, 250);
+                        "events", 2, 120, 250);
                 Assert.assertEquals("a rejected setter must not look up metadata", 1,
                         handler.describeRequests.get());
             }
@@ -102,7 +102,7 @@ public class QwpSchemaSenderIntegrationTest {
                     sender.flush();
 
                     new FrameReader(handler.awaitDataFrame()).parsedDecimalTextTable(
-                            "events", 941 + targetType, 951);
+                            "events");
                 }
             }
         });
@@ -145,7 +145,7 @@ public class QwpSchemaSenderIntegrationTest {
                     sender.flush();
 
                     new FrameReader(handler.awaitDataFrame()).smallIntegerNumericTable(
-                            "events", 901 + i, 911 + i, numericWireType(target));
+                            "events", numericWireType(target));
                     Assert.assertEquals("a rejected setter must not look up metadata", 1,
                             handler.describeRequests.get());
                 }
@@ -177,7 +177,7 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.flush();
 
                 new FrameReader(handler.awaitDataFrames(2))
-                        .twoDateAndTimestampBlocks("events", 981, 991, 992);
+                        .twoDateAndTimestampBlocks("events");
                 Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
                         handler.describeRequests.get());
             }
@@ -209,7 +209,7 @@ public class QwpSchemaSenderIntegrationTest {
                     sender.flush();
 
                     new FrameReader(handler.awaitDataFrame()).integerTemporalTable(
-                            "events", 961 + i, 971 + i, temporalWireType(target));
+                            "events", temporalWireType(target));
                     Assert.assertEquals("a rejected setter must not look up metadata", 1,
                             handler.describeRequests.get());
                 }
@@ -241,7 +241,7 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.flush();
 
                 new FrameReader(handler.awaitDataFrames(2))
-                        .twoSymbolAndVarcharBlocks("events", 1021, 1031, 1032);
+                        .twoSymbolAndVarcharBlocks("events");
                 Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
                         handler.describeRequests.get());
             }
@@ -272,7 +272,7 @@ public class QwpSchemaSenderIntegrationTest {
                     sender.flush();
 
                     new FrameReader(handler.awaitDataFrame()).smallIntegerTextTable(
-                            "events", 1041 + i, 1051 + i, target);
+                            "events", target);
                     Assert.assertEquals("a rejected setter must not look up metadata", 1,
                             handler.describeRequests.get());
                 }
@@ -305,7 +305,7 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.flush();
 
                 new FrameReader(handler.awaitDataFrames(2)).twoSmallIntegerDecimalBlocks(
-                        "events", 1061, 1071, 1072);
+                        "events");
                 Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
                         handler.describeRequests.get());
             }
@@ -334,7 +334,7 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.flush();
 
                 new FrameReader(handler.awaitDataFrame()).smallIntegerDecimalTable(
-                        "events", 1081, 1091);
+                        "events");
                 Assert.assertEquals("a rejected setter must not look up metadata", 1,
                         handler.describeRequests.get());
             }
@@ -366,7 +366,7 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.flush();
 
                 new FrameReader(handler.awaitDataFrames(2)).twoIntDecimalAndIpv4Blocks(
-                        "events", 1101, 1111, 1112);
+                        "events");
                 Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
                         handler.describeRequests.get());
             }
@@ -393,7 +393,7 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.intColumn("value", -1).atNow();
                 sender.flush();
 
-                new FrameReader(handler.awaitDataFrame()).intToIpv4Table("events", 1121, 1131);
+                new FrameReader(handler.awaitDataFrame()).intToIpv4Table("events");
                 Assert.assertEquals("a rejected setter must not look up metadata", 1,
                         handler.describeRequests.get());
             }
@@ -427,10 +427,10 @@ public class QwpSchemaSenderIntegrationTest {
                         sender.flush();
                         FrameReader reader = new FrameReader(handler.awaitDataFrame());
                         if (vector.isNull()) {
-                            reader.uuidOnlyTable("events", 721 + count, 731 + count, 11, 12);
+                            reader.uuidOnlyTable("events", 11, 12);
                         } else {
                             reader.decimalTextTable(
-                                    "events", 721 + count, 731 + count, vector.expectedText);
+                                    "events", vector.expectedText);
                         }
                     } catch (AssertionError e) {
                         throw new AssertionError("case_id=" + vector.caseId + ": " + e.getMessage(), e);
@@ -478,7 +478,7 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.decimalColumn("value", new Decimal64(0, 0)).atNow();
                 sender.flush();
 
-                new FrameReader(handler.awaitDataFrame()).decimalTextLifecycleTable("events", 781, 791);
+                new FrameReader(handler.awaitDataFrame()).decimalTextLifecycleTable("events");
             }
         });
     }
@@ -499,8 +499,6 @@ public class QwpSchemaSenderIntegrationTest {
 
                 new FrameReader(handler.awaitDataFrame()).decimalTextTable(
                         "events",
-                        801,
-                        811,
                         "170141183460469231731687303715884105727",
                         "12.3",
                         "4.20"
@@ -525,7 +523,7 @@ public class QwpSchemaSenderIntegrationTest {
                 }
                 sender.decimalColumn("value", new Decimal64(25, 2)).atNow();
                 sender.flush();
-                new FrameReader(handler.awaitDataFrame()).decimal64Table("events", 601, 611, 4, 15_000, 2_500);
+                new FrameReader(handler.awaitDataFrame()).decimal64Table("events", 4, 15_000, 2_500);
             }
         });
     }
@@ -552,7 +550,7 @@ public class QwpSchemaSenderIntegrationTest {
                 Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
                 sender.table("events").decimalColumn("value", Decimal128.fromLong(1_000, 0)).atNow();
                 sender.flush();
-                new FrameReader(handler.awaitDataFrames(2)).twoDecimalBlocks("events", 621, 631, 632);
+                new FrameReader(handler.awaitDataFrames(2)).twoDecimalBlocks("events");
                 Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
                         handler.describeRequests.get());
             }
@@ -582,7 +580,7 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events").decimalColumn("value", new Decimal64(12_345, 4)).atNow();
                 sender.flush();
                 new FrameReader(handler.awaitDataFrames(2)).twoDecimal64ScaleBlocks(
-                        "events", 641, 651, 652);
+                        "events");
                 Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
                         handler.describeRequests.get());
             }
@@ -611,7 +609,7 @@ public class QwpSchemaSenderIntegrationTest {
                 Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
                 sender.table("events").longColumn("value", 100_000_000_000_000L).atNow();
                 sender.flush();
-                new FrameReader(handler.awaitDataFrames(2)).twoDecimalWidthAndScaleBlocks("events", 661, 671, 672);
+                new FrameReader(handler.awaitDataFrames(2)).twoDecimalWidthAndScaleBlocks("events");
                 Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
                         handler.describeRequests.get());
             }
@@ -640,7 +638,7 @@ public class QwpSchemaSenderIntegrationTest {
                 Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
                 sender.table("events").stringColumn("value", "100000000000000").atNow();
                 sender.flush();
-                new FrameReader(handler.awaitDataFrames(2)).twoDecimalWidthAndScaleBlocks("events", 681, 691, 692);
+                new FrameReader(handler.awaitDataFrames(2)).twoDecimalWidthAndScaleBlocks("events");
                 Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
                         handler.describeRequests.get());
             }
@@ -669,7 +667,7 @@ public class QwpSchemaSenderIntegrationTest {
                 Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
                 sender.table("events").doubleColumn("value", 100_000_000_000_000.0).atNow();
                 sender.flush();
-                new FrameReader(handler.awaitDataFrames(2)).twoDecimalWidthAndScaleBlocks("events", 701, 711, 712);
+                new FrameReader(handler.awaitDataFrames(2)).twoDecimalWidthAndScaleBlocks("events");
                 Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
                         handler.describeRequests.get());
             }
@@ -699,7 +697,7 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events").decimalColumn("value", new Decimal64(250_000, 4)).atNow();
                 sender.flush();
                 new FrameReader(handler.awaitDataFrames(2)).twoDecimal64AndVarcharBlocks(
-                        "events", 741, 751, 752);
+                        "events");
                 Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
                         handler.describeRequests.get());
             }
@@ -715,7 +713,7 @@ public class QwpSchemaSenderIntegrationTest {
                 try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
                     sender.table("events").stringColumn("value", null).atNow();
                     sender.flush();
-                    new FrameReader(handler.awaitDataFrame()).nullGeoHashTable("events", 471 + bits, 481, bits);
+                    new FrameReader(handler.awaitDataFrame()).nullGeoHashTable("events", bits);
                 }
             }
 
@@ -732,7 +730,7 @@ public class QwpSchemaSenderIntegrationTest {
                 }
                 sender.stringColumn("value", "04").atNow();
                 sender.flush();
-                new FrameReader(handler.awaitDataFrame()).geoHashTable("events", 551, 561, 8, 0xff, 1);
+                new FrameReader(handler.awaitDataFrame()).geoHashTable("events", 8, 0xff, 1);
             }
         });
     }
@@ -759,7 +757,7 @@ public class QwpSchemaSenderIntegrationTest {
                 Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
                 sender.table("events").stringColumn("value", "z").atNow();
                 sender.flush();
-                new FrameReader(handler.awaitDataFrames(2)).twoGeoHashBlocks("events", 571, 581, 582);
+                new FrameReader(handler.awaitDataFrames(2)).twoGeoHashBlocks("events");
                 Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
                         handler.describeRequests.get());
             }
@@ -782,7 +780,7 @@ public class QwpSchemaSenderIntegrationTest {
                 }
                 sender.stringColumn("value", "0x0123456789abcdeffedcba9876543210").atNow();
                 sender.flush();
-                new FrameReader(handler.awaitDataFrame()).long256Table("events", 431, 441);
+                new FrameReader(handler.awaitDataFrame()).long256Table("events");
             }
         });
     }
@@ -810,7 +808,7 @@ public class QwpSchemaSenderIntegrationTest {
                 Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
                 sender.table("events").stringColumn("value", "not-long256").atNow();
                 sender.flush();
-                new FrameReader(handler.awaitDataFrames(2)).twoLong256AndVarcharBlocks("events", 451, 461, 462);
+                new FrameReader(handler.awaitDataFrames(2)).twoLong256AndVarcharBlocks("events");
                 Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
                         handler.describeRequests.get());
             }
@@ -832,7 +830,7 @@ public class QwpSchemaSenderIntegrationTest {
                 }
                 sender.stringColumn("value", "\ud83d").atNow();
                 sender.flush();
-                new FrameReader(handler.awaitDataFrame()).charTable("events", 391, 401, 'A', '?');
+                new FrameReader(handler.awaitDataFrame()).charTable("events", 'A', '?');
             }
         });
     }
@@ -858,7 +856,7 @@ public class QwpSchemaSenderIntegrationTest {
                 Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
                 sender.table("events").charColumn("value", '\uffff').atNow();
                 sender.flush();
-                new FrameReader(handler.awaitDataFrames(2)).twoVarcharAndCharBlocks("events", 411, 421, 422);
+                new FrameReader(handler.awaitDataFrames(2)).twoVarcharAndCharBlocks("events");
                 Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
                         handler.describeRequests.get());
             }
@@ -882,7 +880,7 @@ public class QwpSchemaSenderIntegrationTest {
                     sender.timestampColumn("value", 1, ChronoUnit.MILLIS).atNow();
                     sender.flush();
                     new FrameReader(handler.awaitDataFrame()).timestampTextTable(
-                            "events", 351 + target, 361, "1970-01-01T00:00:00.001Z");
+                            "events", "1970-01-01T00:00:00.001Z");
                 }
             }
         });
@@ -910,7 +908,7 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events").timestampColumn("value", Long.MAX_VALUE, ChronoUnit.NANOS).atNow();
                 sender.flush();
                 new FrameReader(handler.awaitDataFrames(2)).twoTimestampAndVarcharBlocks(
-                        "events", 371, 381, 382);
+                        "events");
                 Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
                         handler.describeRequests.get());
             }
@@ -938,8 +936,6 @@ public class QwpSchemaSenderIntegrationTest {
                     sender.flush();
                     new FrameReader(handler.awaitDataFrame()).longTimestampTable(
                             "events",
-                            301 + target,
-                            311,
                             target,
                             target == ColumnType.TIMESTAMP_MICRO ? -1 : -1000
                     );
@@ -967,7 +963,7 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.stringColumn("value", "1969-12-31").atNow();
                 sender.flush();
                 new FrameReader(handler.awaitDataFrame())
-                        .stringDateTable("events", 1141, 1151, -86_400_000L);
+                        .stringDateTable("events", -86_400_000L);
                 Assert.assertEquals("a rejected setter must not look up metadata", 1,
                         handler.describeRequests.get());
             }
@@ -996,7 +992,7 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events").stringColumn("value", "native-a").atNow();
                 sender.flush();
                 new FrameReader(handler.awaitDataFrames(2))
-                        .twoDateAndVarcharBlocks("events", 1161, 1171, 1172);
+                        .twoDateAndVarcharBlocks("events");
                 Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
                         handler.describeRequests.get());
             }
@@ -1022,7 +1018,7 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.doubleArray("value", new double[][]{{3.0}, {4.0}}).atNow();
                 sender.flush();
                 new FrameReader(handler.awaitDataFrame())
-                        .doubleArrayTable("events", 1181, 1191);
+                        .doubleArrayTable("events");
                 Assert.assertEquals("a rejected setter must not look up metadata", 1,
                         handler.describeRequests.get());
             }
@@ -1053,7 +1049,7 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events").doubleArray("value", new double[]{3.0, 4.0}).atNow();
                 sender.flush();
                 new FrameReader(handler.awaitDataFrames(2))
-                        .twoDoubleArrayRankBlocks("events", 1201, 1211, 1212);
+                        .twoDoubleArrayRankBlocks("events");
                 Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
                         handler.describeRequests.get());
             }
@@ -1096,7 +1092,7 @@ public class QwpSchemaSenderIntegrationTest {
                     sender.flush();
                     // Only the two completed DOUBLE[] rows reach the wire; failed_b is rolled back.
                     new FrameReader(handler.awaitDataFrame())
-                            .doubleArrayTable("events", 1221, 1231);
+                            .doubleArrayTable("events");
                     Assert.assertEquals("unsupported input must not refresh [overload=" + overload + "]", 1,
                             handler.describeRequests.get());
                 }
@@ -1142,7 +1138,7 @@ public class QwpSchemaSenderIntegrationTest {
                 // The rebound block holds the recovered row alone: rollback dropped
                 // failed_b with the rejected row.
                 new FrameReader(handler.awaitDataFrames(2))
-                        .twoDoubleArrayRankBlocks("events", 1241, 1251, 1252);
+                        .twoDoubleArrayRankBlocks("events");
                 Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
                         handler.describeRequests.get());
             }
@@ -1193,8 +1189,7 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events").stringColumn("value", "1970-01-01T00:00:00.000001Z").atNow();
                 sender.flush();
                 new FrameReader(handler.awaitDataFrames(2)).twoVarcharAndTimestampBlocks(
-                        "events", 321, 331, 332
-                );
+                        "events");
                 Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
                         handler.describeRequests.get());
             }
@@ -1219,7 +1214,7 @@ public class QwpSchemaSenderIntegrationTest {
                     sender.longColumn("value", Long.MAX_VALUE).atNow();
                     sender.flush();
                     new FrameReader(handler.awaitDataFrame())
-                            .longTimestampTable("events", 251 + target, 261, target, Long.MAX_VALUE);
+                            .longTimestampTable("events", target, Long.MAX_VALUE);
                     Assert.assertEquals("a rejected setter must not look up metadata", 1,
                         handler.describeRequests.get());
                 }
@@ -1248,7 +1243,7 @@ public class QwpSchemaSenderIntegrationTest {
                 Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
                 sender.table("events").longColumn("value", 12).atNow();
                 sender.flush();
-                new FrameReader(handler.awaitDataFrames(2)).twoLongAndTimestampBlocks("events", 271, 281, 282);
+                new FrameReader(handler.awaitDataFrames(2)).twoLongAndTimestampBlocks("events");
                 Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
                         handler.describeRequests.get());
             }
@@ -1276,7 +1271,7 @@ public class QwpSchemaSenderIntegrationTest {
                 Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
                 sender.table("events").doubleColumn("value", 1e23).atNow();
                 sender.flush();
-                new FrameReader(handler.awaitDataFrames(2)).twoDoubleAndVarcharBlocks("events", 231, 241, 242);
+                new FrameReader(handler.awaitDataFrames(2)).twoDoubleAndVarcharBlocks("events");
                 Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
                         handler.describeRequests.get());
             }
@@ -1311,7 +1306,7 @@ public class QwpSchemaSenderIntegrationTest {
                         sender.flush();
 
                         new FrameReader(handler.awaitDataFrame()).floatingTextTable(
-                                "events", 211 + target, 221, target,
+                                "events", target,
                                 "FLOAT".equals(input) ? "0.10000000149011612" : "1.0E23",
                                 "FLOAT".equals(input) ? "1.401298464324817E-45" : "5.0E-324"
                         );
@@ -1349,7 +1344,7 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events").uuidColumn("value", 0x2122232425262728L, 0x3132333435363738L).atNow();
                 sender.flush();
 
-                new FrameReader(handler.awaitDataFrames(2)).twoUuidAndVarcharBlocks("events", 191, 201, 202);
+                new FrameReader(handler.awaitDataFrames(2)).twoUuidAndVarcharBlocks("events");
                 Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
                         handler.describeRequests.get());
             }
@@ -1381,8 +1376,6 @@ public class QwpSchemaSenderIntegrationTest {
                     FrameReader reader = new FrameReader(handler.awaitDataFrame());
                     reader.longTextTable(
                             "events",
-                            171 + target,
-                            181,
                             target,
                             "11121314-1516-1718-0102-030405060708"
                     );
@@ -1426,7 +1419,7 @@ public class QwpSchemaSenderIntegrationTest {
                     sender.flush();
 
                     new FrameReader(handler.awaitDataFrame()).ipv4Table(
-                            "events", 211 + target, 221, target, 0xff010203);
+                            "events", target, 0xff010203);
                     Assert.assertEquals("a rejected setter must not look up metadata", 1,
                         handler.describeRequests.get());
                 }
@@ -1458,7 +1451,7 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events").ipv4Column("value", 0x05060708).atNow();
                 sender.flush();
 
-                new FrameReader(handler.awaitDataFrames(2)).twoIpv4AndVarcharBlocks("events", 231, 241, 242);
+                new FrameReader(handler.awaitDataFrames(2)).twoIpv4AndVarcharBlocks("events");
                 Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
                         handler.describeRequests.get());
             }
@@ -1490,7 +1483,7 @@ public class QwpSchemaSenderIntegrationTest {
                     sender.flush();
 
                     new FrameReader(handler.awaitDataFrame()).geoHashTargetTable(
-                            "events", 251 + target, 261, target, 0xd0c6c, 0x12345, 20);
+                            "events", target, 0xd0c6c, 0x12345, 20);
                     Assert.assertEquals("a rejected setter must not look up metadata", 1,
                         handler.describeRequests.get());
                 }
@@ -1524,7 +1517,7 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.flush();
 
                 new FrameReader(handler.awaitDataFrames(2)).twoNativeGeoHashAndVarcharBlocks(
-                        "events", 281, 291, 292);
+                        "events");
                 Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
                         handler.describeRequests.get());
             }
@@ -1556,7 +1549,7 @@ public class QwpSchemaSenderIntegrationTest {
                     sender.flush();
 
                     new FrameReader(handler.awaitDataFrame()).long256TargetTable(
-                            "events", 251 + target, 261, target, 1, 2, 3, 4);
+                            "events", target, 1, 2, 3, 4);
                     Assert.assertEquals("a rejected setter must not look up metadata", 1,
                         handler.describeRequests.get());
                 }
@@ -1589,7 +1582,7 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.flush();
 
                 new FrameReader(handler.awaitDataFrames(2)).twoNativeLong256AndVarcharBlocks(
-                        "events", 281, 291, 292);
+                        "events");
                 Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
                         handler.describeRequests.get());
             }
@@ -1621,7 +1614,7 @@ public class QwpSchemaSenderIntegrationTest {
                     sender.flush();
 
                     FrameReader reader = new FrameReader(handler.awaitDataFrame());
-                    reader.longTextTable("events", 121 + target, 131, target, Long.toString(Long.MAX_VALUE));
+                    reader.longTextTable("events", target, Long.toString(Long.MAX_VALUE));
                     Assert.assertEquals("a rejected setter must not look up metadata", 1,
                         handler.describeRequests.get());
                 }
@@ -1654,7 +1647,7 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.flush();
 
                 new FrameReader(handler.awaitDataFrames(2))
-                        .twoSymbolAndVarcharBlocks("events", 151, 161, 162);
+                        .twoSymbolAndVarcharBlocks("events");
                 Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
                         handler.describeRequests.get());
             }
@@ -1680,7 +1673,7 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.flush();
                 byte[] frame = handler.awaitDataFrame();
                 FrameReader reader = new FrameReader(frame);
-                reader.schemaTable("events", 41, 73, 2, "id", QwpConstants.TYPE_UUID);
+                reader.schemaTable("events", 2, "id", QwpConstants.TYPE_UUID);
                 Assert.assertEquals(0, reader.u8());
                 Assert.assertEquals(0x0102030405060708L, reader.i64());
                 Assert.assertEquals(0x1112131415161718L, reader.i64());
@@ -1732,7 +1725,7 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("missing").longColumn("x", 8).atNow();
                 sender.flush();
                 FrameReader reader = new FrameReader(handler.awaitDataFrame());
-                reader.schemaTable("missing", -1, -1, 2, "x", QwpConstants.TYPE_LONG);
+                reader.schemaTable("missing", 2, "x", QwpConstants.TYPE_LONG);
                 Assert.assertEquals(0, reader.u8());
                 Assert.assertEquals(7, reader.i64());
                 Assert.assertEquals(8, reader.i64());
@@ -1789,7 +1782,7 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.longColumn("id", 3).atNow();
                 sender.flush();
                 FrameReader reader = new FrameReader(handler.awaitDataFrame());
-                reader.schemaTable("events", -1, -1, 2, "id", QwpConstants.TYPE_LONG);
+                reader.schemaTable("events", 2, "id", QwpConstants.TYPE_LONG);
                 Assert.assertEquals(0, reader.u8());
                 Assert.assertEquals(1, reader.i64());
                 Assert.assertEquals(3, reader.i64());
@@ -1909,7 +1902,7 @@ public class QwpSchemaSenderIntegrationTest {
                     long fsn = sender.flushAndGetSequence();
                     Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
                     FrameReader reader = new FrameReader(handler.awaitDataFrame());
-                    reader.schemaTable("events", -1, -1, 2, "id", QwpConstants.TYPE_LONG);
+                    reader.schemaTable("events", 2, "id", QwpConstants.TYPE_LONG);
                     Assert.assertEquals(0, reader.u8());
                     Assert.assertEquals(1, reader.i64());
                     Assert.assertEquals(3, reader.i64());
@@ -1930,7 +1923,7 @@ public class QwpSchemaSenderIntegrationTest {
                     sender.table("events").longColumn("id", 5).atNow();
                     sender.flush();
                     reader = new FrameReader(handler.awaitDataFrames(2).get(1));
-                    reader.schemaTable("events", -1, -1, 1, "id", QwpConstants.TYPE_LONG);
+                    reader.schemaTable("events", 1, "id", QwpConstants.TYPE_LONG);
                     Assert.assertEquals(0, reader.u8());
                     Assert.assertEquals(5, reader.i64());
                     reader.eof();
@@ -2098,14 +2091,14 @@ public class QwpSchemaSenderIntegrationTest {
                 // next row joins the block pinned to version 52.
                 sender.uuidColumn("id", 3, 4).atNow();
                 long fsn = sender.flushAndGetSequence();
-                new FrameReader(handler.awaitDataFrame()).uuidTable("events", 51, 52, 1, 2, 3, 4);
+                new FrameReader(handler.awaitDataFrame()).uuidTable("events", 1, 2, 3, 4);
                 Assert.assertEquals(1, handler.describeRequests.get());
 
                 // The stale frame's ACK carries version 53; the next batch adopts it.
                 Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
                 sender.table("events").uuidColumn("id", 5, 6).atNow();
                 sender.flush();
-                new FrameReader(handler.awaitDataFrames(2).get(1)).uuidTable("events", 51, 53, 5, 6);
+                new FrameReader(handler.awaitDataFrames(2).get(1)).uuidTable("events", 5, 6);
                 Assert.assertEquals("the ACK feedback replaces a second lookup", 1,
                         handler.describeRequests.get());
             }
@@ -2161,7 +2154,7 @@ public class QwpSchemaSenderIntegrationTest {
                             & QwpConstants.FLAG_DEFER_COMMIT);
                     new FrameReader(frames.get(0)).legacyVarcharTable("events", "legacy_value", "A", "B", "C");
                     FrameReader schema = new FrameReader(frames.get(1));
-                    schema.schemaTable("events", 61, 62, 1, "id", QwpConstants.TYPE_UUID);
+                    schema.schemaTable("events", 1, "id", QwpConstants.TYPE_UUID);
                     Assert.assertEquals(0, schema.u8());
                     Assert.assertEquals(3, schema.i64());
                     Assert.assertEquals(4, schema.i64());
@@ -2213,7 +2206,7 @@ public class QwpSchemaSenderIntegrationTest {
                 new FrameReader(frames.get(0)).legacyTimestampTable(
                         "events", "ts", 3_456_789L, 3_456_789L);
                 new FrameReader(frames.get(1)).schemaTimestampTable(
-                        "events", 71, 72, "ts", 3_456_789_123L);
+                        "events", "ts", 3_456_789_123L);
                 Assert.assertEquals(1, handler.describeRequests.get());
             } finally {
                 sender.close();
@@ -2249,13 +2242,13 @@ public class QwpSchemaSenderIntegrationTest {
                 Assert.assertEquals(0, frames.get(1)[QwpConstants.HEADER_OFFSET_FLAGS]
                         & QwpConstants.FLAG_DEFER_COMMIT);
                 FrameReader first = new FrameReader(frames.get(0));
-                first.schemaTable("a", 81, 82, 1, "id", QwpConstants.TYPE_UUID);
+                first.schemaTable("a", 1, "id", QwpConstants.TYPE_UUID);
                 Assert.assertEquals(0, first.u8());
                 Assert.assertEquals(1, first.i64());
                 Assert.assertEquals(2, first.i64());
                 first.eof();
                 FrameReader second = new FrameReader(frames.get(1));
-                second.schemaTable("b", 82, 82, 1, "id", QwpConstants.TYPE_UUID);
+                second.schemaTable("b", 1, "id", QwpConstants.TYPE_UUID);
                 Assert.assertEquals(0, second.u8());
                 Assert.assertEquals(3, second.i64());
                 Assert.assertEquals(4, second.i64());
@@ -2360,14 +2353,14 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test(timeout = 10_000)
-    public void testStrictAsyncRecoveredSchemaBacklogWaitsForNegotiation() throws Exception {
+    public void testStrictAsyncWithRecoveredBacklogWaitsForFirstConnection() throws Exception {
         assertMemoryLeak(() -> {
-            File sfRoot = temporaryFolder.newFolder("schema-required-recovery");
+            File sfRoot = temporaryFolder.newFolder("strict-async-recovery");
             int unavailablePort = publishUnackedSchemaBacklog(sfRoot, 95, 96);
 
-            // STRICT never takes the legacy contract once schema support is known,
-            // and the recovered backlog already requires it. With no server the
-            // wait runs out its configured budget and fails typed.
+            // Under an asynchronous initial connect, STRICT waits for the first
+            // connection before it picks a contract, recovered backlog or not. With
+            // no server, the wait runs out its budget and fails typed.
             try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + unavailablePort
                     + ";sf_dir=" + sfRoot.getAbsolutePath()
                     + ";sender_id=recovery;initial_connect_retry=async;schema_mode=strict;"
@@ -2376,7 +2369,7 @@ public class QwpSchemaSenderIntegrationTest {
                     + "close_flush_timeout_millis=0;")) {
                 try {
                     sender.table("events");
-                    Assert.fail("recovered schema-required backlog fell back to legacy encoding");
+                    Assert.fail("STRICT took the legacy contract before the first connection");
                 } catch (LineSenderSchemaException e) {
                     Assert.assertEquals(LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE, e.getReason());
                 }
@@ -2387,7 +2380,7 @@ public class QwpSchemaSenderIntegrationTest {
     @Test(timeout = 10_000)
     public void testAutoAsyncRecoveredSchemaBacklogWritesLegacyOfflineAndReplaysBacklog() throws Exception {
         assertMemoryLeak(() -> {
-            File sfRoot = temporaryFolder.newFolder("schema-required-recovery-auto");
+            File sfRoot = temporaryFolder.newFolder("auto-async-recovery");
             int port = publishUnackedSchemaBacklog(sfRoot, 97, 98);
 
             TestWebSocketServer server = null;
@@ -2397,9 +2390,8 @@ public class QwpSchemaSenderIntegrationTest {
                     + "reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=50;"
                     + "auto_flush_rows=2147483647;auto_flush_bytes=0;auto_flush_interval=2147483646;"
                     + "close_flush_timeout_millis=0;")) {
-                // AUTO (the default) never waits on a wire that has not come up. The
-                // recovered backlog still pins the capability requirement for the
-                // reconnect, but this row takes the legacy contract right away.
+                // AUTO (the default) never waits on a wire that has not come up, so
+                // this row takes the legacy contract right away.
                 sender.table("events").stringColumn("legacy_value", "A").atNow();
 
                 SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 97, 98);
@@ -2410,10 +2402,10 @@ public class QwpSchemaSenderIntegrationTest {
                 Assert.assertTrue("schema-capable connection was not installed", handler.awaitPong());
                 sender.flush();
 
-                // The recovered schema frame replays first, then the legacy batch.
+                // The recovered frame replays first, then the legacy batch.
                 List<byte[]> frames = handler.awaitDataFrames(2);
                 FrameReader recovered = new FrameReader(frames.get(0));
-                recovered.schemaTable("events", 97, 98, 1, "id", QwpConstants.TYPE_UUID);
+                recovered.schemaTable("events", 1, "id", QwpConstants.TYPE_UUID);
                 Assert.assertEquals(0, recovered.u8());
                 Assert.assertEquals(1, recovered.i64());
                 Assert.assertEquals(2, recovered.i64());
@@ -2462,7 +2454,7 @@ public class QwpSchemaSenderIntegrationTest {
                 List<byte[]> frames = second.awaitDataFrames(2);
                 new FrameReader(frames.get(0)).legacyVarcharTable("other", "legacy_value", "A");
                 FrameReader schema = new FrameReader(frames.get(1));
-                schema.schemaTable("other", 113, 114, 1, "id", QwpConstants.TYPE_UUID);
+                schema.schemaTable("other", 1, "id", QwpConstants.TYPE_UUID);
                 Assert.assertEquals(0, schema.u8());
                 Assert.assertEquals(3, schema.i64());
                 Assert.assertEquals(4, schema.i64());
@@ -2490,7 +2482,7 @@ public class QwpSchemaSenderIntegrationTest {
             try {
                 sender.table("events").uuidColumn("id", 1, 2).atNow();
                 sender.flush();
-                new FrameReader(first.awaitDataFrame()).schemaTable("events", 121, 122, 1, "id", QwpConstants.TYPE_UUID);
+                new FrameReader(first.awaitDataFrame()).schemaTable("events", 1, "id", QwpConstants.TYPE_UUID);
                 Assert.assertEquals(1, first.describeRequests.get());
                 Assert.assertTrue(sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
                 server.close();
@@ -2505,7 +2497,7 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events").uuidColumn("id", 3, 4).atNow();
                 sender.flush();
                 FrameReader frame = new FrameReader(second.awaitDataFrame());
-                frame.schemaTable("events", 121, 122, 1, "id", QwpConstants.TYPE_UUID);
+                frame.schemaTable("events", 1, "id", QwpConstants.TYPE_UUID);
                 Assert.assertEquals(0, frame.u8());
                 Assert.assertEquals(3, frame.i64());
                 Assert.assertEquals(4, frame.i64());
@@ -2793,7 +2785,7 @@ public class QwpSchemaSenderIntegrationTest {
                 sender.table("events").uuidColumn("id", 3, 4).atNow();
                 long fsn = sender.flushAndGetSequence();
                 FrameReader reader = new FrameReader(handler.awaitDataFrame());
-                reader.schemaTable("events", 101, 102, 1, "id", QwpConstants.TYPE_UUID);
+                reader.schemaTable("events", 1, "id", QwpConstants.TYPE_UUID);
                 Assert.assertEquals(0, reader.u8());
                 Assert.assertEquals(3, reader.i64());
                 Assert.assertEquals(4, reader.i64());
@@ -2802,7 +2794,7 @@ public class QwpSchemaSenderIntegrationTest {
                 Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
                 sender.table("events").uuidColumn("id", 5, 6).atNow();
                 sender.flush();
-                new FrameReader(handler.awaitDataFrames(2).get(1)).uuidTable("events", 101, 103, 5, 6);
+                new FrameReader(handler.awaitDataFrames(2).get(1)).uuidTable("events", 5, 6);
                 Assert.assertEquals(1, handler.describeRequests.get());
             }
         });
@@ -2899,7 +2891,7 @@ public class QwpSchemaSenderIntegrationTest {
 
                     // A legacy row would ship the text as a VARCHAR column instead.
                     FrameReader reader = new FrameReader(handler.awaitDataFrames(2).get(1));
-                    reader.schemaTable("events", 41, 73, 1, "id", QwpConstants.TYPE_UUID);
+                    reader.schemaTable("events", 1, "id", QwpConstants.TYPE_UUID);
                     Assert.assertEquals(mode, 0, reader.u8());
                     Assert.assertEquals(mode, 0x3132333435363738L, reader.i64());
                     Assert.assertEquals(mode, 0x2122232425262728L, reader.i64());
@@ -2941,7 +2933,7 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     /**
-     * Writes one schema-encoded UUID row for "events" through a sender rooted at
+     * Writes one schema-validated UUID row for "events" through a sender rooted at
      * {@code sfRoot} against a server that never acknowledges data, so the frame
      * stays in store-and-forward for a later sender to recover. Returns the port
      * the server listened on, which is free again when this method returns.
@@ -3266,15 +3258,13 @@ public class QwpSchemaSenderIntegrationTest {
 
         private void schemaTimestampTable(
                 String table,
-                int tableId,
-                long version,
                 String column,
                 long expectedNanos
         ) {
             messageHeader(1);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, version, 1, column, QwpConstants.TYPE_TIMESTAMP_NANOS);
+            schemaBlockHeader(table, 1, column, QwpConstants.TYPE_TIMESTAMP_NANOS);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(0, u8());
             Assert.assertEquals(expectedNanos, i64());
@@ -3352,8 +3342,6 @@ public class QwpSchemaSenderIntegrationTest {
 
         private void longTextTable(
                 String table,
-                int tableId,
-                long version,
                 int targetType,
                 String expectedValue
         ) {
@@ -3369,7 +3357,7 @@ public class QwpSchemaSenderIntegrationTest {
                 Assert.assertEquals(0, varint());
                 Assert.assertEquals(0, varint());
             }
-            schemaBlockHeader(table, tableId, version, 2, "value",
+            schemaBlockHeader(table, 2, "value",
                     targetType == ColumnType.SYMBOL ? QwpConstants.TYPE_SYMBOL : QwpConstants.TYPE_VARCHAR);
             Assert.assertEquals(1, u8());
             Assert.assertEquals(1, u8());
@@ -3386,14 +3374,14 @@ public class QwpSchemaSenderIntegrationTest {
             eof();
         }
 
-        private void ipv4Table(String table, int tableId, long version, int targetType, int expectedValue) {
+        private void ipv4Table(String table, int targetType, int expectedValue) {
             messageHeader(1);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
             byte wireType = targetType == ColumnType.IPv4
                     ? QwpConstants.TYPE_IPv4
                     : QwpConstants.TYPE_VARCHAR;
-            schemaBlockHeader(table, tableId, version, 2, "value", wireType);
+            schemaBlockHeader(table, 2, "value", wireType);
             Assert.assertEquals(1, u8());
             Assert.assertEquals(1, u8());
             if (wireType == QwpConstants.TYPE_IPv4) {
@@ -3406,11 +3394,11 @@ public class QwpSchemaSenderIntegrationTest {
             eof();
         }
 
-        private void intToIpv4Table(String table, int tableId, long version) {
+        private void intToIpv4Table(String table) {
             messageHeader(1);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, version, 4, "value", QwpConstants.TYPE_IPv4);
+            schemaBlockHeader(table, 4, "value", QwpConstants.TYPE_IPv4);
             Assert.assertEquals(1, u8());
             Assert.assertEquals(3, u8());
             Assert.assertEquals(1, in.getInt());
@@ -3420,8 +3408,6 @@ public class QwpSchemaSenderIntegrationTest {
 
         private void long256TargetTable(
                 String table,
-                int tableId,
-                long version,
                 int targetType,
                 long l0,
                 long l1,
@@ -3434,7 +3420,7 @@ public class QwpSchemaSenderIntegrationTest {
             byte wireType = targetType == ColumnType.LONG256
                     ? QwpConstants.TYPE_LONG256
                     : QwpConstants.TYPE_VARCHAR;
-            schemaBlockHeader(table, tableId, version, 2, "value", wireType);
+            schemaBlockHeader(table, 2, "value", wireType);
             Assert.assertEquals(1, u8());
             Assert.assertEquals(1, u8());
             if (wireType == QwpConstants.TYPE_LONG256) {
@@ -3451,11 +3437,11 @@ public class QwpSchemaSenderIntegrationTest {
             eof();
         }
 
-        private void long256Table(String table, int tableId, long version) {
+        private void long256Table(String table) {
             messageHeader(1);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, version, 2, "value", QwpConstants.TYPE_LONG256);
+            schemaBlockHeader(table, 2, "value", QwpConstants.TYPE_LONG256);
             Assert.assertEquals(1, u8());
             Assert.assertEquals(1, u8());
             Assert.assertEquals(0xfedcba9876543210L, i64());
@@ -3466,12 +3452,12 @@ public class QwpSchemaSenderIntegrationTest {
         }
 
         private void geoHashTable(
-                String table, int tableId, long version, int bits, int first, int second
+                String table, int bits, int first, int second
         ) {
             messageHeader(1);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, version, 2, "value", QwpConstants.TYPE_GEOHASH);
+            schemaBlockHeader(table, 2, "value", QwpConstants.TYPE_GEOHASH);
             Assert.assertEquals(1, u8());
             Assert.assertEquals(0, u8());
             Assert.assertEquals(bits, varint());
@@ -3482,8 +3468,6 @@ public class QwpSchemaSenderIntegrationTest {
 
         private void geoHashTargetTable(
                 String table,
-                int tableId,
-                long version,
                 int targetType,
                 long first,
                 long second,
@@ -3495,7 +3479,7 @@ public class QwpSchemaSenderIntegrationTest {
             byte wireType = ColumnType.isGeoHash(targetType)
                     ? QwpConstants.TYPE_GEOHASH
                     : QwpConstants.TYPE_VARCHAR;
-            schemaBlockHeader(table, tableId, version, 2, "value", wireType);
+            schemaBlockHeader(table, 2, "value", wireType);
             if (wireType == QwpConstants.TYPE_GEOHASH) {
                 Assert.assertEquals(1, u8());
                 Assert.assertEquals(0, u8());
@@ -3539,12 +3523,12 @@ public class QwpSchemaSenderIntegrationTest {
         }
 
         private void decimal64Table(
-                String table, int tableId, long version, int scale, long first, long second
+                String table, int scale, long first, long second
         ) {
             messageHeader(1);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, version, 2, "value", QwpConstants.TYPE_DECIMAL64);
+            schemaBlockHeader(table, 2, "value", QwpConstants.TYPE_DECIMAL64);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(scale, u8());
             Assert.assertEquals(first, i64());
@@ -3552,7 +3536,7 @@ public class QwpSchemaSenderIntegrationTest {
             eof();
         }
 
-        private void decimalTextLifecycleTable(String table, int tableId, long version) {
+        private void decimalTextLifecycleTable(String table) {
             StringBuilder maxScale = new StringBuilder(78).append("0.");
             for (int i = 0; i < 76; i++) {
                 maxScale.append('9');
@@ -3562,7 +3546,7 @@ public class QwpSchemaSenderIntegrationTest {
             messageHeader(1);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, version, 5, "value", QwpConstants.TYPE_VARCHAR);
+            schemaBlockHeader(table, 5, "value", QwpConstants.TYPE_VARCHAR);
             Assert.assertEquals(1, u8());
             Assert.assertEquals(0x04, u8());
             Assert.assertEquals(0, in.getInt());
@@ -3574,11 +3558,11 @@ public class QwpSchemaSenderIntegrationTest {
             eof();
         }
 
-        private void decimalTextTable(String table, int tableId, long version, String... expectedValues) {
+        private void decimalTextTable(String table, String... expectedValues) {
             messageHeader(1);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, version, expectedValues.length, "value", QwpConstants.TYPE_VARCHAR);
+            schemaBlockHeader(table, expectedValues.length, "value", QwpConstants.TYPE_VARCHAR);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(0, in.getInt());
             int totalLength = 0;
@@ -3595,11 +3579,11 @@ public class QwpSchemaSenderIntegrationTest {
             eof();
         }
 
-        private void parsedDecimalTextTable(String table, int tableId, long version) {
+        private void parsedDecimalTextTable(String table) {
             messageHeader(1);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, version, 4, "value", QwpConstants.TYPE_VARCHAR);
+            schemaBlockHeader(table, 4, "value", QwpConstants.TYPE_VARCHAR);
             Assert.assertEquals(1, u8());
             Assert.assertEquals(0x0c, u8());
             Assert.assertEquals(0, in.getInt());
@@ -3609,15 +3593,15 @@ public class QwpSchemaSenderIntegrationTest {
             eof();
         }
 
-        private void twoDecimalBlocks(String table, int tableId, long firstVersion, long secondVersion) {
+        private void twoDecimalBlocks(String table) {
             messageHeader(2);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, firstVersion, 1, "value", QwpConstants.TYPE_DECIMAL64);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_DECIMAL64);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(0, u8());
             Assert.assertEquals(1, i64());
-            schemaBlockHeader(table, tableId, secondVersion, 1, "value", QwpConstants.TYPE_DECIMAL128);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_DECIMAL128);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(0, u8());
             Assert.assertEquals(1_000, i64());
@@ -3625,15 +3609,15 @@ public class QwpSchemaSenderIntegrationTest {
             eof();
         }
 
-        private void twoDecimal64ScaleBlocks(String table, int tableId, long firstVersion, long secondVersion) {
+        private void twoDecimal64ScaleBlocks(String table) {
             messageHeader(2);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, firstVersion, 1, "value", QwpConstants.TYPE_DECIMAL64);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_DECIMAL64);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(0, u8());
             Assert.assertEquals(1, i64());
-            schemaBlockHeader(table, tableId, secondVersion, 1, "value", QwpConstants.TYPE_DECIMAL64);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_DECIMAL64);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(4, u8());
             Assert.assertEquals(12_345, i64());
@@ -3641,16 +3625,16 @@ public class QwpSchemaSenderIntegrationTest {
         }
 
         private void twoDecimal64AndVarcharBlocks(
-                String table, int tableId, long firstVersion, long secondVersion
+                String table
         ) {
             messageHeader(2);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, firstVersion, 1, "value", QwpConstants.TYPE_DECIMAL64);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_DECIMAL64);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(4, u8());
             Assert.assertEquals(12_340, i64());
-            schemaBlockHeader(table, tableId, secondVersion, 1, "value", QwpConstants.TYPE_VARCHAR);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_VARCHAR);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(0, in.getInt());
             Assert.assertEquals(7, in.getInt());
@@ -3659,16 +3643,16 @@ public class QwpSchemaSenderIntegrationTest {
         }
 
         private void twoDecimalWidthAndScaleBlocks(
-                String table, int tableId, long firstVersion, long secondVersion
+                String table
         ) {
             messageHeader(2);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, firstVersion, 1, "value", QwpConstants.TYPE_DECIMAL64);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_DECIMAL64);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(4, u8());
             Assert.assertEquals(10_000, i64());
-            schemaBlockHeader(table, tableId, secondVersion, 1, "value", QwpConstants.TYPE_DECIMAL128);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_DECIMAL128);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(5, u8());
             Assert.assertEquals(-8_446_744_073_709_551_616L, i64());
@@ -3676,22 +3660,22 @@ public class QwpSchemaSenderIntegrationTest {
             eof();
         }
 
-        private void nullGeoHashTable(String table, int tableId, long version, int bits) {
+        private void nullGeoHashTable(String table, int bits) {
             messageHeader(1);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, version, 1, "value", QwpConstants.TYPE_GEOHASH);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_GEOHASH);
             Assert.assertEquals(1, u8());
             Assert.assertEquals(1, u8());
             Assert.assertEquals(bits, varint());
             eof();
         }
 
-        private void smallIntegerNumericTable(String table, int tableId, long version, byte wireType) {
+        private void smallIntegerNumericTable(String table, byte wireType) {
             messageHeader(1);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, version, 4, "value", wireType);
+            schemaBlockHeader(table, 4, "value", wireType);
             Assert.assertEquals(1, u8());
             Assert.assertEquals(4, u8());
             assertSmallIntegerValue(wireType, -1);
@@ -3700,11 +3684,11 @@ public class QwpSchemaSenderIntegrationTest {
             eof();
         }
 
-        private void smallIntegerDecimalTable(String table, int tableId, long version) {
+        private void smallIntegerDecimalTable(String table) {
             messageHeader(1);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, version, 4, "value", QwpConstants.TYPE_DECIMAL64);
+            schemaBlockHeader(table, 4, "value", QwpConstants.TYPE_DECIMAL64);
             Assert.assertEquals(1, u8());
             Assert.assertEquals(4, u8());
             Assert.assertEquals(2, u8());
@@ -3714,7 +3698,7 @@ public class QwpSchemaSenderIntegrationTest {
             eof();
         }
 
-        private void smallIntegerTextTable(String table, int tableId, long version, int targetType) {
+        private void smallIntegerTextTable(String table, int targetType) {
             messageHeader(1);
             if (targetType == ColumnType.SYMBOL) {
                 Assert.assertEquals(0, varint());
@@ -3727,7 +3711,7 @@ public class QwpSchemaSenderIntegrationTest {
                 Assert.assertEquals(0, varint());
                 Assert.assertEquals(0, varint());
             }
-            schemaBlockHeader(table, tableId, version, 4, "value",
+            schemaBlockHeader(table, 4, "value",
                     targetType == ColumnType.SYMBOL ? QwpConstants.TYPE_SYMBOL : QwpConstants.TYPE_VARCHAR);
             Assert.assertEquals(1, u8());
             Assert.assertEquals(4, u8());
@@ -3745,11 +3729,11 @@ public class QwpSchemaSenderIntegrationTest {
             eof();
         }
 
-        private void integerTemporalTable(String table, int tableId, long version, byte wireType) {
+        private void integerTemporalTable(String table, byte wireType) {
             messageHeader(1);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, version, 5, "value", wireType);
+            schemaBlockHeader(table, 5, "value", wireType);
             Assert.assertEquals(1, u8());
             Assert.assertEquals(4, u8());
             if (wireType != QwpConstants.TYPE_DATE) {
@@ -3787,16 +3771,16 @@ public class QwpSchemaSenderIntegrationTest {
             }
         }
 
-        private void twoGeoHashBlocks(String table, int tableId, long firstVersion, long secondVersion) {
+        private void twoGeoHashBlocks(String table) {
             messageHeader(2);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, firstVersion, 1, "value", QwpConstants.TYPE_GEOHASH);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_GEOHASH);
             Assert.assertEquals(1, u8());
             Assert.assertEquals(0, u8());
             Assert.assertEquals(60, varint());
             Assert.assertEquals(0x443214c74254bL, i64());
-            schemaBlockHeader(table, tableId, secondVersion, 1, "value", QwpConstants.TYPE_GEOHASH);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_GEOHASH);
             Assert.assertEquals(1, u8());
             Assert.assertEquals(0, u8());
             Assert.assertEquals(5, varint());
@@ -3805,15 +3789,15 @@ public class QwpSchemaSenderIntegrationTest {
         }
 
         private void twoDateAndTimestampBlocks(
-                String table, int tableId, long firstVersion, long secondVersion
+                String table
         ) {
             messageHeader(2);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, firstVersion, 1, "value", QwpConstants.TYPE_DATE);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_DATE);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(11, i64());
-            schemaBlockHeader(table, tableId, secondVersion, 1, "value", QwpConstants.TYPE_TIMESTAMP_NANOS);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_TIMESTAMP_NANOS);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(0, u8());
             Assert.assertEquals(12, i64());
@@ -3821,18 +3805,18 @@ public class QwpSchemaSenderIntegrationTest {
         }
 
         private void twoLong256AndVarcharBlocks(
-                String table, int tableId, long firstVersion, long secondVersion
+                String table
         ) {
             messageHeader(2);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, firstVersion, 1, "value", QwpConstants.TYPE_LONG256);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_LONG256);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(0xfedcba9876543210L, i64());
             Assert.assertEquals(0x0123456789abcdefL, i64());
             Assert.assertEquals(0, i64());
             Assert.assertEquals(0, i64());
-            schemaBlockHeader(table, tableId, secondVersion, 1, "value", QwpConstants.TYPE_VARCHAR);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_VARCHAR);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(0, in.getInt());
             Assert.assertEquals(11, in.getInt());
@@ -3841,17 +3825,17 @@ public class QwpSchemaSenderIntegrationTest {
         }
 
         private void twoNativeLong256AndVarcharBlocks(
-                String table, int tableId, long firstVersion, long secondVersion
+                String table
         ) {
             messageHeader(2);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, firstVersion, 1, "value", QwpConstants.TYPE_LONG256);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_LONG256);
             Assert.assertEquals(0, u8());
             for (long value : new long[]{1, 2, 3, 4}) {
                 Assert.assertEquals(value, i64());
             }
-            schemaBlockHeader(table, tableId, secondVersion, 1, "value", QwpConstants.TYPE_VARCHAR);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_VARCHAR);
             Assert.assertEquals(0, u8());
             String expected = "0x08000000000000000700000000000000060000000000000005";
             Assert.assertEquals(0, in.getInt());
@@ -3861,19 +3845,19 @@ public class QwpSchemaSenderIntegrationTest {
         }
 
         private void twoNativeGeoHashAndVarcharBlocks(
-                String table, int tableId, long firstVersion, long secondVersion
+                String table
         ) {
             messageHeader(2);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, firstVersion, 1, "value", QwpConstants.TYPE_GEOHASH);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_GEOHASH);
             Assert.assertEquals(1, u8());
             Assert.assertEquals(0, u8());
             Assert.assertEquals(20, varint());
             Assert.assertEquals(0xde, u8());
             Assert.assertEquals(0xbc, u8());
             Assert.assertEquals(0x0a, u8());
-            schemaBlockHeader(table, tableId, secondVersion, 1, "value", QwpConstants.TYPE_VARCHAR);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_VARCHAR);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(0, in.getInt());
             String expected = "00010010001101000101";
@@ -3883,12 +3867,12 @@ public class QwpSchemaSenderIntegrationTest {
         }
 
         private void longTimestampTable(
-                String table, int tableId, long version, int targetType, long expectedValue
+                String table, int targetType, long expectedValue
         ) {
             messageHeader(1);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, version, 2, "value",
+            schemaBlockHeader(table, 2, "value",
                     targetType == ColumnType.TIMESTAMP_MICRO
                             ? QwpConstants.TYPE_TIMESTAMP
                             : QwpConstants.TYPE_TIMESTAMP_NANOS);
@@ -3900,15 +3884,15 @@ public class QwpSchemaSenderIntegrationTest {
         }
 
         private void twoLongAndTimestampBlocks(
-                String table, int tableId, long firstVersion, long secondVersion
+                String table
         ) {
             messageHeader(2);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, firstVersion, 1, "value", QwpConstants.TYPE_LONG);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_LONG);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(11, i64());
-            schemaBlockHeader(table, tableId, secondVersion, 1, "value", QwpConstants.TYPE_TIMESTAMP_NANOS);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_TIMESTAMP_NANOS);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(0, u8());
             Assert.assertEquals(12, i64());
@@ -3916,17 +3900,17 @@ public class QwpSchemaSenderIntegrationTest {
         }
 
         private void twoVarcharAndTimestampBlocks(
-                String table, int tableId, long firstVersion, long secondVersion
+                String table
         ) {
             messageHeader(2);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, firstVersion, 1, "value", QwpConstants.TYPE_VARCHAR);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_VARCHAR);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(0, in.getInt());
             Assert.assertEquals(8, in.getInt());
             Assert.assertEquals("native-a", stringBytes(8));
-            schemaBlockHeader(table, tableId, secondVersion, 1, "value", QwpConstants.TYPE_TIMESTAMP);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_TIMESTAMP);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(0, u8());
             Assert.assertEquals(1, i64());
@@ -3934,12 +3918,12 @@ public class QwpSchemaSenderIntegrationTest {
         }
 
         private void timestampTextTable(
-                String table, int tableId, long version, String expectedLastValue
+                String table, String expectedLastValue
         ) {
             messageHeader(1);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, version, 2, "value", QwpConstants.TYPE_VARCHAR);
+            schemaBlockHeader(table, 2, "value", QwpConstants.TYPE_VARCHAR);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(0, in.getInt());
             Assert.assertEquals(0, in.getInt());
@@ -3952,23 +3936,23 @@ public class QwpSchemaSenderIntegrationTest {
         }
 
         private void stringDateTable(
-                String table, int tableId, long version, long expectedValue
+                String table, long expectedValue
         ) {
             messageHeader(1);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, version, 2, "value", QwpConstants.TYPE_DATE);
+            schemaBlockHeader(table, 2, "value", QwpConstants.TYPE_DATE);
             Assert.assertEquals(1, u8());
             Assert.assertEquals(1, u8());
             Assert.assertEquals(expectedValue, i64());
             eof();
         }
 
-        private void doubleArrayTable(String table, int tableId, long version) {
+        private void doubleArrayTable(String table) {
             messageHeader(1);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, version, 2, "value", QwpConstants.TYPE_DOUBLE_ARRAY);
+            schemaBlockHeader(table, 2, "value", QwpConstants.TYPE_DOUBLE_ARRAY);
             Assert.assertEquals(0, u8());
             assertDoubleArray(new int[]{1, 2}, 1.0, 2.0);
             assertDoubleArray(new int[]{2, 1}, 3.0, 4.0);
@@ -3976,15 +3960,15 @@ public class QwpSchemaSenderIntegrationTest {
         }
 
         private void twoDoubleArrayRankBlocks(
-                String table, int tableId, long firstVersion, long secondVersion
+                String table
         ) {
             messageHeader(2);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, firstVersion, 1, "value", QwpConstants.TYPE_DOUBLE_ARRAY);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_DOUBLE_ARRAY);
             Assert.assertEquals(0, u8());
             assertDoubleArray(new int[]{1, 2}, 1.0, 2.0);
-            schemaBlockHeader(table, tableId, secondVersion, 1, "value", QwpConstants.TYPE_DOUBLE_ARRAY);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_DOUBLE_ARRAY);
             Assert.assertEquals(0, u8());
             assertDoubleArray(new int[]{2}, 3.0, 4.0);
             eof();
@@ -4001,15 +3985,15 @@ public class QwpSchemaSenderIntegrationTest {
         }
 
         private void twoDateAndVarcharBlocks(
-                String table, int tableId, long firstVersion, long secondVersion
+                String table
         ) {
             messageHeader(2);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, firstVersion, 1, "value", QwpConstants.TYPE_DATE);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_DATE);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(0, i64());
-            schemaBlockHeader(table, tableId, secondVersion, 1, "value", QwpConstants.TYPE_VARCHAR);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_VARCHAR);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(0, in.getInt());
             Assert.assertEquals(8, in.getInt());
@@ -4017,11 +4001,11 @@ public class QwpSchemaSenderIntegrationTest {
             eof();
         }
 
-        private void charTable(String table, int tableId, long version, char first, char second) {
+        private void charTable(String table, char first, char second) {
             messageHeader(1);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, version, 2, "value", QwpConstants.TYPE_CHAR);
+            schemaBlockHeader(table, 2, "value", QwpConstants.TYPE_CHAR);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(first, in.getChar());
             Assert.assertEquals(second, in.getChar());
@@ -4029,33 +4013,33 @@ public class QwpSchemaSenderIntegrationTest {
         }
 
         private void twoVarcharAndCharBlocks(
-                String table, int tableId, long firstVersion, long secondVersion
+                String table
         ) {
             messageHeader(2);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, firstVersion, 1, "value", QwpConstants.TYPE_VARCHAR);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_VARCHAR);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(0, in.getInt());
             Assert.assertEquals(8, in.getInt());
             Assert.assertEquals("native-a", stringBytes(8));
-            schemaBlockHeader(table, tableId, secondVersion, 1, "value", QwpConstants.TYPE_CHAR);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_CHAR);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(0xffff, in.getChar());
             eof();
         }
 
         private void twoTimestampAndVarcharBlocks(
-                String table, int tableId, long firstVersion, long secondVersion
+                String table
         ) {
             messageHeader(2);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, firstVersion, 1, "value", QwpConstants.TYPE_TIMESTAMP_NANOS);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_TIMESTAMP_NANOS);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(0, u8());
             Assert.assertEquals(Long.MIN_VALUE, i64());
-            schemaBlockHeader(table, tableId, secondVersion, 1, "value", QwpConstants.TYPE_VARCHAR);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_VARCHAR);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(0, in.getInt());
             String expected = "2262-04-11T23:47:16.854Z";
@@ -4069,8 +4053,6 @@ public class QwpSchemaSenderIntegrationTest {
 
         private void floatingTextTable(
                 String table,
-                int tableId,
-                long version,
                 int targetType,
                 String rolledBackValue,
                 String expectedValue
@@ -4085,7 +4067,7 @@ public class QwpSchemaSenderIntegrationTest {
                 Assert.assertEquals(0, varint());
                 Assert.assertEquals(0, varint());
             }
-            schemaBlockHeader(table, tableId, version, 2, "value",
+            schemaBlockHeader(table, 2, "value",
                     targetType == ColumnType.SYMBOL ? QwpConstants.TYPE_SYMBOL : QwpConstants.TYPE_VARCHAR);
             Assert.assertEquals(1, u8());
             Assert.assertEquals(1, u8());
@@ -4118,8 +4100,6 @@ public class QwpSchemaSenderIntegrationTest {
 
         private void schemaBlockHeader(
                 String table,
-                int tableId,
-                long version,
                 int rows,
                 String column,
                 byte wireType
@@ -4132,17 +4112,17 @@ public class QwpSchemaSenderIntegrationTest {
             Assert.assertEquals(wireType & 0xff, u8());
         }
 
-        private void twoSymbolAndVarcharBlocks(String table, int tableId, long firstVersion, long secondVersion) {
+        private void twoSymbolAndVarcharBlocks(String table) {
             messageHeader(2);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(1, varint());
             Assert.assertEquals("7", string());
 
-            schemaBlockHeader(table, tableId, firstVersion, 1, "value", QwpConstants.TYPE_SYMBOL);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_SYMBOL);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(0, varint());
 
-            schemaBlockHeader(table, tableId, secondVersion, 1, "value", QwpConstants.TYPE_VARCHAR);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_VARCHAR);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(0, in.getInt());
             Assert.assertEquals(1, in.getInt());
@@ -4151,16 +4131,16 @@ public class QwpSchemaSenderIntegrationTest {
         }
 
         private void twoSmallIntegerDecimalBlocks(
-                String table, int tableId, long firstVersion, long secondVersion
+                String table
         ) {
             messageHeader(2);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, firstVersion, 1, "value", QwpConstants.TYPE_DECIMAL64);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_DECIMAL64);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(0, u8());
             Assert.assertEquals(1, i64());
-            schemaBlockHeader(table, tableId, secondVersion, 1, "value", QwpConstants.TYPE_DECIMAL128);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_DECIMAL128);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(5, u8());
             Assert.assertEquals(100_000_000, i64());
@@ -4169,32 +4149,32 @@ public class QwpSchemaSenderIntegrationTest {
         }
 
         private void twoIntDecimalAndIpv4Blocks(
-                String table, int tableId, long firstVersion, long secondVersion
+                String table
         ) {
             messageHeader(2);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, firstVersion, 1, "value", QwpConstants.TYPE_DECIMAL64);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_DECIMAL64);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(0, u8());
             Assert.assertEquals(1, i64());
-            schemaBlockHeader(table, tableId, secondVersion, 1, "value", QwpConstants.TYPE_IPv4);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_IPv4);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(1_000, in.getInt());
             eof();
         }
 
-        private void twoUuidAndVarcharBlocks(String table, int tableId, long firstVersion, long secondVersion) {
+        private void twoUuidAndVarcharBlocks(String table) {
             messageHeader(2);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
 
-            schemaBlockHeader(table, tableId, firstVersion, 1, "value", QwpConstants.TYPE_UUID);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_UUID);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(0x0102030405060708L, i64());
             Assert.assertEquals(0x1112131415161718L, i64());
 
-            schemaBlockHeader(table, tableId, secondVersion, 1, "value", QwpConstants.TYPE_VARCHAR);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_VARCHAR);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(0, in.getInt());
             Assert.assertEquals(36, in.getInt());
@@ -4202,16 +4182,16 @@ public class QwpSchemaSenderIntegrationTest {
             eof();
         }
 
-        private void twoIpv4AndVarcharBlocks(String table, int tableId, long firstVersion, long secondVersion) {
+        private void twoIpv4AndVarcharBlocks(String table) {
             messageHeader(2);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
 
-            schemaBlockHeader(table, tableId, firstVersion, 1, "value", QwpConstants.TYPE_IPv4);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_IPv4);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(0x01020304, in.getInt());
 
-            schemaBlockHeader(table, tableId, secondVersion, 1, "value", QwpConstants.TYPE_VARCHAR);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_VARCHAR);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(0, in.getInt());
             Assert.assertEquals(7, in.getInt());
@@ -4219,14 +4199,14 @@ public class QwpSchemaSenderIntegrationTest {
             eof();
         }
 
-        private void twoDoubleAndVarcharBlocks(String table, int tableId, long firstVersion, long secondVersion) {
+        private void twoDoubleAndVarcharBlocks(String table) {
             messageHeader(2);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, firstVersion, 1, "value", QwpConstants.TYPE_DOUBLE);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_DOUBLE);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(Double.doubleToRawLongBits(-0.0), i64());
-            schemaBlockHeader(table, tableId, secondVersion, 1, "value", QwpConstants.TYPE_VARCHAR);
+            schemaBlockHeader(table, 1, "value", QwpConstants.TYPE_VARCHAR);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(0, in.getInt());
             Assert.assertEquals(6, in.getInt());
@@ -4252,7 +4232,7 @@ public class QwpSchemaSenderIntegrationTest {
             return new String(bytes, StandardCharsets.UTF_8);
         }
 
-        private void schemaTable(String table, int tableId, long version, int rows, String column, byte type) {
+        private void schemaTable(String table, int rows, String column, byte type) {
             Assert.assertEquals(QwpConstants.MAGIC_MESSAGE, in.getInt());
             Assert.assertEquals(QwpConstants.VERSION, u8());
             u8();
@@ -4268,11 +4248,11 @@ public class QwpSchemaSenderIntegrationTest {
             Assert.assertEquals(type & 0xff, u8());
         }
 
-        private void uuidTable(String table, int tableId, long version, long... loHiPairs) {
+        private void uuidTable(String table, long... loHiPairs) {
             messageHeader(1);
             Assert.assertEquals(0, varint());
             Assert.assertEquals(0, varint());
-            schemaBlockHeader(table, tableId, version, loHiPairs.length / 2, "id", QwpConstants.TYPE_UUID);
+            schemaBlockHeader(table, loHiPairs.length / 2, "id", QwpConstants.TYPE_UUID);
             Assert.assertEquals(0, u8());
             for (long word : loHiPairs) {
                 Assert.assertEquals(word, i64());
@@ -4293,15 +4273,15 @@ public class QwpSchemaSenderIntegrationTest {
             Assert.assertEquals(0, u8());
             Assert.assertEquals(11, i64());
 
-            schemaBlockHeader(table, 31, 41, 1, "id", QwpConstants.TYPE_UUID);
+            schemaBlockHeader(table, 1, "id", QwpConstants.TYPE_UUID);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(0x3132333435363738L, i64());
             Assert.assertEquals(0x2122232425262728L, i64());
             eof();
         }
 
-        private void uuidOnlyTable(String table, int tableId, long version, long lo, long hi) {
-            schemaTable(table, tableId, version, 1, "failed_b", QwpConstants.TYPE_UUID);
+        private void uuidOnlyTable(String table, long lo, long hi) {
+            schemaTable(table, 1, "failed_b", QwpConstants.TYPE_UUID);
             Assert.assertEquals(0, u8());
             Assert.assertEquals(lo, i64());
             Assert.assertEquals(hi, i64());

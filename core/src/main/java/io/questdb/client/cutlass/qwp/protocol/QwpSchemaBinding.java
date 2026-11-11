@@ -495,6 +495,9 @@ public final class QwpSchemaBinding {
         return this;
     }
 
+    // Mirrors integerColumn() with LONG constants. Delegating to it measured about
+    // 4% slower per row in QwpSchemaBindingBenchmark.schemaRow: the JIT does not
+    // inline the shared body, so the constants become runtime arguments.
     public QwpSchemaBinding longColumn(CharSequence name, long value) {
         buffer.requireSchemaBinding(this);
         QwpTableBuffer.ColumnBuffer existing = existingColumn(name);

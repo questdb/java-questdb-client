@@ -82,7 +82,7 @@ public class QwpSchemaBindingDoubleArrayTest {
                 buffer.nextRow();
 
                 int size = encoder.encode(buffer);
-                QwpTestWireReader reader = tableHeader(encoder, size, 1, 1, -1, -1);
+                QwpTestWireReader reader = tableHeader(encoder, size, 1, 1);
                 columnDef(reader, "value");
                 Assert.assertEquals(0, reader.u8());
                 rawArray(reader, 1, new int[]{1}, new double[]{42.0});
@@ -153,7 +153,7 @@ public class QwpSchemaBindingDoubleArrayTest {
                 binding.doubleArray("v", new double[][]{{4.0}, {5.0}});
                 buffer.nextRow();
                 int size = encoder.encode(buffer);
-                QwpTestWireReader reader = tableHeader(encoder, size, 2, 1, -1, -1);
+                QwpTestWireReader reader = tableHeader(encoder, size, 2, 1);
                 columnDef(reader, "v");
                 Assert.assertEquals(0, reader.u8());
                 rawArray(reader, 2, new int[]{1, 2}, new double[]{1.0, 2.0});

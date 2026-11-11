@@ -673,8 +673,8 @@ Applied by the query pool to select and fail over between the nodes in the `addr
 
 The ingest side also accepts store-and-forward and reconnection tuning keys (`auto_flush_*`, `initial_connect_retry`,
 `reconnect_*`, `request_durable_ack`, `sf_*`, `max_frame_rejections`, `poison_min_escalation_window_millis`, …) and
-the schema-aware keys `schema_mode` (`auto`, `strict`, `off`) and `schema_wait_millis`; see
-[docs/schema-aware-ingestion.md](docs/schema-aware-ingestion.md).
+the schema-aware keys `schema_mode` (`auto`, `strict`, `off`, documented on `Sender.SchemaMode`) and
+`schema_wait_millis`.
 `sf_max_total_bytes` caps the unacknowledged data all pooled senders buffer together — 128 MiB of memory by default,
 10 GiB of disk with `sf_dir` — so a larger `sender_pool_max` adds connections, not buffer memory. The only overshoot
 is the minimum working set every live sender keeps: two segments (`2 × sf_max_segment_bytes`, 8 MiB by default).

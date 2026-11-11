@@ -142,42 +142,20 @@ final class QwpSchemaTestFixtures {
     }
 
     static void skipTablePrefix(QwpTestWireReader reader, int rows, int columns) {
-        skipTablePrefix(reader, rows, columns, 1, 1);
+        Assert.assertEquals("t", reader.string());
+        Assert.assertEquals(rows, reader.varint());
+        Assert.assertEquals(columns, reader.varint());
     }
 
     /** Asserts the message header and table prefix, leaving the reader at the first column. */
     static QwpTestWireReader tableHeader(QwpWebSocketEncoder encoder, int size, int rows, int columns) {
-        return tableHeader(encoder, size, rows, columns, 1, 1);
-    }
-
-    /** A negative {@code tableId} expects a schema-framed table block without a pinned identity. */
-    static QwpTestWireReader tableHeader(
-            QwpWebSocketEncoder encoder,
-            int size,
-            int rows,
-            int columns,
-            int tableId,
-            long metadataVersion
-    ) {
         QwpTestWireReader reader = new QwpTestWireReader(encoder.getBuffer().getBufferPtr(), size);
         Assert.assertEquals(QwpConstants.MAGIC_MESSAGE, reader.i32());
         Assert.assertEquals(QwpConstants.VERSION, reader.u8());
         Assert.assertEquals(QwpConstants.FLAG_GORILLA, reader.u8());
         Assert.assertEquals(1, reader.u16());
         Assert.assertEquals(size - QwpConstants.HEADER_SIZE, reader.i32());
-        skipTablePrefix(reader, rows, columns, tableId, metadataVersion);
+        skipTablePrefix(reader, rows, columns);
         return reader;
-    }
-
-    private static void skipTablePrefix(
-            QwpTestWireReader reader,
-            int rows,
-            int columns,
-            int tableId,
-            long metadataVersion
-    ) {
-        Assert.assertEquals("t", reader.string());
-        Assert.assertEquals(rows, reader.varint());
-        Assert.assertEquals(columns, reader.varint());
     }
 }

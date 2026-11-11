@@ -28,9 +28,26 @@ import io.questdb.client.cutlass.line.LineSenderException;
 /** A schema-bound row construction failure with a stable reason. */
 public class LineSenderSchemaException extends LineSenderException {
     public enum Reason {
+        /**
+         * The value cannot go into the target column: it does not parse, it is
+         * outside the column's range, or the column's type does not accept the
+         * setter's input type.
+         */
         INVALID_VALUE,
+        /**
+         * The sender could not obtain the table's schema: the lookup timed out,
+         * the connection dropped under it, or the server reported the schema as
+         * temporarily unavailable. A later attempt may succeed.
+         */
         SCHEMA_UNAVAILABLE,
+        /**
+         * The server denied this connection access to the table's schema.
+         */
         ACCESS_DENIED,
+        /**
+         * The client does not implement this conversion or target, or the
+         * server's schema is too large to return in a discovery response.
+         */
         UNSUPPORTED_FEATURE
     }
 

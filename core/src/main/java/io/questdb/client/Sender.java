@@ -839,11 +839,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * to finalize the row. You can then start a new row by calling this method again.
      * <br>
      * If you want to cancel the current row, you can call {@link #cancelRow()}.
-     * QWP WebSocket senders resolve the table's schema here when the server speaks schema-aware QWP. The call may
-     * therefore wait up to {@code schema_wait_millis} (with an asynchronous initial connect, that includes waiting for
-     * the first connection). So schema errors can surface here, before the row has any values. A failure leaves the table selected and no row started; calling this method again retries the
-     * resolution. {@link SchemaMode} decides what happens when the schema is not obtainable. Setters may resolve it
-     * again when an implicitly started row crosses a batch boundary.
+     * QWP WebSocket senders resolve the table's schema here when the server speaks schema-aware QWP, so the call can
+     * wait up to {@code schema_wait_millis}; under {@link SchemaMode#STRICT} with an asynchronous initial connect, the
+     * wait includes the first connection. Schema errors can therefore surface here, before the row has any values. A
+     * failure leaves the table selected and no row started, and calling this method again retries the resolution.
+     * {@link SchemaMode} decides what happens when the schema is not obtainable. When the table has no pending rows,
+     * for example after a flush, the first setter of the next row resolves the schema again.
      *
      * @param table name of the table
      * @return this instance for method chaining
@@ -953,17 +954,14 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      *       Under {@link InitialConnectMode#ASYNC} the first row also waits for
      *       the first upgrade, because the server's capability is unknown until
      *       then.</li>
-     *   <li>{@link #OFF} — every row uses the legacy conversion contract and
-     *       the sender never looks up schemas. It requests schema support only
-     *       when its stream must replay schema-encoded backlog recovered from
-     *       a store-and-forward directory. Legacy-only streams can fail over
-     *       to servers without schema support.</li>
+     *   <li>{@link #OFF} — every row uses the legacy conversion contract, and
+     *       the sender neither requests schema support nor looks up schemas.</li>
      * </ul>
      * <p>
-     * A batch keeps the contract under which its first row was written: rows
-     * added to a pending legacy batch stay legacy even after a schema becomes
-     * obtainable, and a pending schema batch is published before a legacy row
-     * starts a new batch. STRICT permits legacy rows only until a connection
+     * A table keeps one contract while it holds pending rows: later rows of the
+     * table use the contract of its first pending row, and the first row after
+     * a flush consults the schema again. Tables with different contracts can
+     * share a batch. STRICT permits legacy rows only until a connection
      * successfully negotiates schema support.
      */
     enum SchemaMode {
