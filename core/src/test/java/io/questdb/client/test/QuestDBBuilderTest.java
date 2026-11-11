@@ -229,18 +229,16 @@ public class QuestDBBuilderTest {
         // Sender -- yet it must still reject a malformed ingress key in the
         // single cluster config up front. Covers a typed enum (tls_verify), a
         // registry-STRING value that only the real Sender parse validates
-        // (auto_flush_rows), and WebSocket build-time checks: auto_flush=off disables
-        // auto-flush (unsupported on WebSocket), also when auto_flush_bytes is set, and
+        // (auto_flush_rows), and WebSocket build-time checks: auto_flush=off selects
+        // strict transactional mode, so it cannot combine with transaction=off, and
         // sf_durability=flush is not yet supported.
         assertBuildRejected(
                 "wss::addr=127.0.0.1:1;tls_verify=strict;sender_pool_min=0;query_pool_min=0;", "tls_verify");
         assertBuildRejected(
                 "ws::addr=127.0.0.1:1;auto_flush_rows=abc;sender_pool_min=0;query_pool_min=0;", "auto_flush_rows");
         assertBuildRejected(
-                "ws::addr=127.0.0.1:1;auto_flush=off;sender_pool_min=0;query_pool_min=0;", "auto-flush");
-        assertBuildRejected(
-                "ws::addr=127.0.0.1:1;auto_flush=off;auto_flush_bytes=65536;sender_pool_min=0;query_pool_min=0;",
-                "auto-flush");
+                "ws::addr=127.0.0.1:1;auto_flush=off;transaction=off;sender_pool_min=0;query_pool_min=0;",
+                "auto_flush=off selects strict transactional mode");
         assertBuildRejected(
                 "ws::addr=127.0.0.1:1;sf_durability=flush;sender_pool_min=0;query_pool_min=0;", "not yet supported");
     }

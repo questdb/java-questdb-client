@@ -781,6 +781,26 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     void reset();
 
     /**
+     * Discard the open transaction: the rows buffered since the last flush and, in
+     * WebSocket transactional mode ({@code transaction=on} or {@code strict}), the
+     * rows of the transaction that auto-flush already sent to the server, which
+     * the server discards on request. Blocks until the server confirms.
+     * <br>
+     * Discarding rows already sent needs a server that supports QWP rollback. When
+     * the server does not, this method throws and aborts the transaction: every
+     * later flush throws too, and closing the sender discards the rows, because the
+     * server rolls back uncommitted rows when the connection closes.
+     * <br>
+     * Only the WebSocket transport supports this method.
+     *
+     * @throws LineSenderException if the transport does not support rollback, or the
+     *                             server cannot discard rows already sent
+     */
+    default void rollback() {
+        throw new LineSenderException("rollback is only supported for WebSocket transport");
+    }
+
+    /**
      * Add a column with a 16-bit signed integer value.
      *
      * @param name  name of the column
@@ -1075,7 +1095,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private static final int DEFAULT_TCP_PORT = 9009;
         private static final int DEFAULT_UDP_PORT = 9007;
         private static final int DEFAULT_WEBSOCKET_PORT = 9000;
-        private static final int DEFAULT_WS_AUTO_FLUSH_BYTES = 0;
+        // Unset auto_flush_bytes on WebSocket sizes the byte trigger from what one
+        // frame can carry, so no batch outgrows a frame; see
+        // QwpWebSocketSender.AUTO_FLUSH_BYTES_AUTO.
+        private static final int DEFAULT_WS_AUTO_FLUSH_BYTES = QwpWebSocketSender.AUTO_FLUSH_BYTES_AUTO;
         private static final long DEFAULT_WS_AUTO_FLUSH_INTERVAL_NANOS = 100_000_000L; // 100ms
         private static final int DEFAULT_WS_AUTO_FLUSH_ROWS = 1_000;
         // Cadence at which the SF cursor I/O loop sends a keepalive PING
@@ -1234,7 +1257,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private long reconnectMaxDurationMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private int durableAckTiers = DurableAckTiers.NONE;
         private int retryTimeoutMillis = PARAMETER_NOT_SET_EXPLICITLY;
+        private boolean strictTransactional;
         private boolean transactional;
+        // True once transaction=... (or transactional()/strictTransactional())
+        // set the mode explicitly, so auto_flush=off can refuse to override an
+        // explicit transaction=off.
+        private boolean transactionModeSet;
         private String senderId = DEFAULT_SENDER_ID;
         // Per-append deadline for SF appendBlocking spin-then-throw. Used to
         // be a hardcoded 30s constant; expose so tight-SLA users can lower
@@ -1868,9 +1896,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * <p>
          * It is essential to ensure the maximum buffer capacity is sufficient to accommodate all locally buffered data.
          * <p>
-         * This method should only be used when communicating via the HTTP protocol. Calling this method is illegal when
-         * communicating over the TCP or WebSocket protocol. On WebSocket, {@code auto_flush_interval=off} turns off
-         * only the time-based trigger.
+         * This method can be used with the HTTP and WebSocket protocols; calling it is illegal when communicating over
+         * the TCP protocol. On WebSocket it selects strict transactional mode (see
+         * {@link #strictTransactional(boolean)}): rows still go to the server in frames sized for the connection, so a
+         * batch can be any size, but only {@code flush()} commits them, and closing without a flush discards them.
+         * There, {@code auto_flush_interval=off} alone turns off only the time-based trigger.
          *
          * @return this instance for method chaining
          * @see #autoFlushRows(int)
@@ -2758,11 +2788,42 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
+         * Enables strict transactional mode, the builder form of
+         * {@code transaction=strict}. Like {@link #transactional(boolean)}, auto-flush
+         * sends rows to the server without committing them and {@code flush()}
+         * commits, so a transaction can be any size. In addition the transaction
+         * never commits in parts: a row that would take a table past the server's
+         * {@code qwp.max.uncommitted.rows}, or a transaction that outgrows
+         * {@code sf_max_total_bytes}, throws
+         * {@link io.questdb.client.cutlass.qwp.client.TransactionTooLargeException}
+         * and leaves the transaction open, and {@code close()} without
+         * {@code flush()} discards the transaction instead of committing it.
+         * {@code auto_flush=off} selects the same mode. WebSocket transport only.
+         *
+         * @param enabled true to enable strict transactional mode; false leaves
+         *                {@link #transactional(boolean) transactional} mode as set
+         * @return this instance for method chaining
+         */
+        public LineSenderBuilder strictTransactional(boolean enabled) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("transactional is only supported for WebSocket transport");
+            }
+            this.strictTransactional = enabled;
+            if (enabled) {
+                this.transactional = true;
+            }
+            this.transactionModeSet = true;
+            return this;
+        }
+
+        /**
          * Enables transactional mode. Auto-flush sends data to the server
          * with {@code FLAG_DEFER_COMMIT}; only an explicit {@code flush()}
-         * triggers the server-side WAL commit. This allows accumulating
-         * datasets larger than the server's recv buffer while committing
-         * atomically per table.
+         * (or {@code close()}) triggers the server-side WAL commit. This allows
+         * accumulating datasets larger than the server's recv buffer while
+         * committing atomically per table. The server commits a table on its own
+         * once {@code qwp.max.uncommitted.rows} of its rows are uncommitted; use
+         * {@link #strictTransactional(boolean)} to fail instead.
          *
          * @param enabled true to enable transactional mode
          * @return this instance for method chaining
@@ -2772,6 +2833,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 throw new LineSenderException("transactional is only supported for WebSocket transport");
             }
             this.transactional = enabled;
+            if (!enabled) {
+                this.strictTransactional = false;
+            }
+            this.transactionModeSet = true;
             return this;
         }
 
@@ -3822,6 +3887,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             // dispatcher daemon, drainer pool, microbatch buffers and
             // WebSocketClient inside the abandoned `connected`.
             connected.setTransactional(transactional);
+            // auto_flush=off on WebSocket means "commit only when I flush()": a
+            // strict transaction of any size.
+            if (strictTransactional || autoFlushDisabled) {
+                connected.setStrictTransactional(true);
+            }
             try {
                 final String rebuildSfDir = sfDir;
                 final String rebuildSenderId = senderId;
@@ -4230,8 +4300,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         transactional(true);
                     } else if (Chars.equalsIgnoreCase("off", sink)) {
                         transactional(false);
+                    } else if (Chars.equalsIgnoreCase("strict", sink)) {
+                        strictTransactional(true);
                     } else {
-                        throw new LineSenderException("invalid transaction [value=").put(sink).put(", allowed-values=[on, off]]");
+                        throw new LineSenderException("invalid transaction [value=").put(sink).put(", allowed-values=[on, off, strict]]");
                     }
                 } else if (Chars.equals("sf_dir", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
@@ -4682,8 +4754,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         transactional(true);
                     } else if (s.equalsIgnoreCase("off")) {
                         transactional(false);
+                    } else if (s.equalsIgnoreCase("strict")) {
+                        strictTransactional(true);
                     } else {
-                        throw new LineSenderException("invalid transaction [value=").put(s).put(", allowed-values=[on, off]]");
+                        throw new LineSenderException("invalid transaction [value=").put(s).put(", allowed-values=[on, off, strict]]");
                     }
                 }
                 s = view.getStr("request_durable_ack");
@@ -4821,7 +4895,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             m.put("auto_flush_bytes", autoFlushBytes);
             m.put("auto_flush_interval", autoFlushIntervalMillis);
             m.put("max_name_len", maxNameLength);
-            m.put("transaction", transactional);
+            m.put("transaction", strictTransactional ? "strict" : transactional ? "on" : "off");
             m.put("request_durable_ack", DurableAckTiers.configValue(durableAckTiers));
             m.put("sender_id", senderId);
             m.put("sf_dir", sfDir);
@@ -5068,8 +5142,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 if (protocolVersion != PARAMETER_NOT_SET_EXPLICITLY) {
                     throw new LineSenderException("protocol version is not supported for WebSocket protocol");
                 }
-                if (autoFlushDisabled) {
-                    throw new LineSenderException("disabling auto-flush is not supported for WebSocket protocol");
+                if (autoFlushDisabled && transactionModeSet && !transactional) {
+                    // On WebSocket, auto_flush=off is strict transactional mode.
+                    throw new LineSenderException("auto_flush=off selects strict transactional mode on WebSocket "
+                            + "and cannot be combined with transaction=off");
                 }
                 if ((sfDurability == SfDurability.FLUSH || sfDurability == SfDurability.APPEND)) {
                     throw new LineSenderException(

@@ -37,6 +37,13 @@ public final class QwpConstants {
      */
     public static final String CLIENT_ID = "java/1.0.2";
     /**
+     * Default of the server's {@code qwp.max.uncommitted.rows}: the per-table
+     * count of rows a deferred-commit group may hold before the server commits
+     * them on its own. A strict transaction assumes this value when the server
+     * does not advertise {@code X-QWP-Max-Uncommitted-Rows}.
+     */
+    public static final long DEFAULT_SERVER_MAX_UNCOMMITTED_ROWS = 1_000_000L;
+    /**
      * Flag bit: defer WAL commit. The server appends rows to WAL writers
      * but skips the commit until a subsequent message without this flag.
      */
@@ -50,6 +57,12 @@ public final class QwpConstants {
      * Flag bit: Gorilla timestamp encoding enabled.
      */
     public static final byte FLAG_GORILLA = 0x04;
+    /**
+     * Flag bit: roll back the connection's open deferred-commit group. Only ever
+     * set on the rollback control frame (see {@link #ROLLBACK_FRAME_FLAGS}), which
+     * the client sends only after the server confirmed {@code X-QWP-Rollback}.
+     */
+    public static final byte FLAG_ROLLBACK = 0x20;
     /**
      * Flag bit: payload region after the prelude is zstd-compressed. Set only
      * when the handshake negotiated zstd compression. Mirror of the server-side
@@ -108,6 +121,13 @@ public final class QwpConstants {
      * constant; used by the decoder to reject malformed wire bytes.
      */
     public static final int MAX_TABLE_NAME_LENGTH = 127;
+    /**
+     * Flags byte of the rollback control frame: a bare 12-byte header with no
+     * table blocks and no payload. It carries {@link #FLAG_DEFER_COMMIT} too, so a
+     * server that does not know {@link #FLAG_ROLLBACK} treats it as an empty
+     * deferred frame instead of a commit.
+     */
+    public static final byte ROLLBACK_FRAME_FLAGS = FLAG_ROLLBACK | FLAG_DEFER_COMMIT;
     /**
      * Status byte on a {@code QUERY_ERROR} frame: the query was cancelled,
      * either by a client {@code CANCEL} frame or by explicit server-side

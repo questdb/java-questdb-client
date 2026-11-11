@@ -425,12 +425,15 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
-    public void testDisableAutoFlush_notSupportedForWebSocket() {
+    public void testDisableAutoFlush_rejectsTransactionOffForWebSocket() {
+        // On WebSocket, disabling auto-flush selects strict transactional mode,
+        // which an explicit transactional(false) contradicts.
         assertThrowsAny(
                 Sender.builder(Sender.Transport.WEBSOCKET)
                         .address(LOCALHOST)
-                        .disableAutoFlush(),
-                "not supported for WebSocket");
+                        .disableAutoFlush()
+                        .transactional(false),
+                "cannot be combined with transaction=off");
     }
 
     @Test

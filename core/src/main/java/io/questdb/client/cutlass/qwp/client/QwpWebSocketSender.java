@@ -72,6 +72,7 @@ import io.questdb.client.std.Numbers;
 import io.questdb.client.std.NumericException;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
+import io.questdb.client.std.Unsafe;
 import io.questdb.client.std.bytes.DirectByteSlice;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.TestOnly;
@@ -135,6 +136,15 @@ import java.util.function.Supplier;
  */
 public class QwpWebSocketSender implements Sender {
 
+    /**
+     * {@code autoFlushBytes} value that sizes the byte trigger from the frames the
+     * connection can carry: 90% of the smaller of the server's advertised
+     * {@code X-QWP-Max-Batch-Size} and the store-and-forward segment. It is the
+     * builder default, so a batch never grows past what one frame can hold. A pure
+     * manual-flush sender (non-transactional, row and interval triggers off) keeps
+     * no byte trigger, as before.
+     */
+    public static final int AUTO_FLUSH_BYTES_AUTO = -1;
     public static final long DEFAULT_AUTH_TIMEOUT_MS = 15_000L;
     // Soft per-batch byte budget. Trips a flush when raw column-buffer bytes
     // cross the threshold, well before the server's 16 MB wire cap. Wide-row
@@ -176,6 +186,17 @@ public class QwpWebSocketSender implements Sender {
     public static final int DEFAULT_SYMBOL_DICT_RESET_THRESHOLD_SYMBOLS = 100_000;
     private static final int DEFAULT_BUFFER_SIZE = 8192;
     private static final int DEFAULT_MICROBATCH_BUFFER_SIZE = 1024 * 1024; // 1MB
+    // How long rollback() waits for the server to acknowledge the rollback frame.
+    private static final long DEFAULT_ROLLBACK_ACK_TIMEOUT_MILLIS = 30_000L;
+    // Frames of at most the frame cap that a strict transaction keeps room for in
+    // the client buffer, so the commit that ends it can always be published.
+    private static final int STRICT_COMMIT_RESERVE_FRAMES = 3;
+    // Frame cap the byte trigger assumes when the server does not advertise
+    // X-QWP-Max-Batch-Size: the server's default 2 MiB recv buffer minus the
+    // worst-case WebSocket frame header, the same value such a server would have
+    // advertised. Sizes only the soft trigger, never the hard per-frame guard, so an
+    // older server with a larger buffer still accepts every frame it used to.
+    private static final int FALLBACK_SERVER_MAX_BATCH_SIZE = 2 * 1024 * 1024 - 14;
     private static final Logger LOG = LoggerFactory.getLogger(QwpWebSocketSender.class);
     private static final int MAX_TABLE_NAME_LENGTH = 127;
     // sf-client.md section 4.4 floor: drop-oldest under bursts needs a wide
@@ -678,6 +699,50 @@ public class QwpWebSocketSender implements Sender {
     // refresh this from the cursor I/O thread on a mid-stream reconnect while
     // sendRow reads it on the producer thread with no synchronization.
     private volatile int serverMaxBatchSize;
+    // Byte length of the symbol-dictionary entries the pending batch introduced:
+    // the rows reference these ids, so the batch's next frame must carry the
+    // entries too. Counted toward the byte trigger alongside pendingBytes. Reset
+    // with pendingBytes.
+    private long pendingSymbolDictBytes;
+    // Rollback-ack wait bound; see rollbackOpenTransaction.
+    private long rollbackAckTimeoutMillis = DEFAULT_ROLLBACK_ACK_TIMEOUT_MILLIS;
+    // Server's per-table cap on rows a deferred-commit group may hold before it
+    // commits them on its own (X-QWP-Max-Uncommitted-Rows), 0 when not advertised.
+    // Captured on each FOREGROUND handshake, like serverMaxBatchSize.
+    private volatile long serverMaxUncommittedRows;
+    // True when the current foreground connection confirmed X-QWP-Rollback, so the
+    // rollback control frame may go out. Captured on each FOREGROUND handshake.
+    private volatile boolean serverRollbackEnabled;
+    // Strict transactional mode (transaction=strict, or auto_flush=off on this
+    // transport): implies transactional, never lets an open transaction commit in
+    // parts, and close() discards instead of committing. See setStrictTransactional.
+    private boolean strictTransactional;
+    // Set once the open transaction can no longer be rolled back or committed as
+    // one: rollback()/reset() could not undo frames already sent because the
+    // server does not support rollback. Every later flush throws, and close()
+    // discards; only closing the sender ends this state.
+    private boolean txnAborted;
+    // Strict mode only: set when the client buffer cannot take another deferred
+    // frame of the open transaction and still commit it. Rejects further rows
+    // until flush() or rollback() ends the transaction.
+    private boolean txnBufferFull;
+    // Strict mode only: simulation of how the ring packs the open transaction's
+    // frames, mirroring MmapSegment's append rule. txnSimSegments counts the
+    // segments the transaction's frames occupy (0 = no frame yet) and
+    // txnSimRemaining is the raw space left in the last of them.
+    private long txnSimRemaining;
+    private int txnSimSegments;
+    // Tables with rows in deferred frames of the open transaction, so a commit
+    // or rollback resets only those tables' counters. Producer thread only.
+    private final ObjList<QwpTableBuffer> txnTables = new ObjList<>();
+    // Logs the reset()-cannot-roll-back warning once per sender.
+    private boolean isResetRollbackWarned;
+    // Strict mode only: payload bytes of the open transaction's frames on the
+    // ring, for the error message. Reset with the transaction.
+    private long txnBytes;
+    // Scratch for ensureStrictTransactionRoom: the frame sizes a flush will
+    // publish. Producer thread only.
+    private final IntList strictFrameSizes = new IntList();
 
     private QwpWebSocketSender(
             List<Endpoint> endpoints,
@@ -703,11 +768,12 @@ public class QwpWebSocketSender implements Sender {
         this.closed = false;
         this.autoFlushRows = autoFlushRows;
         this.autoFlushBytes = autoFlushBytes;
-        // Until the handshake completes, honor the configured budget verbatim.
-        // applyServerBatchSizeLimit() clamps this on connect once the server's
-        // X-QWP-Max-Batch-Size is known.
-        this.effectiveAutoFlushBytes = autoFlushBytes;
         this.autoFlushIntervalNanos = autoFlushIntervalNanos;
+        // Until the handshake completes, size the byte trigger without a server
+        // cap. applyServerBatchSizeLimit() re-sizes it on connect once the
+        // server's X-QWP-Max-Batch-Size is known, and setCursorEngine() once the
+        // segment size is.
+        recomputeFrameBudget();
         this.globalSymbolDictionary = new GlobalSymbolDictionary();
 
         int microbatchBufferSize = Math.max(DEFAULT_MICROBATCH_BUFFER_SIZE, autoFlushBytes * 2);
@@ -1795,29 +1861,51 @@ public class QwpWebSocketSender implements Sender {
                 //    sender to discard the batch, so honour that:
                 //    discard it, remember the error, and let the rest of
                 //    close() run. rethrowTerminal below still surfaces it.
-                try {
-                    flushPendingRows(deferCommit);
-                } catch (BatchTooLargeForCapException e) {
-                    resetTableBuffersAfterFlush();
-                    terminalError = captureCloseError(terminalError, e);
-                } catch (Throwable t) {
-                    // Same reasoning as the pre-flight rejection above, for the
-                    // failures a size check cannot see: sealAndSwapBuffer's
-                    // buffer-recycle timeout and appendBlocking's backpressure
-                    // deadline. Letting those escape to the outer catch skipped
-                    // sendCommitMessage, sealAndSwapBuffer and drainOnClose -- so a
-                    // flush that had already published deferred dictionary chunks
-                    // left their group open forever, and every row an EARLIER
-                    // successful flush published was abandoned unacked. The batch is
-                    // NOT discarded here (unlike the over-cap case, this failure is
-                    // not a verdict on the batch's contents), but the rest of close()
-                    // must still run. rethrowTerminal below surfaces it.
-                    terminalError = captureCloseError(terminalError, t);
+                if (strictTransactional || txnAborted) {
+                    // A strict transaction commits only on an explicit flush(), so
+                    // closing without one discards it, and an aborted one must never
+                    // commit. The pending rows never left the client. The frames of
+                    // the open transaction already sent stay uncommitted: a server
+                    // with rollback support discards them on the rollback frame, whose
+                    // ack the drain below waits for; any other server rolls them back
+                    // when the connection closes, and a recovered slot retires them
+                    // as an aborted transaction.
+                    discardPendingRows();
+                    if (hasDeferredMessages && serverRollbackEnabled && !txnAborted) {
+                        try {
+                            publishRollbackFrame();
+                            hasDeferredMessages = false;
+                            lastCommitBoundaryFsn = cursorEngine.publishedFsn();
+                            clearTransactionState();
+                        } catch (Throwable t) {
+                            terminalError = captureCloseError(terminalError, t);
+                        }
+                    }
+                } else {
+                    try {
+                        flushPendingRows(deferCommit);
+                    } catch (BatchTooLargeForCapException e) {
+                        resetTableBuffersAfterFlush();
+                        terminalError = captureCloseError(terminalError, e);
+                    } catch (Throwable t) {
+                        // Same reasoning as the pre-flight rejection above, for the
+                        // failures a size check cannot see: sealAndSwapBuffer's
+                        // buffer-recycle timeout and appendBlocking's backpressure
+                        // deadline. Letting those escape to the outer catch skipped
+                        // sendCommitMessage, sealAndSwapBuffer and drainOnClose -- so a
+                        // flush that had already published deferred dictionary chunks
+                        // left their group open forever, and every row an EARLIER
+                        // successful flush published was abandoned unacked. The batch is
+                        // NOT discarded here (unlike the over-cap case, this failure is
+                        // not a verdict on the batch's contents), but the rest of close()
+                        // must still run. rethrowTerminal below surfaces it.
+                        terminalError = captureCloseError(terminalError, t);
+                    }
+                    if (!deferCommit && hasDeferredMessages) {
+                        sendCommitMessage();
+                    }
                 }
-                if (!deferCommit && hasDeferredMessages) {
-                    sendCommitMessage();
-                }
-                if (activeBuffer != null && activeBuffer.hasData()) {
+                if (!strictTransactional && !txnAborted && activeBuffer != null && activeBuffer.hasData()) {
                     sealAndSwapBuffer();
                     if (!deferCommit) {
                         lastCommitBoundaryFsn = cursorEngine.publishedFsn();
@@ -2272,6 +2360,11 @@ public class QwpWebSocketSender implements Sender {
     public long flushAndGetSequence() {
         checkNotClosed();
         checkRecycleFailure();
+        if (txnAborted) {
+            // Committing now would commit the frames a failed rollback left on
+            // the server together with whatever came after them.
+            throw transactionAbortedError();
+        }
         if (cursorEngine != null) {
             cursorEngine.checkDurability();
         }
@@ -2618,7 +2711,16 @@ public class QwpWebSocketSender implements Sender {
      * @return the global symbol ID
      */
     public int getOrAddGlobalSymbol(CharSequence symbol) {
+        int sizeBefore = globalSymbolDictionary.size();
         int globalId = globalSymbolDictionary.getOrAddSymbol(symbol);
+        if (globalId >= sizeBefore) {
+            // A new entry: the batch's next frame carries it in the dictionary
+            // section ([len varint][utf8]), which the column bytes behind
+            // pendingBytes do not count. Without this a batch of new long symbols
+            // could pass the byte trigger and still outgrow the frame cap.
+            int len = NativeBufferWriter.utf8Length(symbol);
+            pendingSymbolDictBytes += NativeBufferWriter.varintSize(len) + len;
+        }
         if (globalId > currentBatchMaxSymbolId) {
             currentBatchMaxSymbolId = globalId;
         }
@@ -2685,6 +2787,37 @@ public class QwpWebSocketSender implements Sender {
     @TestOnly
     public int getServerMaxBatchSize() {
         return serverMaxBatchSize;
+    }
+
+    /**
+     * The server's per-table {@code qwp.max.uncommitted.rows} from the last
+     * foreground handshake ({@code X-QWP-Max-Uncommitted-Rows}), or 0 when the
+     * server did not advertise it.
+     */
+    public long getServerMaxUncommittedRows() {
+        return serverMaxUncommittedRows;
+    }
+
+    /**
+     * True when the server of the last foreground handshake confirmed QWP
+     * rollback support, so {@link #rollback()} can discard frames already sent.
+     */
+    public boolean isServerRollbackEnabled() {
+        return serverRollbackEnabled;
+    }
+
+    /**
+     * True in strict transactional mode; see {@link #setStrictTransactional(boolean)}.
+     */
+    public boolean isStrictTransactional() {
+        return strictTransactional;
+    }
+
+    /**
+     * True in transactional mode (strict or not); see {@link #setTransactional(boolean)}.
+     */
+    public boolean isTransactional() {
+        return transactional;
     }
 
     /** Resolved value of {@code symbol_dict_reset_max_wait_millis}. */
@@ -3250,9 +3383,91 @@ public class QwpWebSocketSender implements Sender {
         this.closeStartedHook = hook;
     }
 
+    /**
+     * Discards the rows buffered since the last flush, like before. In
+     * transactional mode it also discards the open transaction's frames already
+     * sent, when the server supports QWP rollback (see {@link #rollback()}).
+     * Without that support a strict transaction is aborted -- the next flush
+     * throws and only closing the sender ends it -- while a non-strict one keeps
+     * the frames already sent, and the next flush commits them, as before.
+     */
     @Override
     public void reset() {
         checkNotClosed();
+        discardPendingRows();
+        if (transactional && hasDeferredMessages && !txnAborted) {
+            if (serverRollbackEnabled) {
+                rollbackOpenTransaction();
+            } else if (strictTransactional) {
+                txnAborted = true;
+            } else if (!isResetRollbackWarned) {
+                isResetRollbackWarned = true;
+                LOG.warn("reset() discarded the rows not yet sent, but the server does not support QWP "
+                        + "rollback, so the open transaction's rows already sent stay on the server and the "
+                        + "next flush() commits them. Close the sender to discard them instead");
+            }
+        }
+    }
+
+    /**
+     * Discards the open transaction: the rows buffered since the last flush,
+     * and the transaction's frames already sent, which the server rolls back on
+     * the rollback control frame. Blocks until the server acknowledges the
+     * rollback. Without an open transaction this only discards the buffered
+     * rows.
+     *
+     * @throws LineSenderException when frames of the open transaction were already
+     *                             sent and the server does not support QWP rollback
+     *                             (the transaction is then aborted: the next flush
+     *                             throws, and only closing the sender ends it), or
+     *                             when the server does not acknowledge the rollback
+     *                             in time
+     */
+    @Override
+    public void rollback() {
+        checkNotClosed();
+        checkRecycleFailure();
+        discardPendingRows();
+        if (txnAborted) {
+            throw transactionAbortedError();
+        }
+        if (!hasDeferredMessages) {
+            clearTransactionState();
+            return;
+        }
+        if (!serverRollbackEnabled) {
+            txnAborted = true;
+            throw transactionAbortedError();
+        }
+        rollbackOpenTransaction();
+    }
+
+    /**
+     * Pool hook for a strict-mode lease being returned: discards what the
+     * borrower left uncommitted, so the next borrower starts with no open
+     * transaction. Returns {@code false} when frames already sent could not be
+     * rolled back -- the server does not support QWP rollback, or the transaction
+     * was already aborted -- and the pool must retire the connection instead; the
+     * server rolls those frames back when the connection closes.
+     */
+    public boolean discardTransactionForReuse() {
+        checkNotClosed();
+        discardPendingRows();
+        if (txnAborted) {
+            return false;
+        }
+        if (!hasDeferredMessages) {
+            clearTransactionState();
+            return true;
+        }
+        if (!serverRollbackEnabled) {
+            return false;
+        }
+        rollbackOpenTransaction();
+        return true;
+    }
+
+    private void discardPendingRows() {
         // Reset ALL table buffers, not just the current one
         ObjList<CharSequence> keys = tableBuffers.keys();
         for (int i = 0, n = keys.size(); i < n; i++) {
@@ -3273,6 +3488,7 @@ public class QwpWebSocketSender implements Sender {
         currentBatchMaxSymbolId = -1;
         reclaimUnsentSymbolIds();
         pendingBytes = 0;
+        pendingSymbolDictBytes = 0;
         pendingRowCount = 0;
         firstPendingRowTimeNanos = 0;
         currentTableBuffer = null;
@@ -3280,6 +3496,58 @@ public class QwpWebSocketSender implements Sender {
         currentTableName = null;
         cachedTimestampColumn = null;
         cachedTimestampNanosColumn = null;
+    }
+
+    /**
+     * Publishes the rollback control frame behind the open transaction's
+     * frames: a bare header the server answers by rolling back every row this
+     * connection holds uncommitted. Sent only to a server that confirmed
+     * X-QWP-Rollback.
+     */
+    private void publishRollbackFrame() {
+        int messageSize = encoder.encodeRollbackMessage();
+        QwpBufferWriter buffer = encoder.getBuffer();
+        ensureActiveBufferReady();
+        activeBuffer.ensureCapacity(messageSize);
+        activeBuffer.write(buffer.getBufferPtr(), messageSize);
+        activeBuffer.incrementRowCount();
+        sealAndSwapBuffer();
+    }
+
+    /**
+     * Rolls back the open transaction on the server and waits for the ack.
+     * <p>
+     * The wait is what makes the rollback safe across reconnects. Until the
+     * server acknowledges the rollback frame, a reconnect replays the
+     * transaction's frames together with it, and a server reached by failover
+     * that does not support rollback would keep those frames for the next
+     * commit. Once acknowledged, the frames are trimmed and can never be
+     * replayed. A rollback that is not acknowledged in time aborts the
+     * transaction (see {@link #txnAborted}).
+     */
+    private void rollbackOpenTransaction() {
+        long previousBoundaryFsn = lastCommitBoundaryFsn;
+        publishRollbackFrame();
+        long rollbackFsn = cursorEngine.publishedFsn();
+        hasDeferredMessages = false;
+        // The rollback frame gets an OK ack covering the transaction's frames, so
+        // close-time drains may wait for it like for a commit.
+        lastCommitBoundaryFsn = rollbackFsn;
+        clearTransactionState();
+        boolean isAcked = false;
+        try {
+            isAcked = awaitAckedFsn(fsnEpochBase + rollbackFsn, rollbackAckTimeoutMillis);
+        } finally {
+            if (!isAcked) {
+                txnAborted = true;
+                lastCommitBoundaryFsn = previousBoundaryFsn;
+            }
+        }
+        if (!isAcked) {
+            throw new LineSenderException("rollback not acknowledged by the server [timeoutMillis=")
+                    .put(rollbackAckTimeoutMillis)
+                    .put("]; the transaction is aborted: close the sender to discard it");
+        }
     }
 
     /**
@@ -3400,6 +3668,8 @@ public class QwpWebSocketSender implements Sender {
             engine.adoptCounters(counters);
             engine.setSlotLockReleaseListener(this::onSlotLockReleased);
         }
+        // The segment size bounds every frame; re-size the byte trigger for it.
+        recomputeFrameBudget();
     }
 
     /**
@@ -3549,8 +3819,40 @@ public class QwpWebSocketSender implements Sender {
         this.recycleDeferredCloseMaxWaitMillis = millis;
     }
 
+    @TestOnly
+    public void setRollbackAckTimeoutMillisForTesting(long millis) {
+        this.rollbackAckTimeoutMillis = millis;
+    }
+
+    /**
+     * Strict transactional mode: auto-flush ships rows as FLAG_DEFER_COMMIT frames
+     * like {@link #setTransactional(boolean) transactional} mode, only an explicit
+     * flush commits, and the open transaction never commits in parts. A row that
+     * would push a table past the server's {@code qwp.max.uncommitted.rows}, or a
+     * frame the client buffer could not hold alongside the commit, throws
+     * {@link TransactionTooLargeException} instead. {@link #close()} discards an
+     * uncommitted transaction rather than committing it. Enabling it enables
+     * transactional mode; disabling it leaves transactional mode on.
+     */
+    public void setStrictTransactional(boolean strict) {
+        this.strictTransactional = strict;
+        if (strict) {
+            this.transactional = true;
+        }
+        recomputeFrameBudget();
+    }
+
+    /**
+     * Transactional mode: auto-flush ships rows as FLAG_DEFER_COMMIT frames and
+     * only an explicit flush (or close) commits. Disabling it also disables
+     * {@link #setStrictTransactional(boolean) strict} mode.
+     */
     public void setTransactional(boolean transactional) {
         this.transactional = transactional;
+        if (!transactional) {
+            this.strictTransactional = false;
+        }
+        recomputeFrameBudget();
     }
 
     /**
@@ -3886,44 +4188,30 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Clamps the soft-flush byte budget to fit under the server's advertised
-     * X-QWP-Max-Batch-Size minus a safety margin for encoding overhead
-     * (schema, dict deltas, framing). A 0 advertisement means the server did
-     * not send the header (older build) and the configured budget is kept
-     * verbatim. Called on every successful connect because a rolling upgrade
-     * can leave neighbouring endpoints with different caps.
+     * Records the server's advertised X-QWP-Max-Batch-Size and re-sizes the
+     * byte trigger from it. A 0 advertisement means the server did not send
+     * the header (older build). Called on every successful connect because a
+     * rolling upgrade can leave neighbouring endpoints with different caps.
      * <p>
-     * Always updates {@link #serverMaxBatchSize} so the single-row hard guard
-     * in {@link #sendRow} fires against the freshly advertised value. The
-     * byte trigger, however, is only adjusted when the user left it enabled:
-     * an explicit {@code auto_flush_bytes=off} (autoFlushBytes == 0) is
-     * preserved even when the server advertises a cap, so applications that
-     * opted out keep the contract they asked for.
+     * Always updates {@link #serverMaxBatchSize}, so the single-row guard in
+     * {@link #sendRow} fires against the freshly advertised value. See
+     * {@link #recomputeFrameBudget()} for the byte trigger.
      */
     @TestOnly
     public void applyServerBatchSizeLimit(int advertisedMaxBatchSize) {
         serverMaxBatchSize = advertisedMaxBatchSize;
-        if (autoFlushBytes <= 0) {
-            // User opted out of byte-based auto-flush; respect that even when
-            // the server advertises a cap. The single-row guard still protects
-            // against oversize individual rows via serverMaxBatchSize.
-            effectiveAutoFlushBytes = 0;
-            return;
-        }
-        if (advertisedMaxBatchSize <= 0) {
-            effectiveAutoFlushBytes = autoFlushBytes;
-            return;
-        }
-        // Cap at 90% of the server's hard limit. Raw column-buffer bytes are
-        // a conservative proxy for wire size (compression usually shrinks the
-        // payload), but schema and dict-delta overhead can push the wire size
-        // above the raw total in pathological cases.
-        long safeBudget = (long) advertisedMaxBatchSize * 9 / 10;
-        if (autoFlushBytes < safeBudget) {
-            effectiveAutoFlushBytes = autoFlushBytes;
-        } else {
-            effectiveAutoFlushBytes = (int) safeBudget;
-        }
+        recomputeFrameBudget();
+    }
+
+    /**
+     * Records the transaction limits the server advertised on the last
+     * foreground handshake: its per-table {@code qwp.max.uncommitted.rows}
+     * ({@code 0} when not advertised) and whether it confirmed rollback support.
+     */
+    @TestOnly
+    public void applyServerTransactionLimits(long maxUncommittedRows, boolean rollbackEnabled) {
+        serverMaxUncommittedRows = maxUncommittedRows;
+        serverRollbackEnabled = rollbackEnabled;
     }
 
     private void atMicros(long timestampMicros) {
@@ -4256,6 +4544,9 @@ public class QwpWebSocketSender implements Sender {
                 newClient.setQwpMaxVersion(QwpConstants.VERSION);
                 newClient.setQwpClientId(QwpConstants.CLIENT_ID);
                 newClient.setQwpDurableAckTiers(durableAckTiers);
+                // Ask every server whether it accepts the rollback control frame;
+                // only one that confirms ever receives it.
+                newClient.setQwpRequestRollback(true);
                 newClient.setConnectTimeout(effectiveConnectTimeoutMs(background, connectTimeoutMs));
                 if (cancellation != null) {
                     // Publish the client we are about to block on so a
@@ -4460,6 +4751,8 @@ public class QwpWebSocketSender implements Sender {
                 // endpoint's cap; an oversize row then escapes the producer-side
                 // guard and trips a wire-level ws-close[1009] downstream.
                 applyServerBatchSizeLimit(newClient.getServerMaxBatchSize());
+                applyServerTransactionLimits(
+                        newClient.getServerMaxUncommittedRows(), newClient.isServerRollbackEnabled());
                 return newClient;
             } catch (Error e) {
                 closeQuietlyOnError(newClient);
@@ -5202,6 +5495,7 @@ public class QwpWebSocketSender implements Sender {
         if (tableCount == 0) {
             clearPendingTables();
             pendingBytes = 0;
+            pendingSymbolDictBytes = 0;
             currentTableBufferSnapshotBytes = currentTableBuffer == null
                     ? 0 : currentTableBuffer.getBufferedBytes();
             pendingRowCount = 0;
@@ -5232,6 +5526,13 @@ public class QwpWebSocketSender implements Sender {
         int deltaBaseline = symbolDeltaBaseline();
         int combinedBodyStart = encodeCombinedFrame(tableCount, deferCommit, deltaBaseline);
         int messageSize = encoder.finishMessage();
+
+        // A strict transaction must be able to commit as one: refuse, before any
+        // frame of this flush reaches the ring, a flush the client buffer could not
+        // hold together with the commit that has to follow it.
+        if (strictTransactional && cursorEngine != null) {
+            ensureStrictTransactionRoom(cap, deltaBaseline, messageSize, deferCommit);
+        }
 
         // Full-dict over-cap fallback. A full-dictionary frame carries the whole
         // dictionary from id 0, so its fixed overhead grows with lifetime symbol
@@ -5302,6 +5603,7 @@ public class QwpWebSocketSender implements Sender {
             if (!deferCommit) {
                 lastCommitBoundaryFsn = cursorEngine.publishedFsn();
             }
+            accountTransactionRows(deferCommit);
 
             resetTableBuffersAfterFlush();
         } catch (Throwable t) {
@@ -5531,6 +5833,7 @@ public class QwpWebSocketSender implements Sender {
             // committed the whole group.
             lastCommitBoundaryFsn = cursorEngine.publishedFsn();
         }
+        accountTransactionRows(deferCommit);
         resetTableBuffersAfterFlush();
     }
 
@@ -5554,6 +5857,7 @@ public class QwpWebSocketSender implements Sender {
         flushTableBuffers.setPos(0);
         currentBatchMaxSymbolId = -1;
         pendingBytes = 0;
+        pendingSymbolDictBytes = 0;
         currentTableBufferSnapshotBytes = 0;
         pendingRowCount = 0;
         firstPendingRowTimeNanos = 0;
@@ -6461,6 +6765,7 @@ public class QwpWebSocketSender implements Sender {
         sealAndSwapBuffer();
         hasDeferredMessages = false;
         lastCommitBoundaryFsn = cursorEngine.publishedFsn();
+        clearTransactionState();
     }
 
     private SenderErrorHandler userErrorHandler() {
@@ -7110,7 +7415,17 @@ public class QwpWebSocketSender implements Sender {
         // (durable mmap append, returns once published).
         try {
             toSend.markSending();
+            // Strict mode tracks how the open transaction's frames pack into
+            // segments; the first frame's placement depends on the active
+            // segment's room before the append.
+            boolean isTxnFrame = strictTransactional
+                    && isTransactionFrame(toSend.getBufferPtr(), toSend.getBufferPos());
+            long activeRemaining = isTxnFrame && txnSimSegments == 0
+                    ? cursorEngine.activeSegment().capacityRemaining() : 0;
             cursorEngine.appendBlocking(toSend.getBufferPtr(), toSend.getBufferPos());
+            if (isTxnFrame) {
+                recordTransactionFrame(toSend.getBufferPos(), activeRemaining);
+            }
             toSend.markRecycled();
         } catch (Throwable t) {
             // appendBlocking failed synchronously on the user thread — the
@@ -7136,12 +7451,257 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Adds the rows a just-published FLAG_DEFER_COMMIT flush shipped to each
+     * flushed table's open-transaction count, or forgets the open transaction
+     * when the flush committed it.
+     */
+    private void accountTransactionRows(boolean deferred) {
+        if (!deferred) {
+            clearTransactionState();
+            return;
+        }
+        for (int i = 0, n = flushTableBuffers.size(); i < n; i++) {
+            QwpTableBuffer table = flushTableBuffers.getQuick(i);
+            long sentRows = table.getTxnSentRows();
+            if (sentRows == 0) {
+                txnTables.add(table);
+            }
+            table.setTxnSentRows(sentRows + table.getRowCount());
+        }
+    }
+
+    private void checkTransactionAcceptsRow() {
+        if (txnAborted) {
+            throw transactionAbortedError();
+        }
+        if (!strictTransactional) {
+            return;
+        }
+        if (txnBufferFull) {
+            throw new TransactionTooLargeException("transaction too large for the client buffer")
+                    .put(" [transactionBytes=").put(txnBytes)
+                    .put("]; the buffer cannot hold another frame of the open transaction and still "
+                            + "commit it, so the row was not added. Commit the transaction with flush() or "
+                            + "discard it with rollback() before adding rows");
+        }
+        long maxRows = serverMaxUncommittedRows;
+        if (maxRows <= 0) {
+            maxRows = QwpConstants.DEFAULT_SERVER_MAX_UNCOMMITTED_ROWS;
+        }
+        // The server commits a table on its own once its uncommitted rows reach
+        // maxRows, so a strict transaction holds at most maxRows - 1 rows per table.
+        long rows = currentTableBuffer.getTxnSentRows() + currentTableBuffer.getRowCount() + 1;
+        if (rows >= maxRows) {
+            throw new TransactionTooLargeException("transaction too large for the server")
+                    .put(" [table=").put(currentTableName)
+                    .put(", rows=").put(rows)
+                    .put(", maxUncommittedRows=").put(maxRows)
+                    .put("]; the server commits a table's rows on its own once qwp.max.uncommitted.rows "
+                            + "of them are uncommitted, which would split the transaction, so the row was "
+                            + "not added. Commit the transaction with flush() or discard it with rollback(), "
+                            + "then send smaller transactions or raise qwp.max.uncommitted.rows on the server");
+        }
+    }
+
+    /**
+     * Forgets the open transaction: its tables' row counts, the client-buffer
+     * simulation and the buffer-full latch. Called when a frame commits it or
+     * the rollback frame discards it; O(tables in the transaction).
+     */
+    private void clearTransactionState() {
+        for (int i = 0, n = txnTables.size(); i < n; i++) {
+            txnTables.getQuick(i).setTxnSentRows(0);
+        }
+        txnTables.setPos(0);
+        txnBufferFull = false;
+        txnBytes = 0;
+        txnSimSegments = 0;
+        txnSimRemaining = 0;
+    }
+
+    /**
+     * Strict mode: refuses a flush whose frames, together with the open
+     * transaction's frames already on the ring and (for a deferred flush) room
+     * for the commit that must follow, would not fit the ring under
+     * {@code sf_max_total_bytes}. The server acks none of a transaction's frames
+     * before its commit, so the ring cannot trim them; a transaction that does
+     * not fit would block its own commit.
+     * <p>
+     * Mirrors how the ring packs frames: frames never span segments, and a frame
+     * that does not fit the current segment opens the next one. The flush's
+     * frame sizes are derived the way flushPendingRows and the split publish
+     * them; dictionary chunks of the full-dictionary fallback count as full
+     * frames. Runs before anything of the flush is published, so a refusal
+     * leaves the batch pending and the ring untouched.
+     */
+    private void ensureStrictTransactionRoom(int cap, int deltaBaseline, int messageSize, boolean deferCommit) {
+        CursorSendEngine engine = cursorEngine;
+        long segmentPayload = segmentPayloadCapacity();
+        strictFrameSizes.clear();
+        if (cap <= 0 || messageSize <= cap) {
+            strictFrameSizes.add(messageSize);
+        } else {
+            int baseline = deltaBaseline;
+            if (!deltaDictEnabled && currentBatchMaxSymbolId > deltaBaseline
+                    && !splitFramesFit(cap, deltaBaseline)
+                    && splitFramesFit(cap, currentBatchMaxSymbolId)) {
+                // The full-dictionary fallback ships the section as chunks of at
+                // most cap bytes ahead of the table frames.
+                long dictBytes = encoder.getSplitMessageSize(0, deltaBaseline, currentBatchMaxSymbolId)
+                        - QwpConstants.HEADER_SIZE;
+                long chunkPayload = Math.max(1, cap - QwpConstants.HEADER_SIZE - 16);
+                for (long chunks = dictBytes / chunkPayload + 1; chunks > 0; chunks--) {
+                    strictFrameSizes.add(cap);
+                }
+                baseline = currentBatchMaxSymbolId;
+            }
+            for (int i = 0, n = splitFrameBodyBytes.size(); i < n; i++) {
+                strictFrameSizes.add(encoder.getSplitMessageSize(
+                        splitFrameBodyBytes.getQuick(i), baseline, currentBatchMaxSymbolId));
+                if (deltaDictEnabled && currentBatchMaxSymbolId > baseline) {
+                    baseline = currentBatchMaxSymbolId;
+                }
+            }
+        }
+        int segments = txnSimSegments;
+        long remaining = segments == 0 ? engine.activeSegment().capacityRemaining() : txnSimRemaining;
+        long bytes = txnBytes;
+        for (int i = 0, n = strictFrameSizes.size(); i < n; i++) {
+            long size = strictFrameSizes.getQuick(i);
+            bytes += size;
+            if (segments == 0 || size > remaining) {
+                if (segments > 0 || size > remaining) {
+                    remaining = segmentPayload;
+                }
+                segments++;
+            }
+            remaining = Math.max(0, remaining - size - MmapSegment.FRAME_HEADER_SIZE);
+        }
+        if (deferCommit) {
+            // Keep room for the commit: the rows pending when this transaction
+            // ends are at most a frame's worth plus one row, which a split
+            // ships as a few frames of at most cap bytes.
+            long reserve = cap > 0 ? Math.min(cap, segmentPayload) : segmentPayload;
+            for (int i = 0; i < STRICT_COMMIT_RESERVE_FRAMES; i++) {
+                if (reserve > remaining) {
+                    remaining = segmentPayload;
+                    segments++;
+                }
+                remaining = Math.max(0, remaining - reserve - MmapSegment.FRAME_HEADER_SIZE);
+            }
+        }
+        long ringCapacity = engine.ringCapacityBytes();
+        long maxSegments = Math.max(2, ringCapacity / engine.segmentSizeBytes());
+        if (segments > maxSegments) {
+            if (deferCommit) {
+                txnBufferFull = true;
+            }
+            throw new TransactionTooLargeException("transaction too large for the client buffer")
+                    .put(" [transactionBytes=").put(bytes)
+                    .put(", ringCapacityBytes=").put(ringCapacity)
+                    .put(", segmentBytes=").put(engine.segmentSizeBytes())
+                    .put("]; the client holds an uncommitted transaction until the server commits it, so "
+                            + "the transaction must fit sf_max_total_bytes. This flush was not sent: commit "
+                            + "the transaction with flush() or discard it with rollback(), then send smaller "
+                            + "transactions, raise sf_max_total_bytes, or set sf_dir to keep it on disk");
+        }
+    }
+
+    /**
+     * True for a QWP frame that joins the open transaction: FLAG_DEFER_COMMIT
+     * set, and not the rollback control frame (which also carries the flag).
+     */
+    private static boolean isTransactionFrame(long payloadAddr, int payloadLen) {
+        if (payloadLen < QwpConstants.HEADER_SIZE
+                || Unsafe.getUnsafe().getInt(payloadAddr) != QwpConstants.MAGIC_MESSAGE) {
+            return false;
+        }
+        byte flags = Unsafe.getUnsafe().getByte(payloadAddr + QwpConstants.HEADER_OFFSET_FLAGS);
+        return (flags & QwpConstants.FLAG_DEFER_COMMIT) != 0 && (flags & QwpConstants.FLAG_ROLLBACK) == 0;
+    }
+
+    /**
+     * Re-sizes the byte trigger {@link #effectiveAutoFlushBytes} from the frame
+     * size the connection can carry: the smaller of the advertised
+     * X-QWP-Max-Batch-Size and the payload a store-and-forward segment can hold.
+     * <ul>
+     *   <li>A positive {@code autoFlushBytes} is kept below 90% of that frame size;
+     *   the 10% margin absorbs schema, dictionary and framing bytes that column
+     *   bytes do not count. With nothing advertised only the segment bounds it,
+     *   as an older server's limit is unknown.</li>
+     *   <li>{@code autoFlushBytes == 0} (auto_flush_bytes=off) keeps the byte
+     *   trigger off.</li>
+     *   <li>{@link #AUTO_FLUSH_BYTES_AUTO} sets the trigger to 90% of the frame
+     *   size, assuming the server's default cap when nothing is advertised, so
+     *   that a batch never grows past what one frame can carry. A pure
+     *   manual-flush sender (not transactional, row and interval triggers off)
+     *   keeps no byte trigger, so its flush stays one commit as before.</li>
+     * </ul>
+     */
+    private void recomputeFrameBudget() {
+        long segmentPayload = segmentPayloadCapacity();
+        int advertised = serverMaxBatchSize;
+        long frameSize = Math.min(advertised > 0 ? advertised : FALLBACK_SERVER_MAX_BATCH_SIZE, segmentPayload);
+        long budget = frameSize * 9 / 10;
+        if (autoFlushBytes > 0) {
+            long limit = advertised > 0 ? budget
+                    : (segmentPayload == Long.MAX_VALUE ? Long.MAX_VALUE : segmentPayload * 9 / 10);
+            effectiveAutoFlushBytes = (int) Math.min(autoFlushBytes, limit);
+        } else if (autoFlushBytes == AUTO_FLUSH_BYTES_AUTO
+                && (transactional || autoFlushRows > 0 || autoFlushIntervalNanos > 0)) {
+            effectiveAutoFlushBytes = (int) budget;
+        } else {
+            effectiveAutoFlushBytes = 0;
+        }
+    }
+
+    /**
+     * Strict mode: advances the client-buffer simulation by one open-transaction
+     * frame that just reached the ring. {@code activeRemaining} is the active
+     * segment's room before the append, needed for the transaction's first frame.
+     */
+    private void recordTransactionFrame(int payloadLen, long activeRemaining) {
+        txnBytes += payloadLen;
+        if (txnSimSegments == 0) {
+            txnSimRemaining = payloadLen > activeRemaining ? segmentPayloadCapacity() : activeRemaining;
+            txnSimSegments = 1;
+        } else if (payloadLen > txnSimRemaining) {
+            txnSimRemaining = segmentPayloadCapacity();
+            txnSimSegments++;
+        }
+        txnSimRemaining = Math.max(0, txnSimRemaining - payloadLen - MmapSegment.FRAME_HEADER_SIZE);
+    }
+
+    /**
+     * Largest frame payload a store-and-forward segment can hold, or
+     * {@link Long#MAX_VALUE} before an engine is attached.
+     */
+    private long segmentPayloadCapacity() {
+        CursorSendEngine engine = cursorEngine;
+        return engine == null
+                ? Long.MAX_VALUE
+                : engine.segmentSizeBytes() - MmapSegment.HEADER_SIZE - MmapSegment.FRAME_HEADER_SIZE;
+    }
+
+    private LineSenderException transactionAbortedError() {
+        return new LineSenderException("transaction aborted: rollback could not undo the frames of the "
+                + "open transaction already sent, because the server does not support QWP rollback. Close "
+                + "the sender to discard them; the server rolls them back when the connection closes");
+    }
+
+    /**
      * Accumulates the current row.
      * Rows buffer until flush (explicit or auto-flush).
      */
     private void sendRow() {
         checkRecycleFailure();
         ensureConnected();
+        if (transactional) {
+            // Before nextRow(): a refusal leaves the row uncommitted, so the
+            // at()/atNow() error path discards it and the transaction keeps the
+            // rows accepted before it.
+            checkTransactionAcceptsRow();
+        }
 
         // Hard guard: a single row whose bytes exceed the server's wire cap
         // would flush as an oversize WS frame the server closes with
@@ -7193,7 +7753,7 @@ public class QwpWebSocketSender implements Sender {
         if (autoFlushRows > 0 && pendingRowCount >= autoFlushRows) {
             return true;
         }
-        if (effectiveAutoFlushBytes > 0 && getPendingBytes() >= effectiveAutoFlushBytes) {
+        if (effectiveAutoFlushBytes > 0 && pendingBytes + pendingSymbolDictBytes >= effectiveAutoFlushBytes) {
             return true;
         }
         // pendingRowCount == 1: sendRow() just timestamped this very row, so its

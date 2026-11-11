@@ -28,6 +28,7 @@ import io.questdb.client.ConnectionHealth;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.Decimal256;
 import io.questdb.client.std.Decimal64;
@@ -167,8 +168,18 @@ public final class PooledSender implements Sender {
             // above. A stale duplicate throws here, and the finally routes it
             // to discardBroken, which drops it on the same stale-generation
             // check under the pool lock.
-            slot.live(generation).flush();
-            flushed = true;
+            Sender live = slot.live(generation);
+            if (live instanceof QwpWebSocketSender && ((QwpWebSocketSender) live).isStrictTransactional()) {
+                // A strict transaction commits only on an explicit flush(), so
+                // returning the lease discards whatever the borrower left open.
+                // The next borrower must not inherit it, so a transaction the
+                // server cannot roll back retires the connection instead (the
+                // server rolls it back when the connection closes).
+                flushed = ((QwpWebSocketSender) live).discardTransactionForReuse();
+            } else {
+                live.flush();
+                flushed = true;
+            }
         } finally {
             if (flushed) {
                 slot.pool().giveBack(this);
@@ -339,6 +350,11 @@ public final class PooledSender implements Sender {
     @Override
     public void reset() {
         slot.live(generation).reset();
+    }
+
+    @Override
+    public void rollback() {
+        slot.live(generation).rollback();
     }
 
     @Override

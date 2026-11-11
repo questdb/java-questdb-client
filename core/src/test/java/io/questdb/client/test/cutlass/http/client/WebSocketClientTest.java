@@ -190,6 +190,32 @@ public class WebSocketClientTest {
     }
 
     @Test
+    public void testExtractMaxUncommittedRowsAbsentHeaderReturnsZero() throws Exception {
+        String response = "HTTP/1.1 101 Switching Protocols\r\n"
+                + "X-QWP-Version: 1\r\n"
+                + "X-QWP-Max-Batch-Size: 16777216\r\n"
+                + "\r\n";
+        Assert.assertEquals(0, invokeExtractMaxUncommittedRows(response));
+    }
+
+    @Test
+    public void testExtractMaxUncommittedRowsMalformedOrNegativeReturnsZero() throws Exception {
+        // 0 means "not advertised": a strict transaction then assumes the default.
+        Assert.assertEquals(0, invokeExtractMaxUncommittedRows("HTTP/1.1 101 Switching Protocols\r\n"
+                + "X-QWP-Max-Uncommitted-Rows: lots\r\n\r\n"));
+        Assert.assertEquals(0, invokeExtractMaxUncommittedRows("HTTP/1.1 101 Switching Protocols\r\n"
+                + "X-QWP-Max-Uncommitted-Rows: -5\r\n\r\n"));
+    }
+
+    @Test
+    public void testExtractMaxUncommittedRowsParsesBeyondIntRange() throws Exception {
+        String response = "HTTP/1.1 101 Switching Protocols\r\n"
+                + "x-qwp-max-uncommitted-rows:  5000000000 \r\n"
+                + "\r\n";
+        Assert.assertEquals(5_000_000_000L, invokeExtractMaxUncommittedRows(response));
+    }
+
+    @Test
     public void testFrameBurstIsParsedInPlace() throws Exception {
         assertFrameBurstIsParsedInPlace(false);
     }
@@ -600,6 +626,12 @@ public class WebSocketClientTest {
         Method m = WebSocketClient.class.getDeclaredMethod("extractMaxBatchSize", String.class);
         m.setAccessible(true);
         return (int) m.invoke(null, response);
+    }
+
+    private static long invokeExtractMaxUncommittedRows(String response) throws Exception {
+        Method m = WebSocketClient.class.getDeclaredMethod("extractMaxUncommittedRows", String.class);
+        m.setAccessible(true);
+        return (long) m.invoke(null, response);
     }
 
     private static void setUpgradedTrue(Object obj) throws Exception {
