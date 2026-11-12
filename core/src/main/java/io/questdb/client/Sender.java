@@ -963,6 +963,18 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * a flush consults the schema again. Tables with different contracts can
      * share a batch. STRICT permits legacy rows only until a connection
      * successfully negotiates schema support.
+     * <p>
+     * The sender caches each table's schema and converts values to its column
+     * types. The server reports a schema change, such as
+     * {@code ALTER TABLE ... ALTER COLUMN ... TYPE}, in its reply to a batch
+     * that writes the table, and a reply without a change confirms the cached
+     * schema. While the connection is up, a schema the server has not confirmed
+     * for one second is looked up again before the next batch converts values
+     * against it, which costs that batch one round trip. Rows converted between
+     * a change and the reply that reports it still take the old column type,
+     * for example the precision of a FLOAT column just widened to DOUBLE: rows
+     * sent before that reply arrives, rows written within the second, and rows
+     * written while the connection is down.
      */
     enum SchemaMode {
         AUTO,

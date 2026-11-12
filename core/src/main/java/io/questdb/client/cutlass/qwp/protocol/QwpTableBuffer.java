@@ -30,6 +30,7 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.ArrayBufferAppender;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
+import io.questdb.client.cutlass.qwp.client.QwpSchemaFreshness;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.std.CharSequenceIntHashMap;
 import io.questdb.client.std.Chars;
@@ -68,6 +69,9 @@ public class QwpTableBuffer implements QuietCloseable {
     private final byte[] encodedTableName;
     // lower-cased table name, the schema cache key; the name itself when already lower case
     private final String schemaKey;
+    // Survives reset() and clear(): it tracks the sender's cached schema of the
+    // table, not this buffer's binding.
+    private final QwpSchemaFreshness schemaFreshness = new QwpSchemaFreshness();
     private final QwpWebSocketSender sender;
     private final String tableName;
     private QwpColumnDef[] cachedColumnDefs;
@@ -333,6 +337,14 @@ public class QwpTableBuffer implements QuietCloseable {
      */
     public String getSchemaKey() {
         return schemaKey;
+    }
+
+    /**
+     * Returns when the server last confirmed the sender's cached schema of
+     * this table. The producer thread owns it.
+     */
+    public QwpSchemaFreshness getSchemaFreshness() {
+        return schemaFreshness;
     }
 
     void attachSchemaBinding(QwpSchemaBinding binding) {

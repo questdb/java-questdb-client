@@ -637,8 +637,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // across connections. In default mode this tracks the trim watermark
     // exactly; in durable-ack mode it runs AHEAD of ackedFsn, which waits for
     // STATUS_DURABLE_ACK coverage. I/O thread only; survives reconnects. Used
-    // by the poison-frame detector to measure genuine acceptance progress.
-    private long highestOkFsn = -1L;
+    // by the poison-frame detector to measure genuine acceptance progress, and
+    // read by the producer (getHighestOkFsn) to confirm its schema cache.
+    // Written after the ACK's schema feedback is applied.
+    private volatile long highestOkFsn = -1L;
     // Zero-progress recycle pacer (I/O thread only; survives reconnects).
     // Counts consecutive strike-EXEMPT recycles -- orderly closes
     // (NORMAL_CLOSURE/GOING_AWAY), non-orderly closes before any send on the
@@ -1420,6 +1422,27 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      */
     public QwpSchemaResponse refreshSchema(CharSequence tableName, long timeoutMillis) {
         return schemaCoordinator.resolve(tableName, timeoutMillis, true);
+    }
+
+    /**
+     * Looks the table up through the I/O thread even when the cache holds it,
+     * so a producer can replace a snapshot the server has not confirmed
+     * recently. A failed lookup leaves the cached entry in place; a denial
+     * evicts it. Same contract as {@link #resolveSchema} otherwise.
+     */
+    public QwpSchemaResponse revalidateSchema(CharSequence tableName, long timeoutMillis) {
+        return schemaCoordinator.revalidate(tableName, timeoutMillis);
+    }
+
+    /**
+     * Highest engine FSN the server acknowledged at the OK level, across
+     * connections, or -1. The I/O thread applies an ACK's schema feedback
+     * before it publishes the ACK here, so a producer that reads an FSN
+     * covering a frame also sees the feedback that frame earned. In
+     * durable-ack mode it runs ahead of the engine's acked FSN.
+     */
+    public long getHighestOkFsn() {
+        return highestOkFsn;
     }
 
     /**
@@ -4674,11 +4697,13 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     LOG.warn("server ACK wire seq {} outside sent range [0, {}], clamping",
                             wireSeq, highestSent);
                 }
-                counters.acks.incrementAndGet();
                 long okFsn = fsnAtZero + capped;
                 if (okFsn > highestOkFsn) {
                     highestOkFsn = okFsn;
                 }
+                // After the watermark, so a reader that sees the count also sees
+                // the OK level, and with it the schema feedback applied above.
+                counters.acks.incrementAndGet();
                 // Clear poison-frame suspicion only when OK-level progress
                 // reaches the suspected frame itself: acceptance at or beyond
                 // poisonFsn proves the earlier rejections were not

@@ -21,6 +21,13 @@ import static io.questdb.client.LineSenderSchemaException.Reason.SCHEMA_UNAVAILA
 import static io.questdb.client.LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE;
 
 final class QwpSchemaCoordinator {
+    // Returns a cached entry, else asks the server.
+    private static final int LOOKUP_CACHED = 0;
+    // Evicts the cached entry, then asks the server.
+    private static final int LOOKUP_REFRESH = 1;
+    // Asks the server and keeps the cached entry unless the answer replaces it
+    // or denies access.
+    private static final int LOOKUP_REVALIDATE = 2;
     // Bounded by the tables this sender writes, like its per-table buffers,
     // each far heavier than an entry, so it needs no eviction.
     private final HashMap<String, QwpSchemaResponse> cache = new HashMap<>();
@@ -36,6 +43,19 @@ final class QwpSchemaCoordinator {
     }
 
     QwpSchemaResponse resolve(CharSequence tableName, long timeoutMillis, boolean refresh) {
+        return resolve(tableName, timeoutMillis, refresh ? LOOKUP_REFRESH : LOOKUP_CACHED);
+    }
+
+    /**
+     * Asks the server for the table's schema even when the cache holds it. A
+     * failed lookup leaves the cached entry in place, except that a denial
+     * evicts it, as for any lookup.
+     */
+    QwpSchemaResponse revalidate(CharSequence tableName, long timeoutMillis) {
+        return resolve(tableName, timeoutMillis, LOOKUP_REVALIDATE);
+    }
+
+    private QwpSchemaResponse resolve(CharSequence tableName, long timeoutMillis, int lookup) {
         final long startNanos = System.nanoTime();
         if (timeoutMillis < 0) {
             throw new IllegalArgumentException("timeoutMillis must be non-negative");
@@ -51,12 +71,12 @@ final class QwpSchemaCoordinator {
             if (closed) {
                 throw failure(SCHEMA_UNAVAILABLE, key, "schema coordinator is closed");
             }
-            if (!refresh) {
+            if (lookup == LOOKUP_CACHED) {
                 QwpSchemaResponse cached = cache.get(key);
                 if (cached != null) {
                     return cached;
                 }
-            } else {
+            } else if (lookup == LOOKUP_REFRESH) {
                 cache.remove(key);
             }
             if (timeoutNanos - (System.nanoTime() - startNanos) <= 0) {
@@ -65,7 +85,8 @@ final class QwpSchemaCoordinator {
             if (request != null) {
                 throw failure(SCHEMA_UNAVAILABLE, key, "another schema lookup is already in progress");
             }
-            Request own = new Request(key, tableName.toString(), startNanos, timeoutNanos);
+            Request own = new Request(key, tableName.toString(), startNanos, timeoutNanos,
+                    lookup == LOOKUP_REVALIDATE);
             request = own;
             hasPendingRequest = true;
             // The I/O loop blocks without a timeout when idle. It raises its parked
@@ -148,7 +169,11 @@ final class QwpSchemaCoordinator {
             complete(current, response, null);
             return;
         }
-        cache.remove(current.key);
+        // A revalidation keeps the entry it could not replace; access denial
+        // still evicts it, so the row fails as it would on a cold lookup.
+        if (!current.isRevalidation || response.getResult() == QwpSchemaProtocol.RESULT_DENIED) {
+            cache.remove(current.key);
+        }
         switch (response.getResult()) {
             case QwpSchemaProtocol.RESULT_DENIED:
                 complete(current, null, failure(ACCESS_DENIED, current.key, "schema access denied"));
@@ -347,6 +372,7 @@ final class QwpSchemaCoordinator {
 
 
     static final class Request {
+        final boolean isRevalidation;
         final long startNanos;
         final long timeoutNanos;
         long id;
@@ -358,7 +384,8 @@ final class QwpSchemaCoordinator {
         QwpSchemaResponse response;
         WebSocketClient sentClient;
 
-        Request(String key, String tableName, long startNanos, long timeoutNanos) {
+        Request(String key, String tableName, long startNanos, long timeoutNanos, boolean isRevalidation) {
+            this.isRevalidation = isRevalidation;
             this.key = key;
             this.tableName = tableName;
             this.startNanos = startNanos;

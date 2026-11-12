@@ -45,6 +45,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
@@ -52,6 +53,8 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 public class QwpSchemaSenderIntegrationTest {
     private static final String DECIMAL_TEXT_CORPUS =
             "/io/questdb/client/cutlass/qwp/native-decimal-to-text.tsv";
+    private static final long SCHEMA_MAX_AGE_NANOS =
+            TimeUnit.MILLISECONDS.toNanos(QwpWebSocketSender.SCHEMA_MAX_AGE_MILLIS);
     @Rule
     public final TemporaryFolder temporaryFolder = TemporaryFolder.builder().assureDeletion().build();
 
@@ -1845,6 +1848,312 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test
+    public void testAgedSchemaIsLookedUpAgainAtNextBatch() throws Exception {
+        assertMemoryLeak(() -> {
+            SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 1, 1);
+            try (TestWebSocketServer server = schemaServer(handler);
+                 Sender sender = sender(server)) {
+                AtomicLong clock = new AtomicLong();
+                ((QwpWebSocketSender) sender).setNanoClockForTesting(clock::get);
+                sender.table("events").uuidColumn("id", 1, 2).atNow();
+                Assert.assertTrue(sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+                Assert.assertEquals(1, handler.describeRequests.get());
+
+                clock.set(SCHEMA_MAX_AGE_NANOS);
+                sender.table("events");
+                Assert.assertEquals("a schema confirmed exactly the age limit ago is fresh",
+                        1, handler.describeRequests.get());
+
+                clock.set(SCHEMA_MAX_AGE_NANOS + 1);
+                sender.table("events");
+                Assert.assertEquals(2, handler.describeRequests.get());
+                // The lookup confirmed the schema, so the batch's first setter does not ask again.
+                sender.uuidColumn("id", 3, 4).atNow();
+                Assert.assertEquals(2, handler.describeRequests.get());
+            }
+        });
+    }
+
+    @Test
+    public void testAcknowledgedFrameExtendsSchemaLifetime() throws Exception {
+        assertMemoryLeak(() -> {
+            SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 1, 1);
+            try (TestWebSocketServer server = schemaServer(handler);
+                 Sender sender = sender(server)) {
+                AtomicLong clock = new AtomicLong();
+                ((QwpWebSocketSender) sender).setNanoClockForTesting(clock::get);
+                sender.table("events").uuidColumn("id", 1, 2).atNow();
+                Assert.assertTrue(sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+
+                long flushNanos = SCHEMA_MAX_AGE_NANOS * 3 / 5;
+                clock.set(flushNanos);
+                sender.table("events").uuidColumn("id", 3, 4).atNow();
+                Assert.assertTrue(sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+                Assert.assertEquals(1, handler.describeRequests.get());
+
+                // The OK reply confirms the schema as of the second flush.
+                clock.set(flushNanos + SCHEMA_MAX_AGE_NANOS);
+                sender.table("events");
+                Assert.assertEquals(1, handler.describeRequests.get());
+                clock.set(flushNanos + SCHEMA_MAX_AGE_NANOS + 1);
+                sender.table("events");
+                Assert.assertEquals(2, handler.describeRequests.get());
+            }
+        });
+    }
+
+    @Test
+    public void testUnacknowledgedFrameDoesNotExtendSchemaLifetime() throws Exception {
+        assertMemoryLeak(() -> {
+            SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 1, 1, false);
+            try (TestWebSocketServer server = schemaServer(handler);
+                 Sender sender = sender(server)) {
+                AtomicLong clock = new AtomicLong();
+                ((QwpWebSocketSender) sender).setNanoClockForTesting(clock::get);
+                sender.table("events").uuidColumn("id", 1, 2).atNow();
+                sender.flush();
+                clock.set(SCHEMA_MAX_AGE_NANOS * 3 / 5);
+                sender.table("events").uuidColumn("id", 3, 4).atNow();
+                sender.flush();
+                handler.awaitDataFrames(2);
+                Assert.assertEquals(1, handler.describeRequests.get());
+
+                // Neither frame was acknowledged, so only the DESCRIBE at 0 confirms.
+                clock.set(SCHEMA_MAX_AGE_NANOS + 1);
+                sender.table("events");
+                Assert.assertEquals(2, handler.describeRequests.get());
+            }
+        });
+    }
+
+    @Test
+    public void testDurableAckModeConfirmsSchemaAtOkLevel() throws Exception {
+        assertMemoryLeak(() -> {
+            SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 1, 1);
+            handler.isOkCarryingSeqTxn = true;
+            TestWebSocketServer durableServer = new TestWebSocketServer(handler, true);
+            durableServer.setAdvertiseSchema(true);
+            try (TestWebSocketServer server = start(durableServer);
+                 Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                         + ";request_durable_ack=on;auto_flush_rows=2147483647;auto_flush_bytes=0;"
+                         + "auto_flush_interval=2147483646;close_flush_timeout_millis=0;")) {
+                QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                AtomicLong clock = new AtomicLong();
+                ws.setNanoClockForTesting(clock::get);
+                sender.table("events").uuidColumn("id", 1, 2).atNow();
+                sender.flush();
+                awaitOkAcks(ws, 1);
+
+                long flushNanos = SCHEMA_MAX_AGE_NANOS * 3 / 5;
+                clock.set(flushNanos);
+                sender.table("events").uuidColumn("id", 3, 4).atNow();
+                sender.flush();
+                awaitOkAcks(ws, 2);
+                // The server never sends a durable ACK, so the trim watermark stays put.
+                Assert.assertEquals(-1, sender.getAckedFsn());
+
+                clock.set(flushNanos + SCHEMA_MAX_AGE_NANOS);
+                sender.table("events");
+                Assert.assertEquals("an OK reply confirms the schema without a durable ACK",
+                        1, handler.describeRequests.get());
+                clock.set(flushNanos + SCHEMA_MAX_AGE_NANOS + 1);
+                sender.table("events");
+                Assert.assertEquals(2, handler.describeRequests.get());
+            }
+        });
+    }
+
+    @Test
+    public void testUnansweredRecheckKeepsCachedSchemaAndDefersNextCheck() throws Exception {
+        assertMemoryLeak(() -> {
+            for (String mode : new String[]{"auto", "strict"}) {
+                for (boolean isSilent : new boolean[]{true, false}) {
+                    SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 1, 1);
+                    try (TestWebSocketServer server = schemaServer(handler);
+                         Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                                 + ";schema_mode=" + mode + ";schema_wait_millis=200;auto_flush_rows=2147483647;"
+                                 + "auto_flush_bytes=0;auto_flush_interval=2147483646;close_flush_timeout_millis=0;")) {
+                        String label = "mode=" + mode + ", silent=" + isSilent;
+                        AtomicLong clock = new AtomicLong();
+                        ((QwpWebSocketSender) sender).setNanoClockForTesting(clock::get);
+                        sender.table("events").uuidColumn("id", 1, 2).atNow();
+                        Assert.assertTrue(sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+
+                        if (isSilent) {
+                            handler.respondToDescribe = false;
+                        } else {
+                            handler.result = QwpSchemaProtocol.RESULT_UNAVAILABLE;
+                        }
+                        clock.set(SCHEMA_MAX_AGE_NANOS + 1);
+                        sender.table("events");
+                        Assert.assertEquals(label, 2, handler.describeRequests.get());
+                        // The failed re-check defers the next one, so the first setter does not
+                        // wait again, and the row converts against the cached UUID target.
+                        sender.stringColumn("id", "11121314-1516-1718-0102-030405060708").atNow();
+                        Assert.assertEquals(label, 2, handler.describeRequests.get());
+                        sender.flush();
+
+                        FrameReader reader = new FrameReader(handler.awaitDataFrames(2).get(1));
+                        reader.schemaTable("events", 1, "id", QwpConstants.TYPE_UUID);
+                        Assert.assertEquals(0, reader.u8());
+                        Assert.assertEquals(0x0102030405060708L, reader.i64());
+                        Assert.assertEquals(0x1112131415161718L, reader.i64());
+                        reader.eof();
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testDeniedRecheckFailsRow() throws Exception {
+        assertMemoryLeak(() -> {
+            SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 1, 1);
+            try (TestWebSocketServer server = schemaServer(handler);
+                 Sender sender = sender(server)) {
+                AtomicLong clock = new AtomicLong();
+                ((QwpWebSocketSender) sender).setNanoClockForTesting(clock::get);
+                sender.table("events").uuidColumn("id", 1, 2).atNow();
+                Assert.assertTrue(sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+
+                handler.result = QwpSchemaProtocol.RESULT_DENIED;
+                clock.set(SCHEMA_MAX_AGE_NANOS + 1);
+                for (int attempt = 0; attempt < 2; attempt++) {
+                    try {
+                        sender.table("events");
+                        Assert.fail("expected access denial");
+                    } catch (LineSenderSchemaException e) {
+                        Assert.assertEquals(LineSenderSchemaException.Reason.ACCESS_DENIED, e.getReason());
+                    }
+                }
+                // Unlike an unanswered re-check, a denial never falls back to the cached
+                // schema: the retry asks again and fails too.
+                Assert.assertEquals(3, handler.describeRequests.get());
+            }
+        });
+    }
+
+    @Test(timeout = 10_000)
+    public void testFrameWrittenWhileWireIsDownConfirmsSchemaAfterReconnect() throws Exception {
+        assertMemoryLeak(() -> {
+            int port = TestPorts.findUnusedPort();
+            SchemaHandler first = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 121, 122);
+            TestWebSocketServer server = schemaServer(first, port);
+            CountDownLatch disconnected = new CountDownLatch(1);
+            Sender sender = outageSender(port, "", disconnected);
+            TestWebSocketServer restarted = null;
+            try {
+                AtomicLong clock = new AtomicLong();
+                ((QwpWebSocketSender) sender).setNanoClockForTesting(clock::get);
+                sender.table("events").uuidColumn("id", 1, 2).atNow();
+                Assert.assertTrue(sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+                server.close();
+                Assert.assertTrue("sender did not observe the connection closing",
+                        disconnected.await(5, TimeUnit.SECONDS));
+
+                // The wire is down: the batch converts against the cached schema.
+                long offlineFlushNanos = SCHEMA_MAX_AGE_NANOS * 3 / 5;
+                clock.set(offlineFlushNanos);
+                sender.table("events").uuidColumn("id", 3, 4).atNow();
+                long fsn = sender.flushAndGetSequence();
+
+                SchemaHandler second = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 121, 122);
+                restarted = schemaServer(second, port);
+                Assert.assertTrue(sender.awaitAckedFsn(fsn, 5_000));
+
+                // The reply to the replayed frame confirms the schema as of its flush.
+                clock.set(offlineFlushNanos + SCHEMA_MAX_AGE_NANOS);
+                sender.table("events");
+                Assert.assertEquals(0, second.describeRequests.get());
+                clock.set(offlineFlushNanos + SCHEMA_MAX_AGE_NANOS + 1);
+                sender.table("events");
+                Assert.assertEquals(1, second.describeRequests.get());
+            } finally {
+                sender.close();
+                server.close();
+                if (restarted != null) {
+                    restarted.close();
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testSplitFlushFramesConfirmSchema() throws Exception {
+        assertMemoryLeak(() -> {
+            SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 81, 82);
+            TestWebSocketServer server = new TestWebSocketServer(handler);
+            server.setAdvertiseSchema(true);
+            // Each single-table frame fits the cap; the combined two-table frame does not.
+            server.setAdvertisedMaxBatchSize(48);
+            try (TestWebSocketServer ignored = start(server);
+                 Sender sender = sender(server)) {
+                AtomicLong clock = new AtomicLong();
+                ((QwpWebSocketSender) sender).setNanoClockForTesting(clock::get);
+                sender.table("a").uuidColumn("id", 1, 2).atNow();
+                sender.table("b").uuidColumn("id", 3, 4).atNow();
+                Assert.assertTrue(sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+                long flushNanos = SCHEMA_MAX_AGE_NANOS * 3 / 5;
+                clock.set(flushNanos);
+                sender.table("a").uuidColumn("id", 5, 6).atNow();
+                sender.table("b").uuidColumn("id", 7, 8).atNow();
+                Assert.assertTrue(sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+                Assert.assertEquals("each batch split into one frame per table", 4, handler.awaitDataFrames(4).size());
+                Assert.assertEquals(2, handler.describeRequests.get());
+
+                clock.set(flushNanos + SCHEMA_MAX_AGE_NANOS);
+                sender.table("a");
+                sender.table("b");
+                Assert.assertEquals(2, handler.describeRequests.get());
+                clock.set(flushNanos + SCHEMA_MAX_AGE_NANOS + 1);
+                sender.table("a");
+                sender.table("b");
+                Assert.assertEquals(4, handler.describeRequests.get());
+            }
+        });
+    }
+
+    @Test(timeout = 20_000)
+    public void testSymbolDictRecycleKeepsSchemaConfirmation() throws Exception {
+        assertMemoryLeak(() -> {
+            SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 41, 73);
+            try (TestWebSocketServer server = schemaServer(handler);
+                 Sender sender = sender(server)) {
+                QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                AtomicLong clock = new AtomicLong();
+                ws.setNanoClockForTesting(clock::get);
+                sender.table("events").uuidColumn("id", 1, 2).atNow();
+                Assert.assertTrue(sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+                long flushNanos = SCHEMA_MAX_AGE_NANOS * 3 / 5;
+                clock.set(flushNanos);
+                sender.table("events").uuidColumn("id", 3, 4).atNow();
+                Assert.assertTrue(sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+
+                // The recycle restarts the engine's FSNs. The frame acknowledged before
+                // it must still confirm the schema, and the unacknowledged frame after
+                // it must not, though its engine FSN is below the pre-recycle ones.
+                handler.acknowledgeData = false;
+                clock.set(flushNanos + SCHEMA_MAX_AGE_NANOS / 5);
+                sender.resetSymbolDictionary();
+                sender.table("events");
+                Assert.assertEquals(1, ws.getSymbolDictEpoch());
+                sender.uuidColumn("id", 5, 6).atNow();
+                sender.flush();
+                // The frame reaching the server proves the rebuilt loop's wire is up.
+                handler.awaitDataFrames(3);
+                Assert.assertEquals(1, handler.describeRequests.get());
+
+                clock.set(flushNanos + SCHEMA_MAX_AGE_NANOS);
+                sender.table("events");
+                Assert.assertEquals(1, handler.describeRequests.get());
+                clock.set(flushNanos + SCHEMA_MAX_AGE_NANOS + 1);
+                sender.table("events");
+                Assert.assertEquals(2, handler.describeRequests.get());
+            }
+        });
+    }
+
+    @Test
     public void testAutoTooLargeSchemaLegacyRowJoinsPendingSchemaBatch() throws Exception {
         assertMemoryLeak(() -> {
             SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 121, 122);
@@ -2871,9 +3180,9 @@ public class QwpSchemaSenderIntegrationTest {
             for (String mode : new String[]{"strict", "auto"}) {
                 SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 41, 73);
                 try (TestWebSocketServer server = schemaServer(handler);
-                     Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                     Sender sender = frozenClock(Sender.fromConfig("ws::addr=localhost:" + server.getPort()
                              + ";schema_mode=" + mode + ";auto_flush_rows=2147483647;auto_flush_bytes=0;"
-                             + "auto_flush_interval=2147483646;close_flush_timeout_millis=0;")) {
+                             + "auto_flush_interval=2147483646;close_flush_timeout_millis=0;"))) {
                     QwpWebSocketSender ws = (QwpWebSocketSender) sender;
                     sender.table("events").stringColumn("id", "11121314-1516-1718-0102-030405060708").atNow();
                     Assert.assertTrue(mode, sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
@@ -2920,7 +3229,7 @@ public class QwpSchemaSenderIntegrationTest {
      * {@code extraConfig} is appended verbatim (e.g. {@code schema_mode=strict;}).
      */
     private static Sender outageSender(int port, String extraConfig, CountDownLatch disconnected) {
-        return Sender.builder("ws::addr=localhost:" + port
+        return frozenClock(Sender.builder("ws::addr=localhost:" + port
                         + ";auto_flush_rows=2147483647;auto_flush_bytes=0;auto_flush_interval=2147483646;"
                         + "reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=50;"
                         + "close_flush_timeout_millis=0;" + extraConfig)
@@ -2929,7 +3238,7 @@ public class QwpSchemaSenderIntegrationTest {
                         disconnected.countDown();
                     }
                 })
-                .build();
+                .build());
     }
 
     /**
@@ -3008,10 +3317,30 @@ public class QwpSchemaSenderIntegrationTest {
         }
     }
 
+    private static void awaitOkAcks(QwpWebSocketSender sender, long count) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (sender.getTotalAcks() < count) {
+            if (System.nanoTime() - deadline > 0) {
+                Assert.fail("timed out waiting for " + count + " OK replies; received " + sender.getTotalAcks());
+            }
+            Thread.onSpinWait();
+        }
+    }
+
+    /**
+     * Freezes the sender's clock, so a cached schema never outlives the schema age
+     * limit however long a test waits; the tests that pin the limit move their own
+     * clock.
+     */
+    private static Sender frozenClock(Sender sender) {
+        ((QwpWebSocketSender) sender).setNanoClockForTesting(() -> 0L);
+        return sender;
+    }
+
     private static Sender sender(TestWebSocketServer server) {
-        return Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+        return frozenClock(Sender.fromConfig("ws::addr=localhost:" + server.getPort()
                 + ";auto_flush_rows=2147483647;auto_flush_bytes=0;auto_flush_interval=2147483646;"
-                + "close_flush_timeout_millis=0;");
+                + "close_flush_timeout_millis=0;"));
     }
 
     private static final class DecimalTextVector {
@@ -4306,7 +4635,7 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     private static final class SchemaHandler implements TestWebSocketServer.WebSocketServerHandler {
-        private final boolean acknowledgeData;
+        private volatile boolean acknowledgeData;
         private final List<byte[]> dataFrames = new ArrayList<>();
         private final CountDownLatch pong = new CountDownLatch(1);
         private final AtomicInteger describeRequests = new AtomicInteger();
@@ -4322,6 +4651,9 @@ public class QwpSchemaSenderIntegrationTest {
         private int deliveredResult = -1;
         private long deliveredVersion = -1;
         private volatile boolean isSchemaFeedbackEnabled;
+        // OK replies name a table seqTxn, so in durable-ack mode they wait for a
+        // durable ACK, which this handler never sends.
+        private volatile boolean isOkCarryingSeqTxn;
 
         private SchemaHandler(int result, int tableId, long version) {
             this(result, tableId, version, true);
@@ -4378,6 +4710,9 @@ public class QwpSchemaSenderIntegrationTest {
 
         private byte[] ack() {
             long sequence = ackSequence++;
+            if (isOkCarryingSeqTxn) {
+                return okWithSeqTxn(sequence);
+            }
             if (!isSchemaFeedbackEnabled || (result == deliveredResult && version == deliveredVersion)) {
                 return QwpWireTestUtils.buildAck(sequence);
             }
@@ -4387,6 +4722,18 @@ public class QwpSchemaSenderIntegrationTest {
             deliveredResult = result;
             deliveredVersion = version;
             return ackWithSchemaUpdate(sequence, "events", schemaPayload(0, tableId));
+        }
+
+        private static byte[] okWithSeqTxn(long sequence) {
+            byte[] name = "events".getBytes(StandardCharsets.UTF_8);
+            return ByteBuffer.allocate(1 + 8 + 2 + 2 + name.length + 8).order(ByteOrder.LITTLE_ENDIAN)
+                    .put(WebSocketResponse.STATUS_OK)
+                    .putLong(sequence)
+                    .putShort((short) 1)
+                    .putShort((short) name.length)
+                    .put(name)
+                    .putLong(sequence + 1)
+                    .array();
         }
 
         private static void send(TestWebSocketServer.ClientHandler client, byte[] frame) {

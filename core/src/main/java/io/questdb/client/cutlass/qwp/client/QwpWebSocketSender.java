@@ -183,6 +183,13 @@ public class QwpWebSocketSender implements Sender {
     // Default for symbol_dict_reset_threshold: distinct-symbol count that
     // triggers a recycle once symbol_dict_reset is on.
     public static final int DEFAULT_SYMBOL_DICT_RESET_THRESHOLD_SYMBOLS = 100_000;
+    // Longest the sender converts a batch against a cached table schema the
+    // server has not confirmed, while the wire is up. A successful reply to a
+    // frame that writes the table confirms it; see QwpSchemaFreshness. Bounds
+    // how long rows keep the old type after a column type change when the
+    // sender is idle; it costs one DESCRIBE round trip at the first row of a
+    // batch that follows a quiet second.
+    public static final long SCHEMA_MAX_AGE_MILLIS = 1_000L;
     private static final int DEFAULT_BUFFER_SIZE = 8192;
     private static final int DEFAULT_MICROBATCH_BUFFER_SIZE = 1024 * 1024; // 1MB
     private static final Logger LOG = LoggerFactory.getLogger(QwpWebSocketSender.class);
@@ -197,6 +204,7 @@ public class QwpWebSocketSender implements Sender {
     // past any transient disk/NFS stall the deferred-close machinery exists
     // to survive.
     private static final long RECYCLE_DEFERRED_CLOSE_MAX_WAIT_MILLIS = 30_000L;
+    private static final long SCHEMA_MAX_AGE_NANOS = TimeUnit.MILLISECONDS.toNanos(SCHEMA_MAX_AGE_MILLIS);
     private static final String WRITE_PATH = "/write/v4";
     // Yields the Authorization header value presented on each WebSocket upgrade. A constant for a
     // fixed token or Basic credential; for an httpTokenProvider it pulls a freshly refreshed token,
@@ -659,6 +667,10 @@ public class QwpWebSocketSender implements Sender {
     private long reconnectMaxDurationMillis =
             CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_DURATION_MILLIS;
     private int durableAckTiers;
+    // nanoClock reading taken before the current flush publishes anything, so
+    // its frames confirm the cached schemas their tables consulted as of then.
+    // Read only when a flushed table consulted the schema.
+    private long schemaFlushNanos;
     // Row-encoding contract when a schema is not obtainable; see
     // resolveSchemaForCurrentTable().
     private Sender.SchemaMode schemaMode = Sender.SchemaMode.AUTO;
@@ -5427,7 +5439,9 @@ public class QwpWebSocketSender implements Sender {
      * A table pins one schema snapshot per batch. Once the table holds pending rows,
      * later rows of the same batch validate against that snapshot without consulting
      * the cache; the first row after a flush or reset adopts whatever the cache holds
-     * by then, which ACK schema feedback keeps current. A rejection that a column
+     * by then, which ACK schema feedback keeps current. While the wire is up, a cached
+     * snapshot the server has not confirmed for {@link #SCHEMA_MAX_AGE_MILLIS} is looked
+     * up again first; see {@link #resolveConfirmedSchema}. A rejection that a column
      * type change could explain evicts the snapshot; see {@link #onRowFailure}.
      * <p>
      * When no snapshot is pinned, the configured {@link Sender.SchemaMode} decides
@@ -5498,6 +5512,7 @@ public class QwpWebSocketSender implements Sender {
         }
         final long startNanos = System.nanoTime();
         final long budgetNanos = TimeUnit.MILLISECONDS.toNanos(schemaWaitMillis);
+        final String key = currentTableBuffer.getSchemaKey();
         if (schemaMode == Sender.SchemaMode.STRICT) {
             if (!cursorSendLoop.awaitInitialSchemaMode(remainingSchemaMillis(startNanos, budgetNanos))) {
                 return null;
@@ -5505,27 +5520,76 @@ public class QwpWebSocketSender implements Sender {
             // STRICT writes no rows to a table it cannot describe, so no ACK feedback
             // ever reports that the table shrank: ask again instead of trusting a
             // cached TOO_LARGE. AUTO keeps the cache hit; its legacy rows earn feedback.
-            QwpSchemaResponse cached = cursorSendLoop.peekSchema(currentTableBuffer.getSchemaKey());
+            QwpSchemaResponse cached = cursorSendLoop.peekSchema(key);
             if (cached != null && cached.getResult() == QwpSchemaProtocol.RESULT_TOO_LARGE) {
-                return cursorSendLoop.refreshSchema(currentTableBuffer.getSchemaKey(), remainingSchemaMillis(startNanos, budgetNanos));
+                return cursorSendLoop.refreshSchema(key, remainingSchemaMillis(startNanos, budgetNanos));
             }
-            return cursorSendLoop.resolveSchema(currentTableBuffer.getSchemaKey(), remainingSchemaMillis(startNanos, budgetNanos));
+            return resolveConfirmedSchema(key, cached, startNanos, budgetNanos);
         }
         if (!cursorSendLoop.hasEverConnected()) {
             return null;
         }
         if (!cursorSendLoop.isWireUp()) {
-            return cursorSendLoop.peekSchema(currentTableBuffer.getSchemaKey());
+            // Frames of this batch reach the server after the reconnect, and their
+            // replies confirm the cache as of their flush.
+            currentTableBuffer.getSchemaFreshness().markConsulted();
+            return cursorSendLoop.peekSchema(key);
         }
         if (!cursorSendLoop.isSchemaEnabled()) {
             return null;
         }
         try {
-            return cursorSendLoop.resolveSchema(currentTableBuffer.getSchemaKey(), remainingSchemaMillis(startNanos, budgetNanos));
+            return resolveConfirmedSchema(key, cursorSendLoop.peekSchema(key), startNanos, budgetNanos);
         } catch (LineSenderSchemaException e) {
             if (e.getReason() == LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE
                     || e.getReason() == LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE) {
                 return null;
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Returns {@code cached} while the server confirmed it within
+     * {@link #SCHEMA_MAX_AGE_MILLIS}, or while the wire is down, when no lookup
+     * could answer. Otherwise it looks the table up, which confirms the result as
+     * of the moment before the request went out.
+     * <p>
+     * When that lookup fails as unavailable (no answer within the budget, a lost
+     * connection, or a server that cannot read the schema right now), the batch
+     * keeps the entry the cache still holds, as it did before the entry aged: an
+     * unanswered re-check is no evidence that the schema changed, and failing or
+     * downgrading the row would turn a slow server into lost or differently
+     * converted rows. Such a failure defers the next re-check by the age limit, so
+     * {@code table()} and the first setter do not both wait on a silent server.
+     * Any other failure, such as a denial, and any failure without a cached entry
+     * propagate, as for a cold lookup.
+     */
+    private QwpSchemaResponse resolveConfirmedSchema(
+            String key,
+            QwpSchemaResponse cached,
+            long startNanos,
+            long budgetNanos
+    ) {
+        QwpSchemaFreshness freshness = currentTableBuffer.getSchemaFreshness();
+        freshness.markConsulted();
+        final long nowNanos = nanoClock.getAsLong();
+        if (cached != null
+                && (!freshness.isExpired(nowNanos, SCHEMA_MAX_AGE_NANOS, schemaOkFsn()) || !cursorSendLoop.isWireUp())) {
+            return cached;
+        }
+        try {
+            QwpSchemaResponse fresh = cursorSendLoop.revalidateSchema(key, remainingSchemaMillis(startNanos, budgetNanos));
+            freshness.confirm(nowNanos);
+            return fresh;
+        } catch (LineSenderSchemaException e) {
+            if (e.getReason() == LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE) {
+                QwpSchemaResponse current = cursorSendLoop.peekSchema(key);
+                if (current != null) {
+                    // From the end of the wait, which can outlast the age limit.
+                    freshness.deferCheck(nanoClock.getAsLong());
+                    return current;
+                }
             }
             throw e;
         }
@@ -5649,6 +5713,7 @@ public class QwpWebSocketSender implements Sender {
             LOG.debug("Flushing pending rows [count={}, tables={}, defer={}]", pendingRowCount, tableCount, deferCommit);
         }
 
+        readSchemaFlushClock(tableCount);
         ensureActiveBufferReady();
         // In full-dict mode every frame is self-sufficient: it carries the whole
         // symbol dictionary from id 0 so orphan-drain / recovery replay to a fresh
@@ -5739,6 +5804,7 @@ public class QwpWebSocketSender implements Sender {
                 lastCommitBoundaryFsn = cursorEngine.publishedFsn();
             }
 
+            recordSchemaFramesAfterFlush();
             resetTableBuffersAfterFlush();
         } catch (Throwable t) {
             if (dictionaryChunksAwaitCommit) {
@@ -5967,7 +6033,62 @@ public class QwpWebSocketSender implements Sender {
             // committed the whole group.
             lastCommitBoundaryFsn = cursorEngine.publishedFsn();
         }
+        recordSchemaFramesAfterFlush();
         resetTableBuffersAfterFlush();
+    }
+
+    /**
+     * Reads the clock for {@link #recordSchemaFramesAfterFlush()} before the
+     * flush publishes anything, and only when a flushed table consulted its
+     * schema, so a sender on the legacy contract reads no clock here.
+     */
+    private void readSchemaFlushClock(int tableCount) {
+        for (int i = 0; i < tableCount; i++) {
+            if (flushTableBuffers.getQuick(i).getSchemaFreshness().isConsulted()) {
+                schemaFlushNanos = nanoClock.getAsLong();
+                return;
+            }
+        }
+    }
+
+    /**
+     * Records the frames this flush published against each flushed table that
+     * consulted its schema; their OK replies confirm the cached schema as of
+     * {@link #schemaFlushNanos}. The highest published FSN covers the table's
+     * own frame, which a split flush may have published earlier: cumulative
+     * replies deliver that frame's feedback no later than the reply that
+     * covers the highest one.
+     */
+    private void recordSchemaFramesAfterFlush() {
+        long frameFsn = -1L;
+        long okFsn = -1L;
+        for (int i = 0, n = flushTableBuffers.size(); i < n; i++) {
+            QwpSchemaFreshness freshness = flushTableBuffers.getQuick(i).getSchemaFreshness();
+            if (freshness.isConsulted()) {
+                if (frameFsn < 0) {
+                    frameFsn = fsnEpochBase + cursorEngine.publishedFsn();
+                    okFsn = schemaOkFsn();
+                }
+                freshness.onFramePublished(frameFsn, schemaFlushNanos, okFsn);
+            }
+        }
+    }
+
+    /**
+     * Highest external FSN the server acknowledged at the OK level, or -1. A
+     * symbol-dictionary recycle restarts the engine's FSNs; every frame of the
+     * retired epoch is covered by {@link #lastRecycleDurableFsn}. The producer
+     * thread runs the recycle, so it never sees a torn base and engine pair.
+     * The loop is null only between a recycle retiring it and the next connect,
+     * which a flush on close can fall into.
+     */
+    private long schemaOkFsn() {
+        CursorWebSocketSendLoop loop = cursorSendLoop;
+        long ok = cursorEngine.ackedFsn();
+        if (loop != null) {
+            ok = Math.max(ok, loop.getHighestOkFsn());
+        }
+        return ok < 0 ? lastRecycleDurableFsn : Math.max(lastRecycleDurableFsn, fsnEpochBase + ok);
     }
 
     private void onSlotLockReleased() {

@@ -208,6 +208,76 @@ public class CursorWebSocketSchemaCoordinatorTest {
     }
 
     @Test
+    public void testRevalidateAsksEvenWhenCachedAndReplacesEntry() throws Exception {
+        DescribeHandler handler = new DescribeHandler(true);
+        try (TestWebSocketServer server = server(handler);
+             CursorSendEngine engine = new CursorSendEngine(temp.newFolder("revalidate").getAbsolutePath(), 1 << 20);
+             WebSocketClient client = connect(server.getPort())) {
+            CursorWebSocketSendLoop loop = loop(client, engine);
+            try {
+                loop.start();
+                Assert.assertEquals(1, loop.resolveSchema("Trades", 5_000).getTableId());
+                Assert.assertEquals(2, loop.revalidateSchema("TRADES", 5_000).getTableId());
+                Assert.assertEquals(2, handler.requests.get());
+                Assert.assertEquals(2, loop.resolveSchema("trades", 0).getTableId());
+                Assert.assertEquals(2, handler.requests.get());
+            } finally {
+                loop.close();
+            }
+        }
+    }
+
+    @Test
+    public void testRevalidateTimeoutKeepsCachedEntry() throws Exception {
+        DescribeHandler handler = new DescribeHandler(true);
+        try (TestWebSocketServer server = server(handler);
+             CursorSendEngine engine = new CursorSendEngine(temp.newFolder("revalidate-timeout").getAbsolutePath(), 1 << 20);
+             WebSocketClient client = connect(server.getPort())) {
+            CursorWebSocketSendLoop loop = loop(client, engine);
+            ExecutorService executor = Executors.newSingleThreadExecutor();
+            try {
+                loop.start();
+                Assert.assertEquals(1, loop.resolveSchema("cached", 5_000).getTableId());
+                handler.reply = false;
+                Future<QwpSchemaResponse> revalidate = executor.submit(() -> loop.revalidateSchema("CACHED", 200));
+                Assert.assertTrue(handler.awaitRequests(2));
+                assertFutureReason(LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE, revalidate);
+                // Unlike a refresh, the failed revalidation leaves the entry in place.
+                Assert.assertEquals(1, loop.resolveSchema("cached", 0).getTableId());
+                Assert.assertEquals(2, handler.requests.get());
+            } finally {
+                executor.shutdownNow();
+                loop.close();
+            }
+        }
+    }
+
+    @Test
+    public void testRevalidateKeepsEntryWhenUnavailableAndEvictsItWhenDenied() throws Exception {
+        DescribeHandler handler = new DescribeHandler(true);
+        try (TestWebSocketServer server = server(handler);
+             CursorSendEngine engine = new CursorSendEngine(temp.newFolder("revalidate-results").getAbsolutePath(), 1 << 20);
+             WebSocketClient client = connect(server.getPort())) {
+            CursorWebSocketSendLoop loop = loop(client, engine);
+            try {
+                loop.start();
+                Assert.assertEquals(1, loop.resolveSchema("t", 5_000).getTableId());
+
+                handler.result = QwpSchemaProtocol.RESULT_UNAVAILABLE;
+                assertReason(LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE, () -> loop.revalidateSchema("t", 5_000));
+                Assert.assertEquals(1, loop.peekSchema("t").getTableId());
+
+                handler.result = QwpSchemaProtocol.RESULT_DENIED;
+                assertReason(LineSenderSchemaException.Reason.ACCESS_DENIED, () -> loop.revalidateSchema("t", 5_000));
+                Assert.assertNull(loop.peekSchema("t"));
+                Assert.assertEquals(3, handler.requests.get());
+            } finally {
+                loop.close();
+            }
+        }
+    }
+
+    @Test
     public void testTimeoutIgnoresLateReplyAndNextRequestSucceeds() throws Exception {
         DescribeHandler handler = new DescribeHandler(false);
         try (TestWebSocketServer server = server(handler);
@@ -418,7 +488,7 @@ public class CursorWebSocketSchemaCoordinatorTest {
         private volatile boolean malformedReply;
         private TestWebSocketServer.ClientHandler client;
         private long firstRequestId;
-        private final int result;
+        private volatile int result;
 
         private DescribeHandler(boolean reply) {
             this(reply, QwpSchemaProtocol.RESULT_KNOWN);
