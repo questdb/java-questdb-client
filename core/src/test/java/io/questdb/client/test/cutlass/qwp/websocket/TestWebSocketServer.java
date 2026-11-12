@@ -583,6 +583,8 @@ public class TestWebSocketServer implements Closeable {
         private final Socket socket;
         private InputStream in;
         private boolean isClosed;
+        // True once this connection's 101 response confirmed X-QWP-Rollback: enabled.
+        private volatile boolean isRollbackConfirmed;
         private OutputStream out;
         private Thread readThread;
         // Request path from the WebSocket upgrade GET line (e.g. /write/v4,
@@ -635,6 +637,14 @@ public class TestWebSocketServer implements Closeable {
                     return;
                 }
             }
+        }
+
+        /**
+         * Whether this connection's upgrade confirmed {@code X-QWP-Rollback: enabled}, so
+         * the client may send it the rollback control frame.
+         */
+        public boolean isRollbackConfirmed() {
+            return isRollbackConfirmed;
         }
 
         public synchronized void sendBinary(byte[] data) throws IOException {
@@ -911,6 +921,7 @@ public class TestWebSocketServer implements Closeable {
             }
             if (rollbackSupported && "true".equalsIgnoreCase(rollbackRequest)) {
                 sb.append("X-QWP-Rollback: enabled\r\n");
+                isRollbackConfirmed = true;
             }
             sb.append("\r\n");
             out.write(sb.toString().getBytes(StandardCharsets.US_ASCII));

@@ -39,9 +39,13 @@ import org.junit.Test;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.ArrayList;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
@@ -201,6 +205,39 @@ public class QwpLargeTransactionTest {
     }
 
     @Test
+    public void testPooledStrictLeaseCloseDuringOutageKeepsTheConnection() throws Exception {
+        // Returning a strict lease discards its open transaction. During an outage that
+        // must neither wait for the server nor cost the pool its connection: the next
+        // borrower's transaction goes out behind the rollback frame once the server is back.
+        assertMemoryLeak(() -> {
+            int port = TestPorts.findUnusedPort();
+            TxnServer before = new TxnServer();
+            TxnServer after = new TxnServer();
+            TestWebSocketServer revived = null;
+            try (TestWebSocketServer first = start(before, CAP, port, true)) {
+                try (QuestDB db = QuestDB.connect(outageConf(port) + "transaction=strict;query_pool_min=0;")) {
+                    Sender lease = db.borrowSender();
+                    writeRows(lease, "t", 0, 1_000);
+                    Assert.assertTrue(before.awaitFrames(2));
+                    first.close();
+                    lease.close();
+                    Sender next = db.borrowSender();
+                    writeRows(next, "t", 0, 10);
+                    next.flush();
+                    revived = start(after, CAP, port, true);
+                    Assert.assertTrue(next.drain(10_000));
+                    next.close();
+                }
+            } finally {
+                if (revived != null) {
+                    revived.close();
+                }
+            }
+            assertDiscardedThenCommitted(before, after);
+        });
+    }
+
+    @Test
     public void testPooledStrictLeaseCloseRetiresConnectionWithoutServerRollback() throws Exception {
         assertMemoryLeak(() -> {
             TxnServer h = new TxnServer();
@@ -317,6 +354,14 @@ public class QwpLargeTransactionTest {
     }
 
     @Test
+    public void testResetDuringOutageDoesNotStallTheSender() throws Exception {
+        // Store-and-forward keeps every producer call working through an outage. reset()
+        // used to wait 30 s for the rollback ack and then abort the transaction, so every
+        // later row and flush threw, even after the server came back.
+        assertDiscardDuringOutage("transaction=on;", Sender::reset);
+    }
+
+    @Test
     public void testResetKeepsLegacyBehaviourWithoutServerRollback() throws Exception {
         // transaction=on against a server without rollback: reset() cannot reach the
         // frames already sent, and the next flush() commits them, as before.
@@ -387,6 +432,11 @@ public class QwpLargeTransactionTest {
                 Assert.assertEquals(0, h.commitFrames());
             }
         });
+    }
+
+    @Test
+    public void testRollbackDuringOutageDoesNotStallTheSender() throws Exception {
+        assertDiscardDuringOutage("transaction=strict;", Sender::rollback);
     }
 
     @Test
@@ -684,13 +734,83 @@ public class QwpLargeTransactionTest {
         Assert.assertTrue(h.frames.get(h.frames.size() - 1).isCommit());
     }
 
+    // Asserts what the server that came back after an outage received and committed: the
+    // discarded transaction's frames, replayed and then rolled back, and behind the rollback
+    // frame the next transaction, which alone commits.
+    private static void assertDiscardedThenCommitted(TxnServer before, TxnServer after) {
+        Assert.assertEquals("nothing commits before the outage", 0, before.committedFrames().size());
+        Assert.assertEquals("one connection after the outage: " + after.frames, 1, after.connectionCount());
+        int rollbackAt = -1;
+        for (int i = 0, n = after.frames.size(); i < n; i++) {
+            if (after.frames.get(i).isRollback()) {
+                Assert.assertEquals("one rollback frame: " + after.frames, -1, rollbackAt);
+                rollbackAt = i;
+            }
+        }
+        Assert.assertTrue("the discarded transaction is replayed ahead of the rollback frame: " + after.frames,
+                rollbackAt >= 2);
+        for (int i = 0; i < rollbackAt; i++) {
+            Assert.assertTrue("frame " + i + " must be deferred: " + after.frames, after.frames.get(i).isDeferred());
+        }
+        Assert.assertEquals(1, after.rolledBackGroups);
+        Assert.assertTrue(after.frames.get(after.frames.size() - 1).isCommit());
+        Assert.assertEquals("only the next transaction commits",
+                after.frames.subList(rollbackAt + 1, after.frames.size()), after.committedFrames());
+    }
+
+    // The server confirmed rollback, received the first frames of a transaction and went
+    // away. The transaction is discarded during the outage, the next one is committed, and
+    // the server comes back on the same endpoint.
+    private static void assertDiscardDuringOutage(String mode, Consumer<Sender> discard) throws Exception {
+        assertMemoryLeak(() -> {
+            int port = TestPorts.findUnusedPort();
+            TxnServer before = new TxnServer();
+            TxnServer after = new TxnServer();
+            TestWebSocketServer revived = null;
+            try (TestWebSocketServer first = start(before, CAP, port, true)) {
+                try (Sender s = Sender.fromConfig(outageConf(port) + mode)) {
+                    writeRows(s, "t", 0, 1_000);
+                    Assert.assertTrue(before.awaitFrames(2));
+                    first.close();
+                    // Must neither wait for the server nor fail: the server is away.
+                    discard.accept(s);
+                    writeRows(s, "t", 0, 10);
+                    s.flush();
+                    revived = start(after, CAP, port, true);
+                    Assert.assertTrue(s.drain(10_000));
+                }
+            } finally {
+                if (revived != null) {
+                    revived.close();
+                }
+            }
+            assertDiscardedThenCommitted(before, after);
+        });
+    }
+
     private static String conf(TestWebSocketServer server) {
         return "ws::addr=localhost:" + server.getPort() + ";";
+    }
+
+    // Reconnects within milliseconds once the server is back.
+    private static String outageConf(int port) {
+        return "ws::addr=localhost:" + port + ";reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=50;";
     }
 
     private static TestWebSocketServer start(TxnServer h, int cap) throws Exception {
         TestWebSocketServer server = new TestWebSocketServer(h);
         server.setAdvertisedMaxBatchSize(cap);
+        server.start();
+        Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+        return server;
+    }
+
+    // A server on a fixed port, so a test can take it down and bring it back on the same
+    // endpoint, as one that supports rollback or as one that predates it.
+    private static TestWebSocketServer start(TxnServer h, int cap, int port, boolean isRollbackSupported) throws Exception {
+        TestWebSocketServer server = new TestWebSocketServer(h, false, null, port);
+        server.setAdvertisedMaxBatchSize(cap);
+        server.setRollbackSupported(isRollbackSupported);
         server.start();
         Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
         return server;
@@ -708,12 +828,15 @@ public class QwpLargeTransactionTest {
     }
 
     private static final class TxnFrame {
+        // Index of the connection the frame arrived on, in connection order.
+        final int connection;
         final byte flags;
         final int size;
 
-        TxnFrame(byte flags, int size) {
+        TxnFrame(byte flags, int size, int connection) {
             this.flags = flags;
             this.size = size;
+            this.connection = connection;
         }
 
         boolean isCommit() {
@@ -730,39 +853,68 @@ public class QwpLargeTransactionTest {
 
         @Override
         public String toString() {
-            return (isRollback() ? "R" : isDeferred() ? "D" : "C") + size;
+            return connection + ":" + (isRollback() ? "R" : isDeferred() ? "D" : "C") + size;
         }
     }
 
     /**
-     * Acks frames the way the QuestDB server does for one connection: deferred
-     * frames wait for the commit frame that closes their group, which acks them
-     * cumulatively; the rollback frame discards the group and acks it too.
+     * Acks frames the way the QuestDB server does, per connection: wire sequences
+     * restart at 0 on every connection, deferred frames wait for the commit frame
+     * that closes their group, which acks them cumulatively, and the rollback frame
+     * discards the group and acks it too.
+     * <p>
+     * It also models what the server commits: a commit frame commits the group open
+     * on its connection, while a rollback frame or a closed connection leaves that
+     * group uncommitted. On a connection that did not confirm rollback the rollback
+     * frame is what a server without rollback support makes of it, an empty deferred
+     * frame: the group stays open, and the next commit on the connection commits it.
      */
     private static final class TxnServer implements TestWebSocketServer.WebSocketServerHandler {
+        // Every frame received, over all connections, in arrival order.
         final List<TxnFrame> frames = new CopyOnWriteArrayList<>();
         volatile boolean isAckingRollback = true;
         volatile int rolledBackGroups;
-        private long nextSeq;
+        // Frames a commit frame committed, in commit order.
+        private final List<TxnFrame> committed = new ArrayList<>();
+        private final Map<TestWebSocketServer.ClientHandler, Connection> connections = new IdentityHashMap<>();
 
         @Override
         public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
-            long seq = nextSeq++;
-            TxnFrame frame = new TxnFrame(data[QwpConstants.HEADER_OFFSET_FLAGS], data.length);
+            Connection connection = connections.get(client);
+            if (connection == null) {
+                connection = new Connection(connections.size());
+                connections.put(client, connection);
+            }
+            long seq = connection.nextSeq++;
+            TxnFrame frame = new TxnFrame(data[QwpConstants.HEADER_OFFSET_FLAGS], data.length, connection.index);
             frames.add(frame);
             notifyAll();
             try {
-                if (frame.isRollback()) {
+                if (frame.isCommit()) {
+                    committed.addAll(connection.group);
+                    committed.add(frame);
+                    connection.group.clear();
+                    client.sendBinary(ack(seq));
+                } else if (frame.isRollback() && client.isRollbackConfirmed()) {
                     rolledBackGroups++;
+                    connection.group.clear();
                     if (isAckingRollback) {
                         client.sendBinary(ack(seq));
                     }
-                } else if (frame.isCommit()) {
-                    client.sendBinary(ack(seq));
+                } else {
+                    connection.group.add(frame);
                 }
             } catch (IOException e) {
                 throw new RuntimeException(e);
             }
+        }
+
+        synchronized List<TxnFrame> committedFrames() {
+            return new ArrayList<>(committed);
+        }
+
+        synchronized int connectionCount() {
+            return connections.size();
         }
 
         synchronized boolean awaitFrames(int count) throws InterruptedException {
@@ -804,6 +956,17 @@ public class QwpLargeTransactionTest {
             bb.putLong(seq);
             bb.putShort((short) 0);
             return buf;
+        }
+
+        private static final class Connection {
+            // Deferred frames the connection holds uncommitted.
+            final List<TxnFrame> group = new ArrayList<>();
+            final int index;
+            long nextSeq;
+
+            Connection(int index) {
+                this.index = index;
+            }
         }
     }
 }
