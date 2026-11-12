@@ -795,6 +795,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * later rows never commit the discarded ones, even across reconnects. Call
      * {@link #drain(long)} to wait until the server confirms.
      * <br>
+     * A {@code transaction=on} transaction that already committed in parts (see
+     * {@link LineSenderBuilder#transactional(boolean)}) keeps the parts it committed;
+     * this discards only the rest.
+     * <br>
      * Discarding rows already sent needs a server that supports QWP rollback. When
      * the server does not, this method throws and aborts the transaction: every
      * later flush throws too, and closing the sender discards the rows, because the
@@ -2854,8 +2858,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * with {@code FLAG_DEFER_COMMIT}; only an explicit {@code flush()}
          * (or {@code close()}) triggers the server-side WAL commit. This allows
          * accumulating datasets larger than the server's recv buffer while
-         * committing atomically per table. The server commits a table on its own
-         * once {@code qwp.max.uncommitted.rows} of its rows are uncommitted; use
+         * committing atomically per table. A transaction too large for either side
+         * commits in parts: the server commits a table on its own once
+         * {@code qwp.max.uncommitted.rows} of its rows are uncommitted, and the
+         * sender, which holds the transaction in {@code sf_max_total_bytes} until
+         * the server commits it, commits the rows it already sent once the
+         * transaction outgrows that buffer, and logs a warning. Use
          * {@link #strictTransactional(boolean)} to fail instead.
          * <p>
          * A sender with no auto-flush trigger (see {@link #disableAutoFlush()}) is

@@ -45,6 +45,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.List;
@@ -81,6 +82,12 @@ public class QwpLargeTransactionTest {
     // ~100 encoded bytes per row: 1000 rows (the default row trigger) are ~100 KB,
     // three times the 32 KiB cap.
     private static final String PAD = TestUtils.repeat("x", 90);
+    // transaction=on in frames of exactly 280 rows (~28 KB): two fill a 64 KiB segment,
+    // so the 256 KiB client buffer holds eight frames of a transaction. A blocked
+    // append would wait 30 s.
+    private static final String TXN_ON_FRAMES_OF_280 = "transaction=on;auto_flush_rows=280;auto_flush_bytes=off;"
+            + "auto_flush_interval=off;sf_max_segment_bytes=64k;sf_max_total_bytes=256k;"
+            + "sf_append_deadline_millis=30000;";
 
     @Test
     public void testAutoFlushBytesAloneCommitsEachBatch() throws Exception {
@@ -1101,6 +1108,133 @@ public class QwpLargeTransactionTest {
     }
 
     @Test
+    public void testTransactionalCommitsInPartsAtClientBuffer() throws Exception {
+        // The client holds a transaction's frames until the server commits it. The row
+        // whose frame found no room used to block for sf_append_deadline_millis and then
+        // throw, and close() then committed the frames already sent and dropped the rest.
+        // Now the sender commits the frames already sent and carries on, as the server
+        // does at qwp.max.uncommitted.rows.
+        assertMemoryLeak(() -> {
+            ListAppender<ILoggingEvent> log = captureSenderLog();
+            try {
+                TxnServer h = new TxnServer();
+                try (TestWebSocketServer server = start(h, CAP)) {
+                    try (QwpWebSocketSender s = (QwpWebSocketSender) Sender.fromConfig(conf(server) + TXN_ON_FRAMES_OF_280)) {
+                        long start = System.nanoTime();
+                        // 17 frames of 280 rows, then 240 rows that flush() commits.
+                        writeRows(s, "t", 0, 5_000);
+                        Assert.assertEquals("two parts of eight frames", 4_480, s.getTxnRowsCommittedInPartsForTesting());
+                        s.flush();
+                        Assert.assertEquals(0, s.getTxnRowsCommittedInPartsForTesting());
+                        Assert.assertTrue("must not wait for sf_append_deadline_millis",
+                                System.nanoTime() - start < TimeUnit.SECONDS.toNanos(10));
+                        Assert.assertTrue(s.drain(5_000));
+                    }
+                    // The buffer holds eight frames, so the ninth and the seventeenth each
+                    // start a new part, behind a bare commit frame for the frames before them.
+                    Assert.assertEquals("DDDDDDDDcDDDDDDDDcDC", frameKinds(h));
+                    Assert.assertEquals("every frame commits", h.frames, h.committedFrames());
+                    // Logged once for the transaction, with what the first commit covered.
+                    Assert.assertEquals(Collections.singletonList(commitInPartsWarning(2_240, frameBytes(h, 0, 8))),
+                            commitInPartsWarnings(log));
+                }
+            } finally {
+                releaseSenderLog(log);
+            }
+        });
+    }
+
+    @Test
+    public void testTransactionalCommitsInPartsBeforeFlushThatDoesNotFit() throws Exception {
+        // Eight frames fill the client buffer, and the frame flush() sends with the last
+        // 279 rows, which commits the transaction, does not fit beside them. flush() used
+        // to block for sf_append_deadline_millis and throw. Now it commits the eight
+        // frames first. Each transaction that commits in parts logs once.
+        assertMemoryLeak(() -> {
+            ListAppender<ILoggingEvent> log = captureSenderLog();
+            try {
+                TxnServer h = new TxnServer();
+                try (TestWebSocketServer server = start(h, CAP)) {
+                    try (Sender s = Sender.fromConfig(conf(server) + TXN_ON_FRAMES_OF_280)) {
+                        writeRows(s, "t", 0, 2_519);
+                        Assert.assertTrue(h.awaitFrames(8));
+                        long start = System.nanoTime();
+                        s.flush();
+                        Assert.assertTrue("must not wait for sf_append_deadline_millis",
+                                System.nanoTime() - start < TimeUnit.SECONDS.toNanos(10));
+                        Assert.assertTrue(s.drain(5_000));
+                        Assert.assertEquals("DDDDDDDDcC", frameKinds(h));
+                        Assert.assertEquals(Collections.singletonList(
+                                commitInPartsWarning(2_240, frameBytes(h, 0, 8))), commitInPartsWarnings(log));
+
+                        // The next transaction's first frame shares a segment with the
+                        // previous commit frame, so seven frames fill the buffer this time.
+                        writeRows(s, "t", 0, 2_519);
+                        s.flush();
+                        Assert.assertTrue(s.drain(5_000));
+                    }
+                    Assert.assertEquals("DDDDDDDDcC" + "DDDDDDDcDC", frameKinds(h));
+                    Assert.assertEquals("every frame commits", h.frames, h.committedFrames());
+                    Assert.assertEquals(Arrays.asList(
+                            commitInPartsWarning(2_240, frameBytes(h, 0, 8)),
+                            commitInPartsWarning(1_960, frameBytes(h, 10, 17))
+                    ), commitInPartsWarnings(log));
+                }
+            } finally {
+                releaseSenderLog(log);
+            }
+        });
+    }
+
+    @Test
+    public void testTransactionalDiscardAfterCommitInPartsWarns() throws Exception {
+        // The frames committed when the transaction outgrew the client buffer cannot be
+        // rolled back. rollback() and reset() discard the rest of the transaction, and
+        // say that the part already committed stays.
+        assertMemoryLeak(() -> {
+            ListAppender<ILoggingEvent> log = captureSenderLog();
+            try {
+                String[] actions = {"rollback()", "reset()"};
+                for (String action : actions) {
+                    clearLog(log);
+                    TxnServer h = new TxnServer();
+                    try (TestWebSocketServer server = start(h, CAP)) {
+                        server.setRollbackSupported(true);
+                        try (QwpWebSocketSender s = (QwpWebSocketSender) Sender.fromConfig(conf(server) + TXN_ON_FRAMES_OF_280)) {
+                            // Nine frames, the ninth in a new part, and 100 rows pending.
+                            writeRows(s, "t", 0, 2_620);
+                            Assert.assertEquals(action, 2_240, s.getTxnRowsCommittedInPartsForTesting());
+                            if ("rollback()".equals(action)) {
+                                s.rollback();
+                            } else {
+                                s.reset();
+                            }
+                            Assert.assertEquals(action, 0, s.getTxnRowsCommittedInPartsForTesting());
+                            writeRows(s, "t", 0, 10);
+                            s.flush();
+                            Assert.assertTrue(action, s.drain(5_000));
+                        }
+                        Assert.assertEquals(action, "DDDDDDDDcDRC", frameKinds(h));
+                        Assert.assertEquals(action, 1, h.rolledBackGroups);
+                        // The first part and the next transaction commit, the ninth frame does not.
+                        List<TxnFrame> committed = new ArrayList<>(h.frames.subList(0, 9));
+                        committed.add(h.frames.get(11));
+                        Assert.assertEquals(action, committed, h.committedFrames());
+                        Assert.assertEquals(action, Arrays.asList(
+                                commitInPartsWarning(2_240, frameBytes(h, 0, 8)),
+                                action + " discarded the rows of the open transaction sent since the sender last "
+                                        + "committed part of it, but the 2240 rows it committed when the transaction "
+                                        + "outgrew the client buffer stay committed"
+                        ), commitInPartsWarnings(log));
+                    }
+                }
+            } finally {
+                releaseSenderLog(log);
+            }
+        });
+    }
+
+    @Test
     public void testTransactionalDefaultTriggersSplitWideRows() throws Exception {
         // Before: transaction=on with the default triggers threw
         // BatchTooLargeForCapException at the 1000th wide row.
@@ -1131,6 +1265,31 @@ public class QwpLargeTransactionTest {
         synchronized (log) {
             log.list.clear();
         }
+    }
+
+    // What a transaction=on sender logs the first time a transaction outgrows the
+    // 256 KiB client buffer and it commits the part already sent.
+    private static String commitInPartsWarning(long rows, long transactionBytes) {
+        return "the open transaction outgrew the client buffer, so the sender committed the " + rows
+                + " rows it had already sent, and the rest of the transaction commits separately [transactionBytes="
+                + transactionBytes + ", ringCapacityBytes=262144]. A transaction=on transaction commits in parts when "
+                + "sf_max_total_bytes cannot hold it: raise sf_max_total_bytes or set sf_dir to keep such transactions "
+                + "whole, or use transaction=strict to refuse their rows instead. Logged once per transaction";
+    }
+
+    // The warnings about a transaction the sender committed in parts at the client
+    // buffer logged since the last clearLog(), in order.
+    private static List<String> commitInPartsWarnings(ListAppender<ILoggingEvent> log) {
+        List<String> warnings = new ArrayList<>();
+        synchronized (log) {
+            for (ILoggingEvent e : log.list) {
+                String message = e.getFormattedMessage();
+                if (e.getLevel() == Level.WARN && message.contains("outgrew the client buffer")) {
+                    warnings.add(message);
+                }
+            }
+        }
+        return warnings;
     }
 
     // The discarded-transaction warnings logged since the last clearLog().
@@ -1310,11 +1469,26 @@ public class QwpLargeTransactionTest {
     }
 
     private static long frameBytes(TxnServer h) {
+        return frameBytes(h, 0, h.frames.size());
+    }
+
+    // Bytes of the frames [from, to) the server received.
+    private static long frameBytes(TxnServer h, int from, int to) {
         long bytes = 0;
-        for (TxnFrame f : h.frames) {
-            bytes += f.size;
+        for (int i = from; i < to; i++) {
+            bytes += h.frames.get(i).size;
         }
         return bytes;
+    }
+
+    // One letter per frame the server received: D deferred, c bare commit, C commit
+    // with rows, R rollback.
+    private static String frameKinds(TxnServer h) {
+        StringBuilder kinds = new StringBuilder();
+        for (TxnFrame f : h.frames) {
+            kinds.append(f.isRollback() ? 'R' : f.isDeferred() ? 'D' : f.isBareCommit() ? 'c' : 'C');
+        }
+        return kinds.toString();
     }
 
     private static String serverRowLimitError(String table, long maxUncommittedRows) {
@@ -1366,6 +1540,11 @@ public class QwpLargeTransactionTest {
             this.flags = flags;
             this.size = size;
             this.connection = connection;
+        }
+
+        // A commit frame with no table: the header and an empty symbol delta.
+        boolean isBareCommit() {
+            return isCommit() && size <= QwpConstants.HEADER_SIZE + 6;
         }
 
         boolean isCommit() {
