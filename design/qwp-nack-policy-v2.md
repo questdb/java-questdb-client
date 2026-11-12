@@ -134,8 +134,19 @@ until a primary is reachable. Consequently:
 
 ## Invariants to hold the line on
 
-- **Replay idempotency:** NACK ⇒ batch atomically not applied server-side.
-  RETRIABLE replay depends on it; violating it trades loss for duplication.
+- **No ack past a NACK:** the server acks neither a NACKed frame nor any
+  frame after it, and after a RETRIABLE NACK the client replays them all.
+  Normally the server has stored none of their rows. The exception: the
+  server commits each table on its own. If one table's commit fails after
+  other tables committed, the rows those tables got from the replayed
+  frames are already stored, and the replay stores them a second time.
+  This takes a storage fault, or a DROP, RENAME or SUSPEND WAL that lands
+  while the table waits for its commit. The server commits plain frames at
+  least once per receive pass (`http.recv.buffer.size`, 2 MiB by default;
+  questdb#8195), which bounds what a replay re-sends; a `FLAG_DEFER_COMMIT`
+  group can re-send the whole group. Tables with DEDUP absorb the
+  duplicates. The client accepts them: without the replay, the failed
+  table's rows would be lost.
 - **NACK-before-close:** a server rejecting bytes must NACK before closing;
   a close without a terminal NACK is treated as transport.
 - **No watermark advance on any rejection**, ever (fuzz-tested:
