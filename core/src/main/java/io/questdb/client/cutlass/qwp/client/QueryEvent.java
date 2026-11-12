@@ -45,8 +45,12 @@ public class QueryEvent {
      */
     public static final int KIND_TRANSPORT_ERROR = 4;
 
+    // valid for KIND_END and KIND_EXEC_DONE: the row count and statistics trailers
+    public final QwpQueryDetails details = new QwpQueryDetails();
     public QwpBatchBuffer buffer;     // valid for KIND_BATCH (must be released to pool by consumer)
     public String errorMessage;       // valid for KIND_ERROR
+    // valid for KIND_ERROR: the position trailer, NO_ERROR_POSITION when absent
+    public int errorPosition = QwpEgressMsgKind.NO_ERROR_POSITION;
     public byte errorStatus;          // valid for KIND_ERROR
     public int kind;
     public short opType;              // valid for KIND_EXEC_DONE (matches CompiledQuery.SELECT/INSERT/etc.)
@@ -63,14 +67,20 @@ public class QueryEvent {
         this.kind = KIND_END;
         this.buffer = null;
         this.totalRows = totalRows;
+        this.details.clear();
         return this;
     }
 
     public QueryEvent asError(byte status, String message) {
+        return asError(status, message, QwpEgressMsgKind.NO_ERROR_POSITION);
+    }
+
+    public QueryEvent asError(byte status, String message, int position) {
         this.kind = KIND_ERROR;
         this.buffer = null;
         this.errorStatus = status;
         this.errorMessage = message;
+        this.errorPosition = position;
         return this;
     }
 
@@ -79,6 +89,7 @@ public class QueryEvent {
         this.buffer = null;
         this.opType = opType;
         this.rowsAffected = rowsAffected;
+        this.details.clear();
         return this;
     }
 
@@ -87,6 +98,7 @@ public class QueryEvent {
         this.buffer = null;
         this.errorStatus = status;
         this.errorMessage = message;
+        this.errorPosition = QwpEgressMsgKind.NO_ERROR_POSITION;
         return this;
     }
 
@@ -102,9 +114,30 @@ public class QueryEvent {
         this.kind = -1;
         this.buffer = null;
         this.errorMessage = null;
+        this.errorPosition = QwpEgressMsgKind.NO_ERROR_POSITION;
         this.errorStatus = 0;
         this.opType = 0;
         this.rowsAffected = 0;
         this.totalRows = 0;
+        this.details.clear();
+    }
+
+    /**
+     * Records the {@code row_count} trailer of a {@code RESULT_END} on
+     * {@link #details}. Call after {@link #asEnd(long)}.
+     */
+    public QueryEvent withRowCount(long rowCount) {
+        this.details.setRowCount(rowCount);
+        return this;
+    }
+
+    /**
+     * Records the statistics trailer of a {@code RESULT_END} or
+     * {@code EXEC_DONE} on {@link #details}. Call after {@link #asEnd(long)} or
+     * {@link #asExecDone(short, long)}.
+     */
+    public QueryEvent withStats(long compileNanos, long executeNanos, long countNanos, long clientWaitNanos, boolean isJitCompiled) {
+        this.details.setStats(compileNanos, executeNanos, countNanos, clientWaitNanos, isJitCompiled);
+        return this;
     }
 }

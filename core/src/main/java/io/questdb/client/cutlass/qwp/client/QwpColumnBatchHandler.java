@@ -27,10 +27,19 @@ package io.questdb.client.cutlass.qwp.client;
 /**
  * Callback interface for consuming a streamed QWP egress query result.
  * <p>
- * Invoked by {@link QwpQueryClient#execute(String, QwpColumnBatchHandler)}:
+ * Invoked by {@link QwpQueryClient#execute(CharSequence, QwpColumnBatchHandler)}:
  * once per {@code RESULT_BATCH} frame via {@link #onBatch(QwpColumnBatch)},
  * then exactly once via either {@link #onEnd(long)} or
  * {@link #onError(byte, String)} (or {@link #onExecDone} for non-SELECT queries).
+ * <p>
+ * The client calls the most detailed overload of each terminal callback --
+ * {@link #onEnd(long, long, QwpQueryDetails)},
+ * {@link #onError(long, byte, String, int)} and
+ * {@link #onExecDone(long, short, long, QwpQueryDetails)} -- and each overload
+ * delegates by default to the next simpler one, down to the abstract
+ * {@link #onEnd(long)} and {@link #onError(byte, String)} and the no-op
+ * {@link #onExecDone(short, long)}. Override the overload that carries what you
+ * need; the simpler ones then do not fire for that event.
  * <p>
  * The {@link QwpColumnBatch} passed to {@link #onBatch} is valid only for the
  * duration of that call. Copy any values you need to retain.
@@ -72,6 +81,23 @@ public interface QwpColumnBatchHandler {
     }
 
     /**
+     * Details-aware overload of {@link #onEnd(long, long)}. Receives what the
+     * query reported besides its rows on the request of {@link QwpQueryOptions}:
+     * the row count of the whole result set and execution statistics. The
+     * default delegates to {@link #onEnd(long, long)} for backwards
+     * compatibility; override this method when you need the details.
+     *
+     * @param requestId client-assigned request id (matches {@link QwpColumnBatch#requestId()})
+     * @param totalRows server-reported number of rows streamed, which a row window
+     *                  of {@link QwpQueryOptions} bounds
+     * @param details   the row count and statistics the server reported; never null,
+     *                  and valid only for the duration of this call
+     */
+    default void onEnd(long requestId, long totalRows, QwpQueryDetails details) {
+        onEnd(requestId, totalRows);
+    }
+
+    /**
      * Invoked exactly once if the query fails at any point, instead of
      * {@link #onEnd} / {@link #onExecDone}.
      *
@@ -98,6 +124,29 @@ public interface QwpColumnBatchHandler {
      */
     default void onError(long requestId, byte status, String message) {
         onError(status, message);
+    }
+
+    /**
+     * Position-aware overload of {@link #onError(long, byte, String)}. When the
+     * query asked for the error position with
+     * {@link QwpQueryOptions#errorPosition(boolean)} and the server reported it,
+     * {@code message} is the bare error message and {@code position} the
+     * {@code char} index into the SQL text the error points at. Otherwise
+     * {@code message} is what the server sent, which may start with the
+     * position in brackets, and {@code position} is
+     * {@link QwpEgressMsgKind#NO_ERROR_POSITION}, as it is for errors that do
+     * not come from the SQL text, such as a cancellation or a transport
+     * failure. The default delegates to {@link #onError(long, byte, String)} for
+     * backwards compatibility; override this method when you need the position.
+     *
+     * @param requestId client-assigned request id, or {@code -1} if no request was in flight
+     * @param status    one of the QWP status codes (e.g., {@code STATUS_PARSE_ERROR})
+     * @param message   server-supplied error message (may be empty)
+     * @param position  {@code char} index into the SQL text, or
+     *                  {@link QwpEgressMsgKind#NO_ERROR_POSITION}
+     */
+    default void onError(long requestId, byte status, String message, int position) {
+        onError(requestId, status, message);
     }
 
     /**
@@ -162,5 +211,23 @@ public interface QwpColumnBatchHandler {
      */
     default void onExecDone(long requestId, short opType, long rowsAffected) {
         onExecDone(opType, rowsAffected);
+    }
+
+    /**
+     * Details-aware overload of {@link #onExecDone(long, short, long)}. Receives
+     * the execution statistics the query reported on the request of
+     * {@link QwpQueryOptions#stats(boolean)}; a statement that produces no rows
+     * reports no row count. The default delegates to
+     * {@link #onExecDone(long, short, long)} for backwards compatibility;
+     * override this method when you need the statistics.
+     *
+     * @param requestId    client-assigned request id (matches {@link QwpColumnBatch#requestId()})
+     * @param opType       server-side opType constant (CompiledQuery.SELECT / INSERT / UPDATE / CREATE_TABLE / etc.)
+     * @param rowsAffected rows inserted / updated / deleted; 0 for pure DDL
+     * @param details      the statistics the server reported; never null, and valid
+     *                     only for the duration of this call
+     */
+    default void onExecDone(long requestId, short opType, long rowsAffected, QwpQueryDetails details) {
+        onExecDone(requestId, opType, rowsAffected);
     }
 }

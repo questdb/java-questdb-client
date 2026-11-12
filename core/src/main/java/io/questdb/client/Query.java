@@ -26,6 +26,7 @@ package io.questdb.client;
 
 import io.questdb.client.cutlass.qwp.client.QwpBindSetter;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
+import io.questdb.client.cutlass.qwp.client.QwpQueryOptions;
 import io.questdb.client.cutlass.qwp.client.QwpServerInfo;
 
 import java.io.Closeable;
@@ -43,9 +44,9 @@ import java.io.Closeable;
  * creates one small lease handle per borrow (often scalar-replaced by the JIT
  * when used with try-with-resources).
  * <p>
- * Lifecycle: configure with {@link #sql}, optional {@link #binds}, and
- * {@link #handler}, then call {@link #submit()} to obtain a {@link Completion}
- * and {@code await()} it before the next {@link #submit()}.
+ * Lifecycle: configure with {@link #sql}, optional {@link #binds} and
+ * {@link #options}, and {@link #handler}, then call {@link #submit()} to obtain
+ * a {@link Completion} and {@code await()} it before the next {@link #submit()}.
  * <p>
  * Thread safety: not thread-safe and single-flight -- one in-flight query per
  * handle. To run queries concurrently, borrow one handle per concurrent query.
@@ -99,6 +100,16 @@ public interface Query extends Closeable {
      * thread); use {@link #cancel()} to stop from inside a handler.
      */
     Query handler(QwpColumnBatchHandler handler);
+
+    /**
+     * Sets the per-query options: a row window that pages through the result
+     * set, and what the server reports besides the rows -- the row count of the
+     * whole result set, execution statistics and the error position. See
+     * {@link QwpQueryOptions}. The handle copies the values, so the instance can
+     * be reused right away; they apply to every {@link #submit()} until changed.
+     * Pass null to drop them.
+     */
+    Query options(QwpQueryOptions options);
 
     /**
      * Sets the SQL text. The buffer is not retained past {@link #submit()}.
