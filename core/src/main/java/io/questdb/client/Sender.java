@@ -2824,11 +2824,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * sends rows to the server without committing them and {@code flush()}
          * commits, so a transaction can be any size. In addition the transaction
          * never commits in parts: a row that would take a table past the server's
-         * {@code qwp.max.uncommitted.rows}, or a transaction that outgrows
+         * {@code qwp.max.uncommitted.rows}, or the transaction past
          * {@code sf_max_total_bytes}, throws
          * {@link io.questdb.client.cutlass.qwp.client.TransactionTooLargeException}
-         * and leaves the transaction open, and {@code close()} without
-         * {@code flush()} discards the transaction instead of committing it.
+         * and is not added, and {@code close()} without {@code flush()} discards the
+         * transaction instead of committing it.
          * A sender with no auto-flush trigger (see {@link #disableAutoFlush()}) is
          * in this mode unless {@link #transactional(boolean)} selects the mode.
          * WebSocket transport only.

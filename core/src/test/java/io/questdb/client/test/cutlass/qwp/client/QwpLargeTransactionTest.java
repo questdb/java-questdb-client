@@ -67,6 +67,9 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  */
 public class QwpLargeTransactionTest {
     private static final int CAP = 32 * 1024;
+    // The settings a refusal at the client buffer names.
+    private static final String CLIENT_BUFFER_REMEDY = "Raise sf_max_total_bytes, or set sf_dir to keep the "
+            + "transaction on disk";
     // What closing a sender or returning a pooled lease logs when it discards an open
     // strict transaction of 1000 rows, behind the action that discarded it.
     private static final String DISCARD_WARNING = " discarded an uncommitted transaction of 1000 rows: a strict "
@@ -905,8 +908,7 @@ public class QwpLargeTransactionTest {
                         writeRows(s, "a", 99, 1);
                         Assert.fail("the 100th row of a table must be refused");
                     } catch (TransactionTooLargeException e) {
-                        TestUtils.assertContains(e.getMessage(),
-                                "transaction too large for the server [table=a, rows=100, maxUncommittedRows=100]");
+                        Assert.assertEquals(serverRowLimitError("a", 100), e.getMessage());
                     }
                     // Other tables keep their own count.
                     writeRows(s, "b", 0, 99);
@@ -939,7 +941,7 @@ public class QwpLargeTransactionTest {
                         writeRows(s, "a", 9, 1);
                         Assert.fail("the 10th row must be refused");
                     } catch (TransactionTooLargeException e) {
-                        TestUtils.assertContains(e.getMessage(), "maxUncommittedRows=10");
+                        Assert.assertEquals(serverRowLimitError("a", 10), e.getMessage());
                     }
                     ws.applyServerTransactionLimits(0, false);
                     // 0 means "not advertised": the server default applies.
@@ -951,9 +953,84 @@ public class QwpLargeTransactionTest {
     }
 
     @Test
+    public void testStrictCommitTooLargeForClientBufferIsNotSent() throws Exception {
+        // With auto_flush_bytes=off on top of auto_flush=off, the whole transaction
+        // waits for flush(), which sends one frame per table. Ten tables of ~28 KB need five 64 KiB
+        // segments, and sf_max_total_bytes holds four: flush() sends nothing.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                try (Sender s = Sender.fromConfig(conf(server) + "auto_flush=off;auto_flush_bytes=off;"
+                        + "sf_max_segment_bytes=64k;sf_max_total_bytes=256k;")) {
+                    writeTables(s, 0, 10);
+                    long refusedBytes = -1;
+                    try {
+                        s.flush();
+                        Assert.fail("the client buffer cannot hold the commit");
+                    } catch (TransactionTooLargeException e) {
+                        refusedBytes = assertClientBufferRefusal(e, 262_144, "so the flush was not sent");
+                    }
+                    Assert.assertEquals("nothing was sent", 0, h.frames.size());
+                    s.rollback();
+                    // The same rows, one table per transaction: the refusal reported
+                    // what these frames add up to.
+                    for (int t = 0; t < 10; t++) {
+                        writeTables(s, t, 1);
+                        s.flush();
+                    }
+                    Assert.assertTrue(s.drain(5_000));
+                    Assert.assertEquals(10, h.commitFrames());
+                    Assert.assertEquals(refusedBytes, frameBytes(h));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testStrictDeferredFlushTooLargeForClientBufferIsNotSent() throws Exception {
+        // setDeferCommit(true) makes flush() send rows without committing them. A
+        // strict transaction keeps room for its commit next to such a frame. With
+        // frames as large as a segment that takes four segments, and
+        // sf_max_total_bytes holds three: flush() sends nothing, and the transaction
+        // takes no further rows. The commit itself fits.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, 64 * 1024)) {
+                long refusedBytes = -1;
+                try (QwpWebSocketSender s = (QwpWebSocketSender) Sender.fromConfig(conf(server)
+                        + "transaction=strict;sf_max_segment_bytes=64k;sf_max_total_bytes=192k;")) {
+                    s.setDeferCommit(true);
+                    writeRows(s, "t", 0, 1);
+                    try {
+                        s.flush();
+                        Assert.fail("the client buffer cannot hold a deferred frame and the commit");
+                    } catch (TransactionTooLargeException e) {
+                        refusedBytes = assertClientBufferRefusal(e, 196_608, "so the flush was not sent");
+                    }
+                    Assert.assertEquals("nothing was sent", 0, h.frames.size());
+                    try {
+                        writeRows(s, "t", 1, 1);
+                        Assert.fail("the transaction must take no further rows");
+                    } catch (TransactionTooLargeException e) {
+                        Assert.assertEquals(refusedBytes,
+                                assertClientBufferRefusal(e, 196_608, "so the row was not added"));
+                    }
+                    s.setDeferCommit(false);
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                }
+                // The commit carries the row the refused flush held, and only that row.
+                Assert.assertEquals(1, h.frames.size());
+                Assert.assertTrue(h.frames.get(0).isCommit());
+                Assert.assertEquals(refusedBytes, h.frames.get(0).size);
+            }
+        });
+    }
+
+    @Test
     public void testStrictTransactionTooLargeForClientBufferFailsFast() throws Exception {
         // 64 KiB segments, 256 KiB budget: four segments. A strict transaction keeps
-        // room for its commit, so it must refuse the flush that would take that room
+        // room for its commit, so once its frames fill the rest it must refuse rows
         // instead of blocking for sf_append_deadline_millis.
         assertMemoryLeak(() -> {
             TxnServer h = new TxnServer();
@@ -961,29 +1038,35 @@ public class QwpLargeTransactionTest {
                 try (Sender s = Sender.fromConfig(conf(server) + "transaction=strict;"
                         + "sf_max_segment_bytes=64k;sf_max_total_bytes=256k;sf_append_deadline_millis=30000;")) {
                     long start = System.nanoTime();
-                    int row = 0;
+                    long refusedBytes = -1;
                     try {
-                        for (; row < 100_000; row++) {
+                        for (int row = 0; row < 100_000; row++) {
                             s.table("t").longColumn("v", row).stringColumn("s", PAD).atNow();
                         }
                         Assert.fail("a transaction larger than the client buffer must be refused");
                     } catch (TransactionTooLargeException e) {
-                        TestUtils.assertContains(e.getMessage(), "transaction too large for the client buffer");
+                        // As at the server's row limit, the row that hit the limit is not
+                        // in the transaction.
+                        refusedBytes = assertClientBufferRefusal(e, 262_144, "so the row was not added");
                     }
                     Assert.assertTrue("must fail fast, not wait for the append deadline",
                             System.nanoTime() - start < TimeUnit.SECONDS.toNanos(10));
-                    // The row being added stays in the transaction; further rows are refused.
+                    // Further rows are refused the same way.
                     try {
                         s.table("t").longColumn("v", -1).stringColumn("s", PAD).atNow();
                         Assert.fail("a full transaction must refuse rows");
                     } catch (TransactionTooLargeException e) {
-                        TestUtils.assertContains(e.getMessage(), "the row was not added");
+                        Assert.assertEquals(refusedBytes,
+                                assertClientBufferRefusal(e, 262_144, "so the row was not added"));
                     }
                     // The reserved room lets the transaction commit.
                     s.flush();
                     Assert.assertTrue(s.drain(5_000));
                     Assert.assertTrue(h.frames.get(h.frames.size() - 1).isCommit());
                     Assert.assertEquals(1, h.commitFrames());
+                    // The refusal reported the size of the transaction that committed:
+                    // the rows accepted before it, the last of which filled the buffer.
+                    Assert.assertEquals(refusedBytes, frameBytes(h));
                     // And the next transaction starts with an empty buffer.
                     writeRows(s, "t", 0, 100);
                     s.flush();
@@ -1096,6 +1179,20 @@ public class QwpLargeTransactionTest {
         } catch (LineSenderException e) {
             TestUtils.assertContains(e.getMessage(), "transaction aborted");
         }
+    }
+
+    // Asserts the error of a strict transaction the client buffer cannot hold, with
+    // 64 KiB segments, and returns the transaction size it reports.
+    private static long assertClientBufferRefusal(TransactionTooLargeException e, long ringCapacityBytes, String outcome) {
+        String message = e.getMessage();
+        String prefix = "transaction too large for the client buffer [transactionBytes=";
+        Assert.assertTrue(message, message.startsWith(prefix));
+        long transactionBytes = Long.parseLong(message.substring(prefix.length(), message.indexOf(',')));
+        Assert.assertTrue(message, transactionBytes > 0);
+        Assert.assertEquals(prefix + transactionBytes + ", ringCapacityBytes=" + ringCapacityBytes
+                + ", segmentBytes=65536]; the client holds a strict transaction until the server commits it, "
+                + "and sf_max_total_bytes cannot hold this one, " + outcome + ". " + CLIENT_BUFFER_REMEDY, message);
+        return transactionBytes;
     }
 
     // Build-time validation runs before the sender connects, so no server is needed.
@@ -1212,9 +1309,31 @@ public class QwpLargeTransactionTest {
         return server;
     }
 
+    private static long frameBytes(TxnServer h) {
+        long bytes = 0;
+        for (TxnFrame f : h.frames) {
+            bytes += f.size;
+        }
+        return bytes;
+    }
+
+    private static String serverRowLimitError(String table, long maxUncommittedRows) {
+        return "transaction too large for the server [table=" + table + ", rows=" + maxUncommittedRows
+                + ", maxUncommittedRows=" + maxUncommittedRows + "]; the server commits a table's rows on its "
+                + "own once qwp.max.uncommitted.rows of them are uncommitted, which would split the transaction, "
+                + "so the row was not added. Raise qwp.max.uncommitted.rows on the server";
+    }
+
     private static void writeRows(Sender s, String table, int from, int count) {
         for (int i = from, n = from + count; i < n; i++) {
             s.table(table).longColumn("v", i).stringColumn("s", PAD).atNow();
+        }
+    }
+
+    // ~28 KB in each of count tables, from table t<first>: each fits a 32 KiB frame.
+    private static void writeTables(Sender s, int first, int count) {
+        for (int t = first, n = first + count; t < n; t++) {
+            writeRows(s, "t" + t, 0, 280);
         }
     }
 
