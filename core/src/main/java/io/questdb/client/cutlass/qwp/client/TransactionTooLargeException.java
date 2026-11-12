@@ -27,11 +27,12 @@ package io.questdb.client.cutlass.qwp.client;
 import io.questdb.client.cutlass.line.LineSenderException;
 
 /**
- * A strict transaction ({@code transaction=strict} or {@code auto_flush=off} on the
- * WebSocket transport) grew past a limit that would stop it from committing as one
- * transaction: the server's per-table {@code qwp.max.uncommitted.rows}, past which
- * the server commits the rows on its own, or the client's {@code sf_max_total_bytes},
- * which must hold the whole uncommitted transaction until the server commits it.
+ * A strict transaction ({@code transaction=strict}, or a sender with no auto-flush
+ * trigger such as {@code auto_flush=off}, on the WebSocket transport) grew past a
+ * limit that would stop it from committing as one transaction: the server's
+ * per-table {@code qwp.max.uncommitted.rows}, past which the server commits the
+ * rows on its own, or the client's {@code sf_max_total_bytes}, which must hold the
+ * whole uncommitted transaction until the server commits it.
  * <p>
  * Thrown before anything that would cross the limit reaches the server, and the
  * transaction stays open: the caller can still commit the rows accepted so far

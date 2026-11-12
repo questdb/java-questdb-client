@@ -48,7 +48,9 @@ import java.time.temporal.ChronoUnit;
  * <p>
  * Behaviour difference from a raw Sender: {@link #close()} flushes the buffer
  * and returns the slot to the pool. The underlying Sender is only truly closed
- * when {@link io.questdb.client.QuestDB#close()} shuts the pool down.
+ * when {@link io.questdb.client.QuestDB#close()} shuts the pool down. A
+ * WebSocket Sender in strict transactional mode commits only on flush(), so
+ * there close() discards the open transaction instead of flushing it.
  * <p>
  * Because the slot is reused across borrows, this wrapper -- not the slot --
  * carries the lease identity. A stale handle (held after {@link #close()}, with

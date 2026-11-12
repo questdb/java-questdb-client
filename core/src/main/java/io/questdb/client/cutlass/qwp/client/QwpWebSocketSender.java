@@ -140,9 +140,7 @@ public class QwpWebSocketSender implements Sender {
      * {@code autoFlushBytes} value that sizes the byte trigger from the frames the
      * connection can carry: 90% of the smaller of the server's advertised
      * {@code X-QWP-Max-Batch-Size} and the store-and-forward segment. It is the
-     * builder default, so a batch never grows past what one frame can hold. A pure
-     * manual-flush sender (non-transactional, row and interval triggers off) keeps
-     * no byte trigger, as before.
+     * builder default, so a batch never grows past what one frame can hold.
      */
     public static final int AUTO_FLUSH_BYTES_AUTO = -1;
     public static final long DEFAULT_AUTH_TIMEOUT_MS = 15_000L;
@@ -709,8 +707,8 @@ public class QwpWebSocketSender implements Sender {
     // True when the current foreground connection confirmed X-QWP-Rollback, so the
     // rollback control frame may go out. Captured on each FOREGROUND handshake.
     private volatile boolean serverRollbackEnabled;
-    // Strict transactional mode (transaction=strict, or auto_flush=off on this
-    // transport): implies transactional, never lets an open transaction commit in
+    // Strict transactional mode (transaction=strict, or a sender with no auto-flush
+    // trigger): implies transactional, never lets an open transaction commit in
     // parts, and close() discards instead of committing. See setStrictTransactional.
     private boolean strictTransactional;
     // Set once the open transaction can no longer be rolled back or committed as
@@ -1866,6 +1864,9 @@ public class QwpWebSocketSender implements Sender {
                     // ack the drain below waits for; any other server rolls them back
                     // when the connection closes, and a recovered slot retires them
                     // as an aborted transaction.
+                    if (!txnAborted) {
+                        warnDiscardedTransaction("close()");
+                    }
                     discardPendingRows();
                     if (hasDeferredMessages && serverRollbackEnabled && !txnAborted) {
                         try {
@@ -3454,6 +3455,9 @@ public class QwpWebSocketSender implements Sender {
      */
     public boolean discardTransactionForReuse() {
         checkNotClosed();
+        if (!txnAborted) {
+            warnDiscardedTransaction("returning the sender to the pool");
+        }
         discardPendingRows();
         if (txnAborted) {
             return false;
@@ -3463,6 +3467,10 @@ public class QwpWebSocketSender implements Sender {
             return true;
         }
         if (!serverRollbackEnabled) {
+            // Only closing the connection discards the frames already sent, so the
+            // transaction is over. Aborting it also keeps the close() that retires
+            // the connection from warning about the same rows again.
+            txnAborted = true;
             return false;
         }
         rollbackOpenTransaction();
@@ -3826,7 +3834,6 @@ public class QwpWebSocketSender implements Sender {
         if (strict) {
             this.transactional = true;
         }
-        recomputeFrameBudget();
     }
 
     /**
@@ -3839,7 +3846,6 @@ public class QwpWebSocketSender implements Sender {
         if (!transactional) {
             this.strictTransactional = false;
         }
-        recomputeFrameBudget();
     }
 
     /**
@@ -7620,9 +7626,9 @@ public class QwpWebSocketSender implements Sender {
      *   trigger off.</li>
      *   <li>{@link #AUTO_FLUSH_BYTES_AUTO} sets the trigger to 90% of the frame
      *   size, assuming the server's default cap when nothing is advertised, so
-     *   that a batch never grows past what one frame can carry. A pure
-     *   manual-flush sender (not transactional, row and interval triggers off)
-     *   keeps no byte trigger, so its flush stays one commit as before.</li>
+     *   that a batch never grows past what one frame can carry. The builder makes
+     *   a sender with no other auto-flush trigger transactional, so this trigger
+     *   never splits such a sender's flush into several commits.</li>
      * </ul>
      */
     private void recomputeFrameBudget() {
@@ -7634,8 +7640,7 @@ public class QwpWebSocketSender implements Sender {
             long limit = advertised > 0 ? budget
                     : (segmentPayload == Long.MAX_VALUE ? Long.MAX_VALUE : segmentPayload * 9 / 10);
             effectiveAutoFlushBytes = (int) Math.min(autoFlushBytes, limit);
-        } else if (autoFlushBytes == AUTO_FLUSH_BYTES_AUTO
-                && (transactional || autoFlushRows > 0 || autoFlushIntervalNanos > 0)) {
+        } else if (autoFlushBytes == AUTO_FLUSH_BYTES_AUTO) {
             effectiveAutoFlushBytes = (int) budget;
         } else {
             effectiveAutoFlushBytes = 0;
@@ -7674,6 +7679,27 @@ public class QwpWebSocketSender implements Sender {
         return new LineSenderException("transaction aborted: rollback could not undo the frames of the "
                 + "open transaction already sent, because the server does not support QWP rollback. Close "
                 + "the sender to discard them; the server rolls them back when the connection closes");
+    }
+
+    /**
+     * Strict mode commits only on flush(), so closing the sender or returning a
+     * pooled lease discards the open transaction. Logs it when the transaction holds
+     * rows: a caller that relied on close() to commit, as a sender with auto-flush
+     * triggers does, would otherwise lose them without a trace. Counts the rows
+     * already sent in deferred frames and those still buffered; call it before
+     * discardPendingRows() clears the latter.
+     */
+    private void warnDiscardedTransaction(String action) {
+        long rows = pendingRowCount;
+        for (int i = 0, n = txnTables.size(); i < n; i++) {
+            rows += txnTables.getQuick(i).getTxnSentRows();
+        }
+        if (rows > 0) {
+            LOG.warn("{} discarded an uncommitted transaction of {} rows: a strict transactional sender "
+                    + "(transaction=strict, or one with no auto-flush trigger) commits only on flush(). Call "
+                    + "flush() before close() to keep the rows, or ignore this if the discard is intentional",
+                    action, rows);
+        }
     }
 
     /**

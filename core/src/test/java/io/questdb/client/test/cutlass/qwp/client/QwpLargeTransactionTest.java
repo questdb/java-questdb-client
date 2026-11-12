@@ -24,6 +24,10 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import io.questdb.client.QuestDB;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
@@ -35,17 +39,20 @@ import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
+import java.util.function.Function;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
@@ -60,40 +67,62 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  */
 public class QwpLargeTransactionTest {
     private static final int CAP = 32 * 1024;
+    // What closing a sender or returning a pooled lease logs when it discards an open
+    // strict transaction of 1000 rows, behind the action that discarded it.
+    private static final String DISCARD_WARNING = " discarded an uncommitted transaction of 1000 rows: a strict "
+            + "transactional sender (transaction=strict, or one with no auto-flush trigger) commits only on "
+            + "flush(). Call flush() before close() to keep the rows, or ignore this if the discard is intentional";
+    private static final String NO_TRIGGER_TRANSACTION_OFF_ERROR = "auto-flush is off (auto_flush=off, or "
+            + "auto_flush_rows=off and auto_flush_interval=off), which on WebSocket selects strict transactional "
+            + "mode and cannot be combined with transaction=off; set transaction=on or turn on an auto-flush trigger";
     // ~100 encoded bytes per row: 1000 rows (the default row trigger) are ~100 KB,
     // three times the 32 KiB cap.
     private static final String PAD = TestUtils.repeat("x", 90);
 
     @Test
-    public void testAutoFlushOffIsStrictTransactionOfAnySize() throws Exception {
+    public void testAutoFlushBytesAloneCommitsEachBatch() throws Exception {
+        // A positive auto_flush_bytes is an auto-flush trigger: with the row and
+        // interval triggers off, every batch it cuts commits on its own, as before.
+        // transaction=off may say so explicitly.
         assertMemoryLeak(() -> {
-            TxnServer h = new TxnServer();
-            try (TestWebSocketServer server = start(h, CAP)) {
-                try (Sender s = Sender.fromConfig(conf(server) + "auto_flush=off;")) {
-                    Assert.assertTrue(((QwpWebSocketSender) s).isStrictTransactional());
-                    writeRows(s, "t", 0, 2_000);
-                    // ~200 KB went out as deferred frames before flush(); none commits.
-                    Assert.assertTrue(h.awaitFrames(5));
-                    Assert.assertEquals(0, h.commitFrames());
-                    s.flush();
-                    Assert.assertTrue(s.drain(5_000));
+            String[] configs = {
+                    "auto_flush_rows=off;auto_flush_interval=off;auto_flush_bytes=8192;",
+                    "auto_flush_rows=off;auto_flush_interval=off;auto_flush_bytes=8192;transaction=off;"
+            };
+            for (String config : configs) {
+                TxnServer h = new TxnServer();
+                try (TestWebSocketServer server = start(h, CAP)) {
+                    try (Sender s = Sender.fromConfig(conf(server) + config)) {
+                        QwpWebSocketSender ws = (QwpWebSocketSender) s;
+                        Assert.assertFalse(config, ws.isTransactional());
+                        Assert.assertEquals(config, 8_192, ws.getEffectiveAutoFlushBytes());
+                        // ~20 KB: the byte trigger sends at least two batches, and each
+                        // commits before any flush().
+                        writeRows(s, "t", 0, 200);
+                        Assert.assertTrue(config, h.awaitFrames(2));
+                        for (TxnFrame f : h.frames) {
+                            Assert.assertTrue(config + ": " + h.frames, f.isCommit());
+                        }
+                    }
+                    // close() commits the rest.
+                    Assert.assertEquals(config, h.frames, h.committedFrames());
                 }
-                assertFramesWithinCap(h, CAP);
-                assertOneTransaction(h);
             }
         });
     }
 
     @Test
-    public void testAutoFlushOffRejectsTransactionOff() throws Exception {
+    public void testAutoFlushOffRejectsPositiveAutoFlushBytes() throws Exception {
+        // auto_flush=off turns every auto-flush trigger off, so a byte trigger
+        // contradicts it, as a row or interval trigger already does. The ws:: parser
+        // applies the trigger keys before auto_flush, whatever their order.
+        // auto_flush_bytes=off is no trigger; see
+        // testNoAutoFlushTriggerWithAutoFlushBytesOffSendsOneFramePerFlush.
         assertMemoryLeak(() -> {
-            try {
-                Sender.fromConfig("ws::addr=localhost:1;auto_flush=off;transaction=off;").close();
-                Assert.fail("auto_flush=off must not combine with transaction=off");
-            } catch (LineSenderException e) {
-                TestUtils.assertContains(e.getMessage(),
-                        "auto_flush=off selects strict transactional mode on WebSocket");
-            }
+            assertConfigRejected("auto_flush=off;auto_flush_bytes=65536;",
+                    "auto flush bytes was already configured [autoFlushBytes=65536]");
+            assertConfigRejected("auto_flush_bytes=65536;auto_flush=off;",
+                    "auto flush bytes was already configured [autoFlushBytes=65536]");
         });
     }
 
@@ -161,29 +190,6 @@ public class QwpLargeTransactionTest {
     }
 
     @Test
-    public void testManualFlushKeepsOneCommitPerFlush() throws Exception {
-        // A non-transactional sender with every auto-flush trigger off keeps its
-        // flush as one commit: no byte trigger splits the batch early.
-        assertMemoryLeak(() -> {
-            TxnServer h = new TxnServer();
-            try (TestWebSocketServer server = start(h, CAP)) {
-                try (Sender s = Sender.fromConfig(conf(server) + "auto_flush_rows=off;auto_flush_interval=off;")) {
-                    Assert.assertEquals(0, ((QwpWebSocketSender) s).getEffectiveAutoFlushBytes());
-                    writeRows(s, "a", 0, 250);
-                    writeRows(s, "b", 0, 250);
-                    Assert.assertEquals(0, h.frames.size());
-                    s.flush();
-                    Assert.assertTrue(s.drain(5_000));
-                }
-                // The 50 KB batch splits per table at flush: one deferred frame, one commit.
-                Assert.assertEquals(2, h.frames.size());
-                Assert.assertTrue(h.frames.get(0).isDeferred());
-                Assert.assertTrue(h.frames.get(1).isCommit());
-            }
-        });
-    }
-
-    @Test
     public void testNewSymbolsCountTowardByteTrigger() throws Exception {
         // Symbol columns buffer 4-byte ids; the 300-byte strings ride in the frame's
         // dictionary section. Counting them keeps the frame within the cap.
@@ -200,6 +206,225 @@ public class QwpLargeTransactionTest {
                 }
                 assertFramesWithinCap(h, CAP);
                 Assert.assertTrue(h.frames.size() >= 10);
+            }
+        });
+    }
+
+    @Test
+    public void testNoAutoFlushTriggerIsStrictTransactionOfAnySize() throws Exception {
+        // Every way to turn off all auto-flush triggers builds the same sender: a
+        // strict transaction of any size, which only flush() commits.
+        // auto_flush_rows=off with auto_flush_interval=off used to send each flush as
+        // one batch, which failed past the frame cap, and to commit on close().
+        assertMemoryLeak(() -> {
+            for (NoTriggerSpelling spelling : noTriggerSpellings()) {
+                TxnServer h = new TxnServer();
+                List<TxnFrame> committed = null;
+                try (TestWebSocketServer server = start(h, CAP)) {
+                    try (Sender s = spelling.build(conf(server))) {
+                        QwpWebSocketSender ws = (QwpWebSocketSender) s;
+                        Assert.assertTrue(spelling.name, ws.isStrictTransactional());
+                        Assert.assertEquals(spelling.name, CAP * 9 / 10, ws.getEffectiveAutoFlushBytes());
+                        writeRows(s, "t", 0, 2_000);
+                        // ~200 KB went out as deferred frames before flush(); none commits.
+                        Assert.assertTrue(spelling.name, h.awaitFrames(5));
+                        Assert.assertEquals(spelling.name, 0, h.commitFrames());
+                        s.flush();
+                        Assert.assertTrue(spelling.name, s.drain(5_000));
+                        assertFramesWithinCap(h, CAP);
+                        assertOneTransaction(h);
+                        committed = h.committedFrames();
+                        Assert.assertEquals(spelling.name, h.frames, committed);
+                        // close() without flush() discards the next transaction, its
+                        // frames already sent included.
+                        writeRows(s, "t", 2_000, 1_000);
+                        Assert.assertTrue(spelling.name, h.awaitFrames(committed.size() + 2));
+                    }
+                    Assert.assertEquals(spelling.name, committed, h.committedFrames());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testNoAutoFlushTriggerRejectsTransactionOff() throws Exception {
+        // With no auto-flush trigger only flush() commits, and a non-transactional
+        // flush has to fit one frame, so every spelling refuses transaction=off.
+        assertMemoryLeak(() -> {
+            assertConfigRejected("auto_flush=off;transaction=off;", NO_TRIGGER_TRANSACTION_OFF_ERROR);
+            assertConfigRejected("auto_flush_rows=off;auto_flush_interval=off;transaction=off;",
+                    NO_TRIGGER_TRANSACTION_OFF_ERROR);
+            assertConfigRejected("auto_flush_rows=off;auto_flush_interval=off;auto_flush_bytes=off;transaction=off;",
+                    NO_TRIGGER_TRANSACTION_OFF_ERROR);
+        });
+    }
+
+    @Test
+    public void testNoAutoFlushTriggerWithAutoFlushBytesOffSendsOneFramePerFlush() throws Exception {
+        // auto_flush_bytes=off opts out of sizing batches to the frame: the
+        // transaction still commits only on flush(), but the application keeps it
+        // within one frame per table, and a flush past the cap is refused and keeps
+        // the rows, as auto_flush_bytes=off documents.
+        assertMemoryLeak(() -> {
+            String[] configs = {
+                    "auto_flush=off;auto_flush_bytes=off;",
+                    "auto_flush_rows=off;auto_flush_interval=off;auto_flush_bytes=off;"
+            };
+            for (String config : configs) {
+                TxnServer h = new TxnServer();
+                try (TestWebSocketServer server = start(h, CAP)) {
+                    try (Sender s = Sender.fromConfig(conf(server) + config)) {
+                        QwpWebSocketSender ws = (QwpWebSocketSender) s;
+                        Assert.assertTrue(config, ws.isStrictTransactional());
+                        Assert.assertEquals(config, 0, ws.getEffectiveAutoFlushBytes());
+                        // ~20 KB fits the 32 KiB cap: one frame, which commits.
+                        writeRows(s, "t", 0, 200);
+                        s.flush();
+                        Assert.assertTrue(config, s.drain(5_000));
+                        Assert.assertEquals(config, 1, h.frames.size());
+                        Assert.assertTrue(config, h.frames.get(0).isCommit());
+                        // ~100 KB does not.
+                        writeRows(s, "t", 200, 1_000);
+                        try {
+                            s.flush();
+                            Assert.fail(config + ": a flush past the cap must be refused");
+                        } catch (BatchTooLargeForCapException e) {
+                            TestUtils.assertContains(e.getMessage(), "serverMaxBatchSize=" + CAP);
+                        }
+                        s.reset();
+                    }
+                    Assert.assertEquals(config, 1, h.frames.size());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testNoAutoFlushTriggerWithTransactionOnCommitsOnClose() throws Exception {
+        // An explicit transaction=on wins over the strict mode a sender with no
+        // auto-flush trigger otherwise gets: close() commits, as transaction=on does.
+        assertMemoryLeak(() -> {
+            for (NoTriggerSpelling spelling : noTriggerSpellings()) {
+                TxnServer h = new TxnServer();
+                try (TestWebSocketServer server = start(h, CAP)) {
+                    try (Sender s = spelling.build(conf(server) + "transaction=on;")) {
+                        QwpWebSocketSender ws = (QwpWebSocketSender) s;
+                        Assert.assertTrue(spelling.name, ws.isTransactional());
+                        Assert.assertFalse(spelling.name, ws.isStrictTransactional());
+                        writeRows(s, "t", 0, 2_000);
+                        Assert.assertTrue(spelling.name, h.awaitFrames(5));
+                        Assert.assertEquals(spelling.name, 0, h.commitFrames());
+                    }
+                    assertFramesWithinCap(h, CAP);
+                    assertOneTransaction(h);
+                    Assert.assertEquals(spelling.name, h.frames, h.committedFrames());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testOneAutoFlushTriggerLeftKeepsEveryBatchCommitting() throws Exception {
+        // Turning off the row or the interval trigger alone leaves the other one, so
+        // the sender is not transactional: every batch it sends commits on its own.
+        assertMemoryLeak(() -> {
+            String[] configs = {"auto_flush_rows=off;", "auto_flush_interval=off;"};
+            for (String config : configs) {
+                TxnServer h = new TxnServer();
+                try (TestWebSocketServer server = start(h, CAP)) {
+                    try (Sender s = Sender.fromConfig(conf(server) + config)) {
+                        QwpWebSocketSender ws = (QwpWebSocketSender) s;
+                        Assert.assertFalse(config, ws.isTransactional());
+                        Assert.assertEquals(config, CAP * 9 / 10, ws.getEffectiveAutoFlushBytes());
+                        // ~100 KB: the byte trigger sends at least three batches before
+                        // any flush(), and each commits.
+                        writeRows(s, "t", 0, 1_000);
+                        Assert.assertTrue(config, h.awaitFrames(3));
+                        for (TxnFrame f : h.frames) {
+                            Assert.assertTrue(config + ": " + h.frames, f.isCommit());
+                        }
+                    }
+                    Assert.assertEquals(config, h.frames, h.committedFrames());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testPooledLeaseWithAbortedTransactionRetiresQuietly() throws Exception {
+        // reset() could not undo the frames already sent, so the transaction is
+        // aborted and every flush already said so. Returning the lease retires the
+        // connection, which discards the frames, without warning about them again.
+        assertMemoryLeak(() -> {
+            ListAppender<ILoggingEvent> log = captureSenderLog();
+            try {
+                TxnServer h = new TxnServer();
+                try (TestWebSocketServer server = start(h, CAP)) {
+                    try (QuestDB db = QuestDB.connect(conf(server)
+                            + "auto_flush_rows=off;auto_flush_interval=off;query_pool_min=0;")) {
+                        Sender lease = db.borrowSender();
+                        writeRows(lease, "t", 0, 1_000);
+                        lease.reset();
+                        assertAborted(lease::flush);
+                        lease.close();
+                        Sender next = db.borrowSender();
+                        writeRows(next, "t", 0, 10);
+                        next.flush();
+                        Assert.assertTrue(next.drain(5_000));
+                        next.close();
+                    }
+                    List<TxnFrame> committed = h.committedFrames();
+                    Assert.assertEquals("only the next lease commits", 1, committed.size());
+                    Assert.assertTrue(committed.get(0).isCommit());
+                    Assert.assertEquals("the aborted lease's connection was retired", 2, server.upgradeRequestCount());
+                }
+                Assert.assertEquals(Collections.emptyList(), discardWarnings(log));
+            } finally {
+                releaseSenderLog(log);
+            }
+        });
+    }
+
+    @Test
+    public void testPooledLeaseWithoutAutoFlushTriggerDiscardsOnReturn() throws Exception {
+        // Returning a lease of a pool with no auto-flush trigger used to commit its rows.
+        // The lease now holds a strict transaction, which only flush() commits, so
+        // returning it discards the rows, and says so once: whether the server rolls
+        // back the frames already sent, or the pool retires the connection to discard them.
+        assertMemoryLeak(() -> {
+            ListAppender<ILoggingEvent> log = captureSenderLog();
+            try {
+                String[] spellings = {"auto_flush=off;", "auto_flush_rows=off;auto_flush_interval=off;"};
+                for (String spelling : spellings) {
+                    for (boolean isRollbackSupported : new boolean[]{false, true}) {
+                        String name = spelling + " rollback=" + isRollbackSupported;
+                        clearLog(log);
+                        TxnServer h = new TxnServer();
+                        try (TestWebSocketServer server = start(h, CAP)) {
+                            server.setRollbackSupported(isRollbackSupported);
+                            try (QuestDB db = QuestDB.connect(conf(server) + spelling + "query_pool_min=0;")) {
+                                Sender lease = db.borrowSender();
+                                writeRows(lease, "t", 0, 1_000);
+                                Assert.assertTrue(name, h.awaitFrames(2));
+                                lease.close();
+                                Sender next = db.borrowSender();
+                                writeRows(next, "t", 0, 10);
+                                next.flush();
+                                Assert.assertTrue(name, next.drain(5_000));
+                                next.close();
+                            }
+                            List<TxnFrame> committed = h.committedFrames();
+                            Assert.assertEquals(name + ": only the next lease commits", 1, committed.size());
+                            Assert.assertTrue(name, committed.get(0).isCommit());
+                            Assert.assertEquals(name, isRollbackSupported ? 1 : 0, h.rollbackFrames());
+                        }
+                        Assert.assertEquals(name,
+                                Collections.singletonList("returning the sender to the pool" + DISCARD_WARNING),
+                                discardWarnings(log));
+                    }
+                }
+            } finally {
+                releaseSenderLog(log);
             }
         });
     }
@@ -609,6 +834,44 @@ public class QwpLargeTransactionTest {
     }
 
     @Test
+    public void testStrictCloseWithoutFlushWarnsOfDiscardedRows() throws Exception {
+        // A sender with no auto-flush trigger used to commit on close(). Now close()
+        // discards its open transaction, and says so once, counting the rows already
+        // sent with those still buffered. A committed transaction leaves nothing to
+        // discard, and an aborted one already failed every flush.
+        assertMemoryLeak(() -> {
+            ListAppender<ILoggingEvent> log = captureSenderLog();
+            try {
+                TxnServer h = new TxnServer();
+                try (TestWebSocketServer server = start(h, CAP)) {
+                    try (Sender s = Sender.fromConfig(conf(server) + "auto_flush_rows=off;auto_flush_interval=off;")) {
+                        writeRows(s, "t", 0, 1_000);
+                        Assert.assertTrue(h.awaitFrames(2));
+                    }
+                    Assert.assertEquals(Collections.singletonList("close()" + DISCARD_WARNING), discardWarnings(log));
+                    clearLog(log);
+
+                    try (Sender s = Sender.fromConfig(conf(server) + "auto_flush_rows=off;auto_flush_interval=off;")) {
+                        writeRows(s, "t", 0, 1_000);
+                        s.flush();
+                        Assert.assertTrue(s.drain(5_000));
+                    }
+                    try (Sender s = Sender.fromConfig(conf(server) + "transaction=strict;")) {
+                        writeRows(s, "t", 0, 1_000);
+                        // Frames went out and the server cannot roll them back.
+                        s.reset();
+                        assertAborted(s::flush);
+                    }
+                    Assert.assertEquals(Collections.emptyList(), discardWarnings(log));
+                    Assert.assertEquals(1, h.commitFrames());
+                }
+            } finally {
+                releaseSenderLog(log);
+            }
+        });
+    }
+
+    @Test
     public void testStrictCloseWithoutFlushRollsBackWhenServerSupportsIt() throws Exception {
         assertMemoryLeak(() -> {
             TxnServer h = new TxnServer();
@@ -772,12 +1035,76 @@ public class QwpLargeTransactionTest {
         });
     }
 
+    // Captures what QwpWebSocketSender logs, so a test can assert its warnings.
+    private static ListAppender<ILoggingEvent> captureSenderLog() {
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        senderLogger().addAppender(appender);
+        return appender;
+    }
+
+    // The appender appends under its own lock, and I/O threads log into it too.
+    private static void clearLog(ListAppender<ILoggingEvent> log) {
+        synchronized (log) {
+            log.list.clear();
+        }
+    }
+
+    // The discarded-transaction warnings logged since the last clearLog().
+    private static List<String> discardWarnings(ListAppender<ILoggingEvent> log) {
+        List<String> warnings = new ArrayList<>();
+        synchronized (log) {
+            for (ILoggingEvent e : log.list) {
+                String message = e.getFormattedMessage();
+                if (e.getLevel() == Level.WARN && message.contains("discarded an uncommitted transaction")) {
+                    warnings.add(message);
+                }
+            }
+        }
+        return warnings;
+    }
+
+    // Every way to configure a WebSocket sender with no auto-flush trigger, applied
+    // on top of a config string.
+    private static List<NoTriggerSpelling> noTriggerSpellings() {
+        List<NoTriggerSpelling> spellings = new ArrayList<>();
+        spellings.add(new NoTriggerSpelling("auto_flush=off", c -> Sender.builder(c + "auto_flush=off;")));
+        spellings.add(new NoTriggerSpelling("auto_flush_rows=off;auto_flush_interval=off",
+                c -> Sender.builder(c + "auto_flush_rows=off;auto_flush_interval=off;")));
+        spellings.add(new NoTriggerSpelling("auto_flush_interval=off;auto_flush_rows=off",
+                c -> Sender.builder(c + "auto_flush_interval=off;auto_flush_rows=off;")));
+        spellings.add(new NoTriggerSpelling("disableAutoFlush()",
+                c -> Sender.builder(c).disableAutoFlush()));
+        spellings.add(new NoTriggerSpelling("autoFlushRows(0).autoFlushIntervalMillis(Integer.MAX_VALUE)",
+                c -> Sender.builder(c).autoFlushRows(0).autoFlushIntervalMillis(Integer.MAX_VALUE)));
+        return spellings;
+    }
+
+    private static void releaseSenderLog(ListAppender<ILoggingEvent> log) {
+        senderLogger().detachAppender(log);
+        log.stop();
+    }
+
+    private static Logger senderLogger() {
+        return (Logger) LoggerFactory.getLogger(QwpWebSocketSender.class);
+    }
+
     private static void assertAborted(ThrowingRunnable r) {
         try {
             r.run();
             Assert.fail("expected the aborted-transaction error");
         } catch (LineSenderException e) {
             TestUtils.assertContains(e.getMessage(), "transaction aborted");
+        }
+    }
+
+    // Build-time validation runs before the sender connects, so no server is needed.
+    private static void assertConfigRejected(String config, String expectedMessage) {
+        try {
+            Sender.fromConfig("ws::addr=localhost:1;" + config).close();
+            Assert.fail(config + " must be rejected");
+        } catch (LineSenderException e) {
+            TestUtils.assertContains(e.getMessage(), expectedMessage);
         }
     }
 
@@ -894,6 +1221,20 @@ public class QwpLargeTransactionTest {
     @FunctionalInterface
     private interface ThrowingRunnable {
         void run();
+    }
+
+    private static final class NoTriggerSpelling {
+        final String name;
+        private final Function<String, Sender.LineSenderBuilder> builder;
+
+        NoTriggerSpelling(String name, Function<String, Sender.LineSenderBuilder> builder) {
+            this.name = name;
+            this.builder = builder;
+        }
+
+        Sender build(String config) {
+            return builder.apply(config).build();
+        }
     }
 
     private static final class TxnFrame {

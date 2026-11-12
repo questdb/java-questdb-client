@@ -1150,10 +1150,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private final IntList ports = new IntList();
         private long authTimeoutMillis = QwpWebSocketSender.DEFAULT_AUTH_TIMEOUT_MS;
         private int autoFlushBytes = PARAMETER_NOT_SET_EXPLICITLY;
-        // Set by disableAutoFlush(). auto_flush_interval=off also stores the interval as
-        // Integer.MAX_VALUE, so the WebSocket validation keys on this flag to reject only the
-        // full disable and accept the interval-only opt-out.
-        private boolean autoFlushDisabled;
+        // disableAutoFlush() (auto_flush=off) sets it. That call turns off every
+        // auto-flush trigger, so a positive auto_flush_bytes contradicts it, and only
+        // that conflict check reads this flag. auto_flush_rows=off with
+        // auto_flush_interval=off reaches the same trigger state, which is what
+        // hasAutoFlushTrigger() reads to pick the sender's mode.
+        private boolean isAutoFlushDisabled;
         private int autoFlushIntervalMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private int autoFlushRows = PARAMETER_NOT_SET_EXPLICITLY;
         private int bufferCapacity = PARAMETER_NOT_SET_EXPLICITLY;
@@ -1422,7 +1424,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * <br>
          * This is only used when communicating over WebSocket transport.
          * <br>
-         * Default value is 0, which disables byte-based auto-flush.
+         * By default the byte trigger fires at 90% of the largest frame the connection can carry: the server's
+         * advertised maximum batch size, or the store-and-forward segment when that is smaller. A positive value sets
+         * the trigger, capped at that size, and counts as an auto-flush trigger: unless the sender is transactional,
+         * every batch it sends commits. 0 turns the byte trigger off, and then every batch must fit one frame per
+         * table.
+         * <br>
+         * You cannot set a positive value when auto-flush is disabled. See {@link #disableAutoFlush()}.
          *
          * @param bytes maximum bytes per batch
          * @return this instance for method chaining
@@ -1434,6 +1442,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             if (this.autoFlushBytes != PARAMETER_NOT_SET_EXPLICITLY) {
                 throw new LineSenderException("auto flush bytes was already configured")
                         .put("[bytes=").put(this.autoFlushBytes).put("]");
+            } else if (isAutoFlushDisabled && bytes > 0) {
+                throw new LineSenderException("cannot set auto flush bytes when auto-flush is already disabled");
             }
             if (bytes < 0) {
                 throw new LineSenderException("auto flush bytes cannot be negative")
@@ -1492,7 +1502,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * Setting this to 1 means that the Sender will send each row to a server immediately after it is added. This
          * effectively disables batching and may lead to a significant performance degradation.
          * <br>
-         * Setting this to 0 disables row-based auto-flush. Interval-based auto-flush remains enabled.
+         * Setting this to 0 disables row-based auto-flush. Interval-based auto-flush remains enabled. On WebSocket, a
+         * sender whose interval trigger is off too, and that has no positive {@link #autoFlushBytes(int)}, has no
+         * auto-flush trigger left and works like one built with {@link #disableAutoFlush()}.
          * <p>
          * You cannot set this value when auto-flush is disabled. See {@link #disableAutoFlush()}.
          *
@@ -1906,10 +1918,16 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * It is essential to ensure the maximum buffer capacity is sufficient to accommodate all locally buffered data.
          * <p>
          * This method can be used with the HTTP and WebSocket protocols; calling it is illegal when communicating over
-         * the TCP protocol. On WebSocket it selects strict transactional mode (see
-         * {@link #strictTransactional(boolean)}): rows still go to the server in frames sized for the connection, so a
-         * batch can be any size, but only {@code flush()} commits them, and closing without a flush discards them.
-         * There, {@code auto_flush_interval=off} alone turns off only the time-based trigger.
+         * the TCP protocol. Turning off both the row and the interval trigger ({@code auto_flush_rows=off} and
+         * {@code auto_flush_interval=off}) has the same effect.
+         * <p>
+         * On WebSocket, a sender with no auto-flush trigger is in strict transactional mode (see
+         * {@link #strictTransactional(boolean)}) unless {@link #transactional(boolean)} selects the mode: rows still go
+         * to the server in frames sized for the connection, so a batch can be any size, but only {@code flush()}
+         * commits them, and closing the sender or returning a pooled sender without a flush discards them.
+         * {@code transactional(true)} keeps such a sender non-strict, so closing it commits, and
+         * {@code transactional(false)} cannot be combined with it. Nor can a positive {@link #autoFlushBytes(int)},
+         * which is an auto-flush trigger.
          *
          * @return this instance for method chaining
          * @see #autoFlushRows(int)
@@ -1924,10 +1942,14 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 throw new LineSenderException("auto flush interval was already configured ")
                         .put("[autoFlushIntervalMillis=").put(this.autoFlushIntervalMillis).put("]");
             }
+            if (this.autoFlushBytes > 0) {
+                throw new LineSenderException("auto flush bytes was already configured ")
+                        .put("[autoFlushBytes=").put(this.autoFlushBytes).put("]");
+            }
 
             this.autoFlushRows = AUTO_FLUSH_DISABLED;
             this.autoFlushIntervalMillis = Integer.MAX_VALUE;
-            this.autoFlushDisabled = true;
+            this.isAutoFlushDisabled = true;
             return this;
         }
 
@@ -2807,7 +2829,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * {@link io.questdb.client.cutlass.qwp.client.TransactionTooLargeException}
          * and leaves the transaction open, and {@code close()} without
          * {@code flush()} discards the transaction instead of committing it.
-         * {@code auto_flush=off} selects the same mode. WebSocket transport only.
+         * A sender with no auto-flush trigger (see {@link #disableAutoFlush()}) is
+         * in this mode unless {@link #transactional(boolean)} selects the mode.
+         * WebSocket transport only.
          *
          * @param enabled true to enable strict transactional mode; false leaves
          *                {@link #transactional(boolean) transactional} mode as set
@@ -2833,6 +2857,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * committing atomically per table. The server commits a table on its own
          * once {@code qwp.max.uncommitted.rows} of its rows are uncommitted; use
          * {@link #strictTransactional(boolean)} to fail instead.
+         * <p>
+         * A sender with no auto-flush trigger (see {@link #disableAutoFlush()}) is
+         * in strict transactional mode unless this method selects the mode:
+         * {@code true} keeps it in this non-strict mode, and {@code false} cannot
+         * be combined with it.
          *
          * @param enabled true to enable transactional mode
          * @return this instance for method chaining
@@ -3896,9 +3925,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             // dispatcher daemon, drainer pool, microbatch buffers and
             // WebSocketClient inside the abandoned `connected`.
             connected.setTransactional(transactional);
-            // auto_flush=off on WebSocket means "commit only when I flush()": a
-            // strict transaction of any size.
-            if (strictTransactional || autoFlushDisabled) {
+            // With no auto-flush trigger only flush() commits: a strict transaction of
+            // any size, unless transaction= chose the mode.
+            if (strictTransactional || (!transactionModeSet && !hasAutoFlushTrigger())) {
                 connected.setStrictTransactional(true);
             }
             try {
@@ -4948,6 +4977,16 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             return m;
         }
 
+        // True when a configured trigger flushes rows on its own: the row or interval
+        // trigger, or a positive auto_flush_bytes. auto_flush=off, and
+        // auto_flush_rows=off with auto_flush_interval=off, leave none. The WebSocket
+        // default byte trigger does not count: it only sizes frames.
+        private boolean hasAutoFlushTrigger() {
+            return autoFlushRows != AUTO_FLUSH_DISABLED
+                    || autoFlushIntervalMillis != Integer.MAX_VALUE
+                    || autoFlushBytes > 0;
+        }
+
         /**
          * Use HTTP protocol as transport.
          * <br>
@@ -5151,10 +5190,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 if (protocolVersion != PARAMETER_NOT_SET_EXPLICITLY) {
                     throw new LineSenderException("protocol version is not supported for WebSocket protocol");
                 }
-                if (autoFlushDisabled && transactionModeSet && !transactional) {
-                    // On WebSocket, auto_flush=off is strict transactional mode.
-                    throw new LineSenderException("auto_flush=off selects strict transactional mode on WebSocket "
-                            + "and cannot be combined with transaction=off");
+                if (transactionModeSet && !transactional && !hasAutoFlushTrigger()) {
+                    // Only flush() can commit this sender's rows, and a non-transactional
+                    // flush has to fit one frame per table.
+                    throw new LineSenderException("auto-flush is off (auto_flush=off, or auto_flush_rows=off and "
+                            + "auto_flush_interval=off), which on WebSocket selects strict transactional mode and "
+                            + "cannot be combined with transaction=off; set transaction=on or turn on an auto-flush "
+                            + "trigger");
                 }
                 if ((sfDurability == SfDurability.FLUSH || sfDurability == SfDurability.APPEND)) {
                     throw new LineSenderException(

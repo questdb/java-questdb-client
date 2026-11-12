@@ -215,12 +215,20 @@ public class QuestDBBuilderTest {
     @Test
     public void testAutoFlushIntervalOffAcceptedAtBuildWithMinZero() {
         // auto_flush_interval=off turns off only the time-based trigger and is legal on
-        // WebSocket, alone or with the row trigger off too (only auto_flush=off is rejected).
+        // WebSocket: alone, with the row trigger off too (a sender with no auto-flush
+        // trigger, in strict transactional mode), and with a byte trigger left as the
+        // only one.
         QuestDB.builder().fromConfig(
                 "ws::addr=127.0.0.1:1;auto_flush_interval=off;sender_pool_min=0;query_pool_min=0;").build().close();
         QuestDB.builder().fromConfig(
+                "ws::addr=127.0.0.1:1;auto_flush_rows=off;auto_flush_interval=off;"
+                        + "sender_pool_min=0;query_pool_min=0;").build().close();
+        QuestDB.builder().fromConfig(
                 "ws::addr=127.0.0.1:1;auto_flush_rows=off;auto_flush_interval=off;auto_flush_bytes=65536;"
                         + "sender_pool_min=0;query_pool_min=0;").build().close();
+        QuestDB.builder().fromConfig(
+                "ws::addr=127.0.0.1:1;auto_flush=off;auto_flush_bytes=off;sender_pool_min=0;query_pool_min=0;")
+                .build().close();
     }
 
     @Test
@@ -229,16 +237,24 @@ public class QuestDBBuilderTest {
         // Sender -- yet it must still reject a malformed ingress key in the
         // single cluster config up front. Covers a typed enum (tls_verify), a
         // registry-STRING value that only the real Sender parse validates
-        // (auto_flush_rows), and WebSocket build-time checks: auto_flush=off selects
-        // strict transactional mode, so it cannot combine with transaction=off, and
-        // sf_durability=flush is not yet supported.
+        // (auto_flush_rows), and WebSocket build-time checks: a sender with no
+        // auto-flush trigger is in strict transactional mode, so it cannot combine
+        // with transaction=off, auto_flush=off cannot combine with a byte trigger,
+        // and sf_durability=flush is not yet supported.
         assertBuildRejected(
                 "wss::addr=127.0.0.1:1;tls_verify=strict;sender_pool_min=0;query_pool_min=0;", "tls_verify");
         assertBuildRejected(
                 "ws::addr=127.0.0.1:1;auto_flush_rows=abc;sender_pool_min=0;query_pool_min=0;", "auto_flush_rows");
         assertBuildRejected(
                 "ws::addr=127.0.0.1:1;auto_flush=off;transaction=off;sender_pool_min=0;query_pool_min=0;",
-                "auto_flush=off selects strict transactional mode");
+                "which on WebSocket selects strict transactional mode and cannot be combined with transaction=off");
+        assertBuildRejected(
+                "ws::addr=127.0.0.1:1;auto_flush_rows=off;auto_flush_interval=off;transaction=off;"
+                        + "sender_pool_min=0;query_pool_min=0;",
+                "which on WebSocket selects strict transactional mode and cannot be combined with transaction=off");
+        assertBuildRejected(
+                "ws::addr=127.0.0.1:1;auto_flush=off;auto_flush_bytes=65536;sender_pool_min=0;query_pool_min=0;",
+                "auto flush bytes was already configured [autoFlushBytes=65536]");
         assertBuildRejected(
                 "ws::addr=127.0.0.1:1;sf_durability=flush;sender_pool_min=0;query_pool_min=0;", "not yet supported");
     }
