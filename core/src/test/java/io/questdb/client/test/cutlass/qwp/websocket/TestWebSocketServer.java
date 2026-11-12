@@ -112,6 +112,10 @@ public class TestWebSocketServer implements Closeable {
     // connections carry only ACK frames.
     private volatile boolean sendServerInfo;
     private volatile int capabilities;
+    // Runs on the connection's thread right before it sends SERVER_INFO, while
+    // the client waits for the frame inside connect() or a failover reconnect.
+    // Null for none. Set via setBeforeServerInfoHook().
+    private volatile Runnable beforeServerInfoHook;
     // When true, the server fails the WebSocket upgrade on the egress read path
     // (/read...) by dropping the connection before the 101, while still serving
     // the ingest write path (/write...) normally. Lets one server + one cluster
@@ -432,6 +436,16 @@ public class TestWebSocketServer implements Closeable {
      */
     public void setSendServerInfo(boolean sendServerInfo) {
         this.sendServerInfo = sendServerInfo;
+    }
+
+    /**
+     * Runs {@code hook} on each egress connection right before the server sends
+     * its {@code SERVER_INFO} frame, which the client awaits inside
+     * {@code connect()} or a failover reconnect. Lets a test act at a fixed
+     * point of the client's connect sequence. Null removes the hook.
+     */
+    public void setBeforeServerInfoHook(Runnable hook) {
+        this.beforeServerInfoHook = hook;
     }
 
     // Advertised SERVER_INFO capabilities. CAP_ZONE is unsupported here: the
@@ -792,6 +806,9 @@ public class TestWebSocketServer implements Closeable {
             // query pool's connect fails fast, while ingest write-path upgrades
             // still complete on this same server.
             if (rejectReadUpgrade && isReadPath(requestPath)) {
+                // Drop the connection before the 101, so the client fails its
+                // upgrade at once instead of waiting out its auth timeout.
+                close();
                 return false;
             }
 
@@ -941,6 +958,10 @@ public class TestWebSocketServer implements Closeable {
                         // connection parses every inbound frame as an ACK and
                         // would fail on it.
                         if (sendServerInfo && isReadPath(requestPath)) {
+                            Runnable hook = beforeServerInfoHook;
+                            if (hook != null) {
+                                hook.run();
+                            }
                             sendBinary(buildServerInfoFrame(roleByte(advertisedRole), capabilities));
                         }
 

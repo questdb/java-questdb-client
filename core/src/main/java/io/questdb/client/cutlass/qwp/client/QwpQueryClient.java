@@ -188,6 +188,11 @@ public class QwpQueryClient implements QuietCloseable {
     private final Random failoverRandom = new Random();
     // Connection health (design/qwp-token-provider-spec.md, section 8.4).
     private final QwpConnectionHealthTracker healthTracker = new QwpConnectionHealthTracker();
+    // Deterministic barrier used by shutdown tests. Null in production. execute()
+    // runs it after an attempt intercepted a transport failure and before it
+    // checks for a stop request, the window a requestShutdown() from another
+    // thread can otherwise only hit by chance.
+    private volatile Runnable afterTransportFailureHook;
     private long authTimeoutMs = DEFAULT_AUTH_TIMEOUT_MS;
     private String authorizationHeader;
     // Deterministic lifecycle barrier used by facade shutdown tests. Null in
@@ -1017,6 +1022,11 @@ public class QwpQueryClient implements QuietCloseable {
     }
 
     @TestOnly
+    public void setAfterTransportFailureHookForTest(Runnable hook) {
+        afterTransportFailureHook = hook;
+    }
+
+    @TestOnly
     public void setBeforeCloseHookForTest(Runnable hook) {
         beforeCloseHook = hook;
     }
@@ -1839,6 +1849,10 @@ public class QwpQueryClient implements QuietCloseable {
             if (!probe.transportFailureIntercepted) {
                 return;
             }
+            Runnable hook = afterTransportFailureHook;
+            if (hook != null) {
+                hook.run();
+            }
             if (isShutdownRequested) {
                 handler.onError(probe.interceptedRequestId, probe.interceptedStatus, "query client shut down",
                         QwpEgressMsgKind.NO_ERROR_POSITION);
@@ -1998,7 +2012,9 @@ public class QwpQueryClient implements QuietCloseable {
             return;
         }
         // Resolved per attempt: a failover reconnect may land on a server that
-        // advertises other capabilities.
+        // advertises other capabilities. Every bound connection has its
+        // SERVER_INFO; only a connect() racing this query from another thread
+        // could clear it, and then no flag goes out.
         final QwpServerInfo info = serverInfo;
         final int capabilities = info != null ? info.getCapabilities() : 0;
         final long wireQueryFlags = resolveQueryFlags(queryFlags, capabilities);
@@ -2080,6 +2096,8 @@ public class QwpQueryClient implements QuietCloseable {
                             probe.markTransportFailure(requestId, ev.errorStatus, ev.errorMessage);
                             return;
                         default:
+                            // Unreachable: the I/O thread emits only the kinds above.
+                            assert false : "unknown event kind " + ev.kind;
                             probe.onError(requestId, WebSocketResponse.STATUS_INTERNAL_ERROR, "unknown event kind " + ev.kind,
                                     QwpEgressMsgKind.NO_ERROR_POSITION);
                             return;

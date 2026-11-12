@@ -108,6 +108,30 @@ public final class QwpEgressMockServer implements AutoCloseable {
         return requests;
     }
 
+    /**
+     * Number of WebSocket upgrades the server completed: the initial connect
+     * and each reconnect.
+     */
+    public int handshakeCount() {
+        return server.handshakeCount();
+    }
+
+    /**
+     * Runs {@code hook} on each connection right before the server sends
+     * {@code SERVER_INFO}; see {@link TestWebSocketServer#setBeforeServerInfoHook}.
+     */
+    public void setBeforeServerInfoHook(Runnable hook) {
+        server.setBeforeServerInfoHook(hook);
+    }
+
+    /**
+     * While set, the server drops every new egress connection before the
+     * upgrade completes, so connects and failover reconnects fail.
+     */
+    public void setRejectUpgrades(boolean isRejecting) {
+        server.setRejectReadUpgrade(isRejecting);
+    }
+
     @FunctionalInterface
     public interface Responder {
         /**
