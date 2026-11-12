@@ -26,23 +26,20 @@ package io.questdb.client.cutlass.qwp.client;
 
 /**
  * Tracks when the server last confirmed the schema snapshot a sender caches
- * for one table.
+ * for one table. The sender converts values against that snapshot, so after a
+ * column type change it converts to the old type until it learns of the change.
  * <p>
- * The sender converts values against that snapshot, so after a column type
- * change it keeps converting to the old type until it learns of the change.
  * The server reports a change in its reply to a frame that writes the table,
  * and the client applies that feedback before it advances the OK watermark.
- * So once the watermark covers such a frame, the cached snapshot was current
- * when the frame was flushed. A DESCRIBE confirms the snapshot as of the
- * moment before its request went out. Both times are lower bounds of the
- * moment the server read the schema, which keeps the age an upper bound.
+ * Once the watermark covers such a frame, the cached snapshot was current when
+ * the frame was flushed. A DESCRIBE confirms the snapshot as of the moment
+ * before its request. Both times precede the server's read of the schema, so
+ * the computed age never understates the real one.
  * <p>
- * One frame at a time waits for confirmation: the oldest published frame the
- * watermark does not cover yet. Its reply arrives first, and a frame published
- * after it is recorded once it is confirmed.
+ * One frame at a time waits for confirmation, the oldest uncovered one, since
+ * its reply arrives first. Frames published while it waits are not recorded.
  * <p>
- * A re-check the server did not answer defers the next one by the same age
- * limit, so a silent server costs one lookup wait per limit, not one per call.
+ * A re-check the server did not answer defers the next one by the age limit.
  * <p>
  * The producer thread owns this object; it is not thread-safe.
  */
@@ -85,10 +82,9 @@ public final class QwpSchemaFreshness {
     }
 
     /**
-     * Reports whether the server last confirmed the snapshot more than
-     * {@code maxAgeNanos} before {@code nowNanos}, or never, and no failed
-     * re-check within {@code maxAgeNanos} defers the next one. A waiting frame
-     * that {@code okFsn} covers confirms the snapshot first.
+     * Reports whether the snapshot needs a re-check at {@code nowNanos}: no
+     * confirmation and no failed re-check lies within {@code maxAgeNanos}. A
+     * waiting frame that {@code okFsn} covers confirms the snapshot first.
      */
     public boolean isExpired(long nowNanos, long maxAgeNanos, long okFsn) {
         confirmCoveredFrame(okFsn);

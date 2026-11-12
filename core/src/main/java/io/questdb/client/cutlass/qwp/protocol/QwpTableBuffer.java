@@ -340,8 +340,8 @@ public class QwpTableBuffer implements QuietCloseable {
     }
 
     /**
-     * Returns when the server last confirmed the sender's cached schema of
-     * this table. The producer thread owns it.
+     * Returns the tracker of when the server last confirmed the sender's cached
+     * schema of this table. The producer thread owns it.
      */
     public QwpSchemaFreshness getSchemaFreshness() {
         return schemaFreshness;

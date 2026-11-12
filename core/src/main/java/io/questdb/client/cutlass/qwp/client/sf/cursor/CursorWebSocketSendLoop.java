@@ -1425,10 +1425,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
-     * Looks the table up through the I/O thread even when the cache holds it,
-     * so a producer can replace a snapshot the server has not confirmed
-     * recently. A failed lookup leaves the cached entry in place; a denial
-     * evicts it. Same contract as {@link #resolveSchema} otherwise.
+     * Looks the table up through the I/O thread even when the cache holds it.
+     * A failed lookup leaves the cached entry in place; a denial evicts it.
+     * Same contract as {@link #resolveSchema} otherwise.
      */
     public QwpSchemaResponse revalidateSchema(CharSequence tableName, long timeoutMillis) {
         return schemaCoordinator.revalidate(tableName, timeoutMillis);
@@ -1437,9 +1436,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     /**
      * Highest engine FSN the server acknowledged at the OK level, across
      * connections, or -1. The I/O thread applies an ACK's schema feedback
-     * before it publishes the ACK here, so a producer that reads an FSN
-     * covering a frame also sees the feedback that frame earned. In
-     * durable-ack mode it runs ahead of the engine's acked FSN.
+     * before it publishes the ACK here, so a reader that sees a frame covered
+     * also sees that frame's feedback.
      */
     public long getHighestOkFsn() {
         return highestOkFsn;
