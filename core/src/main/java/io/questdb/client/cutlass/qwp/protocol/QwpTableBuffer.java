@@ -78,6 +78,9 @@ public class QwpTableBuffer implements QuietCloseable {
     // buffer is listed once. Producer thread only.
     private boolean listedPending;
     private int rowCount;
+    // Rows of this table the sender already shipped in FLAG_DEFER_COMMIT frames
+    // of the open transaction. Producer thread only.
+    private long txnSentRows;
 
     public QwpTableBuffer(String tableName) {
         this(tableName, null);
@@ -283,6 +286,14 @@ public class QwpTableBuffer implements QuietCloseable {
     }
 
     /**
+     * Rows of this table already shipped in FLAG_DEFER_COMMIT frames of the
+     * sender's open transaction; 0 outside a transaction.
+     */
+    public long getTxnSentRows() {
+        return txnSentRows;
+    }
+
+    /**
      * Returns true if a row is partially built (columns written but not yet committed
      * via {@link #nextRow()}).
      */
@@ -424,6 +435,13 @@ public class QwpTableBuffer implements QuietCloseable {
      */
     public void setListedPending(boolean listedPending) {
         this.listedPending = listedPending;
+    }
+
+    /**
+     * Sets the count reported by {@link #getTxnSentRows()}.
+     */
+    public void setTxnSentRows(long txnSentRows) {
+        this.txnSentRows = txnSentRows;
     }
 
     private static void assertColumnType(CharSequence name, byte type, ColumnBuffer column) {

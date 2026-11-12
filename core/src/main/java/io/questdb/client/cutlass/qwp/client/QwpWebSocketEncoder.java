@@ -184,6 +184,26 @@ public class QwpWebSocketEncoder implements QuietCloseable {
         return finishMessage();
     }
 
+    /**
+     * Encodes the rollback control frame into the buffer: a bare header with
+     * {@code ROLLBACK_FRAME_FLAGS}, no table blocks and an empty payload. The
+     * server matches it on exactly that shape.
+     *
+     * @return the frame size in bytes
+     */
+    public int encodeRollbackMessage() {
+        buffer.reset();
+        buffer.putByte((byte) 'Q');
+        buffer.putByte((byte) 'W');
+        buffer.putByte((byte) 'P');
+        buffer.putByte((byte) '1');
+        buffer.putByte(version);
+        buffer.putByte(ROLLBACK_FRAME_FLAGS);
+        buffer.putShort((short) 0);
+        buffer.putInt(0);
+        return buffer.getPosition();
+    }
+
     public int finishMessage() {
         int payloadLength = buffer.getPosition() - payloadStart;
         buffer.patchInt(8, payloadLength);

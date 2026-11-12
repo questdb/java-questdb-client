@@ -139,7 +139,11 @@ public interface QuestDB extends Closeable {
      * {@link Sender#close()} on the returned instance to release it back to
      * the pool. {@code close()} on a pooled Sender flushes pending rows
      * before returning to the pool; a real disconnect only happens at
-     * {@link #close()} on this {@code QuestDB} handle.
+     * {@link #close()} on this {@code QuestDB} handle. A Sender in strict
+     * transactional mode ({@code transaction=strict}, or a WebSocket config
+     * with no auto-flush trigger, such as {@code auto_flush=off}) commits only
+     * on {@link Sender#flush()}, so its {@code close()} discards the rows it
+     * did not flush instead.
      * <p>
      * Allocation: zero at steady state -- the returned instance is a
      * pre-allocated decorator backed by a pre-allocated underlying Sender.

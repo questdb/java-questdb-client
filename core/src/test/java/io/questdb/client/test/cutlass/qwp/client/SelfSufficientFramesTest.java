@@ -487,8 +487,10 @@ public class SelfSufficientFramesTest {
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
+                // auto_flush_bytes=off: the batch must reach flush() whole, as the
+                // byte trigger would otherwise publish it from at().
                 String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
-                        + ";sf_max_segment_bytes=64;";
+                        + ";sf_max_segment_bytes=64;auto_flush_bytes=off;";
                 String pad = TestUtils.repeat("x", 60);
                 Sender sender = Sender.fromConfig(config);
                 try {

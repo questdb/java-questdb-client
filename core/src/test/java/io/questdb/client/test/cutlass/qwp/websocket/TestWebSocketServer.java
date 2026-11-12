@@ -146,6 +146,16 @@ public class TestWebSocketServer implements Closeable {
     // builds. Lets a test force the delta-dictionary catch-up to split across
     // several frames. Live-updatable via setAdvertisedMaxBatchSize().
     private volatile int advertisedMaxBatchSize;
+    // When > 0, 101 upgrade responses advertise this value as the
+    // X-QWP-Max-Uncommitted-Rows header. Live-updatable.
+    private volatile long advertisedMaxUncommittedRows;
+    // X-QWP-Request-Rollback header value captured from each well-formed upgrade
+    // request ("" when absent).
+    private final BlockingQueue<String> capturedRollbackRequests = new LinkedBlockingQueue<>();
+    // When true, a 101 upgrade response to a request carrying
+    // X-QWP-Request-Rollback: true confirms it with X-QWP-Rollback: enabled.
+    // Live-updatable.
+    private volatile boolean rollbackSupported;
 
     public TestWebSocketServer(WebSocketServerHandler handler) throws IOException {
         this(handler, false);
@@ -350,6 +360,31 @@ public class TestWebSocketServer implements Closeable {
     }
 
     /**
+     * Advertises {@code X-QWP-Max-Uncommitted-Rows: <rows>} on subsequent
+     * handshakes (live update). Pass {@code 0} to stop advertising it.
+     */
+    public void setAdvertisedMaxUncommittedRows(long rows) {
+        this.advertisedMaxUncommittedRows = rows;
+    }
+
+    /**
+     * When {@code true}, subsequent handshakes that request rollback
+     * ({@code X-QWP-Request-Rollback: true}) are confirmed with
+     * {@code X-QWP-Rollback: enabled} (live update).
+     */
+    public void setRollbackSupported(boolean supported) {
+        this.rollbackSupported = supported;
+    }
+
+    /**
+     * Blocks up to {@code timeout} for the next captured X-QWP-Request-Rollback
+     * header value ("" when the upgrade request carried none).
+     */
+    public String pollRollbackRequest(long timeout, TimeUnit unit) throws InterruptedException {
+        return capturedRollbackRequests.poll(timeout, unit);
+    }
+
+    /**
      * Replaces the advertised role for subsequent handshakes (live update).
      */
     public void setAdvertisedRole(String role) {
@@ -548,6 +583,8 @@ public class TestWebSocketServer implements Closeable {
         private final Socket socket;
         private InputStream in;
         private boolean isClosed;
+        // True once this connection's 101 response confirmed X-QWP-Rollback: enabled.
+        private volatile boolean isRollbackConfirmed;
         private OutputStream out;
         private Thread readThread;
         // Request path from the WebSocket upgrade GET line (e.g. /write/v4,
@@ -600,6 +637,14 @@ public class TestWebSocketServer implements Closeable {
                     return;
                 }
             }
+        }
+
+        /**
+         * Whether this connection's upgrade confirmed {@code X-QWP-Rollback: enabled}, so
+         * the client may send it the rollback control frame.
+         */
+        public boolean isRollbackConfirmed() {
+            return isRollbackConfirmed;
         }
 
         public synchronized void sendBinary(byte[] data) throws IOException {
@@ -762,6 +807,7 @@ public class TestWebSocketServer implements Closeable {
             String key = null;
             String authorization = "";
             String durableAckRequest = "";
+            String rollbackRequest = "";
             String[] lines = request.toString().split("\r\n");
             if (lines.length > 0) {
                 // GET <path> HTTP/1.1
@@ -778,6 +824,8 @@ public class TestWebSocketServer implements Closeable {
                     authorization = line.substring("authorization:".length()).trim();
                 } else if (lower.startsWith("x-qwp-request-durable-ack:")) {
                     durableAckRequest = line.substring("x-qwp-request-durable-ack:".length()).trim();
+                } else if (lower.startsWith("x-qwp-request-rollback:")) {
+                    rollbackRequest = line.substring("x-qwp-request-rollback:".length()).trim();
                 }
             }
 
@@ -787,6 +835,7 @@ public class TestWebSocketServer implements Closeable {
             upgradeRequestCount.incrementAndGet();
             capturedAuthHeaders.add(authorization);
             capturedDurableAckRequests.add(durableAckRequest);
+            capturedRollbackRequests.add(rollbackRequest);
 
             // Read-path reject: drop the egress upgrade before the 101 so the
             // query pool's connect fails fast, while ingest write-path upgrades
@@ -865,6 +914,14 @@ public class TestWebSocketServer implements Closeable {
             int maxBatch = advertisedMaxBatchSize;
             if (maxBatch > 0) {
                 sb.append("X-QWP-Max-Batch-Size: ").append(maxBatch).append("\r\n");
+            }
+            long maxUncommittedRows = advertisedMaxUncommittedRows;
+            if (maxUncommittedRows > 0) {
+                sb.append("X-QWP-Max-Uncommitted-Rows: ").append(maxUncommittedRows).append("\r\n");
+            }
+            if (rollbackSupported && "true".equalsIgnoreCase(rollbackRequest)) {
+                sb.append("X-QWP-Rollback: enabled\r\n");
+                isRollbackConfirmed = true;
             }
             sb.append("\r\n");
             out.write(sb.toString().getBytes(StandardCharsets.US_ASCII));

@@ -84,6 +84,11 @@ public abstract class WebSocketClient implements QuietCloseable {
     private static final String QWP_CONTENT_ENCODING_HEADER_NAME = "X-QWP-Content-Encoding:";
     private static final String QWP_DURABLE_ACK_HEADER_NAME = "X-QWP-Durable-Ack:";
     private static final String QWP_MAX_BATCH_SIZE_HEADER_NAME = "X-QWP-Max-Batch-Size:";
+    private static final String QWP_MAX_UNCOMMITTED_ROWS_HEADER_NAME = "X-QWP-Max-Uncommitted-Rows:";
+    private static final String QWP_ROLLBACK_HEADER_NAME = "X-QWP-Rollback:";
+    // Token the server echoes in X-QWP-Rollback when it accepts the rollback
+    // control frame on this connection.
+    private static final String QWP_ROLLBACK_TOKEN_ENABLED = "enabled";
     private static final String QWP_VERSION_HEADER_NAME = "X-QWP-Version:";
     private static final ThreadLocal<MessageDigest> SHA1_DIGEST = ThreadLocal.withInitial(() -> {
         try {
@@ -148,6 +153,9 @@ public abstract class WebSocketClient implements QuietCloseable {
     // Requested durable-ack tier set (DurableAckTiers bitmask), sent as
     // X-QWP-Request-Durable-Ack: <DurableAckTiers.requestHeaderValue>
     private int qwpDurableAckTiers = DurableAckTiers.NONE;
+    // When true, the upgrade request carries X-QWP-Request-Rollback: true, asking
+    // the server to confirm that it accepts the rollback control frame.
+    private boolean qwpRequestRollback;
     // Receive buffer (native memory)
     private long recvBufPtr;
     private int recvBufSize;
@@ -170,6 +178,11 @@ public abstract class WebSocketClient implements QuietCloseable {
     // not advertise the header (older builds), in which case the sender falls
     // back to its locally configured budget.
     private int serverMaxBatchSize;
+    // Server's per-table cap on rows a deferred-commit group may hold before the
+    // server commits them on its own (qwp.max.uncommitted.rows), extracted from
+    // X-QWP-Max-Uncommitted-Rows on the 101 upgrade response. 0 when the server
+    // did not advertise it (older builds).
+    private long serverMaxUncommittedRows;
     // Zstd compression level the server actually applied for this connection,
     // extracted from the echoed X-QWP-Content-Encoding response header.
     // 0 means "no zstd" -- either the server picked raw, the header was absent
@@ -178,6 +191,11 @@ public abstract class WebSocketClient implements QuietCloseable {
     // the wire said without re-clamping so a misconfigured server is observable.
     private int serverNegotiatedZstdLevel;
     private int serverQwpVersion = 1;
+    // Set during upgrade response validation when the client asked for rollback
+    // (qwpRequestRollback) and the server confirmed it with X-QWP-Rollback:
+    // enabled. A server that does not confirm treats the rollback control frame
+    // as an empty deferred frame, so the client must never send it there.
+    private boolean serverRollbackEnabled;
     private String upgradeRejectRole;
     // WWW-Authenticate value(s) from the most recent rejected upgrade, joined with ", " when the server sent
     // several, or null when absent. Lets a 401 carrying "Bearer error=insufficient_scope" be told apart from an
@@ -413,6 +431,16 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
+     * Server's per-table limit on rows a deferred-commit group may hold before
+     * the server commits them on its own ({@code qwp.max.uncommitted.rows}), taken
+     * from the {@code X-QWP-Max-Uncommitted-Rows} response header on the 101
+     * upgrade. Returns {@code 0} when the server did not advertise the header.
+     */
+    public long getServerMaxUncommittedRows() {
+        return serverMaxUncommittedRows;
+    }
+
+    /**
      * Zstd level the server actually applied for this connection, parsed
      * from the echoed {@code X-QWP-Content-Encoding} response header.
      * <p>
@@ -492,6 +520,16 @@ public abstract class WebSocketClient implements QuietCloseable {
      */
     public boolean isServerDurableAckEnabled() {
         return serverDurableAckEnabled;
+    }
+
+    /**
+     * Returns true when the client asked for rollback support via
+     * {@link #setQwpRequestRollback} and the 101 upgrade response confirmed it
+     * with {@code X-QWP-Rollback: enabled}. Meaningful only after
+     * {@link #upgrade} returns.
+     */
+    public boolean isServerRollbackEnabled() {
+        return serverRollbackEnabled;
     }
 
     /**
@@ -671,6 +709,16 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
+     * When {@code true}, the upgrade request carries
+     * {@code X-QWP-Request-Rollback: true}. A server that accepts the rollback
+     * control frame confirms it with {@code X-QWP-Rollback: enabled}; see
+     * {@link #isServerRollbackEnabled()}.
+     */
+    public void setQwpRequestRollback(boolean requestRollback) {
+        this.qwpRequestRollback = requestRollback;
+    }
+
+    /**
      * Sets the requested durable-ack tier set ({@link DurableAckTiers}
      * bitmask) for the opt-in X-QWP-Request-Durable-Ack upgrade header. When
      * granted, the server emits STATUS_DURABLE_ACK frames (replicated tier)
@@ -795,6 +843,9 @@ public abstract class WebSocketClient implements QuietCloseable {
             sendBuffer.putAscii(DurableAckTiers.requestHeaderValue(qwpDurableAckTiers));
             sendBuffer.putAscii("\r\n");
         }
+        if (qwpRequestRollback) {
+            sendBuffer.putAscii("X-QWP-Request-Rollback: true\r\n");
+        }
         if (authorizationHeader != null) {
             sendBuffer.putAscii("Authorization: ");
             sendBuffer.putAscii(authorizationHeader);
@@ -912,6 +963,22 @@ public abstract class WebSocketClient implements QuietCloseable {
         return null;
     }
 
+    private static String extractHeaderValue(String response, String headerName) {
+        int headerLen = headerName.length();
+        int responseLen = response.length();
+        for (int i = 0; i <= responseLen - headerLen; i++) {
+            if (response.regionMatches(true, i, headerName, 0, headerLen)) {
+                int valueStart = i + headerLen;
+                int lineEnd = response.indexOf('\r', valueStart);
+                if (lineEnd < 0) {
+                    lineEnd = responseLen;
+                }
+                return response.substring(valueStart, lineEnd).trim();
+            }
+        }
+        return null;
+    }
+
     private static int extractMaxBatchSize(String response) {
         int headerLen = QWP_MAX_BATCH_SIZE_HEADER_NAME.length();
         int responseLen = response.length();
@@ -932,6 +999,18 @@ public abstract class WebSocketClient implements QuietCloseable {
             }
         }
         return 0;
+    }
+
+    private static long extractMaxUncommittedRows(String response) {
+        String value = extractHeaderValue(response, QWP_MAX_UNCOMMITTED_ROWS_HEADER_NAME);
+        if (value == null) {
+            return 0;
+        }
+        try {
+            return Math.max(Long.parseLong(value), 0);
+        } catch (NumberFormatException e) {
+            return 0;
+        }
     }
 
     private static int extractQwpVersion(String response) {
@@ -1540,6 +1619,16 @@ public abstract class WebSocketClient implements QuietCloseable {
         // Extract X-QWP-Max-Batch-Size (optional). Older servers omit it; the
         // sender falls back to its locally configured byte budget in that case.
         serverMaxBatchSize = extractMaxBatchSize(response);
+
+        // Extract X-QWP-Max-Uncommitted-Rows (optional). Older servers omit it;
+        // a strict transaction then assumes the server's default.
+        serverMaxUncommittedRows = extractMaxUncommittedRows(response);
+
+        // Extract the X-QWP-Rollback confirmation (optional). Only a client that
+        // asked for rollback may treat it as granted: the server echoes it only
+        // on request, and an older server never sends it.
+        serverRollbackEnabled = qwpRequestRollback
+                && QWP_ROLLBACK_TOKEN_ENABLED.equalsIgnoreCase(extractHeaderValue(response, QWP_ROLLBACK_HEADER_NAME));
 
         // Extract X-QWP-Content-Encoding (optional). Surfaces what level the
         // server actually applied -- which may differ from what this client

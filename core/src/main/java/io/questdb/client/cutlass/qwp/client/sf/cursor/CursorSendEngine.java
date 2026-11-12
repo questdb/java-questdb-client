@@ -1901,6 +1901,17 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
+     * Bytes of segments the ring may hold under {@code sf_max_total_bytes}: the
+     * budget's capacity minus the side-file bytes it also charges (disk mode).
+     * In a sender pool the budget is shared, so this bounds the rings of all
+     * pooled senders together, not this ring alone.
+     */
+    public long ringCapacityBytes() {
+        SegmentBudget budget = manager.getBudget();
+        return budget.getCapacityBytes() - budget.getSideFileBytes();
+    }
+
+    /**
      * Configured per-segment size in bytes.
      */
     public long segmentSizeBytes() {

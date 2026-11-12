@@ -425,12 +425,28 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
-    public void testDisableAutoFlush_notSupportedForWebSocket() {
-        assertThrowsAny(
-                Sender.builder(Sender.Transport.WEBSOCKET)
+    public void testDisableAutoFlush_rejectsPositiveAutoFlushBytes() {
+        // disableAutoFlush() turns every auto-flush trigger off, so a byte trigger
+        // contradicts it in either order, as a row or interval trigger does.
+        assertThrows("cannot set auto flush bytes when auto-flush is already disabled",
+                () -> Sender.builder(Sender.Transport.WEBSOCKET)
                         .address(LOCALHOST)
-                        .disableAutoFlush(),
-                "not supported for WebSocket");
+                        .disableAutoFlush()
+                        .autoFlushBytes(65_536));
+        assertThrows("auto flush bytes was already configured [autoFlushBytes=65536]",
+                () -> Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address(LOCALHOST)
+                        .autoFlushBytes(65_536)
+                        .disableAutoFlush());
+        // 0 turns the byte trigger off, which agrees with it.
+        Assert.assertNotNull(Sender.builder(Sender.Transport.WEBSOCKET)
+                .address(LOCALHOST)
+                .disableAutoFlush()
+                .autoFlushBytes(0));
+        Assert.assertNotNull(Sender.builder(Sender.Transport.WEBSOCKET)
+                .address(LOCALHOST)
+                .autoFlushBytes(0)
+                .disableAutoFlush());
     }
 
     @Test
@@ -788,6 +804,50 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
         assertThrowsAny(
                 Sender.builder(Sender.Transport.WEBSOCKET),
                 "address not set");
+    }
+
+    @Test
+    public void testNoAutoFlushTrigger_rejectsTransactionOff() {
+        // A WebSocket sender with no auto-flush trigger commits only on flush(): it is
+        // strict unless transactional(true) says otherwise, and transactional(false)
+        // contradicts it, however the triggers were turned off.
+        String expected = "auto-flush is off (auto_flush=off, or auto_flush_rows=off and auto_flush_interval=off), "
+                + "which on WebSocket selects strict transactional mode and cannot be combined with "
+                + "transaction=off; set transaction=on or turn on an auto-flush trigger";
+        assertThrowsAny(
+                Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address(LOCALHOST)
+                        .disableAutoFlush()
+                        .transactional(false),
+                expected);
+        assertThrowsAny(
+                Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address(LOCALHOST)
+                        .transactional(false)
+                        .disableAutoFlush(),
+                expected);
+        assertThrowsAny(
+                Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address(LOCALHOST)
+                        .autoFlushRows(0)
+                        .autoFlushIntervalMillis(Integer.MAX_VALUE)
+                        .transactional(false),
+                expected);
+        assertThrowsAny(
+                Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address(LOCALHOST)
+                        .autoFlushRows(0)
+                        .autoFlushIntervalMillis(Integer.MAX_VALUE)
+                        .autoFlushBytes(0)
+                        .transactional(false),
+                expected);
+        // strictTransactional(false) keeps transactional mode as set: off here.
+        assertThrowsAny(
+                Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address(LOCALHOST)
+                        .disableAutoFlush()
+                        .strictTransactional(false),
+                expected);
     }
 
     @Test
