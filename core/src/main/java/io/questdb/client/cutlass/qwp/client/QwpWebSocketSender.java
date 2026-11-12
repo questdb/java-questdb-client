@@ -186,8 +186,6 @@ public class QwpWebSocketSender implements Sender {
     public static final int DEFAULT_SYMBOL_DICT_RESET_THRESHOLD_SYMBOLS = 100_000;
     private static final int DEFAULT_BUFFER_SIZE = 8192;
     private static final int DEFAULT_MICROBATCH_BUFFER_SIZE = 1024 * 1024; // 1MB
-    // How long rollback() waits for the server to acknowledge the rollback frame.
-    private static final long DEFAULT_ROLLBACK_ACK_TIMEOUT_MILLIS = 30_000L;
     // Frames of at most the frame cap that a strict transaction keeps room for in
     // the client buffer, so the commit that ends it can always be published.
     private static final int STRICT_COMMIT_RESERVE_FRAMES = 3;
@@ -704,8 +702,6 @@ public class QwpWebSocketSender implements Sender {
     // entries too. Counted toward the byte trigger alongside pendingBytes. Reset
     // with pendingBytes.
     private long pendingSymbolDictBytes;
-    // Rollback-ack wait bound; see rollbackOpenTransaction.
-    private long rollbackAckTimeoutMillis = DEFAULT_ROLLBACK_ACK_TIMEOUT_MILLIS;
     // Server's per-table cap on rows a deferred-commit group may hold before it
     // commits them on its own (X-QWP-Max-Uncommitted-Rows), 0 when not advertised.
     // Captured on each FOREGROUND handshake, like serverMaxBatchSize.
@@ -3386,10 +3382,11 @@ public class QwpWebSocketSender implements Sender {
     /**
      * Discards the rows buffered since the last flush, like before. In
      * transactional mode it also discards the open transaction's frames already
-     * sent, when the server supports QWP rollback (see {@link #rollback()}).
-     * Without that support a strict transaction is aborted -- the next flush
-     * throws and only closing the sender ends it -- while a non-strict one keeps
-     * the frames already sent, and the next flush commits them, as before.
+     * sent, when the server supports QWP rollback (see {@link #rollback()}), and
+     * like {@link #rollback()} it does not wait for the server. Without that
+     * support a strict transaction is aborted -- the next flush throws and only
+     * closing the sender ends it -- while a non-strict one keeps the frames
+     * already sent, and the next flush commits them, as before.
      */
     @Override
     public void reset() {
@@ -3412,16 +3409,21 @@ public class QwpWebSocketSender implements Sender {
     /**
      * Discards the open transaction: the rows buffered since the last flush,
      * and the transaction's frames already sent, which the server rolls back on
-     * the rollback control frame. Blocks until the server acknowledges the
-     * rollback. Without an open transaction this only discards the buffered
-     * rows.
+     * the rollback control frame. Without an open transaction this only discards
+     * the buffered rows.
+     * <p>
+     * Like {@link #flush()}, it hands the rollback frame to store-and-forward and
+     * returns without waiting for the server, so a server outage makes it fail
+     * only when the store-and-forward buffer is full, as it would a flush. The
+     * frame goes out behind the transaction's frames and ahead of anything sent
+     * later, on every connection and after a restart, so nothing sent later can
+     * commit the discarded rows. Call {@link #drain(long)} to wait for the server
+     * to confirm.
      *
      * @throws LineSenderException when frames of the open transaction were already
      *                             sent and the server does not support QWP rollback
      *                             (the transaction is then aborted: the next flush
-     *                             throws, and only closing the sender ends it), or
-     *                             when the server does not acknowledge the rollback
-     *                             in time
+     *                             throws, and only closing the sender ends it)
      */
     @Override
     public void rollback() {
@@ -3515,39 +3517,29 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Rolls back the open transaction on the server and waits for the ack.
+     * Rolls back the open transaction: publishes the rollback frame behind its
+     * frames and ends it, without waiting for the server.
      * <p>
-     * The wait is what makes the rollback safe across reconnects. Until the
-     * server acknowledges the rollback frame, a reconnect replays the
-     * transaction's frames together with it, and a server reached by failover
-     * that does not support rollback would keep those frames for the next
-     * commit. Once acknowledged, the frames are trimmed and can never be
-     * replayed. A rollback that is not acknowledged in time aborts the
-     * transaction (see {@link #txnAborted}).
+     * No wait is needed to keep the rolled-back frames from ever committing. The
+     * store-and-forward log orders the rollback frame ahead of every frame
+     * published later, and every connection replays the log in that order, so a
+     * server that receives a later commit has rolled the transaction back first.
+     * Only a server that does not support rollback, reached by a reconnect
+     * before the frame was acked, could commit them: it would read the frame as
+     * an empty deferred frame. The I/O loop never sends it there; it discards
+     * the transaction by closing that connection instead (see
+     * {@code CursorWebSocketSendLoop.retireRollbackFrame}). The same holds for
+     * frames replayed after a restart or by a background drainer, which use the
+     * same loop.
      */
     private void rollbackOpenTransaction() {
-        long previousBoundaryFsn = lastCommitBoundaryFsn;
         publishRollbackFrame();
-        long rollbackFsn = cursorEngine.publishedFsn();
         hasDeferredMessages = false;
-        // The rollback frame gets an OK ack covering the transaction's frames, so
+        // The rollback frame gets an OK ack covering the transaction's frames, or the
+        // I/O loop acknowledges it when it discards the transaction itself, so
         // close-time drains may wait for it like for a commit.
-        lastCommitBoundaryFsn = rollbackFsn;
+        lastCommitBoundaryFsn = cursorEngine.publishedFsn();
         clearTransactionState();
-        boolean isAcked = false;
-        try {
-            isAcked = awaitAckedFsn(fsnEpochBase + rollbackFsn, rollbackAckTimeoutMillis);
-        } finally {
-            if (!isAcked) {
-                txnAborted = true;
-                lastCommitBoundaryFsn = previousBoundaryFsn;
-            }
-        }
-        if (!isAcked) {
-            throw new LineSenderException("rollback not acknowledged by the server [timeoutMillis=")
-                    .put(rollbackAckTimeoutMillis)
-                    .put("]; the transaction is aborted: close the sender to discard it");
-        }
     }
 
     /**
@@ -3817,11 +3809,6 @@ public class QwpWebSocketSender implements Sender {
     @TestOnly
     public void setRecycleDeferredCloseMaxWaitMillisForTesting(long millis) {
         this.recycleDeferredCloseMaxWaitMillis = millis;
-    }
-
-    @TestOnly
-    public void setRollbackAckTimeoutMillisForTesting(long millis) {
-        this.rollbackAckTimeoutMillis = millis;
     }
 
     /**

@@ -773,8 +773,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * data format) and want to continue sending new data without retrying the problematic data.
      * After calling this method, you can start building a new row by calling {@link #table(CharSequence)}.
      * <br>
-     * Note: This method is only available for HTTP transport. TCP transport doesn't support
-     * this operation.
+     * In WebSocket transactional mode ({@code transaction=on} or {@code strict}) it also
+     * discards the rows of the open transaction that auto-flush already sent, as
+     * {@link #rollback()} does, when the server supports QWP rollback.
+     * <br>
+     * Note: the ILP TCP and UDP transports don't support this operation.
      *
      * @see #flush()
      */
@@ -784,7 +787,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * Discard the open transaction: the rows buffered since the last flush and, in
      * WebSocket transactional mode ({@code transaction=on} or {@code strict}), the
      * rows of the transaction that auto-flush already sent to the server, which
-     * the server discards on request. Blocks until the server confirms.
+     * the server discards on request.
+     * <br>
+     * Like {@link #flush()}, this returns without waiting for the server, so a
+     * server outage makes it fail only when the store-and-forward buffer is full,
+     * as it would a flush. The request goes out ahead of anything sent later, so
+     * later rows never commit the discarded ones, even across reconnects. Call
+     * {@link #drain(long)} to wait until the server confirms.
      * <br>
      * Discarding rows already sent needs a server that supports QWP rollback. When
      * the server does not, this method throws and aborts the transaction: every

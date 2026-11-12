@@ -591,6 +591,16 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // and by the I/O thread afterwards -- never concurrently.
     private long orphanSkipStartFsn = -1L;
     private long orphanSkipTipFsn = -1L;
+    // Whether the current connection's server confirmed X-QWP-Rollback, so a rollback
+    // control frame may go out on it. setWireBaselineWithCatchUp sets it for every
+    // connection from the client it runs on; false until then, the safe side (see
+    // retireRollbackFrame). Written by start() on the user thread before the I/O thread
+    // exists, and by the I/O thread afterwards -- never concurrently.
+    private boolean isRollbackConfirmed;
+    // FSN of the last commit-bearing frame sent on the current connection, -1 when none.
+    // Tracked only while !isRollbackConfirmed, for retireRollbackFrame. Reset with
+    // isRollbackConfirmed; same threading.
+    private long lastSentCommitBearingFsn = -1L;
     // Poison-frame detector state (I/O thread only). poisonFsn is the FSN of the
     // frame implicated by the most recent server-active rejection: the NACK-named
     // frame, or the OK-level head-of-line frame (highestOkFsn+1) for a
@@ -3198,6 +3208,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // handleServerRejection can tell "only the catch-up went out" from "the
         // head data frame went out".
         dataFrameSentThisConnection = false;
+        // The server this connection reached decides whether a rollback frame may go
+        // out on it; until a client exists no frame goes out at all.
+        isRollbackConfirmed = client != null && client.isServerRollbackEnabled();
+        lastSentCommitBearingFsn = -1L;
         // Do not gate solely on isDeltaDictEnabled(): a recovered delta slot can
         // lose access to its side-file while its on-disk frames still start above
         // zero. hasReplayDictionaryDependency preserves that distinction while
@@ -3228,6 +3242,26 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // A malformed start id reads as "no delta section", which the caller's
         // `deltaStart >= 0` gate already handles.
         return encoded < 0L ? -1 : (int) (encoded >>> 3);
+    }
+
+    // True for a QWP frame carrying FLAG_DEFER_COMMIT. A short or foreign payload counts
+    // as commit-bearing, so retireRollbackFrame waits for its ack: the safe side, and the
+    // rule RecoveredFrameAnalysis applies to the orphaned deferred tail.
+    private static boolean isDeferredFrame(long payloadAddr, int payloadLen) {
+        return payloadLen >= QwpConstants.HEADER_SIZE
+                && Unsafe.getUnsafe().getInt(payloadAddr) == QwpConstants.MAGIC_MESSAGE
+                && (Unsafe.getUnsafe().getByte(payloadAddr + QwpConstants.HEADER_OFFSET_FLAGS)
+                & QwpConstants.FLAG_DEFER_COMMIT) != 0;
+    }
+
+    // True only for the rollback control frame (QwpWebSocketEncoder.encodeRollbackMessage):
+    // a bare QWP header whose flags byte equals ROLLBACK_FRAME_FLAGS, compared whole as the
+    // server matches it.
+    private static boolean isRollbackFrame(long payloadAddr, int payloadLen) {
+        return payloadLen == QwpConstants.HEADER_SIZE
+                && Unsafe.getUnsafe().getInt(payloadAddr) == QwpConstants.MAGIC_MESSAGE
+                && Unsafe.getUnsafe().getByte(payloadAddr + QwpConstants.HEADER_OFFSET_FLAGS)
+                == QwpConstants.ROLLBACK_FRAME_FLAGS;
     }
 
     // True only for a well-formed QWP frame this encoder produced that carries a
@@ -4001,6 +4035,16 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 break; // fixed byte cap: the next call carries on from this frame
             }
             long frameAddr = base + sendOffset + MmapSegment.FRAME_HEADER_SIZE;
+            if (!isRollbackConfirmed && isRollbackFrame(frameAddr, payloadLen)) {
+                if (batchFrames > 0) {
+                    break;
+                }
+                // This server cannot roll back, so the frame never goes out on this
+                // connection: the loop waits for acks, or it discarded the rolled-back
+                // transaction and recycled.
+                retireRollbackFrame();
+                return false;
+            }
             // Torn-dictionary guard. sentDictCount is this loop's model of how many ids the
             // CURRENT server has been told about. A frame whose delta starts ABOVE that
             // coverage references ids the server was never given, and the server now rejects
@@ -4063,6 +4107,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             sendOffset = frameEnd;
             long fsnSent = fsnAtZero + nextWireSeq;
             nextWireSeq++;
+            if (!isRollbackConfirmed && !isDeferredFrame(frameAddr, payloadLen)) {
+                lastSentCommitBearingFsn = fsnSent;
+            }
             batchFrames++;
             batchBytes += wireLen;
             if (replayTargetFsn >= 0) {
@@ -4112,6 +4159,45 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // handles it on the first connect).
         setWireBaselineWithCatchUp(replayStart);
         positionCursorAt(replayStart);
+    }
+
+    /**
+     * Retires the rollback control frame at the send cursor of a connection whose
+     * server did not confirm X-QWP-Rollback. The producer sends that frame only after
+     * a server confirmed rollback, so this connection is a reconnect that reached a
+     * server without rollback support, such as an older node after a failover, with
+     * the frame not yet acked. That server would read the frame as an empty deferred
+     * frame and commit the rolled-back transaction, whose frames it holds uncommitted
+     * on this connection, with the next commit frame. So the frame never goes out:
+     * closing the connection discards those frames instead, as every server does with
+     * the rows a closed connection leaves uncommitted.
+     * <p>
+     * The close waits until the server acks every commit-bearing frame sent on this
+     * connection before the rollback frame: the self-acknowledge below covers those
+     * frames too, so a commit the server had not yet processed would be lost with the
+     * connection. Until then this returns without doing anything, and tryReceiveAcks
+     * runs every loop iteration. Once they are acked, the frames this connection holds
+     * unacked are exactly the rolled-back transaction's deferred frames. The cumulative
+     * self-acknowledge of the rollback frame retires them, and the recycle discards
+     * them server-side and re-anchors the next connection past the rollback frame, the
+     * way {@link #tryRetireOrphanTail} handles an orphaned deferred tail.
+     */
+    private void retireRollbackFrame() {
+        long rollbackFsn = fsnAtZero + nextWireSeq;
+        long ackedFsn = engine.ackedFsn();
+        if (ackedFsn < lastSentCommitBearingFsn) {
+            return;
+        }
+        LOG.info("server does not support QWP rollback: discarding the rolled-back transaction "
+                        + "[fsn {}..{}] by closing the connection that holds it uncommitted",
+                externalFsnBase + ackedFsn + 1L, externalFsnBase + rollbackFsn);
+        boolean isAdvanced = engine.acknowledge(rollbackFsn);
+        // Every ack is clamped to the frames this loop sent, and the cursor stands on
+        // the rollback frame, so the self-acknowledge always advances the watermark.
+        assert isAdvanced : "rollback frame already acknowledged [fsn=" + rollbackFsn + ']';
+        dispatchProgress(rollbackFsn);
+        fail(new LineSenderException(
+                "recycling connection to discard a rolled-back transaction the server cannot roll back"));
     }
 
     /**
