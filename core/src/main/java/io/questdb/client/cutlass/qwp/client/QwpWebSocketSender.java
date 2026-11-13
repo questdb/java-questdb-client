@@ -5454,8 +5454,9 @@ public class QwpWebSocketSender implements Sender {
         }
         ensureConnected();
         if (pinned != null && recheckRejectingSchema(pinned) && currentTableBuffer.getRowCount() > 0) {
-            // The pending rows carry the old column types, which the server converts.
-            // Sending them frees the buffer to take the new schema below.
+            // The pending rows carry the old column types, which the server converts
+            // as it converts any frame encoded before the change. Sending them frees
+            // the buffer to take the new schema below.
             flushPendingRows(transactional);
         }
         // A table buffer keeps one contract while it holds rows; the first row
@@ -5491,36 +5492,41 @@ public class QwpWebSocketSender implements Sender {
      * After a column type change, a sender whose rows all fail against the old
      * type never reaches the {@code at()} that could flush its batch, so no reply
      * reports the change, and the batch keeps the snapshot while it holds rows.
-     * The re-check needs a connected, schema-aware wire, waits at most
+     * The re-check needs a connected wire, waits at most
      * {@code SCHEMA_RECHECK_WAIT_MILLIS}, and runs at most once per
      * {@link #SCHEMA_MAX_AGE_MILLIS} per table, so values that are invalid under
-     * the current schema cost little. A failed lookup says nothing about the
-     * schema, so it keeps the snapshot.
+     * the current schema cost little. A failed lookup, including one on a wire
+     * without schema support, says nothing about the schema, so it keeps the
+     * snapshot. It defers the table's next lookup from the end of its wait, as a
+     * failed lookup in {@link #resolveConfirmedSchema} does, so a server that never
+     * answers costs each table at most one wait per interval after it.
      */
     private boolean recheckRejectingSchema(QwpSchemaBinding pinned) {
         QwpSchemaFreshness freshness = currentTableBuffer.getSchemaFreshness();
         if (!freshness.isRecheckDue()) {
             return false;
         }
-        CursorWebSocketSendLoop loop = cursorSendLoop;
-        // A run that finds the wire down stays due for the next connection.
-        if (loop == null || !loop.isWireUp() || !loop.isSchemaEnabled()) {
+        // The caller ran ensureConnected(), which installs a loop; the lookup after
+        // this re-check dereferences it the same way.
+        assert cursorSendLoop != null;
+        // A lookup on a wire that is down would wait for the reconnect. A run that
+        // finds the wire down stays due for the next connection.
+        if (!cursorSendLoop.isWireUp()) {
             return false;
         }
         final long nowNanos = nanoClock.getAsLong();
         if (!freshness.takeRecheck(nowNanos, SCHEMA_MAX_AGE_NANOS)) {
             return false;
         }
-        final String key = currentTableBuffer.getSchemaKey();
-        QwpSchemaResponse latest = loop.peekSchema(key);
-        if (latest == null || isSnapshotOf(pinned, latest)) {
-            try {
-                latest = loop.revalidateSchema(key, Math.min(schemaWaitMillis, SCHEMA_RECHECK_WAIT_MILLIS));
-            } catch (LineSenderSchemaException e) {
-                return false;
-            }
-            freshness.confirm(nowNanos);
+        final QwpSchemaResponse latest;
+        try {
+            latest = cursorSendLoop.revalidateSchema(currentTableBuffer.getSchemaKey(),
+                    Math.min(schemaWaitMillis, SCHEMA_RECHECK_WAIT_MILLIS));
+        } catch (LineSenderSchemaException e) {
+            freshness.deferCheck(nanoClock.getAsLong());
+            return false;
         }
+        freshness.confirm(nowNanos);
         return !isSnapshotOf(pinned, latest);
     }
 

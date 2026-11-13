@@ -1284,29 +1284,146 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test
-    public void testRunOfRejectedRowsAdoptsChangedSchemaWithoutFlush() throws Exception {
+    public void testRunOfRejectedRowsFlushesPendingRowsAndAdoptsChangedSchema() throws Exception {
         assertMemoryLeak(() -> {
             for (String mode : new String[]{"auto", "strict"}) {
-                LongTextSchemaHandler handler = new LongTextSchemaHandler(251, 261, ColumnType.INT);
-                try (TestWebSocketServer server = schemaServer(handler);
-                     Sender sender = frozenClock(Sender.fromConfig("ws::addr=localhost:" + server.getPort()
-                             + ";schema_mode=" + mode + ";auto_flush_rows=2147483647;auto_flush_bytes=0;"
-                             + "auto_flush_interval=2147483646;close_flush_timeout_millis=0;"))) {
-                    sender.table("events").longColumn("value", 7).atNow();
-                    // ALTER COLUMN value TYPE DOUBLE. No frame of the open batch reaches
-                    // the server, so no reply reports the change.
-                    handler.targetType = ColumnType.DOUBLE;
-                    handler.version = 262;
-                    rejectRun(sender);
-                    Assert.assertEquals(mode, 1, handler.describeRequests.get());
-                    // The run of rejected rows makes the next row look the table up. The
-                    // server reports the change, so the sender flushes the pending INT row
-                    // and converts this row to DOUBLE.
-                    sender.table("events").doubleColumn("value", 2.5).atNow();
-                    Assert.assertEquals(mode, 2, handler.describeRequests.get());
-                    sender.flush();
-                    new FrameReader(handler.awaitDataFrames(2)).intThenDoubleBlocks("events", 7, 2.5);
+                for (String transaction : new String[]{"off", "on"}) {
+                    for (boolean isRecreated : new boolean[]{false, true}) {
+                        String run = mode + ", transaction=" + transaction + ", recreated=" + isRecreated;
+                        LongTextSchemaHandler handler = new LongTextSchemaHandler(251, 261, ColumnType.INT);
+                        try (TestWebSocketServer server = schemaServer(handler);
+                             Sender sender = frozenClock(Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                                     + ";schema_mode=" + mode + ";transaction=" + transaction
+                                     + ";auto_flush_rows=2147483647;auto_flush_bytes=0;"
+                                     + "auto_flush_interval=2147483646;close_flush_timeout_millis=0;"))) {
+                            sender.table("events").longColumn("value", 7).atNow();
+                            // ALTER COLUMN value TYPE DOUBLE, or DROP TABLE and CREATE TABLE with
+                            // a DOUBLE column, which gives the table a new id. No frame of the
+                            // open batch reaches the server, so no reply reports the change.
+                            handler.targetType = ColumnType.DOUBLE;
+                            if (isRecreated) {
+                                handler.tableId = 252;
+                            } else {
+                                handler.version = 262;
+                            }
+                            rejectRun(sender);
+                            Assert.assertEquals(run, 1, handler.describeRequests.get());
+                            // The run of rejected rows makes the next row look the table up. The
+                            // server reports the change, so the sender flushes the pending INT row
+                            // and converts this row to DOUBLE.
+                            sender.table("events").doubleColumn("value", 2.5).atNow();
+                            Assert.assertEquals(run, 2, handler.describeRequests.get());
+                            Assert.assertEquals(run, 1, handler.awaitDataFrames(1).size());
+                            sender.flush();
+                            List<byte[]> frames = handler.awaitDataFrames(2);
+                            // Like an auto-flush, the sender's flush leaves a transaction open:
+                            // only the application's flush() commits it.
+                            Assert.assertEquals(run, transaction.equals("on") ? QwpConstants.FLAG_DEFER_COMMIT : 0,
+                                    frames.get(0)[QwpConstants.HEADER_OFFSET_FLAGS] & QwpConstants.FLAG_DEFER_COMMIT);
+                            Assert.assertEquals(run, 0,
+                                    frames.get(1)[QwpConstants.HEADER_OFFSET_FLAGS] & QwpConstants.FLAG_DEFER_COMMIT);
+                            new FrameReader(frames).intThenDoubleBlocks("events", 7, 2.5);
+                        }
+                    }
                 }
+            }
+        });
+    }
+
+    @Test
+    public void testRunOfRejectedRowsAdoptsChangedSchemaWithEmptyBatch() throws Exception {
+        assertMemoryLeak(() -> {
+            LongTextSchemaHandler handler = new LongTextSchemaHandler(253, 263, ColumnType.INT);
+            try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
+                sender.table("events").longColumn("value", 7).atNow();
+                sender.flush();
+                handler.awaitDataFrames(1);
+                // ALTER COLUMN value TYPE DOUBLE. The frozen clock keeps the cached
+                // schema within the age limit, so each new batch takes it unchanged.
+                handler.targetType = ColumnType.DOUBLE;
+                handler.version = 264;
+                rejectRun(sender);
+                Assert.assertEquals(1, handler.describeRequests.get());
+                // Nothing is pending, so the sender adopts the new schema without a flush.
+                sender.table("events").doubleColumn("value", 2.5).atNow();
+                Assert.assertEquals(2, handler.describeRequests.get());
+                Assert.assertEquals(1, handler.dataFrameCount());
+                sender.flush();
+                new FrameReader(handler.awaitDataFrames(2)).intThenDoubleBlocks("events", 7, 2.5);
+            }
+        });
+    }
+
+    @Test(timeout = 20_000)
+    public void testRunOfRejectedRowsKeepsSnapshotWhenLookupFails() throws Exception {
+        assertMemoryLeak(() -> {
+            LongTextSchemaHandler handler = new LongTextSchemaHandler(255, 265, ColumnType.INT);
+            // The schema wait exceeds the test timeout, which proves that a re-check
+            // waits only for SCHEMA_RECHECK_WAIT_MILLIS.
+            try (TestWebSocketServer server = schemaServer(handler);
+                 Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                         + ";schema_wait_millis=60000;auto_flush_rows=2147483647;auto_flush_bytes=0;"
+                         + "auto_flush_interval=2147483646;close_flush_timeout_millis=0;")) {
+                AtomicLong clock = new AtomicLong();
+                ((QwpWebSocketSender) sender).setNanoClockForTesting(clock::get);
+                sender.table("events").longColumn("value", 7).atNow();
+                handler.targetType = ColumnType.DOUBLE;
+                handler.version = 266;
+                handler.isDescribeSilent = true;
+                // The wait outlasts the interval between re-checks.
+                handler.onDescribeIgnored = () -> clock.set(SCHEMA_MAX_AGE_NANOS + 1);
+                rejectRun(sender);
+                // The re-check gets no answer, so the row meets the cached schema.
+                assertDoubleRejected(sender, 2.5);
+                Assert.assertEquals(2, handler.describeRequests.get());
+                Assert.assertEquals(0, handler.dataFrameCount());
+
+                // The row rejected after the failed re-check starts the next run. The
+                // interval runs from the end of the failed wait, so a server that never
+                // answers cannot hold the producer all the time.
+                rejectRows(sender, QwpSchemaFreshness.REJECTIONS_BEFORE_RECHECK - 1);
+                assertDoubleRejected(sender, 2.5);
+                Assert.assertEquals(2, handler.describeRequests.get());
+
+                // The lookup that got no answer leaves the next one free to run.
+                handler.isDescribeSilent = false;
+                clock.set(2 * (SCHEMA_MAX_AGE_NANOS + 1));
+                sender.table("events").doubleColumn("value", 2.5).atNow();
+                Assert.assertEquals(3, handler.describeRequests.get());
+                sender.flush();
+                new FrameReader(handler.awaitDataFrames(2)).intThenDoubleBlocks("events", 7, 2.5);
+            }
+        });
+    }
+
+    @Test
+    public void testRejectionsNoTypeChangeExplainsLookNothingUp() throws Exception {
+        assertMemoryLeak(() -> {
+            LongTextSchemaHandler handler = new LongTextSchemaHandler(257, 267, ColumnType.INT);
+            try (TestWebSocketServer server = schemaServer(handler); Sender sender = sender(server)) {
+                sender.table("events").longColumn("value", 7).atNow();
+                handler.targetType = ColumnType.DOUBLE;
+                handler.version = 268;
+                for (int i = 0; i < QwpSchemaFreshness.REJECTIONS_BEFORE_RECHECK; i++) {
+                    // A column name no table can have.
+                    try {
+                        sender.table("events").longColumn("bad\nname", 1);
+                        Assert.fail("expected invalid column name rejection");
+                    } catch (LineSenderSchemaException e) {
+                        Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
+                    }
+                    // A designated timestamp outside the range of its column type.
+                    try {
+                        sender.table("events").longColumn("value", 8).at(Long.MAX_VALUE, ChronoUnit.MICROS);
+                        Assert.fail("expected designated timestamp rejection");
+                    } catch (LineSenderSchemaException e) {
+                        Assert.assertEquals(LineSenderSchemaException.Reason.INVALID_VALUE, e.getReason());
+                    }
+                }
+                sender.table("events").longColumn("value", 9).atNow();
+                Assert.assertEquals(1, handler.describeRequests.get());
+                sender.flush();
+                new FrameReader(handler.awaitDataFrame()).intTable("events", 7, 9);
             }
         });
     }
@@ -4970,10 +5087,14 @@ public class QwpSchemaSenderIntegrationTest {
         private final List<byte[]> dataFrames = new ArrayList<>();
         private final AtomicInteger describeRequests = new AtomicInteger();
         private final CountDownLatch pong = new CountDownLatch(1);
-        private final int tableId;
+        private long ackSequence;
+        // Counts DESCRIBE requests but answers none of them.
+        private volatile boolean isDescribeSilent;
+        private volatile Runnable onDescribeIgnored = () -> {
+        };
+        private volatile int tableId;
         private volatile int targetType;
         private volatile long version;
-        private long ackSequence;
         // The version the client last received, through DESCRIBE or ACK feedback.
         private long deliveredVersion = -1;
 
@@ -4988,6 +5109,10 @@ public class QwpSchemaSenderIntegrationTest {
             if (data.length >= QwpConstants.HEADER_SIZE
                     && data[QwpConstants.HEADER_OFFSET_FLAGS] == QwpSchemaProtocol.FLAG_CONTROL) {
                 describeRequests.incrementAndGet();
+                if (isDescribeSilent) {
+                    onDescribeIgnored.run();
+                    return;
+                }
                 ByteBuffer request = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
                 long requestId = request.getLong(QwpConstants.HEADER_SIZE + 1);
                 deliveredVersion = version;
@@ -5032,6 +5157,10 @@ public class QwpSchemaSenderIntegrationTest {
 
         private boolean awaitPong() throws InterruptedException {
             return pong.await(5, TimeUnit.SECONDS);
+        }
+
+        private synchronized int dataFrameCount() {
+            return dataFrames.size();
         }
 
         private synchronized byte[] awaitDataFrame() throws InterruptedException {

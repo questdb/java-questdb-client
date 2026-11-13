@@ -155,11 +155,15 @@ public final class QwpSchemaFreshness {
 
     /**
      * Reports whether to re-check the snapshot at {@code nowNanos}: a run of
-     * rejected rows is due, and no re-check ran within {@code minIntervalNanos}.
-     * Taking the re-check ends the run; a run the interval defers stays due.
+     * rejected rows is due, no re-check started within {@code minIntervalNanos},
+     * and no re-check that got no answer ended within it; see
+     * {@link #deferCheck}. Taking the re-check ends the run; a run the interval
+     * defers stays due.
      */
     public boolean takeRecheck(long nowNanos, long minIntervalNanos) {
-        if (!isRecheckDue() || (hasRechecked && nowNanos - recheckNanos <= minIntervalNanos)) {
+        if (!isRecheckDue()
+                || (hasRechecked && nowNanos - recheckNanos <= minIntervalNanos)
+                || (hasFailedCheck && nowNanos - failedCheckNanos <= minIntervalNanos)) {
             return false;
         }
         rejectedRows = 0;

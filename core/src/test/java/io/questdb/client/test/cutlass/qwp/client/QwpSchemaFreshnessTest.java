@@ -191,6 +191,32 @@ public class QwpSchemaFreshnessTest {
     }
 
     @Test
+    public void testRecheckWaitsIntervalAfterUnansweredCheck() {
+        QwpSchemaFreshness freshness = new QwpSchemaFreshness();
+        rejectRun(freshness);
+        Assert.assertTrue(freshness.takeRecheck(0, MAX_AGE));
+        // The lookup waited past the interval and got no answer.
+        freshness.deferCheck(MAX_AGE + 1);
+        rejectRun(freshness);
+        Assert.assertFalse(freshness.takeRecheck(2 * MAX_AGE + 1, MAX_AGE));
+        Assert.assertTrue(freshness.isRecheckDue());
+        Assert.assertTrue(freshness.takeRecheck(2 * MAX_AGE + 2, MAX_AGE));
+    }
+
+    @Test
+    public void testRunOfRejectedRowsOutlastsIntRange() {
+        // A sender that keeps rejecting rows while the wire is down takes no re-check,
+        // so the run grows until a connection comes back. It must still be due then.
+        QwpSchemaFreshness freshness = new QwpSchemaFreshness();
+        for (long i = 0; i <= Integer.MAX_VALUE; i++) {
+            freshness.onRowRejected();
+        }
+        Assert.assertTrue(freshness.isRecheckDue());
+        Assert.assertTrue(freshness.takeRecheck(0, MAX_AGE));
+        Assert.assertFalse(freshness.isRecheckDue());
+    }
+
+    @Test
     public void testRandomSequencesNeverReportUnconfirmedSnapshotFresh() {
         Rnd rnd = TestUtils.generateRandom(null);
         for (int run = 0; run < 2_000; run++) {
