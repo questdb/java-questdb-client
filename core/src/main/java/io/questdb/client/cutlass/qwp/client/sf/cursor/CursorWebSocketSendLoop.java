@@ -25,6 +25,7 @@
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.LineSenderServerException;
+import io.questdb.client.LineSenderSchemaException;
 import io.questdb.client.SenderConnectionEvent;
 import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
@@ -41,6 +42,8 @@ import io.questdb.client.cutlass.qwp.client.QwpRoleMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpVersionMismatchException;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
+import io.questdb.client.cutlass.qwp.protocol.QwpSchemaProtocol;
+import io.questdb.client.cutlass.qwp.protocol.QwpSchemaResponse;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketFrameWriter;
 import io.questdb.client.std.CharSequenceLongHashMap;
@@ -53,6 +56,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayDeque;
 import java.util.Arrays;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
@@ -326,6 +330,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private final CatchUpCapGapPolicy catchUpCapGapPolicy;
     private final CursorSendEngine engine;
     private final ReconnectPolicy reconnectPolicy;
+    private final QwpSchemaCoordinator schemaCoordinator = new QwpSchemaCoordinator(this::wakeIoIfParked);
     // FIFO of OK-acked batches awaiting durable-upload confirmation. Used only
     // when durableAckMode is true. Each entry binds a wireSeq to the per-table
     // (name, seqTxn) pairs the server reported on the OK frame. The queue is
@@ -498,6 +503,17 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // foreground sender's transient auth blip becomes a producer-fatal terminal -- the
     // exact failure this policy exists to prevent.
     private volatile boolean hasEverConnected;
+    // STRICT row policy remembers successful schema negotiation independently of replay.
+    private volatile boolean hasNegotiatedSchema;
+    // Producer-visible wire state. True from the moment swapClient installs a
+    // connection until the I/O thread enters the reconnect loop for it. The
+    // sender's schema contract selection reads it to decide between a lookup
+    // (wire up) and a cache-only probe (wire down).
+    private volatile boolean isWireUp;
+    // When true, connectLoop fails a pending schema lookup immediately instead of
+    // letting the replacement connection re-send it. Set by a sender whose schema
+    // mode can fall back to the legacy contract.
+    private volatile boolean shouldAbandonSchemaLookupOnDisconnect;
     // Cause of the outage the reconnect loop is currently riding out, or null once a
     // connect succeeds. Written by the I/O thread, read by the producer thread so a
     // backpressure or drain-timeout failure can NAME the reason the wire is not draining
@@ -621,8 +637,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // across connections. In default mode this tracks the trim watermark
     // exactly; in durable-ack mode it runs AHEAD of ackedFsn, which waits for
     // STATUS_DURABLE_ACK coverage. I/O thread only; survives reconnects. Used
-    // by the poison-frame detector to measure genuine acceptance progress.
-    private long highestOkFsn = -1L;
+    // by the poison-frame detector to measure genuine acceptance progress, and
+    // read by the producer (getHighestOkFsn) to confirm its schema cache.
+    // Written after the ACK's schema feedback is applied.
+    private volatile long highestOkFsn = -1L;
     // Zero-progress recycle pacer (I/O thread only; survives reconnects).
     // Counts consecutive strike-EXEMPT recycles -- orderly closes
     // (NORMAL_CLOSURE/GOING_AWAY), non-orderly closes before any send on the
@@ -1034,7 +1052,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // already know we reached the server at least once. ASYNC startup
         // hands null and lets the I/O thread connect — hasEverConnected
         // stays false until swapClient sees its first success.
+        this.hasNegotiatedSchema = client != null && client.isQwpSchemaEnabled();
         this.hasEverConnected = client != null;
+        this.isWireUp = client != null;
         // Adopt the engine's recovered orphaned-deferred-tail range (if any).
         // See the field docs on orphanSkipStartFsn/orphanSkipTipFsn; the
         // BackgroundDrainer path builds its loop through this same
@@ -1333,6 +1353,97 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * Resolves a schema through this loop's I/O thread, returning a KNOWN, MISSING or TOO_LARGE response.
+     * This producer-side API permits one outstanding lookup. The timeout covers the entire
+     * operation, including connection and I/O; zero permits only an existing cache hit.
+     * Failures are reported as {@link LineSenderSchemaException}. This does not mutate rows,
+     * store-and-forward state, or acknowledgment watermarks.
+     */
+    public QwpSchemaResponse resolveSchema(CharSequence tableName, long timeoutMillis) {
+        return schemaCoordinator.resolve(tableName, timeoutMillis, false);
+    }
+
+    /**
+     * Cache-only variant of {@link #resolveSchema}: the schema the coordinator
+     * already holds for the table, or {@code null}. Never sends a request and
+     * never waits, so a producer can call it while the wire is down.
+     */
+    public QwpSchemaResponse peekSchema(CharSequence tableName) {
+        return schemaCoordinator.peek(tableName);
+    }
+
+    /**
+     * Evicts the cached KNOWN snapshot of {@code tableName} if it still has the
+     * given identity, so the next batch that writes the table looks it up again.
+     */
+    public void evictSchema(CharSequence tableName, int tableId, long metadataVersion) {
+        schemaCoordinator.evictKnown(tableName, tableId, metadataVersion);
+    }
+
+    /**
+     * Selects what happens to a schema lookup in flight when the connection
+     * drops: {@code true} fails it immediately, {@code false} (the default) keeps
+     * it pending with its original deadline for the replacement connection.
+     */
+    public void setAbandonSchemaLookupOnDisconnect(boolean abandon) {
+        this.shouldAbandonSchemaLookupOnDisconnect = abandon;
+    }
+
+    /**
+     * Copies this loop's schema cache into {@code sink}. Also works after {@link #close()}.
+     */
+    public void exportSchemaCache(Map<String, QwpSchemaResponse> sink) {
+        schemaCoordinator.exportCache(sink);
+    }
+
+    /**
+     * Seeds the schema state of a loop that replaces a retired one in a
+     * symbol-dictionary recycle, the schema counterpart of
+     * {@link #markEverConnected()}. The rebuilt loop starts without a client,
+     * so without this it would report that no connection ever negotiated
+     * schema support, and STRICT would let legacy rows through until the new
+     * connection comes up. The cache spares one blocking DESCRIBE per table
+     * and keeps AUTO on the schema contract while the new connection is
+     * still pending. Call before {@link #start()}.
+     */
+    public void seedSchemaState(boolean hasNegotiatedSchema, Map<String, QwpSchemaResponse> cache) {
+        if (hasNegotiatedSchema) {
+            this.hasNegotiatedSchema = true;
+        }
+        schemaCoordinator.importCache(cache);
+    }
+
+    /**
+     * Evicts the named cache entry at admission and resolves it again through the I/O thread.
+     * This producer-side API permits one outstanding lookup. The timeout covers the entire
+     * operation, including connection and I/O, and must leave time for a request. It returns
+     * a KNOWN, MISSING or TOO_LARGE response and reports failures as {@link LineSenderSchemaException}.
+     * This does not mutate rows, store-and-forward state, or acknowledgment watermarks.
+     */
+    public QwpSchemaResponse refreshSchema(CharSequence tableName, long timeoutMillis) {
+        return schemaCoordinator.resolve(tableName, timeoutMillis, true);
+    }
+
+    /**
+     * Looks the table up through the I/O thread even when the cache holds it.
+     * A failed lookup leaves the cached entry in place; a denial evicts it.
+     * Same contract as {@link #resolveSchema} otherwise.
+     */
+    public QwpSchemaResponse revalidateSchema(CharSequence tableName, long timeoutMillis) {
+        return schemaCoordinator.revalidate(tableName, timeoutMillis);
+    }
+
+    /**
+     * Highest engine FSN the server acknowledged at the OK level, across
+     * connections, or -1. The I/O thread applies an ACK's schema feedback
+     * before it publishes the ACK here, so a reader that sees a frame covered
+     * also sees that frame's feedback.
+     */
+    public long getHighestOkFsn() {
+        return highestOkFsn;
+    }
+
+    /**
      * The typed rotating-credential auth terminal (401/403), or {@code null} if the loop's terminal
      * (if any) is a different failure class. Non-null only after {@link #checkError()} started
      * throwing: the marker is written before the {@code terminalError} latch, both on the I/O thread.
@@ -1390,6 +1501,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // is false and start's ioLoop will exit immediately) or entirely
         // after — the latch await is only skipped when the loop never ran.
         running = false;
+        schemaCoordinator.close();
         Thread t = ioThread;
         // The symbol-dict mirror (sentDictBytesAddr) is I/O-thread-owned and gets
         // freed on ioLoop's exit path. When t == null the loop never ran (start()
@@ -1723,6 +1835,63 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      */
     public boolean hasEverConnected() {
         return hasEverConnected;
+    }
+
+    /**
+     * True once any connection this loop installed negotiated schema support,
+     * or once {@link #seedSchemaState} carried that over from a retired loop.
+     * Sticky, like {@link #hasEverConnected()}.
+     */
+    public boolean hasNegotiatedSchema() {
+        return hasNegotiatedSchema;
+    }
+
+    public boolean isSchemaEnabled() {
+        WebSocketClient activeClient = client;
+        return activeClient != null && activeClient.isQwpSchemaEnabled();
+    }
+
+    /**
+     * Whether a connection is currently installed. False before the first
+     * upgrade completes and from the moment the I/O thread enters the reconnect
+     * loop until {@code swapClient} installs the replacement.
+     */
+    public boolean isWireUp() {
+        return isWireUp;
+    }
+
+    /**
+     * Waits for the first completed WebSocket upgrade and returns whether any
+     * installed connection has selected schema mode. A failed or still-pending
+     * handshake is never interpreted as a legacy peer.
+     */
+    public boolean awaitInitialSchemaMode(long timeoutMillis) {
+        long timeoutNanos = TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+        long start = System.nanoTime();
+        while (!hasEverConnected) {
+            checkError();
+            if (!running) {
+                throw new LineSenderSchemaException(
+                        LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE,
+                        "schema negotiation stopped before the first successful connection");
+            }
+            if (Thread.interrupted()) {
+                Thread.currentThread().interrupt();
+                throw new LineSenderSchemaException(
+                        LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE,
+                        "schema negotiation was interrupted");
+            }
+            if (timeoutNanos - (System.nanoTime() - start) <= 0) {
+                throw new LineSenderSchemaException(
+                        LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE,
+                        "schema negotiation timed out before the first successful connection");
+            }
+            LockSupport.parkNanos(Math.min(50_000L,
+                    timeoutNanos - (System.nanoTime() - start)));
+        }
+        // Publish negotiation before hasEverConnected; recovered frames alone
+        // do not establish the first connection's row policy.
+        return hasNegotiatedSchema;
     }
 
     /**
@@ -2079,6 +2248,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private void connectWalk(Throwable initial, String phase, long paceFirstAttemptMillis) {
         if (!running) {
             return;
+        }
+        isWireUp = false;
+        WebSocketClient failedClient = client;
+        if (failedClient != null) {
+            schemaCoordinator.connectionLost(failedClient, shouldAbandonSchemaLookupOnDisconnect);
         }
         if (reconnectFactory == null) {
             recordFatal(initial);
@@ -2762,7 +2936,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // Snapshot before the send attempt: a publish after this point is
                 // caught by the re-check below, so the idle decision cannot race it.
                 long publishedBeforeWork = engine.publishStamp();
-                boolean didWork = trySendBatch();
+                boolean didWork = trySendSchemaRequest();
+                if (trySendBatch()) {
+                    didWork = true;
+                }
                 // 1. Try to send next frame(s).
                 // 2. Try to receive ACKs.
                 if (tryReceiveAcks()) {
@@ -2793,14 +2970,17 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 }
                 // 5. Nothing to do: block until the socket has bytes (an ACK),
                 //    a producer publishes a frame (engine rings the doorbell via
-                //    setIoWakeup), close() rings it, or the next PING is due.
+                //    setIoWakeup), a producer queues a schema lookup (the schema
+                //    coordinator rings it), close() rings it, or the next PING
+                //    is due.
                 //    No spinning: an idle connection costs zero CPU. A PING that
                 //    failed in 3/4 reconnected and rewound the cursor, which set
                 //    recycledThisIteration again: go back to trySendBatch instead.
                 if (!didWork && running && !recycledThisIteration) {
                     ioParked = true;
                     try {
-                        if (engine.publishStamp() == publishedBeforeWork) {
+                        if (engine.publishStamp() == publishedBeforeWork
+                                && !schemaCoordinator.hasUnsentRequest()) {
                             awaitIdle();
                         }
                     } finally {
@@ -2840,6 +3020,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 }
             }
         } finally {
+            schemaCoordinator.close();
             // Release native-segment lifetime before publishing I/O-thread
             // completion or running delegated engine cleanup.
             releaseSendingSegment();
@@ -2959,6 +3140,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * every rethrow delivers the same instance.
      */
     private void recordFatal(Throwable t) {
+        schemaCoordinator.close();
         io.questdb.client.cutlass.qwp.client.QwpConnectionHealthTracker tracker = healthTracker;
         if (tracker != null) {
             tracker.failed();
@@ -3135,6 +3317,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private void swapClient(WebSocketClient newClient) {
         WebSocketClient old = this.client;
         this.client = newClient;
+        // The schema cache survives the reconnect. The server ingests by column name
+        // and ignores the identity a frame carries, except to decide on feedback. A
+        // new connection has reported nothing yet, so the first ACK for each table
+        // refreshes any snapshot that went stale during the outage. Clearing here
+        // would cost one blocking DESCRIBE per table on the next batch.
         recycledThisIteration = true;
         this.lastReconnectError = null;
         if (old != null) {
@@ -3176,6 +3363,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // dies inside the dictionary catch-up above was never fully
         // established, so the sender stays INITIALIZING and a subsequent
         // endpoint-policy rejection still latches the startup terminal.
+        if (newClient.isQwpSchemaEnabled()) {
+            this.hasNegotiatedSchema = true;
+        }
+        this.isWireUp = true;
         this.hasEverConnected = true;
     }
 
@@ -3876,6 +4067,43 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         return any;
     }
 
+    private boolean trySendSchemaRequest() {
+        if (!schemaCoordinator.hasPendingRequest()) {
+            return false;
+        }
+        WebSocketClient activeClient = client;
+        if (activeClient == null) {
+            return false;
+        }
+        QwpSchemaCoordinator.Request request = schemaCoordinator.requestToSend(activeClient);
+        if (request == null) {
+            return false;
+        }
+        if (!activeClient.isQwpSchemaEnabled()) {
+            schemaCoordinator.fail(request, LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE,
+                    "server did not negotiate schema lookup support");
+            return true;
+        }
+        long remainingNanos = request.remainingNanos();
+        if (remainingNanos <= 0) {
+            schemaCoordinator.fail(request, LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE,
+                    "schema lookup timed out before send");
+            return true;
+        }
+        int timeoutMillis = (int) Math.min(Integer.MAX_VALUE,
+                1L + (remainingNanos - 1L) / 1_000_000L);
+        try {
+            activeClient.sendBinary(request.message, timeoutMillis);
+            return true;
+        } catch (Throwable t) {
+            if (t instanceof Error) {
+                throw (Error) t;
+            }
+            fail(t);
+            return true;
+        }
+    }
+
     /**
      * Returns true if at least one frame was sent (caller skips the park).
      * Sends every fully published frame of the current segment in one write,
@@ -4416,10 +4644,43 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private final class ResponseHandler implements WebSocketFrameHandler {
         @Override
         public void onBinaryMessage(long payloadPtr, int payloadLen) {
-            if (!response.readFrom(payloadPtr, payloadLen)) {
+            if (payloadLen >= Integer.BYTES
+                    && Unsafe.getUnsafe().getInt(payloadPtr) == QwpConstants.MAGIC_MESSAGE) {
+                WebSocketClient responseClient = client;
+                final long requestId;
+                try {
+                    if (responseClient == null || !responseClient.isQwpSchemaEnabled()) {
+                        throw new IllegalArgumentException("schema control response was not negotiated");
+                    }
+                    requestId = QwpSchemaProtocol.peekResponseRequestId(payloadPtr, payloadLen);
+                } catch (RuntimeException e) {
+                    schemaCoordinator.invalidResponse(responseClient, 0);
+                    fail(new LineSenderException("Invalid schema control response: " + e.getMessage(), e));
+                    return;
+                }
+                if (!schemaCoordinator.isLiveResponse(responseClient, requestId)) {
+                    return;
+                }
+                final QwpSchemaResponse schema;
+                try {
+                    schema = QwpSchemaProtocol.decodeResponse(payloadPtr, payloadLen);
+                } catch (RuntimeException e) {
+                    if (!schemaCoordinator.invalidResponse(responseClient, requestId)) {
+                        return;
+                    }
+                    fail(new LineSenderException("Invalid schema control response: " + e.getMessage(), e));
+                    return;
+                }
+                schemaCoordinator.completeResponse(responseClient, schema);
+                return;
+            }
+            if (!response.readFrom(payloadPtr, payloadLen, client != null && client.isQwpSchemaEnabled())) {
                 fail(new LineSenderException(
                         "Invalid ACK response payload [length=" + payloadLen + ']'));
                 return;
+            }
+            if (response.hasSchemaUpdates() || response.isSchemaInvalidation()) {
+                schemaCoordinator.applyFeedback(response);
             }
             long wireSeq = response.getSequence();
             if (response.isSuccess()) {
@@ -4434,11 +4695,13 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     LOG.warn("server ACK wire seq {} outside sent range [0, {}], clamping",
                             wireSeq, highestSent);
                 }
-                counters.acks.incrementAndGet();
                 long okFsn = fsnAtZero + capped;
                 if (okFsn > highestOkFsn) {
                     highestOkFsn = okFsn;
                 }
+                // After the watermark, so a reader that sees the count also sees
+                // the OK level, and with it the schema feedback applied above.
+                counters.acks.incrementAndGet();
                 // Clear poison-frame suspicion only when OK-level progress
                 // reaches the suspected frame itself: acceptance at or beyond
                 // poisonFsn proves the earlier rejections were not

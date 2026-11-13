@@ -84,6 +84,8 @@ public abstract class WebSocketClient implements QuietCloseable {
     private static final String QWP_CONTENT_ENCODING_HEADER_NAME = "X-QWP-Content-Encoding:";
     private static final String QWP_DURABLE_ACK_HEADER_NAME = "X-QWP-Durable-Ack:";
     private static final String QWP_MAX_BATCH_SIZE_HEADER_NAME = "X-QWP-Max-Batch-Size:";
+    private static final String QWP_SCHEMA_ENABLED_VALUE = "enabled";
+    private static final String QWP_SCHEMA_HEADER_NAME = "X-QWP-Schema:";
     private static final String QWP_VERSION_HEADER_NAME = "X-QWP-Version:";
     private static final ThreadLocal<MessageDigest> SHA1_DIGEST = ThreadLocal.withInitial(() -> {
         try {
@@ -148,6 +150,9 @@ public abstract class WebSocketClient implements QuietCloseable {
     // Requested durable-ack tier set (DurableAckTiers bitmask), sent as
     // X-QWP-Request-Durable-Ack: <DurableAckTiers.requestHeaderValue>
     private int qwpDurableAckTiers = DurableAckTiers.NONE;
+    // Sent as X-QWP-Request-Schema: true. Off by default; QwpWebSocketSender
+    // turns it on unless schema_mode=off.
+    private boolean qwpRequestSchema;
     // Receive buffer (native memory)
     private long recvBufPtr;
     private int recvBufSize;
@@ -165,6 +170,7 @@ public abstract class WebSocketClient implements QuietCloseable {
     // durable-ack-driven trim. Absence (after requesting tiers via
     // setQwpDurableAckTiers) is the early-fail signal.
     private boolean serverDurableAckEnabled;
+    private boolean serverQwpSchemaEnabled;
     // Server's hard cap on ingest QWP message payload bytes, extracted from
     // X-QWP-Max-Batch-Size on the 101 upgrade response. 0 when the server did
     // not advertise the header (older builds), in which case the sender falls
@@ -355,6 +361,7 @@ public abstract class WebSocketClient implements QuietCloseable {
     public void disconnect() {
         Misc.free(socket);
         upgraded = false;
+        serverQwpSchemaEnabled = false;
         host = null;
         port = 0;
         recvPos = 0;
@@ -494,6 +501,11 @@ public abstract class WebSocketClient implements QuietCloseable {
         return serverDurableAckEnabled;
     }
 
+    /** Returns whether a requested schema extension was confirmed by this connection. */
+    public boolean isQwpSchemaEnabled() {
+        return serverQwpSchemaEnabled;
+    }
+
     /**
      * Receives and processes WebSocket frames.
      *
@@ -549,6 +561,19 @@ public abstract class WebSocketClient implements QuietCloseable {
         sendBuffer.reset();
         sendBuffer.beginFrame();
         sendBuffer.putBlockOfBytes(dataPtr, length);
+        WebSocketSendBuffer.FrameInfo frame = sendBuffer.endBinaryFrame();
+        doSend(sendBuffer.getBufferPtr() + frame.offset, frame.length, timeout);
+        sendBuffer.reset();
+    }
+
+    /** Sends a small caller-owned byte array as one binary message. */
+    public void sendBinary(byte[] data, int timeout) {
+        checkConnected();
+        sendBuffer.reset();
+        sendBuffer.beginFrame();
+        for (byte b : data) {
+            sendBuffer.putByte(b);
+        }
         WebSocketSendBuffer.FrameInfo frame = sendBuffer.endBinaryFrame();
         doSend(sendBuffer.getBufferPtr() + frame.offset, frame.length, timeout);
         sendBuffer.reset();
@@ -682,6 +707,14 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
+     * Requests schema control support on subsequent WebSocket upgrades. There is
+     * no way to turn the request off again.
+     */
+    public void requestQwpSchema() {
+        this.qwpRequestSchema = true;
+    }
+
+    /**
      * Non-blocking attempt to receive a WebSocket frame.
      * Returns immediately if no complete frame is available.
      *
@@ -746,6 +779,7 @@ public abstract class WebSocketClient implements QuietCloseable {
         upgradeRejectWwwAuthenticate = null;
         upgradeRejectZone = null;
         upgradeStatusCode = 0;
+        serverQwpSchemaEnabled = false;
 
         // Generate random key
         byte[] keyBytes = new byte[16];
@@ -794,6 +828,9 @@ public abstract class WebSocketClient implements QuietCloseable {
             sendBuffer.putAscii("X-QWP-Request-Durable-Ack: ");
             sendBuffer.putAscii(DurableAckTiers.requestHeaderValue(qwpDurableAckTiers));
             sendBuffer.putAscii("\r\n");
+        }
+        if (qwpRequestSchema) {
+            sendBuffer.putAscii("X-QWP-Request-Schema: true\r\n");
         }
         if (authorizationHeader != null) {
             sendBuffer.putAscii("Authorization: ");
@@ -849,6 +886,28 @@ public abstract class WebSocketClient implements QuietCloseable {
             }
         }
         return true;
+    }
+
+    private static String extractUniqueHeaderValue(String response, String headerName) {
+        String value = null;
+        int lineStart = response.indexOf("\r\n") + 2; // skip status line
+        while (lineStart >= 2 && lineStart < response.length()) {
+            int lineEnd = response.indexOf("\r\n", lineStart);
+            if (lineEnd < 0 || lineEnd == lineStart) {
+                break;
+            }
+            int colon = response.indexOf(':', lineStart);
+            if (colon > lineStart && colon < lineEnd
+                    && colon - lineStart == headerName.length() - 1
+                    && response.regionMatches(true, lineStart, headerName, 0, headerName.length() - 1)) {
+                if (value != null) {
+                    throw new HttpClientException("Duplicate X-QWP-Schema header");
+                }
+                value = response.substring(colon + 1, lineEnd).trim();
+            }
+            lineStart = lineEnd + 2;
+        }
+        return value;
     }
 
     /**
@@ -1536,6 +1595,17 @@ public abstract class WebSocketClient implements QuietCloseable {
         String expectedDurableAckToken = DurableAckTiers.expectedConfirmToken(qwpDurableAckTiers);
         serverDurableAckEnabled = expectedDurableAckToken != null
                 && expectedDurableAckToken.equalsIgnoreCase(serverDurableAckEcho);
+
+        // An absent confirmation means an older server. A present value is a
+        // protocol assertion, so a requested handshake must reject anything
+        // other than the single defined value instead of treating it as legacy.
+        if (qwpRequestSchema) {
+            String schemaValue = extractUniqueHeaderValue(response, QWP_SCHEMA_HEADER_NAME);
+            if (schemaValue != null && !schemaValue.equalsIgnoreCase(QWP_SCHEMA_ENABLED_VALUE)) {
+                throw new HttpClientException("Invalid X-QWP-Schema header value: ").put(schemaValue);
+            }
+            serverQwpSchemaEnabled = schemaValue != null;
+        }
 
         // Extract X-QWP-Max-Batch-Size (optional). Older servers omit it; the
         // sender falls back to its locally configured byte budget in that case.

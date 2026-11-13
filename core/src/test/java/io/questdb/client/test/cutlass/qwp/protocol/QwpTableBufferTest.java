@@ -1247,6 +1247,20 @@ public class QwpTableBufferTest {
     }
 
     @Test
+    public void testGetSchemaKeyLowerCasesOnlyWhenNeeded() throws Exception {
+        assertMemoryLeak(() -> {
+            String lowerCaseName = "trades";
+            try (QwpTableBuffer table = new QwpTableBuffer(lowerCaseName)) {
+                assertSame(lowerCaseName, table.getSchemaKey());
+            }
+            try (QwpTableBuffer table = new QwpTableBuffer("Trades_ÄB")) {
+                assertEquals("trades_äb", table.getSchemaKey());
+                assertEquals("Trades_ÄB", table.getTableName());
+            }
+        });
+    }
+
+    @Test
     public void testLongArrayMultipleRows() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpTableBuffer table = new QwpTableBuffer("test")) {

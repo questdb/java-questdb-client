@@ -49,18 +49,15 @@ import java.util.concurrent.TimeUnit;
  * JMH benchmark for {@link Numbers#append(io.questdb.client.std.str.CharSink, double)},
  * the double-to-text routine behind every double column the client sends.
  * <p>
- * Its bignum slow path goes through the {@code FdBig} bridge over the JDK's
- * internal {@code FDBigInteger}. On Java 9+ that bridge binds the bignum
- * methods via {@code static final} method handles resolved once at class-init
- * (JDK 26 made the class package-private, so it can no longer be named in
- * source). This benchmark exists to show the handle-based bridge costs the
- * same as the direct calls it replaced: run it once against a client jar
- * built from the previous {@code main} and once against the current tree,
- * same JDK, and compare {@code shape=extreme} (100% slow path).
+ * {@code Numbers.append()} formats through Ryu (the same algorithm the server
+ * uses), which has no bignum slow path. The {@code shape} parameter still
+ * spans the input distributions that exercised the slow path of the pre-Ryu
+ * formatter, so the benchmark can compare the two across client versions:
+ * run it against a jar built from an older client and once against the
+ * current tree, same JDK. The slow-path shares below refer to that pre-Ryu
+ * formatter.
  * <p>
- * Input shapes, each a fixed pool of 1024 values cycled per invocation. The
- * slow-path share was measured by running the pool against a pre-fix jar on
- * JDK 26, where the bignum path throws and the fast path does not:
+ * Input shapes, each a fixed pool of 1024 values cycled per invocation:
  * <ul>
  * <li>{@code simple} -- short literals like {@code 1.0}, {@code 123456.789};
  * 0/1024 slow path.</li>

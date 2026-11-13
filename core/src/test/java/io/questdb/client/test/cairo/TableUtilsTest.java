@@ -82,8 +82,13 @@ public class TableUtilsTest extends AbstractTest {
         Assert.assertFalse(TableUtils.isValidTableName("\\..", 127));
         Assert.assertFalse(TableUtils.isValidTableName("/..", 127));
         Assert.assertFalse(TableUtils.isValidTableName("../", 127));
+        Assert.assertFalse(TableUtils.isValidTableName("t\uFEFFt", 127));
+        Assert.assertFalse(TableUtils.isValidTableName("t\uD800t", 127));
+        Assert.assertFalse(TableUtils.isValidTableName("t\uDB80t", 127));
+        Assert.assertFalse(TableUtils.isValidTableName("t\uDFFFt", 127));
 
         Assert.assertTrue(TableUtils.isValidTableName("table name", 127));
+        Assert.assertTrue(TableUtils.isValidTableName("t\uD83D\uDE00t", 127));
         Assert.assertTrue(TableUtils.isValidTableName("table name.csv", 127));
         Assert.assertTrue(TableUtils.isValidTableName("table-name", 127));
         Assert.assertTrue(TableUtils.isValidTableName("table_name", 127));

@@ -44,6 +44,27 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 public class QwpWebSocketEncoderTest {
 
     @Test
+    public void testHeaderRejectsTableCountOutsideUnsignedShortRange() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder()) {
+                encoder.writeHeader(0, 0);
+                encoder.writeHeader(0xffff, 0);
+                assertIllegalArgument(() -> encoder.writeHeader(-1, 0));
+                assertIllegalArgument(() -> encoder.writeHeader(0x1_0000, 0));
+            }
+        });
+    }
+
+    private static void assertIllegalArgument(Runnable action) {
+        try {
+            action.run();
+            Assert.fail("expected IllegalArgumentException");
+        } catch (IllegalArgumentException expected) {
+            // expected
+        }
+    }
+
+    @Test
     public void testBufferResetAndReuse() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();

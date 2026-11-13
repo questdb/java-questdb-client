@@ -52,11 +52,12 @@ class QwpColumnWriter {
             long stringDataSize,
             int symbolDictionarySize,
             boolean useGorilla,
-            boolean useGlobalSymbols
+            boolean useGlobalSymbols,
+            boolean forceNullBitmap
     ) {
         long dataAddr = col.getDataAddress();
 
-        writeNullHeader(col, rowCount, rowCount - valueCount);
+        writeNullHeader(col, rowCount, rowCount - valueCount, forceNullBitmap);
 
         switch (col.getType()) {
             case TYPE_BOOLEAN:
@@ -239,8 +240,13 @@ class QwpColumnWriter {
         }
     }
 
-    private void writeNullHeader(QwpTableBuffer.ColumnBuffer col, int rowCount, int nullCount) {
-        if (nullCount > 0) {
+    private void writeNullHeader(
+            QwpTableBuffer.ColumnBuffer col,
+            int rowCount,
+            int nullCount,
+            boolean forceNullBitmap
+    ) {
+        if (nullCount > 0 || forceNullBitmap) {
             buffer.putByte((byte) 1);
             col.ensureNullBitmapCapacity(rowCount);
             long nullAddr = col.getNullBitmapAddress();
@@ -330,6 +336,10 @@ class QwpColumnWriter {
             boolean useGlobalSymbols,
             boolean useGorilla
     ) {
+        // A schema-bound GEOHASH column always ships its null bitmap, so an
+        // all-ones value stays distinct from NULL.
+        boolean isSchemaBound = tableBuffer.getSchemaBinding() != null;
+
         writeTableHeader(tableBuffer, rowCount);
 
         for (int i = 0; i < tableBuffer.getColumnCount(); i++) {
@@ -344,7 +354,9 @@ class QwpColumnWriter {
                 symbolDictionarySize = limitedSymbolDictionarySizes[i];
             }
 
-            encodeColumn(col, rowCount, valueCount, stringDataSize, symbolDictionarySize, useGorilla, useGlobalSymbols);
+            encodeColumn(col, rowCount, valueCount, stringDataSize, symbolDictionarySize,
+                    useGorilla, useGlobalSymbols,
+                    isSchemaBound && col.getType() == TYPE_GEOHASH && col.usesNullBitmap());
         }
     }
 

@@ -749,16 +749,16 @@ public class SymbolDictRecycleTest {
     }
 
     /**
-     * A pending REBUILD resume must refuse to complete under an in-progress
-     * row. The row's symbol ids belong to the outgoing dictionary; committing
-     * the swap underneath it would ship them against the fresh one and the
-     * server would decode a different symbol. at()/atNow() always arrive with
-     * a row in progress, so only table(), flush() and drain() can complete a
-     * pending rebuild: the refused row is rolled back and the next table()
-     * completes the swap.
+     * A pending REBUILD resume must never complete under a row that holds
+     * values. The row's symbol ids would belong to the outgoing dictionary;
+     * committing the swap underneath it would ship them against the fresh one
+     * and the server would decode a different symbol. The first setter of a
+     * row resolves the table's schema before the row takes its first value,
+     * and that resolution completes the pending rebuild, so the row's symbol
+     * id comes from the fresh dictionary.
      */
     @Test(timeout = 60_000L)
-    public void testRebuildResumeRefusesAnInProgressRow() throws Exception {
+    public void testRebuildResumeCompletesBeforeTheRowTakesAValue() throws Exception {
         assertMemoryLeak(() -> {
             try (TestWebSocketServer server = ackingServer()) {
                 try (Sender sender = Sender.fromConfig(cfg(server))) {
@@ -784,20 +784,11 @@ public class SymbolDictRecycleTest {
                     }
                     Assert.assertEquals(0, ws.getSymbolDictEpoch());
 
-                    // The caller ignores the failure and finishes a row on the
-                    // still-selected table: its symbol id is an OLD-dictionary id.
-                    try {
-                        sender.symbol("s", "x").longColumn("v", 2L).atNow();
-                        Assert.fail("atNow() must not complete the pending rebuild under an in-progress row");
-                    } catch (LineSenderException e) {
-                        TestUtils.assertContains(e.getMessage(),
-                                "a symbol dictionary recycle is completing; finish or cancel the in-progress row and retry");
-                    }
-                    Assert.assertEquals("the swap must not commit underneath the row",
-                            0, ws.getSymbolDictEpoch());
-
-                    // The refused row was rolled back; the next table() completes the swap.
-                    sender.table("t").symbol("s", "x").longColumn("v", 3L).atNow();
+                    // The caller ignores the failure and starts a row on the still-selected table.
+                    sender.symbol("s", "x");
+                    Assert.assertEquals("the swap must complete before the row takes a value",
+                            1, ws.getSymbolDictEpoch());
+                    sender.longColumn("v", 2L).atNow();
                     Assert.assertEquals(1, ws.getSymbolDictEpoch());
                     long f2 = sender.flushAndGetSequence();
                     Assert.assertTrue(sender.awaitAckedFsn(f2, 5_000));

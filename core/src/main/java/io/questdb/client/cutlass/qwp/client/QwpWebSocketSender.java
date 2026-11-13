@@ -27,6 +27,7 @@ package io.questdb.client.cutlass.qwp.client;
 import io.questdb.client.ClientTlsConfiguration;
 import io.questdb.client.ConnectionHealth;
 import io.questdb.client.HttpTokenProvider;
+import io.questdb.client.LineSenderSchemaException;
 import io.questdb.client.Sender;
 import io.questdb.client.SenderConnectionEvent;
 import io.questdb.client.SenderConnectionListener;
@@ -52,6 +53,9 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderConnectionLis
 import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderErrorHandler;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderProgressHandler;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
+import io.questdb.client.cutlass.qwp.protocol.QwpSchemaBinding;
+import io.questdb.client.cutlass.qwp.protocol.QwpSchemaProtocol;
+import io.questdb.client.cutlass.qwp.protocol.QwpSchemaResponse;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderConnectionDispatcher;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher;
@@ -82,6 +86,7 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -146,6 +151,10 @@ public class QwpWebSocketSender implements Sender {
     // Finite fallback (ms) for BACKGROUND (drainer) TCP connects when the
     // user left connect_timeout unset. See effectiveConnectTimeoutMs.
     public static final int DEFAULT_BACKGROUND_CONNECT_TIMEOUT_MS = 15_000;
+    // Upper bound for a row's first setter to wait on the initial handshake
+    // and a schema DESCRIBE round trip. A healthy lookup takes milliseconds;
+    // this only bounds a dead or still-connecting link.
+    public static final long DEFAULT_SCHEMA_WAIT_MILLIS = 30_000L;
     // Default for symbol_dict_reset -- periodic symbol-dictionary recycling is
     // on by default so a long-lived sender's dictionary does not grow without
     // bound. The recycle runs at a table() call that finds the backlog
@@ -174,6 +183,9 @@ public class QwpWebSocketSender implements Sender {
     // Default for symbol_dict_reset_threshold: distinct-symbol count that
     // triggers a recycle once symbol_dict_reset is on.
     public static final int DEFAULT_SYMBOL_DICT_RESET_THRESHOLD_SYMBOLS = 100_000;
+    // Longest a batch converts against a cached table schema the server has not
+    // confirmed, while the wire is up; see QwpSchemaFreshness.
+    public static final long SCHEMA_MAX_AGE_MILLIS = 1_000L;
     private static final int DEFAULT_BUFFER_SIZE = 8192;
     private static final int DEFAULT_MICROBATCH_BUFFER_SIZE = 1024 * 1024; // 1MB
     private static final Logger LOG = LoggerFactory.getLogger(QwpWebSocketSender.class);
@@ -188,6 +200,10 @@ public class QwpWebSocketSender implements Sender {
     // past any transient disk/NFS stall the deferred-close machinery exists
     // to survive.
     private static final long RECYCLE_DEFERRED_CLOSE_MAX_WAIT_MILLIS = 30_000L;
+    private static final long SCHEMA_MAX_AGE_NANOS = TimeUnit.MILLISECONDS.toNanos(SCHEMA_MAX_AGE_MILLIS);
+    // Longest the row after a run of rejected rows waits for the re-check of its
+    // table's schema; see recheckRejectingSchema().
+    private static final long SCHEMA_RECHECK_WAIT_MILLIS = 1_000L;
     private static final String WRITE_PATH = "/write/v4";
     // Yields the Authorization header value presented on each WebSocket upgrade. A constant for a
     // fixed token or Basic credential; for an httpTokenProvider it pulls a freshly refreshed token,
@@ -430,6 +446,11 @@ public class QwpWebSocketSender implements Sender {
     // wasEverConnected() for the whole post-recycle outage window. Volatile:
     // wasEverConnected() is consulted from the error-dispatcher daemon.
     private volatile boolean hasLoopEverConnected;
+    // The schema counterpart of hasLoopEverConnected. A symbol-dictionary recycle
+    // carries it and recycledSchemaCache into the rebuilt loop; see
+    // CursorWebSocketSendLoop.seedSchemaState(). Producer thread only.
+    private boolean hasLoopNegotiatedSchema;
+    private final HashMap<String, QwpSchemaResponse> recycledSchemaCache = new HashMap<>();
     // FSN of the last commit-bearing (non-FLAG_DEFER_COMMIT) frame this session
     // published, or -1 when none. Frames above it are deferred and uncommitted:
     // the server withholds their acks by design (their rows are rolled back on
@@ -645,6 +666,12 @@ public class QwpWebSocketSender implements Sender {
     private long reconnectMaxDurationMillis =
             CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_DURATION_MILLIS;
     private int durableAckTiers;
+    // nanoClock reading taken before a flush publishes; see recordSchemaFramesAfterFlush().
+    private long schemaFlushNanos;
+    // Row-encoding contract when a schema is not obtainable; see
+    // resolveSchemaForCurrentTable().
+    private Sender.SchemaMode schemaMode = Sender.SchemaMode.AUTO;
+    private long schemaWaitMillis = DEFAULT_SCHEMA_WAIT_MILLIS;
     // Monotonic per-attempt counter snapshotted onto every connection event
     // fired from buildAndConnect. Counts every FOREGROUND endpoint try --
     // successes and failures alike -- across this sender's lifetime.
@@ -1191,13 +1218,63 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * As the master overload below, with the default {@link Sender.SchemaMode#AUTO}
+     * schema contract and the default schema wait. Kept as its own overload so a
+     * caller compiled before the schema knobs moved into the master keeps linking.
+     */
+    public static QwpWebSocketSender connectWithCredentialSupplier(
+            List<Endpoint> endpoints,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            Supplier<String> authorizationHeaderSupplier,
+            int durableAckTiers,
+            CursorSendEngine cursorEngine,
+            long closeFlushTimeoutMillis,
+            long reconnectMaxDurationMillis,
+            long reconnectInitialBackoffMillis,
+            long reconnectMaxBackoffMillis,
+            Sender.InitialConnectMode initialConnectMode,
+            SenderErrorHandler errorHandler,
+            int errorInboxCapacity,
+            long durableAckKeepaliveIntervalMillis,
+            long authTimeoutMs,
+            int connectTimeoutMs,
+            SenderConnectionListener connectionListener,
+            int connectionListenerInboxCapacity,
+            int maxFrameRejections,
+            long poisonMinEscalationWindowMillis,
+            long catchUpCapGapMinEscalationWindowMillis,
+            boolean symbolDictResetEnabled,
+            int symbolDictResetThresholdSymbols,
+            long symbolDictResetMaxWaitMillis,
+            long keepaliveIntervalMillis
+    ) {
+        return connectWithCredentialSupplier(endpoints, tlsConfig, autoFlushRows, autoFlushBytes,
+                autoFlushIntervalNanos, authorizationHeaderSupplier, durableAckTiers,
+                cursorEngine, closeFlushTimeoutMillis, reconnectMaxDurationMillis,
+                reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
+                initialConnectMode, errorHandler, errorInboxCapacity,
+                durableAckKeepaliveIntervalMillis, authTimeoutMs, connectTimeoutMs,
+                connectionListener, connectionListenerInboxCapacity,
+                maxFrameRejections, poisonMinEscalationWindowMillis,
+                catchUpCapGapMinEscalationWindowMillis,
+                symbolDictResetEnabled, symbolDictResetThresholdSymbols,
+                symbolDictResetMaxWaitMillis, keepaliveIntervalMillis,
+                Sender.SchemaMode.AUTO, DEFAULT_SCHEMA_WAIT_MILLIS);
+    }
+
+    /**
      * Master connect entry point — also accepts the poison-frame detector
      * threshold ({@code max_frame_rejections}) and the symbol-dictionary
      * recycle knobs ({@code symbol_dict_reset}, {@code symbol_dict_reset_threshold},
      * {@code symbol_dict_reset_max_wait_millis}): consecutive server-active
      * rejections of the same head-of-line frame, with no ack progress in
      * between, before the loop escalates to a typed terminal. Also takes the
-     * idle keepalive PING cadence ({@code keepalive_interval_millis}).
+     * idle keepalive PING cadence ({@code keepalive_interval_millis}), and the
+     * schema contract ({@code schema_mode}) with its lookup budget
+     * ({@code schema_wait_millis}).
      * <p>
      * Named apart from {@code connect} for the reason given on
      * {@link #connectWithCredentialSupplier(List, ClientTlsConfiguration, int, int, long, Supplier,
@@ -1242,7 +1319,9 @@ public class QwpWebSocketSender implements Sender {
             boolean symbolDictResetEnabled,
             int symbolDictResetThresholdSymbols,
             long symbolDictResetMaxWaitMillis,
-            long keepaliveIntervalMillis
+            long keepaliveIntervalMillis,
+            Sender.SchemaMode schemaMode,
+            long schemaWaitMillis
     ) {
         if (symbolDictResetThresholdSymbols <= 0
                 || symbolDictResetThresholdSymbols > QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE / 2) {
@@ -1281,6 +1360,8 @@ public class QwpWebSocketSender implements Sender {
             sender.initialConnectMode = initialConnectMode == null
                     ? Sender.InitialConnectMode.OFF
                     : initialConnectMode;
+            sender.schemaMode = schemaMode == null ? Sender.SchemaMode.AUTO : schemaMode;
+            sender.schemaWaitMillis = schemaWaitMillis;
             if (errorHandler != null) {
                 sender.setErrorHandler(errorHandler);
             }
@@ -1396,6 +1477,12 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.designatedTimestamp(timestamp, unit);
+                sendRow();
+                return;
+            }
             if (unit == ChronoUnit.NANOS) {
                 atNanos(timestamp);
             } else {
@@ -1403,8 +1490,7 @@ public class QwpWebSocketSender implements Sender {
                 atMicros(micros);
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e);
         }
     }
 
@@ -1413,11 +1499,16 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.designatedTimestamp(timestamp);
+                sendRow();
+                return;
+            }
             long micros = timestamp.getEpochSecond() * 1_000_000L + timestamp.getNano() / 1000L;
             atMicros(micros);
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e);
         }
     }
 
@@ -1426,11 +1517,11 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
+            bindingForEffectiveWrite();
             // Server-assigned timestamp - just send the row without designated timestamp
             sendRow();
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e);
         }
     }
 
@@ -1475,7 +1566,10 @@ public class QwpWebSocketSender implements Sender {
         if (timeoutMillis <= 0L) {
             return false;
         }
-        long deadlineNanos = System.nanoTime() + timeoutMillis * 1_000_000L;
+        // Elapsed-versus-budget, not an absolute deadline: toNanos saturates, so
+        // Long.MAX_VALUE waits indefinitely instead of wrapping to no wait.
+        final long startNanos = System.nanoTime();
+        final long budgetNanos = TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
         Thread me = Thread.currentThread();
         // Registered before the first check: an ack that lands after a check
         // unparks us (or leaves the permit), one that landed before is seen by it.
@@ -1490,7 +1584,7 @@ public class QwpWebSocketSender implements Sender {
                     return true;
                 }
                 checkAwaitAckedFsnErrors();
-                long remaining = deadlineNanos - System.nanoTime();
+                long remaining = budgetNanos - (System.nanoTime() - startNanos);
                 if (remaining <= 0L) {
                     return false;
                 }
@@ -1537,26 +1631,29 @@ public class QwpWebSocketSender implements Sender {
      * Adds a BINARY column value to the current row. The bytes are written
      * verbatim with no encoding or transformation. A {@code null} array
      * reference is rejected so the NULL contract stays explicit (use the null
-     * bitmap instead). An empty array is accepted on the wire but QuestDB's
-     * BINARY storage uses the same NULL sentinel for zero-length and absent
-     * values, so an empty payload round-trips as NULL on read.
+     * bitmap instead). An empty array is accepted and remains a present,
+     * zero-length BINARY value, distinct from an omitted/null value.
      */
     @Override
     public QwpWebSocketSender binaryColumn(CharSequence columnName, byte[] value) {
         checkNotClosed();
         checkTableSelected();
-        if (value == null) {
-            throw new LineSenderException(
-                    "BINARY value cannot be null; mark the row null via the null bitmap instead");
-        }
         try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.binaryColumn(columnName, value);
+                return this;
+            }
+            if (value == null) {
+                throw new LineSenderException(
+                        "BINARY value cannot be null; mark the row null via the null bitmap instead");
+            }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_BINARY, true);
             if (col != null) {
                 col.addBinary(value);
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e);
         }
         return this;
     }
@@ -1571,11 +1668,20 @@ public class QwpWebSocketSender implements Sender {
     public QwpWebSocketSender binaryColumn(CharSequence columnName, DirectByteSlice slice) {
         checkNotClosed();
         checkTableSelected();
-        if (slice == null) {
-            throw new LineSenderException(
-                    "BINARY slice cannot be null; mark the row null via the null bitmap instead");
+        try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.binaryColumn(columnName, slice);
+                return this;
+            }
+            if (slice == null) {
+                throw new LineSenderException(
+                        "BINARY slice cannot be null; mark the row null via the null bitmap instead");
+            }
+            return binaryColumn(columnName, slice.ptr(), slice.size());
+        } catch (RuntimeException | Error e) {
+            throw onRowFailure(e);
         }
-        return binaryColumn(columnName, slice.ptr(), slice.size());
     }
 
     /**
@@ -1588,13 +1694,17 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.binaryColumn(columnName, ptr, len);
+                return this;
+            }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_BINARY, true);
             if (col != null) {
                 col.addBinary(ptr, len);
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e);
         }
         return this;
     }
@@ -1604,13 +1714,17 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.boolColumn(columnName, value);
+                return this;
+            }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_BOOLEAN, false);
             if (col != null) {
                 col.addBoolean(value);
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e);
         }
         return this;
     }
@@ -1631,13 +1745,17 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.byteColumn(columnName, value);
+                return this;
+            }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_BYTE, false);
             if (col != null) {
                 col.addByte(value);
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e);
         }
         return this;
     }
@@ -1664,13 +1782,17 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.charColumn(columnName, value);
+                return this;
+            }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_CHAR, false);
             if (col != null) {
                 col.addShort((short) value);
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e);
         }
         return this;
     }
@@ -2054,13 +2176,17 @@ public class QwpWebSocketSender implements Sender {
         if (value == null || value.isNull()) return this;
         checkTableSelected();
         try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.decimalColumn(name, value);
+                return this;
+            }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_DECIMAL64, true);
             if (col != null) {
                 col.addDecimal64(value);
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e);
         }
         return this;
     }
@@ -2071,13 +2197,17 @@ public class QwpWebSocketSender implements Sender {
         if (value == null || value.isNull()) return this;
         checkTableSelected();
         try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.decimalColumn(name, value);
+                return this;
+            }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_DECIMAL128, true);
             if (col != null) {
                 col.addDecimal128(value);
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e);
         }
         return this;
     }
@@ -2088,13 +2218,17 @@ public class QwpWebSocketSender implements Sender {
         if (value == null || value.isNull()) return this;
         checkTableSelected();
         try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.decimalColumn(name, value);
+                return this;
+            }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_DECIMAL256, true);
             if (col != null) {
                 col.addDecimal256(value);
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e);
         }
         return this;
     }
@@ -2105,14 +2239,18 @@ public class QwpWebSocketSender implements Sender {
         if (value == null || value.length() == 0) return this;
         checkTableSelected();
         try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.decimalColumn(name, value, currentDecimal256);
+                return this;
+            }
             currentDecimal256.ofString(value);
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_DECIMAL256, true);
             if (col != null) {
                 col.addDecimal256(currentDecimal256);
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e);
         }
         return this;
     }
@@ -2123,13 +2261,17 @@ public class QwpWebSocketSender implements Sender {
         if (values == null) return this;
         checkTableSelected();
         try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.doubleArray(name, values);
+                return this;
+            }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_DOUBLE_ARRAY, true);
             if (col != null) {
                 col.addDoubleArray(values);
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e);
         }
         return this;
     }
@@ -2140,13 +2282,17 @@ public class QwpWebSocketSender implements Sender {
         if (values == null) return this;
         checkTableSelected();
         try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.doubleArray(name, values);
+                return this;
+            }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_DOUBLE_ARRAY, true);
             if (col != null) {
                 col.addDoubleArray(values);
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e);
         }
         return this;
     }
@@ -2157,13 +2303,17 @@ public class QwpWebSocketSender implements Sender {
         if (values == null) return this;
         checkTableSelected();
         try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.doubleArray(name, values);
+                return this;
+            }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_DOUBLE_ARRAY, true);
             if (col != null) {
                 col.addDoubleArray(values);
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e);
         }
         return this;
     }
@@ -2174,13 +2324,17 @@ public class QwpWebSocketSender implements Sender {
         if (array == null) return this;
         checkTableSelected();
         try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.doubleArray(name, array);
+                return this;
+            }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_DOUBLE_ARRAY, true);
             if (col != null) {
                 col.addDoubleArray(array);
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e);
         }
         return this;
     }
@@ -2190,13 +2344,17 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.doubleColumn(columnName, value);
+                return this;
+            }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_DOUBLE, true);
             if (col != null) {
                 col.addDouble(value);
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e);
         }
         return this;
     }
@@ -2212,13 +2370,17 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.floatColumn(columnName, value);
+                return this;
+            }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_FLOAT, true);
             if (col != null) {
                 col.addFloat(value);
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e);
         }
         return this;
     }
@@ -2357,18 +2519,22 @@ public class QwpWebSocketSender implements Sender {
     public QwpWebSocketSender geoHashColumn(CharSequence columnName, long bits, int precisionBits) {
         checkNotClosed();
         checkTableSelected();
-        if (precisionBits < 1 || precisionBits > 60) {
-            throw new LineSenderException(
-                    "invalid GEOHASH precision: " + precisionBits + " (must be 1-60)");
-        }
         try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.geoHashColumn(columnName, bits, precisionBits);
+                return this;
+            }
+            if (precisionBits < 1 || precisionBits > 60) {
+                throw new LineSenderException(
+                        "invalid GEOHASH precision: " + precisionBits + " (must be 1-60)");
+            }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_GEOHASH, true);
             if (col != null) {
                 col.addGeoHash(maskGeoHashBits(bits, precisionBits), precisionBits);
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e);
         }
         return this;
     }
@@ -2391,6 +2557,15 @@ public class QwpWebSocketSender implements Sender {
     public QwpWebSocketSender geoHashColumn(CharSequence columnName, CharSequence value) {
         checkNotClosed();
         checkTableSelected();
+        try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.geoHashColumn(columnName, value);
+                return this;
+            }
+        } catch (RuntimeException | Error e) {
+            throw onRowFailure(e);
+        }
         if (value == null) {
             throw new LineSenderException(
                     "GEOHASH string cannot be null; mark the row null via the null bitmap instead");
@@ -2987,13 +3162,17 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.intColumn(columnName, value);
+                return this;
+            }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_INT, true);
             if (col != null) {
                 col.addInt(value);
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e);
         }
         return this;
     }
@@ -3016,13 +3195,17 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.ipv4Column(columnName, address);
+                return this;
+            }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_IPv4, true);
             if (col != null) {
                 col.addIPv4(address);
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e);
         }
         return this;
     }
@@ -3061,6 +3244,15 @@ public class QwpWebSocketSender implements Sender {
             return this;
         }
         checkTableSelected();
+        try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.ipv4Column(columnName, address);
+                return this;
+            }
+        } catch (RuntimeException | Error e) {
+            throw onRowFailure(e);
+        }
         if (Chars.equalsIgnoreCase("null", address) || Chars.equals("0.0.0.0", address)) {
             throw new LineSenderException(
                     "invalid IPv4 address: NULL sentinel inputs are rejected"
@@ -3078,6 +3270,12 @@ public class QwpWebSocketSender implements Sender {
 
     /**
      * Adds a LONG256 column value to the current row.
+     * <p>
+     * In schema-aware mode, setting all four limbs to {@link Long#MIN_VALUE}
+     * writes SQL NULL. Any other limb combination, including a partial match,
+     * is a value. Legacy mode preserves its existing behavior: the four limbs
+     * are emitted as native LONG256 wire data and server-side null/conversion
+     * handling applies.
      *
      * @param columnName the column name
      * @param l0         the least significant 64 bits
@@ -3086,17 +3284,22 @@ public class QwpWebSocketSender implements Sender {
      * @param l3         the most significant 64 bits
      * @return this sender for method chaining
      */
+    @Override
     public QwpWebSocketSender long256Column(CharSequence columnName, long l0, long l1, long l2, long l3) {
         checkNotClosed();
         checkTableSelected();
         try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.long256Column(columnName, l0, l1, l2, l3);
+                return this;
+            }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_LONG256, true);
             if (col != null) {
                 col.addLong256(l0, l1, l2, l3);
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e);
         }
         return this;
     }
@@ -3107,13 +3310,18 @@ public class QwpWebSocketSender implements Sender {
         if (values == null) return this;
         checkTableSelected();
         try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.unsupportedColumn(name, "LONG_ARRAY");
+                return this;
+            }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_LONG_ARRAY, true);
             if (col != null) {
                 col.addLongArray(values);
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            // LONG_ARRAY is unimplemented; a schema refresh cannot make it valid.
+            throw onRowFailure(e);
         }
         return this;
     }
@@ -3124,13 +3332,17 @@ public class QwpWebSocketSender implements Sender {
         if (values == null) return this;
         checkTableSelected();
         try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.unsupportedColumn(name, "LONG_ARRAY");
+                return this;
+            }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_LONG_ARRAY, true);
             if (col != null) {
                 col.addLongArray(values);
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e);
         }
         return this;
     }
@@ -3141,13 +3353,17 @@ public class QwpWebSocketSender implements Sender {
         if (values == null) return this;
         checkTableSelected();
         try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.unsupportedColumn(name, "LONG_ARRAY");
+                return this;
+            }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_LONG_ARRAY, true);
             if (col != null) {
                 col.addLongArray(values);
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e);
         }
         return this;
     }
@@ -3158,13 +3374,17 @@ public class QwpWebSocketSender implements Sender {
         if (array == null) return this;
         checkTableSelected();
         try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.unsupportedColumn(name, "LONG_ARRAY");
+                return this;
+            }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_LONG_ARRAY, true);
             if (col != null) {
                 col.addLongArray(array);
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e);
         }
         return this;
     }
@@ -3174,13 +3394,17 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.longColumn(columnName, value);
+                return this;
+            }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_LONG, true);
             if (col != null) {
                 col.addLong(value);
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e);
         }
         return this;
     }
@@ -3585,13 +3809,17 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.shortColumn(columnName, value);
+                return this;
+            }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_SHORT, false);
             if (col != null) {
                 col.addShort(value);
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e);
         }
         return this;
     }
@@ -3701,13 +3929,17 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.stringColumn(columnName, value);
+                return this;
+            }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_VARCHAR, true);
             if (col != null) {
                 col.addString(value);
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e);
         }
         return this;
     }
@@ -3717,13 +3949,17 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.symbol(columnName, value);
+                return this;
+            }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_SYMBOL, true);
             if (col != null) {
                 col.addSymbol(value);
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e);
         }
         return this;
     }
@@ -3737,33 +3973,34 @@ public class QwpWebSocketSender implements Sender {
         } else if (resetArmed) {
             maybeRecycleForDictReset();
         }
-        // Fast path: if table name matches current, skip hashmap lookup
-        if (currentTableName != null && currentTableBuffer != null && Chars.equals(tableName, currentTableName)) {
-            return this;
+        if (currentTableName == null || !Chars.equals(tableName, currentTableName)) {
+            // Prevent switching tables while a row is in progress.
+            if (currentTableBuffer != null && currentTableBuffer.hasInProgressRow()) {
+                throw new LineSenderException("cannot switch tables while row is in progress"
+                        + " [currentTable=").put(currentTableName).put(']');
+            }
+            validateTableName(tableName);
+            // Table changed - invalidate cached column references.
+            cachedTimestampColumn = null;
+            cachedTimestampNanosColumn = null;
+            currentTableBuffer = tableBuffers.get(tableName);
+            if (currentTableBuffer != null) {
+                currentTableName = currentTableBuffer.getTableName();
+            } else {
+                currentTableName = tableName.toString();
+                currentTableBuffer = new QwpTableBuffer(currentTableName, this);
+                tableBuffers.put(currentTableName, currentTableBuffer);
+            }
+            // Re-snap so sendRow()'s delta math is anchored to this table's
+            // current byte count. The prior current table's bytes already match
+            // its last-snapped value (the in-progress-row guard above ensures
+            // no column setters ran on it since the last consistency point).
+            currentTableBufferSnapshotBytes = currentTableBuffer.getBufferedBytes();
         }
-        // Prevent switching tables while a row is in progress
-        if (currentTableBuffer != null && currentTableBuffer.hasInProgressRow()) {
-            throw new LineSenderException("cannot switch tables while row is in progress"
-                    + " [currentTable=").put(currentTableName).put(']');
-        }
-        // Table changed - invalidate cached column references
-        validateTableName(tableName);
-        cachedTimestampColumn = null;
-        cachedTimestampNanosColumn = null;
-        currentTableBuffer = tableBuffers.get(tableName);
-        if (currentTableBuffer != null) {
-            currentTableName = currentTableBuffer.getTableName();
-        } else {
-            currentTableName = tableName.toString();
-            currentTableBuffer = new QwpTableBuffer(currentTableName, this);
-            tableBuffers.put(currentTableName, currentTableBuffer);
-        }
-        // Re-snap so sendRow()'s delta math is anchored to this table's
-        // current byte count. The prior current table's bytes already match
-        // its last-snapped value (the in-progress-row guard above ensures
-        // no column setters ran on it since the last consistency point).
-        currentTableBufferSnapshotBytes = currentTableBuffer.getBufferedBytes();
-        // Both modes accumulate rows until flush
+        // Resolve schema at the explicit table boundary. Setters retain the
+        // same lookup as a fallback because the selected table also starts
+        // implicit rows after completion, cancellation, and batch flushes.
+        bindingForEffectiveWrite();
         return this;
     }
 
@@ -3772,6 +4009,11 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.timestampColumn(columnName, value, unit);
+                return this;
+            }
             if (unit == ChronoUnit.NANOS) {
                 QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_TIMESTAMP_NANOS, true);
                 if (col != null) {
@@ -3785,8 +4027,7 @@ public class QwpWebSocketSender implements Sender {
                 }
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e);
         }
         return this;
     }
@@ -3796,14 +4037,18 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.timestampColumn(columnName, value);
+                return this;
+            }
             long micros = value.getEpochSecond() * 1_000_000L + value.getNano() / 1000L;
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_TIMESTAMP, true);
             if (col != null) {
                 col.addLong(micros);
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e);
         }
         return this;
     }
@@ -3820,13 +4065,17 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
+            QwpSchemaBinding binding = bindingForEffectiveWrite();
+            if (binding != null) {
+                binding.uuidColumn(columnName, lo, hi);
+                return this;
+            }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_UUID, true);
             if (col != null) {
                 col.addUuid(hi, lo);
             }
         } catch (RuntimeException | Error e) {
-            rollbackRow();
-            throw e;
+            throw onRowFailure(e);
         }
         return this;
     }
@@ -4256,6 +4505,9 @@ public class QwpWebSocketSender implements Sender {
                 newClient.setQwpMaxVersion(QwpConstants.VERSION);
                 newClient.setQwpClientId(QwpConstants.CLIENT_ID);
                 newClient.setQwpDurableAckTiers(durableAckTiers);
+                if (schemaMode != Sender.SchemaMode.OFF) {
+                    newClient.requestQwpSchema();
+                }
                 newClient.setConnectTimeout(effectiveConnectTimeoutMs(background, connectTimeoutMs));
                 if (cancellation != null) {
                     // Publish the client we are about to block on so a
@@ -4878,7 +5130,8 @@ public class QwpWebSocketSender implements Sender {
                 LOG.error("Error in close-drain-waiting test hook: {}", String.valueOf(t));
             }
         }
-        long deadlineNanos = System.nanoTime() + closeFlushTimeoutMillis * 1_000_000L;
+        final long startNanos = System.nanoTime();
+        final long budgetNanos = TimeUnit.MILLISECONDS.toNanos(closeFlushTimeoutMillis);
         restoreInterrupt[0] |= Thread.interrupted();
         try {
             Thread me = Thread.currentThread();
@@ -4904,7 +5157,8 @@ public class QwpWebSocketSender implements Sender {
                     } else {
                         cursorSendLoop.checkError();
                     }
-                    if (System.nanoTime() >= deadlineNanos) {
+                    long remainingNanos = budgetNanos - (System.nanoTime() - startNanos);
+                    if (remainingNanos <= 0L) {
                         long acked = cursorEngine.ackedFsn();
                         long externalTarget = fsnEpochBase + target;
                         long externalAcked = fsnEpochBase + acked;
@@ -4926,7 +5180,7 @@ public class QwpWebSocketSender implements Sender {
                                         ? " pending batches; data may be lost (use larger closeFlushTimeoutMillis or smaller batches)"
                                         : " pending batches; the wire is not draining: " + outage.getMessage());
                     }
-                    java.util.concurrent.locks.LockSupport.parkNanos(this, deadlineNanos - System.nanoTime());
+                    java.util.concurrent.locks.LockSupport.parkNanos(this, remainingNanos);
                 }
             } finally {
                 ackWaiters.remove(me);
@@ -5084,6 +5338,10 @@ public class QwpWebSocketSender implements Sender {
             // the loop no longer fires a terminal budget-exhaustion event -- it
             // retries indefinitely.)
             cursorSendLoop.setConnectionDispatcher(connectionDispatcher);
+            // AUTO falls back to the legacy contract when the wire drops under a
+            // lookup, so the lookup must fail right away rather than ride the
+            // reconnect. STRICT keeps it pending for the replacement connection.
+            cursorSendLoop.setAbandonSchemaLookupOnDisconnect(schemaMode == Sender.SchemaMode.AUTO);
             cursorSendLoop.setConnectionHealthTracker(healthTracker);
             // Seed the fresh loop's own hasEverConnected before it can observe
             // any endpoint-policy failure: without this, a symbol-dict
@@ -5095,10 +5353,13 @@ public class QwpWebSocketSender implements Sender {
             if (hasLoopEverConnected) {
                 cursorSendLoop.markEverConnected();
             }
+            cursorSendLoop.seedSchemaState(hasLoopNegotiatedSchema, recycledSchemaCache);
             if (loopStartFault != null) {
                 loopStartFault.run();
             }
             cursorSendLoop.start();
+            // The started loop owns its copy; a failed start keeps this one for the retry.
+            recycledSchemaCache.clear();
         } catch (Throwable t) {
             // start() (or dispatcher construction) failed after cursorSendLoop was
             // assigned. Close it so a caller that retries -- re-entering
@@ -5168,6 +5429,297 @@ public class QwpWebSocketSender implements Sender {
         hasInitialConnectRun = true;
     }
 
+    /**
+     * Selects the wire contract at an explicit table boundary or before the first
+     * effective value of an implicit row.
+     * <p>
+     * A table pins one schema snapshot per batch. Once the table holds pending rows,
+     * later rows of the same batch validate against that snapshot without consulting
+     * the cache; the first row after a flush or reset adopts whatever the cache holds
+     * by then, which ACK schema feedback keeps current. While the wire is up, a cached
+     * snapshot the server has not confirmed for {@link #SCHEMA_MAX_AGE_MILLIS} is looked
+     * up again first; see {@link #resolveConfirmedSchema}. A rejection that a column
+     * type change could explain evicts the snapshot; see {@link #onRowFailure}. A run
+     * of rows the snapshot rejected makes the next row look the table up even while
+     * the batch holds rows; see {@link #recheckRejectingSchema}.
+     * <p>
+     * When no snapshot is pinned, the configured {@link Sender.SchemaMode} decides
+     * between a schema lookup and the legacy contract; see
+     * {@link #resolveSchemaForCurrentTable()}.
+     */
+    private QwpSchemaBinding bindingForEffectiveWrite() {
+        QwpSchemaBinding pinned = currentTableBuffer.getSchemaBinding();
+        if (currentTableBuffer.hasInProgressRow()) {
+            return pinned;
+        }
+        ensureConnected();
+        if (pinned != null && recheckRejectingSchema(pinned) && currentTableBuffer.getRowCount() > 0) {
+            // The pending rows carry the old column types, which the server converts
+            // as it converts any frame encoded before the change. Sending them frees
+            // the buffer to take the new schema below.
+            flushPendingRows(transactional);
+        }
+        // A table buffer keeps one contract while it holds rows; the first row
+        // after the flush consults the schema again.
+        if (currentTableBuffer.getRowCount() > 0) {
+            return pinned;
+        }
+        // AUTO uses detected connection state to decide whether to attempt lookup.
+        // A silent peer can leave the wire marked up. Each lookup has its own
+        // budget: table() and the first setter can both wait on an empty batch,
+        // and later batches can repeat this (up to 60 s with default settings).
+        // This is an accepted trade-off: transient unavailability is not cached
+        // or latched into legacy mode, so later attempts can adopt schema again.
+        QwpSchemaResponse latest = resolveSchemaForCurrentTable();
+        if (latest == null) {
+            return selectLegacyContract();
+        }
+        if (pinned != null && isSnapshotOf(pinned, latest)) {
+            return pinned;
+        }
+        return installSchemaBinding(latest);
+    }
+
+    private static boolean isSnapshotOf(QwpSchemaBinding binding, QwpSchemaResponse schema) {
+        return binding.getTableId() == schema.getTableId()
+                && binding.getMetadataVersion() == schema.getMetadataVersion();
+    }
+
+    /**
+     * Looks the current table up again after a run of rows its pinned snapshot
+     * rejected, and reports whether the server's schema differs from the snapshot.
+     * <p>
+     * After a column type change, a sender whose rows all fail against the old
+     * type never reaches the {@code at()} that could flush its batch, so no reply
+     * reports the change, and the batch keeps the snapshot while it holds rows.
+     * The re-check needs a connected wire, waits at most
+     * {@code SCHEMA_RECHECK_WAIT_MILLIS}, and runs at most once per
+     * {@link #SCHEMA_MAX_AGE_MILLIS} per table, so values that are invalid under
+     * the current schema cost little. A failed lookup, including one on a wire
+     * without schema support, says nothing about the schema, so it keeps the
+     * snapshot. It defers the table's next lookup from the end of its wait, as a
+     * failed lookup in {@link #resolveConfirmedSchema} does, so a server that never
+     * answers costs each table at most one wait per interval after it.
+     */
+    private boolean recheckRejectingSchema(QwpSchemaBinding pinned) {
+        QwpSchemaFreshness freshness = currentTableBuffer.getSchemaFreshness();
+        if (!freshness.isRecheckDue()) {
+            return false;
+        }
+        // The caller ran ensureConnected(), which installs a loop; the lookup after
+        // this re-check dereferences it the same way.
+        assert cursorSendLoop != null;
+        // A lookup on a wire that is down would wait for the reconnect. A run that
+        // finds the wire down stays due for the next connection.
+        if (!cursorSendLoop.isWireUp()) {
+            return false;
+        }
+        final long nowNanos = nanoClock.getAsLong();
+        if (!freshness.takeRecheck(nowNanos, SCHEMA_MAX_AGE_NANOS)) {
+            return false;
+        }
+        final QwpSchemaResponse latest;
+        try {
+            latest = cursorSendLoop.revalidateSchema(currentTableBuffer.getSchemaKey(),
+                    Math.min(schemaWaitMillis, SCHEMA_RECHECK_WAIT_MILLIS));
+        } catch (LineSenderSchemaException e) {
+            freshness.deferCheck(nanoClock.getAsLong());
+            return false;
+        }
+        freshness.confirm(nowNanos);
+        return !isSnapshotOf(pinned, latest);
+    }
+
+    /**
+     * Resolves the current table's schema under the configured
+     * {@link Sender.SchemaMode}, or returns {@code null} when the row must take the
+     * legacy contract: the mode is OFF, the server negotiated legacy QWP, or, in
+     * AUTO, the schema is not obtainable.
+     * <p>
+     * STRICT waits for the first upgrade and then for the lookup within one
+     * {@code schemaWaitMillis} budget and lets a lookup failure propagate. AUTO
+     * never waits on a dead wire: before the first upgrade it takes the legacy
+     * contract outright, while the wire is down it consults only the cache, and
+     * a lookup that ends in {@code SCHEMA_UNAVAILABLE} (a drop under it, a timeout,
+     * a server-side unavailability) or {@code UNSUPPORTED_FEATURE} (an oversized
+     * or unsupported schema response) selects the legacy contract instead of failing
+     * the row. Access denial still fails the row.
+     */
+    private QwpSchemaResponse resolveSchemaForCurrentTable() {
+        QwpSchemaResponse schema = lookUpSchemaForCurrentTable();
+        if (schema == null || schema.getResult() != QwpSchemaProtocol.RESULT_TOO_LARGE) {
+            return schema;
+        }
+        // The coordinator caches TOO_LARGE, so this costs no round trip per batch.
+        if (schemaMode == Sender.SchemaMode.STRICT) {
+            throw new LineSenderSchemaException(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
+                    "schema lookup failed [reason=UNSUPPORTED_FEATURE, table=" + currentTableName
+                            + ", detail=schema could not be returned within the discovery response limit]");
+        }
+        return null;
+    }
+
+    private QwpSchemaResponse lookUpSchemaForCurrentTable() {
+        if (schemaMode == Sender.SchemaMode.OFF) {
+            return null;
+        }
+        final long startNanos = System.nanoTime();
+        final long budgetNanos = TimeUnit.MILLISECONDS.toNanos(schemaWaitMillis);
+        final String key = currentTableBuffer.getSchemaKey();
+        if (schemaMode == Sender.SchemaMode.STRICT) {
+            if (!cursorSendLoop.awaitInitialSchemaMode(remainingSchemaMillis(startNanos, budgetNanos))) {
+                return null;
+            }
+            // STRICT writes no rows to a table it cannot describe, so no ACK feedback
+            // ever reports that the table shrank: ask again instead of trusting a
+            // cached TOO_LARGE. AUTO keeps the cache hit; its legacy rows earn feedback.
+            QwpSchemaResponse cached = cursorSendLoop.peekSchema(key);
+            if (cached != null && cached.getResult() == QwpSchemaProtocol.RESULT_TOO_LARGE) {
+                return cursorSendLoop.refreshSchema(key, remainingSchemaMillis(startNanos, budgetNanos));
+            }
+            return resolveConfirmedSchema(key, cached, startNanos, budgetNanos);
+        }
+        if (!cursorSendLoop.hasEverConnected()) {
+            return null;
+        }
+        if (!cursorSendLoop.isWireUp()) {
+            // Frames of this batch reach the server after the reconnect, and their
+            // replies confirm the cache as of their flush.
+            currentTableBuffer.getSchemaFreshness().markConsulted();
+            return cursorSendLoop.peekSchema(key);
+        }
+        if (!cursorSendLoop.isSchemaEnabled()) {
+            return null;
+        }
+        try {
+            return resolveConfirmedSchema(key, cursorSendLoop.peekSchema(key), startNanos, budgetNanos);
+        } catch (LineSenderSchemaException e) {
+            if (e.getReason() == LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE
+                    || e.getReason() == LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE) {
+                return null;
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Returns {@code cached} if the server confirmed it within
+     * {@link #SCHEMA_MAX_AGE_MILLIS} or the wire is down. Otherwise looks the table
+     * up, which confirms the result as of the moment before the request.
+     * <p>
+     * A lookup that fails with {@code SCHEMA_UNAVAILABLE} says nothing about the
+     * schema: the batch keeps the cached entry, and the next re-check waits out the
+     * age limit, so {@code table()} and the first setter do not both wait on a
+     * silent server. Other failures, and any failure without a cached entry,
+     * propagate as for a cold lookup.
+     */
+    private QwpSchemaResponse resolveConfirmedSchema(
+            String key,
+            QwpSchemaResponse cached,
+            long startNanos,
+            long budgetNanos
+    ) {
+        QwpSchemaFreshness freshness = currentTableBuffer.getSchemaFreshness();
+        freshness.markConsulted();
+        final long nowNanos = nanoClock.getAsLong();
+        if (cached != null
+                && (!freshness.isExpired(nowNanos, SCHEMA_MAX_AGE_NANOS, schemaOkFsn()) || !cursorSendLoop.isWireUp())) {
+            return cached;
+        }
+        try {
+            QwpSchemaResponse fresh = cursorSendLoop.revalidateSchema(key, remainingSchemaMillis(startNanos, budgetNanos));
+            freshness.confirm(nowNanos);
+            return fresh;
+        } catch (LineSenderSchemaException e) {
+            if (e.getReason() == LineSenderSchemaException.Reason.SCHEMA_UNAVAILABLE) {
+                QwpSchemaResponse current = cursorSendLoop.peekSchema(key);
+                if (current != null) {
+                    // From the end of the wait, which can outlast the age limit.
+                    freshness.deferCheck(nanoClock.getAsLong());
+                    return current;
+                }
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Commits the current table's next row to the legacy contract. A buffer still
+     * bound to an earlier batch's snapshot is unbound so the legacy setters lay out
+     * its columns afresh.
+     */
+    private QwpSchemaBinding selectLegacyContract() {
+        if (currentTableBuffer.getSchemaBinding() != null) {
+            unbindCurrentTableBuffer();
+        }
+        return null;
+    }
+
+    /**
+     * Binds the row-less current table buffer to {@code latest}. A buffer that has
+     * been bound before, or that a flushed legacy batch left with a column layout
+     * ({@link QwpTableBuffer#reset()} keeps columns), cannot take a new binding in
+     * place; {@link QwpTableBuffer#clear()} drops both before rebinding.
+     */
+    private QwpSchemaBinding installSchemaBinding(QwpSchemaResponse latest) {
+        if (currentTableBuffer.getSchemaBinding() != null || currentTableBuffer.getColumnCount() != 0) {
+            unbindCurrentTableBuffer();
+        }
+        return new QwpSchemaBinding(currentTableBuffer, latest);
+    }
+
+    /**
+     * Drops the row-less current table buffer's binding and column layout so the
+     * next contract lays it out afresh.
+     */
+    private void unbindCurrentTableBuffer() {
+        assert currentTableBuffer.getRowCount() == 0 : "table buffer unbound under pending rows";
+        currentTableBuffer.clear();
+        currentTableBufferSnapshotBytes = 0;
+        cachedTimestampColumn = null;
+        cachedTimestampNanosColumn = null;
+    }
+
+    // Single home of the row-failure policy: roll the whole row back, then report
+    // the failure as raised. The sender never looks up fresh metadata from a failed
+    // setter. When the snapshot rejected a value for a column it knows, the column
+    // may have changed type since, and no frame may ever reach the server to earn
+    // feedback. When the snapshot type could not take the value at all, the sender
+    // evicts the snapshot, so the next batch looks the table up. Any such rejection
+    // also counts towards a run, after which the next row re-checks the schema even
+    // while the batch holds rows; see recheckRejectingSchema().
+    private RuntimeException onRowFailure(Throwable e) {
+        QwpSchemaBinding binding = currentTableBuffer != null ? currentTableBuffer.getSchemaBinding() : null;
+        if (binding != null) {
+            if (binding.hasTargetTypeConflict()) {
+                binding.clearTargetTypeConflict();
+                CursorWebSocketSendLoop loop = cursorSendLoop;
+                if (loop != null) {
+                    loop.evictSchema(currentTableBuffer.getTableName(), binding.getTableId(), binding.getMetadataVersion());
+                }
+            }
+            if (binding.hasRejectedKnownColumn()) {
+                binding.clearRejectedKnownColumn();
+                currentTableBuffer.getSchemaFreshness().onRowRejected();
+            }
+        }
+        rollbackRow();
+        if (e instanceof Error) {
+            throw (Error) e;
+        }
+        return (RuntimeException) e;
+    }
+
+    /**
+     * Milliseconds left of a saturated nanosecond budget, rounded up. Comparing
+     * elapsed time against the budget cannot wrap, unlike an absolute deadline,
+     * so a budget of Long.MAX_VALUE millis means no limit.
+     */
+    private static long remainingSchemaMillis(long startNanos, long budgetNanos) {
+        long remaining = budgetNanos - (System.nanoTime() - startNanos);
+        return remaining <= 0 ? 0 : 1L + (remaining - 1L) / 1_000_000L;
+    }
+
     private void ensureNoInProgressRow() {
         if (currentTableBuffer != null && currentTableBuffer.hasInProgressRow()) {
             throw new LineSenderException(
@@ -5208,11 +5760,16 @@ public class QwpWebSocketSender implements Sender {
             firstPendingRowTimeNanos = 0;
             return;
         }
+        if (tableCount > 0xffff) {
+            throw new LineSenderException("too many table blocks in one QWP message [count=")
+                    .put(tableCount).put("]");
+        }
 
         if (LOG.isDebugEnabled()) {
             LOG.debug("Flushing pending rows [count={}, tables={}, defer={}]", pendingRowCount, tableCount, deferCommit);
         }
 
+        readSchemaFlushClock(tableCount);
         ensureActiveBufferReady();
         // In full-dict mode every frame is self-sufficient: it carries the whole
         // symbol dictionary from id 0 so orphan-drain / recovery replay to a fresh
@@ -5303,6 +5860,7 @@ public class QwpWebSocketSender implements Sender {
                 lastCommitBoundaryFsn = cursorEngine.publishedFsn();
             }
 
+            recordSchemaFramesAfterFlush();
             resetTableBuffersAfterFlush();
         } catch (Throwable t) {
             if (dictionaryChunksAwaitCommit) {
@@ -5531,7 +6089,59 @@ public class QwpWebSocketSender implements Sender {
             // committed the whole group.
             lastCommitBoundaryFsn = cursorEngine.publishedFsn();
         }
+        recordSchemaFramesAfterFlush();
         resetTableBuffersAfterFlush();
+    }
+
+    /**
+     * Reads the clock before the flush publishes, and only when a flushed table
+     * consulted its schema: a sender on the legacy contract reads no clock here.
+     */
+    private void readSchemaFlushClock(int tableCount) {
+        for (int i = 0; i < tableCount; i++) {
+            if (flushTableBuffers.getQuick(i).getSchemaFreshness().isConsulted()) {
+                schemaFlushNanos = nanoClock.getAsLong();
+                return;
+            }
+        }
+    }
+
+    /**
+     * Records the highest FSN this flush published against each flushed table
+     * that consulted its schema, as of {@link #schemaFlushNanos}. A split flush
+     * publishes a table's own frame earlier, but replies are cumulative, so the
+     * reply covering the highest FSN also delivers that frame's feedback.
+     */
+    private void recordSchemaFramesAfterFlush() {
+        long frameFsn = -1L;
+        long okFsn = -1L;
+        for (int i = 0, n = flushTableBuffers.size(); i < n; i++) {
+            QwpSchemaFreshness freshness = flushTableBuffers.getQuick(i).getSchemaFreshness();
+            if (freshness.isConsulted()) {
+                if (frameFsn < 0) {
+                    frameFsn = fsnEpochBase + cursorEngine.publishedFsn();
+                    okFsn = schemaOkFsn();
+                }
+                freshness.onFramePublished(frameFsn, schemaFlushNanos, okFsn);
+            }
+        }
+    }
+
+    /**
+     * Highest external FSN the server acknowledged at the OK level, or -1. A
+     * symbol-dictionary recycle restarts the engine's FSNs, and
+     * {@link #lastRecycleDurableFsn} covers every frame of the retired epoch. The
+     * producer thread runs the recycle, so it never reads a torn base and engine
+     * pair. The loop is null between a recycle retiring it and the next connect,
+     * which a flush on close can reach.
+     */
+    private long schemaOkFsn() {
+        CursorWebSocketSendLoop loop = cursorSendLoop;
+        long ok = cursorEngine.ackedFsn();
+        if (loop != null) {
+            ok = Math.max(ok, loop.getHighestOkFsn());
+        }
+        return ok < 0 ? lastRecycleDurableFsn : Math.max(lastRecycleDurableFsn, fsnEpochBase + ok);
     }
 
     private void onSlotLockReleased() {
@@ -6404,7 +7014,8 @@ public class QwpWebSocketSender implements Sender {
      * ever-connected sticky over: close joins the I/O thread, so a connect
      * that landed mid-window is final here, and this is the only place an
      * ASYNC-initial sender's connect (observed only by the I/O thread)
-     * reaches {@code hasLoopEverConnected}. A loop that latched a terminal
+     * reaches {@code hasLoopEverConnected}. It carries the schema state over
+     * the same way; see {@code hasLoopNegotiatedSchema}. A loop that latched a terminal
      * error while it was stopping is kept instead and its error thrown, so
      * {@link #checkConnectionError()} throws it from every later call, as on
      * a sender that never recycled.
@@ -6413,6 +7024,9 @@ public class QwpWebSocketSender implements Sender {
         cursorSendLoop.checkError();
         healthTracker.connectionLost();
         hasLoopEverConnected |= cursorSendLoop.hasEverConnected();
+        hasLoopNegotiatedSchema |= cursorSendLoop.hasNegotiatedSchema();
+        recycledSchemaCache.clear();
+        cursorSendLoop.exportSchemaCache(recycledSchemaCache);
         cursorSendLoop = null;
     }
 
@@ -7158,6 +7772,7 @@ public class QwpWebSocketSender implements Sender {
         int cap = serverMaxBatchSize;
         long bufferedNow = currentTableBuffer.nextRow(
                 currentTableBufferSnapshotBytes, cap > 0 ? cap : Long.MAX_VALUE);
+        currentTableBuffer.getSchemaFreshness().onRowAccepted();
 
         // Interval off (0): no clock read on the row path at all.
         if (pendingRowCount == 0 && autoFlushIntervalNanos > 0) {

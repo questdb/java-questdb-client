@@ -67,6 +67,7 @@ public class QwpWebSocketEncoder implements QuietCloseable {
     }
 
     public void addTable(QwpTableBuffer tableBuffer) {
+        validateBoundTable(tableBuffer, true);
         columnWriter.encodeTable(tableBuffer, true, true);
     }
 
@@ -80,10 +81,7 @@ public class QwpWebSocketEncoder implements QuietCloseable {
         deltaStart = confirmedMaxId + 1;
         deltaCount = Math.max(0, batchMaxId - confirmedMaxId);
         byte headerFlags = (byte) (flags | FLAG_DELTA_SYMBOL_DICT);
-        byte origFlags = flags;
-        flags = headerFlags;
-        writeHeader(tableCount, 0);
-        flags = origFlags;
+        writeHeader(tableCount, 0, headerFlags);
         payloadStart = buffer.getPosition();
         buffer.putVarint(deltaStart);
         buffer.putVarint(deltaCount);
@@ -163,6 +161,10 @@ public class QwpWebSocketEncoder implements QuietCloseable {
     }
 
     public int encode(QwpTableBuffer tableBuffer) {
+        validateBoundTable(tableBuffer, false);
+        if (tableBuffer.getSchemaBinding() != null && tableBuffer.getRowCount() == 0) {
+            return 0;
+        }
         buffer.reset();
         writeHeader(1, 0);
         int payloadStart = buffer.getPosition();
@@ -179,6 +181,8 @@ public class QwpWebSocketEncoder implements QuietCloseable {
             int confirmedMaxId,
             int batchMaxId
     ) {
+        // Validate before beginMessage resets the staged buffer.
+        validateBoundTable(tableBuffer, true);
         beginMessage(1, globalDict, confirmedMaxId, batchMaxId);
         addTable(tableBuffer);
         return finishMessage();
@@ -188,6 +192,18 @@ public class QwpWebSocketEncoder implements QuietCloseable {
         int payloadLength = buffer.getPosition() - payloadStart;
         buffer.patchInt(8, payloadLength);
         return buffer.getPosition();
+    }
+
+    private static void validateBoundTable(QwpTableBuffer tableBuffer, boolean additive) {
+        if (tableBuffer.getSchemaBinding() == null) {
+            return;
+        }
+        if (tableBuffer.hasInProgressRow()) {
+            throw new IllegalStateException("cannot encode a schema-bound table with an incomplete row");
+        }
+        if (additive && tableBuffer.getRowCount() == 0) {
+            throw new IllegalStateException("cannot add an empty schema-bound table");
+        }
     }
 
     public QwpBufferWriter getBuffer() {
@@ -234,12 +250,19 @@ public class QwpWebSocketEncoder implements QuietCloseable {
     }
 
     public void writeHeader(int tableCount, int payloadLength) {
+        writeHeader(tableCount, payloadLength, flags);
+    }
+
+    private void writeHeader(int tableCount, int payloadLength, byte headerFlags) {
+        if (tableCount < 0 || tableCount > 0xffff) {
+            throw new IllegalArgumentException("QWP table count is outside unsigned-short range: " + tableCount);
+        }
         buffer.putByte((byte) 'Q');
         buffer.putByte((byte) 'W');
         buffer.putByte((byte) 'P');
         buffer.putByte((byte) '1');
         buffer.putByte(version);
-        buffer.putByte(flags);
+        buffer.putByte(headerFlags);
         buffer.putShort((short) tableCount);
         buffer.putInt(payloadLength);
     }
