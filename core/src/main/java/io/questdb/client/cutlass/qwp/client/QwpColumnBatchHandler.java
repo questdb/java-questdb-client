@@ -135,9 +135,12 @@ public interface QwpColumnBatchHandler {
      * {@code message} is what the server sent, which may start with the
      * position in brackets, and {@code position} is
      * {@link QwpEgressMsgKind#NO_ERROR_POSITION}, as it is for errors that do
-     * not come from the SQL text, such as a cancellation or a transport
-     * failure. The default delegates to {@link #onError(long, byte, String)} for
-     * backwards compatibility; override this method when you need the position.
+     * not come from the SQL text, such as a {@code CANCEL} this client sent or a
+     * transport failure. A query timeout and a cancellation on the server, such
+     * as {@code CANCEL QUERY}, report position 0, as the {@code /exec} HTTP
+     * endpoint does. The default delegates to
+     * {@link #onError(long, byte, String)} for backwards compatibility; override
+     * this method when you need the position.
      *
      * @param requestId client-assigned request id, or {@code -1} if no request was in flight
      * @param status    one of the QWP status codes (e.g., {@code STATUS_PARSE_ERROR})

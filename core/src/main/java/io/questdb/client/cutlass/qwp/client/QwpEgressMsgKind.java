@@ -72,8 +72,11 @@ public final class QwpEgressMsgKind {
     public static final byte EXEC_DONE = 0x16;
     /**
      * Error position that points nowhere in the SQL text: the position of an
-     * error that does not come from the SQL text, such as a cancellation, and
-     * of every error when the position was not requested or not reported.
+     * error that does not come from the SQL text, such as a {@code CANCEL} the
+     * client sent, and of every error when the position was not requested or
+     * not reported. A query timeout and a cancellation on the server, such as
+     * {@code CANCEL QUERY}, report position 0, as the {@code /exec} HTTP endpoint
+     * does.
      */
     public static final int NO_ERROR_POSITION = -1;
     public static final byte QUERY_ERROR = 0x13;
