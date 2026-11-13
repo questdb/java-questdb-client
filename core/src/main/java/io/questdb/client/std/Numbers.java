@@ -40,11 +40,8 @@ public final class Numbers {
     public final static int[] hexNumbers;
     public static final long[] pow10;
     private static final int[] DOUBLE_DIGIT_PAIRS = new int[100];
-    private static final int EXP_BIAS = 1023;
     private static final long EXP_BIT_MASK = 0x7FF0000000000000L;
     private static final int EXP_SHIFT = SIGNIFICAND_WIDTH - 1;
-    static final long EXP_ONE = ((long) EXP_BIAS) << EXP_SHIFT; // exponent of 1.0
-    private static final long FRACT_HOB = (1L << EXP_SHIFT); // assumed High-Order bit
     // Maps ASCII chars in [48, 122] (i.e. '0'..'z'), shifted by -48, to the
     // 5-bit base32 digit, or -1 if not a valid geohash character. Matches the
     // server-side alphabet in io.questdb.cairo.GeoHashes#base32Indexes: digits
@@ -62,13 +59,7 @@ public final class Numbers {
             21, 22, 23, 24, 25, 26, 27, 28, // 'p'..'w'
             29, 30, 31                      // 'x','y','z'
     };
-    private static final long[] LONG_5_POW = new long[]{1L, 5L, 25L, 125L, 625L, 3125L, 15625L, 78125L, 390625L, 1953125L, 9765625L, 48828125L, 244140625L, 1220703125L, 6103515625L, 30517578125L, 152587890625L, 762939453125L, 3814697265625L, 19073486328125L, 95367431640625L, 476837158203125L, 2384185791015625L, 11920928955078125L, 59604644775390625L, 298023223876953125L, 1490116119384765625L};
-    private static final int MAX_SMALL_BIN_EXP = 62;
-    private static final int MIN_SMALL_BIN_EXP = -(63 / 3);
-    private static final int[] N_5_BITS = new int[]{0, 3, 5, 7, 10, 12, 14, 17, 19, 21, 24, 26, 28, 31, 33, 35, 38, 40, 42, 45, 47, 49, 52, 54, 56, 59, 61};
     private static final long SIGNIF_BIT_MASK = 0x000FFFFFFFFFFFFFL;
-    private static final int[] SMALL_5_POW = new int[]{1, 5, 25, 125, 625, 3125, 15625, 78125, 390625, 1953125, 9765625, 48828125, 244140625, 1220703125};
-    private static final int[] insignificantDigitsNumber = new int[]{0, 0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 8, 8, 8, 9, 9, 9, 9, 10, 10, 10, 11, 11, 11, 12, 12, 12, 12, 13, 13, 13, 14, 14, 14, 15, 15, 15, 15, 16, 16, 16, 17, 17, 17, 18, 18, 18, 19};
     private static final LongHexAppender[] longHexAppender = new LongHexAppender[Long.SIZE + 1];
     private static final LongHexAppender[] longHexAppenderPad64 = new LongHexAppender[Long.SIZE + 1];
     // Slot 0 holds RyuDouble.d2d()'s decimal exponent; slots 1-17 hold ASCII digits.
@@ -204,9 +195,13 @@ public final class Numbers {
             return;
         }
 
-        // Decompose via Ryu
+        // Short decimals, such as prices and readings, take an exact path that
+        // returns what Ryu would; Ryu decomposes the rest.
         int[] scratch = tlRyuScratch.get();
-        long output = RyuDouble.d2d(ieeeMantissa, ieeeExponent, scratch);
+        long output = shortDecimal(Math.abs(value), scratch);
+        if (output == 0) {
+            output = RyuDouble.d2d(ieeeMantissa, ieeeExponent, scratch);
+        }
         int olength = RyuDouble.decimalLength17(output);
         int decExp = scratch[0] + olength;
         int digitsToWrite = olength;
@@ -1060,27 +1055,6 @@ public final class Numbers {
         sink.putAscii(hexDigit);
     }
 
-    private static int estimateDecExpDouble(long fractBits, int binExp) {
-        double d2 = Double.longBitsToDouble(EXP_ONE | fractBits & SIGNIF_BIT_MASK);
-        double d = (d2 - 1.5D) * 0.289529654D + 0.176091259D + (double) binExp * 0.301029995663981D;
-        long dBits = Double.doubleToRawLongBits(d);
-        int exponent = (int) ((dBits & EXP_BIT_MASK) >> EXP_SHIFT) - EXP_BIAS;
-        final boolean isNegative = (dBits & SIGN_BIT_MASK) != 0L;
-        if (exponent > -1 && exponent < 52) {
-            final long mask = SIGNIF_BIT_MASK >> exponent;
-            final int r = (int) ((dBits & SIGNIF_BIT_MASK | FRACT_HOB) >> EXP_SHIFT - exponent);
-            return isNegative ? ((mask & dBits) == 0L ? -r : -r - 1) : r;
-        } else if (exponent < 0) {
-            return (dBits & ~SIGN_BIT_MASK) == 0L ? 0 : (isNegative ? -1 : 0);
-        } else {
-            return (int) d;
-        }
-    }
-
-    private static int insignificantDigitsForPow2(int p2) {
-        return p2 > 1 && p2 < insignificantDigitsNumber.length ? insignificantDigitsNumber[p2] : 0;
-    }
-
     private static int parseInt0(CharSequence sequence, final int p, int lim) throws NumericException {
         if (lim == p) {
             throw NumericException.instance().put("empty integer string");
@@ -1180,27 +1154,60 @@ public final class Numbers {
         return negative ? val : -val;
     }
 
-    private static boolean roundupDouble(int firstDigitIndex, char[] digits, int nDigits) {
-        int charIndex = firstDigitIndex + nDigits - 1;
-        char c = digits[charIndex];
-        if (c == '9') {
-            while (true) {
-                if (c != '9' || charIndex <= firstDigitIndex) {
-                    if (c == '9') {
-                        digits[firstDigitIndex] = '1';
-                        return true;
-                    }
-                    break;
-                }
-
-                digits[charIndex] = '0';
-                --charIndex;
-                c = digits[charIndex];
-            }
+    /**
+     * Returns the shortest decimal significand of the positive finite
+     * {@code abs}, with its decimal exponent in {@code e10Out[0]}, when
+     * {@code abs} is below 10^7 and is the double nearest to a decimal with at
+     * most 8 fractional digits. Returns 0 otherwise, and then leaves
+     * {@code e10Out} alone.
+     * <p>
+     * The result equals {@code RyuDouble.d2d()}'s at a fraction of its cost: Ryu
+     * removes one digit per pass from a 17-digit interval, so a short result
+     * costs it the most passes. It agrees with Ryu for these reasons:
+     * <ul>
+     *   <li>The check {@code m / 10^8 == abs} is exact. Both operands are exact
+     *   doubles, and IEEE division rounds correctly with ties to even, which
+     *   accepts the interval bounds exactly when Ryu does. So it passes exactly
+     *   when the decimal {@code m * 10^-8} rounds to {@code abs}.</li>
+     *   <li>Below 10^7, {@code ulp(abs) * 10^8 < 1}, so the rounding interval of
+     *   {@code abs} holds at most one decimal with 8 fractional digits.</li>
+     *   <li>All decimals in the interval start at the same digit position,
+     *   unless the interval holds a power of ten, which then is that one
+     *   decimal. So the shortest decimal in the interval, which Ryu returns,
+     *   ends no later than {@code m * 10^-8} does. It is a multiple of
+     *   10^-8 as well, so it is {@code m} with its trailing zeros removed.</li>
+     * </ul>
+     */
+    private static long shortDecimal(double abs, int[] e10Out) {
+        if (abs >= 1e7) {
+            return 0;
         }
-
-        digits[charIndex] = (char) (c + 1);
-        return false;
+        // abs * 1e8 < 2^50, so adding 0.5 is exact
+        long m = (long) (abs * 1e8 + 0.5);
+        // m == 0 fails here too, since abs is positive
+        if ((double) m / 1e8 != abs) {
+            return 0;
+        }
+        // m < 10^15 has at most 14 trailing zeros: strip 8, 4, 2 and 1 of them
+        int e10 = -8;
+        if (m % 100_000_000L == 0) {
+            m /= 100_000_000L;
+            e10 += 8;
+        }
+        if (m % 10_000L == 0) {
+            m /= 10_000L;
+            e10 += 4;
+        }
+        if (m % 100L == 0) {
+            m /= 100L;
+            e10 += 2;
+        }
+        if (m % 10L == 0) {
+            m /= 10L;
+            e10 += 1;
+        }
+        e10Out[0] = e10;
+        return m;
     }
 
     @FunctionalInterface
