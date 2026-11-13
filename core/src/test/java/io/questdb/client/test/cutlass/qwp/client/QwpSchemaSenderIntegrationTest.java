@@ -16,6 +16,7 @@ import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.protocol.QwpSchemaProtocol;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
+import io.questdb.client.std.Compat;
 import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.Decimal256;
 import io.questdb.client.std.Decimal64;
@@ -3323,7 +3324,7 @@ public class QwpSchemaSenderIntegrationTest {
             if (System.nanoTime() - deadline > 0) {
                 Assert.fail("timed out waiting for " + count + " OK replies; received " + sender.getTotalAcks());
             }
-            Thread.onSpinWait();
+            Compat.onSpinWait();
         }
     }
 
