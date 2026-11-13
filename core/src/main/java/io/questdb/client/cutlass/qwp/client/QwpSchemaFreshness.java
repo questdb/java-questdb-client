@@ -41,9 +41,21 @@ package io.questdb.client.cutlass.qwp.client;
  * <p>
  * A re-check the server did not answer defers the next one by the age limit.
  * <p>
+ * A column type change can also show as rows the snapshot rejects. While the
+ * table holds pending rows, its batch keeps the snapshot, and rows that fail
+ * reach no {@code at()} that could flush the batch, so no reply reports the
+ * change. A run of {@link #REJECTIONS_BEFORE_RECHECK} rejected rows with no
+ * accepted one in between asks for a re-check before the next row; see
+ * {@link #takeRecheck}.
+ * <p>
  * The producer thread owns this object; it is not thread-safe.
  */
 public final class QwpSchemaFreshness {
+    /**
+     * Consecutive rows the snapshot rejects before the next row re-checks it.
+     * More than one, so a single bad value in a flowing batch costs no lookup.
+     */
+    public static final int REJECTIONS_BEFORE_RECHECK = 2;
     private static final long NO_FRAME = -1L;
     private long confirmedNanos;
     private long failedCheckNanos;
@@ -51,7 +63,11 @@ public final class QwpSchemaFreshness {
     private long frameNanos;
     private boolean hasConfirmation;
     private boolean hasFailedCheck;
+    private boolean hasRechecked;
     private boolean isConsulted;
+    private long recheckNanos;
+    // Rows the snapshot rejected since the table last accepted one.
+    private int rejectedRows;
 
     /**
      * Records that the server confirmed the snapshot as of {@code nanos}. An
@@ -93,6 +109,14 @@ public final class QwpSchemaFreshness {
     }
 
     /**
+     * Reports whether a run of rejected rows asks for a re-check, before the
+     * interval of {@link #takeRecheck} applies.
+     */
+    public boolean isRecheckDue() {
+        return rejectedRows >= REJECTIONS_BEFORE_RECHECK;
+    }
+
+    /**
      * Marks that the current batch of the table consults the cached schema.
      */
     public void markConsulted() {
@@ -111,6 +135,37 @@ public final class QwpSchemaFreshness {
             frameFsn = fsn;
             frameNanos = flushNanos;
         }
+    }
+
+    /**
+     * Records a row the table accepted, which ends a run of rejected rows.
+     */
+    public void onRowAccepted() {
+        rejectedRows = 0;
+    }
+
+    /**
+     * Records a row the snapshot rejected, for a column it knows.
+     */
+    public void onRowRejected() {
+        if (rejectedRows < REJECTIONS_BEFORE_RECHECK) {
+            rejectedRows++;
+        }
+    }
+
+    /**
+     * Reports whether to re-check the snapshot at {@code nowNanos}: a run of
+     * rejected rows is due, and no re-check ran within {@code minIntervalNanos}.
+     * Taking the re-check ends the run; a run the interval defers stays due.
+     */
+    public boolean takeRecheck(long nowNanos, long minIntervalNanos) {
+        if (!isRecheckDue() || (hasRechecked && nowNanos - recheckNanos <= minIntervalNanos)) {
+            return false;
+        }
+        rejectedRows = 0;
+        recheckNanos = nowNanos;
+        hasRechecked = true;
+        return true;
     }
 
     private void confirmCoveredFrame(long okFsn) {

@@ -43,6 +43,22 @@ public class QwpSchemaFreshnessTest {
     private static final long MAX_AGE = 1_000;
 
     @Test
+    public void testAcceptedRowEndsRunOfRejectedRows() {
+        QwpSchemaFreshness freshness = new QwpSchemaFreshness();
+        for (int i = 1; i < QwpSchemaFreshness.REJECTIONS_BEFORE_RECHECK; i++) {
+            freshness.onRowRejected();
+        }
+        freshness.onRowAccepted();
+        for (int i = 1; i < QwpSchemaFreshness.REJECTIONS_BEFORE_RECHECK; i++) {
+            freshness.onRowRejected();
+        }
+        Assert.assertFalse(freshness.isRecheckDue());
+        Assert.assertFalse(freshness.takeRecheck(0, MAX_AGE));
+        freshness.onRowRejected();
+        Assert.assertTrue(freshness.isRecheckDue());
+    }
+
+    @Test
     public void testConfirmationAtAgeLimitIsFreshAndOneNanoLaterExpired() {
         QwpSchemaFreshness freshness = new QwpSchemaFreshness();
         freshness.confirm(100);
@@ -147,6 +163,34 @@ public class QwpSchemaFreshnessTest {
     }
 
     @Test
+    public void testRecheckFollowsRunOfRejectedRows() {
+        QwpSchemaFreshness freshness = new QwpSchemaFreshness();
+        for (int i = 1; i < QwpSchemaFreshness.REJECTIONS_BEFORE_RECHECK; i++) {
+            freshness.onRowRejected();
+            Assert.assertFalse(freshness.isRecheckDue());
+            Assert.assertFalse(freshness.takeRecheck(0, MAX_AGE));
+        }
+        freshness.onRowRejected();
+        Assert.assertTrue(freshness.isRecheckDue());
+        Assert.assertTrue(freshness.takeRecheck(0, MAX_AGE));
+        Assert.assertFalse("taking the re-check ends the run", freshness.isRecheckDue());
+        Assert.assertFalse(freshness.takeRecheck(0, MAX_AGE));
+    }
+
+    @Test
+    public void testRecheckRunsAtMostOncePerInterval() {
+        QwpSchemaFreshness freshness = new QwpSchemaFreshness();
+        rejectRun(freshness);
+        Assert.assertTrue(freshness.takeRecheck(Long.MAX_VALUE - 10, MAX_AGE));
+        rejectRun(freshness);
+        // Differences only, so the interval holds across a clock wrap.
+        Assert.assertFalse(freshness.takeRecheck(Long.MAX_VALUE - 10 + MAX_AGE, MAX_AGE));
+        Assert.assertTrue("a run deferred by the interval stays due", freshness.isRecheckDue());
+        Assert.assertTrue(freshness.takeRecheck(Long.MAX_VALUE - 9 + MAX_AGE, MAX_AGE));
+        Assert.assertFalse(freshness.isRecheckDue());
+    }
+
+    @Test
     public void testRandomSequencesNeverReportUnconfirmedSnapshotFresh() {
         Rnd rnd = TestUtils.generateRandom(null);
         for (int run = 0; run < 2_000; run++) {
@@ -216,5 +260,11 @@ public class QwpSchemaFreshnessTest {
             }
         }
         return false;
+    }
+
+    private static void rejectRun(QwpSchemaFreshness freshness) {
+        for (int i = 0; i < QwpSchemaFreshness.REJECTIONS_BEFORE_RECHECK; i++) {
+            freshness.onRowRejected();
+        }
     }
 }

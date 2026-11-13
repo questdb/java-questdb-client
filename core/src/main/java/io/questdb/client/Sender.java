@@ -974,6 +974,14 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * precision in a column just widened to DOUBLE: rows sent before the reply
      * arrives, rows written within that second, and rows written while the
      * connection is down.
+     * <p>
+     * A change can also show as rows the cached schema rejects, such as
+     * fractional values for a column just widened from INT to DOUBLE. After two
+     * consecutive rejected rows for a table, the next row of that table looks the
+     * schema up again, waiting at most one second, and at most once a second.
+     * When the schema changed, the sender flushes its pending rows, whose old
+     * types the server converts, and converts the row to the new types. The
+     * rejected rows themselves are not retried.
      */
     enum SchemaMode {
         AUTO,

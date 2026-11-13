@@ -201,6 +201,9 @@ public class QwpWebSocketSender implements Sender {
     // to survive.
     private static final long RECYCLE_DEFERRED_CLOSE_MAX_WAIT_MILLIS = 30_000L;
     private static final long SCHEMA_MAX_AGE_NANOS = TimeUnit.MILLISECONDS.toNanos(SCHEMA_MAX_AGE_MILLIS);
+    // Longest the row after a run of rejected rows waits for the re-check of its
+    // table's schema; see recheckRejectingSchema().
+    private static final long SCHEMA_RECHECK_WAIT_MILLIS = 1_000L;
     private static final String WRITE_PATH = "/write/v4";
     // Yields the Authorization header value presented on each WebSocket upgrade. A constant for a
     // fixed token or Basic credential; for an httpTokenProvider it pulls a freshly refreshed token,
@@ -5436,7 +5439,9 @@ public class QwpWebSocketSender implements Sender {
      * by then, which ACK schema feedback keeps current. While the wire is up, a cached
      * snapshot the server has not confirmed for {@link #SCHEMA_MAX_AGE_MILLIS} is looked
      * up again first; see {@link #resolveConfirmedSchema}. A rejection that a column
-     * type change could explain evicts the snapshot; see {@link #onRowFailure}.
+     * type change could explain evicts the snapshot; see {@link #onRowFailure}. A run
+     * of rows the snapshot rejected makes the next row look the table up even while
+     * the batch holds rows; see {@link #recheckRejectingSchema}.
      * <p>
      * When no snapshot is pinned, the configured {@link Sender.SchemaMode} decides
      * between a schema lookup and the legacy contract; see
@@ -5448,6 +5453,11 @@ public class QwpWebSocketSender implements Sender {
             return pinned;
         }
         ensureConnected();
+        if (pinned != null && recheckRejectingSchema(pinned) && currentTableBuffer.getRowCount() > 0) {
+            // The pending rows carry the old column types, which the server converts.
+            // Sending them frees the buffer to take the new schema below.
+            flushPendingRows(transactional);
+        }
         // A table buffer keeps one contract while it holds rows; the first row
         // after the flush consults the schema again.
         if (currentTableBuffer.getRowCount() > 0) {
@@ -5463,12 +5473,55 @@ public class QwpWebSocketSender implements Sender {
         if (latest == null) {
             return selectLegacyContract();
         }
-        if (pinned != null
-                && pinned.getTableId() == latest.getTableId()
-                && pinned.getMetadataVersion() == latest.getMetadataVersion()) {
+        if (pinned != null && isSnapshotOf(pinned, latest)) {
             return pinned;
         }
         return installSchemaBinding(latest);
+    }
+
+    private static boolean isSnapshotOf(QwpSchemaBinding binding, QwpSchemaResponse schema) {
+        return binding.getTableId() == schema.getTableId()
+                && binding.getMetadataVersion() == schema.getMetadataVersion();
+    }
+
+    /**
+     * Looks the current table up again after a run of rows its pinned snapshot
+     * rejected, and reports whether the server's schema differs from the snapshot.
+     * <p>
+     * After a column type change, a sender whose rows all fail against the old
+     * type never reaches the {@code at()} that could flush its batch, so no reply
+     * reports the change, and the batch keeps the snapshot while it holds rows.
+     * The re-check needs a connected, schema-aware wire, waits at most
+     * {@code SCHEMA_RECHECK_WAIT_MILLIS}, and runs at most once per
+     * {@link #SCHEMA_MAX_AGE_MILLIS} per table, so values that are invalid under
+     * the current schema cost little. A failed lookup says nothing about the
+     * schema, so it keeps the snapshot.
+     */
+    private boolean recheckRejectingSchema(QwpSchemaBinding pinned) {
+        QwpSchemaFreshness freshness = currentTableBuffer.getSchemaFreshness();
+        if (!freshness.isRecheckDue()) {
+            return false;
+        }
+        CursorWebSocketSendLoop loop = cursorSendLoop;
+        // A run that finds the wire down stays due for the next connection.
+        if (loop == null || !loop.isWireUp() || !loop.isSchemaEnabled()) {
+            return false;
+        }
+        final long nowNanos = nanoClock.getAsLong();
+        if (!freshness.takeRecheck(nowNanos, SCHEMA_MAX_AGE_NANOS)) {
+            return false;
+        }
+        final String key = currentTableBuffer.getSchemaKey();
+        QwpSchemaResponse latest = loop.peekSchema(key);
+        if (latest == null || isSnapshotOf(pinned, latest)) {
+            try {
+                latest = loop.revalidateSchema(key, Math.min(schemaWaitMillis, SCHEMA_RECHECK_WAIT_MILLIS));
+            } catch (LineSenderSchemaException e) {
+                return false;
+            }
+            freshness.confirm(nowNanos);
+        }
+        return !isSnapshotOf(pinned, latest);
     }
 
     /**
@@ -5622,18 +5675,26 @@ public class QwpWebSocketSender implements Sender {
     }
 
     // Single home of the row-failure policy: roll the whole row back, then report
-    // the failure as raised. A schema rejection is final for the batch's snapshot;
-    // the sender never looks up fresh metadata from a failed setter. When the
-    // snapshot type of a known column rejected the value, the column may have
-    // changed type since, and no frame may ever reach the server to earn feedback.
-    // The sender then evicts the snapshot, so the next batch looks the table up.
+    // the failure as raised. The sender never looks up fresh metadata from a failed
+    // setter. When the snapshot rejected a value for a column it knows, the column
+    // may have changed type since, and no frame may ever reach the server to earn
+    // feedback. When the snapshot type could not take the value at all, the sender
+    // evicts the snapshot, so the next batch looks the table up. Any such rejection
+    // also counts towards a run, after which the next row re-checks the schema even
+    // while the batch holds rows; see recheckRejectingSchema().
     private RuntimeException onRowFailure(Throwable e) {
         QwpSchemaBinding binding = currentTableBuffer != null ? currentTableBuffer.getSchemaBinding() : null;
-        if (binding != null && binding.hasTargetTypeConflict()) {
-            binding.clearTargetTypeConflict();
-            CursorWebSocketSendLoop loop = cursorSendLoop;
-            if (loop != null) {
-                loop.evictSchema(currentTableBuffer.getTableName(), binding.getTableId(), binding.getMetadataVersion());
+        if (binding != null) {
+            if (binding.hasTargetTypeConflict()) {
+                binding.clearTargetTypeConflict();
+                CursorWebSocketSendLoop loop = cursorSendLoop;
+                if (loop != null) {
+                    loop.evictSchema(currentTableBuffer.getTableName(), binding.getTableId(), binding.getMetadataVersion());
+                }
+            }
+            if (binding.hasRejectedKnownColumn()) {
+                binding.clearRejectedKnownColumn();
+                currentTableBuffer.getSchemaFreshness().onRowRejected();
             }
         }
         rollbackRow();
@@ -7705,6 +7766,7 @@ public class QwpWebSocketSender implements Sender {
         int cap = serverMaxBatchSize;
         long bufferedNow = currentTableBuffer.nextRow(
                 currentTableBufferSnapshotBytes, cap > 0 ? cap : Long.MAX_VALUE);
+        currentTableBuffer.getSchemaFreshness().onRowAccepted();
 
         // Interval off (0): no clock read on the row path at all.
         if (pendingRowCount == 0 && autoFlushIntervalNanos > 0) {

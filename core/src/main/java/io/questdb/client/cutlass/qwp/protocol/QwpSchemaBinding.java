@@ -79,6 +79,7 @@ public final class QwpSchemaBinding {
     private final QwpTableBuffer buffer;
     private final QwpSchemaResponse schema;
     private final String tableName;
+    private boolean hasRejectedKnownColumn;
     private boolean hasTargetTypeConflict;
     private Decimal256 decimalTextScratch;
     private StringSink charTextSink;
@@ -914,11 +915,28 @@ public final class QwpSchemaBinding {
     }
 
     /**
+     * Clears the rejection that {@link #hasRejectedKnownColumn()} reports, once
+     * the caller has acted on it.
+     */
+    public void clearRejectedKnownColumn() {
+        hasRejectedKnownColumn = false;
+    }
+
+    /**
      * Clears the conflict that {@link #hasTargetTypeConflict()} reports, once the
      * caller has acted on it.
      */
     public void clearTargetTypeConflict() {
         hasTargetTypeConflict = false;
+    }
+
+    /**
+     * Reports whether the last rejected value targeted a column the snapshot
+     * knows, as an invalid value or one the snapshot type cannot take. A column
+     * type change after the snapshot can explain either.
+     */
+    public boolean hasRejectedKnownColumn() {
+        return hasRejectedKnownColumn;
     }
 
     /**
@@ -938,6 +956,11 @@ public final class QwpSchemaBinding {
             Integer targetType,
             String detail
     ) {
+        // An invalid value may suit the column's type after a change; an input that
+        // no column type takes, such as LONG_ARRAY, cannot.
+        if (reason == INVALID_VALUE && column != null && schema.getColumnIndex(column) >= 0) {
+            hasRejectedKnownColumn = true;
+        }
         StringSink message = new StringSink();
         message.put("schema row error [reason=").put(reason.name()).put(", table=").putAsPrintable(tableName);
         if (column != null) {
@@ -958,6 +981,7 @@ public final class QwpSchemaBinding {
     private void recordTargetTypeConflict(CharSequence name) {
         if (name != null && schema.getColumnIndex(name) >= 0) {
             hasTargetTypeConflict = true;
+            hasRejectedKnownColumn = true;
         }
     }
 
