@@ -113,6 +113,10 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     private volatile boolean closed;
     private boolean creditEnabled;
     private boolean currentQueryDone;
+    // query_flags of the in-flight request as it went on the wire, after the
+    // client dropped the bits the server does not advertise. Tells the
+    // terminator decoders which trailers to read. I/O thread only.
+    private long currentQueryFlags;
     private long currentRequestId = -1L;
     private volatile boolean shutdown;
 
@@ -165,13 +169,29 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     }
 
     /**
+     * Decodes a QUERY_ERROR payload of a request without
+     * {@link QwpEgressMsgKind#QUERY_FLAG_ERROR_POSITION} into a
+     * {@link QueryEvent}. Visible for testing. See
+     * {@link #decodeError(long, int, long)}.
+     */
+    public static QueryEvent decodeError(long payload, int payloadLen) {
+        return decodeError(payload, payloadLen, 0);
+    }
+
+    /**
      * Decodes a QUERY_ERROR payload into a {@link QueryEvent}. Visible for testing.
+     * Body: {@code msg_kind(1) + request_id(8) + status(1) + msg_len(u16) + msg},
+     * then {@code position(i32)} when {@code queryFlags} has
+     * {@link QwpEgressMsgKind#QUERY_FLAG_ERROR_POSITION}. Bytes after the known
+     * fields are ignored.
+     * <p>
      * Bound-checks msgLen against the actual payload: a hostile or buggy server
      * can encode msgLen=0xFFFF with a tiny payload, which would otherwise read
      * up to 65 KiB of native memory beyond the frame and surface it to the user
-     * callback as a String.
+     * callback as a String. A frame that is too short for what it claims
+     * decodes to a {@code STATUS_INTERNAL_ERROR} event that names the defect.
      */
-    public static QueryEvent decodeError(long payload, int payloadLen) {
+    public static QueryEvent decodeError(long payload, int payloadLen, long queryFlags) {
         long payloadEnd = payload + payloadLen;
         long p = payload + QwpConstants.HEADER_SIZE + 1 + 8;
         if (p + 1 + 2 > payloadEnd) {
@@ -189,7 +209,63 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         for (int i = 0; i < msgLen; i++) {
             bytes[i] = Unsafe.getUnsafe().getByte(p + i);
         }
-        return new QueryEvent().asError(status, new String(bytes, StandardCharsets.UTF_8));
+        String message = new String(bytes, StandardCharsets.UTF_8);
+        p += msgLen;
+        // A frame that ends with the message is a baseline frame, which the
+        // server also sends for a request whose flags it could not read.
+        if ((queryFlags & QwpEgressMsgKind.QUERY_FLAG_ERROR_POSITION) == 0 || p == payloadEnd) {
+            return new QueryEvent().asError(status, message);
+        }
+        if (p + Integer.BYTES > payloadEnd) {
+            return new QueryEvent().asError(WebSocketResponse.STATUS_INTERNAL_ERROR,
+                    "QUERY_ERROR frame truncated mid position [status=" + status + ", message=" + message + ']');
+        }
+        return new QueryEvent().asError(status, message, Unsafe.getUnsafe().getInt(p));
+    }
+
+    /**
+     * Decodes an EXEC_DONE payload into a {@link QueryEvent}. Visible for
+     * testing. Body: {@code msg_kind(1) + request_id(8) + op_type(1) +
+     * rows_affected(varint)}, then the statistics block when {@code queryFlags}
+     * has {@link QwpEgressMsgKind#QUERY_FLAG_STATS}. Statements that produce no
+     * rows carry no {@code row_count}, whatever the flags. Bytes after the known
+     * fields are ignored.
+     *
+     * @throws QwpDecodeException if the frame ends inside a field the flags call
+     *                            for, or a varint does not fit in 64 bits
+     */
+    public static QueryEvent decodeExecDone(long payload, int payloadLen, long queryFlags) throws QwpDecodeException {
+        TerminatorReader rd = new TerminatorReader("EXEC_DONE", payload + QwpConstants.HEADER_SIZE + 1 + 8, payload + payloadLen);
+        byte opType = rd.int8("op_type");
+        QueryEvent ev = new QueryEvent().asExecDone(opType, rd.varint("rows_affected"));
+        if ((queryFlags & QwpEgressMsgKind.QUERY_FLAG_STATS) != 0) {
+            readStats(rd, ev);
+        }
+        return ev;
+    }
+
+    /**
+     * Decodes a RESULT_END payload into a {@link QueryEvent}. Visible for
+     * testing. Body: {@code msg_kind(1) + request_id(8) + final_seq(varint) +
+     * total_rows(varint)}, then {@code row_count(varint)} when
+     * {@code queryFlags} has {@link QwpEgressMsgKind#QUERY_FLAG_COUNT_ROWS}, then
+     * the statistics block when it has {@link QwpEgressMsgKind#QUERY_FLAG_STATS}.
+     * Bytes after the known fields are ignored.
+     *
+     * @throws QwpDecodeException if the frame ends inside a field the flags call
+     *                            for, or a varint does not fit in 64 bits
+     */
+    public static QueryEvent decodeResultEnd(long payload, int payloadLen, long queryFlags) throws QwpDecodeException {
+        TerminatorReader rd = new TerminatorReader("RESULT_END", payload + QwpConstants.HEADER_SIZE + 1 + 8, payload + payloadLen);
+        rd.varint("final_seq");
+        QueryEvent ev = new QueryEvent().asEnd(rd.varint("total_rows"));
+        if ((queryFlags & QwpEgressMsgKind.QUERY_FLAG_COUNT_ROWS) != 0) {
+            ev.withRowCount(rd.varint("row_count"));
+        }
+        if ((queryFlags & QwpEgressMsgKind.QUERY_FLAG_STATS) != 0) {
+            readStats(rd, ev);
+        }
+        return ev;
     }
 
     @Override
@@ -316,6 +392,7 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
                 // Per-query state; accessed only from the I/O thread.
                 currentQueryDone = false;
                 currentRequestId = req.requestId;
+                currentQueryFlags = req.queryFlags;
                 creditEnabled = req.initialCredit > 0L;
                 // The schema rides the first RESULT_BATCH (batch_seq == 0) of each
                 // query; invalidate any schema left from the prior query so a
@@ -380,6 +457,12 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
      * during {@link #sendQueryRequest} and does not retain a reference after
      * the send completes. {@code bindCount} is the number of binds the
      * payload contains; zero when the user supplied no binds.
+     * <p>
+     * {@code queryFlags} are the bits the request carries, which the server
+     * must advertise; zero sends no {@code query_flags} trailer. {@code skipRows}
+     * goes on the wire only with {@link QwpEgressMsgKind#QUERY_FLAG_SKIP_ROWS}
+     * and {@code maxRows} only with {@link QwpEgressMsgKind#QUERY_FLAG_MAX_ROWS};
+     * both must be non-negative.
      */
     public void submitQuery(
             CharSequence sql,
@@ -388,7 +471,9 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
             int bindCount,
             long bindPayloadPtr,
             long bindPayloadLen,
-            long queryFlags
+            long queryFlags,
+            long skipRows,
+            long maxRows
     ) throws InterruptedException {
         pendingRequest.sql = sql;
         pendingRequest.requestId = requestId;
@@ -397,6 +482,8 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         pendingRequest.bindPayloadPtr = bindPayloadPtr;
         pendingRequest.bindPayloadLen = bindPayloadLen;
         pendingRequest.queryFlags = queryFlags;
+        pendingRequest.skipRows = skipRows;
+        pendingRequest.maxRows = maxRows;
         requests.put(pendingRequest);
     }
 
@@ -405,6 +492,22 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
      */
     public QueryEvent takeEvent() throws InterruptedException {
         return events.take();
+    }
+
+    /**
+     * Reads the statistics block of {@link QwpEgressMsgKind#QUERY_FLAG_STATS}:
+     * {@code compile_ns, execute_ns, count_ns, client_wait_ns} as varints and
+     * the {@code stats_flags} byte. Flag bits other than
+     * {@link QwpEgressMsgKind#STATS_FLAG_JIT_COMPILED} are reserved and ignored.
+     */
+    private static void readStats(TerminatorReader rd, QueryEvent ev) throws QwpDecodeException {
+        long compileNanos = rd.varint("compile_ns");
+        long executeNanos = rd.varint("execute_ns");
+        long countNanos = rd.varint("count_ns");
+        long clientWaitNanos = rd.varint("client_wait_ns");
+        byte statsFlags = rd.int8("stats_flags");
+        ev.withStats(compileNanos, executeNanos, countNanos, clientWaitNanos,
+                (statsFlags & QwpEgressMsgKind.STATS_FLAG_JIT_COMPILED) != 0);
     }
 
     /**
@@ -424,104 +527,35 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     }
 
     private void decodeAndEmitError(long payload, int payloadLen) {
-        QueryEvent ev = decodeError(payload, payloadLen);
+        QueryEvent ev = decodeError(payload, payloadLen, currentQueryFlags);
         events.offer(ev);
     }
 
     /**
-     * EXEC_DONE body: msg_kind(1) + requestId(8) + op_type(1) + rows_affected(varint).
-     * Parses all fields, surfaces as a {@link QueryEvent#KIND_EXEC_DONE} event.
+     * Surfaces an EXEC_DONE as a {@link QueryEvent#KIND_EXEC_DONE} event. A
+     * frame that ends inside a field, or carries a varint that does not fit in
+     * 64 bits, is a terminal transport error rather than an EXEC_DONE with a
+     * partial value.
      */
     private void decodeAndEmitExecDone(long payload, int payloadLen) {
-        long p = payload + QwpConstants.HEADER_SIZE + 1 + 8;
-        long limit = payload + payloadLen;
-        if (p + 1 > limit) {
-            emitTerminalTransportError("EXEC_DONE frame truncated before op_type");
-            return;
+        try {
+            events.offer(decodeExecDone(payload, payloadLen, currentQueryFlags));
+        } catch (QwpDecodeException e) {
+            emitTerminalTransportError(e.getMessage());
         }
-        byte opType = Unsafe.getUnsafe().getByte(p++);
-        long rowsAffected = 0;
-        int shift = 0;
-        boolean terminated = false;
-        while (p < limit) {
-            byte b = Unsafe.getUnsafe().getByte(p++);
-            rowsAffected |= (long) (b & 0x7F) << shift;
-            if ((b & 0x80) == 0) {
-                terminated = true;
-                break;
-            }
-            shift += 7;
-            if (shift > 63) {
-                emitTerminalTransportError("EXEC_DONE rows_affected varint overflow");
-                return;
-            }
-        }
-        // The loop also exits when {@code p == limit} on a frame that ended
-        // mid-varint without a terminator byte. Without this guard, a buggy or
-        // hostile server could truncate the frame and the partial value would
-        // surface to the user handler as if the EXEC_DONE completed normally.
-        if (!terminated) {
-            emitTerminalTransportError("EXEC_DONE frame truncated mid rows_affected varint");
-            return;
-        }
-        events.offer(new QueryEvent().asExecDone(opType, rowsAffected));
     }
 
     /**
-     * RESULT_END body: msg_kind(1) + requestId(8) + final_seq(varint) + total_rows(varint).
-     * We only need total_rows. Both varint loops cap at 10 bytes so a hostile
-     * server cannot drive {@code shift} past 63 (where Java's {@code <<} masks
-     * the count to 6 bits and silently wraps high bytes back into the low bits,
-     * producing a wildly wrong total). A frame that ends mid-varint surfaces
-     * as a terminal transport error rather than a partial-value RESULT_END.
+     * Surfaces a RESULT_END as a {@link QueryEvent#KIND_END} event. A frame that
+     * ends inside a field, or carries a varint that does not fit in 64 bits, is
+     * a terminal transport error rather than a RESULT_END with a partial value.
      */
     private void decodeAndEmitResultEnd(long payload, int payloadLen) {
-        long p = payload + QwpConstants.HEADER_SIZE + 1 + 8;
-        long limit = payload + payloadLen;
-        int seqBytes = 0;
-        boolean seqTerminated = false;
-        while (p < limit) {
-            byte b = Unsafe.getUnsafe().getByte(p++);
-            if ((b & 0x80) == 0) {
-                seqTerminated = true;
-                break;
-            }
-            if (++seqBytes > 9) {
-                // Continuation bit set on byte 10 of the final_seq varint --
-                // malformed. Surface as terminal so the caller cannot proceed
-                // with a desynced cursor.
-                emitTerminalTransportError("RESULT_END final_seq varint overflow");
-                return;
-            }
+        try {
+            events.offer(decodeResultEnd(payload, payloadLen, currentQueryFlags));
+        } catch (QwpDecodeException e) {
+            emitTerminalTransportError(e.getMessage());
         }
-        if (!seqTerminated) {
-            emitTerminalTransportError("RESULT_END frame truncated mid final_seq varint");
-            return;
-        }
-        long total = 0;
-        int shift = 0;
-        boolean totalTerminated = false;
-        while (p < limit) {
-            byte b = Unsafe.getUnsafe().getByte(p++);
-            total |= (long) (b & 0x7F) << shift;
-            if ((b & 0x80) == 0) {
-                totalTerminated = true;
-                break;
-            }
-            shift += 7;
-            if (shift > 63) {
-                // Same overflow guard decodeAndEmitExecDone uses; without it,
-                // byte 10 of total_rows could land in the sign bit and bytes
-                // 11+ would silently wrap.
-                emitTerminalTransportError("RESULT_END total_rows varint overflow");
-                return;
-            }
-        }
-        if (!totalTerminated) {
-            emitTerminalTransportError("RESULT_END frame truncated mid total_rows varint");
-            return;
-        }
-        events.offer(new QueryEvent().asEnd(total));
     }
 
     /**
@@ -721,9 +755,16 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
             sendScratch.putBlockOfBytes(req.bindPayloadPtr, req.bindPayloadLen);
         }
         // Optional query_flags trailer; omitted when zero so a baseline frame
-        // stays byte-identical and the server defaults the flags to 0.
+        // stays byte-identical and the server defaults the flags to 0. The
+        // row-window values follow the flags in ascending order of their bits.
         if (req.queryFlags != 0) {
             sendScratch.putVarint(req.queryFlags);
+            if ((req.queryFlags & QwpEgressMsgKind.QUERY_FLAG_SKIP_ROWS) != 0) {
+                sendScratch.putVarint(req.skipRows);
+            }
+            if ((req.queryFlags & QwpEgressMsgKind.QUERY_FLAG_MAX_ROWS) != 0) {
+                sendScratch.putVarint(req.maxRows);
+            }
         }
         wsClient.sendBinary(sendScratch.getBufferPtr(), sendScratch.getPosition());
         sendScratch.reset();
@@ -783,8 +824,62 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         long bindPayloadLen;
         long bindPayloadPtr;
         long initialCredit;
+        long maxRows;
         long queryFlags;
         long requestId;
+        long skipRows;
         CharSequence sql;
+    }
+
+    /**
+     * Bounds-checked cursor over the body of a terminator frame (RESULT_END,
+     * EXEC_DONE). Every read fails with a {@link QwpDecodeException} that names
+     * the frame and the field, rather than read past the frame or return a
+     * partial value.
+     */
+    private static final class TerminatorReader {
+        private final String frame;
+        private final long limit;
+        private long p;
+
+        TerminatorReader(String frame, long p, long limit) {
+            this.frame = frame;
+            this.p = p;
+            this.limit = limit;
+        }
+
+        byte int8(String field) throws QwpDecodeException {
+            if (p >= limit) {
+                throw new QwpDecodeException(frame + " frame truncated before " + field);
+            }
+            return Unsafe.getUnsafe().getByte(p++);
+        }
+
+        /**
+         * Reads an unsigned LEB128 varint of at most 10 bytes. On byte 10 only
+         * bit 0 of the data still fits in a long: a hostile server must not
+         * drive the shift past 63, where Java's {@code <<} masks the count to
+         * 6 bits and wraps the high bytes back into the low bits, producing a
+         * wildly wrong value.
+         */
+        long varint(String field) throws QwpDecodeException {
+            long value = 0;
+            int shift = 0;
+            while (p < limit) {
+                byte b = Unsafe.getUnsafe().getByte(p++);
+                if (shift == 63 && (b & 0x7E) != 0) {
+                    throw new QwpDecodeException(frame + ' ' + field + " varint overflow");
+                }
+                value |= (long) (b & 0x7F) << shift;
+                if ((b & 0x80) == 0) {
+                    return value;
+                }
+                shift += 7;
+                if (shift > 63) {
+                    throw new QwpDecodeException(frame + ' ' + field + " varint overflow");
+                }
+            }
+            throw new QwpDecodeException(frame + " frame truncated mid " + field + " varint");
+        }
     }
 }
