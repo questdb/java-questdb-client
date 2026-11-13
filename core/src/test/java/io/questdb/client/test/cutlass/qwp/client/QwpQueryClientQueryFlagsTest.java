@@ -95,6 +95,11 @@ public class QwpQueryClientQueryFlagsTest {
         Assert.assertEquals(QwpEgressMsgKind.QUERY_FLAG_RESET_DICT, r.queryFlags);
         Assert.assertEquals(0, r.trailingBytes);
 
+        // a server with per-query timeouts, but without the query details
+        r = executeOnce(QwpEgressMsgKind.CAP_QUERY_FLAGS | QwpEgressMsgKind.CAP_QUERY_TIMEOUT, options);
+        Assert.assertEquals(QwpEgressMsgKind.QUERY_FLAG_RESET_DICT, r.queryFlags);
+        Assert.assertEquals(0, r.trailingBytes);
+
         r = executeOnce(0, options);
         Assert.assertFalse("a server without CAP_QUERY_FLAGS gets no trailer", r.hasQueryFlags);
         Assert.assertEquals(0, r.trailingBytes);
@@ -123,12 +128,13 @@ public class QwpQueryClientQueryFlagsTest {
                 .resetSymbolDict(true).errorPosition(true).stats(true).countRows(true)
                 .skipRows(300).maxRows(16_384);
         QwpEgressFrames.QueryRequest r = executeOnce(ALL_CAPABILITIES, options);
-        Assert.assertEquals(0x3F, r.queryFlags);
+        // every bit but 0x02, which per-query timeouts own
+        Assert.assertEquals(0x7D, r.queryFlags);
         Assert.assertEquals(300, r.skipRows);
         Assert.assertEquals(16_384, r.maxRows);
         Assert.assertEquals(0, r.trailingBytes);
         // flags, skip_rows, max_rows: the last bytes of the request, in that order
-        byte[] tail = new QwpEgressFrames.Body().varint(0x3F).varint(300).varint(16_384).toBody();
+        byte[] tail = new QwpEgressFrames.Body().varint(0x7D).varint(300).varint(16_384).toBody();
         Assert.assertArrayEquals(tail, Arrays.copyOfRange(r.payload, r.payload.length - tail.length, r.payload.length));
     }
 
@@ -252,7 +258,12 @@ public class QwpQueryClientQueryFlagsTest {
                 new QwpQueryOptions().maxRows(0),
                 new QwpQueryOptions().skipRows(10).maxRows(10).stats(true),
         };
-        for (int capabilities : new int[]{0, QwpEgressMsgKind.CAP_QUERY_FLAGS}) {
+        final int[] capabilitiesWithoutDetails = {
+                0,
+                QwpEgressMsgKind.CAP_QUERY_FLAGS,
+                QwpEgressMsgKind.CAP_QUERY_FLAGS | QwpEgressMsgKind.CAP_QUERY_TIMEOUT
+        };
+        for (int capabilities : capabilitiesWithoutDetails) {
             TestUtils.assertMemoryLeak(() -> {
                 try (QwpEgressMockServer server = new QwpEgressMockServer(capabilities, QwpQueryClientQueryFlagsTest::execDone);
                      QwpQueryClient client = newClient(server)) {
@@ -294,6 +305,43 @@ public class QwpQueryClientQueryFlagsTest {
         Assert.assertEquals(QwpEgressMsgKind.QUERY_FLAG_MAX_ROWS, r.queryFlags);
         Assert.assertEquals(-1, r.skipRows);
         Assert.assertEquals(10, r.maxRows);
+    }
+
+    /**
+     * Each capability and each query flag is a bit of its own, and the query
+     * details leave alone the per-query timeout bits that released clients
+     * already use: capability 0x08 and flag 0x02, followed by {@code timeout_ms}
+     * (c-questdb-client 7.2.0 and py-questdb-client 6.0.0).
+     */
+    @Test
+    public void testWireBitsAreDistinctAndLeaveTimeoutBitsFree() {
+        Assert.assertEquals(0x08, QwpEgressMsgKind.CAP_QUERY_TIMEOUT);
+        Assert.assertEquals(0x02, QwpEgressMsgKind.QUERY_FLAG_TIMEOUT);
+        assertDistinctBits(
+                QwpEgressMsgKind.CAP_ZONE,
+                QwpEgressMsgKind.CAP_QUERY_FLAGS,
+                0x04, // the server's CAP_COMPRESSION, which this client does not read
+                QwpEgressMsgKind.CAP_QUERY_TIMEOUT,
+                QwpEgressMsgKind.CAP_QUERY_DETAILS
+        );
+        assertDistinctBits(
+                QwpEgressMsgKind.QUERY_FLAG_RESET_DICT,
+                QwpEgressMsgKind.QUERY_FLAG_TIMEOUT,
+                QwpEgressMsgKind.QUERY_FLAG_ERROR_POSITION,
+                QwpEgressMsgKind.QUERY_FLAG_STATS,
+                QwpEgressMsgKind.QUERY_FLAG_COUNT_ROWS,
+                QwpEgressMsgKind.QUERY_FLAG_SKIP_ROWS,
+                QwpEgressMsgKind.QUERY_FLAG_MAX_ROWS
+        );
+    }
+
+    private static void assertDistinctBits(int... bits) {
+        int union = 0;
+        for (int bit : bits) {
+            Assert.assertEquals("0x" + Integer.toHexString(bit) + " must be a single bit", 1, Integer.bitCount(bit));
+            Assert.assertEquals("0x" + Integer.toHexString(bit) + " is taken twice", 0, union & bit);
+            union |= bit;
+        }
     }
 
     private static byte[] buildExecDone(byte[] queryRequest) {
