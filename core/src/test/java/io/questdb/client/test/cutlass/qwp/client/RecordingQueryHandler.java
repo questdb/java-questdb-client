@@ -37,11 +37,11 @@ import java.util.List;
  * Records what the most detailed callbacks of {@link QwpColumnBatchHandler}
  * receive, copying the {@link QwpQueryDetails} values out while they are
  * valid. The simpler overloads fail: the client must call the detailed ones.
- * Batches must carry a single LONG column.
+ * Batches must carry a single LONG column. Also hosts the assertion on a
+ * {@link QwpQueryDetails} that carries nothing, which the decoder tests share.
  */
 public class RecordingQueryHandler implements QwpColumnBatchHandler {
     public final List<Long> values = new ArrayList<>();
-    public int batchCount;
     public long clientWaitNanos;
     public long compileNanos;
     public long countNanos;
@@ -63,6 +63,22 @@ public class RecordingQueryHandler implements QwpColumnBatchHandler {
     public long rowsAffected;
     public long totalRows;
 
+    /**
+     * Asserts that {@code details} carries neither a row count nor statistics:
+     * every getter returns its absent value.
+     */
+    public static void assertNoDetails(QwpQueryDetails details) {
+        Assert.assertFalse(details.hasRowCount());
+        Assert.assertEquals(-1, details.getRowCount());
+        Assert.assertFalse(details.hasStats());
+        Assert.assertEquals(-1, details.getCompileNanos());
+        Assert.assertEquals(-1, details.getExecuteNanos());
+        Assert.assertEquals(-1, details.getCountNanos());
+        Assert.assertEquals(-1, details.getClientWaitNanos());
+        Assert.assertFalse(details.isJitCompiled());
+        Assert.assertEquals("QwpQueryDetails{}", details.toString());
+    }
+
     public void assertNoDetails() {
         Assert.assertFalse("row count", hasRowCount);
         Assert.assertEquals(-1, rowCount);
@@ -82,7 +98,6 @@ public class RecordingQueryHandler implements QwpColumnBatchHandler {
 
     @Override
     public void onBatch(QwpColumnBatch batch) {
-        batchCount++;
         for (int row = 0; row < batch.getRowCount(); row++) {
             values.add(batch.getLongValue(0, row));
         }

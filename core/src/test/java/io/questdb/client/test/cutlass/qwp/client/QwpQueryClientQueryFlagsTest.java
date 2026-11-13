@@ -106,7 +106,7 @@ public class QwpQueryClientQueryFlagsTest {
     }
 
     @Test
-    public void testEachDetailOptionSendsItsFlag() throws Exception {
+    public void testEachBooleanOptionSendsItsFlag() throws Exception {
         Object[][] cases = {
                 {new QwpQueryOptions().errorPosition(true), QwpEgressMsgKind.QUERY_FLAG_ERROR_POSITION},
                 {new QwpQueryOptions().stats(true), QwpEgressMsgKind.QUERY_FLAG_STATS},

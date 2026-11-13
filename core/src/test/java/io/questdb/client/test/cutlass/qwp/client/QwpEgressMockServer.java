@@ -33,6 +33,7 @@ import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.ToIntFunction;
 
 /**
  * Egress endpoint that advertises the given {@code SERVER_INFO} capabilities,
@@ -64,10 +65,7 @@ public final class QwpEgressMockServer implements AutoCloseable {
                     frames = null;
                 }
                 if (frames == null) {
-                    // ClientHandler.close() joins this read thread, so close from another one
-                    Thread dropper = new Thread(client::close, "mock-egress-drop");
-                    dropper.setDaemon(true);
-                    dropper.start();
+                    client.close();
                     return;
                 }
                 try {
@@ -114,6 +112,15 @@ public final class QwpEgressMockServer implements AutoCloseable {
      */
     public int handshakeCount() {
         return server.handshakeCount();
+    }
+
+    /**
+     * Decides every new egress upgrade from its {@code Authorization} header: a
+     * positive return is the HTTP status the server rejects the upgrade with;
+     * see {@link TestWebSocketServer#setAuthorizationValidator}. Null removes it.
+     */
+    public void setAuthorizationValidator(ToIntFunction<String> validator) {
+        server.setAuthorizationValidator(validator);
     }
 
     /**

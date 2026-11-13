@@ -75,7 +75,7 @@ public class QwpEgressTerminatorDecodeTest {
 
             ev = decodeExecDone(QwpEgressFrames.execDone(3, 2, 30).toFrame(), QwpEgressMsgKind.QUERY_FLAG_COUNT_ROWS);
             Assert.assertEquals(30, ev.rowsAffected);
-            assertNoDetails(ev.details);
+            RecordingQueryHandler.assertNoDetails(ev.details);
         });
     }
 
@@ -132,7 +132,7 @@ public class QwpEgressTerminatorDecodeTest {
             QueryEvent ev = decodeExecDone(frame, 0);
             Assert.assertEquals(2, ev.opType);
             Assert.assertEquals(30, ev.rowsAffected);
-            assertNoDetails(ev.details);
+            RecordingQueryHandler.assertNoDetails(ev.details);
         });
     }
 
@@ -373,7 +373,7 @@ public class QwpEgressTerminatorDecodeTest {
                     QueryEvent ev = decodeResultEnd(frame, flags);
                     Assert.assertEquals(QueryEvent.KIND_END, ev.kind);
                     Assert.assertEquals(30, ev.totalRows);
-                    assertNoDetails(ev.details);
+                    RecordingQueryHandler.assertNoDetails(ev.details);
                 }
             }
             // COUNT_ROWS alone reads the row count and leaves what follows alone
@@ -424,18 +424,6 @@ public class QwpEgressTerminatorDecodeTest {
         } catch (QwpDecodeException e) {
             Assert.assertEquals(expectedMessage, e.getMessage());
         }
-    }
-
-    private static void assertNoDetails(QwpQueryDetails details) {
-        Assert.assertFalse(details.hasRowCount());
-        Assert.assertEquals(-1, details.getRowCount());
-        Assert.assertFalse(details.hasStats());
-        Assert.assertEquals(-1, details.getCompileNanos());
-        Assert.assertEquals(-1, details.getExecuteNanos());
-        Assert.assertEquals(-1, details.getCountNanos());
-        Assert.assertEquals(-1, details.getClientWaitNanos());
-        Assert.assertFalse(details.isJitCompiled());
-        Assert.assertEquals("QwpQueryDetails{}", details.toString());
     }
 
     private static void assertStats(

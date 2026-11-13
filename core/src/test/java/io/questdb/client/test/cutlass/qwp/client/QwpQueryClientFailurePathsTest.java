@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.cutlass.auth.TokenUnavailableException;
 import io.questdb.client.cutlass.qwp.client.QwpEgressMsgKind;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 import io.questdb.client.cutlass.qwp.client.QwpQueryOptions;
@@ -39,8 +40,9 @@ import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * The failures {@link QwpQueryClient#execute} detects itself -- a failover
- * reconnect that fails, a stop request or a {@code close()} between attempts --
- * reach the handler through the position-aware
+ * reconnect that fails or meets a rejected or unavailable credential, a
+ * failover that runs out of attempts, a stop request or a {@code close()}
+ * between attempts -- reach the handler through the position-aware
  * {@code onError(requestId, status, message, position)} with
  * {@link QwpEgressMsgKind#NO_ERROR_POSITION}, like the server's errors, so a
  * handler that overrides only that overload sees them all. Each query asks for
@@ -51,6 +53,34 @@ public class QwpQueryClientFailurePathsTest {
     private static final int ALL_CAPABILITIES = QwpEgressMsgKind.CAP_QUERY_FLAGS | QwpEgressMsgKind.CAP_QUERY_DETAILS;
     private static final QwpQueryOptions OPTIONS = new QwpQueryOptions().countRows(true).stats(true).errorPosition(true);
     private static final String SQL = "SELECT x FROM t";
+
+    @Test(timeout = 30_000)
+    public void testAuthRejectedFailoverReportsNoPosition() throws Exception {
+        // the server dies with the first query and rejects the credential of
+        // the failover reconnect
+        TestUtils.assertMemoryLeak(() -> {
+            AtomicReference<QwpEgressMockServer> serverRef = new AtomicReference<>();
+            try (QwpEgressMockServer server = new QwpEgressMockServer(ALL_CAPABILITIES, r -> {
+                serverRef.get().setAuthorizationValidator(authorization -> 401);
+                return null;
+            });
+                 QwpQueryClient client = newClient(server)) {
+                serverRef.set(server);
+                client.connect();
+                RecordingQueryHandler handler = new RecordingQueryHandler();
+                client.execute(SQL, handler, OPTIONS);
+                handler.assertOnlyError();
+                Assert.assertEquals(server.getRequests().get(0).requestId, handler.errorRequestId);
+                Assert.assertEquals(WebSocketResponse.STATUS_INTERNAL_ERROR, handler.errorStatus);
+                Assert.assertTrue(handler.errorMessage,
+                        handler.errorMessage.startsWith("auth-rejected during failover reconnect [host=localhost:"));
+                TestUtils.assertContains(handler.errorMessage, ", status=401, last error: ");
+                Assert.assertEquals(QwpEgressMsgKind.NO_ERROR_POSITION, handler.errorPosition);
+                Assert.assertEquals("the failover reconnect must not complete", 1, server.handshakeCount());
+                server.assertNoFailure();
+            }
+        });
+    }
 
     @Test(timeout = 30_000)
     public void testCloseBetweenAttemptsReportsClosed() throws Exception {
@@ -76,6 +106,65 @@ public class QwpQueryClientFailurePathsTest {
                 Assert.assertEquals(QwpEgressMsgKind.NO_ERROR_POSITION, handler.errorPosition);
                 Assert.assertFalse(client.wasLastCloseTimedOut());
                 Assert.assertEquals("the closed client must not replay the query", 1, server.getRequests().size());
+                server.assertNoFailure();
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testCredentialUnavailableFailoverReportsNoPosition() throws Exception {
+        // the token provider fails when the failover reconnect asks it for a
+        // credential, so the reconnect contacts no endpoint
+        TestUtils.assertMemoryLeak(() -> {
+            AtomicInteger tokenPulls = new AtomicInteger();
+            try (QwpEgressMockServer server = new QwpEgressMockServer(ALL_CAPABILITIES, dropFirstQuery());
+                 QwpQueryClient client = newClient(server).withBearerTokenProvider(() -> {
+                     if (tokenPulls.incrementAndGet() > 1) {
+                         throw TokenUnavailableException.retryable("IdP unreachable");
+                     }
+                     return "TOKEN";
+                 })) {
+                client.connect();
+                RecordingQueryHandler handler = new RecordingQueryHandler();
+                client.execute(SQL, handler, OPTIONS);
+                handler.assertOnlyError();
+                Assert.assertEquals(server.getRequests().get(0).requestId, handler.errorRequestId);
+                Assert.assertEquals(WebSocketResponse.STATUS_INTERNAL_ERROR, handler.errorStatus);
+                Assert.assertTrue(handler.errorMessage, handler.errorMessage.startsWith("failover reconnect failed: "));
+                TestUtils.assertContains(handler.errorMessage, "IdP unreachable");
+                Assert.assertEquals(QwpEgressMsgKind.NO_ERROR_POSITION, handler.errorPosition);
+                Assert.assertEquals("the failover reconnect must contact no endpoint", 1, server.handshakeCount());
+                server.assertNoFailure();
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testExhaustedFailoverReportsNoPosition() throws Exception {
+        // failover_max_attempts=1 leaves no attempt for a failover: the query
+        // dies with its connection, and the next query hits the latched failure
+        TestUtils.assertMemoryLeak(() -> {
+            final String failure = "transport failure after 1 execute attempt (0 failover reconnects); last error: ";
+            try (QwpEgressMockServer server = new QwpEgressMockServer(ALL_CAPABILITIES, r -> null);
+                 QwpQueryClient client = newClient(server, "failover_max_attempts=1;")) {
+                client.connect();
+                RecordingQueryHandler handler = new RecordingQueryHandler();
+                client.execute(SQL, handler, OPTIONS);
+                handler.assertOnlyError();
+                Assert.assertEquals(server.getRequests().get(0).requestId, handler.errorRequestId);
+                Assert.assertEquals(WebSocketResponse.STATUS_INTERNAL_ERROR, handler.errorStatus);
+                Assert.assertTrue(handler.errorMessage, handler.errorMessage.startsWith(failure));
+                Assert.assertEquals(QwpEgressMsgKind.NO_ERROR_POSITION, handler.errorPosition);
+
+                RecordingQueryHandler latched = new RecordingQueryHandler();
+                client.execute(SQL, latched, OPTIONS);
+                latched.assertOnlyError();
+                Assert.assertEquals(-1, latched.errorRequestId);
+                Assert.assertEquals(WebSocketResponse.STATUS_INTERNAL_ERROR, latched.errorStatus);
+                Assert.assertTrue(latched.errorMessage, latched.errorMessage.startsWith(failure));
+                Assert.assertEquals(QwpEgressMsgKind.NO_ERROR_POSITION, latched.errorPosition);
+                Assert.assertEquals("no failover reconnect", 1, server.handshakeCount());
+                Assert.assertEquals("the latched failure sends nothing", 1, server.getRequests().size());
                 server.assertNoFailure();
             }
         });
@@ -236,7 +325,11 @@ public class QwpQueryClientFailurePathsTest {
     }
 
     private static QwpQueryClient newClient(QwpEgressMockServer server) {
+        return newClient(server, "");
+    }
+
+    private static QwpQueryClient newClient(QwpEgressMockServer server, String extraConfig) {
         return QwpQueryClient.fromConfig("ws::addr=" + server.getAddress()
-                + ";auth_timeout_ms=2000;failover_backoff_initial_ms=0;");
+                + ";auth_timeout_ms=2000;failover_backoff_initial_ms=0;" + extraConfig);
     }
 }

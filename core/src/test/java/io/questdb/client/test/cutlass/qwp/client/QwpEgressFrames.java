@@ -69,7 +69,7 @@ public final class QwpEgressFrames {
         Assert.assertEquals("frame must be a QUERY_REQUEST", QwpEgressMsgKind.QUERY_REQUEST, (byte) rd.u8());
         long requestId = rd.i64();
         String sql = rd.utf8((int) rd.varint());
-        long initialCredit = rd.varint();
+        rd.varint(); // initial_credit
         int bindCount = (int) rd.varint();
         long[] longBinds = new long[bindCount];
         for (int i = 0; i < bindCount; i++) {
@@ -81,7 +81,7 @@ public final class QwpEgressFrames {
         long queryFlags = hasQueryFlags ? rd.varint() : 0;
         long skipRows = (queryFlags & QwpEgressMsgKind.QUERY_FLAG_SKIP_ROWS) != 0 ? rd.varint() : -1;
         long maxRows = (queryFlags & QwpEgressMsgKind.QUERY_FLAG_MAX_ROWS) != 0 ? rd.varint() : -1;
-        return new QueryRequest(payload, requestId, sql, initialCredit, longBinds, hasQueryFlags, queryFlags, skipRows, maxRows, rd.remaining());
+        return new QueryRequest(payload, requestId, sql, longBinds, hasQueryFlags, queryFlags, skipRows, maxRows, rd.remaining());
     }
 
     /**
@@ -204,7 +204,6 @@ public final class QwpEgressFrames {
      */
     public static final class QueryRequest {
         public final boolean hasQueryFlags;
-        public final long initialCredit;
         public final long[] longBinds;
         public final long maxRows;
         // the raw payload, as the client sent it
@@ -219,7 +218,6 @@ public final class QwpEgressFrames {
                 byte[] payload,
                 long requestId,
                 String sql,
-                long initialCredit,
                 long[] longBinds,
                 boolean hasQueryFlags,
                 long queryFlags,
@@ -230,7 +228,6 @@ public final class QwpEgressFrames {
             this.payload = payload;
             this.requestId = requestId;
             this.sql = sql;
-            this.initialCredit = initialCredit;
             this.longBinds = longBinds;
             this.hasQueryFlags = hasQueryFlags;
             this.queryFlags = queryFlags;

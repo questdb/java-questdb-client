@@ -27,7 +27,6 @@ package io.questdb.client.test.cutlass.qwp.client;
 import io.questdb.client.cutlass.qwp.client.QueryEvent;
 import io.questdb.client.cutlass.qwp.client.QwpBatchBuffer;
 import io.questdb.client.cutlass.qwp.client.QwpEgressMsgKind;
-import io.questdb.client.cutlass.qwp.client.QwpQueryDetails;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -53,16 +52,16 @@ public class QueryEventTest {
         Assert.assertEquals(0L, ev.rowsAffected);
         Assert.assertEquals(0L, ev.totalRows);
         Assert.assertEquals(QwpEgressMsgKind.NO_ERROR_POSITION, ev.errorPosition);
-        assertNoDetails(ev.details);
+        RecordingQueryHandler.assertNoDetails(ev.details);
     }
 
     @Test
     public void testAsEndAndAsExecDoneDropStaleDetails() {
         QueryEvent ev = new QueryEvent().asEnd(1).withRowCount(9).withStats(1, 2, 3, 4, true);
         ev.asEnd(2);
-        assertNoDetails(ev.details);
+        RecordingQueryHandler.assertNoDetails(ev.details);
         ev.withRowCount(9).withStats(1, 2, 3, 4, true).asExecDone((short) 1, 2);
-        assertNoDetails(ev.details);
+        RecordingQueryHandler.assertNoDetails(ev.details);
     }
 
     @Test
@@ -201,7 +200,7 @@ public class QueryEventTest {
     public void testResetClearsDetails() {
         QueryEvent ev = new QueryEvent().asEnd(5).withRowCount(9).withStats(1, 2, 3, 4, true);
         ev.reset();
-        assertNoDetails(ev.details);
+        RecordingQueryHandler.assertNoDetails(ev.details);
     }
 
     @Test
@@ -223,17 +222,5 @@ public class QueryEventTest {
         Assert.assertEquals(-1, ev.kind);
         Assert.assertEquals(0, ev.opType);
         Assert.assertEquals(0L, ev.rowsAffected);
-    }
-
-    private static void assertNoDetails(QwpQueryDetails details) {
-        Assert.assertFalse(details.hasRowCount());
-        Assert.assertEquals(-1, details.getRowCount());
-        Assert.assertFalse(details.hasStats());
-        Assert.assertEquals(-1, details.getCompileNanos());
-        Assert.assertEquals(-1, details.getExecuteNanos());
-        Assert.assertEquals(-1, details.getCountNanos());
-        Assert.assertEquals(-1, details.getClientWaitNanos());
-        Assert.assertFalse(details.isJitCompiled());
-        Assert.assertEquals("QwpQueryDetails{}", details.toString());
     }
 }

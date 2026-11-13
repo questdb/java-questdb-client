@@ -24,8 +24,6 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
-import io.questdb.client.QueryException;
-import io.questdb.client.cutlass.qwp.client.QwpEgressMsgKind;
 import io.questdb.client.cutlass.qwp.client.QwpQueryOptions;
 import org.junit.Assert;
 import org.junit.Test;
@@ -92,17 +90,6 @@ public class QwpQueryOptionsTest {
             Assert.assertEquals(3, options.getSkipRows());
             Assert.assertEquals(4, options.getMaxRows());
         }
-    }
-
-    @Test
-    public void testQueryExceptionPosition() {
-        Assert.assertEquals(QwpEgressMsgKind.NO_ERROR_POSITION, new QueryException((byte) 5, "x").getPosition());
-        Assert.assertEquals(QwpEgressMsgKind.NO_ERROR_POSITION,
-                new QueryException((byte) 0, "x", new IllegalStateException()).getPosition());
-        QueryException e = new QueryException((byte) 5, "table does not exist", 14);
-        Assert.assertEquals(5, e.getStatus());
-        Assert.assertEquals("table does not exist", e.getMessage());
-        Assert.assertEquals(14, e.getPosition());
     }
 
     @Test

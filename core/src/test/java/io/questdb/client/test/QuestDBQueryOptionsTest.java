@@ -161,6 +161,33 @@ public class QuestDBQueryOptionsTest {
     }
 
     @Test
+    public void testOptionsOnClosedHandleRejected() throws Exception {
+        // The pool holds one client, so the second borrow gets the client the
+        // closed handle had: its options must not reach that borrower's query.
+        TestUtils.assertMemoryLeak(() -> {
+            try (QwpEgressMockServer server = new QwpEgressMockServer(ALL_CAPABILITIES, QuestDBQueryOptionsTest::model);
+                 QuestDB db = connect(server)) {
+                Query closed = db.borrowQuery();
+                closed.close();
+                try (Query q = db.borrowQuery()) {
+                    try {
+                        closed.options(new QwpQueryOptions().maxRows(1));
+                        Assert.fail("a closed handle must reject options()");
+                    } catch (IllegalStateException e) {
+                        Assert.assertEquals("query handle is not borrowed (closed or never leased)", e.getMessage());
+                    }
+                    RecordingQueryHandler handler = new RecordingQueryHandler();
+                    q.sql("SELECT x").handler(handler).submit().await();
+                    Assert.assertEquals(10, handler.values.size());
+                }
+                Assert.assertEquals(1, server.getRequests().size());
+                Assert.assertFalse(server.getRequests().get(0).hasQueryFlags);
+                server.assertNoFailure();
+            }
+        });
+    }
+
+    @Test
     public void testStatsReachExecDone() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             try (QwpEgressMockServer server = new QwpEgressMockServer(ALL_CAPABILITIES, QuestDBQueryOptionsTest::model);
