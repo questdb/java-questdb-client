@@ -4090,10 +4090,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     "schema lookup timed out before send");
             return true;
         }
-        int timeoutMillis = (int) Math.min(Integer.MAX_VALUE,
-                1L + (remainingNanos - 1L) / 1_000_000L);
         try {
-            activeClient.sendBinary(request.message, timeoutMillis);
+            // A timeout here reconnects and replays unacked frames, so the request
+            // waits for the socket as long as a data frame does. The producer stops
+            // waiting at its own deadline, in QwpSchemaCoordinator.await().
+            activeClient.sendBinary(request.message);
             return true;
         } catch (Throwable t) {
             if (t instanceof Error) {

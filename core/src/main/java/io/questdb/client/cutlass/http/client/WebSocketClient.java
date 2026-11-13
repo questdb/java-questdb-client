@@ -566,8 +566,11 @@ public abstract class WebSocketClient implements QuietCloseable {
         sendBuffer.reset();
     }
 
-    /** Sends a small caller-owned byte array as one binary message. */
-    public void sendBinary(byte[] data, int timeout) {
+    /**
+     * Sends a small caller-owned byte array as one binary message with the same
+     * timeout as data frames.
+     */
+    public void sendBinary(byte[] data) {
         checkConnected();
         sendBuffer.reset();
         sendBuffer.beginFrame();
@@ -575,7 +578,7 @@ public abstract class WebSocketClient implements QuietCloseable {
             sendBuffer.putByte(b);
         }
         WebSocketSendBuffer.FrameInfo frame = sendBuffer.endBinaryFrame();
-        doSend(sendBuffer.getBufferPtr() + frame.offset, frame.length, timeout);
+        doSend(sendBuffer.getBufferPtr() + frame.offset, frame.length, defaultTimeout);
         sendBuffer.reset();
     }
 
