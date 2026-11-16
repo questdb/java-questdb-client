@@ -41,8 +41,9 @@ import java.util.concurrent.atomic.AtomicReference;
 /**
  * The failures {@link QwpQueryClient#execute} detects itself -- a failover
  * reconnect that fails or meets a rejected or unavailable credential, a
- * failover that runs out of attempts, a stop request or a {@code close()}
- * between attempts -- reach the handler through the position-aware
+ * failover that runs out of attempts, an interrupt during the failover
+ * backoff, a stop request or a {@code close()} between attempts -- reach the
+ * handler through the position-aware
  * {@code onError(requestId, status, message, position)} with
  * {@link QwpEgressMsgKind#NO_ERROR_POSITION}, like the server's errors, so a
  * handler that overrides only that overload sees them all. Each query asks for
@@ -214,6 +215,38 @@ public class QwpQueryClientFailurePathsTest {
                 Assert.assertEquals(1, recovered.rowCount);
                 Assert.assertTrue(recovered.hasStats);
                 Assert.assertEquals(2, server.getRequests().size());
+                server.assertNoFailure();
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testInterruptedBackoffReportsNoPosition() throws Exception {
+        // An interrupt during the failover backoff ends the query instead of
+        // the reconnect. The hook closes the client before it raises the
+        // interrupt, so the failover cleanup finds the failed connection torn
+        // down already, and the pending interrupt ends the backoff's sleep.
+        TestUtils.assertMemoryLeak(() -> {
+            try (QwpEgressMockServer server = new QwpEgressMockServer(ALL_CAPABILITIES, r -> null);
+                 QwpQueryClient client = QwpQueryClient.fromConfig("ws::addr=" + server.getAddress()
+                         + ";auth_timeout_ms=2000;failover_backoff_initial_ms=20000;failover_backoff_max_ms=20000;")) {
+                client.connect();
+                // the first backoff takes 13.9 s unless the interrupt cuts it short
+                client.seedFailoverRandomForTest(0);
+                client.setAfterTransportFailureHookForTest(() -> {
+                    client.close();
+                    Thread.currentThread().interrupt();
+                });
+                RecordingQueryHandler handler = new RecordingQueryHandler();
+                client.execute(SQL, handler, OPTIONS);
+                Assert.assertTrue("execute() must restore the interrupt", Thread.interrupted());
+                handler.assertOnlyError();
+                Assert.assertEquals(server.getRequests().get(0).requestId, handler.errorRequestId);
+                Assert.assertEquals(WebSocketResponse.STATUS_INTERNAL_ERROR, handler.errorStatus);
+                Assert.assertTrue(handler.errorMessage, handler.errorMessage.startsWith(
+                        "failover interrupted while backing off after attempt 1; last error: "));
+                Assert.assertEquals(QwpEgressMsgKind.NO_ERROR_POSITION, handler.errorPosition);
+                Assert.assertEquals("no failover reconnect", 1, server.handshakeCount());
                 server.assertNoFailure();
             }
         });

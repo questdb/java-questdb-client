@@ -91,6 +91,7 @@ public class QuestDBQueryOptionsTest {
                 handler.assertNoWrongOverloads();
                 Assert.assertEquals(7, handler.errorPosition);
 
+                // a failure after one with a position reports its own: none
                 q.options(null);
                 try {
                     q.submit().await();
@@ -101,13 +102,15 @@ public class QuestDBQueryOptionsTest {
                 }
                 handler.assertNoWrongOverloads();
 
-                // a failure after one with a position reports its own
-                q.sql("SELECT x").options(new QwpQueryOptions().maxRows(1));
+                // a failure the client detects itself reports no position, even
+                // when the query asked for one
+                q.sql("SELECT x").options(new QwpQueryOptions().maxRows(1).errorPosition(true));
                 server.close();
                 try {
                     q.submit().await();
                     Assert.fail("the query must fail");
                 } catch (QueryException e) {
+                    Assert.assertEquals(WebSocketResponse.STATUS_INTERNAL_ERROR, e.getStatus());
                     Assert.assertEquals(QwpEgressMsgKind.NO_ERROR_POSITION, e.getPosition());
                 }
                 handler.assertNoWrongOverloads();
