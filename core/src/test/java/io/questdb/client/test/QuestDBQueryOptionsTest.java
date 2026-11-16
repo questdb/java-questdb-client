@@ -24,12 +24,14 @@
 
 package io.questdb.client.test;
 
+import io.questdb.client.Completion;
 import io.questdb.client.Query;
 import io.questdb.client.QueryException;
 import io.questdb.client.QuestDB;
 import io.questdb.client.cutlass.qwp.client.QwpEgressMsgKind;
 import io.questdb.client.cutlass.qwp.client.QwpQueryOptions;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
+import io.questdb.client.impl.QuestDBImpl;
 import io.questdb.client.test.cutlass.qwp.client.QwpEgressFrames;
 import io.questdb.client.test.cutlass.qwp.client.QwpEgressMockServer;
 import io.questdb.client.test.cutlass.qwp.client.RecordingQueryHandler;
@@ -38,7 +40,10 @@ import org.junit.Assert;
 import org.junit.Test;
 
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * {@link Query#options(QwpQueryOptions)} on the pooled facade: the options
@@ -58,7 +63,9 @@ public class QuestDBQueryOptionsTest {
                  Query q = db.borrowQuery()) {
                 q.sql("SELECT x").options(new QwpQueryOptions().maxRows(1)).handler(new RecordingQueryHandler());
                 q.abandon();
-                q.sql("SELECT x").handler(new RecordingQueryHandler()).submit().await();
+                RecordingQueryHandler handler = new RecordingQueryHandler();
+                q.sql("SELECT x").handler(handler).submit().await();
+                handler.assertNoWrongOverloads();
                 Assert.assertFalse(server.getRequests().get(0).hasQueryFlags);
                 server.assertNoFailure();
             }
@@ -81,6 +88,7 @@ public class QuestDBQueryOptionsTest {
                     Assert.assertEquals("Invalid column: nope", e.getMessage());
                     Assert.assertEquals(7, e.getPosition());
                 }
+                handler.assertNoWrongOverloads();
                 Assert.assertEquals(7, handler.errorPosition);
 
                 q.options(null);
@@ -91,6 +99,7 @@ public class QuestDBQueryOptionsTest {
                     Assert.assertEquals("[7] Invalid column: nope", e.getMessage());
                     Assert.assertEquals(QwpEgressMsgKind.NO_ERROR_POSITION, e.getPosition());
                 }
+                handler.assertNoWrongOverloads();
 
                 // a failure after one with a position reports its own
                 q.sql("SELECT x").options(new QwpQueryOptions().maxRows(1));
@@ -101,6 +110,7 @@ public class QuestDBQueryOptionsTest {
                 } catch (QueryException e) {
                     Assert.assertEquals(QwpEgressMsgKind.NO_ERROR_POSITION, e.getPosition());
                 }
+                handler.assertNoWrongOverloads();
                 server.assertNoFailure();
             }
         });
@@ -118,6 +128,7 @@ public class QuestDBQueryOptionsTest {
                         // the handle copied the options: changing them does not reach it
                         options.clear().maxRows(9);
                         q.submit().await();
+                        handler.assertNoWrongOverloads();
                         Assert.assertEquals(Arrays.asList(1L, 2L), handler.values);
                         Assert.assertEquals(2, handler.totalRows);
                         Assert.assertEquals(10, handler.rowCount);
@@ -134,12 +145,15 @@ public class QuestDBQueryOptionsTest {
                         q.submit().await();
                         q.options(null);
                         q.submit().await();
+                        handler.assertNoWrongOverloads();
                         // the lease ends with options set
                         q.options(new QwpQueryOptions().stats(true).skipRows(3));
                     }
                     // a new borrow of the same pooled client starts without options
                     try (Query q = db.borrowQuery()) {
-                        q.sql("SELECT x").handler(new RecordingQueryHandler()).submit().await();
+                        RecordingQueryHandler handler = new RecordingQueryHandler();
+                        q.sql("SELECT x").handler(handler).submit().await();
+                        handler.assertNoWrongOverloads();
                     }
                 }
                 List<QwpEgressFrames.QueryRequest> requests = server.getRequests();
@@ -178,10 +192,73 @@ public class QuestDBQueryOptionsTest {
                     }
                     RecordingQueryHandler handler = new RecordingQueryHandler();
                     q.sql("SELECT x").handler(handler).submit().await();
+                    handler.assertNoWrongOverloads();
                     Assert.assertEquals(10, handler.values.size());
                 }
                 Assert.assertEquals(1, server.getRequests().size());
                 Assert.assertFalse(server.getRequests().get(0).hasQueryFlags);
+                server.assertNoFailure();
+            }
+        });
+    }
+
+    @Test
+    public void testOptionsSetWhileInFlightApplyToTheNextSubmit() throws Exception {
+        // The worker takes a query some time after submit() returns. A hook parks
+        // it between two queries, so it takes the second only after the caller
+        // has set the options of the third: the second must still run with the
+        // options it was submitted with.
+        QwpQueryOptions[] changes = {new QwpQueryOptions().skipRows(5).maxRows(5).countRows(true), null};
+        TestUtils.assertMemoryLeak(() -> {
+            try (QwpEgressMockServer server = new QwpEgressMockServer(ALL_CAPABILITIES, QuestDBQueryOptionsTest::model)) {
+                for (QwpQueryOptions change : changes) {
+                    // one facade per case: its single worker parks once, after the first query
+                    try (QuestDB db = connect(server);
+                         Query q = db.borrowQuery()) {
+                        CountDownLatch release = new CountDownLatch(1);
+                        AtomicBoolean isParkPending = new AtomicBoolean(true);
+                        ((QuestDBImpl) db).getQueryPoolForTesting().setBusyWorkerHookForTesting(() -> {
+                            if (isParkPending.compareAndSet(true, false)) {
+                                try {
+                                    release.await();
+                                } catch (InterruptedException e) {
+                                    Thread.currentThread().interrupt();
+                                }
+                            }
+                        });
+                        RecordingQueryHandler handler = new RecordingQueryHandler();
+                        q.sql("SELECT x").options(new QwpQueryOptions().maxRows(1)).handler(handler);
+                        Completion inFlight;
+                        try {
+                            q.submit().await();
+                            handler.values.clear();
+                            inFlight = q.submit();
+                            q.options(change);
+                        } finally {
+                            release.countDown();
+                        }
+                        inFlight.await();
+                        Assert.assertEquals(Collections.singletonList(0L), handler.values);
+
+                        // the change applies to the next submit
+                        handler.values.clear();
+                        q.submit().await();
+                        Assert.assertEquals(change == null ? 10 : 5, handler.values.size());
+                        handler.assertNoWrongOverloads();
+                    }
+                }
+                List<QwpEgressFrames.QueryRequest> requests = server.getRequests();
+                Assert.assertEquals(6, requests.size());
+                for (int i : new int[]{0, 1, 3, 4}) {
+                    QwpEgressFrames.QueryRequest r = requests.get(i);
+                    Assert.assertEquals("request " + i, QwpEgressMsgKind.QUERY_FLAG_MAX_ROWS, r.queryFlags);
+                    Assert.assertEquals("request " + i, 1, r.maxRows);
+                }
+                QwpEgressFrames.QueryRequest next = requests.get(2);
+                Assert.assertEquals(WINDOW_FLAGS | QwpEgressMsgKind.QUERY_FLAG_COUNT_ROWS, next.queryFlags);
+                Assert.assertEquals(5, next.skipRows);
+                Assert.assertEquals(5, next.maxRows);
+                Assert.assertFalse(requests.get(5).hasQueryFlags);
                 server.assertNoFailure();
             }
         });
@@ -195,6 +272,7 @@ public class QuestDBQueryOptionsTest {
                  Query q = db.borrowQuery()) {
                 RecordingQueryHandler handler = new RecordingQueryHandler();
                 q.sql("INSERT INTO t VALUES (1)").options(new QwpQueryOptions().stats(true)).handler(handler).submit().await();
+                handler.assertNoWrongOverloads();
                 Assert.assertEquals(1, handler.execDoneCount);
                 Assert.assertEquals(4, handler.rowsAffected);
                 Assert.assertTrue(handler.hasStats);

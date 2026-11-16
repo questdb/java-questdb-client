@@ -31,14 +31,20 @@ import io.questdb.client.cutlass.qwp.client.QwpServerInfo;
 import org.junit.Assert;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * Records what the most detailed callbacks of {@link QwpColumnBatchHandler}
  * receive, copying the {@link QwpQueryDetails} values out while they are
- * valid. The simpler overloads fail: the client must call the detailed ones.
- * Batches must carry a single LONG column. Also hosts the assertion on a
- * {@link QwpQueryDetails} that carries nothing, which the decoder tests share.
+ * valid. The simpler overloads record the call and fail: the client must call
+ * the detailed ones. A direct {@code QwpQueryClient.execute()} rethrows that
+ * failure, but the pooled facade runs handlers on its worker thread, which
+ * swallows it, so a facade test calls {@link #assertNoWrongOverloads()} after
+ * {@code await()}. Batches must carry a single LONG column. Also hosts the
+ * assertion on a {@link QwpQueryDetails} that carries nothing, which the
+ * decoder tests share.
  */
 public class RecordingQueryHandler implements QwpColumnBatchHandler {
     public final List<Long> values = new ArrayList<>();
@@ -62,6 +68,8 @@ public class RecordingQueryHandler implements QwpColumnBatchHandler {
     public long rowCount;
     public long rowsAffected;
     public long totalRows;
+    // written on the thread that runs the callbacks, read on the test thread
+    private final List<String> wrongOverloads = new CopyOnWriteArrayList<>();
 
     /**
      * Asserts that {@code details} carries neither a row count nor statistics:
@@ -80,6 +88,7 @@ public class RecordingQueryHandler implements QwpColumnBatchHandler {
     }
 
     public void assertNoDetails() {
+        assertNoWrongOverloads();
         Assert.assertFalse("row count", hasRowCount);
         Assert.assertEquals(-1, rowCount);
         Assert.assertFalse("stats", hasStats);
@@ -90,7 +99,16 @@ public class RecordingQueryHandler implements QwpColumnBatchHandler {
         Assert.assertFalse(isJitCompiled);
     }
 
+    /**
+     * Fails when the client called a simpler overload of a terminal callback,
+     * on any thread.
+     */
+    public void assertNoWrongOverloads() {
+        Assert.assertEquals("simpler overloads called", Collections.emptyList(), wrongOverloads);
+    }
+
     public void assertOnlyError() {
+        assertNoWrongOverloads();
         Assert.assertEquals("errors", 1, errorCount);
         Assert.assertEquals("ends", 0, endCount);
         Assert.assertEquals("exec dones", 0, execDoneCount);
@@ -105,7 +123,7 @@ public class RecordingQueryHandler implements QwpColumnBatchHandler {
 
     @Override
     public void onEnd(long totalRows) {
-        Assert.fail("the client must call onEnd(requestId, totalRows, details)");
+        wrongOverload("the client must call onEnd(requestId, totalRows, details)");
     }
 
     @Override
@@ -118,7 +136,7 @@ public class RecordingQueryHandler implements QwpColumnBatchHandler {
 
     @Override
     public void onError(byte status, String message) {
-        Assert.fail("the client must call onError(requestId, status, message, position)");
+        wrongOverload("the client must call onError(requestId, status, message, position)");
     }
 
     @Override
@@ -132,7 +150,7 @@ public class RecordingQueryHandler implements QwpColumnBatchHandler {
 
     @Override
     public void onExecDone(short opType, long rowsAffected) {
-        Assert.fail("the client must call onExecDone(requestId, opType, rowsAffected, details)");
+        wrongOverload("the client must call onExecDone(requestId, opType, rowsAffected, details)");
     }
 
     @Override
@@ -159,5 +177,10 @@ public class RecordingQueryHandler implements QwpColumnBatchHandler {
         countNanos = details.getCountNanos();
         clientWaitNanos = details.getClientWaitNanos();
         isJitCompiled = details.isJitCompiled();
+    }
+
+    private void wrongOverload(String message) {
+        wrongOverloads.add(message);
+        Assert.fail(message);
     }
 }

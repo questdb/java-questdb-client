@@ -47,6 +47,9 @@ import java.io.Closeable;
  * Lifecycle: configure with {@link #sql}, optional {@link #binds} and
  * {@link #options}, and {@link #handler}, then call {@link #submit()} to obtain
  * a {@link Completion} and {@code await()} it before the next {@link #submit()}.
+ * The query reads its SQL text, binds and handler while it runs, so do not
+ * change them before {@code await()} returns. It takes its options when it is
+ * submitted, so {@link #options} may set up the next query in the meantime.
  * <p>
  * Thread safety: not thread-safe and single-flight -- one in-flight query per
  * handle. To run queries concurrently, borrow one handle per concurrent query.
@@ -107,7 +110,9 @@ public interface Query extends Closeable {
      * whole result set, execution statistics and the error position. See
      * {@link QwpQueryOptions}. The handle copies the values, so the instance can
      * be reused right away; they apply to every {@link #submit()} until changed.
-     * Pass null to drop them.
+     * Each {@link #submit()} runs with the options set when it is called, so
+     * changing them while a query is in flight affects only the next one. Pass
+     * null to drop them.
      */
     Query options(QwpQueryOptions options);
 

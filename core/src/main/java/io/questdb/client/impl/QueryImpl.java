@@ -72,9 +72,15 @@ final class QueryImpl {
     private final Condition doneCondition;
     private final ReentrantLock doneLock = new ReentrantLock();
     // The handle's own copy of the user's options: Query.options() copies into it,
-    // so the user may reuse the instance, and execute() reads it on the worker thread.
+    // so the user may reuse the instance. submit() copies it into submittedOptions.
     private final QwpQueryOptions options = new QwpQueryOptions();
     private final StringSink sqlBuffer = new StringSink();
+    // The options of the submitted query, which execute() reads on the worker
+    // thread when it starts the query. That can be after options() has already
+    // set up the next query, so the worker never reads the handle's options.
+    // submit() overwrites it only once the previous query is done, long after
+    // its execute() read it.
+    private final QwpQueryOptions submittedOptions = new QwpQueryOptions();
     private final QueryWorker worker;
     private final QwpBindSetter wireBinds = this::applyBinds;
     private final WrappingHandler wrappingHandler = new WrappingHandler();
@@ -249,6 +255,7 @@ final class QueryImpl {
         } finally {
             doneLock.unlock();
         }
+        submittedOptions.copyFrom(options);
         worker.dispatch(this);
     }
 
@@ -363,11 +370,13 @@ final class QueryImpl {
     void runOn(QwpQueryClient client) {
         // Pass the StringSink directly as a CharSequence -- the wire encoder
         // reads chars and writes UTF-8 bytes straight into the send buffer.
-        // sqlBuffer is stable for the duration of execute(): the calling
-        // worker thread is blocked here until a terminal event arrives, and
-        // sql(...) cannot be invoked again until done==true. The same holds for
-        // options, which execute() reads once, when it starts.
-        client.execute(sqlBuffer, wireBinds, wrappingHandler, options);
+        // The query reads sqlBuffer, the binds and the handler while it runs;
+        // the Query contract tells the caller not to change them before
+        // await() returns, but nothing enforces it. The options come from
+        // submittedOptions instead, which submit() filled: execute() reads them
+        // once, when it starts, and options() may change the handle's options
+        // for the next query meanwhile.
+        client.execute(sqlBuffer, wireBinds, wrappingHandler, submittedOptions);
     }
 
     /**
