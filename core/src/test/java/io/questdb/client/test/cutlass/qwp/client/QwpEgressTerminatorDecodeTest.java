@@ -490,7 +490,7 @@ public class QwpEgressTerminatorDecodeTest {
     private static QueryEvent decodeExecDone(byte[] frame, long flags) throws QwpDecodeException {
         long buf = toNative(frame);
         try {
-            return QwpEgressIoThread.decodeExecDone(buf, frame.length, flags);
+            return QwpEgressIoThread.decodeExecDone(new QueryEvent(), buf, frame.length, flags);
         } finally {
             Unsafe.free(buf, frame.length, MemoryTag.NATIVE_DEFAULT);
         }
@@ -499,7 +499,7 @@ public class QwpEgressTerminatorDecodeTest {
     private static QueryEvent decodeResultEnd(byte[] frame, long flags) throws QwpDecodeException {
         long buf = toNative(frame);
         try {
-            return QwpEgressIoThread.decodeResultEnd(buf, frame.length, flags);
+            return QwpEgressIoThread.decodeResultEnd(new QueryEvent(), buf, frame.length, flags);
         } finally {
             Unsafe.free(buf, frame.length, MemoryTag.NATIVE_DEFAULT);
         }

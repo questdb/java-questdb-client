@@ -38,7 +38,10 @@ import org.junit.Test;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Set;
 
 /**
  * End-to-end coverage of {@link QwpQueryOptions} through
@@ -93,6 +96,56 @@ public class QwpQueryClientQueryDetailsTest {
                 for (QwpEgressFrames.QueryRequest r : server.getRequests()) {
                     Assert.assertFalse(r.toString(), r.hasQueryFlags);
                 }
+                server.assertNoFailure();
+            }
+        });
+    }
+
+    @Test
+    public void testDetailsAreReusedAcrossQueries() throws Exception {
+        // The I/O thread takes the event that ends a query from its pool, as it
+        // does for batches, so ending a query allocates no QwpQueryDetails: once
+        // the pool has gone round, no query brings an instance the handler has
+        // not seen. Queries with and without details take turns, so an instance
+        // that carried details also ends a query that asked for none.
+        TestUtils.assertMemoryLeak(() -> {
+            try (QwpEgressMockServer server = new QwpEgressMockServer(ALL_CAPABILITIES, QwpQueryClientQueryDetailsTest::model);
+                 QwpQueryClient client = newClient(server, "")) {
+                client.connect();
+                QwpQueryOptions options = new QwpQueryOptions().countRows(true).stats(true).maxRows(1);
+                Set<QwpQueryDetails> firstRound = Collections.newSetFromMap(new IdentityHashMap<>());
+                Set<QwpQueryDetails> secondRound = Collections.newSetFromMap(new IdentityHashMap<>());
+                for (Set<QwpQueryDetails> seen : Arrays.asList(firstRound, secondRound)) {
+                    for (int i = 0; i < 32; i++) {
+                        RecordingQueryHandler handler = new RecordingQueryHandler() {
+                            @Override
+                            public void onEnd(long requestId, long totalRows, QwpQueryDetails details) {
+                                super.onEnd(requestId, totalRows, details);
+                                seen.add(details);
+                            }
+
+                            @Override
+                            public void onExecDone(long requestId, short opType, long rowsAffected, QwpQueryDetails details) {
+                                super.onExecDone(requestId, opType, rowsAffected, details);
+                                seen.add(details);
+                            }
+                        };
+                        if (i % 2 == 0) {
+                            client.execute("SELECT x FROM t", handler, options);
+                            Assert.assertEquals(1, handler.endCount);
+                            Assert.assertEquals(Arrays.asList(0L), handler.values);
+                            Assert.assertEquals(TABLE_ROWS, handler.rowCount);
+                            Assert.assertTrue(handler.hasStats);
+                        } else {
+                            client.execute("INSERT INTO t VALUES (1)", handler);
+                            Assert.assertEquals(1, handler.execDoneCount);
+                            handler.assertNoDetails();
+                        }
+                    }
+                }
+                Assert.assertFalse(secondRound.isEmpty());
+                Assert.assertTrue("ending a query must not bring a new QwpQueryDetails",
+                        firstRound.containsAll(secondRound));
                 server.assertNoFailure();
             }
         });

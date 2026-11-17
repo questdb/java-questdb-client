@@ -36,15 +36,29 @@ import java.util.Arrays;
 import java.util.List;
 
 /**
- * The two default methods on {@link QwpColumnBatchHandler}
- * ({@link QwpColumnBatchHandler#onFailoverReset(QwpServerInfo) onFailoverReset}
- * and {@link QwpColumnBatchHandler#onExecDone(short, long) onExecDone}) are
- * documented as no-ops that handlers without explicit overrides can rely on.
- * The QwpQueryClient calls them unconditionally; if the defaults ever started
- * throwing we would silently break SELECT-only handlers and any handler that
- * does not opt into failover-aware behaviour.
+ * The default methods of {@link QwpColumnBatchHandler} that handlers without
+ * explicit overrides rely on:
+ * {@link QwpColumnBatchHandler#onFailoverReset(QwpServerInfo) onFailoverReset}
+ * and {@link QwpColumnBatchHandler#onExecDone(short, long) onExecDone} are
+ * no-ops, and each detailed overload of {@code onEnd}, {@code onError} and
+ * {@code onExecDone} delegates to the next simpler one. The QwpQueryClient
+ * calls the detailed overloads unconditionally; if a default ever threw, or
+ * stopped delegating, it would silently break SELECT-only handlers, handlers
+ * that do not opt into failover-aware behaviour, and handlers that override
+ * only the simpler overloads.
  */
 public class QwpColumnBatchHandlerTest {
+
+    @Test
+    public void testDefaultMethodsAreNoOpAndDoNotThrow() {
+        QwpColumnBatchHandler handler = new MinimalHandler();
+        // Both callable with arbitrary args including null without raising:
+        handler.onFailoverReset(null);
+        handler.onFailoverReset(new QwpServerInfo((byte) 0, 0L, 0, 0L, "", "", null));
+        handler.onExecDone((short) 0, 0L);
+        handler.onExecDone((short) 1, 12345L);
+        handler.onExecDone(Short.MAX_VALUE, Long.MAX_VALUE);
+    }
 
     @Test
     public void testDetailedOverloadsDelegateToSimplerOnes() {
@@ -99,17 +113,6 @@ public class QwpColumnBatchHandlerTest {
         correlating.onError(2, (byte) 5, "Invalid column: nope", 7);
         correlating.onExecDone(3, (short) 2, 4, event.details);
         Assert.assertEquals(Arrays.asList("onEnd 1 5", "onError 2 5 Invalid column: nope", "onExecDone 3 2 4"), calls);
-    }
-
-    @Test
-    public void testDefaultMethodsAreNoOpAndDoNotThrow() {
-        QwpColumnBatchHandler handler = new MinimalHandler();
-        // Both callable with arbitrary args including null without raising:
-        handler.onFailoverReset(null);
-        handler.onFailoverReset(new QwpServerInfo((byte) 0, 0L, 0, 0L, "", "", null));
-        handler.onExecDone((short) 0, 0L);
-        handler.onExecDone((short) 1, 12345L);
-        handler.onExecDone(Short.MAX_VALUE, Long.MAX_VALUE);
     }
 
     /**

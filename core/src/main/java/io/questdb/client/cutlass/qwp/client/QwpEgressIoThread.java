@@ -57,8 +57,9 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     // Pool of reusable QueryEvent instances flowing back from the user thread
     // to the I/O thread. Producer = user thread (calls {@link #releaseEvent}
     // after a handler returns). Consumer = I/O thread (calls {@link #borrowEvent}
-    // before publishing a RESULT_BATCH). Pre-filled at construction so the
-    // per-batch publish path stays allocation-free after warmup.
+    // before publishing a RESULT_BATCH, RESULT_END or EXEC_DONE). Pre-filled at
+    // construction so publishing the batches and the end of a query stays
+    // allocation-free after warmup.
     private final QwpSpscQueue<QueryEvent> eventPool;
     // Events delivered from I/O thread (producer) to user thread (consumer):
     // RESULT_BATCH / RESULT_END / EXEC_DONE / QUERY_ERROR. Hot path of every
@@ -132,7 +133,7 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         // the events queue is full, the I/O thread can still borrow one event
         // (being filled between borrow and offer) while the user thread holds
         // another (between take and release). Pre-fill so the steady-state
-        // batch-publish path never allocates.
+        // publish path of batches and query ends never allocates.
         int eventPoolCapacity = bufferPoolSize + 4;
         this.eventPool = new QwpSpscQueue<>(eventPoolCapacity);
         for (int i = 0; i < eventPoolCapacity; i++) {
@@ -224,20 +225,21 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     }
 
     /**
-     * Decodes an EXEC_DONE payload into a {@link QueryEvent}. Visible for
-     * testing. Body: {@code msg_kind(1) + request_id(8) + op_type(1) +
-     * rows_affected(varint)}, then the statistics block when {@code queryFlags}
-     * has {@link QwpEgressMsgKind#QUERY_FLAG_STATS}. Statements that produce no
+     * Decodes an EXEC_DONE payload into {@code ev}, which may be an event the
+     * pool recycled, and returns it. Visible for testing. Body:
+     * {@code msg_kind(1) + request_id(8) + op_type(1) + rows_affected(varint)},
+     * then the statistics block when {@code queryFlags} has
+     * {@link QwpEgressMsgKind#QUERY_FLAG_STATS}. Statements that produce no
      * rows carry no {@code row_count}, whatever the flags. Bytes after the known
      * fields are ignored.
      *
      * @throws QwpDecodeException if the frame ends inside a field the flags call
      *                            for, or a varint does not fit in 64 bits
      */
-    public static QueryEvent decodeExecDone(long payload, int payloadLen, long queryFlags) throws QwpDecodeException {
+    public static QueryEvent decodeExecDone(QueryEvent ev, long payload, int payloadLen, long queryFlags) throws QwpDecodeException {
         TerminatorReader rd = new TerminatorReader("EXEC_DONE", payload + QwpConstants.HEADER_SIZE + 1 + 8, payload + payloadLen);
         byte opType = rd.int8("op_type");
-        QueryEvent ev = new QueryEvent().asExecDone(opType, rd.varint("rows_affected"));
+        ev.asExecDone(opType, rd.varint("rows_affected"));
         if ((queryFlags & QwpEgressMsgKind.QUERY_FLAG_STATS) != 0) {
             readStats(rd, ev);
         }
@@ -245,20 +247,21 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     }
 
     /**
-     * Decodes a RESULT_END payload into a {@link QueryEvent}. Visible for
-     * testing. Body: {@code msg_kind(1) + request_id(8) + final_seq(varint) +
-     * total_rows(varint)}, then {@code row_count(varint)} when
-     * {@code queryFlags} has {@link QwpEgressMsgKind#QUERY_FLAG_COUNT_ROWS}, then
-     * the statistics block when it has {@link QwpEgressMsgKind#QUERY_FLAG_STATS}.
-     * Bytes after the known fields are ignored.
+     * Decodes a RESULT_END payload into {@code ev}, which may be an event the
+     * pool recycled, and returns it. Visible for testing. Body:
+     * {@code msg_kind(1) + request_id(8) + final_seq(varint) + total_rows(varint)},
+     * then {@code row_count(varint)} when {@code queryFlags} has
+     * {@link QwpEgressMsgKind#QUERY_FLAG_COUNT_ROWS}, then the statistics block
+     * when it has {@link QwpEgressMsgKind#QUERY_FLAG_STATS}. Bytes after the
+     * known fields are ignored.
      *
      * @throws QwpDecodeException if the frame ends inside a field the flags call
      *                            for, or a varint does not fit in 64 bits
      */
-    public static QueryEvent decodeResultEnd(long payload, int payloadLen, long queryFlags) throws QwpDecodeException {
+    public static QueryEvent decodeResultEnd(QueryEvent ev, long payload, int payloadLen, long queryFlags) throws QwpDecodeException {
         TerminatorReader rd = new TerminatorReader("RESULT_END", payload + QwpConstants.HEADER_SIZE + 1 + 8, payload + payloadLen);
         rd.varint("final_seq");
-        QueryEvent ev = new QueryEvent().asEnd(rd.varint("total_rows"));
+        ev.asEnd(rd.varint("total_rows"));
         if ((queryFlags & QwpEgressMsgKind.QUERY_FLAG_COUNT_ROWS) != 0) {
             ev.withRowCount(rd.varint("row_count"));
         }
@@ -532,27 +535,30 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     }
 
     /**
-     * Surfaces an EXEC_DONE as a {@link QueryEvent#KIND_EXEC_DONE} event. A
-     * frame that ends inside a field, or carries a varint that does not fit in
-     * 64 bits, is a terminal transport error rather than an EXEC_DONE with a
-     * partial value.
+     * Surfaces an EXEC_DONE as a {@link QueryEvent#KIND_EXEC_DONE} event taken
+     * from the pool. A frame that ends inside a field, or carries a varint that
+     * does not fit in 64 bits, is a terminal transport error rather than an
+     * EXEC_DONE with a partial value. The event borrowed for such a frame stays
+     * out of the pool: only the user thread returns events to it.
      */
     private void decodeAndEmitExecDone(long payload, int payloadLen) {
         try {
-            events.offer(decodeExecDone(payload, payloadLen, currentQueryFlags));
+            events.offer(decodeExecDone(borrowEvent(), payload, payloadLen, currentQueryFlags));
         } catch (QwpDecodeException e) {
             emitTerminalTransportError(e.getMessage());
         }
     }
 
     /**
-     * Surfaces a RESULT_END as a {@link QueryEvent#KIND_END} event. A frame that
-     * ends inside a field, or carries a varint that does not fit in 64 bits, is
-     * a terminal transport error rather than a RESULT_END with a partial value.
+     * Surfaces a RESULT_END as a {@link QueryEvent#KIND_END} event taken from
+     * the pool. A frame that ends inside a field, or carries a varint that does
+     * not fit in 64 bits, is a terminal transport error rather than a RESULT_END
+     * with a partial value. The event borrowed for such a frame stays out of
+     * the pool: only the user thread returns events to it.
      */
     private void decodeAndEmitResultEnd(long payload, int payloadLen) {
         try {
-            events.offer(decodeResultEnd(payload, payloadLen, currentQueryFlags));
+            events.offer(decodeResultEnd(borrowEvent(), payload, payloadLen, currentQueryFlags));
         } catch (QwpDecodeException e) {
             emitTerminalTransportError(e.getMessage());
         }
