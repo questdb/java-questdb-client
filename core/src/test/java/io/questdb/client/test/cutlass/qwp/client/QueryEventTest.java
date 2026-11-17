@@ -26,6 +26,7 @@ package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.cutlass.qwp.client.QueryEvent;
 import io.questdb.client.cutlass.qwp.client.QwpBatchBuffer;
+import io.questdb.client.cutlass.qwp.client.QwpEgressMsgKind;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -38,21 +39,6 @@ import org.junit.Test;
 public class QueryEventTest {
 
     @Test
-    public void testFreshEventDefaults() {
-        // A bare new QueryEvent has kind=0 (KIND_BATCH default) and zeroed
-        // primitives. The I/O thread always calls one of the asX() builders
-        // before publishing, so the defaults are only relevant before first use.
-        QueryEvent ev = new QueryEvent();
-        Assert.assertEquals(0, ev.kind);
-        Assert.assertNull(ev.buffer);
-        Assert.assertNull(ev.errorMessage);
-        Assert.assertEquals(0, ev.errorStatus);
-        Assert.assertEquals(0, ev.opType);
-        Assert.assertEquals(0L, ev.rowsAffected);
-        Assert.assertEquals(0L, ev.totalRows);
-    }
-
-    @Test
     public void testAsBatchSetsBufferAndKind() {
         QueryEvent ev = new QueryEvent();
         try (QwpBatchBuffer buf = new QwpBatchBuffer(64)) {
@@ -61,6 +47,15 @@ public class QueryEventTest {
             Assert.assertEquals(QueryEvent.KIND_BATCH, ev.kind);
             Assert.assertSame(buf, ev.buffer);
         }
+    }
+
+    @Test
+    public void testAsEndAndAsExecDoneDropStaleDetails() {
+        QueryEvent ev = new QueryEvent().asEnd(1).withRowCount(9).withStats(1, 2, 3, 4, true);
+        ev.asEnd(2);
+        RecordingQueryHandler.assertNoDetails(ev.details);
+        ev.withRowCount(9).withStats(1, 2, 3, 4, true).asExecDone((short) 1, 2);
+        RecordingQueryHandler.assertNoDetails(ev.details);
     }
 
     @Test
@@ -89,6 +84,21 @@ public class QueryEventTest {
     }
 
     @Test
+    public void testAsErrorWithPosition() {
+        QueryEvent ev = new QueryEvent();
+        Assert.assertSame(ev, ev.asError((byte) 0x05, "Invalid column: nope", 7));
+        Assert.assertEquals(QueryEvent.KIND_ERROR, ev.kind);
+        Assert.assertEquals((byte) 0x05, ev.errorStatus);
+        Assert.assertEquals("Invalid column: nope", ev.errorMessage);
+        Assert.assertEquals(7, ev.errorPosition);
+        // the builders without a position drop the stale one
+        ev.asError((byte) 0x05, "boom");
+        Assert.assertEquals(QwpEgressMsgKind.NO_ERROR_POSITION, ev.errorPosition);
+        ev.asError((byte) 0x05, "boom", 3).asTransportError((byte) 0x06, "socket reset");
+        Assert.assertEquals(QwpEgressMsgKind.NO_ERROR_POSITION, ev.errorPosition);
+    }
+
+    @Test
     public void testAsExecDoneSetsOpTypeAndRowsAffected() {
         QueryEvent ev = new QueryEvent();
         QueryEvent returned = ev.asExecDone((short) 7, 999L);
@@ -111,6 +121,23 @@ public class QueryEventTest {
     }
 
     @Test
+    public void testFreshEventDefaults() {
+        // A bare new QueryEvent has kind=0 (KIND_BATCH default) and zeroed
+        // primitives. The I/O thread always calls one of the asX() builders
+        // before publishing, so the defaults are only relevant before first use.
+        QueryEvent ev = new QueryEvent();
+        Assert.assertEquals(0, ev.kind);
+        Assert.assertNull(ev.buffer);
+        Assert.assertNull(ev.errorMessage);
+        Assert.assertEquals(0, ev.errorStatus);
+        Assert.assertEquals(0, ev.opType);
+        Assert.assertEquals(0L, ev.rowsAffected);
+        Assert.assertEquals(0L, ev.totalRows);
+        Assert.assertEquals(QwpEgressMsgKind.NO_ERROR_POSITION, ev.errorPosition);
+        RecordingQueryHandler.assertNoDetails(ev.details);
+    }
+
+    @Test
     public void testKindConstantsAreDistinct() {
         // Sanity: the KIND_* discriminators must be five distinct ints, otherwise
         // a switch over event.kind would silently merge two cases. Putting them
@@ -130,17 +157,10 @@ public class QueryEventTest {
     }
 
     @Test
-    public void testResetClearsEverythingFromError() {
-        QueryEvent ev = new QueryEvent();
-        ev.asError((byte) 0x05, "boom");
+    public void testResetClearsDetails() {
+        QueryEvent ev = new QueryEvent().asEnd(5).withRowCount(9).withStats(1, 2, 3, 4, true);
         ev.reset();
-        Assert.assertEquals(-1, ev.kind);
-        Assert.assertNull(ev.buffer);
-        Assert.assertNull(ev.errorMessage);
-        Assert.assertEquals(0, ev.errorStatus);
-        Assert.assertEquals(0, ev.opType);
-        Assert.assertEquals(0L, ev.rowsAffected);
-        Assert.assertEquals(0L, ev.totalRows);
+        RecordingQueryHandler.assertNoDetails(ev.details);
     }
 
     @Test
@@ -155,6 +175,21 @@ public class QueryEventTest {
     }
 
     @Test
+    public void testResetClearsEverythingFromError() {
+        QueryEvent ev = new QueryEvent();
+        ev.asError((byte) 0x05, "boom", 12);
+        ev.reset();
+        Assert.assertEquals(-1, ev.kind);
+        Assert.assertNull(ev.buffer);
+        Assert.assertNull(ev.errorMessage);
+        Assert.assertEquals(0, ev.errorStatus);
+        Assert.assertEquals(QwpEgressMsgKind.NO_ERROR_POSITION, ev.errorPosition);
+        Assert.assertEquals(0, ev.opType);
+        Assert.assertEquals(0L, ev.rowsAffected);
+        Assert.assertEquals(0L, ev.totalRows);
+    }
+
+    @Test
     public void testResetClearsEverythingFromExecDone() {
         QueryEvent ev = new QueryEvent();
         ev.asExecDone((short) 9, 1234L);
@@ -162,5 +197,30 @@ public class QueryEventTest {
         Assert.assertEquals(-1, ev.kind);
         Assert.assertEquals(0, ev.opType);
         Assert.assertEquals(0L, ev.rowsAffected);
+    }
+
+    @Test
+    public void testWithRowCountAndStats() {
+        QueryEvent ev = new QueryEvent().asEnd(5);
+        Assert.assertSame(ev, ev.withRowCount(0));
+        Assert.assertTrue(ev.details.hasRowCount());
+        Assert.assertEquals(0, ev.details.getRowCount());
+        Assert.assertFalse(ev.details.hasStats());
+        Assert.assertEquals("QwpQueryDetails{rowCount=0}", ev.details.toString());
+
+        Assert.assertSame(ev, ev.withStats(10, 20, 30, 40, true));
+        Assert.assertTrue(ev.details.hasStats());
+        Assert.assertEquals(10, ev.details.getCompileNanos());
+        Assert.assertEquals(20, ev.details.getExecuteNanos());
+        Assert.assertEquals(30, ev.details.getCountNanos());
+        Assert.assertEquals(40, ev.details.getClientWaitNanos());
+        Assert.assertTrue(ev.details.isJitCompiled());
+
+        QueryEvent statsOnly = new QueryEvent().asExecDone((short) 2, 1).withStats(0, 0, 0, 0, false);
+        Assert.assertFalse(statsOnly.details.hasRowCount());
+        Assert.assertTrue(statsOnly.details.hasStats());
+        Assert.assertFalse(statsOnly.details.isJitCompiled());
+        Assert.assertEquals("QwpQueryDetails{compileNanos=0, executeNanos=0, countNanos=0, clientWaitNanos=0, "
+                + "jitCompiled=false}", statsOnly.details.toString());
     }
 }
