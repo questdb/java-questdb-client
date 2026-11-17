@@ -188,6 +188,11 @@ public class QwpQueryClient implements QuietCloseable {
     private final Random failoverRandom = new Random();
     // Connection health (design/qwp-token-provider-spec.md, section 8.4).
     private final QwpConnectionHealthTracker healthTracker = new QwpConnectionHealthTracker();
+    // Deterministic barrier used by failover tests. Null in production. execute()
+    // runs it after it tore down the connection of a failed attempt and before
+    // it backs off and reconnects, the window in which the failover deadline
+    // can otherwise run out only by chance.
+    private volatile Runnable afterFailoverCleanupHook;
     // Deterministic barrier used by shutdown tests. Null in production. execute()
     // runs it after an attempt intercepted a transport failure and before it
     // checks for a stop request, the window a requestShutdown() from another
@@ -1019,6 +1024,11 @@ public class QwpQueryClient implements QuietCloseable {
         synchronized (failoverRandom) {
             failoverRandom.setSeed(seed);
         }
+    }
+
+    @TestOnly
+    public void setAfterFailoverCleanupHookForTest(Runnable hook) {
+        afterFailoverCleanupHook = hook;
     }
 
     @TestOnly
@@ -1904,6 +1914,10 @@ public class QwpQueryClient implements QuietCloseable {
             // Every exit from here on - an exhausted deadline, an interrupted backoff, a failed reconnect - leaves
             // the client disconnected; the next execute() reconnects rather than throw "not connected".
             isReconnectOnNextExecute = true;
+            Runnable cleanupHook = afterFailoverCleanupHook;
+            if (cleanupHook != null) {
+                cleanupHook.run();
+            }
             if (failoverInitialBackoffMs > 0L) {
                 long base = failoverInitialBackoffMs << Math.min(attempt - 1, 30);
                 if (base < 0L) base = failoverMaxBackoffMs;

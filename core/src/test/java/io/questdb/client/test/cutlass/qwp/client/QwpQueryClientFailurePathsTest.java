@@ -35,15 +35,17 @@ import org.junit.Assert;
 import org.junit.Test;
 
 import java.util.Collections;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.LockSupport;
 
 /**
  * The failures {@link QwpQueryClient#execute} detects itself -- a failover
  * reconnect that fails or meets a rejected or unavailable credential, a
- * failover that runs out of attempts, an interrupt during the failover
- * backoff, a stop request or a {@code close()} between attempts -- reach the
- * handler through the position-aware
+ * failover that runs out of attempts or of time, an interrupt during the
+ * failover backoff, a stop request or a {@code close()} between attempts --
+ * reach the handler through the position-aware
  * {@code onError(requestId, status, message, position)} with
  * {@link QwpEgressMsgKind#NO_ERROR_POSITION}, like the server's errors, so a
  * handler that overrides only that overload sees them all. Each query asks for
@@ -135,6 +137,55 @@ public class QwpQueryClientFailurePathsTest {
                 TestUtils.assertContains(handler.errorMessage, "IdP unreachable");
                 Assert.assertEquals(QwpEgressMsgKind.NO_ERROR_POSITION, handler.errorPosition);
                 Assert.assertEquals("the failover reconnect must contact no endpoint", 1, server.handshakeCount());
+                server.assertNoFailure();
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testDeadlineExpiredBeforeBackoffReportsNoPosition() throws Exception {
+        // The failover deadline runs out while execute() tears down the failed
+        // connection, after the attempt check let the query fail over: the
+        // query ends before the backoff, and the next query reconnects.
+        TestUtils.assertMemoryLeak(() -> {
+            final long failoverMaxDurationMillis = 2_000;
+            AtomicInteger cleanups = new AtomicInteger();
+            try (QwpEgressMockServer server = new QwpEgressMockServer(ALL_CAPABILITIES, dropFirstQuery());
+                 QwpQueryClient client = QwpQueryClient.fromConfig("ws::addr=" + server.getAddress()
+                         + ";auth_timeout_ms=2000;failover_max_duration_ms=" + failoverMaxDurationMillis + ';')) {
+                client.connect();
+                client.setAfterFailoverCleanupHookForTest(() -> {
+                    cleanups.incrementAndGet();
+                    // The deadline started with execute(), before this hook, so it
+                    // has passed once its whole duration has passed from here.
+                    long passedNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(failoverMaxDurationMillis);
+                    long leftNanos;
+                    while ((leftNanos = passedNanos - System.nanoTime()) > 0) {
+                        LockSupport.parkNanos(leftNanos);
+                    }
+                });
+                RecordingQueryHandler handler = new RecordingQueryHandler();
+                client.execute(SQL, handler, OPTIONS);
+                Assert.assertEquals("the attempt check must let the query fail over", 1, cleanups.get());
+                handler.assertOnlyError();
+                Assert.assertEquals(0, handler.failoverResetCount);
+                Assert.assertEquals(server.getRequests().get(0).requestId, handler.errorRequestId);
+                Assert.assertEquals(WebSocketResponse.STATUS_INTERNAL_ERROR, handler.errorStatus);
+                Assert.assertTrue(handler.errorMessage, handler.errorMessage.startsWith(
+                        "transport failure after 1 execute attempt (0 failover reconnects); last error: "));
+                Assert.assertEquals(QwpEgressMsgKind.NO_ERROR_POSITION, handler.errorPosition);
+                Assert.assertEquals("no failover reconnect", 1, server.handshakeCount());
+                Assert.assertFalse(client.isConnected());
+
+                // Unlike a query out of attempts, this one tore its connection
+                // down, so the next query reconnects instead of failing on it.
+                RecordingQueryHandler next = new RecordingQueryHandler();
+                client.execute(SQL, next, OPTIONS);
+                Assert.assertEquals(1, next.endCount);
+                Assert.assertEquals(Collections.singletonList(42L), next.values);
+                Assert.assertEquals(2, server.handshakeCount());
+                Assert.assertEquals(2, server.getRequests().size());
+                Assert.assertEquals(1, cleanups.get());
                 server.assertNoFailure();
             }
         });
