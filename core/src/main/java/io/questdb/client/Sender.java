@@ -979,10 +979,18 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * fractional values for a column just widened from INT to DOUBLE. After two
      * consecutive rejected rows for a table, the next row of that table looks the
      * schema up again, waiting at most one second, and at most once a second.
+     * The lookup needs the connection: while it is down, such rows keep failing
+     * until the sender reconnects.
      * When the schema changed, the sender flushes its pending rows in the old
      * types, which the server converts as it converts any frame encoded before
      * the change, and converts the row to the new types. The rejected rows
      * themselves are not retried.
+     * <p>
+     * The sender parses text written to a DATE or timestamp column itself. It
+     * takes a time zone as {@code Z}, {@code UTC}, {@code GMT} or a numeric offset
+     * such as {@code +01:00}, and rejects the row for a zone name such as
+     * {@code EST} or {@code Europe/Berlin}: a name resolves through the zone data
+     * of the JVM that parses it, which can differ between client and server.
      */
     enum SchemaMode {
         AUTO,
