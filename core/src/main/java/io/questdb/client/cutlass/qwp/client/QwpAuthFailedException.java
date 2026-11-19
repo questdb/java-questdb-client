@@ -46,6 +46,7 @@ public final class QwpAuthFailedException extends HttpClientException {
     private final String bearerError;
     private final String host;
     private final int port;
+    private final String reason;
     private final int statusCode;
 
     public QwpAuthFailedException(int statusCode, String host, int port) {
@@ -56,6 +57,15 @@ public final class QwpAuthFailedException extends HttpClientException {
      * @param wwwAuthenticate the {@code WWW-Authenticate} header value(s) of the rejection, or null
      */
     public QwpAuthFailedException(int statusCode, String host, int port, String wwwAuthenticate) {
+        this(statusCode, host, port, wwwAuthenticate, null);
+    }
+
+    /**
+     * @param wwwAuthenticate the {@code WWW-Authenticate} header value(s) of the rejection, or null
+     * @param reason          the rejection's plain-text body, sanitized for display, or null, see
+     *                        {@link io.questdb.client.cutlass.http.client.WebSocketClient#getUpgradeRejectReason()}
+     */
+    public QwpAuthFailedException(int statusCode, String host, int port, String wwwAuthenticate, String reason) {
         super("auth-rejected: WebSocket upgrade rejected with HTTP ");
         put(statusCode);
         String error = BearerChallenge.bearerError(wwwAuthenticate);
@@ -67,10 +77,16 @@ public final class QwpAuthFailedException extends HttpClientException {
             put(" [error=").put(error).put(']');
         }
         put(" for ").put(host).put(':').put(port);
+        if (reason != null) {
+            // e.g. why the server refused the owned_by the client named, a refusal that is no credential
+            // failure although it answers 403
+            put(" [reason=").put(reason).put(']');
+        }
         this.statusCode = statusCode;
         this.host = host;
         this.port = port;
         this.bearerError = error;
+        this.reason = reason;
     }
 
     /**
@@ -87,6 +103,13 @@ public final class QwpAuthFailedException extends HttpClientException {
 
     public int getPort() {
         return port;
+    }
+
+    /**
+     * The plain-text body of the rejection, sanitized for display, or null when the server sent none.
+     */
+    public String getReason() {
+        return reason;
     }
 
     public int getStatusCode() {

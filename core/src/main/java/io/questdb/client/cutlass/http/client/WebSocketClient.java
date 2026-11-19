@@ -25,6 +25,7 @@
 package io.questdb.client.cutlass.http.client;
 
 import io.questdb.client.HttpClientConfiguration;
+import io.questdb.client.cutlass.auth.CredentialRedaction;
 import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.cutlass.qwp.client.QwpVersionMismatchException;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
@@ -75,15 +76,20 @@ public abstract class WebSocketClient implements QuietCloseable {
     private static final int DEFAULT_RECV_BUFFER_SIZE = 65536;
     private static final int DEFAULT_SEND_BUFFER_SIZE = 65536;
     private static final Logger LOG = LoggerFactory.getLogger(WebSocketClient.class);
+    // Cap on the body bytes of a rejected upgrade read for its reason, see extractRejectReason().
+    private static final int MAX_REJECT_REASON_BYTES = 4096;
     // tryParseFrame() return values
     private static final int PARSE_INCOMPLETE = 0;
     private static final int PARSE_NEED_MORE = -1;
     private static final int PARSE_OK = 1;
+    // Upper-case, as RFC 3986 section 2.1 recommends for percent-encoding, and as the server echoes it.
+    private static final char[] PERCENT_ENCODING_HEX_DIGITS = "0123456789ABCDEF".toCharArray();
     private static final String QUESTDB_ROLE_HEADER_NAME = "X-QuestDB-Role:";
     private static final String QUESTDB_ZONE_HEADER_NAME = "X-QuestDB-Zone:";
     private static final String QWP_CONTENT_ENCODING_HEADER_NAME = "X-QWP-Content-Encoding:";
     private static final String QWP_DURABLE_ACK_HEADER_NAME = "X-QWP-Durable-Ack:";
     private static final String QWP_MAX_BATCH_SIZE_HEADER_NAME = "X-QWP-Max-Batch-Size:";
+    private static final String QWP_OWNED_BY_HEADER_NAME = "X-QWP-Owned-By:";
     private static final String QWP_VERSION_HEADER_NAME = "X-QWP-Version:";
     private static final ThreadLocal<MessageDigest> SHA1_DIGEST = ThreadLocal.withInitial(() -> {
         try {
@@ -145,6 +151,10 @@ public abstract class WebSocketClient implements QuietCloseable {
     // down to its own hard limit.
     private int qwpMaxBatchRows;
     private int qwpMaxVersion = 1;
+    // Owner of the tables and columns the connection auto-creates, or null, and its X-QWP-Owned-By value,
+    // percent-encoded by encodeOwnedBy(). The server echoes the value in the 101 response when it accepts it.
+    private String qwpOwnedBy;
+    private String qwpOwnedByHeaderValue;
     // Requested durable-ack tier set (DurableAckTiers bitmask), sent as
     // X-QWP-Request-Durable-Ack: <DurableAckTiers.requestHeaderValue>
     private int qwpDurableAckTiers = DurableAckTiers.NONE;
@@ -178,6 +188,10 @@ public abstract class WebSocketClient implements QuietCloseable {
     // the wire said without re-clamping so a misconfigured server is observable.
     private int serverNegotiatedZstdLevel;
     private int serverQwpVersion = 1;
+    // Plain-text body of the most recent rejected upgrade, sanitized for display, or null when the response
+    // carried none or it had not fully arrived with the headers. QuestDB explains some refusals there, such
+    // as a refused owned_by. Reset to null on every upgrade() invocation.
+    private String upgradeRejectReason;
     private String upgradeRejectRole;
     // WWW-Authenticate value(s) from the most recent rejected upgrade, joined with ", " when the server sent
     // several, or null when absent. Lets a 401 carrying "Bearer error=insufficient_scope" be told apart from an
@@ -239,6 +253,27 @@ public abstract class WebSocketClient implements QuietCloseable {
             Misc.free(socket);
             throw t;
         }
+    }
+
+    /**
+     * Returns the {@code X-QWP-Owned-By} encoding of an owner name: its UTF-8 bytes, the RFC 3986 unreserved
+     * characters as they are and every other byte as {@code %XX} with upper-case hex digits. That keeps a
+     * name outside ASCII intact through proxies, and it is the canonical form the server echoes the accepted
+     * owner in, so the echo can be compared to what was sent.
+     */
+    public static String encodeOwnedBy(String ownedBy) {
+        final byte[] utf8 = ownedBy.getBytes(StandardCharsets.UTF_8);
+        final StringBuilder sb = new StringBuilder(utf8.length);
+        for (byte b : utf8) {
+            if (isUnreservedByte(b)) {
+                sb.append((char) b);
+            } else {
+                sb.append('%')
+                        .append(PERCENT_ENCODING_HEX_DIGITS[(b >> 4) & 0xF])
+                        .append(PERCENT_ENCODING_HEX_DIGITS[b & 0xF]);
+            }
+        }
+        return sb.toString();
     }
 
     /**
@@ -437,6 +472,15 @@ public abstract class WebSocketClient implements QuietCloseable {
      */
     public int getServerQwpVersion() {
         return serverQwpVersion;
+    }
+
+    /**
+     * Plain-text body of the most recent rejected upgrade, sanitized for display, or null when the response
+     * carried none, or it had not fully arrived with the headers. QuestDB explains some refusals there, such
+     * as an {@code owned_by} the principal may not name.
+     */
+    public String getUpgradeRejectReason() {
+        return upgradeRejectReason;
     }
 
     /**
@@ -671,6 +715,17 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
+     * Names the owner of the tables and columns the connection auto-creates, sent in the
+     * {@code X-QWP-Owned-By} upgrade header, see {@link #encodeOwnedBy}. The upgrade fails with a
+     * {@link WebSocketUpgradeException} unless the server echoes it, as a server that does not support the
+     * header ignores it. {@code null} (the default) omits the header. Must be called before {@link #upgrade}.
+     */
+    public void setQwpOwnedBy(String ownedBy) {
+        this.qwpOwnedBy = ownedBy;
+        this.qwpOwnedByHeaderValue = ownedBy == null ? null : encodeOwnedBy(ownedBy);
+    }
+
+    /**
      * Sets the requested durable-ack tier set ({@link DurableAckTiers}
      * bitmask) for the opt-in X-QWP-Request-Durable-Ack upgrade header. When
      * granted, the server emits STATUS_DURABLE_ACK frames (replicated tier)
@@ -742,6 +797,7 @@ public abstract class WebSocketClient implements QuietCloseable {
         if (upgraded) {
             return; // Already upgraded
         }
+        upgradeRejectReason = null;
         upgradeRejectRole = null;
         upgradeRejectWwwAuthenticate = null;
         upgradeRejectZone = null;
@@ -793,6 +849,11 @@ public abstract class WebSocketClient implements QuietCloseable {
         if (qwpDurableAckTiers != DurableAckTiers.NONE) {
             sendBuffer.putAscii("X-QWP-Request-Durable-Ack: ");
             sendBuffer.putAscii(DurableAckTiers.requestHeaderValue(qwpDurableAckTiers));
+            sendBuffer.putAscii("\r\n");
+        }
+        if (qwpOwnedByHeaderValue != null) {
+            sendBuffer.putAscii("X-QWP-Owned-By: ");
+            sendBuffer.putAscii(qwpOwnedByHeaderValue);
             sendBuffer.putAscii("\r\n");
         }
         if (authorizationHeader != null) {
@@ -1023,6 +1084,12 @@ public abstract class WebSocketClient implements QuietCloseable {
         return null;
     }
 
+    // RFC 3986 section 2.3
+    private static boolean isUnreservedByte(byte b) {
+        return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9')
+                || b == '-' || b == '.' || b == '_' || b == '~';
+    }
+
     private static int parseStatusCode(String statusLine) {
         int sp1 = statusLine.indexOf(' ');
         if (sp1 < 0 || sp1 + 4 > statusLine.length()) return 0;
@@ -1202,6 +1269,34 @@ public abstract class WebSocketClient implements QuietCloseable {
                 ioWait(remainingTimeout, IOOperation.WRITE);
             }
         }
+    }
+
+    // The plain-text body of a rejected upgrade, sanitized for display, when the bytes received with the
+    // headers hold all of it, or null. Best effort: it waits for no more bytes, and a body that is not
+    // text/plain with a Content-Length, such as a chunked one or a proxy's HTML page, yields none.
+    private String extractRejectReason(String response, int headerEnd) {
+        final String contentType = extractHeaderValues(response, "Content-Type:");
+        final String contentLength = extractHeaderValues(response, "Content-Length:");
+        if (contentType == null || contentLength == null
+                || !contentType.regionMatches(true, 0, "text/plain", 0, "text/plain".length())) {
+            return null;
+        }
+        final int length;
+        try {
+            length = Integer.parseInt(contentLength);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+        if (length <= 0 || length > recvPos - headerEnd) {
+            return null;
+        }
+        final int n = Math.min(length, MAX_REJECT_REASON_BYTES);
+        final byte[] bytes = new byte[n];
+        for (int i = 0; i < n; i++) {
+            bytes[i] = Unsafe.getUnsafe().getByte(recvBufPtr + headerEnd + i);
+        }
+        final String reason = new String(bytes, StandardCharsets.UTF_8).trim();
+        return reason.isEmpty() ? null : CredentialRedaction.sanitizeErrorText(reason);
     }
 
     private int findHeaderEnd() {
@@ -1489,9 +1584,13 @@ public abstract class WebSocketClient implements QuietCloseable {
                 upgradeRejectRole = extractRoleHeader(response);
                 upgradeRejectZone = extractZoneHeader(response);
             }
+            upgradeRejectReason = extractRejectReason(response, headerEnd);
             WebSocketUpgradeException ex = new WebSocketUpgradeException(
                     upgradeStatusCode, upgradeRejectRole, "WebSocket upgrade failed: ");
             ex.put(statusLine);
+            if (upgradeRejectReason != null) {
+                ex.put(" [reason=").put(upgradeRejectReason).put(']');
+            }
             throw ex;
         }
 
@@ -1548,6 +1647,23 @@ public abstract class WebSocketClient implements QuietCloseable {
         // 0 means "no zstd" (raw transport, or header absent on older
         // servers); non-zero is the applied level.
         serverNegotiatedZstdLevel = extractContentEncodingZstdLevel(response);
+
+        // A server that accepts the owner echoes it in X-QWP-Owned-By; one that
+        // refuses it rejects the upgrade instead. No echo means a server that
+        // does not know the header and ignored it, so the tables this client
+        // auto-creates would not get the owner. The failure is a non-421 upgrade
+        // error, which the connect walk latches as terminal: the same endpoints
+        // will not start honoring the owner on a retry.
+        if (qwpOwnedByHeaderValue != null) {
+            String echo = extractHeaderValues(response, QWP_OWNED_BY_HEADER_NAME);
+            if (!qwpOwnedByHeaderValue.equals(echo)) {
+                WebSocketUpgradeException ex = new WebSocketUpgradeException(
+                        101, null, "WebSocket upgrade failed: server did not confirm owned_by, "
+                        + "it cannot set the owner of auto-created tables and columns [owned_by=");
+                ex.put(qwpOwnedBy).put(", echoed=").put(echo != null ? echo : "<no X-QWP-Owned-By header>").put(']');
+                throw ex;
+            }
+        }
     }
 
     protected void dieWaiting(int n) {

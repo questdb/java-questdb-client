@@ -70,6 +70,9 @@ public class TestWebSocketServer implements Closeable {
     // ("" when absent), in arrival order. Tests poll this to assert the exact request token
     // the client sent for a configured tier set ("true", "local", "local,replicated", ...).
     private final BlockingQueue<String> capturedDurableAckRequests = new LinkedBlockingQueue<>();
+    // X-QWP-Owned-By header value captured from each well-formed upgrade request ("" when absent), in
+    // arrival order.
+    private final BlockingQueue<String> capturedOwnedByRequests = new LinkedBlockingQueue<>();
     private final List<ClientHandler> clients = new CopyOnWriteArrayList<>();
     private final boolean emitDurableAckHeader;
     private final WebSocketServerHandler handler;
@@ -146,6 +149,14 @@ public class TestWebSocketServer implements Closeable {
     // builds. Lets a test force the delta-dictionary catch-up to split across
     // several frames. Live-updatable via setAdvertisedMaxBatchSize().
     private volatile int advertisedMaxBatchSize;
+    // When non-null, 101 upgrade responses to a request that named an owner carry this exact
+    // X-QWP-Owned-By value instead of echoing the request's -- simulating a server that mangled the name.
+    private volatile String ownedByEchoValue;
+    // text/plain body of arbitrary-status rejects (setRejectWithStatus or the validator), or null for none.
+    private volatile String rejectBody;
+    // When true, 101 upgrade responses omit the X-QWP-Owned-By echo -- simulating a server that does not
+    // know the header and ignores it.
+    private volatile boolean suppressOwnedByEcho;
 
     public TestWebSocketServer(WebSocketServerHandler handler) throws IOException {
         this(handler, false);
@@ -403,6 +414,29 @@ public class TestWebSocketServer implements Closeable {
      * header value ("" when the upgrade request carried none). Values arrive in
      * handshake order, one per well-formed upgrade request.
      */
+    public String pollOwnedByRequest(long timeout, TimeUnit unit) throws InterruptedException {
+        return capturedOwnedByRequests.poll(timeout, unit);
+    }
+
+    /**
+     * Forces 101 upgrade responses to a request that named an owner to echo this exact
+     * {@code X-QWP-Owned-By} value. Pass null to echo the request's value, as a server that accepts it does.
+     */
+    public void setOwnedByEchoValue(String value) {
+        this.ownedByEchoValue = value;
+    }
+
+    /**
+     * Sends {@code body} as the {@code text/plain} body of arbitrary-status rejects, or none when null.
+     */
+    public void setRejectBody(String body) {
+        this.rejectBody = body;
+    }
+
+    public void setSuppressOwnedByEcho(boolean suppressOwnedByEcho) {
+        this.suppressOwnedByEcho = suppressOwnedByEcho;
+    }
+
     public String pollDurableAckRequest(long timeout, TimeUnit unit) throws InterruptedException {
         return capturedDurableAckRequests.poll(timeout, unit);
     }
@@ -762,6 +796,7 @@ public class TestWebSocketServer implements Closeable {
             String key = null;
             String authorization = "";
             String durableAckRequest = "";
+            String ownedByRequest = "";
             String[] lines = request.toString().split("\r\n");
             if (lines.length > 0) {
                 // GET <path> HTTP/1.1
@@ -778,6 +813,8 @@ public class TestWebSocketServer implements Closeable {
                     authorization = line.substring("authorization:".length()).trim();
                 } else if (lower.startsWith("x-qwp-request-durable-ack:")) {
                     durableAckRequest = line.substring("x-qwp-request-durable-ack:".length()).trim();
+                } else if (lower.startsWith("x-qwp-owned-by:")) {
+                    ownedByRequest = line.substring("x-qwp-owned-by:".length()).trim();
                 }
             }
 
@@ -787,6 +824,7 @@ public class TestWebSocketServer implements Closeable {
             upgradeRequestCount.incrementAndGet();
             capturedAuthHeaders.add(authorization);
             capturedDurableAckRequests.add(durableAckRequest);
+            capturedOwnedByRequests.add(ownedByRequest);
 
             // Read-path reject: drop the egress upgrade before the 101 so the
             // query pool's connect fails fast, while ingest write-path upgrades
@@ -866,6 +904,10 @@ public class TestWebSocketServer implements Closeable {
             if (maxBatch > 0) {
                 sb.append("X-QWP-Max-Batch-Size: ").append(maxBatch).append("\r\n");
             }
+            if (!ownedByRequest.isEmpty() && !suppressOwnedByEcho) {
+                String echo = ownedByEchoValue;
+                sb.append("X-QWP-Owned-By: ").append(echo != null ? echo : ownedByRequest).append("\r\n");
+            }
             sb.append("\r\n");
             out.write(sb.toString().getBytes(StandardCharsets.US_ASCII));
             out.flush();
@@ -874,16 +916,26 @@ public class TestWebSocketServer implements Closeable {
         }
 
         private void writeStatusReject(int status, String reason) throws IOException {
+            String body = rejectBody;
+            byte[] bodyBytes = body != null ? body.getBytes(StandardCharsets.UTF_8) : new byte[0];
             StringBuilder sb = new StringBuilder()
                     .append("HTTP/1.1 ").append(status).append(' ').append(reason).append("\r\n")
-                    .append("Connection: close\r\n")
-                    .append("Content-Length: 0\r\n");
+                    .append("Connection: close\r\n");
+            if (body != null) {
+                sb.append("Content-Type: text/plain\r\n");
+            }
+            sb.append("Content-Length: ").append(bodyBytes.length).append("\r\n");
             String challenge = rejectWwwAuthenticate;
             if (status == 401 && challenge != null) {
                 sb.append("WWW-Authenticate: ").append(challenge).append("\r\n");
             }
             sb.append("\r\n");
-            out.write(sb.toString().getBytes(StandardCharsets.US_ASCII));
+            // one write, so the body arrives with the headers, as the QuestDB server sends it
+            byte[] head = sb.toString().getBytes(StandardCharsets.US_ASCII);
+            byte[] response = new byte[head.length + bodyBytes.length];
+            System.arraycopy(head, 0, response, 0, head.length);
+            System.arraycopy(bodyBytes, 0, response, head.length, bodyBytes.length);
+            out.write(response);
             out.flush();
         }
 
