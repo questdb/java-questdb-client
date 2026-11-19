@@ -1802,6 +1802,10 @@ public class QwpWebSocketSender implements Sender {
      * acked data within {@code close_flush_timeout}, stops the I/O loop,
      * closes the orphan-drainer pool, and frees buffers.
      * <p>
+     * A row the caller started and did not finish with {@code at()} or
+     * {@code atNow()} is dropped, as {@link #cancelRow()} drops it. The rows
+     * that are complete are flushed.
+     * <p>
      * Worst-case latency budget (dominant contributors, sequential):
      * <ul>
      *   <li>bounded drain: up to {@code close_flush_timeout} when the server
@@ -1917,7 +1921,11 @@ public class QwpWebSocketSender implements Sender {
                 //    sender to discard the batch, so honour that:
                 //    discard it, remember the error, and let the rest of
                 //    close() run. rethrowTerminal below still surfaces it.
+                //    A row the caller started and never finished with at()
+                //    or atNow() is not part of the batch. Drop it, as
+                //    cancelRow() does, so the complete rows still go out.
                 try {
+                    rollbackRow();
                     flushPendingRows(deferCommit);
                 } catch (BatchTooLargeForCapException e) {
                     resetTableBuffersAfterFlush();

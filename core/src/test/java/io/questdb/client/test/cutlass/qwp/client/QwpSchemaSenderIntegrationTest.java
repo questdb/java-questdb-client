@@ -2040,6 +2040,49 @@ public class QwpSchemaSenderIntegrationTest {
     }
 
     @Test
+    public void testCloseDropsUnfinishedRowAndSendsCompleteRows() throws Exception {
+        assertMemoryLeak(() -> {
+            SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_MISSING, -1, -1);
+            try (TestWebSocketServer server = schemaServer(handler)) {
+                Sender sender = closeFlushingSender(server);
+                try {
+                    sender.table("missing").longColumn("x", 7).atNow();
+                    sender.table("missing").longColumn("x", 8).atNow();
+                    // The caller starts a row and never finishes it.
+                    sender.table("missing").longColumn("x", 9).longColumn("y", 10);
+                } finally {
+                    sender.close();
+                }
+                FrameReader reader = new FrameReader(handler.awaitDataFrame());
+                reader.schemaTable("missing", 2, "x", QwpConstants.TYPE_LONG);
+                Assert.assertEquals(0, reader.u8());
+                Assert.assertEquals(7, reader.i64());
+                Assert.assertEquals(8, reader.i64());
+                reader.eof();
+            }
+        });
+    }
+
+    @Test
+    public void testCloseDropsUnfinishedRowOnLegacyFrame() throws Exception {
+        assertMemoryLeak(() -> {
+            SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_KNOWN, 1, 1);
+            try (TestWebSocketServer server = legacyServer(handler)) {
+                Sender sender = closeFlushingSender(server);
+                try {
+                    sender.table("events").stringColumn("value", "first").atNow();
+                    sender.table("events").stringColumn("value", "second").atNow();
+                    // The caller starts a row and never finishes it.
+                    sender.table("events").stringColumn("value", "third").longColumn("y", 10);
+                } finally {
+                    sender.close();
+                }
+                new FrameReader(handler.awaitDataFrame()).legacyVarcharTable("events", "value", "first", "second");
+            }
+        });
+    }
+
+    @Test
     public void testTooLargeSchemaIsDescribedOnce() throws Exception {
         assertMemoryLeak(() -> {
             SchemaHandler handler = new SchemaHandler(QwpSchemaProtocol.RESULT_TOO_LARGE, -1, -1);
@@ -3582,6 +3625,13 @@ public class QwpSchemaSenderIntegrationTest {
     private static Sender frozenClock(Sender sender) {
         ((QwpWebSocketSender) sender).setNanoClockForTesting(() -> 0L);
         return sender;
+    }
+
+    // Like sender(), but close() waits for the server to acknowledge what it sent.
+    private static Sender closeFlushingSender(TestWebSocketServer server) {
+        return frozenClock(Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                + ";auto_flush_rows=2147483647;auto_flush_bytes=0;auto_flush_interval=2147483646;"
+                + "close_flush_timeout_millis=5000;"));
     }
 
     private static Sender sender(TestWebSocketServer server) {
