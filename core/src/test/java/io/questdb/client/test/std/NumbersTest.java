@@ -29,16 +29,23 @@ import io.questdb.client.std.NumericException;
 import io.questdb.client.std.Rnd;
 import io.questdb.client.std.str.StringSink;
 import io.questdb.client.std.str.Utf8Sequence;
+import io.questdb.client.std.str.Utf8StringSink;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
+import org.junit.Assume;
 import org.junit.Before;
 import org.junit.Test;
+
+import java.math.BigDecimal;
+import java.math.MathContext;
+import java.math.RoundingMode;
 
 import static io.questdb.client.std.Numbers.ceilPow2;
 import static org.junit.Assert.assertEquals;
 
 public class NumbersTest {
     private final StringSink sink = new StringSink();
+    private final Utf8StringSink utf8Sink = new Utf8StringSink();
     private Rnd rnd;
 
     @Test(expected = NumericException.class)
@@ -140,7 +147,10 @@ public class NumbersTest {
     public void testFormatDoubleFast() {
         sink.clear();
         Numbers.append(sink, -5.9522650387500933e18);
-        TestUtils.assertEquals("-5.9522650387500933E18", sink);
+        // Shortest form that still reads back to the same double. The previous
+        // formatter emitted a 17th digit ("...0933E18"); both parse to
+        // -0x1.4a6ac610aeb44p62, and Double.toString agrees with this one.
+        TestUtils.assertEquals("-5.952265038750093E18", sink);
     }
 
     @Test
@@ -197,6 +207,141 @@ public class NumbersTest {
         sink.clear();
         Numbers.append(sink, 4455630333333333333333334444d);
         TestUtils.assertEquals("4.4556303333333335E27", sink);
+    }
+
+    @Test
+    public void testFormatDoubleRoundTrip() {
+        for (int i = 0; i < 100_000; i++) {
+            long bits = rnd.nextLong();
+            double value = Double.longBitsToDouble(bits);
+            if (Double.isNaN(value) || Double.isInfinite(value)) {
+                continue;
+            }
+            sink.clear();
+            utf8Sink.clear();
+            Numbers.append(sink, value);
+            Numbers.append(utf8Sink, value);
+            TestUtils.assertEquals(sink, utf8Sink);
+            assertEquals(bits, Double.doubleToRawLongBits(Double.parseDouble(sink.toString())));
+        }
+    }
+
+    @Test
+    public void testFormatDoubleScale() {
+        assertFormatDouble("450.31", 450.31, Numbers.MAX_DOUBLE_SCALE);
+        assertFormatDouble("120.25", 120.25, Numbers.MAX_DOUBLE_SCALE);
+        assertFormatDouble("123.4", 123.456, 0);
+        assertFormatDouble("123.4", 123.456, -1);
+        assertFormatDouble("123.45", 123.456, 2);
+        assertFormatDouble("123.456", 123.456, 3);
+        assertFormatDouble("0.0", 0.001234, 1);
+        assertFormatDouble("0.00", 0.001234, 2);
+        assertFormatDouble("0.0", 0.001234, Integer.MIN_VALUE);
+        assertFormatDouble("0.001", 0.001234, 3);
+        assertFormatDouble("-0.0012", -0.001234, 4);
+        assertFormatDouble("1234000.0", 1234000.0, 1);
+        // Scientific notation is not truncated by scale.
+        assertFormatDouble("1.23456789E7", 12345678.9, 1);
+        assertFormatDouble("1.234E-4", 0.0001234, 1);
+    }
+
+    @Test
+    public void testFormatDoubleScratchReuse() {
+        for (int i = 0; i < 3; i++) {
+            assertFormatDouble("1.7976931348623157E308", Double.MAX_VALUE, Numbers.MAX_DOUBLE_SCALE);
+            assertFormatDouble("1.0", 1.0, Numbers.MAX_DOUBLE_SCALE);
+            assertFormatDouble("1.2345678901234567", 1.2345678901234567, Numbers.MAX_DOUBLE_SCALE);
+            assertFormatDouble("0.001", 0.001, Numbers.MAX_DOUBLE_SCALE);
+            assertFormatDouble("-0.0", -0.0, Numbers.MAX_DOUBLE_SCALE);
+            assertFormatDouble("NaN", Double.NaN, Numbers.MAX_DOUBLE_SCALE);
+            assertFormatDouble("Infinity", Double.POSITIVE_INFINITY, Numbers.MAX_DOUBLE_SCALE);
+            assertFormatDouble("-Infinity", Double.NEGATIVE_INFINITY, Numbers.MAX_DOUBLE_SCALE);
+            assertFormatDouble("450.31", 450.31, Numbers.MAX_DOUBLE_SCALE);
+        }
+    }
+
+    @Test
+    public void testFormatDoubleShortDecimalBoundaries() {
+        // Short decimals below 10^7 take an exact path, the rest Ryu; values on
+        // either side of each limit of that path.
+        assertFormatDouble("3.25", 3.25, Numbers.MAX_DOUBLE_SCALE);
+        assertFormatDouble("-42.5", -42.5, Numbers.MAX_DOUBLE_SCALE);
+        assertFormatDouble("1200000.0", 1_200_000.0, Numbers.MAX_DOUBLE_SCALE);
+        assertFormatDouble("9999999.99999999", 9999999.99999999, Numbers.MAX_DOUBLE_SCALE);
+        assertFormatDouble("1.0E7", 1e7, Numbers.MAX_DOUBLE_SCALE);
+        assertFormatDouble("1.00000005E7", 10000000.5, Numbers.MAX_DOUBLE_SCALE);
+        assertFormatDouble("0.12345678", 0.12345678, Numbers.MAX_DOUBLE_SCALE);
+        assertFormatDouble("0.123456789", 0.123456789, Numbers.MAX_DOUBLE_SCALE);
+        assertFormatDouble("0.001", 0.001, Numbers.MAX_DOUBLE_SCALE);
+        assertFormatDouble("9.99E-4", 0.000999, Numbers.MAX_DOUBLE_SCALE);
+        assertFormatDouble("1.0E-8", 1e-8, Numbers.MAX_DOUBLE_SCALE);
+        assertFormatDouble("5.0E-9", 5e-9, Numbers.MAX_DOUBLE_SCALE);
+        assertFormatDouble("0.30000000000000004", 0.1 + 0.2, Numbers.MAX_DOUBLE_SCALE);
+        assertFormatDouble("450.3", 450.31, 1);
+        double[] values = {
+                Math.nextDown(1e7), Math.nextUp(1e7), Math.nextDown(9999999.99999999), Math.nextUp(9999999.99999999),
+                1e-8, Math.nextDown(1e-8), Math.nextUp(1e-8), 5e-9, Math.nextDown(5e-9), Math.nextUp(5e-9),
+                Double.MIN_VALUE, Double.MIN_NORMAL, Double.MAX_VALUE, 1.0 / 3, 2.0 / 3, 0.1 + 0.2
+        };
+        for (double value : values) {
+            assertShortestNearest(value);
+            assertShortestNearest(-value);
+        }
+        // Powers of ten and the doubles next to them, where the rounding
+        // interval can hold the power of ten itself.
+        for (int exp = -12; exp <= 12; exp++) {
+            double up = Double.parseDouble("1E" + exp);
+            double down = up;
+            for (int i = 0; i < 16; i++) {
+                assertShortestNearest(up);
+                assertShortestNearest(down);
+                up = Math.nextUp(up);
+                down = Math.nextDown(down);
+            }
+        }
+    }
+
+    @Test
+    public void testFormatDoubleShortDecimalsMatchJdk() {
+        // From JDK 19 on, Double.toString prints the shortest decimal that rounds
+        // to the value, nearest to it (JDK-4511638), in the notation Numbers uses.
+        Assume.assumeTrue(javaFeatureVersion() >= 19);
+        for (int scale = 0; scale <= 9; scale++) {
+            for (int k = 1; k <= 200_000; k++) {
+                double value = Double.parseDouble(k + "E-" + scale);
+                assertFormatDoubleAsJdk(value);
+                assertFormatDoubleAsJdk(-value);
+            }
+        }
+    }
+
+    @Test
+    public void testFormatDoubleShortestNearestDecimal() {
+        // Decimals k * 10^-scale, the doubles next to them, and random doubles,
+        // against the shortest decimal that rounds to the value, computed from
+        // its definition. This holds on every JDK, unlike Double.toString.
+        for (int scale = 0; scale <= 9; scale++) {
+            for (int k = 1; k <= 5_000; k++) {
+                double value = Double.parseDouble(k + "E-" + scale);
+                assertShortestNearest(value);
+                assertShortestNearest(-value);
+                assertShortestNearest(Math.nextUp(value));
+                assertShortestNearest(Math.nextDown(value));
+            }
+        }
+        Rnd rnd = TestUtils.generateRandom(null);
+        for (int i = 0; i < 20_000; i++) {
+            // up to 10 significant digits with up to 9 of them fractional, as
+            // prices and readings have
+            double value = Double.parseDouble((rnd.nextLong() >>> 1) % 10_000_000_000L + "E-" + rnd.nextInt(10));
+            assertShortestNearest(value);
+            assertShortestNearest(Math.nextUp(value));
+            double random = Double.longBitsToDouble(rnd.nextLong());
+            if (!Double.isNaN(random) && !Double.isInfinite(random)) {
+                assertShortestNearest(random);
+            }
+            assertShortestNearest((rnd.nextLong() >>> 11) * 0x1.0p-53 * 1e7);
+        }
     }
 
     @Test
@@ -537,6 +682,16 @@ public class NumbersTest {
     }
 
     @Test(expected = NumericException.class)
+    public void testParseIPv4OnlyDots() {
+        Numbers.parseIPv4("....");
+    }
+
+    @Test(expected = NumericException.class)
+    public void testParseIPv4SingleDot() {
+        Numbers.parseIPv4(".");
+    }
+
+    @Test(expected = NumericException.class)
     public void testParseIPv4MiddleDots() {
         Numbers.parseIPv4("1..2..3..4");
     }
@@ -730,6 +885,36 @@ public class NumbersTest {
         Numbers.parseDouble("NaN1");
     }
 
+    private void assertFormatDouble(String expected, double value, int scale) {
+        sink.clear();
+        utf8Sink.clear();
+        Numbers.append(sink, value, scale);
+        Numbers.append(utf8Sink, value, scale);
+        TestUtils.assertEquals(expected, sink);
+        TestUtils.assertEquals(expected, utf8Sink);
+    }
+
+    private void assertFormatDoubleAsJdk(double value) {
+        sink.clear();
+        Numbers.append(sink, value);
+        String expected = Double.toString(value);
+        if (!expected.contentEquals(sink)) {
+            Assert.fail("value bits " + Double.doubleToRawLongBits(value) + ": expected " + expected + ", got " + sink);
+        }
+    }
+
+    private void assertShortestNearest(double value) {
+        sink.clear();
+        Numbers.append(sink, value);
+        BigDecimal expected = shortestNearest(Math.abs(value));
+        BigDecimal actual = new BigDecimal(sink.toString()).abs();
+        if (expected.compareTo(actual) != 0) {
+            Assert.fail("value bits " + Double.doubleToRawLongBits(value) + ": expected digits of "
+                    + expected.stripTrailingZeros().toPlainString() + ", got " + sink);
+        }
+        Assert.assertEquals(value, Double.parseDouble(sink.toString()), 0.0);
+    }
+
     private static void assertParseLongException(String input) {
         try {
             Numbers.parseLong(input);
@@ -744,5 +929,52 @@ public class NumbersTest {
             Assert.fail("expected [" + hex + "] to be rejected, got " + parsed);
         } catch (NumericException expected) {
         }
+    }
+
+    private static boolean isCloser(BigDecimal candidate, BigDecimal best, BigDecimal exact) {
+        int cmp = candidate.subtract(exact).abs().compareTo(best.subtract(exact).abs());
+        return cmp < 0 || (cmp == 0 && !candidate.unscaledValue().testBit(0));
+    }
+
+    private static int javaFeatureVersion() {
+        String version = System.getProperty("java.specification.version");
+        return version.startsWith("1.") ? Integer.parseInt(version.substring(2)) : Integer.parseInt(version);
+    }
+
+    /**
+     * The shortest decimal that rounds to {@code value}, nearest to it among
+     * those, ties to an even last digit, as Ryu defines its result. The interval
+     * of decimals that round to {@code value} keeps its bounds when the
+     * significand is even, as round-half-even does.
+     */
+    private static BigDecimal shortestNearest(double value) {
+        BigDecimal exact = new BigDecimal(value);
+        BigDecimal half = BigDecimal.valueOf(5, 1);
+        BigDecimal lo = exact.add(new BigDecimal(Math.nextDown(value))).multiply(half);
+        // Above Double.MAX_VALUE the next double is infinite; the interval ends
+        // where the gap to it would.
+        BigDecimal hi = Double.isInfinite(Math.nextUp(value))
+                ? exact.add(exact.subtract(new BigDecimal(Math.nextDown(value))).multiply(half))
+                : exact.add(new BigDecimal(Math.nextUp(value))).multiply(half);
+        boolean isBoundIncluded = (Double.doubleToRawLongBits(value) & 1) == 0;
+        for (int digits = 1; digits <= 17; digits++) {
+            BigDecimal nearest = exact.round(new MathContext(digits, RoundingMode.HALF_EVEN));
+            BigDecimal unit = nearest.ulp();
+            BigDecimal best = null;
+            // At a power of two the interval is narrower below the value, so the
+            // nearest candidate can fall outside while its neighbor is inside.
+            for (BigDecimal candidate : new BigDecimal[]{nearest.subtract(unit), nearest, nearest.add(unit)}) {
+                int cmpLo = candidate.compareTo(lo);
+                int cmpHi = candidate.compareTo(hi);
+                boolean isInside = isBoundIncluded ? cmpLo >= 0 && cmpHi <= 0 : cmpLo > 0 && cmpHi < 0;
+                if (isInside && (best == null || isCloser(candidate, best, exact))) {
+                    best = candidate;
+                }
+            }
+            if (best != null) {
+                return best;
+            }
+        }
+        throw new AssertionError("no decimal of up to 17 digits rounds to " + value);
     }
 }

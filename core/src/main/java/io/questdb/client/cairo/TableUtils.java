@@ -87,6 +87,15 @@ public final class TableUtils {
 
         for (int i = 0; i < length; i++) {
             char c = tableName.charAt(i);
+            if (Character.isHighSurrogate(c)) {
+                if (++i >= length || !Character.isLowSurrogate(tableName.charAt(i))) {
+                    return false;
+                }
+                continue;
+            }
+            if (Character.isLowSurrogate(c)) {
+                return false;
+            }
             switch (c) {
                 case '.':
                     if (i == 0 || i == length - 1 || tableName.charAt(i - 1) == '.') {

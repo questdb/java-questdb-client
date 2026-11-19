@@ -148,6 +148,19 @@ public abstract class AbstractArray implements QuietCloseable {
     }
 
     /**
+     * Returns the number of dimensions in this array.
+     *
+     * @return the array dimensionality
+     * @throws LineSenderException if the array is closed
+     */
+    public int getDimensionality() {
+        if (closed) {
+            throw new LineSenderException("Cannot inspect a closed array");
+        }
+        return array.getDimCount();
+    }
+
+    /**
      * Closes this array and releases all associated native memory resources.
      * <p>
      * <strong>Important:</strong> after calling this method, the array becomes unusable.

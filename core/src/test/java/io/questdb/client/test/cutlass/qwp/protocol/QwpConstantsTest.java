@@ -46,6 +46,7 @@ public class QwpConstantsTest {
         Assert.assertEquals(2, QwpConstants.getFixedTypeSize(TYPE_SHORT));
         Assert.assertEquals(2, QwpConstants.getFixedTypeSize(TYPE_CHAR));
         Assert.assertEquals(4, QwpConstants.getFixedTypeSize(TYPE_INT));
+        Assert.assertEquals(4, QwpConstants.getFixedTypeSize(TYPE_IPv4));
         Assert.assertEquals(8, QwpConstants.getFixedTypeSize(TYPE_LONG));
         Assert.assertEquals(4, QwpConstants.getFixedTypeSize(TYPE_FLOAT));
         Assert.assertEquals(8, QwpConstants.getFixedTypeSize(TYPE_DOUBLE));
@@ -67,6 +68,7 @@ public class QwpConstantsTest {
     public void testGetTypeName() {
         Assert.assertEquals("BOOLEAN", QwpConstants.getTypeName(TYPE_BOOLEAN));
         Assert.assertEquals("INT", QwpConstants.getTypeName(TYPE_INT));
+        Assert.assertEquals("IPv4", QwpConstants.getTypeName(TYPE_IPv4));
         Assert.assertEquals("VARCHAR", QwpConstants.getTypeName(TYPE_VARCHAR));
         Assert.assertEquals("TIMESTAMP", QwpConstants.getTypeName(TYPE_TIMESTAMP));
         Assert.assertEquals("TIMESTAMP_NANOS", QwpConstants.getTypeName(TYPE_TIMESTAMP_NANOS));
@@ -94,6 +96,7 @@ public class QwpConstantsTest {
         Assert.assertTrue(QwpConstants.isFixedWidthType(TYPE_SHORT));
         Assert.assertTrue(QwpConstants.isFixedWidthType(TYPE_CHAR));
         Assert.assertTrue(QwpConstants.isFixedWidthType(TYPE_INT));
+        Assert.assertTrue(QwpConstants.isFixedWidthType(TYPE_IPv4));
         Assert.assertTrue(QwpConstants.isFixedWidthType(TYPE_LONG));
         Assert.assertTrue(QwpConstants.isFixedWidthType(TYPE_FLOAT));
         Assert.assertTrue(QwpConstants.isFixedWidthType(TYPE_DOUBLE));
