@@ -32,6 +32,7 @@ import org.junit.Assert;
 import org.junit.Test;
 
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Regression coverage (M3): {@code catch (Throwable)} in the reconnect
@@ -110,4 +111,69 @@ public class CursorWebSocketSendLoopJvmErrorTest {
         Assert.assertEquals("no retry on a JVM Error", 1, attempts.get());
     }
 
+    /**
+     * A JVM Error in the reconnect walk reaches {@code recordFatal()} twice: the
+     * walk that caught it latches it and rethrows, and the I/O loop's own catch
+     * records it again. The first call must win. A producer that took the
+     * terminal from {@code checkError()} owns that instance, and
+     * {@code close()} compares instances to tell whether it still has to report
+     * the terminal, so a second latch would report one failure twice.
+     */
+    @Test(timeout = 30_000)
+    public void testReconnectJvmErrorKeepsFirstLatchedTerminal() throws Exception {
+        LinkageError injected = new LinkageError("simulated JVM failure");
+        AtomicReference<CursorWebSocketSendLoop> loopRef = new AtomicReference<>();
+        AtomicReference<Throwable> firstLatched = new AtomicReference<>();
+        AtomicReference<Throwable> ownedByProducer = new AtomicReference<>();
+        try (CursorSendEngine engine = new CursorSendEngine(null, 64 * 1024)) {
+            CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
+                    null,
+                    engine,
+                    0L,
+                    () -> {
+                        throw injected;
+                    },
+                    1L,
+                    4L,
+                    DurableAckTiers.NONE
+            );
+            loopRef.set(loop);
+            // recordFatal() signals ack progress right after it latches, so the
+            // listener reads the instance the first call latched, before the
+            // second call runs.
+            loop.setAckProgressListener(() -> {
+                Throwable latched = loopRef.get().getTerminalError();
+                if (latched != null && firstLatched.compareAndSet(null, latched)) {
+                    // What a producer's flush() or at() does at this instant.
+                    try {
+                        loopRef.get().checkError();
+                    } catch (LineSenderException e) {
+                        ownedByProducer.set(e);
+                    }
+                }
+            });
+            try {
+                loop.start();
+                long deadlineNanos = System.nanoTime() + 5_000_000_000L;
+                while ((loop.getTerminalError() == null || loop.isRunning())
+                        && System.nanoTime() < deadlineNanos) {
+                    Thread.yield();
+                }
+            } finally {
+                // close() waits for the I/O thread, whose catch has recorded the
+                // Error a second time by then.
+                loop.close();
+            }
+
+            Assert.assertNotNull("I/O loop did not latch the JVM Error", firstLatched.get());
+            Assert.assertSame("the producer takes the first latched instance",
+                    firstLatched.get(), ownedByProducer.get());
+            Assert.assertSame("the first latched instance must stay latched",
+                    firstLatched.get(), loop.getTerminalError());
+            Assert.assertSame("the wrapper must retain the original JVM Error",
+                    injected, loop.getTerminalError().getCause());
+            // The producer owns the terminal, so the check close() runs stays silent.
+            loop.checkUnsurfacedError();
+        }
+    }
 }
