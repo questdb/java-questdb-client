@@ -78,7 +78,7 @@ public class QwpSchemaBindingStringTimestampTest {
                     count++;
                 }
             }
-            Assert.assertEquals(110, count);
+            Assert.assertEquals(118, count);
         });
     }
 
@@ -176,6 +176,19 @@ public class QwpSchemaBindingStringTimestampTest {
             assertReason(LineSenderSchemaException.Reason.UNSUPPORTED_FEATURE,
                     () -> binding.stringColumn("ts", "1970-01-01T00:00:00Z"));
         }
+    }
+
+    @Test
+    public void testZoneNameIsRejectedWithTheAcceptedForms() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                QwpSchemaBinding binding = binding(buffer, -1, column("value", ColumnType.TIMESTAMP_MICRO));
+                assertReason(LineSenderSchemaException.Reason.INVALID_VALUE,
+                        () -> binding.stringColumn("value", "2024-01-02T03:04:05EST"),
+                        "column=value", "a time zone must be Z, UTC, GMT or a numeric offset");
+                Assert.assertEquals(0, buffer.getRowCount());
+            }
+        });
     }
 
     private static QwpTestWireReader tableReader(QwpWebSocketEncoder encoder, int size, int rows, String name, byte type) {

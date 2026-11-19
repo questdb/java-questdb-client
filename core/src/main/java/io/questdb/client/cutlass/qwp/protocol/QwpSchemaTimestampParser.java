@@ -9,24 +9,19 @@ import io.questdb.client.std.NumericException;
 import io.questdb.client.std.Numbers;
 import io.questdb.client.std.datetime.CommonUtils;
 
-import java.text.DateFormatSymbols;
-import java.time.Instant;
-import java.time.ZoneId;
 import java.time.ZoneOffset;
-import java.time.zone.ZoneOffsetTransition;
-import java.time.zone.ZoneOffsetTransitionRule;
-import java.time.zone.ZoneRules;
-import java.time.zone.ZoneRulesProvider;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Locale;
-import java.util.Map;
 
 /**
  * Source-faithful parser for the fixed formats accepted by QWP STRING-to-timestamp
  * and STRING-to-DATE conversion. The grammar and computation mirror the server's
  * {@code MicrosFormatUtils}, {@code DateFormatUtils} and generic format parsers;
  * this is deliberately not a general date-format compiler.
+ * <p>
+ * A time zone is {@code Z}, {@code UTC}, {@code GMT} or a numeric offset, which
+ * {@code UTC} or {@code GMT} may precede. The server also resolves zone names such
+ * as {@code EST} or {@code Europe/Berlin}, with its JVM's zone data. A client JVM
+ * can hold other data and resolve the same name to another offset, so this parser
+ * rejects every other name instead.
  */
 final class QwpSchemaTimestampParser {
     private static final int DAYS_0000_TO_1970 = 719527;
@@ -34,11 +29,10 @@ final class QwpSchemaTimestampParser {
     private static final int[] MONTH_START_DAYS_COMMON = monthStartDays(false);
     private static final int[] MONTH_START_DAYS_LEAP = monthStartDays(true);
     private static final int REFERENCE_CENTURY = referenceCentury();
-    // The server parses TIMESTAMP text with MicrosFormatUtils over UTF-8 bytes,
-    // and DATE text with DateFormatUtils over UTF-16. Its two parsers also differ
-    // in year overflow and in zone rules for negative years.
-    private static final Target DATE = new Target(1L, false, false, true);
-    private static final Target TIMESTAMP = new Target(1_000L, true, true, false);
+    // The server parses TIMESTAMP text with MicrosFormatUtils and DATE text with
+    // DateFormatUtils, both over UTF-8 bytes. The two differ in year overflow.
+    private static final Target DATE = new Target(1L, false);
+    private static final Target TIMESTAMP = new Target(1_000L, true);
 
     private QwpSchemaTimestampParser() {
     }
@@ -58,7 +52,7 @@ final class QwpSchemaTimestampParser {
         return parseIso(value);
     }
 
-    /** Parses DATE text to epoch millis; the server parses DATE text as UTF-16. */
+    /** Parses DATE text to epoch millis. */
     static long parseDate(CharSequence value) throws NumericException {
         int n = value.length();
         int dash = firstDash(value, n);
@@ -66,15 +60,13 @@ final class QwpSchemaTimestampParser {
             // Both date layouts need an inner dash and a raw number cannot hold one.
             return Numbers.parseLong(value);
         }
-        // PG ends at the day or continues with a space; only UTC has a 'T' there.
+        // PG ends at the day or continues with a space. UTC has a 'T' at a fixed
+        // position, which parseUtcDate() checks.
         int separator = dash + 6;
         if (separator >= n || value.charAt(separator) == ' ') {
             return parsePgDate(value, dash);
         }
-        if (value.charAt(separator) == 'T') {
-            return parseUtcDate(value);
-        }
-        throw NumericException.instance();
+        return parseUtcDate(value);
     }
 
     private static int firstDash(CharSequence value, int n) {
@@ -111,16 +103,18 @@ final class QwpSchemaTimestampParser {
                 millis = (int) parsed;
                 pos += 1 + (int) (parsed >>> 32);
             }
-            return zoned(DATE, localTime(DATE, year, month, day, hour, minute, second, millis, 0), year, value, pos, n);
+            return zoned(DATE, localTime(DATE, year, month, day, hour, minute, second, millis, 0), value, pos, n);
         } catch (NumericException ignored) {
-            return zoned(DATE, localTime(DATE, year, month, day, 0, 0, 0, 0, 0), year, value, tail, n);
+            return zoned(DATE, localTime(DATE, year, month, day, 0, 0, 0, 0, 0), value, tail, n);
         }
     }
 
     private static long parseUtcDate(CharSequence value) throws NumericException {
         int n = value.length();
-        int pos = 0;
-        int year = fixedInt(value, pos, pos += 4, n);
+        // A signed year has four digits after the sign, as in parseIso(). The text
+        // holds a dash, so it is not empty.
+        int pos = value.charAt(0) == '-' ? 5 : 4;
+        int year = pos == 5 ? -fixedInt(value, 1, pos, n) : fixedInt(value, 0, pos, n);
         require(value, pos++, n, '-');
         int month = fixedInt(value, pos, pos += 2, n);
         require(value, pos++, n, '-');
@@ -133,7 +127,7 @@ final class QwpSchemaTimestampParser {
         int second = fixedInt(value, pos, pos += 2, n);
         require(value, pos++, n, '.');
         int millis = fixedInt(value, pos, pos += 3, n);
-        return zoned(DATE, localTime(DATE, year, month, day, hour, minute, second, millis, 0), year, value, pos, n);
+        return zoned(DATE, localTime(DATE, year, month, day, hour, minute, second, millis, 0), value, pos, n);
     }
 
     private static long parseIso(CharSequence value) throws NumericException {
@@ -172,7 +166,7 @@ final class QwpSchemaTimestampParser {
         if (pos < n && value.charAt(pos) == '.') {
             return parseIsoFraction(value, pos + 1, n, year, month, day, hour, minute, second);
         }
-        return zoned(TIMESTAMP, localTime(TIMESTAMP, year, month, day, hour, minute, second, 0, 0), year, value, pos, n);
+        return zoned(TIMESTAMP, localTime(TIMESTAMP, year, month, day, hour, minute, second, 0, 0), value, pos, n);
     }
 
     /**
@@ -195,7 +189,7 @@ final class QwpSchemaTimestampParser {
         if (parsed != GREEDY_MILLIS_FAILED) {
             try {
                 long local = localTime(TIMESTAMP, year, month, day, hour, minute, second, (int) parsed, 0);
-                return zoned(TIMESTAMP, local, year, value, pos + (int) (parsed >>> 32), n);
+                return zoned(TIMESTAMP, local, value, pos + (int) (parsed >>> 32), n);
             } catch (NumericException ignored) {
             }
         }
@@ -203,7 +197,7 @@ final class QwpSchemaTimestampParser {
             try {
                 int millis = fixedInt(value, pos, pos + 3, n);
                 int micros = fixedInt(value, pos + 3, pos + 6, n);
-                return zoned(TIMESTAMP, localTime(TIMESTAMP, year, month, day, hour, minute, second, millis, micros), year, value, pos + 6, n);
+                return zoned(TIMESTAMP, localTime(TIMESTAMP, year, month, day, hour, minute, second, millis, micros), value, pos + 6, n);
             } catch (NumericException ignored) {
             }
         }
@@ -213,7 +207,7 @@ final class QwpSchemaTimestampParser {
                 parsed = greedyMillis(value, pos + 1, n);
                 if (parsed != GREEDY_MILLIS_FAILED) {
                     long local = localTime(TIMESTAMP, year, month, day, hour, minute, second, (int) parsed, 0);
-                    return zoned(TIMESTAMP, local, year, value, pos + 1 + (int) (parsed >>> 32), n);
+                    return zoned(TIMESTAMP, local, value, pos + 1 + (int) (parsed >>> 32), n);
                 }
             } catch (NumericException ignored) {
             }
@@ -224,7 +218,7 @@ final class QwpSchemaTimestampParser {
         if (pos + 3 <= n) {
             try {
                 int millis = fixedInt(value, pos, pos + 3, n);
-                return zoned(TIMESTAMP, localTime(TIMESTAMP, year, month, day, hour, minute, second, millis, 0), year, value, pos + 3, n);
+                return zoned(TIMESTAMP, localTime(TIMESTAMP, year, month, day, hour, minute, second, millis, 0), value, pos + 3, n);
             } catch (NumericException ignored) {
             }
         }
@@ -249,7 +243,7 @@ final class QwpSchemaTimestampParser {
         int second = fixedInt(value, pos, pos += 2, n);
         require(value, pos++, n, '.');
         int millis = fixedInt(value, pos, pos += 3, n);
-        return zoned(TIMESTAMP, localTime(TIMESTAMP, year, month, day, hour, minute, second, millis, 0), year, value, pos, n);
+        return zoned(TIMESTAMP, localTime(TIMESTAMP, year, month, day, hour, minute, second, millis, 0), value, pos, n);
     }
 
     /**
@@ -323,8 +317,8 @@ final class QwpSchemaTimestampParser {
     }
 
     /** Converts {@code local}, in {@code t}'s unit, to UTC using the zone text in {@code [lo, hi)}. */
-    private static long zoned(Target t, long local, int year, CharSequence value, int lo, int hi) throws NumericException {
-        return local - ZoneMatcher.offset(t, value, lo, hi, local, year);
+    private static long zoned(Target t, long local, CharSequence value, int lo, int hi) throws NumericException {
+        return local - ZoneMatcher.offset(t, value, lo, hi);
     }
 
     private static int fixedInt(CharSequence s, int lo, int hi, int limit) throws NumericException {
@@ -407,18 +401,6 @@ final class QwpSchemaTimestampParser {
         long start = days * t.day;
         return t.isYearSaturating && days < 0 && start > 0 ? Long.MIN_VALUE : start;
     }
-    private static int dayOfWeek(Target t, long time) {
-        long d;
-        if (time > -1) {
-            d = time / t.day;
-        } else {
-            d = (time - (t.day - 1)) / t.day;
-            if (d < -3) {
-                return 7 + (int) ((d + 4) % 7);
-            }
-        }
-        return 1 + (int) ((d + 3) % 7);
-    }
     private static int endYearDow(int year) {
         return (year + Math.abs(year / 4) - Math.abs(year / 100) + Math.abs(year / 400)) % 7;
     }
@@ -455,33 +437,27 @@ final class QwpSchemaTimestampParser {
     private static int dayOfMonth(long micros, int year, int month, boolean leap) {
         return (int) ((micros - yearStart(TIMESTAMP, year, leap) - monthStart(TIMESTAMP, month, leap)) / TIMESTAMP.day) + 1;
     }
-    private static long nextOrSame(Target t, long time, int dow) {
-        int current = dayOfWeek(t, time);
-        return current <= dow ? time + (dow - current) * t.day : time + (7 - current + dow) * t.day;
-    }
-    private static long previousOrSame(Target t, long time, int dow) {
-        int current = dayOfWeek(t, time);
-        return current >= dow ? time - (current - dow) * t.day : time - (7 + current - dow) * t.day;
-    }
     private static final class ZoneMatcher {
 
         /**
-         * Zone offset in {@code t}'s unit. The server matches TIMESTAMP zone text
-         * against UTF-8 bytes, where a non-ASCII name never matches, and DATE zone
-         * text case-insensitively as UTF-16.
+         * Zone offset in {@code t}'s unit. The server matches zone text against
+         * UTF-8 bytes, where a non-ASCII character never matches.
          */
-        private static long offset(Target t, CharSequence s, int lo, int hi, long epoch, int year) throws NumericException {
+        private static long offset(Target t, CharSequence s, int lo, int hi) throws NumericException {
             if (lo >= hi) {
                 throw NumericException.instance();
             }
-            int minutes = numericOffset(s, lo, hi);
-            if (minutes != Integer.MIN_VALUE) {
-                return minutes * t.minute;
+            int minutes = offsetMinutes(s, lo, hi);
+            if (minutes == Integer.MIN_VALUE) {
+                // A zone name. See the class comment.
+                throw NumericException.instance();
             }
-            return NamedZones.find(s, lo, hi, t.isZoneAsciiOnly).offset(t, epoch, year);
+            return minutes * t.minute;
         }
 
-        private static int numericOffset(CharSequence s, int lo, int hi) {
+        // Z, UTC, GMT, or a numeric offset that UTC or GMT may precede.
+        // Integer.MIN_VALUE for anything else.
+        private static int offsetMinutes(CharSequence s, int lo, int hi) {
             if (hi - lo == 1 && (s.charAt(lo) == 'Z' || s.charAt(lo) == 'z')) {
                 return 0;
             }
@@ -489,9 +465,13 @@ final class QwpSchemaTimestampParser {
             boolean namedPrefix = startsWithIgnoreCase(s, p, hi, "UTC") || startsWithIgnoreCase(s, p, hi, "GMT");
             if (namedPrefix) {
                 p += 3;
+                if (p == hi) {
+                    return 0;
+                }
             }
+            // The zone text is not empty and a bare UTC or GMT has returned, so p < hi.
             boolean negative = false;
-            if (p < hi && (s.charAt(p) == '+' || s.charAt(p) == '-')) {
+            if (s.charAt(p) == '+' || s.charAt(p) == '-') {
                 negative = s.charAt(p++) == '-';
             } else if (namedPrefix) {
                 return Integer.MIN_VALUE;
@@ -521,201 +501,21 @@ final class QwpSchemaTimestampParser {
             return c >= '0' && c <= '9';
         }
 
+        // prefix is upper-case ASCII; only an ASCII letter matches it in either case.
         private static boolean startsWithIgnoreCase(CharSequence value, int lo, int hi, String prefix) {
             if (hi - lo < prefix.length()) {
                 return false;
             }
             for (int i = 0; i < prefix.length(); i++) {
-                if (Character.toUpperCase(value.charAt(lo + i)) != prefix.charAt(i)) {
+                char c = value.charAt(lo + i);
+                if (c >= 'a' && c <= 'z') {
+                    c -= 'a' - 'A';
+                }
+                if (c != prefix.charAt(i)) {
                     return false;
                 }
             }
             return true;
-        }
-
-        /**
-         * Zone names by case-insensitive text. A holder class, so that only a
-         * named-zone lookup loads every zone's rules; 'Z' and numeric offsets
-         * never initialize it.
-         */
-        private static final class NamedZones {
-            private static final int MASK;
-            private static final String[] NAMES;
-            private static final Zone[] ZONES;
-
-            static {
-                Map<String, Zone> rules = new HashMap<>();
-                for (String id : ZoneRulesProvider.getAvailableZoneIds()) {
-                    rules.put(id, new Zone(ZoneRulesProvider.getRules(id, true)));
-                }
-                for (Map.Entry<String, String> alias : ZoneId.SHORT_IDS.entrySet()) {
-                    if (!rules.containsKey(alias.getKey())) {
-                        Zone target = rules.get(alias.getValue());
-                        if (target == null) {
-                            target = new Zone(ZoneId.of(alias.getValue()).getRules());
-                        }
-                        rules.put(alias.getKey(), target);
-                    }
-                }
-                String[][] rows = new DateFormatSymbols(Locale.ENGLISH).getZoneStrings();
-                int names = 1;
-                for (String[] row : rows) {
-                    names += row.length;
-                }
-                // At most half full, so a miss ends at an empty slot quickly.
-                int capacity = 16;
-                while (capacity < 2 * names) {
-                    capacity <<= 1;
-                }
-                MASK = capacity - 1;
-                NAMES = new String[capacity];
-                ZONES = new Zone[capacity];
-                // The first definition of a name wins; UTC goes first.
-                define(rules.get("UTC"), "UTC");
-                for (String[] row : rows) {
-                    if (row.length == 0 || !rules.containsKey(row[0])) {
-                        continue;
-                    }
-                    Zone zone = rules.get(row[0]);
-                    for (String name : row) {
-                        define(zone, name);
-                    }
-                }
-            }
-
-            private static void define(Zone zone, String name) {
-                if (zone == null || name == null || name.isEmpty()) {
-                    return;
-                }
-                String text = name.toUpperCase(Locale.ROOT);
-                int hash = 0;
-                for (int i = 0, n = text.length(); i < n; i++) {
-                    hash = 31 * hash + text.charAt(i);
-                }
-                int slot = spread(hash) & MASK;
-                while (NAMES[slot] != null) {
-                    if (NAMES[slot].equals(text)) {
-                        return;
-                    }
-                    slot = (slot + 1) & MASK;
-                }
-                NAMES[slot] = text;
-                ZONES[slot] = zone;
-            }
-
-            private static Zone find(CharSequence s, int lo, int hi, boolean isAsciiOnly) throws NumericException {
-                int hash = 0;
-                for (int i = lo; i < hi; i++) {
-                    char c = s.charAt(i);
-                    if (isAsciiOnly && c > 0x7f) {
-                        throw NumericException.instance();
-                    }
-                    hash = 31 * hash + Character.toUpperCase(c);
-                }
-                int length = hi - lo;
-                for (int slot = spread(hash) & MASK; NAMES[slot] != null; slot = (slot + 1) & MASK) {
-                    String name = NAMES[slot];
-                    if (name.length() == length && regionMatches(s, lo, name)) {
-                        return ZONES[slot];
-                    }
-                }
-                throw NumericException.instance();
-            }
-
-            private static boolean regionMatches(CharSequence value, int lo, String name) {
-                for (int i = 0, n = name.length(); i < n; i++) {
-                    if (Character.toUpperCase(value.charAt(lo + i)) != name.charAt(i)) {
-                        return false;
-                    }
-                }
-                return true;
-            }
-
-            private static int spread(int hash) {
-                return hash ^ (hash >>> 16);
-            }
-        }
-
-        private static final class Zone {
-            // Seconds, or Long.MIN_VALUE when absent.
-            private final long cutoffSeconds;
-            private final long fixedOffsetSeconds;
-            private final long lastWallSeconds;
-            private final List<ZoneOffsetTransitionRule> recurring;
-            private final ZoneRules rules;
-
-            private Zone(ZoneRules rules) {
-                this.rules = rules;
-                List<ZoneOffsetTransition> history = rules.getTransitions();
-                cutoffSeconds = history.isEmpty() ? Long.MIN_VALUE : history.get(history.size() - 1).toEpochSecond();
-                recurring = rules.getTransitionRules();
-                fixedOffsetSeconds = rules.isFixedOffset() ? rules.getOffset(Instant.EPOCH).getTotalSeconds() : Long.MIN_VALUE;
-                lastWallSeconds = history.isEmpty() ? rules.getOffset(Instant.EPOCH).getTotalSeconds()
-                        : history.get(history.size() - 1).getOffsetAfter().getTotalSeconds();
-            }
-
-            private static long transitionEpoch(Target t, ZoneOffsetTransitionRule rule, int year) {
-                boolean leap = CommonUtils.isLeapYear(year);
-                int month = rule.getMonth().getValue();
-                int dom = rule.getDayOfMonthIndicator();
-                int dow = rule.getDayOfWeek() == null ? -1 : rule.getDayOfWeek().getValue();
-                long time = rule.getLocalTime().getHour() * t.hour + rule.getLocalTime().getMinute() * t.minute
-                        + rule.getLocalTime().getSecond() * t.second;
-                long timestamp;
-                if (dom < 0) {
-                    timestamp = yearStart(t, year, leap) + monthStart(t, month, leap)
-                            + (CommonUtils.getDaysPerMonth(month, leap) + dom) * t.day + time;
-                    if (dow > -1) {
-                        timestamp = previousOrSame(t, timestamp, dow);
-                    }
-                } else {
-                    timestamp = yearStart(t, year, leap) + monthStart(t, month, leap) + (dom - 1L) * t.day + time;
-                    if (dow > -1) {
-                        timestamp = nextOrSame(t, timestamp, dow);
-                    }
-                }
-                if (rule.isMidnightEndOfDay()) {
-                    timestamp += t.day;
-                }
-                int before = rule.getOffsetBefore().getTotalSeconds();
-                if (rule.getTimeDefinition() == ZoneOffsetTransitionRule.TimeDefinition.UTC) {
-                    timestamp += before * t.second;
-                } else if (rule.getTimeDefinition() == ZoneOffsetTransitionRule.TimeDefinition.STANDARD) {
-                    timestamp += (before - rule.getStandardOffset().getTotalSeconds()) * t.second;
-                }
-                return timestamp - before * t.second;
-            }
-
-            private long offset(Target t, long epoch, int year) throws NumericException {
-                if (fixedOffsetSeconds != Long.MIN_VALUE) {
-                    return fixedOffsetSeconds * t.second;
-                }
-                long cutoff = cutoffSeconds == Long.MIN_VALUE ? Long.MIN_VALUE : cutoffSeconds * t.second;
-                if (!recurring.isEmpty() && epoch > cutoff) {
-                    if (t.isNegativeYearRuleRejected && year < 0) {
-                        // The server's DATE recurring-rule cache rejects negative
-                        // year keys. This is only reachable after full-width DATE
-                        // arithmetic wraps past the cutoff.
-                        throw NumericException.instance();
-                    }
-                    // The server computes future rules with the parsed year,
-                    // even when calendar arithmetic has wrapped the epoch.
-                    long after = 0;
-                    for (int i = 0, n = recurring.size(); i < n; i++) {
-                        ZoneOffsetTransitionRule rule = recurring.get(i);
-                        if (epoch < transitionEpoch(t, rule, year)) {
-                            return rule.getOffsetBefore().getTotalSeconds() * t.second;
-                        }
-                        after = rule.getOffsetAfter().getTotalSeconds() * t.second;
-                    }
-                    return after;
-                }
-                if (epoch > cutoff) {
-                    return lastWallSeconds * t.second;
-                }
-                Instant instant = Instant.ofEpochSecond(Math.floorDiv(epoch, t.second), Math.floorMod(epoch, t.second) * t.nanos);
-                return rules.getOffset(instant).getTotalSeconds() * t.second;
-            }
         }
     }
 
@@ -723,30 +523,18 @@ final class QwpSchemaTimestampParser {
     private static final class Target {
         private final long day;
         private final long hour;
-        private final boolean isNegativeYearRuleRejected;
         private final boolean isYearSaturating;
-        private final boolean isZoneAsciiOnly;
         private final long milli;
         private final long minute;
-        // Nanos per unit.
-        private final long nanos;
         private final long second;
 
-        private Target(
-                long unitsPerMilli,
-                boolean isYearSaturating,
-                boolean isZoneAsciiOnly,
-                boolean isNegativeYearRuleRejected
-        ) {
+        private Target(long unitsPerMilli, boolean isYearSaturating) {
             this.milli = unitsPerMilli;
             this.second = 1_000L * unitsPerMilli;
             this.minute = 60_000L * unitsPerMilli;
             this.hour = 3_600_000L * unitsPerMilli;
             this.day = 86_400_000L * unitsPerMilli;
-            this.nanos = 1_000_000L / unitsPerMilli;
             this.isYearSaturating = isYearSaturating;
-            this.isZoneAsciiOnly = isZoneAsciiOnly;
-            this.isNegativeYearRuleRejected = isNegativeYearRuleRejected;
         }
     }
 }

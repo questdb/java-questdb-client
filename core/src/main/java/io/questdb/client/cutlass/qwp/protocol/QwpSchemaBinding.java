@@ -1642,7 +1642,8 @@ public final class QwpSchemaBinding {
                 column.addLong(millis);
             }
         } catch (NumericException e) {
-            throw error(INVALID_VALUE, name, "STRING", targetType, "invalid DATE text");
+            throw error(INVALID_VALUE, name, "STRING", targetType,
+                    "invalid DATE text; a time zone must be Z, UTC, GMT or a numeric offset");
         }
     }
 
@@ -1663,7 +1664,8 @@ public final class QwpSchemaBinding {
                 column.addLong(micros);
             }
         } catch (NumericException e) {
-            throw error(INVALID_VALUE, name, "STRING", targetType, "invalid timestamp text");
+            throw error(INVALID_VALUE, name, "STRING", targetType,
+                    "invalid timestamp text; a time zone must be Z, UTC, GMT or a numeric offset");
         }
     }
 
