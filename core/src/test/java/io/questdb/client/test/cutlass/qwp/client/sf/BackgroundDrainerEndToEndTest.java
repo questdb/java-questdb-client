@@ -270,6 +270,43 @@ public class BackgroundDrainerEndToEndTest {
         });
     }
 
+    @Test
+    public void testDrainerSendsOwnedBy() throws Exception {
+        // A drainer connects through the connect walk of the sender that adopted the orphan slot, so its upgrade
+        // names that sender's owned_by, and the tables and columns the replay auto-creates get the owner too.
+        TestUtils.assertMemoryLeak(() -> {
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg1 = "ws::addr=localhost:" + silent.getPort()
+                        + ";sf_dir=" + sfDir
+                        + ";sender_id=ghost"
+                        + ";close_flush_timeout_millis=0;";
+                try (Sender g = Sender.fromConfig(cfg1)) {
+                    g.table("foo").longColumn("v", 1L).atNow();
+                    g.flush();
+                }
+            }
+            Assert.assertEquals("ghost slot must be a candidate orphan",
+                    1, OrphanScanner.scan(sfDir, "primary").size());
+
+            try (TestWebSocketServer good = new TestWebSocketServer(new AckHandler())) {
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                String cfg2 = "ws::addr=localhost:" + good.getPort()
+                        + ";sf_dir=" + sfDir
+                        + ";sender_id=primary"
+                        + ";drain_orphans=true"
+                        + ";owned_by=team_a;";
+                try (Sender ignored = Sender.fromConfig(cfg2)) {
+                    // the upgrades of the foreground sender and of the drainer, in either order
+                    Assert.assertEquals("team_a", good.pollOwnedByRequest(5, TimeUnit.SECONDS));
+                    Assert.assertEquals("team_a", good.pollOwnedByRequest(5, TimeUnit.SECONDS));
+                }
+            }
+        });
+    }
+
     private static void rmDirRec(String dir) {
         if (!Files.exists(dir)) return;
         long find = Files.findFirst(dir);

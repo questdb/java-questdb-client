@@ -2563,8 +2563,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * clause of {@code CREATE TABLE} and {@code ALTER TABLE ... ADD COLUMN} does in SQL: the server grants
          * the new tables and columns to this user, group or service account instead of the authenticated
          * principal. The principal may name itself or one of its groups, and the built-in admin any existing
-         * entity. An external user, for example one authenticated with an OpenID Connect token, cannot own
-         * anything itself, so it must name one of its groups to have tables or columns auto-created at all.
+         * entity but an external user. An external user, for example one authenticated with an OpenID Connect
+         * token, cannot own anything itself, so it must name one of its groups to have tables or columns
+         * auto-created at all.
          * <p>
          * The owner is sent once per connection, in the WebSocket upgrade, and checked there: a server that
          * refuses it rejects the connection, and a server that does not confirm it, one without the feature,

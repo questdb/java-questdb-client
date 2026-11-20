@@ -154,6 +154,10 @@ public class TestWebSocketServer implements Closeable {
     private volatile String ownedByEchoValue;
     // text/plain body of arbitrary-status rejects (setRejectWithStatus or the validator), or null for none.
     private volatile String rejectBody;
+    // Content-Length and Content-Type values of the rejects that carry rejectBody, or null for the defaults:
+    // the body's byte length and text/plain. Lets a test send headers that do not describe the body.
+    private volatile String rejectBodyContentLength;
+    private volatile String rejectBodyContentType;
     // When true, 101 upgrade responses omit the X-QWP-Owned-By echo -- simulating a server that does not
     // know the header and ignores it.
     private volatile boolean suppressOwnedByEcho;
@@ -441,6 +445,16 @@ public class TestWebSocketServer implements Closeable {
      */
     public void setRejectBody(String body) {
         this.rejectBody = body;
+    }
+
+    /**
+     * Overrides the {@code Content-Type} and {@code Content-Length} values of the rejects that carry a
+     * {@link #setRejectBody body}, so that a test can send headers that do not describe it. A null value
+     * restores its default: {@code text/plain}, and the byte length of the body.
+     */
+    public void setRejectBodyHeaders(String contentType, String contentLength) {
+        this.rejectBodyContentType = contentType;
+        this.rejectBodyContentLength = contentLength;
     }
 
     /**
@@ -929,10 +943,16 @@ public class TestWebSocketServer implements Closeable {
             StringBuilder sb = new StringBuilder()
                     .append("HTTP/1.1 ").append(status).append(' ').append(reason).append("\r\n")
                     .append("Connection: close\r\n");
+            String contentLength = Integer.toString(bodyBytes.length);
             if (body != null) {
-                sb.append("Content-Type: text/plain\r\n");
+                String contentType = rejectBodyContentType;
+                sb.append("Content-Type: ").append(contentType != null ? contentType : "text/plain").append("\r\n");
+                String contentLengthOverride = rejectBodyContentLength;
+                if (contentLengthOverride != null) {
+                    contentLength = contentLengthOverride;
+                }
             }
-            sb.append("Content-Length: ").append(bodyBytes.length).append("\r\n");
+            sb.append("Content-Length: ").append(contentLength).append("\r\n");
             String challenge = rejectWwwAuthenticate;
             if (status == 401 && challenge != null) {
                 sb.append("WWW-Authenticate: ").append(challenge).append("\r\n");

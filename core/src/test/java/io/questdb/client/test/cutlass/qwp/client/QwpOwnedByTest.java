@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.ConnectionHealth;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketClientFactory;
@@ -35,6 +36,8 @@ import org.junit.Assert;
 import org.junit.Test;
 
 import java.util.concurrent.TimeUnit;
+
+import static io.questdb.client.test.cutlass.auth.TokenTestKit.await;
 
 /**
  * The {@code owned_by} option: the owner of the tables and columns a sender auto-creates, sent as
@@ -50,6 +53,35 @@ public class QwpOwnedByTest {
         Assert.assertEquals("Team-A_1.x~", WebSocketClient.encodeOwnedBy("Team-A_1.x~"));
         // everything else is percent-encoded UTF-8 with upper-case hex digits, '%' and '+' included
         Assert.assertEquals("a%20b%2Bc%25d%2F%C3%A9%E8%A1%A8", WebSocketClient.encodeOwnedBy("a b+c%d/\u00e9\u8868"));
+        // the ends of the unreserved ranges stay as they are, the characters just outside them do not: the server
+        // re-encodes the owner it echoes, so the two sides must draw these lines at the same characters
+        Assert.assertEquals("AZaz09", WebSocketClient.encodeOwnedBy("AZaz09"));
+        Assert.assertEquals("%40%5B%60%7B%2F%3A", WebSocketClient.encodeOwnedBy("@[`{/:"));
+    }
+
+    @Test
+    public void testHealthReportsUnconfirmedOwnedByWithoutStatus() throws Exception {
+        // A running sender keeps retrying an endpoint that stops confirming the owner. That endpoint answered 101,
+        // so health reports the failure without an HTTP status, as it does a missing durable-ack echo.
+        TestUtils.assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = startServer()) {
+                try (Sender sender = Sender.fromConfig(senderConfig(server)
+                        + "reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=20;")) {
+                    Assert.assertEquals(OWNER_ENCODED, server.pollOwnedByRequest(5, TimeUnit.SECONDS));
+                    server.setSuppressOwnedByEcho(true);
+                    server.dropAllConnections();
+                    await(() -> {
+                        ConnectionHealth.Failure failure = sender.health().getLastFailure();
+                        return failure != null && failure.getMessage().contains("did not confirm owned_by");
+                    }, 10_000, "a reconnect round that fails on the missing owned_by echo");
+                    ConnectionHealth health = sender.health();
+                    Assert.assertEquals(health.toString(), ConnectionHealth.State.RECONNECTING, health.getState());
+                    Assert.assertEquals(health.toString(), ConnectionHealth.FailureClass.OTHER,
+                            health.getLastFailure().getFailureClass());
+                    Assert.assertEquals(health.toString(), 0, health.getLastFailure().getStatusCode());
+                }
+            }
+        });
     }
 
     @Test
@@ -88,6 +120,31 @@ public class QwpOwnedByTest {
     }
 
     @Test
+    public void testRejectReasonNullUnlessBodyIsUsable() throws Exception {
+        // The reason is best effort: a text/plain body that arrived whole with the headers. Anything else yields
+        // none rather than a guess, and above all no byte past the ones received.
+        TestUtils.assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = startServer()) {
+                server.setRejectWithStatus(400, "Bad Request");
+                // body, Content-Type (null for text/plain), Content-Length (null for the length of the body)
+                String[][] cases = {
+                        {"owned_by refused", null, "1000"},
+                        {"owned_by refused", null, "abc"},
+                        {"owned_by refused", null, "-1"},
+                        {"owned_by refused", null, "0"},
+                        {"<p>owned_by refused</p>", "text/html", null},
+                        {" \r\n\t ", null, null}
+                };
+                for (String[] c : cases) {
+                    server.setRejectBody(c[0]);
+                    server.setRejectBodyHeaders(c[1], c[2]);
+                    assertBadRequestReason(server, null);
+                }
+            }
+        });
+    }
+
+    @Test
     public void testRejectReasonNullWithoutBody() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             try (TestWebSocketServer server = startServer()) {
@@ -102,6 +159,29 @@ public class QwpOwnedByTest {
                         Assert.assertEquals("WebSocket upgrade failed: HTTP/1.1 400 Bad Request", e.getMessage());
                     }
                 }
+            }
+        });
+    }
+
+    @Test
+    public void testRejectReasonSanitized() throws Exception {
+        // Whatever answers the upgrade, a proxy included, writes the reason, so it reaches messages and logs only
+        // as display-safe text: without control and format characters, and at most 256 characters long.
+        TestUtils.assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = startServer()) {
+                server.setRejectWithStatus(400, "Bad Request");
+                server.setRejectBody("owned_by refused:\r\n\u0007bob\u202E is\u200B not part of group caf\u00e9");
+                server.setRejectBodyHeaders("text/plain; charset=utf-8", null);
+                assertBadRequestReason(server, "owned_by refused:bob is not part of group caf\u00e9");
+
+                StringBuilder body = new StringBuilder();
+                for (int i = 0; i < 300; i++) {
+                    body.append('x');
+                }
+                server.setRejectBody(body.toString());
+                server.setRejectBodyHeaders(null, null);
+                // cut to 256 characters, the last three of which mark the cut
+                assertBadRequestReason(server, body.substring(0, 253) + "...");
             }
         });
     }
@@ -142,6 +222,21 @@ public class QwpOwnedByTest {
                             + ", echoed=<no X-QWP-Owned-By header>]");
                 }
                 Assert.assertEquals(OWNER_ENCODED, server.pollOwnedByRequest(5, TimeUnit.SECONDS));
+            }
+        });
+    }
+
+    @Test
+    public void testSenderResendsOwnedByOnReconnect() throws Exception {
+        // The owner travels in every upgrade, not only in the first one, so the tables and columns auto-created
+        // over a re-established connection get it too.
+        TestUtils.assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = startServer()) {
+                try (Sender ignored = Sender.fromConfig(senderConfig(server))) {
+                    Assert.assertEquals(OWNER_ENCODED, server.pollOwnedByRequest(5, TimeUnit.SECONDS));
+                    server.dropAllConnections();
+                    Assert.assertEquals(OWNER_ENCODED, server.pollOwnedByRequest(10, TimeUnit.SECONDS));
+                }
             }
         });
     }
@@ -195,6 +290,23 @@ public class QwpOwnedByTest {
         });
     }
 
+    // Upgrades against a server that rejects it with 400 Bad Request, and asserts the reason the client takes
+    // from the body of the rejection, null for none.
+    private static void assertBadRequestReason(TestWebSocketServer server, String expectedReason) {
+        try (WebSocketClient client = WebSocketClientFactory.newPlainTextInstance()) {
+            client.connect("127.0.0.1", server.getPort());
+            try {
+                client.upgrade("/write/v4", null);
+                Assert.fail("expected the upgrade to fail");
+            } catch (WebSocketUpgradeException e) {
+                Assert.assertEquals(400, e.getStatusCode());
+                Assert.assertEquals(expectedReason, client.getUpgradeRejectReason());
+                Assert.assertEquals("WebSocket upgrade failed: HTTP/1.1 400 Bad Request"
+                        + (expectedReason != null ? " [reason=" + expectedReason + ']' : ""), e.getMessage());
+            }
+        }
+    }
+
     private static void assertUpgradeFailsOnEcho(TestWebSocketServer server, String expectedEcho) {
         try (WebSocketClient client = WebSocketClientFactory.newPlainTextInstance()) {
             client.setQwpOwnedBy(OWNER);
@@ -203,7 +315,9 @@ public class QwpOwnedByTest {
                 client.upgrade("/write/v4", null);
                 Assert.fail("expected the upgrade to fail");
             } catch (WebSocketUpgradeException e) {
-                // a non-421 upgrade error, which the connect walk latches as terminal
+                // no status, as the server answered 101, and a non-421 upgrade error, which the connect walk
+                // latches as terminal
+                Assert.assertEquals(WebSocketUpgradeException.STATUS_NONE, e.getStatusCode());
                 Assert.assertFalse(e.isRoleMismatch());
                 Assert.assertFalse(client.isConnected());
                 TestUtils.assertContains(e.getMessage(), "WebSocket upgrade failed: server did not confirm owned_by, "
