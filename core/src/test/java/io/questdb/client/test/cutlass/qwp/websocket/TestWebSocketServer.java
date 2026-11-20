@@ -149,6 +149,9 @@ public class TestWebSocketServer implements Closeable {
     // builds. Lets a test force the delta-dictionary catch-up to split across
     // several frames. Live-updatable via setAdvertisedMaxBatchSize().
     private volatile int advertisedMaxBatchSize;
+    // When true, 101 upgrade responses omit the X-QWP-Owned-By echo -- simulating a server that does not
+    // know the header and ignores it.
+    private volatile boolean isOwnedByEchoSuppressed;
     // When non-null, 101 upgrade responses to a request that named an owner carry this exact
     // X-QWP-Owned-By value instead of echoing the request's -- simulating a server that mangled the name.
     private volatile String ownedByEchoValue;
@@ -158,9 +161,6 @@ public class TestWebSocketServer implements Closeable {
     // the body's byte length and text/plain. Lets a test send headers that do not describe the body.
     private volatile String rejectBodyContentLength;
     private volatile String rejectBodyContentType;
-    // When true, 101 upgrade responses omit the X-QWP-Owned-By echo -- simulating a server that does not
-    // know the header and ignores it.
-    private volatile boolean suppressOwnedByEcho;
 
     public TestWebSocketServer(WebSocketServerHandler handler) throws IOException {
         this(handler, false);
@@ -433,6 +433,14 @@ public class TestWebSocketServer implements Closeable {
     }
 
     /**
+     * When enabled, 101 upgrade responses omit the {@code X-QWP-Owned-By} echo, as a server that does not
+     * know the header does.
+     */
+    public void setOwnedByEchoSuppressed(boolean isOwnedByEchoSuppressed) {
+        this.isOwnedByEchoSuppressed = isOwnedByEchoSuppressed;
+    }
+
+    /**
      * Forces 101 upgrade responses to a request that named an owner to echo this exact
      * {@code X-QWP-Owned-By} value. Pass null to echo the request's value, as a server that accepts it does.
      */
@@ -467,14 +475,6 @@ public class TestWebSocketServer implements Closeable {
      */
     public void setSuppressDurableAckHeader(boolean suppressDurableAckHeader) {
         this.suppressDurableAckHeader = suppressDurableAckHeader;
-    }
-
-    /**
-     * When enabled, 101 upgrade responses omit the {@code X-QWP-Owned-By} echo, as a server that does not
-     * know the header does.
-     */
-    public void setSuppressOwnedByEcho(boolean suppressOwnedByEcho) {
-        this.suppressOwnedByEcho = suppressOwnedByEcho;
     }
 
     /**
@@ -926,7 +926,7 @@ public class TestWebSocketServer implements Closeable {
             if (maxBatch > 0) {
                 sb.append("X-QWP-Max-Batch-Size: ").append(maxBatch).append("\r\n");
             }
-            if (!ownedByRequest.isEmpty() && !suppressOwnedByEcho) {
+            if (!ownedByRequest.isEmpty() && !isOwnedByEchoSuppressed) {
                 String echo = ownedByEchoValue;
                 sb.append("X-QWP-Owned-By: ").append(echo != null ? echo : ownedByRequest).append("\r\n");
             }

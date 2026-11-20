@@ -68,7 +68,7 @@ public class QwpOwnedByTest {
                 try (Sender sender = Sender.fromConfig(senderConfig(server)
                         + "reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=20;")) {
                     Assert.assertEquals(OWNER_ENCODED, server.pollOwnedByRequest(5, TimeUnit.SECONDS));
-                    server.setSuppressOwnedByEcho(true);
+                    server.setOwnedByEchoSuppressed(true);
                     server.dropAllConnections();
                     await(() -> {
                         ConnectionHealth.Failure failure = sender.health().getLastFailure();
@@ -213,7 +213,7 @@ public class QwpOwnedByTest {
         // auto-created there would not get the owner, so build fails rather than connecting.
         TestUtils.assertMemoryLeak(() -> {
             try (TestWebSocketServer server = startServer()) {
-                server.setSuppressOwnedByEcho(true);
+                server.setOwnedByEchoSuppressed(true);
                 try (Sender ignored = Sender.fromConfig(senderConfig(server))) {
                     Assert.fail("expected build to fail");
                 } catch (WebSocketUpgradeException e) {
@@ -284,7 +284,7 @@ public class QwpOwnedByTest {
     public void testUpgradeFailsOnMissingEcho() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             try (TestWebSocketServer server = startServer()) {
-                server.setSuppressOwnedByEcho(true);
+                server.setOwnedByEchoSuppressed(true);
                 assertUpgradeFailsOnEcho(server, "echoed=<no X-QWP-Owned-By header>]");
             }
         });
@@ -315,8 +315,8 @@ public class QwpOwnedByTest {
                 client.upgrade("/write/v4", null);
                 Assert.fail("expected the upgrade to fail");
             } catch (WebSocketUpgradeException e) {
-                // no status, as the server answered 101, and a non-421 upgrade error, which the connect walk
-                // latches as terminal
+                // no status, as the server answered 101, and a non-421 upgrade error, which fails the initial
+                // connect
                 Assert.assertEquals(WebSocketUpgradeException.STATUS_NONE, e.getStatusCode());
                 Assert.assertFalse(e.isRoleMismatch());
                 Assert.assertFalse(client.isConnected());
