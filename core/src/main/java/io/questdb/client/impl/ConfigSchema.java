@@ -87,6 +87,8 @@ public final class ConfigSchema {
         str("poison_min_escalation_window_millis", Side.INGRESS);
         str("catch_up_cap_gap_min_escalation_window_millis", Side.INGRESS);
         str("max_name_len", Side.INGRESS);
+        // Owner of the tables and columns the Sender auto-creates, sent as X-QWP-Owned-By on every upgrade.
+        str("owned_by", Side.INGRESS);
         str("reconnect_initial_backoff_millis", Side.INGRESS);
         str("reconnect_max_backoff_millis", Side.INGRESS);
         str("reconnect_max_duration_millis", Side.INGRESS);

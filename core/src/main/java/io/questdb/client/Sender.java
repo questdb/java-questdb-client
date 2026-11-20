@@ -1221,6 +1221,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         };
         private long minRequestThroughput = PARAMETER_NOT_SET_EXPLICITLY;
         private int multicastTtl = PARAMETER_NOT_SET_EXPLICITLY;
+        // Owner of the tables and columns the sender auto-creates (WebSocket only), or null.
+        private String ownedBy;
         private String password;
         private PrivateKey privateKey;
         private int protocol = PARAMETER_NOT_SET_EXPLICITLY;
@@ -2557,6 +2559,39 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
+         * Names the owner of the tables and columns this sender auto-creates, the way the {@code OWNED BY}
+         * clause of {@code CREATE TABLE} and {@code ALTER TABLE ... ADD COLUMN} does in SQL: the server grants
+         * the new tables and columns to this user, group or service account instead of the authenticated
+         * principal. The principal may name itself or one of its groups, and the built-in admin any existing
+         * entity but an external user. An external user, for example one authenticated with an OpenID Connect
+         * token, cannot own anything itself, so it must name one of its groups to have tables or columns
+         * auto-created at all.
+         * <p>
+         * The owner is sent once per connection, in the WebSocket upgrade, and checked there: a server that
+         * refuses it rejects the connection, and a server that does not confirm it, one without the feature,
+         * fails it. Requires QuestDB Enterprise with access control enabled.
+         * <p>
+         * This setting is only supported for WebSocket transport.
+         *
+         * @param owner name of the user, group or service account to own the auto-created tables and columns
+         * @return this instance for method chaining
+         */
+        public LineSenderBuilder ownedBy(String owner) {
+            if (this.ownedBy != null) {
+                throw new LineSenderException("owned_by was already configured ")
+                        .put("[ownedBy=").put(this.ownedBy).put("]");
+            }
+            if (Chars.isBlank(owner)) {
+                throw new LineSenderException("owned_by cannot be empty nor null");
+            }
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("owned_by is only supported for WebSocket transport");
+            }
+            this.ownedBy = owner;
+            return this;
+        }
+
+        /**
          * Set port where a QuestDB server is listening on.
          *
          * @param port port where a QuestDB server is listening on.
@@ -3769,7 +3804,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                                 symbolDictReset,
                                 actualSymbolDictResetThreshold,
                                 actualSymbolDictResetMaxWaitMillis,
-                                keepaliveIntervalMillis
+                                keepaliveIntervalMillis,
+                                ownedBy
                         );
                     } catch (UnreplayableSlotException e) {
                         // The one failure build() recovers from. The slot's frames reference ids
@@ -4211,6 +4247,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         int protocolVersion = parseIntValue(sink, "protocol_version");
                         protocolVersion(protocolVersion);
                     }
+                } else if (Chars.equals("owned_by", sink)) {
+                    // ws/wss strings never reach this parser, see fromConfigWebSocket()
+                    throw new LineSenderException("owned_by is only supported for WebSocket transport");
                 } else if (Chars.equals("request_durable_ack", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException("request_durable_ack is only supported for WebSocket transport");
@@ -4686,6 +4725,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         throw new LineSenderException("invalid transaction [value=").put(s).put(", allowed-values=[on, off]]");
                     }
                 }
+                s = view.getStr("owned_by");
+                if (s != null) {
+                    ownedBy(s);
+                }
                 s = view.getStr("request_durable_ack");
                 if (s != null) {
                     int tiers = DurableAckTiers.parseConfigValue(s);
@@ -4823,6 +4866,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             m.put("max_name_len", maxNameLength);
             m.put("transaction", transactional);
             m.put("request_durable_ack", DurableAckTiers.configValue(durableAckTiers));
+            m.put("owned_by", ownedBy);
             m.put("sender_id", senderId);
             m.put("sf_dir", sfDir);
             m.put("sf_max_segment_bytes", sfMaxSegmentBytes);
@@ -4944,6 +4988,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             }
             if (durableAckTiers != DurableAckTiers.NONE && protocol != PROTOCOL_WEBSOCKET) {
                 throw new LineSenderException("request_durable_ack is only supported for WebSocket transport");
+            }
+            if (ownedBy != null && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("owned_by is only supported for WebSocket transport");
             }
             if (protocol == PROTOCOL_HTTP) {
                 if (httpClientConfiguration.getMaximumRequestBufferSize() < httpClientConfiguration.getInitialRequestBufferSize()) {

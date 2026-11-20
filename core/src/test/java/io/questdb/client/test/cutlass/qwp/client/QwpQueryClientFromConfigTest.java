@@ -715,6 +715,7 @@ public class QwpQueryClientFromConfigTest {
                 "keepalive_interval_millis=30000",
                 "max_background_drainers=4",
                 "max_name_len=127",
+                "owned_by=team_a",
                 "reconnect_initial_backoff_millis=100",
                 "reconnect_max_backoff_millis=5000",
                 "reconnect_max_duration_millis=300000",

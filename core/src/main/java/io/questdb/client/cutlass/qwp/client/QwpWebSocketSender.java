@@ -74,6 +74,7 @@ import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.bytes.DirectByteSlice;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -645,6 +646,9 @@ public class QwpWebSocketSender implements Sender {
     private long reconnectMaxDurationMillis =
             CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_DURATION_MILLIS;
     private int durableAckTiers;
+    // Owner of the tables and columns this sender auto-creates, sent as X-QWP-Owned-By on every upgrade, or
+    // null. Set once before the first connect, like durableAckTiers.
+    private String ownedBy;
     // Monotonic per-attempt counter snapshotted onto every connection event
     // fired from buildAndConnect. Counts every FOREGROUND endpoint try --
     // successes and failures alike -- across this sender's lifetime.
@@ -1244,6 +1248,58 @@ public class QwpWebSocketSender implements Sender {
             long symbolDictResetMaxWaitMillis,
             long keepaliveIntervalMillis
     ) {
+        return connectWithCredentialSupplier(endpoints, tlsConfig, autoFlushRows, autoFlushBytes,
+                autoFlushIntervalNanos, authorizationHeaderSupplier, durableAckTiers,
+                cursorEngine, closeFlushTimeoutMillis, reconnectMaxDurationMillis,
+                reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
+                initialConnectMode, errorHandler, errorInboxCapacity,
+                durableAckKeepaliveIntervalMillis, authTimeoutMs, connectTimeoutMs,
+                connectionListener, connectionListenerInboxCapacity,
+                maxFrameRejections, poisonMinEscalationWindowMillis,
+                catchUpCapGapMinEscalationWindowMillis, symbolDictResetEnabled,
+                symbolDictResetThresholdSymbols, symbolDictResetMaxWaitMillis,
+                keepaliveIntervalMillis, null);
+    }
+
+    /**
+     * As the master overload above, but also names the owner of the tables and columns the sender
+     * auto-creates ({@code owned_by}): the server grants them to {@code ownedBy} instead of the
+     * authenticated principal. Sent as {@code X-QWP-Owned-By} on every upgrade; an upgrade the server does
+     * not confirm it on fails with a {@link WebSocketUpgradeException}. {@code null} names no owner. The
+     * overload above is kept, delegating here, so a caller compiled before {@code ownedBy} keeps linking.
+     *
+     * @throws LineSenderException if a symbol-dictionary recycle setting is out of range
+     */
+    public static QwpWebSocketSender connectWithCredentialSupplier(
+            List<Endpoint> endpoints,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            Supplier<String> authorizationHeaderSupplier,
+            int durableAckTiers,
+            CursorSendEngine cursorEngine,
+            long closeFlushTimeoutMillis,
+            long reconnectMaxDurationMillis,
+            long reconnectInitialBackoffMillis,
+            long reconnectMaxBackoffMillis,
+            Sender.InitialConnectMode initialConnectMode,
+            SenderErrorHandler errorHandler,
+            int errorInboxCapacity,
+            long durableAckKeepaliveIntervalMillis,
+            long authTimeoutMs,
+            int connectTimeoutMs,
+            SenderConnectionListener connectionListener,
+            int connectionListenerInboxCapacity,
+            int maxFrameRejections,
+            long poisonMinEscalationWindowMillis,
+            long catchUpCapGapMinEscalationWindowMillis,
+            boolean symbolDictResetEnabled,
+            int symbolDictResetThresholdSymbols,
+            long symbolDictResetMaxWaitMillis,
+            long keepaliveIntervalMillis,
+            @Nullable String ownedBy
+    ) {
         if (symbolDictResetThresholdSymbols <= 0
                 || symbolDictResetThresholdSymbols > QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE / 2) {
             throw new LineSenderException("symbol_dict_reset_threshold must be > 0 and <= ")
@@ -1264,6 +1320,7 @@ public class QwpWebSocketSender implements Sender {
         );
         try {
             sender.durableAckTiers = durableAckTiers;
+            sender.ownedBy = ownedBy;
             sender.authTimeoutMs = authTimeoutMs;
             sender.connectTimeoutMs = connectTimeoutMs;
             sender.closeFlushTimeoutMillis = closeFlushTimeoutMillis;
@@ -4256,6 +4313,7 @@ public class QwpWebSocketSender implements Sender {
                 newClient.setQwpMaxVersion(QwpConstants.VERSION);
                 newClient.setQwpClientId(QwpConstants.CLIENT_ID);
                 newClient.setQwpDurableAckTiers(durableAckTiers);
+                newClient.setQwpOwnedBy(ownedBy);
                 newClient.setConnectTimeout(effectiveConnectTimeoutMs(background, connectTimeoutMs));
                 if (cancellation != null) {
                     // Publish the client we are about to block on so a
