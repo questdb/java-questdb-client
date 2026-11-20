@@ -26,10 +26,12 @@ package io.questdb.client.cutlass.http.client;
 
 /**
  * Thrown by {@link WebSocketClient#upgrade} when the server returns a non-101
- * status. Carries the status code and the server role (parsed from the
- * {@code X-QuestDB-Role} header) so callers can distinguish a transient
- * role-mismatch (status 421 against a REPLICA / PRIMARY_CATCHUP node) from
- * a terminal upgrade rejection (e.g. 401, 403, 426).
+ * status, or a 101 that does not confirm the {@code owned_by} the client
+ * requested (status 101, see {@link WebSocketClient#setQwpOwnedBy}). Carries the
+ * status code and the server role (parsed from the {@code X-QuestDB-Role}
+ * header) so callers can distinguish a transient role-mismatch (status 421
+ * against a REPLICA / PRIMARY_CATCHUP node) from a terminal upgrade rejection
+ * (e.g. 401, 403, 426).
  */
 public class WebSocketUpgradeException extends HttpClientException {
 
