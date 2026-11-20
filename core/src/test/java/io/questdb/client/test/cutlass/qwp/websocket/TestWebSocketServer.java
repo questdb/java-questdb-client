@@ -402,20 +402,30 @@ public class TestWebSocketServer implements Closeable {
     }
 
     /**
-     * When enabled, 101 upgrade responses omit the {@code X-QWP-Durable-Ack}
-     * header even on a server constructed with {@code emitDurableAckHeader} —
-     * the next opted-in connect ({@code request_durable_ack=on}) observes a
-     * durable-ack capability gap. Pass {@code false} to clear and resume
-     * advertising, the way a rolling upgrade eventually settles. The setting
-     * applies to every new handshake until cleared.
-     */
-    /**
      * Blocks up to {@code timeout} for the next captured X-QWP-Request-Durable-Ack
      * header value ("" when the upgrade request carried none). Values arrive in
      * handshake order, one per well-formed upgrade request.
      */
+    public String pollDurableAckRequest(long timeout, TimeUnit unit) throws InterruptedException {
+        return capturedDurableAckRequests.poll(timeout, unit);
+    }
+
+    /**
+     * Blocks up to {@code timeout} for the next captured X-QWP-Owned-By header value ("" when the
+     * upgrade request carried none). Values arrive in handshake order, one per well-formed upgrade request.
+     */
     public String pollOwnedByRequest(long timeout, TimeUnit unit) throws InterruptedException {
         return capturedOwnedByRequests.poll(timeout, unit);
+    }
+
+    /**
+     * Forces 101 upgrade responses to carry this exact {@code X-QWP-Durable-Ack}
+     * value instead of echoing the client's requested set. Pass null to restore
+     * the echo behavior. Only takes effect on a server constructed with
+     * {@code emitDurableAckHeader}.
+     */
+    public void setDurableAckHeaderValue(String value) {
+        this.durableAckHeaderValue = value;
     }
 
     /**
@@ -433,26 +443,24 @@ public class TestWebSocketServer implements Closeable {
         this.rejectBody = body;
     }
 
-    public void setSuppressOwnedByEcho(boolean suppressOwnedByEcho) {
-        this.suppressOwnedByEcho = suppressOwnedByEcho;
-    }
-
-    public String pollDurableAckRequest(long timeout, TimeUnit unit) throws InterruptedException {
-        return capturedDurableAckRequests.poll(timeout, unit);
+    /**
+     * When enabled, 101 upgrade responses omit the {@code X-QWP-Durable-Ack}
+     * header even on a server constructed with {@code emitDurableAckHeader} —
+     * the next opted-in connect ({@code request_durable_ack=on}) observes a
+     * durable-ack capability gap. Pass {@code false} to clear and resume
+     * advertising, the way a rolling upgrade eventually settles. The setting
+     * applies to every new handshake until cleared.
+     */
+    public void setSuppressDurableAckHeader(boolean suppressDurableAckHeader) {
+        this.suppressDurableAckHeader = suppressDurableAckHeader;
     }
 
     /**
-     * Forces 101 upgrade responses to carry this exact {@code X-QWP-Durable-Ack}
-     * value instead of echoing the client's requested set. Pass null to restore
-     * the echo behavior. Only takes effect on a server constructed with
-     * {@code emitDurableAckHeader}.
+     * When enabled, 101 upgrade responses omit the {@code X-QWP-Owned-By} echo, as a server that does not
+     * know the header does.
      */
-    public void setDurableAckHeaderValue(String value) {
-        this.durableAckHeaderValue = value;
-    }
-
-    public void setSuppressDurableAckHeader(boolean suppressDurableAckHeader) {
-        this.suppressDurableAckHeader = suppressDurableAckHeader;
+    public void setSuppressOwnedByEcho(boolean suppressOwnedByEcho) {
+        this.suppressOwnedByEcho = suppressOwnedByEcho;
     }
 
     /**
