@@ -4549,10 +4549,14 @@ public class QwpWebSocketSender implements Sender {
         // extend HttpClientException directly, so they fall through this
         // check and stay terminal even when replicas role-rejected in the
         // same sweep -- the contract the durable-ack paragraph below
-        // documents and relies on.
+        // documents and relies on. QwpOwnedByMismatchException stays terminal
+        // too: a writable endpoint answered 101 without confirming the owner,
+        // so the round did find a primary, one that cannot set the owner, and
+        // demoting the failure would report a missing primary instead.
         if (terminalUpgradeError != null
                 && !(lastRoleReject != null
-                && terminalUpgradeError instanceof WebSocketUpgradeException)) {
+                && terminalUpgradeError instanceof WebSocketUpgradeException
+                && !(terminalUpgradeError instanceof QwpOwnedByMismatchException))) {
             throw terminalUpgradeError;
         }
         if (lastRoleReject != null) {

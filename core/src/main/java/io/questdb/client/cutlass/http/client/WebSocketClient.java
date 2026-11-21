@@ -27,6 +27,7 @@ package io.questdb.client.cutlass.http.client;
 import io.questdb.client.HttpClientConfiguration;
 import io.questdb.client.cutlass.auth.CredentialRedaction;
 import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
+import io.questdb.client.cutlass.qwp.client.QwpOwnedByMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpVersionMismatchException;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketFrameParser;
@@ -1652,19 +1653,15 @@ public abstract class WebSocketClient implements QuietCloseable {
         // refuses it rejects the upgrade instead. No echo means a server that
         // does not know the header and ignored it, so the tables this client
         // auto-creates would not get the owner. The failure is a non-421 upgrade
-        // error: it fails the initial connect and an orphan drainer's slot, while
-        // a sender that has connected before keeps retrying it, as it retries
-        // every upgrade policy failure. It carries no status, as the server
-        // answered 101 and so did not reject the upgrade itself.
+        // error: it fails the initial connect and an orphan drainer's slot, also
+        // when another endpoint of the round answered 421, while a sender that has
+        // connected before keeps retrying it, as it retries every upgrade policy
+        // failure. It carries no status, as the server answered 101 and so did not
+        // reject the upgrade itself. See QwpOwnedByMismatchException.
         if (qwpOwnedByHeaderValue != null) {
             String echo = extractHeaderValues(response, QWP_OWNED_BY_HEADER_NAME);
             if (!qwpOwnedByHeaderValue.equals(echo)) {
-                WebSocketUpgradeException ex = new WebSocketUpgradeException(
-                        WebSocketUpgradeException.STATUS_NONE, null,
-                        "WebSocket upgrade failed: server did not confirm owned_by, "
-                        + "it cannot set the owner of auto-created tables and columns [owned_by=");
-                ex.put(qwpOwnedBy).put(", echoed=").put(echo != null ? echo : "<no X-QWP-Owned-By header>").put(']');
-                throw ex;
+                throw new QwpOwnedByMismatchException(qwpOwnedBy, echo);
             }
         }
     }

@@ -30,6 +30,7 @@ import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketClientFactory;
 import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
 import io.questdb.client.cutlass.qwp.client.QwpAuthFailedException;
+import io.questdb.client.cutlass.qwp.client.QwpOwnedByMismatchException;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
@@ -80,6 +81,46 @@ public class QwpOwnedByTest {
                             health.getLastFailure().getFailureClass());
                     Assert.assertEquals(health.toString(), 0, health.getLastFailure().getStatusCode());
                 }
+            }
+        });
+    }
+
+    @Test
+    public void testMixedRoundReportsRefusedOwner() throws Exception {
+        // A replica's 421 does not hide the primary's refusal of the owner: the round reports the refusal, as it does
+        // with the primary alone, not a missing primary.
+        TestUtils.assertMemoryLeak(() -> {
+            try (TestWebSocketServer replica = startServer(); TestWebSocketServer primary = startServer()) {
+                replica.setRejectWithRole("REPLICA");
+                primary.setRejectWithStatus(403, "Forbidden");
+                primary.setRejectBody("owned_by refused: bob is not part of group team");
+                try (Sender ignored = Sender.fromConfig(mixedRoundConfig(replica, primary))) {
+                    Assert.fail("expected build to fail");
+                } catch (QwpAuthFailedException e) {
+                    Assert.assertEquals(403, e.getStatusCode());
+                    Assert.assertEquals("owned_by refused: bob is not part of group team", e.getReason());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testMixedRoundReportsUnconfirmedOwner() throws Exception {
+        // A replica's 421 does not turn a primary that answered 101 without the owned_by echo into a missing primary:
+        // the round did find a primary, one that cannot set the owner, and reports that, as it does with the primary
+        // alone.
+        TestUtils.assertMemoryLeak(() -> {
+            try (TestWebSocketServer replica = startServer(); TestWebSocketServer primary = startServer()) {
+                replica.setRejectWithRole("REPLICA");
+                primary.setOwnedByEchoSuppressed(true);
+                try (Sender ignored = Sender.fromConfig(mixedRoundConfig(replica, primary))) {
+                    Assert.fail("expected build to fail");
+                } catch (QwpOwnedByMismatchException e) {
+                    TestUtils.assertContains(e.getMessage(), "WebSocket upgrade failed: server did not confirm owned_by, "
+                            + "it cannot set the owner of auto-created tables and columns [owned_by=" + OWNER
+                            + ", echoed=<no X-QWP-Owned-By header>]");
+                }
+                Assert.assertEquals(OWNER_ENCODED, primary.pollOwnedByRequest(5, TimeUnit.SECONDS));
             }
         });
     }
@@ -216,7 +257,7 @@ public class QwpOwnedByTest {
                 server.setOwnedByEchoSuppressed(true);
                 try (Sender ignored = Sender.fromConfig(senderConfig(server))) {
                     Assert.fail("expected build to fail");
-                } catch (WebSocketUpgradeException e) {
+                } catch (QwpOwnedByMismatchException e) {
                     TestUtils.assertContains(fullMessage(e), "WebSocket upgrade failed: server did not confirm owned_by, "
                             + "it cannot set the owner of auto-created tables and columns [owned_by=" + OWNER
                             + ", echoed=<no X-QWP-Owned-By header>]");
@@ -314,7 +355,7 @@ public class QwpOwnedByTest {
             try {
                 client.upgrade("/write/v4", null);
                 Assert.fail("expected the upgrade to fail");
-            } catch (WebSocketUpgradeException e) {
+            } catch (QwpOwnedByMismatchException e) {
                 // no status, as the server answered 101, and a non-421 upgrade error, which fails the initial
                 // connect
                 Assert.assertEquals(WebSocketUpgradeException.STATUS_NONE, e.getStatusCode());
@@ -332,6 +373,11 @@ public class QwpOwnedByTest {
             sb.append(t.getMessage()).append(" <- ");
         }
         return sb.toString();
+    }
+
+    // A connect string that walks a replica, then a primary, in one round.
+    private static String mixedRoundConfig(TestWebSocketServer replica, TestWebSocketServer primary) {
+        return "ws::addr=localhost:" + replica.getPort() + ",localhost:" + primary.getPort() + ";owned_by=" + OWNER + ";";
     }
 
     private static String senderConfig(TestWebSocketServer server) {
