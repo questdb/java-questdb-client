@@ -36,6 +36,10 @@ package io.questdb.client.cutlass.qwp.client.sf.cursor;
  * routinely produce brief windows where no current endpoint advertises
  * durable ack.
  * <p>
+ * A writable endpoint that does not confirm the sender's {@code owned_by} is
+ * the same kind of capability gap: the drainer counts it toward the same
+ * settle budget, but reports it through neither durable-ack callback.
+ * <p>
  * Listener methods run on the drainer's own thread. Implementations must
  * not block — hand off to a queue or metrics sink and return.
  */

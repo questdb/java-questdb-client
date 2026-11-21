@@ -29,12 +29,13 @@ import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
 /**
  * Server completed the WebSocket upgrade (HTTP 101) without confirming the {@code owned_by} the client named
  * in {@code X-QWP-Owned-By}: it echoed no owner, as a server without the feature does, or another one. The
- * tables and columns the connection auto-created there would not get the owner, so the upgrade fails like a
- * non-421 upgrade rejection: at the initial connect and on an orphan drainer's slot, while a sender that has
- * connected before keeps retrying it. Unlike a plain {@link WebSocketUpgradeException}, a round that also
- * met a 421 role reject does not take it for part of a failover: like a missing durable-ack echo, it comes
- * from a writable endpoint that lacks the capability, and the round reports it instead of a missing primary.
- * Carries no status ({@link #STATUS_NONE}), as the server answered 101.
+ * tables and columns the connection auto-created there would not get the owner, so the upgrade fails: the
+ * initial connect fails, while a sender that has connected before keeps retrying it. Like a missing
+ * durable-ack echo, it comes from a writable endpoint that lacks the capability, which a rolling upgrade
+ * clears: an orphan drainer gives it the same settle budget before it quarantines the slot, and a round that
+ * also met a 421 role reject does not take it for part of a failover, unlike a plain
+ * {@link WebSocketUpgradeException}, but reports it instead of a missing primary. Carries no status
+ * ({@link #STATUS_NONE}), as the server answered 101.
  */
 public final class QwpOwnedByMismatchException extends WebSocketUpgradeException {
     public QwpOwnedByMismatchException(String ownedBy, String echo) {

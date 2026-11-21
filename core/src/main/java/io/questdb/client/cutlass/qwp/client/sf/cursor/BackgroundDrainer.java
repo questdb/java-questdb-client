@@ -33,6 +33,7 @@ import io.questdb.client.cutlass.qwp.client.QwpAuthFailedException;
 import io.questdb.client.cutlass.qwp.client.QwpCredentialUnavailableException;
 import io.questdb.client.cutlass.qwp.client.QwpDurableAckMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpIngressRoleRejectedException;
+import io.questdb.client.cutlass.qwp.client.QwpOwnedByMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpRoleMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpVersionMismatchException;
 import org.jetbrains.annotations.TestOnly;
@@ -63,9 +64,10 @@ import java.util.function.Consumer;
  *   <li>Close everything in reverse order; release the lock.</li>
  * </ol>
  * <p>
- * On terminal failure (auth-rejection on reconnect, a cluster-wide durable-ack
- * capability gap that exhausts its settle budget, corrupt or incomplete durable
- * recovery state), the drainer drops a
+ * On terminal failure (auth-rejection on reconnect, a cluster-wide capability
+ * gap -- no durable ack, or an {@code owned_by} no endpoint confirms -- that
+ * exhausts its settle budget, corrupt or incomplete durable recovery state), the
+ * drainer drops a
  * {@link OrphanScanner#FAILED_SENTINEL_NAME} sentinel into the slot before
  * exiting. Future scans skip the slot until an operator clears the sentinel —
  * bounded automatic retry, then human-in-the-loop. Operational setup failures
@@ -77,10 +79,12 @@ import java.util.function.Consumer;
 public final class BackgroundDrainer implements Runnable {
 
     /**
-     * Cap on consecutive {@link QwpDurableAckMismatchException} attempts at
-     * initial connect before the drainer escalates to a {@code .failed}
-     * sentinel. Applies ONLY to a genuine cluster-wide durable-ack capability
-     * gap (a server that upgrades but does not advertise durable ack); a
+     * Cap on consecutive capability-gap attempts at initial connect before the
+     * drainer escalates to a {@code .failed} sentinel. Applies ONLY to a genuine
+     * cluster-wide capability gap: a server that upgrades but does not advertise
+     * durable ack ({@link QwpDurableAckMismatchException}), or does not confirm
+     * the owner named in {@code owned_by} ({@link QwpOwnedByMismatchException}),
+     * both counted in one episode; a
      * transient all-replica failover window (role reject) is retried
      * indefinitely and is never subject to this cap (Invariant B). The
      * wall-clock budget {@code reconnectMaxDurationMillis} also caps this
@@ -381,7 +385,10 @@ public final class BackgroundDrainer implements Runnable {
      * configured endpoint per attempt and only throws
      * {@link QwpDurableAckMismatchException} when none of them advertise
      * durable ack -- i.e. the symptom of a misconfigured cluster or a
-     * rolling-upgrade transient.
+     * rolling-upgrade transient. A writable endpoint that answers 101 without
+     * confirming the requested {@code owned_by}
+     * ({@link QwpOwnedByMismatchException}) is the same kind of gap and shares
+     * the budget below.
      * <p>
      * Blocking foreground startup keeps its fail-fast policy, while asynchronous
      * foreground startup and reconnect keep buffering and retrying through a
@@ -395,7 +402,8 @@ public final class BackgroundDrainer implements Runnable {
      * exactly as the original single-shot path did.
      * <p>
      * The budget measures a capability-gap <i>episode</i>: consecutive
-     * {@link QwpDurableAckMismatchException} sweeps only. Transient
+     * {@link QwpDurableAckMismatchException} or {@link QwpOwnedByMismatchException}
+     * sweeps only. Transient
      * conditions -- an all-replica failover window (role reject) or a
      * transport error -- are retried indefinitely (Invariant B) and never
      * consume the budget. Either transient restarts the attempt count and wall
@@ -471,7 +479,7 @@ public final class BackgroundDrainer implements Runnable {
         long lastReplicaWarnNanos = 0L;
         long lastTransportWarnNanos = 0L;
         while (!stopRequested) {
-            // True only for a genuine durable-ack CAPABILITY gap, which is
+            // True only for a genuine CAPABILITY gap, which is
             // bounded by the settle budget / attempt cap. A transient all-replica
             // failover window (role reject) is retried indefinitely under
             // Invariant B and leaves this false, so its backoff is never clamped
@@ -479,6 +487,76 @@ public final class BackgroundDrainer implements Runnable {
             boolean boundedByBudget = false;
             try {
                 return clientFactory.reconnect();
+            } catch (QwpDurableAckMismatchException | QwpOwnedByMismatchException e) {
+                // Genuine cluster-wide CAPABILITY gap: a server upgraded but does
+                // not advertise durable ack, or it completed the upgrade without
+                // confirming the owner named in owned_by, as a server without
+                // that feature does. Unlike a role reject this will not clear by
+                // waiting for a promotion, so it stays terminal for the drainer --
+                // give the cluster a bounded settle budget (rolling upgrade, or a
+                // failover back to an upgraded node), then quarantine the slot.
+                // Both gaps count toward one episode: each is a sweep that found
+                // the cluster still short of a capability this slot's replay needs.
+                // Caught ahead of the auth/upgrade arm, which would otherwise take
+                // QwpOwnedByMismatchException, a WebSocketUpgradeException, for a
+                // rejected upgrade and quarantine the slot on its first sweep.
+                final boolean isDurableAckGap = e instanceof QwpDurableAckMismatchException;
+                capabilityGapAttempts++;
+                // Symmetry with the arm below, which restarts the capability-gap episode because an auth
+                // rejection says nothing about a node's capabilities: a capability gap says nothing about the
+                // credential either. We reached a node and it answered - it simply lacks the capability -
+                // so this is not time the credential spent REJECTED, and charging it to the rotating-401
+                // dwell would let a rolling upgrade satisfy that floor for free. The settle budget below can
+                // legitimately run for the whole reconnect budget, which is exactly the span the dwell is
+                // meant to require of an uninterrupted rejection.
+                firstDynamicCredentialAuthFailureNanos = 0L;
+                long now = System.nanoTime();
+                if (lastCapabilityGapNanos != 0L) {
+                    // Charge only the interval since the PREVIOUS gap sweep,
+                    // and only when no transient error interrupted it. Time
+                    // spent in a transient window -- before the first gap or
+                    // between two gaps -- is never charged to the episode.
+                    capabilityGapElapsedNanos += now - lastCapabilityGapNanos;
+                }
+                lastCapabilityGapNanos = now;
+                long elapsedMs = capabilityGapElapsedNanos / 1_000_000L;
+                boolean exhausted = capabilityGapAttempts >= DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS
+                        || capabilityGapElapsedNanos >= reconnectBudgetNanos;
+                BackgroundDrainerListener l = listener;
+                if (exhausted) {
+                    LOG.error("drainer giving up on slot {} after {} capability-gap attempts ({}ms): {}",
+                            slotPath, capabilityGapAttempts, elapsedMs, e.getMessage());
+                    // The listener reports durable ack only, see BackgroundDrainerListener.
+                    if (isDurableAckGap && l != null) {
+                        try {
+                            l.onDurableAckPersistentFailure(slotPath, capabilityGapAttempts, elapsedMs);
+                        } catch (Throwable cb) {
+                            LOG.warn("drainer listener onDurableAckPersistentFailure threw: {}",
+                                    cb.getMessage());
+                        }
+                    }
+                    lastErrorMessage = e.getMessage();
+                    String reason = (isDurableAckGap
+                            ? "durable-ack persistently unavailable after "
+                            : "owned_by persistently unconfirmed after ")
+                            + capabilityGapAttempts + " attempts: " + e.getMessage();
+                    OrphanScanner.markFailed(slotPath, reason);
+                    dispatchDataLoss(reason);
+                    outcome = DrainOutcome.FAILED;
+                    return null;
+                }
+                boundedByBudget = true;
+                if (isDurableAckGap && l != null) {
+                    try {
+                        l.onDurableAckUnavailable(slotPath, capabilityGapAttempts);
+                    } catch (Throwable cb) {
+                        LOG.warn("drainer listener onDurableAckUnavailable threw: {}",
+                                cb.getMessage());
+                    }
+                }
+                LOG.warn("drainer slot {} attempt {}: {}, retrying after backoff",
+                        slotPath, capabilityGapAttempts,
+                        isDurableAckGap ? "durable-ack unavailable" : "owned_by not confirmed");
             } catch (QwpAuthFailedException | WebSocketUpgradeException e) {
                 // A non-421 upgrade reject, and a 401/403 against a CONSTANT credential, are genuinely
                 // non-retriable across the cluster: waiting will not fix them, so quarantine immediately
@@ -590,64 +668,6 @@ public final class BackgroundDrainer implements Runnable {
                             slotPath, roleRejectAttempts);
                     lastReplicaWarnNanos = nowWarn;
                 }
-            } catch (QwpDurableAckMismatchException e) {
-                // Genuine cluster-wide durable-ack CAPABILITY gap: a server
-                // upgraded but does not advertise durable ack. Unlike a role
-                // reject this will not clear by waiting for a promotion, so it
-                // stays terminal for the drainer -- give the cluster a bounded
-                // settle budget (rolling upgrade), then quarantine the slot.
-                capabilityGapAttempts++;
-                // Symmetry with the arm above, which restarts the capability-gap episode because an auth
-                // rejection says nothing about a node's batch cap: a capability gap says nothing about the
-                // credential either. We reached a node and it answered - it simply cannot do durable ack -
-                // so this is not time the credential spent REJECTED, and charging it to the rotating-401
-                // dwell would let a rolling upgrade satisfy that floor for free. The settle budget below can
-                // legitimately run for the whole reconnect budget, which is exactly the span the dwell is
-                // meant to require of an uninterrupted rejection.
-                firstDynamicCredentialAuthFailureNanos = 0L;
-                long now = System.nanoTime();
-                if (lastCapabilityGapNanos != 0L) {
-                    // Charge only the interval since the PREVIOUS gap sweep,
-                    // and only when no transient error interrupted it. Time
-                    // spent in a transient window -- before the first gap or
-                    // between two gaps -- is never charged to the episode.
-                    capabilityGapElapsedNanos += now - lastCapabilityGapNanos;
-                }
-                lastCapabilityGapNanos = now;
-                long elapsedMs = capabilityGapElapsedNanos / 1_000_000L;
-                boolean exhausted = capabilityGapAttempts >= DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS
-                        || capabilityGapElapsedNanos >= reconnectBudgetNanos;
-                BackgroundDrainerListener l = listener;
-                if (exhausted) {
-                    LOG.error("drainer giving up on slot {} after {} durable-ack-mismatch attempts ({}ms): {}",
-                            slotPath, capabilityGapAttempts, elapsedMs, e.getMessage());
-                    if (l != null) {
-                        try {
-                            l.onDurableAckPersistentFailure(slotPath, capabilityGapAttempts, elapsedMs);
-                        } catch (Throwable cb) {
-                            LOG.warn("drainer listener onDurableAckPersistentFailure threw: {}",
-                                    cb.getMessage());
-                        }
-                    }
-                    lastErrorMessage = e.getMessage();
-                    String reason = "durable-ack persistently unavailable after "
-                            + capabilityGapAttempts + " attempts: " + e.getMessage();
-                    OrphanScanner.markFailed(slotPath, reason);
-                    dispatchDataLoss(reason);
-                    outcome = DrainOutcome.FAILED;
-                    return null;
-                }
-                boundedByBudget = true;
-                if (l != null) {
-                    try {
-                        l.onDurableAckUnavailable(slotPath, capabilityGapAttempts);
-                    } catch (Throwable cb) {
-                        LOG.warn("drainer listener onDurableAckUnavailable threw: {}",
-                                cb.getMessage());
-                    }
-                }
-                LOG.warn("drainer slot {} attempt {}: durable-ack unavailable, retrying after backoff",
-                        slotPath, capabilityGapAttempts);
             } catch (Throwable t) {
                 if (t instanceof Error) {
                     // java.lang.Error (OOM, LinkageError, StackOverflowError)
@@ -1207,8 +1227,9 @@ public final class BackgroundDrainer implements Runnable {
                             // first sweep. The loop's own failed sweep is not counted
                             // toward the fresh budget -- an off-by-one immaterial at
                             // either budget. Two classes route here:
-                            //   - capability gap: the 16 consecutive-sweep / wall-clock
-                            //     settle budget.
+                            //   - capability gap (no durable ack, or an owned_by the
+                            //     endpoint did not confirm): the 16 consecutive-sweep /
+                            //     wall-clock settle budget.
                             //   - rotating-credential 401/403 (authTerminal): the
                             //     DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS ride-out.
                             //     Only an ORPHAN loop with a dynamic credential sets it;
@@ -1218,7 +1239,7 @@ public final class BackgroundDrainer implements Runnable {
                                                 + "re-entering the rotating-401 ride-out",
                                         slotPath, t.getMessage());
                             } else {
-                                LOG.warn("drainer slot {}: durable-ack capability gap "
+                                LOG.warn("drainer slot {}: capability gap "
                                                 + "mid-drain ({}), re-entering settle budget",
                                         slotPath, t.getMessage());
                             }

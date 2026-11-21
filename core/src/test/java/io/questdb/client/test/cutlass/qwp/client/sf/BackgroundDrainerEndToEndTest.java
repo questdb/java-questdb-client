@@ -25,6 +25,11 @@
 package io.questdb.client.test.cutlass.qwp.client.sf;
 
 import io.questdb.client.Sender;
+import io.questdb.client.cutlass.http.client.WebSocketClient;
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.std.Files;
 import io.questdb.client.test.cutlass.qwp.client.QwpWireTestUtils;
@@ -43,6 +48,7 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -302,6 +308,58 @@ public class BackgroundDrainerEndToEndTest {
                     // the upgrades of the foreground sender and of the drainer, in either order
                     Assert.assertEquals("team_a", good.pollOwnedByRequest(5, TimeUnit.SECONDS));
                     Assert.assertEquals("team_a", good.pollOwnedByRequest(5, TimeUnit.SECONDS));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testDrainerRidesOutAnUnconfirmedOwnedByWindow() throws Exception {
+        // The connect walk of the sender that adopts an orphan slot reaches a writable endpoint that answers 101
+        // without the owned_by echo, as a node that a rolling upgrade has not reached yet does. The drainer rides
+        // that out within its settle budget and connects once the endpoint confirms the owner, instead of
+        // quarantining the slot on its first sweep.
+        TestUtils.assertMemoryLeak(() -> {
+            String slotPath = sfDir + "/ghost";
+            java.nio.file.Files.createDirectories(Paths.get(slotPath));
+            try (TestWebSocketServer server = new TestWebSocketServer(new SilentHandler())) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort() + ";owned_by=team_a;")) {
+                    server.setOwnedByEchoSuppressed(true);
+                    CursorWebSocketSendLoop.ReconnectFactory walk =
+                            ((QwpWebSocketSender) sender).newBackgroundReconnectFactory(() -> false);
+                    AtomicInteger sweeps = new AtomicInteger();
+                    BackgroundDrainer drainer = new BackgroundDrainer(
+                            slotPath,
+                            1L << 20,
+                            1L << 22,
+                            () -> {
+                                if (sweeps.incrementAndGet() == 3) {
+                                    // the rolling upgrade reached the endpoint
+                                    server.setOwnedByEchoSuppressed(false);
+                                }
+                                return walk.reconnect();
+                            },
+                            60_000L,
+                            1L,
+                            4L,
+                            DurableAckTiers.NONE,
+                            0L
+                    );
+                    WebSocketClient client = drainer.connectWithDurableAckRetry();
+                    try {
+                        Assert.assertNotNull("the drainer must connect once the owner is confirmed [outcome="
+                                + drainer.outcome() + ", lastError=" + drainer.getLastErrorMessage() + ']', client);
+                    } finally {
+                        if (client != null) {
+                            client.close();
+                        }
+                    }
+                    Assert.assertEquals("two unconfirmed sweeps, then the confirmed one", 3, sweeps.get());
+                    Assert.assertEquals(BackgroundDrainer.DrainOutcome.PENDING, drainer.outcome());
+                    Assert.assertFalse("an unconfirmed owner inside the settle budget must not quarantine the slot",
+                            Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
                 }
             }
         });

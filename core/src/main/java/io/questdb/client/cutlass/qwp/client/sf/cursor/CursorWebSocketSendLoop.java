@@ -27,6 +27,7 @@ package io.questdb.client.cutlass.qwp.client.sf.cursor;
 import io.questdb.client.LineSenderServerException;
 import io.questdb.client.SenderConnectionEvent;
 import io.questdb.client.SenderError;
+import io.questdb.client.cutlass.http.client.HttpClientException;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
 import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
@@ -37,6 +38,7 @@ import io.questdb.client.cutlass.qwp.client.QwpAuthFailedException;
 import io.questdb.client.cutlass.qwp.client.QwpCredentialUnavailableException;
 import io.questdb.client.cutlass.qwp.client.QwpDurableAckMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpIngressRoleRejectedException;
+import io.questdb.client.cutlass.qwp.client.QwpOwnedByMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpRoleMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpVersionMismatchException;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
@@ -532,17 +534,19 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // capability-gap recycle rests on. A CONSTANT credential never sets it (it stays fatal), and
     // foreground reconnects never set it either. Write-once alongside terminalError.
     private volatile QwpAuthFailedException authTerminal;
-    // Typed marker for a durable-ack CAPABILITY-GAP terminal: set (before the
-    // terminalError latch, so a checkError() caller that observes the latch is
-    // guaranteed to observe this marker too) when a reconnect sweep threw
-    // QwpDurableAckMismatchException. The orphan drainer consults it to route
-    // a mid-drain capability gap into its budgeted settle-retry
-    // (BackgroundDrainer.connectWithDurableAckRetry) instead of quarantining
-    // the slot on the first sweep. Foreground reconnects never set this marker;
-    // they keep retrying after a successful initial connection. Write-once alongside
-    // terminalError: the only writer runs on the I/O thread under the same
-    // first-writer-wins latch.
-    private volatile QwpDurableAckMismatchException capabilityGapTerminal;
+    // Typed marker for a CAPABILITY-GAP terminal: set (before the terminalError
+    // latch, so a checkError() caller that observes the latch is guaranteed to
+    // observe this marker too) when a reconnect sweep reached a writable endpoint
+    // that lacks a capability the sender asked for: it threw
+    // QwpDurableAckMismatchException, or, on an ORPHAN loop,
+    // QwpOwnedByMismatchException (the endpoint did not confirm owned_by). The
+    // orphan drainer consults it to route a mid-drain capability gap into its
+    // budgeted settle-retry (BackgroundDrainer.connectWithDurableAckRetry) instead
+    // of quarantining the slot on the first sweep. Foreground reconnects never set
+    // this marker; they keep retrying after a successful initial connection.
+    // Write-once alongside terminalError: the only writer runs on the I/O thread
+    // under the same first-writer-wins latch.
+    private volatile HttpClientException capabilityGapTerminal;
     // Failed-stop hand-off callback: set when an owner could not stop the I/O
     // thread and must defer worker-reachable cleanup until the thread exits.
     // Read strictly after shutdownLatch.countDown(); see delegateClose().
@@ -1349,8 +1353,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
-     * The typed durable-ack capability-gap terminal, or {@code null} if the
-     * loop's terminal (if any) is a different failure class. Non-null only
+     * The typed capability-gap terminal -- a {@link QwpDurableAckMismatchException},
+     * or on an orphan loop a {@link QwpOwnedByMismatchException} -- or {@code null}
+     * if the loop's terminal (if any) is a different failure class. Non-null only
      * after {@link #checkError()} started throwing: the marker is written
      * before the {@code terminalError} latch, both on the I/O thread.
      * <p>
@@ -1361,7 +1366,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * terminal). Package-private on purpose -- the foreground sender must
      * not branch on it (spec'd loud-fail, sf-client.md section 8.1).
      */
-    QwpDurableAckMismatchException capabilityGapTerminal() {
+    HttpClientException capabilityGapTerminal() {
         return capabilityGapTerminal;
     }
 
@@ -2192,6 +2197,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     final boolean rotatingCredentialReject = reconnectPolicy == ReconnectPolicy.ORPHAN
                             && e instanceof QwpAuthFailedException
                             && reconnectFactory.hasDynamicCredential();
+                    // A 101 that did not confirm the owner named in owned_by rejected nothing: the writable
+                    // endpoint lacks the feature, as one without durable ack lacks that, and a rolling upgrade
+                    // or a failover back to an upgraded node clears it. Hand it back as a RECOVERABLE
+                    // capability gap, so BackgroundDrainer gives it the same settle budget as a missing
+                    // durable-ack echo instead of quarantining on the first sweep. Gated on ORPHAN like the
+                    // rotating-credential case: an INITIALIZING foreground still fails fast on it.
+                    final boolean ownedByCapabilityGap = reconnectPolicy == ReconnectPolicy.ORPHAN
+                            && e instanceof QwpOwnedByMismatchException;
                     if (rotatingCredentialReject) {
                         if (terminalError == null) {
                             // Publish the marker before terminalError, the volatile first-writer-wins
@@ -2200,6 +2213,15 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                         }
                         LOG.warn("rotating credential rejected during {} -- handing the slot back to the "
                                         + "drainer to retry with a freshly pulled token: {}",
+                                phase, e.getMessage());
+                    } else if (ownedByCapabilityGap) {
+                        if (terminalError == null) {
+                            // Publish the marker before terminalError, the volatile first-writer-wins
+                            // latch the owner observes -- same ordering as the durable-ack arm below.
+                            capabilityGapTerminal = e;
+                        }
+                        LOG.warn("owned_by not confirmed during {} -- handing the slot back to the drainer's "
+                                        + "capability-gap settle budget: {}",
                                 phase, e.getMessage());
                     } else {
                         // Orphans return control to their quarantine owner.

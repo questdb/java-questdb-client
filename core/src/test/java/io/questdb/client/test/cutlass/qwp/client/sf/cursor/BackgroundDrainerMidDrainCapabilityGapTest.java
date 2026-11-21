@@ -29,6 +29,7 @@ import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketClientFactory;
 import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
 import io.questdb.client.cutlass.qwp.client.QwpDurableAckMismatchException;
+import io.questdb.client.cutlass.qwp.client.QwpOwnedByMismatchException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerListener;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
@@ -356,6 +357,38 @@ public class BackgroundDrainerMidDrainCapabilityGapTest {
     }
 
     @Test
+    public void testMidDrainPersistentlyUnconfirmedOwnedByExhaustsBudgetThenQuarantines() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            seedSlot(SEEDED_FRAMES);
+            GapScenarioHandler handler = new GapScenarioHandler(/* dropFirstConnection */ true);
+            try (TestWebSocketServer server = new TestWebSocketServer(handler, true)) {
+                server.start();
+                assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                // No endpoint ever confirms the owner: every sweep after the drop throws.
+                ScriptedWireFactory factory = new ScriptedWireFactory(
+                        server.getPort(), 2, Integer.MAX_VALUE,
+                        () -> new QwpOwnedByMismatchException("team_a", null));
+                BackgroundDrainer drainer = newDrainer(factory);
+                CountingListener listener = new CountingListener();
+                drainer.setListener(listener);
+
+                runToCompletion(drainer);
+
+                int budget = BackgroundDrainer.DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS;
+                assertEquals(BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
+                assertTrue("a persistently unconfirmed owner must quarantine after the budget",
+                        Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+                // 1 healthy connect + 1 loop reconnect sweep (latches the loop) + the full budget of re-entered
+                // sweeps: the escalation goes through the settle budget, not the wire-error path.
+                assertEquals(2 + budget, factory.attempts());
+                // the durable-ack callbacks report durable ack only
+                assertEquals(0, listener.unavailableAttempts.size());
+                assertEquals(0, listener.persistentFailures.get());
+            }
+        });
+    }
+
+    @Test
     public void testMidDrainTerminalUpgradeErrorStillQuarantinesImmediately() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             seedSlot(SEEDED_FRAMES);
@@ -379,6 +412,41 @@ public class BackgroundDrainerMidDrainCapabilityGapTest {
                 assertTrue(Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
                 assertEquals("terminal upgrade error must not consume gap sweeps",
                         2, factory.attempts());
+                assertEquals(0, listener.unavailableAttempts.size());
+                assertEquals(0, listener.persistentFailures.get());
+            }
+        });
+    }
+
+    @Test
+    public void testMidDrainUnconfirmedOwnedByGetsSettleBudgetNotQuarantine() throws Exception {
+        // The wire drops mid-drain and the reconnect sweeps land on a writable node that answers 101 without
+        // confirming owned_by, as a node not upgraded yet does. That is a capability gap like a missing
+        // durable-ack echo, not a rejected upgrade: the drainer re-enters the settle budget, and drains the slot
+        // once a node that confirms the owner is back.
+        TestUtils.assertMemoryLeak(() -> {
+            seedSlot(SEEDED_FRAMES);
+            GapScenarioHandler handler = new GapScenarioHandler(/* dropFirstConnection */ true);
+            try (TestWebSocketServer server = new TestWebSocketServer(handler, true)) {
+                server.start();
+                assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                // Call 1: healthy connect, then the drop. Calls 2-4: no owner confirmation. Call 5+: healthy.
+                ScriptedWireFactory factory = new ScriptedWireFactory(
+                        server.getPort(), 2, 4,
+                        () -> new QwpOwnedByMismatchException("team_a", null));
+                BackgroundDrainer drainer = newDrainer(factory);
+                CountingListener listener = new CountingListener();
+                drainer.setListener(listener);
+
+                runToCompletion(drainer);
+
+                assertEquals("an unconfirmed owner inside the settle budget must not quarantine the slot",
+                        BackgroundDrainer.DrainOutcome.SUCCESS, drainer.outcome());
+                assertFalse("no .failed sentinel after a successful drain",
+                        Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+                // Stopping at 2 means the drainer latched terminal on the first unconfirmed sweep.
+                assertTrue("expected the drainer to retry through the gap, attempts=" + factory.attempts(),
+                        factory.attempts() >= 5);
                 assertEquals(0, listener.unavailableAttempts.size());
                 assertEquals(0, listener.persistentFailures.get());
             }

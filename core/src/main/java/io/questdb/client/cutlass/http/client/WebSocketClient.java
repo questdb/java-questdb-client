@@ -1652,12 +1652,13 @@ public abstract class WebSocketClient implements QuietCloseable {
         // A server that accepts the owner echoes it in X-QWP-Owned-By; one that
         // refuses it rejects the upgrade instead. No echo means a server that
         // does not know the header and ignored it, so the tables this client
-        // auto-creates would not get the owner. The failure is a non-421 upgrade
-        // error: it fails the initial connect and an orphan drainer's slot, also
-        // when another endpoint of the round answered 421, while a sender that has
-        // connected before keeps retrying it, as it retries every upgrade policy
-        // failure. It carries no status, as the server answered 101 and so did not
-        // reject the upgrade itself. See QwpOwnedByMismatchException.
+        // auto-creates would not get the owner. The failure fails the initial
+        // connect, also when another endpoint of the round answered 421, while a
+        // sender that has connected before keeps retrying it, as it retries every
+        // upgrade policy failure, and an orphan drainer retries it within its
+        // capability-gap settle budget, as it does a missing durable-ack echo. It
+        // carries no status, as the server answered 101 and so did not reject the
+        // upgrade itself. See QwpOwnedByMismatchException.
         if (qwpOwnedByHeaderValue != null) {
             String echo = extractHeaderValues(response, QWP_OWNED_BY_HEADER_NAME);
             if (!qwpOwnedByHeaderValue.equals(echo)) {

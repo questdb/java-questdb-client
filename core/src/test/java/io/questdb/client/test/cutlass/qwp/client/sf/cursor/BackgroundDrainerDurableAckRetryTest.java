@@ -36,6 +36,7 @@ import io.questdb.client.cutlass.qwp.client.QwpAuthFailedException;
 import io.questdb.client.std.Os;
 import io.questdb.client.cutlass.qwp.client.QwpDurableAckMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpIngressRoleRejectedException;
+import io.questdb.client.cutlass.qwp.client.QwpOwnedByMismatchException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerListener;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
@@ -799,6 +800,100 @@ public class BackgroundDrainerDurableAckRetryTest {
             assertEquals(0, listener.persistentFailures.get());
             assertEquals(BackgroundDrainer.DrainOutcome.PENDING, drainer.outcome());
             assertFalse(Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+        });
+    }
+
+    @Test(timeout = 60_000)
+    public void testRetriesOnUnconfirmedOwnedByThenSucceeds() throws Exception {
+        // A writable endpoint that answers 101 without confirming owned_by lacks the feature, as one without
+        // durable ack lacks that, and a rolling upgrade clears it: the drainer rides it out within the settle
+        // budget instead of quarantining the slot on the first sweep, like a non-421 upgrade reject.
+        assertMemoryLeak(() -> {
+            CountingListener listener = new CountingListener();
+            int failTimes = 5;
+            ScriptedFactory factory = ScriptedFactory.failingTimes(failTimes,
+                    () -> new QwpOwnedByMismatchException("team_a", null));
+            BackgroundDrainer drainer = newDrainer(factory);
+            drainer.setListener(listener);
+            List<SenderError> captured = Collections.synchronizedList(new ArrayList<SenderError>());
+            drainer.setErrorSink(captured::add);
+
+            WebSocketClient out = drainer.connectWithDurableAckRetry();
+
+            assertSame(factory.successSentinel(), out);
+            assertEquals(failTimes + 1, factory.attempts());
+            assertEquals(BackgroundDrainer.DrainOutcome.PENDING, drainer.outcome());
+            assertFalse(Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+            assertEquals("nothing was abandoned: " + captured, 0, captured.size());
+            // the durable-ack callbacks report durable ack only
+            assertEquals(0, listener.unavailableAttempts.size());
+            assertEquals(0, listener.persistentFailures.get());
+        });
+    }
+
+    @Test(timeout = 60_000)
+    public void testUnconfirmedOwnedByEscalatesAfterTheSettleBudget() throws Exception {
+        // A cluster that never confirms the owner is quarantined once the settle budget runs out, with a reason
+        // that names owned_by.
+        assertMemoryLeak(() -> {
+            CountingListener listener = new CountingListener();
+            ScriptedFactory factory = ScriptedFactory.alwaysFailing(
+                    () -> new QwpOwnedByMismatchException("team_a", null));
+            BackgroundDrainer drainer = newDrainer(factory);
+            drainer.setListener(listener);
+            List<SenderError> captured = Collections.synchronizedList(new ArrayList<SenderError>());
+            drainer.setErrorSink(captured::add);
+
+            WebSocketClient out = drainer.connectWithDurableAckRetry();
+
+            assertNull(out);
+            assertEquals(BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
+            int threshold = BackgroundDrainer.DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS;
+            assertEquals(threshold, factory.attempts());
+            assertTrue(Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+            assertEquals("exactly one abandonment report: " + captured, 1, captured.size());
+            SenderError err = captured.get(0);
+            assertEquals(SenderError.Category.DATA_LOSS, err.getCategory());
+            assertEquals(SenderError.Policy.ABANDONED, err.getAppliedPolicy());
+            assertTrue("reason must name the unconfirmed owner [msg=" + err.getServerMessage() + ']',
+                    err.getServerMessage() != null && err.getServerMessage().startsWith(
+                            "owned_by persistently unconfirmed after " + threshold + " attempts: "));
+            assertEquals(0, listener.unavailableAttempts.size());
+            assertEquals(0, listener.persistentFailures.get());
+        });
+    }
+
+    @Test(timeout = 60_000)
+    public void testDurableAckAndOwnedByGapsShareOneSettleBudget() throws Exception {
+        // Either gap is a sweep that found the cluster short of a capability the replay needs, so sweeps that
+        // alternate between the two are one uninterrupted episode, not two budgets of their own.
+        assertMemoryLeak(() -> {
+            CountingListener listener = new CountingListener();
+            AtomicInteger sweep = new AtomicInteger();
+            ScriptedFactory factory = ScriptedFactory.alwaysFailing(() -> sweep.incrementAndGet() % 2 == 1
+                    ? new QwpOwnedByMismatchException("team_a", null)
+                    : new QwpDurableAckMismatchException("h", 1234, "primary"));
+            BackgroundDrainer drainer = newDrainer(factory);
+            drainer.setListener(listener);
+
+            WebSocketClient out = drainer.connectWithDurableAckRetry();
+
+            assertNull(out);
+            assertEquals(BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
+            int threshold = BackgroundDrainer.DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS;
+            assertEquals("the two gaps must share one budget", threshold, factory.attempts());
+            assertTrue(Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+            // Only the durable-ack sweeps, the even ones, fire the durable-ack callbacks, numbered within the
+            // shared episode. With an even threshold the last sweep is one of them, so it reports the persistent
+            // failure instead of the unavailability.
+            assertEquals("the assertions below expect an even threshold", 0, threshold % 2);
+            List<Integer> expectedUnavailable = new ArrayList<>();
+            for (int attempt = 2; attempt < threshold; attempt += 2) {
+                expectedUnavailable.add(attempt);
+            }
+            assertEquals(expectedUnavailable, listener.unavailableAttempts);
+            assertEquals(1, listener.persistentFailures.get());
+            assertEquals(threshold, listener.lastPersistentTotalAttempts.get());
         });
     }
 
