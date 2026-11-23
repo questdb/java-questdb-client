@@ -126,6 +126,35 @@ public class QwpOwnedByTest {
     }
 
     @Test
+    public void testMixedRoundReportsUnconfirmedOwnerAfterPlainUpgradeFailure() throws Exception {
+        // The round meets a plain upgrade failure first, such as a proxy's 503 for a node that is down, then a
+        // primary that answers 101 without the owned_by echo, then a replica's 421. The 421 turns the 503 into part
+        // of a failover, but not the missing echo: the round reports the owner the primary cannot set, as it does when
+        // it meets the missing echo first, with the 503 as a suppressed diagnostic.
+        TestUtils.assertMemoryLeak(() -> {
+            try (
+                    TestWebSocketServer proxy = startServer();
+                    TestWebSocketServer primary = startServer();
+                    TestWebSocketServer replica = startServer()
+            ) {
+                proxy.setRejectWithStatus(503, "Service Unavailable");
+                primary.setOwnedByEchoSuppressed(true);
+                replica.setRejectWithRole("REPLICA");
+                try (Sender ignored = Sender.fromConfig(mixedRoundConfig(proxy, primary, replica))) {
+                    Assert.fail("expected build to fail");
+                } catch (QwpOwnedByMismatchException e) {
+                    TestUtils.assertContains(e.getMessage(), "WebSocket upgrade failed: server did not confirm owned_by, "
+                            + "it cannot set the owner of auto-created tables and columns [owned_by=" + OWNER
+                            + ", echoed=<no X-QWP-Owned-By header>]");
+                    Assert.assertEquals(1, e.getSuppressed().length);
+                    Assert.assertEquals(503, ((WebSocketUpgradeException) e.getSuppressed()[0]).getStatusCode());
+                }
+                Assert.assertEquals(OWNER_ENCODED, primary.pollOwnedByRequest(5, TimeUnit.SECONDS));
+            }
+        });
+    }
+
+    @Test
     public void testNoHeaderWithoutOwnedBy() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             try (TestWebSocketServer server = startServer()) {
@@ -375,9 +404,16 @@ public class QwpOwnedByTest {
         return sb.toString();
     }
 
-    // A connect string that walks a replica, then a primary, in one round.
-    private static String mixedRoundConfig(TestWebSocketServer replica, TestWebSocketServer primary) {
-        return "ws::addr=localhost:" + replica.getPort() + ",localhost:" + primary.getPort() + ";owned_by=" + OWNER + ";";
+    // A connect string that walks the servers in the order given, in one round.
+    private static String mixedRoundConfig(TestWebSocketServer... servers) {
+        StringBuilder sb = new StringBuilder("ws::addr=");
+        for (int i = 0; i < servers.length; i++) {
+            if (i > 0) {
+                sb.append(',');
+            }
+            sb.append("localhost:").append(servers[i].getPort());
+        }
+        return sb.append(";owned_by=").append(OWNER).append(';').toString();
     }
 
     private static String senderConfig(TestWebSocketServer server) {

@@ -27,6 +27,7 @@ package io.questdb.client.test.cutlass.qwp.client;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.QwpDurableAckMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpRoleMismatchException;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
@@ -303,6 +304,57 @@ public class WriteFailoverTest {
         } finally {
             r1.close();
             r2.close();
+        }
+    }
+
+    @Test
+    public void testMixedSweepCapabilityGapOutranksDemotedUpgradeError() throws Exception {
+        // Mixed connect sweep: [node(503), primary without durable ack,
+        // replica(421+role)] for a sender that requests durable ack. The
+        // 421 demotes the 503 latched first, but not the capability gap the
+        // primary showed: a writable endpoint lacks durable ack, which no
+        // promotion fixes, so the round must stay terminal with the
+        // durable-ack mismatch, as it does when the sweep meets the gap
+        // first, instead of reporting a missing primary. The demoted 503
+        // rides along as a suppressed diagnostic.
+        AckHandler ack = new AckHandler();
+        TestWebSocketServer sick = new TestWebSocketServer(ack);
+        int port1 = sick.getPort();
+        sick.setRejectWithStatus(503, "Service Unavailable");
+        TestWebSocketServer primary = new TestWebSocketServer(ack, false, "PRIMARY");
+        int port2 = primary.getPort();
+        TestWebSocketServer replica = new TestWebSocketServer(ack);
+        int port3 = replica.getPort();
+        replica.setRejectWithRole("REPLICA");
+        try {
+            sick.start();
+            primary.start();
+            replica.start();
+            Assert.assertTrue(sick.awaitStart(5, TimeUnit.SECONDS));
+            Assert.assertTrue(primary.awaitStart(5, TimeUnit.SECONDS));
+            Assert.assertTrue(replica.awaitStart(5, TimeUnit.SECONDS));
+
+            // Off-mode walk: a fresh round visits the endpoints in address
+            // order, so the 503 is the first non-421 error of the round.
+            try (Sender ignored = Sender.builder(Sender.Transport.WEBSOCKET)
+                    .address("localhost:" + port1)
+                    .address("localhost:" + port2)
+                    .address("localhost:" + port3)
+                    .requestDurableAck(true)
+                    .build()) {
+                Assert.fail("expected the mixed-sweep connect to fail");
+            } catch (QwpDurableAckMismatchException e) {
+                Assert.assertTrue("must name the primary without durable ack: " + e.getMessage(),
+                        e.getMessage().contains("port=" + port2));
+                Assert.assertEquals(1, e.getSuppressed().length);
+                Assert.assertEquals(503, ((WebSocketUpgradeException) e.getSuppressed()[0]).getStatusCode());
+            } catch (QwpRoleMismatchException e) {
+                throw new AssertionError("capability gap misreported as a missing primary: " + e.getMessage(), e);
+            }
+        } finally {
+            sick.close();
+            primary.close();
+            replica.close();
         }
     }
 

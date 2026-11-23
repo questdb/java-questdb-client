@@ -4229,6 +4229,11 @@ public class QwpWebSocketSender implements Sender {
         // -- they throw immediately because a rejected credential is uniformly
         // rejected across the cluster.
         HttpClientException terminalUpgradeError = null;
+        // The first capability gap of the round: a writable endpoint that answered 101 without the durable ack or the
+        // owner the sender asked for. Usually terminalUpgradeError latches it, but a plain non-421 upgrade error met
+        // earlier takes the latch first, and the epilogue demotes that error when the round also met a 421. The gap
+        // must still stand then, see the epilogue.
+        HttpClientException capabilityGapError = null;
         QwpIngressRoleRejectedException lastRoleReject = null;
         Endpoint lastEndpoint = null;
         // Honor a close/stop that raced this (re)connect before doing any work - a token pull can make a
@@ -4405,6 +4410,9 @@ public class QwpWebSocketSender implements Sender {
                                 && !((WebSocketUpgradeException) classified).isRoleMismatch()))) {
                     terminalUpgradeError = classified;
                 }
+                if (capabilityGapError == null && classified instanceof QwpOwnedByMismatchException) {
+                    capabilityGapError = classified;
+                }
                 hostTracker.recordTransportError(idx, !background);
                 lastError = classified;
                 if (!background) {
@@ -4462,6 +4470,9 @@ public class QwpWebSocketSender implements Sender {
                             ep.host, ep.port, durableAckTiers, newClient.getServerDurableAckEcho());
                     if (terminalUpgradeError == null) {
                         terminalUpgradeError = ackErr;
+                    }
+                    if (capabilityGapError == null) {
+                        capabilityGapError = ackErr;
                     }
                     lastError = ackErr;
                     if (!background) {
@@ -4558,6 +4569,18 @@ public class QwpWebSocketSender implements Sender {
                 && terminalUpgradeError instanceof WebSocketUpgradeException
                 && !(terminalUpgradeError instanceof QwpOwnedByMismatchException))) {
             throw terminalUpgradeError;
+        }
+        if (capabilityGapError != null) {
+            // A plain non-421 upgrade error met before the capability gap took
+            // the latch, and the round's 421 demoted it above. The demotion
+            // holds for that error, which may be part of a failover window,
+            // but not for the gap: the round did find a writable endpoint, one
+            // that lacks the capability, so it reports that rather than a
+            // missing primary, as it does when it meets the gap first. The
+            // demoted error rides along as a suppressed diagnostic.
+            assert lastRoleReject != null && terminalUpgradeError != null;
+            capabilityGapError.addSuppressed(terminalUpgradeError);
+            throw capabilityGapError;
         }
         if (lastRoleReject != null) {
             // Every endpoint either role-rejected the /write/v4 upgrade or
