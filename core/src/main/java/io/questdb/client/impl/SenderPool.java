@@ -79,6 +79,10 @@ import java.util.function.IntFunction;
  * {@code sf_max_total_bytes}. That key therefore caps the pool as a whole:
  * growing the pool adds connections, not buffer memory. The only overshoot is
  * the minimum working set (two segments) each live sender is always granted.
+ * The budget is declared for {@code maxSize} senders: a strict transaction pins
+ * its segments until the server commits it, so one that spans segments counts
+ * only on its sender's share of the budget, and the transactions of all pooled
+ * senders fit at once instead of leaving each other's commits no room.
  * <p>
  * <b>Store-and-forward slots.</b> When the configuration enables SF
  * ({@code sf_dir} set), every sender owns an exclusive on-disk slot
@@ -557,7 +561,7 @@ public final class SenderPool implements AutoCloseable {
         }
         this.storeAndForward = probe.isStoreAndForwardEnabled();
         long budgetBytes = probe.getResolvedSfMaxTotalBytes();
-        this.segmentBudget = budgetBytes > 0 ? new SegmentBudget(budgetBytes) : null;
+        this.segmentBudget = budgetBytes > 0 ? new SegmentBudget(budgetBytes, maxSize) : null;
         this.slotBaseId = this.storeAndForward ? probe.getConfiguredSenderId() : null;
         this.sfDir = this.storeAndForward ? probe.getConfiguredSfDir() : null;
         this.slotInUse = this.storeAndForward ? new boolean[maxSize] : null;

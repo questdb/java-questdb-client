@@ -34,7 +34,9 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.BatchTooLargeForCapException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.TransactionTooLargeException;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentBudget;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
+import io.questdb.client.impl.SenderPool;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
@@ -51,6 +53,7 @@ import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -87,9 +90,19 @@ public class QwpLargeTransactionTest {
     private static final String RESET_KEEPS_ROWS_WARNING = "reset() discarded the rows not yet sent, but the "
             + "server does not support QWP rollback, so the open transaction's rows already sent stay on the "
             + "server and the next flush() commits them. Close the sender to discard them instead";
+    // The settings a refusal at a sender's share of a shared client buffer names.
+    private static final String SHARE_REMEDY = "Raise sf_max_total_bytes, lower sender_pool_max, or set sf_dir to "
+            + "keep the transaction on disk";
     // Before its first connection the sender sizes frames for the server's default frame
     // cap, not for this mock's CAP: 200 rows (~20 KB) keep each such frame within CAP.
     private static final String SMALL_FRAMES = "auto_flush_rows=200;";
+    // A strict transaction in frames of exactly 280 rows (~28 KB): two share a 64 KiB
+    // segment. A deferred frame also keeps room for the commit, three 32 KiB frames: one
+    // fits next to a single frame of 280 rows, none next to two. So k frames span
+    // ceil(k/2) segments, and with the room for the commit they need 2 more segments for
+    // odd k and 3 more for even k. A blocked append would wait 30 s.
+    private static final String STRICT_FRAMES_OF_280 = "transaction=strict;auto_flush_rows=280;auto_flush_bytes=off;"
+            + "auto_flush_interval=off;sf_max_segment_bytes=64k;sf_append_deadline_millis=30000;";
     // transaction=on in frames of exactly 280 rows (~28 KB): two fill a 64 KiB segment,
     // so the 256 KiB client buffer holds eight frames of a transaction. A blocked
     // append would wait 30 s.
@@ -671,6 +684,410 @@ public class QwpLargeTransactionTest {
                 Assert.assertEquals(1, h.frames.size());
                 Assert.assertTrue(h.frames.get(0).isCommit());
                 Assert.assertEquals(1, server.upgradeRequestCount());
+            }
+        });
+    }
+
+    @Test
+    public void testPooledStrictCommitPastTheShareIsNotSent() throws Exception {
+        // With no auto-flush trigger at all, flush() sends the whole transaction, one
+        // frame per table, two to a 64 KiB segment. Two senders share 512 KiB, so each
+        // can count on four segments: nine tables need five, and flush() sends nothing,
+        // while eight fit and commit as one transaction. The refused transaction stays
+        // open, and once it outgrows the whole buffer, at seventeen tables in nine
+        // segments, the refusal says so: only a larger buffer could take it.
+        assertMemoryLeak(() -> {
+            String config = "auto_flush=off;auto_flush_bytes=off;sf_max_segment_bytes=64k;sf_max_total_bytes=512k;"
+                    + "sender_pool_max=2;query_pool_min=0;";
+            TxnServer h = new TxnServer();
+            long refusedBytes = -1;
+            try (TestWebSocketServer server = start(h, CAP)) {
+                try (QuestDB db = QuestDB.connect(conf(server) + config)) {
+                    Sender lease = db.borrowSender();
+                    writeTables(lease, 0, 9);
+                    try {
+                        lease.flush();
+                        Assert.fail("the sender's share cannot hold the commit");
+                    } catch (TransactionTooLargeException e) {
+                        refusedBytes = assertShareRefusal(e, 524_288, 2, "so the flush was not sent");
+                    }
+                    writeTables(lease, 9, 8);
+                    try {
+                        lease.flush();
+                        Assert.fail("the client buffer cannot hold the commit");
+                    } catch (TransactionTooLargeException e) {
+                        assertClientBufferRefusal(e, 524_288, "so the flush was not sent");
+                    }
+                    Assert.assertEquals("nothing was sent", 0, h.frames.size());
+                    lease.rollback();
+                    // The same rows, one table per transaction: the refusal reported what
+                    // these frames add up to.
+                    for (int t = 0; t < 9; t++) {
+                        writeTables(lease, t, 1);
+                        lease.flush();
+                    }
+                    Assert.assertTrue(lease.drain(5_000));
+                    lease.close();
+                }
+                Assert.assertEquals("CCCCCCCCC", frameKinds(h));
+                Assert.assertEquals(refusedBytes, frameBytes(h));
+            }
+            h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                try (QuestDB db = QuestDB.connect(conf(server) + config)) {
+                    Sender lease = db.borrowSender();
+                    writeTables(lease, 0, 8);
+                    lease.flush();
+                    Assert.assertTrue(lease.drain(5_000));
+                    lease.close();
+                }
+                Assert.assertEquals("DDDDDDDC", frameKinds(h));
+                Assert.assertEquals(h.frames.size(), h.committedFrames().size());
+            }
+        });
+    }
+
+    @Test
+    public void testPooledStrictLeaseOfPoolOfOneKeepsTheWholeBuffer() throws Exception {
+        // A pool of one sender shares its client buffer with no other sender, so its
+        // lease's strict transaction may fill all of it, like that of a sender built on
+        // its own, on disk too: no other sender's pre-created segment can take its room.
+        // 520 KiB holds eight segments: eleven frames of 280 rows and the room for their
+        // commit, so the twelfth frame is refused.
+        assertMemoryLeak(() -> {
+            String dir = TestUtils.createTmpDir("qwp-txn-share-");
+            try {
+                for (boolean isDiskMode : new boolean[]{false, true}) {
+                    String context = isDiskMode ? "sf_dir" : "memory";
+                    TxnServer h = new TxnServer();
+                    try (TestWebSocketServer server = start(h, CAP)) {
+                        String config = conf(server) + STRICT_FRAMES_OF_280 + "sf_max_total_bytes=520k;"
+                                + (isDiskMode ? "sf_dir=" + dir + ";" : "");
+                        try (SenderPool pool = new SenderPool(config, 1, 1, 5_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                            Sender lease = pool.borrow();
+                            Refusal refusal = writeUntilTooLarge(lease, "t");
+                            Assert.assertEquals(context, 3_360, refusal.row);
+                            // On disk the budget also charges the symbol dictionary files.
+                            SegmentBudget budget = pool.getSegmentBudgetForTesting();
+                            assertClientBufferRefusal(refusal.error,
+                                    budget.getCapacityBytes() - budget.getSideFileBytes(), "so the row was not added");
+                            lease.flush();
+                            Assert.assertTrue(context, lease.drain(5_000));
+                            lease.close();
+                        }
+                        if (!isDiskMode) {
+                            // A sender built on its own refuses the same row.
+                            try (Sender s = Sender.fromConfig(config)) {
+                                Assert.assertEquals(3_360, writeUntilRefused(s, 532_480));
+                                s.flush();
+                                Assert.assertTrue(s.drain(5_000));
+                            }
+                        }
+                    }
+                    Assert.assertEquals(context, isDiskMode ? "DDDDDDDDDDDC" : "DDDDDDDDDDDCDDDDDDDDDDDC", frameKinds(h));
+                    Assert.assertEquals(context, h.frames.size(), h.committedFrames().size());
+                }
+            } finally {
+                TestUtils.removeTmpDirRec(dir);
+            }
+        });
+    }
+
+    @Test
+    public void testPooledStrictLeaseReturnEndsTheShareRefusal() throws Exception {
+        // Returning a lease whose transaction its share refused discards the transaction:
+        // the next borrower of the same sender starts with the whole share again.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                server.setRollbackSupported(true);
+                try (QuestDB db = QuestDB.connect(conf(server) + STRICT_FRAMES_OF_280
+                        + "sf_max_total_bytes=512k;query_pool_min=0;")) {
+                    Sender lease = db.borrowSender();
+                    Refusal first = writeUntilTooLarge(lease, "t");
+                    Assert.assertEquals(840, first.row);
+                    assertShareRefusal(first.error, 524_288, 4, "so the row was not added");
+                    lease.close();
+                    Sender next = db.borrowSender();
+                    Refusal second = writeUntilTooLarge(next, "t");
+                    Assert.assertEquals(840, second.row);
+                    long refusedBytes = assertShareRefusal(second.error, 524_288, 4, "so the row was not added");
+                    next.flush();
+                    Assert.assertTrue(next.drain(5_000));
+                    next.close();
+                    Assert.assertEquals("DDRDDC", frameKinds(h));
+                    Assert.assertEquals(refusedBytes, frameBytes(h, 3, 6));
+                }
+                assertRolledBackThenCommitted(h);
+            }
+        });
+    }
+
+    @Test
+    public void testPooledStrictLeasesRefuseRowsPastTheirShare() throws Exception {
+        // The senders of a pool share sf_max_total_bytes, and each may hold a strict
+        // transaction until the server commits it. Two leases used to size their
+        // transactions against the whole 512 KiB: both sent frames until together they
+        // filled it, then each commit waited for room the other held, threw after
+        // sf_append_deadline_millis, and nothing committed. A transaction that spans
+        // segments now counts only on its sender's share: two of the eight segments with
+        // four senders, and two with sixteen, whose share is less than a segment, as the
+        // budget grants every sender two segments past its cap. The third frame of 280
+        // rows spans a second segment and needs four with the room for its commit, so it
+        // is refused, and row 840 with it. Each lease commits the rows it accepted, as one
+        // transaction, in the two segments its share holds.
+        assertMemoryLeak(() -> {
+            for (int senders : new int[]{4, 16}) {
+                String context = "senders: " + senders;
+                TxnServer h = new TxnServer();
+                try (TestWebSocketServer server = start(h, CAP)) {
+                    long[] refusedBytes = new long[2];
+                    try (QuestDB db = QuestDB.connect(conf(server) + STRICT_FRAMES_OF_280
+                            + "sf_max_total_bytes=512k;sender_pool_max=" + senders + ";query_pool_min=0;")) {
+                        Sender[] leases = {db.borrowSender(), db.borrowSender()};
+                        long start = System.nanoTime();
+                        // Both transactions are open before either commits.
+                        for (int i = 0; i < 2; i++) {
+                            Refusal refusal = writeUntilTooLarge(leases[i], "t" + i);
+                            Assert.assertEquals(context, 840, refusal.row);
+                            refusedBytes[i] = assertShareRefusal(refusal.error, 524_288, senders, "so the row was not added");
+                        }
+                        for (Sender lease : leases) {
+                            lease.flush();
+                        }
+                        Assert.assertTrue(context + ": must not wait for sf_append_deadline_millis",
+                                System.nanoTime() - start < TimeUnit.SECONDS.toNanos(10));
+                        for (Sender lease : leases) {
+                            Assert.assertTrue(context, lease.drain(5_000));
+                            lease.close();
+                        }
+                    }
+                    List<List<TxnFrame>> byConnection = h.framesByConnection();
+                    Assert.assertEquals(context + ": " + h.frames, 2, byConnection.size());
+                    for (int i = 0; i < 2; i++) {
+                        Assert.assertEquals(context, "DDC", frameKinds(byConnection.get(i)));
+                        // The refusal reported the size of the transaction that committed.
+                        Assert.assertEquals(context, refusedBytes[i], frameBytes(byConnection.get(i)));
+                    }
+                    Assert.assertEquals(context, h.frames.size(), h.committedFrames().size());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testPooledStrictLeasesRefuseRowsPastTheirShareConcurrently() throws Exception {
+        // Two leases fill their transactions on two threads at once, so their frames
+        // compete for the shared client buffer. Each counts only on its own share, so
+        // neither waits for room the other holds, even with both transactions at their
+        // share's limit: with two senders and 1 MiB the share is eight segments, which
+        // hold eleven frames of 280 rows and the room for their commit, so the twelfth
+        // frame is refused.
+        assertMemoryLeak(() -> {
+            String[] configs = {"sf_max_total_bytes=512k;", "sf_max_total_bytes=1m;sender_pool_max=2;"};
+            long[] capacities = {524_288, 1_048_576};
+            int[] senders = {4, 2};
+            int[] refusedRows = {840, 3_360};
+            String[] kinds = {"DDC", "DDDDDDDDDDDC"};
+            for (int c = 0; c < configs.length; c++) {
+                String context = configs[c];
+                TxnServer h = new TxnServer();
+                try (TestWebSocketServer server = start(h, CAP)) {
+                    Refusal[] refusals = new Refusal[2];
+                    try (QuestDB db = QuestDB.connect(conf(server) + STRICT_FRAMES_OF_280 + configs[c] + "query_pool_min=0;")) {
+                        Sender[] leases = {db.borrowSender(), db.borrowSender()};
+                        CyclicBarrier barrier = new CyclicBarrier(2);
+                        Throwable[] errors = new Throwable[2];
+                        Thread[] threads = new Thread[2];
+                        long start = System.nanoTime();
+                        for (int i = 0; i < 2; i++) {
+                            final int lease = i;
+                            threads[i] = new Thread(() -> {
+                                try {
+                                    barrier.await(30, TimeUnit.SECONDS);
+                                    refusals[lease] = writeUntilTooLarge(leases[lease], "t" + lease);
+                                    // Both transactions are open, each at its largest, before
+                                    // either commits.
+                                    barrier.await(30, TimeUnit.SECONDS);
+                                    leases[lease].flush();
+                                } catch (Throwable t) {
+                                    errors[lease] = t;
+                                    barrier.reset();
+                                }
+                            });
+                            threads[i].start();
+                        }
+                        for (Thread thread : threads) {
+                            thread.join();
+                        }
+                        for (Throwable error : errors) {
+                            if (error != null) {
+                                throw new AssertionError(context, error);
+                            }
+                        }
+                        Assert.assertTrue(context + ": must not wait for sf_append_deadline_millis",
+                                System.nanoTime() - start < TimeUnit.SECONDS.toNanos(10));
+                        for (Sender lease : leases) {
+                            Assert.assertTrue(context, lease.drain(5_000));
+                            lease.close();
+                        }
+                    }
+                    List<List<TxnFrame>> byConnection = h.framesByConnection();
+                    Assert.assertEquals(context + ": " + h.frames, 2, byConnection.size());
+                    // Connections are numbered by their first frame, not by lease: compare
+                    // the sizes each refusal reported with the transactions that committed
+                    // as sets.
+                    long[] refusedBytes = new long[2];
+                    long[] committedBytes = new long[2];
+                    for (int i = 0; i < 2; i++) {
+                        Assert.assertEquals(context, refusedRows[c], refusals[i].row);
+                        refusedBytes[i] = assertShareRefusal(refusals[i].error, capacities[c], senders[c],
+                                "so the row was not added");
+                        Assert.assertEquals(context, kinds[c], frameKinds(byConnection.get(i)));
+                        committedBytes[i] = frameBytes(byConnection.get(i));
+                    }
+                    Arrays.sort(refusedBytes);
+                    Arrays.sort(committedBytes);
+                    Assert.assertArrayEquals(context, refusedBytes, committedBytes);
+                    Assert.assertEquals(context, h.frames.size(), h.committedFrames().size());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testPooledStrictShareLeavesRoomForPrefetchedSegment() throws Exception {
+        // With sf_dir, the segment manager creates each sender's next segment ahead of
+        // time, charged to the budget until the sender moves into it, which it may not do
+        // while it holds a transaction: that segment comes out of the share too. Two
+        // senders and 648 KiB: in memory the share is five segments, which hold five
+        // frames of 280 rows and the room for their commit, so the sixth frame is
+        // refused; on disk it is four, so the fourth frame is.
+        assertMemoryLeak(() -> {
+            String dir = TestUtils.createTmpDir("qwp-txn-share-");
+            try {
+                for (boolean isDiskMode : new boolean[]{false, true}) {
+                    String context = isDiskMode ? "sf_dir" : "memory";
+                    TxnServer h = new TxnServer();
+                    long refusedBytes;
+                    try (TestWebSocketServer server = start(h, CAP)) {
+                        String config = conf(server) + STRICT_FRAMES_OF_280 + "sf_max_total_bytes=648k;"
+                                + (isDiskMode ? "sf_dir=" + dir + ";" : "");
+                        try (SenderPool pool = new SenderPool(config, 1, 2, 5_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                            Sender lease = pool.borrow();
+                            Refusal refusal = writeUntilTooLarge(lease, "t");
+                            Assert.assertEquals(context, isDiskMode ? 1_120 : 1_680, refusal.row);
+                            // On disk the budget also charges the symbol dictionary files.
+                            SegmentBudget budget = pool.getSegmentBudgetForTesting();
+                            refusedBytes = assertShareRefusal(refusal.error,
+                                    budget.getCapacityBytes() - budget.getSideFileBytes(), 2, "so the row was not added");
+                            lease.flush();
+                            Assert.assertTrue(context, lease.drain(5_000));
+                            lease.close();
+                        }
+                    }
+                    Assert.assertEquals(context, isDiskMode ? "DDDC" : "DDDDDC", frameKinds(h));
+                    Assert.assertEquals(context, refusedBytes, frameBytes(h));
+                }
+            } finally {
+                TestUtils.removeTmpDirRec(dir);
+            }
+        });
+    }
+
+    @Test
+    public void testPooledStrictTransactionOfOneSegmentKeepsTheWholeBuffer() throws Exception {
+        // The share bounds only a transaction whose frames span segments. One whose
+        // frames fit a single segment needs, with its commit, at most the two segments
+        // the budget grants every sender past its cap, whatever the others hold. Held to
+        // its share, a lease of a pool of four sharing 256 KiB, whose share is less than a
+        // segment, would refuse the first frame of every strict transaction: next to the
+        // room for its commit it needs three segments. A batch that fits one frame, all a
+        // sender with no auto-flush trigger could send before, would no longer go out.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                try (QuestDB db = QuestDB.connect(conf(server) + STRICT_FRAMES_OF_280
+                        + "sf_max_total_bytes=256k;query_pool_min=0;")) {
+                    Sender lease = db.borrowSender();
+                    // Two frames, one segment.
+                    writeRows(lease, "t", 0, 560);
+                    lease.flush();
+                    // The third frame spans a second segment: the share refuses it.
+                    Refusal refusal = writeUntilTooLarge(lease, "t");
+                    Assert.assertEquals(840, refusal.row);
+                    long refusedBytes = assertShareRefusal(refusal.error, 262_144, 4, "so the row was not added");
+                    lease.flush();
+                    Assert.assertTrue(lease.drain(5_000));
+                    lease.close();
+                    Assert.assertEquals("DDcDDC", frameKinds(h));
+                    Assert.assertEquals(refusedBytes, frameBytes(h, 3, 6));
+                }
+                Assert.assertEquals(h.frames.size(), h.committedFrames().size());
+            }
+        });
+    }
+
+    @Test
+    public void testPooledStrictTransactionPastTheWholeBufferIsRefusedForIt() throws Exception {
+        // A transaction the whole client buffer cannot hold is refused for that, share or
+        // not, as on a sender of its own, since only a larger buffer can take it: with
+        // 128 KiB, two segments, the first frame of 280 rows needs three next to the room
+        // for its commit; with 256 KiB, four segments, nine tables sent by one flush()
+        // need five, more than both the buffer and the share of two segments.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                try (QuestDB db = QuestDB.connect(conf(server) + STRICT_FRAMES_OF_280
+                        + "sf_max_total_bytes=128k;sender_pool_max=2;query_pool_min=0;")) {
+                    Sender lease = db.borrowSender();
+                    Assert.assertEquals(280, writeUntilRefused(lease, 131_072));
+                    lease.flush();
+                    Assert.assertTrue(lease.drain(5_000));
+                    lease.close();
+                }
+                Assert.assertEquals("C", frameKinds(h));
+            }
+            h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                try (QuestDB db = QuestDB.connect(conf(server) + "auto_flush=off;auto_flush_bytes=off;"
+                        + "sf_max_segment_bytes=64k;sf_max_total_bytes=256k;sender_pool_max=2;query_pool_min=0;")) {
+                    Sender lease = db.borrowSender();
+                    writeTables(lease, 0, 9);
+                    try {
+                        lease.flush();
+                        Assert.fail("the client buffer cannot hold the commit");
+                    } catch (TransactionTooLargeException e) {
+                        assertClientBufferRefusal(e, 262_144, "so the flush was not sent");
+                    }
+                    lease.rollback();
+                    lease.close();
+                }
+                Assert.assertEquals("nothing was sent", 0, h.frames.size());
+            }
+        });
+    }
+
+    @Test
+    public void testPooledTransactionalLeaseCommitsInPartsAtTheWholeBuffer() throws Exception {
+        // transaction=on keeps sizing a transaction against the whole client buffer, and
+        // commits it in parts when that cannot hold it. Held to its share in a pool of
+        // four, a quarter of 256 KiB, it would split transactions that a sender of its
+        // own commits whole.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                try (QuestDB db = QuestDB.connect(conf(server) + TXN_ON_FRAMES_OF_280 + "query_pool_min=0;")) {
+                    Sender lease = db.borrowSender();
+                    writeRows(lease, "t", 0, 5_000);
+                    lease.flush();
+                    Assert.assertTrue(lease.drain(5_000));
+                    lease.close();
+                }
+                // As on a sender of its own: the buffer holds eight frames, so the ninth
+                // and the seventeenth each start a new part.
+                Assert.assertEquals("DDDDDDDDcDDDDDDDDcDC", frameKinds(h));
+                Assert.assertEquals("every frame commits", h.frames.size(), h.committedFrames().size());
             }
         });
     }
@@ -1739,6 +2156,23 @@ public class QwpLargeTransactionTest {
         return transactionBytes;
     }
 
+    // Asserts the error of a strict transaction that its sender's share of a client
+    // buffer shared by several senders cannot hold, with 64 KiB segments, and returns
+    // the transaction size it reports.
+    private static long assertShareRefusal(TransactionTooLargeException e, long ringCapacityBytes, int senders, String outcome) {
+        String message = e.getMessage();
+        String prefix = "transaction too large for this sender's share of the client buffer [transactionBytes=";
+        Assert.assertTrue(message, message.startsWith(prefix));
+        long transactionBytes = Long.parseLong(message.substring(prefix.length(), message.indexOf(',')));
+        Assert.assertTrue(message, transactionBytes > 0);
+        Assert.assertEquals(prefix + transactionBytes + ", ringCapacityBytes=" + ringCapacityBytes
+                + ", senders=" + senders + ", segmentBytes=65536]; the client holds a strict transaction until the "
+                + "server commits it, and the " + senders + " senders that share sf_max_total_bytes may each hold "
+                + "one at the same time, so a transaction that spans segments can count only on this sender's "
+                + "share, which cannot hold this one, " + outcome + ". " + SHARE_REMEDY, message);
+        return transactionBytes;
+    }
+
     // Build-time validation runs before the sender connects, so no server is needed.
     private static void assertConfigRejected(String config, String expectedMessage) {
         try {
@@ -1873,6 +2307,14 @@ public class QwpLargeTransactionTest {
         return frameBytes(h, 0, h.frames.size());
     }
 
+    private static long frameBytes(List<TxnFrame> frames) {
+        long bytes = 0;
+        for (int i = 0, n = frames.size(); i < n; i++) {
+            bytes += frames.get(i).size;
+        }
+        return bytes;
+    }
+
     // Bytes of the frames [from, to) the server received.
     private static long frameBytes(TxnServer h, int from, int to) {
         long bytes = 0;
@@ -1885,8 +2327,12 @@ public class QwpLargeTransactionTest {
     // One letter per frame the server received: D deferred, c bare commit, C commit
     // with rows, R rollback.
     private static String frameKinds(TxnServer h) {
+        return frameKinds(h.frames);
+    }
+
+    private static String frameKinds(List<TxnFrame> frames) {
         StringBuilder kinds = new StringBuilder();
-        for (TxnFrame f : h.frames) {
+        for (TxnFrame f : frames) {
             kinds.append(f.isRollback() ? 'R' : f.isDeferred() ? 'D' : f.isBareCommit() ? 'c' : 'C');
         }
         return kinds.toString();
@@ -1912,6 +2358,20 @@ public class QwpLargeTransactionTest {
         }
     }
 
+    // Writes rows 0, 1, ... of the table until the client buffer refuses one, and
+    // returns the refusal.
+    private static Refusal writeUntilTooLarge(Sender s, String table) {
+        for (int row = 0; row < 100_000; row++) {
+            try {
+                s.table(table).longColumn("v", row).stringColumn("s", PAD).atNow();
+            } catch (TransactionTooLargeException e) {
+                return new Refusal(row, e);
+            }
+        }
+        Assert.fail("the client buffer must refuse a row");
+        return null;
+    }
+
     // Writes rows 0, 1, ... of table t until the client buffer refuses one, with 64 KiB
     // segments, and returns the refused row.
     private static int writeUntilRefused(Sender s, long ringCapacityBytes) {
@@ -1925,6 +2385,17 @@ public class QwpLargeTransactionTest {
         }
         Assert.fail("the client buffer must refuse a row");
         return -1;
+    }
+
+    // A row the client buffer refused, and why.
+    private static final class Refusal {
+        final TransactionTooLargeException error;
+        final int row;
+
+        Refusal(int row, TransactionTooLargeException error) {
+            this.row = row;
+            this.error = error;
+        }
     }
 
     private static final class NoTriggerSpelling {

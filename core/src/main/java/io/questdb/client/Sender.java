@@ -2833,6 +2833,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * {@link io.questdb.client.cutlass.qwp.client.TransactionTooLargeException}
          * and is not added, and {@code close()} without {@code flush()} discards the
          * transaction instead of committing it.
+         * The senders of a pool share {@code sf_max_total_bytes} and may all hold
+         * strict transactions at once, so there a transaction that spans more than
+         * one segment counts only on its sender's share: {@code sf_max_total_bytes}
+         * divided by {@code sender_pool_max}, less one segment with {@code sf_dir}.
          * A sender with no auto-flush trigger (see {@link #disableAutoFlush()}) is
          * in this mode unless {@link #transactional(boolean)} selects the mode.
          * WebSocket transport only.
@@ -3133,7 +3137,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * {@link #storeAndForwardSharedBudget(SegmentBudget)}. The connection
          * pool behind {@link QuestDB} does that for every sender it builds,
          * so in a pool the cap bounds all pooled senders together, not each
-         * of them.
+         * of them, and a strict transaction that spans more than one segment
+         * counts only on its sender's share of the cap (see
+         * {@link #strictTransactional(boolean)}).
          */
         public LineSenderBuilder storeAndForwardMaxTotalBytes(long maxTotalBytes) {
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
@@ -3154,9 +3160,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * minimum working set: the active segment plus the one it rotates
          * into. This
          * sender's own {@code sf_max_total_bytes} then caps only the
-         * background orphan drainers it starts. The connection pool behind
-         * {@link QuestDB} builds every sender this way. WebSocket transport
-         * only.
+         * background orphan drainers it starts. A strict transaction that
+         * spans more than one segment counts only on this sender's share of
+         * the budget: its capacity divided by the senders it was built for
+         * ({@link SegmentBudget#SegmentBudget(long, int)}). The connection pool
+         * behind {@link QuestDB} builds every sender this way, on a budget
+         * built for its maximum size. WebSocket transport only.
          *
          * @param budget the shared budget, or {@code null} for a private one
          *               (the default)

@@ -753,6 +753,10 @@ public class QwpWebSocketSender implements Sender {
     // flush the client buffer last refused, for the error messages. Reset with the
     // transaction.
     private long txnRefusedBytes;
+    // Strict mode only: the flush the client buffer last refused did fit the whole
+    // buffer but not this sender's share of a buffer other senders share, for the
+    // error messages. Reset with the transaction.
+    private boolean isTxnRefusedAtShare;
     // Scratch for hasTransactionRoom: the frame sizes a flush will publish.
     // Producer thread only.
     private final IntList transactionFrameSizes = new IntList();
@@ -7553,6 +7557,7 @@ public class QwpWebSocketSender implements Sender {
         txnBufferFull = false;
         txnBytes = 0;
         txnRefusedBytes = 0;
+        isTxnRefusedAtShare = false;
         txnRowsCommittedInParts = 0;
         txnSimSegments = 0;
         txnSimRemaining = 0;
@@ -7594,6 +7599,10 @@ public class QwpWebSocketSender implements Sender {
      * pending when it ends, a transaction=on transaction for a bare commit frame:
      * it commits its frames with one when the next flush does not fit.
      * <p>
+     * When other senders share the budget, as in a pool, they may all hold strict
+     * transactions at once, so a strict transaction whose frames span segments must
+     * also fit this sender's share ({@link CursorSendEngine#shareSegments(long)}).
+     * <p>
      * Mirrors how the ring packs frames: frames never span segments, and a frame
      * that does not fit the current segment opens the next one. The flush's
      * frame sizes are derived the way flushPendingRows and the split publish
@@ -7601,7 +7610,8 @@ public class QwpWebSocketSender implements Sender {
      * frames. Runs before anything of the flush is published, so a refusal
      * leaves the batch pending and the ring untouched. On a strict refusal it
      * records the size the transaction would have reached in
-     * {@link #txnRefusedBytes}.
+     * {@link #txnRefusedBytes}, and in {@link #isTxnRefusedAtShare} whether only
+     * the share refused it.
      */
     private boolean hasTransactionRoom(int cap, int deltaBaseline, int messageSize, boolean deferCommit) {
         CursorSendEngine engine = cursorEngine;
@@ -7651,6 +7661,9 @@ public class QwpWebSocketSender implements Sender {
             }
             remaining = Math.max(0, remaining - size - MmapSegment.FRAME_HEADER_SIZE);
         }
+        // The segments the transaction's frames span with this flush, without the
+        // room kept for the commit.
+        int frameSegments = segments;
         if (deferCommit && strictTransactional) {
             // Keep room for the commit: the rows pending when this transaction
             // ends are at most a frame's worth plus one row, which a split
@@ -7664,11 +7677,26 @@ public class QwpWebSocketSender implements Sender {
                 remaining = Math.max(0, remaining - reserve - MmapSegment.FRAME_HEADER_SIZE);
             }
         }
-        long maxSegments = Math.max(2, engine.ringCapacityBytes() / engine.segmentSizeBytes());
-        if (segments > maxSegments) {
+        long capacity = engine.ringCapacityBytes();
+        if (segments > Math.max(2, capacity / engine.segmentSizeBytes())) {
             if (strictTransactional) {
                 txnRefusedBytes = bytes;
+                isTxnRefusedAtShare = false;
             }
+            return false;
+        }
+        // Every sender sharing the budget may hold a strict transaction at the same
+        // time, and none can trim one before the server commits it. Were each to size
+        // its transaction against the whole budget, together they could fill it and
+        // each commit would wait for room only another commit frees, so a transaction
+        // counts only on its sender's share. One whose frames fit a single segment is
+        // exempt: with its commit, a frame's worth of rows at most, it needs no more
+        // than the two segments the budget grants every sender past its cap, and a
+        // share smaller than its room for that commit would refuse even a batch that
+        // fits one frame.
+        if (strictTransactional && frameSegments > 1 && segments > Math.max(2, engine.shareSegments(capacity))) {
+            txnRefusedBytes = bytes;
+            isTxnRefusedAtShare = true;
             return false;
         }
         return true;
@@ -7762,12 +7790,26 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * The error for a strict transaction the client buffer cannot hold: the size
-     * the transaction would have reached, the buffer, what was refused, and the
-     * settings that make room.
+     * The error for a strict transaction the client buffer, or this sender's share
+     * of a buffer other senders share, cannot hold: the size the transaction would
+     * have reached, the buffer, what was refused, and the settings that make room.
      */
     private LineSenderException transactionTooLargeForClientBuffer(String outcome) {
         CursorSendEngine engine = cursorEngine;
+        if (isTxnRefusedAtShare) {
+            int senders = engine.budgetSharers();
+            return new TransactionTooLargeException("transaction too large for this sender's share of the client buffer")
+                    .put(" [transactionBytes=").put(txnRefusedBytes)
+                    .put(", ringCapacityBytes=").put(engine.ringCapacityBytes())
+                    .put(", senders=").put(senders)
+                    .put(", segmentBytes=").put(engine.segmentSizeBytes())
+                    .put("]; the client holds a strict transaction until the server commits it, and the ").put(senders)
+                    .put(" senders that share sf_max_total_bytes may each hold one at the same time, so a transaction "
+                            + "that spans segments can count only on this sender's share, which cannot hold this one, ")
+                    .put(outcome)
+                    .put(". Raise sf_max_total_bytes, lower sender_pool_max, or set sf_dir to keep the transaction "
+                            + "on disk");
+        }
         return new TransactionTooLargeException("transaction too large for the client buffer")
                 .put(" [transactionBytes=").put(txnRefusedBytes)
                 .put(", ringCapacityBytes=").put(engine.ringCapacityBytes())

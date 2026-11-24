@@ -1912,6 +1912,31 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
+     * The most senders that charge this ring's budget at once: 1 unless the
+     * budget is shared, as in a sender pool.
+     */
+    public int budgetSharers() {
+        return manager.getBudget().getMaxSharers();
+    }
+
+    /**
+     * Segments of {@code capacityBytes}, the {@link #ringCapacityBytes()} of this
+     * ring, that a strict transaction on it can count on while each other sender
+     * sharing the budget pins as many: an equal share among the budget's sharers,
+     * or all of them when the budget is not shared. In disk mode the share also
+     * pays for the segment the manager creates ahead of the ring's next rotation,
+     * which stays charged to the budget until the ring moves into it.
+     */
+    public long shareSegments(long capacityBytes) {
+        int sharers = manager.getBudget().getMaxSharers();
+        if (sharers == 1) {
+            return capacityBytes / segmentSizeBytes;
+        }
+        long share = capacityBytes / sharers / segmentSizeBytes;
+        return sfDir == null ? share : share - 1;
+    }
+
+    /**
      * Configured per-segment size in bytes.
      */
     public long segmentSizeBytes() {

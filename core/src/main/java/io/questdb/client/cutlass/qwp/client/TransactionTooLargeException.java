@@ -32,10 +32,14 @@ import io.questdb.client.cutlass.line.LineSenderException;
  * limit that would stop it from committing as one transaction: the server's
  * per-table {@code qwp.max.uncommitted.rows}, past which the server commits the
  * rows on its own, or the client's {@code sf_max_total_bytes}, which must hold the
- * whole uncommitted transaction until the server commits it. To send transactions
- * of that size, raise the limit the message names: {@code qwp.max.uncommitted.rows}
- * on the server, or {@code sf_max_total_bytes} on the client, whose default is
- * larger with {@code sf_dir} set.
+ * whole uncommitted transaction until the server commits it. In a sender pool, whose
+ * senders share {@code sf_max_total_bytes} and may all hold such transactions at
+ * once, a transaction that spans more than one segment gets only its sender's
+ * share of it. To send transactions of that size, raise the limit the message
+ * names: {@code qwp.max.uncommitted.rows} on the server, or
+ * {@code sf_max_total_bytes} on the client, whose default is larger with
+ * {@code sf_dir} set; in a pool, a lower {@code sender_pool_max} also makes each
+ * share larger.
  * <p>
  * {@code at()} and {@code atNow()} throw it for the row that would take the
  * transaction past either limit, and that row is not part of the transaction.
