@@ -277,6 +277,12 @@ public class QwpWebSocketSender implements Sender {
     private final ObjList<QwpTableBuffer> pendingTables = new ObjList<>();
     private final IntList splitFrameBodyBytes = new IntList();
     private final CharSequenceObjHashMap<QwpTableBuffer> tableBuffers;
+    // The first spelling of every table in tableBuffers, by the table name with every
+    // char folded by Character.toLowerCase(), as the engine compares table names. The
+    // server keys its writers the same way (QwpTudCache.tableKey()), so the names that
+    // fold to one key are spellings of one table (QwpTableBuffer.getFirstSpelling()).
+    // Producer thread only.
+    private final CharSequenceObjHashMap<QwpTableBuffer> firstSpellings = new CharSequenceObjHashMap<>();
     // null means plain text (no TLS)
     private final ClientTlsConfiguration tlsConfig;
     private MicrobatchBuffer activeBuffer;
@@ -2013,6 +2019,7 @@ public class QwpWebSocketSender implements Sender {
                 }
             }
             tableBuffers.clear();
+            firstSpellings.clear();
             pendingTables.clear();
         } catch (Throwable t) {
             LOG.error("Error closing encoder or table buffers: {}", String.valueOf(t));
@@ -2857,8 +2864,7 @@ public class QwpWebSocketSender implements Sender {
     public QwpTableBuffer getTableBuffer(String tableName) {
         QwpTableBuffer buffer = tableBuffers.get(tableName);
         if (buffer == null) {
-            buffer = new QwpTableBuffer(tableName, this);
-            tableBuffers.put(tableName, buffer);
+            buffer = newTableBuffer(tableName);
         }
         currentTableBuffer = buffer;
         currentTableBufferSnapshotBytes = buffer.getBufferedBytes();
@@ -4075,8 +4081,7 @@ public class QwpWebSocketSender implements Sender {
             currentTableName = currentTableBuffer.getTableName();
         } else {
             currentTableName = tableName.toString();
-            currentTableBuffer = new QwpTableBuffer(currentTableName, this);
-            tableBuffers.put(currentTableName, currentTableBuffer);
+            currentTableBuffer = newTableBuffer(currentTableName);
         }
         // Re-snap so sendRow()'s delta math is anchored to this table's
         // current byte count. The prior current table's bytes already match
@@ -5886,6 +5891,25 @@ public class QwpWebSocketSender implements Sender {
         resetTableBuffersAfterFlush();
     }
 
+    /**
+     * Creates the buffer of a table name the sender has no buffer for, and makes it
+     * a spelling of the table whose name differs from it only in letter case, if the
+     * sender has a buffer of one: the server counts the rows of every spelling as one
+     * table's, and so must a strict transaction. Runs once per name.
+     */
+    private QwpTableBuffer newTableBuffer(String tableName) {
+        QwpTableBuffer buffer = new QwpTableBuffer(tableName, this);
+        tableBuffers.put(tableName, buffer);
+        String lowerCaseName = Chars.toLowerCase(tableName);
+        int index = firstSpellings.keyIndex(lowerCaseName);
+        if (index < 0) {
+            firstSpellings.valueAtQuick(index).addSpelling(buffer);
+        } else {
+            firstSpellings.putAt(index, lowerCaseName, buffer);
+        }
+        return buffer;
+    }
+
     private void onSlotLockReleased() {
         slotLockReleased = true;
         Runnable listener = slotLockReleaseListener;
@@ -7532,15 +7556,28 @@ public class QwpWebSocketSender implements Sender {
         }
         // The server commits a table on its own once its uncommitted rows reach
         // maxRows, so a strict transaction holds at most maxRows - 1 rows per table.
-        long rows = currentTableBuffer.getTxnSentRows() + currentTableBuffer.getRowCount() + 1;
+        // The server counts the rows of every spelling of the table, the names that
+        // differ only in letter case, as one table's: add up the rows of each, those
+        // shipped in deferred frames and those still buffered. A table almost always
+        // has one spelling.
+        QwpTableBuffer firstSpelling = currentTableBuffer.getFirstSpelling();
+        long rows = 1;
+        for (QwpTableBuffer spelling = firstSpelling; spelling != null; spelling = spelling.getNextSpelling()) {
+            rows += spelling.getTxnSentRows() + spelling.getRowCount();
+        }
         if (rows >= maxRows) {
-            throw new TransactionTooLargeException("transaction too large for the server")
+            LineSenderException e = new TransactionTooLargeException("transaction too large for the server")
                     .put(" [table=").put(currentTableName)
                     .put(", rows=").put(rows)
                     .put(", maxUncommittedRows=").put(maxRows)
                     .put("]; the server commits a table's rows on its own once qwp.max.uncommitted.rows "
                             + "of them are uncommitted, which would split the transaction, so the row was "
-                            + "not added. Raise qwp.max.uncommitted.rows on the server");
+                            + "not added.");
+            if (firstSpelling.getNextSpelling() != null) {
+                e.put(" Rows sent under names that differ only in letter case count together: the server "
+                        + "counts them as one table.");
+            }
+            throw e.put(" Raise qwp.max.uncommitted.rows on the server");
         }
     }
 

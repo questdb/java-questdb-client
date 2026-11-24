@@ -40,10 +40,12 @@ import io.questdb.client.impl.SenderPool;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
+import org.junit.Assume;
 import org.junit.Test;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.lang.management.ManagementFactory;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
@@ -1594,6 +1596,191 @@ public class QwpLargeTransactionTest {
     }
 
     @Test
+    public void testStrictRowLimitCountsEverySpellingOfATable() throws Exception {
+        // The server writes the rows of names that differ only in letter case to one
+        // table and commits it on its own once the advertised 100 of its rows are
+        // uncommitted. Each spelling used to keep its own count, so a transaction that
+        // wrote "tab" and "TAB" took 99 rows of each, and the server committed it in
+        // parts.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, 4_096)) {
+                server.setAdvertisedMaxUncommittedRows(100);
+                try (Sender s = Sender.fromConfig(conf(server) + "transaction=strict;")) {
+                    // 4 KiB frames: the rows go out over several deferred frames, and
+                    // the last of them are still pending.
+                    writeRows(s, "tab", 0, 40);
+                    writeRows(s, "TAB", 40, 40);
+                    writeRows(s, "Tab", 80, 19);
+                    Assert.assertTrue(h.awaitFrames(2));
+                    // "tAB" is new to the sender: its first row is the 100th of the table.
+                    for (String spelling : new String[]{"tab", "TAB", "Tab", "tAB"}) {
+                        try {
+                            writeRows(s, spelling, 99, 1);
+                            Assert.fail("the 100th row of the table must be refused as " + spelling);
+                        } catch (TransactionTooLargeException e) {
+                            Assert.assertEquals(spellingsRowLimitError(spelling, 100), e.getMessage());
+                        }
+                    }
+                    // Other tables keep their own count.
+                    writeRows(s, "other", 0, 99);
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                    // A new transaction starts from zero again, for every spelling.
+                    writeRows(s, "TAB", 0, 50);
+                    writeRows(s, "tAB", 50, 49);
+                    try {
+                        writeRows(s, "tab", 99, 1);
+                        Assert.fail("the 100th row of the table must be refused");
+                    } catch (TransactionTooLargeException e) {
+                        Assert.assertEquals(spellingsRowLimitError("tab", 100), e.getMessage());
+                    }
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                }
+                Assert.assertEquals(0, h.rollbackFrames());
+                Assert.assertEquals(2, h.commitFrames());
+            }
+        });
+    }
+
+    @Test
+    public void testStrictRowLimitCheckAllocatesNothingPerRow() throws Exception {
+        // The check runs for every row of a strict transaction and walks every spelling
+        // of the row's table, here two that alternate row by row. It only reads counts
+        // the buffers keep.
+        Assume.assumeTrue(ManagementFactory.getThreadMXBean() instanceof com.sun.management.ThreadMXBean);
+        com.sun.management.ThreadMXBean mx = (com.sun.management.ThreadMXBean) ManagementFactory.getThreadMXBean();
+        Assume.assumeTrue(mx.isThreadAllocatedMemorySupported());
+        mx.setThreadAllocatedMemoryEnabled(true);
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                // Nothing goes out before flush(), so only the row path runs.
+                try (Sender s = Sender.fromConfig(conf(server) + "auto_flush=off;auto_flush_bytes=off;")) {
+                    Assert.assertTrue(((QwpWebSocketSender) s).isStrictTransactional());
+                    long tid = Thread.currentThread().getId();
+                    // The first pass creates both buffers and grows their columns.
+                    writeAlternatingSpellings(s, 20_000);
+                    s.reset();
+                    long before = mx.getThreadAllocatedBytes(tid);
+                    writeAlternatingSpellings(s, 20_000);
+                    long allocated = mx.getThreadAllocatedBytes(tid) - before;
+                    // An object per row would take at least 16 bytes each, 320 KB in all.
+                    // The allowance covers one-off costs, such as a coverage agent's probes.
+                    Assert.assertTrue("the row path allocated " + allocated + " bytes", allocated < 8_192);
+                    s.reset();
+                }
+                Assert.assertEquals("nothing was sent", 0, h.frames.size());
+            }
+        });
+    }
+
+    @Test
+    public void testStrictRowLimitCountsPendingRowsOfEverySpelling() throws Exception {
+        // Nothing goes out before flush(), which then sends the rows of both spellings
+        // to the same table: their pending rows count together too.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                server.setAdvertisedMaxUncommittedRows(100);
+                try (Sender s = Sender.fromConfig(conf(server) + "auto_flush=off;")) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) s;
+                    Assert.assertTrue(ws.isStrictTransactional());
+                    writeRows(s, "t", 0, 50);
+                    writeRows(s, "T", 50, 49);
+                    try {
+                        writeRows(s, "t", 99, 1);
+                        Assert.fail("the 100th row of the table must be refused");
+                    } catch (TransactionTooLargeException e) {
+                        Assert.assertEquals(spellingsRowLimitError("t", 100), e.getMessage());
+                    }
+                    Assert.assertFalse("no frame went out before flush()", ws.hasDeferredMessagesForTesting());
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                }
+                Assert.assertEquals("one commit frame", "C", frameKinds(h));
+            }
+        });
+    }
+
+    @Test
+    public void testStrictRowLimitResetsEverySpellingWithTheTransaction() throws Exception {
+        // rollback(), reset() and returning a pooled lease end the transaction for every
+        // spelling of a table, whichever of them the transaction wrote last.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, 4_096)) {
+                server.setAdvertisedMaxUncommittedRows(100);
+                server.setRollbackSupported(true);
+                try (QuestDB db = QuestDB.connect(conf(server) + "transaction=strict;query_pool_min=0;")) {
+                    try (Sender lease = db.borrowSender()) {
+                        assertSpellingsRefuseRow100(lease);
+                        lease.rollback();
+                        assertSpellingsRefuseRow100(lease);
+                        lease.reset();
+                        assertSpellingsRefuseRow100(lease);
+                    }
+                    // The pool discarded that transaction, so the next lease of the same
+                    // sender starts from zero.
+                    try (Sender lease = db.borrowSender()) {
+                        assertSpellingsRefuseRow100(lease);
+                        lease.flush();
+                        Assert.assertTrue(lease.drain(5_000));
+                    }
+                }
+                Assert.assertEquals("one connection, so one sender", 1, server.upgradeRequestCount());
+                Assert.assertEquals(3, h.rollbackFrames());
+                Assert.assertEquals(1, h.commitFrames());
+            }
+        });
+    }
+
+    @Test
+    public void testStrictRowLimitFoldsLetterCaseAsTheEngine() throws Exception {
+        // The server counts the rows of the names the engine resolves to one table
+        // together, and the engine folds each char with Character.toLowerCase(): "t\u00e4"
+        // and "t\u00c4" are one table, and so are "ti" and "t\u0130", whose \u0130 folds to
+        // an ASCII i. That leaves apart the cases of a letter outside the Basic
+        // Multilingual Plane, a surrogate pair, and "\u00df" against "SS".
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, 4_096)) {
+                server.setAdvertisedMaxUncommittedRows(100);
+                try (Sender s = Sender.fromConfig(conf(server) + "transaction=strict;")) {
+                    writeRows(s, "t\u00e4", 0, 50);
+                    writeRows(s, "t\u00c4", 50, 49);
+                    writeRows(s, "ti", 0, 50);
+                    writeRows(s, "t\u0130", 50, 49);
+                    writeRows(s, "t\uD801\uDC00", 0, 99);
+                    writeRows(s, "t\uD801\uDC28", 0, 99);
+                    writeRows(s, "stra\u00dfe", 0, 99);
+                    writeRows(s, "STRASSE", 0, 99);
+                    for (String spelling : new String[]{"T\u00c4", "TI", "T\u0130"}) {
+                        try {
+                            writeRows(s, spelling, 99, 1);
+                            Assert.fail("the 100th row of the table must be refused as " + spelling);
+                        } catch (TransactionTooLargeException e) {
+                            Assert.assertEquals(spellingsRowLimitError(spelling, 100), e.getMessage());
+                        }
+                    }
+                    for (String table : new String[]{"t\uD801\uDC00", "t\uD801\uDC28", "stra\u00dfe", "STRASSE"}) {
+                        try {
+                            writeRows(s, table, 99, 1);
+                            Assert.fail("the 100th row of " + table + " must be refused");
+                        } catch (TransactionTooLargeException e) {
+                            Assert.assertEquals(serverRowLimitError(table, 100), e.getMessage());
+                        }
+                    }
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                }
+                Assert.assertEquals(1, h.commitFrames());
+            }
+        });
+    }
+
+    @Test
     public void testStrictCommitTooLargeForClientBufferIsNotSent() throws Exception {
         // With auto_flush_bytes=off on top of auto_flush=off, the whole transaction
         // waits for flush(), which sends one frame per table. Ten tables of ~28 KB need five 64 KiB
@@ -2343,6 +2530,38 @@ public class QwpLargeTransactionTest {
                 + ", maxUncommittedRows=" + maxUncommittedRows + "]; the server commits a table's rows on its "
                 + "own once qwp.max.uncommitted.rows of them are uncommitted, which would split the transaction, "
                 + "so the row was not added. Raise qwp.max.uncommitted.rows on the server";
+    }
+
+    // Writes 99 rows of a table under two spellings, which send some of them in deferred
+    // frames of 4 KiB, and checks that a 100th row is refused under each.
+    private static void assertSpellingsRefuseRow100(Sender s) {
+        writeRows(s, "x", 0, 60);
+        writeRows(s, "X", 60, 39);
+        for (String spelling : new String[]{"x", "X"}) {
+            try {
+                writeRows(s, spelling, 99, 1);
+                Assert.fail("the 100th row of the table must be refused as " + spelling);
+            } catch (TransactionTooLargeException e) {
+                Assert.assertEquals(spellingsRowLimitError(spelling, 100), e.getMessage());
+            }
+        }
+    }
+
+    // Writes count rows of one table, alternating between two spellings of its name.
+    private static void writeAlternatingSpellings(Sender s, int count) {
+        for (int i = 0; i < count; i++) {
+            s.table(i % 2 == 0 ? "t" : "T").longColumn("v", i).atNow();
+        }
+    }
+
+    // The refusal at the server's row limit of a table the transaction wrote under names
+    // that differ only in letter case.
+    private static String spellingsRowLimitError(String table, long maxUncommittedRows) {
+        return "transaction too large for the server [table=" + table + ", rows=" + maxUncommittedRows
+                + ", maxUncommittedRows=" + maxUncommittedRows + "]; the server commits a table's rows on its "
+                + "own once qwp.max.uncommitted.rows of them are uncommitted, which would split the transaction, "
+                + "so the row was not added. Rows sent under names that differ only in letter case count together: "
+                + "the server counts them as one table. Raise qwp.max.uncommitted.rows on the server";
     }
 
     private static void writeRows(Sender s, String table, int from, int count) {
