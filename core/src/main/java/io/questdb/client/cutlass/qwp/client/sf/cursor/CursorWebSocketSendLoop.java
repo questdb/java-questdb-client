@@ -2203,7 +2203,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     // capability gap, so BackgroundDrainer gives it the same settle budget as a missing
                     // durable-ack echo instead of quarantining on the first sweep. Gated on ORPHAN like the
                     // rotating-credential case: an INITIALIZING foreground still fails fast on it.
-                    final boolean ownedByCapabilityGap = reconnectPolicy == ReconnectPolicy.ORPHAN
+                    final boolean isOwnedByCapabilityGap = reconnectPolicy == ReconnectPolicy.ORPHAN
                             && e instanceof QwpOwnedByMismatchException;
                     if (rotatingCredentialReject) {
                         if (terminalError == null) {
@@ -2214,7 +2214,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                         LOG.warn("rotating credential rejected during {} -- handing the slot back to the "
                                         + "drainer to retry with a freshly pulled token: {}",
                                 phase, e.getMessage());
-                    } else if (ownedByCapabilityGap) {
+                    } else if (isOwnedByCapabilityGap) {
                         if (terminalError == null) {
                             // Publish the marker before terminalError, the volatile first-writer-wins
                             // latch the owner observes -- same ordering as the durable-ack arm below.
