@@ -600,6 +600,32 @@ public class QwpLargeTransactionTest {
     }
 
     @Test
+    public void testResetKeepsDeferredFramesOfNonTransactionalSender() throws Exception {
+        // Outside transactional mode reset() discards only the buffered rows, as before,
+        // also on a server with rollback support: a frame setDeferCommit(true) already
+        // sent stays deferred, and the next commit commits it.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                server.setRollbackSupported(true);
+                try (QwpWebSocketSender s = (QwpWebSocketSender) Sender.fromConfig(conf(server) + "transaction=off;")) {
+                    s.setDeferCommit(true);
+                    writeRows(s, "t", 0, 10);
+                    s.flush();
+                    writeRows(s, "t", 10, 10);
+                    s.reset();
+                    Assert.assertTrue(s.hasDeferredMessagesForTesting());
+                    s.setDeferCommit(false);
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                }
+                Assert.assertEquals("Dc", frameKinds(h));
+                Assert.assertEquals(h.frames, h.committedFrames());
+            }
+        });
+    }
+
+    @Test
     public void testResetKeepsLegacyBehaviourWithoutServerRollback() throws Exception {
         // transaction=on against a server without rollback: reset() cannot reach the
         // frames already sent, and the next flush() commits them, as before.
@@ -1035,6 +1061,95 @@ public class QwpLargeTransactionTest {
     }
 
     @Test
+    public void testStrictDiscardAfterRefusedFirstAutoFlushStartsNewTransaction() throws Exception {
+        // 64 KiB segments, 128 KiB budget: too small for a strict transaction's first
+        // deferred frame next to the room it keeps for its commit, so the first
+        // auto-flush is refused and nothing is sent. reset() used to keep the refusal,
+        // so the sender refused every later row until rollback() or close(). Both
+        // discards must end the transaction, whether or not the server supports
+        // rollback: there is nothing to roll back. With the interval trigger off, the
+        // byte trigger alone decides which row the client buffer refuses.
+        assertMemoryLeak(() -> {
+            int expectedFrameSize = commitFrameSize(10);
+            for (String action : new String[]{"reset()", "rollback()"}) {
+                for (boolean isRollbackSupported : new boolean[]{true, false}) {
+                    String context = action + ", rollback supported: " + isRollbackSupported;
+                    TxnServer h = new TxnServer();
+                    try (TestWebSocketServer server = start(h, CAP)) {
+                        server.setRollbackSupported(isRollbackSupported);
+                        try (Sender s = Sender.fromConfig(conf(server) + "transaction=strict;auto_flush_interval=off;"
+                                + "sf_max_segment_bytes=64k;sf_max_total_bytes=128k;")) {
+                            int refused = writeUntilRefused(s, 131_072);
+                            Assert.assertTrue(context, refused > 0);
+                            Assert.assertEquals(context + ": nothing was sent", 0, h.frames.size());
+                            if ("reset()".equals(action)) {
+                                s.reset();
+                                // A repeated reset() finds nothing left to discard.
+                                s.reset();
+                            } else {
+                                s.rollback();
+                            }
+                            writeRows(s, "t", 0, 10);
+                            s.flush();
+                            Assert.assertTrue(context, s.drain(5_000));
+                            // Only the transaction after the discard reached the server, as one
+                            // commit frame with only its rows; nothing needed a rollback frame.
+                            Assert.assertEquals(context + ": " + h.frames, 1, h.frames.size());
+                            Assert.assertTrue(context, h.frames.get(0).isCommit());
+                            Assert.assertEquals(context, expectedFrameSize, h.frames.get(0).size);
+                            // The next transaction has the whole client buffer again: the same
+                            // rows meet the same refusal.
+                            Assert.assertEquals(context, refused, writeUntilRefused(s, 131_072));
+                            s.rollback();
+                        }
+                        Assert.assertEquals(context + ": " + h.frames, 1, h.frames.size());
+                        Assert.assertEquals(context, 0, h.rollbackFrames());
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testStrictResetAfterRefusedLaterAutoFlushDiscardsSentFrames() throws Exception {
+        // 64 KiB segments, 256 KiB budget: the transaction's first frames go out before
+        // the client buffer refuses a row. reset() discards them as for any open
+        // transaction: a server with rollback support rolls them back and the next
+        // transaction commits alone; without that support the transaction is aborted,
+        // so nothing can commit them, and a repeated reset() leaves it aborted.
+        assertMemoryLeak(() -> {
+            for (boolean isRollbackSupported : new boolean[]{true, false}) {
+                String context = "rollback supported: " + isRollbackSupported;
+                TxnServer h = new TxnServer();
+                try (TestWebSocketServer server = start(h, CAP)) {
+                    server.setRollbackSupported(isRollbackSupported);
+                    try (Sender s = Sender.fromConfig(conf(server) + "transaction=strict;auto_flush_interval=off;"
+                            + "sf_max_segment_bytes=64k;sf_max_total_bytes=256k;")) {
+                        writeUntilRefused(s, 262_144);
+                        Assert.assertTrue(context + ": frames were sent before the refusal", h.awaitFrames(2));
+                        s.reset();
+                        if (isRollbackSupported) {
+                            writeRows(s, "t", 0, 10);
+                            s.flush();
+                            Assert.assertTrue(context, s.drain(5_000));
+                        } else {
+                            assertAborted(() -> s.table("t").longColumn("v", 1).atNow());
+                            s.reset();
+                            assertAborted(s::flush);
+                        }
+                    }
+                    if (isRollbackSupported) {
+                        assertRolledBackThenCommitted(h);
+                    } else {
+                        Assert.assertEquals(context + ": " + h.frames, 0, h.commitFrames());
+                        Assert.assertEquals(context + ": " + h.frames, 0, h.rollbackFrames());
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
     public void testStrictTransactionTooLargeForClientBufferFailsFast() throws Exception {
         // 64 KiB segments, 256 KiB budget: four segments. A strict transaction keeps
         // room for its commit, so once its frames fill the rest it must refuse rows
@@ -1438,6 +1553,22 @@ public class QwpLargeTransactionTest {
         });
     }
 
+    // Size of the commit frame a fresh strict sender sends for rows [0, count) of
+    // table t: what a transaction of only those rows sends.
+    private static int commitFrameSize(int count) throws Exception {
+        TxnServer h = new TxnServer();
+        try (TestWebSocketServer server = start(h, CAP)) {
+            try (Sender s = Sender.fromConfig(conf(server) + "transaction=strict;")) {
+                writeRows(s, "t", 0, count);
+                s.flush();
+                Assert.assertTrue(s.drain(5_000));
+            }
+            Assert.assertEquals(h.frames.toString(), 1, h.frames.size());
+            Assert.assertTrue(h.frames.get(0).isCommit());
+            return h.frames.get(0).size;
+        }
+    }
+
     private static String conf(TestWebSocketServer server) {
         return "ws::addr=localhost:" + server.getPort() + ";";
     }
@@ -1509,6 +1640,21 @@ public class QwpLargeTransactionTest {
         for (int t = first, n = first + count; t < n; t++) {
             writeRows(s, "t" + t, 0, 280);
         }
+    }
+
+    // Writes rows 0, 1, ... of table t until the client buffer refuses one, with 64 KiB
+    // segments, and returns the refused row.
+    private static int writeUntilRefused(Sender s, long ringCapacityBytes) {
+        for (int row = 0; row < 100_000; row++) {
+            try {
+                s.table("t").longColumn("v", row).stringColumn("s", PAD).atNow();
+            } catch (TransactionTooLargeException e) {
+                assertClientBufferRefusal(e, ringCapacityBytes, "so the row was not added");
+                return row;
+            }
+        }
+        Assert.fail("the client buffer must refuse a row");
+        return -1;
     }
 
     @FunctionalInterface

@@ -3413,13 +3413,21 @@ public class QwpWebSocketSender implements Sender {
      * like {@link #rollback()} it does not wait for the server. Without that
      * support a strict transaction is aborted -- the next flush throws and only
      * closing the sender ends it -- while a non-strict one keeps the frames
-     * already sent, and the next flush commits them, as before.
+     * already sent, and the next flush commits them, as before. A transaction
+     * that sent no frames yet ends on any server, so the next row starts a new
+     * one, also after the client buffer refused a row of a strict transaction.
      */
     @Override
     public void reset() {
         checkNotClosed();
         discardPendingRows();
-        if (transactional && hasDeferredMessages && !txnAborted) {
+        if (!hasDeferredMessages) {
+            // No frame of the open transaction was sent, so there is nothing to roll
+            // back: end the transaction as rollback() does. That also clears the
+            // refusal a strict auto-flush latches when the client buffer cannot hold
+            // it, which would otherwise refuse every later row.
+            clearTransactionState();
+        } else if (transactional && !txnAborted) {
             if (serverRollbackEnabled) {
                 rollbackOpenTransaction("reset()");
             } else if (strictTransactional) {
