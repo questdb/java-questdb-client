@@ -710,18 +710,21 @@ public class QwpWebSocketSender implements Sender {
     // commits them on its own (X-QWP-Max-Uncommitted-Rows), 0 when not advertised.
     // Captured on each FOREGROUND handshake, like serverMaxBatchSize.
     private volatile long serverMaxUncommittedRows;
-    // True when the current foreground connection confirmed X-QWP-Rollback, so the
-    // rollback control frame may go out. Captured on each FOREGROUND handshake.
+    // True when the server of the last FOREGROUND handshake did not confirm
+    // X-QWP-Rollback; false before the first handshake, while the sender cannot know.
+    // Only reset() of a transaction=on transaction reads it: on a server known to lack
+    // rollback it keeps the rows already sent, as before rollback existed. Captured on
+    // each FOREGROUND handshake, like serverRollbackEnabled.
+    private volatile boolean isServerRollbackDeclined;
+    // True when the server of the last FOREGROUND handshake confirmed X-QWP-Rollback.
+    // close() reads it to roll a strict transaction back on the server; every other
+    // discard publishes the rollback frame regardless, and the I/O loop decides per
+    // connection whether it goes out. Captured on each FOREGROUND handshake.
     private volatile boolean serverRollbackEnabled;
     // Strict transactional mode (transaction=strict, or a sender with no auto-flush
     // trigger): implies transactional, never lets an open transaction commit in
     // parts, and close() discards instead of committing. See setStrictTransactional.
     private boolean strictTransactional;
-    // Set once the open transaction can no longer be rolled back or committed as
-    // one: rollback()/reset() could not undo frames already sent because the
-    // server does not support rollback. Every later flush throws, and close()
-    // discards; only closing the sender ends this state.
-    private boolean txnAborted;
     // Strict mode only: set when the client buffer cannot take another deferred
     // frame of the open transaction and still commit it. Rejects further rows
     // until flush() or rollback() ends the transaction. The rows accepted before
@@ -1871,20 +1874,17 @@ public class QwpWebSocketSender implements Sender {
                 //    sender to discard the batch, so honour that:
                 //    discard it, remember the error, and let the rest of
                 //    close() run. rethrowTerminal below still surfaces it.
-                if (strictTransactional || txnAborted) {
+                if (strictTransactional) {
                     // A strict transaction commits only on an explicit flush(), so
-                    // closing without one discards it, and an aborted one must never
-                    // commit. The pending rows never left the client. The frames of
-                    // the open transaction already sent stay uncommitted: a server
-                    // with rollback support discards them on the rollback frame, whose
-                    // ack the drain below waits for; any other server rolls them back
-                    // when the connection closes, and a recovered slot retires them
-                    // as an aborted transaction.
-                    if (!txnAborted) {
-                        warnDiscardedTransaction("close()");
-                    }
+                    // closing without one discards it. The pending rows never left the
+                    // client. The frames of the open transaction already sent stay
+                    // uncommitted: a server with rollback support discards them on the
+                    // rollback frame, whose ack the drain below waits for; any other
+                    // server rolls them back when the connection closes, and a
+                    // recovered slot retires them as an aborted transaction.
+                    warnDiscardedTransaction("close()");
                     discardPendingRows();
-                    if (hasDeferredMessages && serverRollbackEnabled && !txnAborted) {
+                    if (hasDeferredMessages && serverRollbackEnabled) {
                         try {
                             publishRollbackFrame();
                             hasDeferredMessages = false;
@@ -1918,7 +1918,7 @@ public class QwpWebSocketSender implements Sender {
                         sendCommitMessage();
                     }
                 }
-                if (!strictTransactional && !txnAborted && activeBuffer != null && activeBuffer.hasData()) {
+                if (!strictTransactional && activeBuffer != null && activeBuffer.hasData()) {
                     sealAndSwapBuffer();
                     if (!deferCommit) {
                         lastCommitBoundaryFsn = cursorEngine.publishedFsn();
@@ -2373,11 +2373,6 @@ public class QwpWebSocketSender implements Sender {
     public long flushAndGetSequence() {
         checkNotClosed();
         checkRecycleFailure();
-        if (txnAborted) {
-            // Committing now would commit the frames a failed rollback left on
-            // the server together with whatever came after them.
-            throw transactionAbortedError();
-        }
         if (cursorEngine != null) {
             cursorEngine.checkDurability();
         }
@@ -3409,13 +3404,13 @@ public class QwpWebSocketSender implements Sender {
     /**
      * Discards the rows buffered since the last flush, like before. In
      * transactional mode it also discards the open transaction's frames already
-     * sent, when the server supports QWP rollback (see {@link #rollback()}), and
-     * like {@link #rollback()} it does not wait for the server. Without that
-     * support a strict transaction is aborted -- the next flush throws and only
-     * closing the sender ends it -- while a non-strict one keeps the frames
-     * already sent, and the next flush commits them, as before. A transaction
-     * that sent no frames yet ends on any server, so the next row starts a new
-     * one, also after the client buffer refused a row of a strict transaction.
+     * sent, as {@link #rollback()} does, without waiting for the server. The
+     * exception is a transaction=on transaction on a sender whose last handshake
+     * was with a server without QWP rollback support: it keeps the frames already
+     * sent, and the next flush commits them, as before rollback existed. A
+     * transaction that sent no frames yet ends on any server, so the next row
+     * starts a new one, also after the client buffer refused a row of a strict
+     * transaction.
      */
     @Override
     public void reset() {
@@ -3427,11 +3422,9 @@ public class QwpWebSocketSender implements Sender {
             // refusal a strict auto-flush latches when the client buffer cannot hold
             // it, which would otherwise refuse every later row.
             clearTransactionState();
-        } else if (transactional && !txnAborted) {
-            if (serverRollbackEnabled) {
+        } else if (transactional) {
+            if (strictTransactional || !isServerRollbackDeclined) {
                 rollbackOpenTransaction("reset()");
-            } else if (strictTransactional) {
-                txnAborted = true;
             } else if (!isResetRollbackWarned) {
                 isResetRollbackWarned = true;
                 LOG.warn("reset() discarded the rows not yet sent, but the server does not support QWP "
@@ -3443,76 +3436,51 @@ public class QwpWebSocketSender implements Sender {
 
     /**
      * Discards the open transaction: the rows buffered since the last flush,
-     * and the transaction's frames already sent, which the server rolls back on
-     * the rollback control frame. Without an open transaction this only discards
-     * the buffered rows.
+     * and the transaction's frames already sent. Without an open transaction this
+     * only discards the buffered rows.
      * <p>
      * Like {@link #flush()}, it hands the rollback frame to store-and-forward and
      * returns without waiting for the server, so a server outage makes it fail
      * only when the store-and-forward buffer is full, as it would a flush. The
      * frame goes out behind the transaction's frames and ahead of anything sent
      * later, on every connection and after a restart, so nothing sent later can
-     * commit the discarded rows. Call {@link #drain(long)} to wait for the server
-     * to confirm.
+     * commit the discarded rows. A server that supports QWP rollback discards them
+     * on the frame. A server without that support never receives it: the sender
+     * closes the connection that holds the rows instead, which makes the server
+     * discard them, and reconnects. Call {@link #drain(long)} to wait until the
+     * rows are discarded.
      * <p>
      * A transaction=on transaction that already committed in parts, at the
      * client buffer or the server's {@code qwp.max.uncommitted.rows}, keeps the
      * parts it committed; this discards only the rest.
-     *
-     * @throws LineSenderException when frames of the open transaction were already
-     *                             sent and the server does not support QWP rollback
-     *                             (the transaction is then aborted: the next flush
-     *                             throws, and only closing the sender ends it)
      */
     @Override
     public void rollback() {
         checkNotClosed();
         checkRecycleFailure();
         discardPendingRows();
-        if (txnAborted) {
-            throw transactionAbortedError();
-        }
         if (!hasDeferredMessages) {
             clearTransactionState();
             return;
-        }
-        if (!serverRollbackEnabled) {
-            txnAborted = true;
-            throw transactionAbortedError();
         }
         rollbackOpenTransaction("rollback()");
     }
 
     /**
      * Pool hook for a strict-mode lease being returned: discards what the
-     * borrower left uncommitted, so the next borrower starts with no open
-     * transaction. Returns {@code false} when frames already sent could not be
-     * rolled back -- the server does not support QWP rollback, or the transaction
-     * was already aborted -- and the pool must retire the connection instead; the
-     * server rolls those frames back when the connection closes.
+     * borrower left uncommitted, like {@link #rollback()}, so the next borrower
+     * starts with no open transaction. Like rollback() it does not wait for the
+     * server, and the pool keeps the sender for the next borrower.
      */
-    public boolean discardTransactionForReuse() {
+    public void discardTransactionForReuse() {
         checkNotClosed();
-        if (!txnAborted) {
-            warnDiscardedTransaction("returning the sender to the pool");
-        }
+        warnDiscardedTransaction("returning the sender to the pool");
         discardPendingRows();
-        if (txnAborted) {
-            return false;
-        }
         if (!hasDeferredMessages) {
             clearTransactionState();
-            return true;
-        }
-        if (!serverRollbackEnabled) {
-            // Only closing the connection discards the frames already sent, so the
-            // transaction is over. Aborting it also keeps the close() that retires
-            // the connection from warning about the same rows again.
-            txnAborted = true;
-            return false;
+            return;
         }
         rollbackOpenTransaction("returning the sender to the pool");
-        return true;
     }
 
     private void discardPendingRows() {
@@ -3570,13 +3538,15 @@ public class QwpWebSocketSender implements Sender {
      * store-and-forward log orders the rollback frame ahead of every frame
      * published later, and every connection replays the log in that order, so a
      * server that receives a later commit has rolled the transaction back first.
-     * Only a server that does not support rollback, reached by a reconnect
-     * before the frame was acked, could commit them: it would read the frame as
-     * an empty deferred frame. The I/O loop never sends it there; it discards
-     * the transaction by closing that connection instead (see
-     * {@code CursorWebSocketSendLoop.retireRollbackFrame}). The same holds for
-     * frames replayed after a restart or by a background drainer, which use the
-     * same loop.
+     * Only a server that does not support rollback could commit them: it would
+     * read the frame as an empty deferred frame. The producer cannot tell which
+     * server the frame reaches -- it may publish it before the first connection,
+     * during an outage, or while connected to such a server -- so it publishes it
+     * regardless, and the I/O loop decides per connection. It never sends the
+     * frame to such a server; it discards the transaction by closing that
+     * connection instead (see {@code CursorWebSocketSendLoop.retireRollbackFrame}).
+     * The same holds for frames replayed after a restart or by a background
+     * drainer, which use the same loop.
      * <p>
      * The rows a transaction=on transaction committed in parts stay committed;
      * {@code action} names the call in the warning that says so.
@@ -4256,6 +4226,7 @@ public class QwpWebSocketSender implements Sender {
     public void applyServerTransactionLimits(long maxUncommittedRows, boolean rollbackEnabled) {
         serverMaxUncommittedRows = maxUncommittedRows;
         serverRollbackEnabled = rollbackEnabled;
+        isServerRollbackDeclined = !rollbackEnabled;
     }
 
     private void atMicros(long timestampMicros) {
@@ -7545,9 +7516,6 @@ public class QwpWebSocketSender implements Sender {
     }
 
     private void checkTransactionAcceptsRow() {
-        if (txnAborted) {
-            throw transactionAbortedError();
-        }
         if (!strictTransactional) {
             return;
         }
@@ -7791,12 +7759,6 @@ public class QwpWebSocketSender implements Sender {
             rows += txnTables.getQuick(i).getTxnSentRows();
         }
         return rows;
-    }
-
-    private LineSenderException transactionAbortedError() {
-        return new LineSenderException("transaction aborted: rollback could not undo the frames of the "
-                + "open transaction already sent, because the server does not support QWP rollback. Close "
-                + "the sender to discard them; the server rolls them back when the connection closes");
     }
 
     /**

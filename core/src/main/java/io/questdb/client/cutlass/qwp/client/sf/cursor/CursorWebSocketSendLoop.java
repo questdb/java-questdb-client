@@ -4163,14 +4163,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
 
     /**
      * Retires the rollback control frame at the send cursor of a connection whose
-     * server did not confirm X-QWP-Rollback. The producer sends that frame only after
-     * a server confirmed rollback, so this connection is a reconnect that reached a
-     * server without rollback support, such as an older node after a failover, with
-     * the frame not yet acked. That server would read the frame as an empty deferred
-     * frame and commit the rolled-back transaction, whose frames it holds uncommitted
-     * on this connection, with the next commit frame. So the frame never goes out:
-     * closing the connection discards those frames instead, as every server does with
-     * the rows a closed connection leaves uncommitted.
+     * server did not confirm X-QWP-Rollback. The producer publishes that frame without
+     * knowing which server it reaches: it may do so before the sender's first
+     * connection, during an outage, while connected to a server without rollback
+     * support, or ahead of a failover to an older node. Such a server would read the
+     * frame as an empty deferred frame and commit the rolled-back transaction, whose
+     * frames it holds uncommitted on this connection, with the next commit frame. So
+     * the frame never goes out: closing the connection discards those frames instead,
+     * as every server does with the rows a closed connection leaves uncommitted.
      * <p>
      * The close waits until the server acks every commit-bearing frame sent on this
      * connection before the rollback frame: the self-acknowledge below covers those

@@ -173,15 +173,14 @@ public final class PooledSender implements Sender {
             Sender live = slot.live(generation);
             if (live instanceof QwpWebSocketSender && ((QwpWebSocketSender) live).isStrictTransactional()) {
                 // A strict transaction commits only on an explicit flush(), so
-                // returning the lease discards whatever the borrower left open.
-                // The next borrower must not inherit it, so a transaction the
-                // server cannot roll back retires the connection instead (the
-                // server rolls it back when the connection closes).
-                flushed = ((QwpWebSocketSender) live).discardTransactionForReuse();
+                // returning the lease discards whatever the borrower left open, as
+                // rollback() does, and the next borrower starts with no open
+                // transaction.
+                ((QwpWebSocketSender) live).discardTransactionForReuse();
             } else {
                 live.flush();
-                flushed = true;
             }
+            flushed = true;
         } finally {
             if (flushed) {
                 slot.pool().giveBack(this);

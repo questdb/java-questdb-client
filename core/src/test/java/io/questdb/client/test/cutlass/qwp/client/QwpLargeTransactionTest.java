@@ -82,6 +82,14 @@ public class QwpLargeTransactionTest {
     // ~100 encoded bytes per row: 1000 rows (the default row trigger) are ~100 KB,
     // three times the 32 KiB cap.
     private static final String PAD = TestUtils.repeat("x", 90);
+    // What reset() of a transaction=on transaction logs, once per sender, when it keeps the
+    // rows already sent because the server of the last handshake lacks rollback support.
+    private static final String RESET_KEEPS_ROWS_WARNING = "reset() discarded the rows not yet sent, but the "
+            + "server does not support QWP rollback, so the open transaction's rows already sent stay on the "
+            + "server and the next flush() commits them. Close the sender to discard them instead";
+    // Before its first connection the sender sizes frames for the server's default frame
+    // cap, not for this mock's CAP: 200 rows (~20 KB) keep each such frame within CAP.
+    private static final String SMALL_FRAMES = "auto_flush_rows=200;";
     // transaction=on in frames of exactly 280 rows (~28 KB): two fill a 64 KiB segment,
     // so the 256 KiB client buffer holds eight frames of a transaction. A blocked
     // append would wait 30 s.
@@ -361,10 +369,12 @@ public class QwpLargeTransactionTest {
     }
 
     @Test
-    public void testPooledLeaseWithAbortedTransactionRetiresQuietly() throws Exception {
-        // reset() could not undo the frames already sent, so the transaction is
-        // aborted and every flush already said so. Returning the lease retires the
-        // connection, which discards the frames, without warning about them again.
+    public void testPooledLeaseResetWithoutServerRollbackKeepsWorking() throws Exception {
+        // reset() on a lease of a pool with no auto-flush trigger, against a server without
+        // rollback support, used to abort the transaction: every flush threw until the pool
+        // retired the connection. The sender now discards the rows already sent by closing
+        // the connection that holds them, and the lease carries on, without warning about
+        // rows it discarded on purpose.
         assertMemoryLeak(() -> {
             ListAppender<ILoggingEvent> log = captureSenderLog();
             try {
@@ -374,8 +384,10 @@ public class QwpLargeTransactionTest {
                             + "auto_flush_rows=off;auto_flush_interval=off;query_pool_min=0;")) {
                         Sender lease = db.borrowSender();
                         writeRows(lease, "t", 0, 1_000);
+                        Assert.assertTrue(h.awaitFrames(2));
                         lease.reset();
-                        assertAborted(lease::flush);
+                        writeRows(lease, "t", 0, 10);
+                        lease.flush();
                         lease.close();
                         Sender next = db.borrowSender();
                         writeRows(next, "t", 0, 10);
@@ -383,15 +395,41 @@ public class QwpLargeTransactionTest {
                         Assert.assertTrue(next.drain(5_000));
                         next.close();
                     }
-                    List<TxnFrame> committed = h.committedFrames();
-                    Assert.assertEquals("only the next lease commits", 1, committed.size());
-                    Assert.assertTrue(committed.get(0).isCommit());
-                    Assert.assertEquals("the aborted lease's connection was retired", 2, server.upgradeRequestCount());
+                    Assert.assertEquals("one reconnect discards the transaction", 2, server.upgradeRequestCount());
                 }
+                assertDiscardedByClosingConnection("reset() on a lease", h);
+                Assert.assertEquals("both leases commit: " + h.frames, 2, h.committedFrames().size());
                 Assert.assertEquals(Collections.emptyList(), discardWarnings(log));
             } finally {
                 releaseSenderLog(log);
             }
+        });
+    }
+
+    @Test
+    public void testPooledLeaseRollbackWithoutServerRollbackClosesQuietly() throws Exception {
+        // rollback() on a transaction=on lease, against a server without rollback support,
+        // used to throw and abort the transaction, and returning the lease then threw the
+        // same error again: the flush that returns a transaction=on lease hit the aborted
+        // transaction. Now neither throws, and the next lease commits.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                try (QuestDB db = QuestDB.connect(conf(server) + "transaction=on;query_pool_min=0;")) {
+                    Sender lease = db.borrowSender();
+                    writeRows(lease, "t", 0, 1_000);
+                    Assert.assertTrue(h.awaitFrames(2));
+                    lease.rollback();
+                    lease.close();
+                    Sender next = db.borrowSender();
+                    writeRows(next, "t", 0, 10);
+                    next.flush();
+                    Assert.assertTrue(next.drain(5_000));
+                    next.close();
+                }
+                Assert.assertEquals("one reconnect discards the transaction", 2, server.upgradeRequestCount());
+            }
+            assertDiscardedByClosingConnection("rollback() on a lease", h);
         });
     }
 
@@ -481,8 +519,9 @@ public class QwpLargeTransactionTest {
                     Sender lease = db.borrowSender();
                     writeRows(lease, "t", 0, 1_000);
                     Assert.assertTrue(h.awaitFrames(2));
-                    // The frames already sent cannot be rolled back: the pool retires
-                    // the connection, which makes the server discard them.
+                    // The server cannot roll back the frames already sent: the sender
+                    // closes the connection that holds them, which makes the server
+                    // discard them, and sends the next lease's rows on a new one.
                     lease.close();
                     Sender next = db.borrowSender();
                     writeRows(next, "t", 0, 10);
@@ -492,7 +531,95 @@ public class QwpLargeTransactionTest {
                 }
                 Assert.assertEquals(1, h.commitFrames());
                 Assert.assertEquals(0, h.rollbackFrames());
+                Assert.assertEquals(2, server.upgradeRequestCount());
             }
+            assertDiscardedByClosingConnection("strict lease returned", h);
+        });
+    }
+
+    @Test
+    public void testPooledStrictLeaseReturnBeforeFirstConnectKeepsEarlierCommits() throws Exception {
+        // The server is down when the pool starts. Returning a strict lease whose frames
+        // were already sent used to retire the pooled sender, as if the server could not
+        // roll them back, and closing it dropped the rows an earlier lease had committed,
+        // which no server had acknowledged yet. The pool now keeps the sender: once a
+        // server is reached the transaction is discarded, and both commits land.
+        for (boolean isRollbackSupported : new boolean[]{true, false}) {
+            assertMemoryLeak(() -> {
+                int port = TestPorts.findUnusedPort();
+                TxnServer h = new TxnServer();
+                TestWebSocketServer server = null;
+                try {
+                    try (QuestDB db = QuestDB.connect(outageConf(port)
+                            + "transaction=strict;lazy_connect=true;" + SMALL_FRAMES)) {
+                        Sender lease = db.borrowSender();
+                        writeRows(lease, "t", 0, 10);
+                        lease.flush();
+                        lease.close();
+                        lease = db.borrowSender();
+                        writeRows(lease, "t", 0, 600);
+                        lease.close();
+                        server = start(h, CAP, port, isRollbackSupported);
+                        lease = db.borrowSender();
+                        writeRows(lease, "t", 0, 5);
+                        lease.flush();
+                        Assert.assertTrue(lease.drain(10_000));
+                        lease.close();
+                    }
+                } finally {
+                    if (server != null) {
+                        server.close();
+                    }
+                }
+                assertCommittedFlushesOnly(h, 2);
+                Assert.assertEquals(h.frames.toString(), isRollbackSupported ? 1 : 0, h.rollbackFrames());
+                Assert.assertEquals(h.frames.toString(), isRollbackSupported ? 1 : 2, h.connectionCount());
+            });
+        }
+    }
+
+    @Test
+    public void testPooledStrictLeaseReturnDuringOutageKeepsEarlierCommits() throws Exception {
+        // A pool connected to a server without rollback support, which then goes down.
+        // Returning a strict lease whose frames were already sent used to retire the pooled
+        // sender, and closing it dropped the rows an earlier lease had committed during the
+        // outage. The pool now keeps the sender, and both commits land once the server is
+        // back.
+        assertMemoryLeak(() -> {
+            int port = TestPorts.findUnusedPort();
+            TxnServer before = new TxnServer();
+            TxnServer after = new TxnServer();
+            TestWebSocketServer revived = null;
+            try (TestWebSocketServer first = start(before, CAP, port, false)) {
+                try (QuestDB db = QuestDB.connect(outageConf(port) + "transaction=strict;query_pool_min=0;")) {
+                    Sender lease = db.borrowSender();
+                    writeRows(lease, "t", 0, 10);
+                    lease.flush();
+                    Assert.assertTrue(lease.drain(5_000));
+                    lease.close();
+                    first.close();
+                    lease = db.borrowSender();
+                    writeRows(lease, "t", 0, 10);
+                    lease.flush();
+                    lease.close();
+                    lease = db.borrowSender();
+                    writeRows(lease, "t", 0, 600);
+                    lease.close();
+                    revived = start(after, CAP, port, false);
+                    lease = db.borrowSender();
+                    writeRows(lease, "t", 0, 5);
+                    lease.flush();
+                    Assert.assertTrue(lease.drain(10_000));
+                    lease.close();
+                }
+            } finally {
+                if (revived != null) {
+                    revived.close();
+                }
+            }
+            assertCommittedFlushesOnly(before, 1);
+            assertCommittedFlushesOnly(after, 2);
+            Assert.assertEquals(after.frames.toString(), 0, after.rollbackFrames());
         });
     }
 
@@ -575,20 +702,48 @@ public class QwpLargeTransactionTest {
     }
 
     @Test
-    public void testResetAbortsStrictTransactionWithoutServerRollback() throws Exception {
-        assertMemoryLeak(() -> {
-            TxnServer h = new TxnServer();
-            try (TestWebSocketServer server = start(h, CAP)) {
-                try (Sender s = Sender.fromConfig(conf(server) + "transaction=strict;")) {
-                    writeRows(s, "t", 0, 1_000);
-                    Assert.assertTrue(h.awaitFrames(2));
-                    s.reset();
-                    assertAborted(s::flush);
-                    assertAborted(() -> s.table("t").longColumn("v", 1).atNow());
+    public void testResetBeforeFirstConnectDiscardsStrictTransaction() throws Exception {
+        // reset() used to abort a strict transaction silently when no server had been
+        // reached yet, as if the server could not roll back: every later row and flush
+        // threw, even once a server that supports rollback came up.
+        assertDiscardBeforeFirstConnect("transaction=strict;", Sender::reset);
+    }
+
+    @Test
+    public void testResetBeforeFirstConnectDiscardsTransaction() throws Exception {
+        // reset() of a transaction=on transaction used to keep the rows already sent when
+        // no server had been reached yet, and warned that the server does not support
+        // rollback: the next flush committed them even on a server that supports it.
+        assertDiscardBeforeFirstConnect("transaction=on;", Sender::reset);
+    }
+
+    @Test
+    public void testResetDiscardsStrictTransactionWithoutServerRollback() throws Exception {
+        // A server without rollback support cannot discard the rows already sent on
+        // request. reset() used to abort a strict transaction silently, so every later row
+        // and flush threw until the sender was closed, which also hit a sender with no
+        // auto-flush trigger once its byte trigger had sent a frame. The sender now closes
+        // the connection that holds those rows, which makes the server discard them, and
+        // carries on.
+        List<NoTriggerSpelling> spellings = noTriggerSpellings();
+        spellings.add(new NoTriggerSpelling("transaction=strict", c -> Sender.builder(c + "transaction=strict;")));
+        for (NoTriggerSpelling spelling : spellings) {
+            assertMemoryLeak(() -> {
+                TxnServer h = new TxnServer();
+                try (TestWebSocketServer server = start(h, CAP)) {
+                    try (Sender s = spelling.build(conf(server))) {
+                        writeRows(s, "t", 0, 1_000);
+                        Assert.assertTrue(spelling.name, h.awaitFrames(2));
+                        s.reset();
+                        writeRows(s, "t", 0, 10);
+                        s.flush();
+                        Assert.assertTrue(spelling.name, s.drain(5_000));
+                    }
+                    Assert.assertEquals(spelling.name, 2, server.upgradeRequestCount());
                 }
-                Assert.assertEquals("the reset transaction must never commit", 0, h.commitFrames());
-            }
-        });
+                assertDiscardedByClosingConnection(spelling.name, h);
+            });
+        }
     }
 
     @Test
@@ -627,21 +782,30 @@ public class QwpLargeTransactionTest {
 
     @Test
     public void testResetKeepsLegacyBehaviourWithoutServerRollback() throws Exception {
-        // transaction=on against a server without rollback: reset() cannot reach the
-        // frames already sent, and the next flush() commits them, as before.
+        // transaction=on against a server that the handshake showed to lack rollback:
+        // reset() keeps the frames already sent, and the next flush() commits them, as
+        // before rollback existed. It says so once per sender.
         assertMemoryLeak(() -> {
-            TxnServer h = new TxnServer();
-            try (TestWebSocketServer server = start(h, CAP)) {
-                try (Sender s = Sender.fromConfig(conf(server) + "transaction=on;")) {
-                    writeRows(s, "t", 0, 1_000);
-                    Assert.assertTrue(h.awaitFrames(2));
-                    s.reset();
-                    s.flush();
-                    Assert.assertTrue(s.drain(5_000));
+            ListAppender<ILoggingEvent> log = captureSenderLog();
+            try {
+                TxnServer h = new TxnServer();
+                try (TestWebSocketServer server = start(h, CAP)) {
+                    try (Sender s = Sender.fromConfig(conf(server) + "transaction=on;")) {
+                        writeRows(s, "t", 0, 1_000);
+                        Assert.assertTrue(h.awaitFrames(2));
+                        s.reset();
+                        s.reset();
+                        s.flush();
+                        Assert.assertTrue(s.drain(5_000));
+                    }
+                    // The frames sent before reset() are deferred, and the flush after it
+                    // committed them with an empty commit frame.
+                    assertOneTransaction(h);
+                    Assert.assertEquals(1, server.upgradeRequestCount());
                 }
-                // The frames sent before reset() are deferred, and the flush after it
-                // committed them with an empty commit frame.
-                assertOneTransaction(h);
+                Assert.assertEquals(Collections.singletonList(RESET_KEEPS_ROWS_WARNING), resetKeepsRowsWarnings(log));
+            } finally {
+                releaseSenderLog(log);
             }
         });
     }
@@ -707,26 +871,21 @@ public class QwpLargeTransactionTest {
                 }
             }
             Assert.assertEquals(0, before.committedFrames().size());
-            Assert.assertEquals("the rollback frame must not reach a server without rollback support: "
-                    + after.frames, 0, after.rollbackFrames());
-            List<List<TxnFrame>> connections = after.framesByConnection();
-            Assert.assertEquals("one connection for the discarded transaction, one for the next: "
-                    + after.frames, 2, connections.size());
-            // The reader threads of the two connections may log their first frames in
-            // either order: tell them apart by what they carry.
-            List<TxnFrame> discarded = connections.get(0);
-            List<TxnFrame> next = connections.get(1);
-            if (next.get(next.size() - 1).isDeferred()) {
-                discarded = connections.get(1);
-                next = connections.get(0);
-            }
-            Assert.assertTrue("the discarded transaction is replayed: " + after.frames, discarded.size() >= 2);
-            for (TxnFrame f : discarded) {
-                Assert.assertTrue("frame must be deferred: " + after.frames, f.isDeferred());
-            }
-            Assert.assertTrue(next.get(next.size() - 1).isCommit());
-            Assert.assertEquals("only the next transaction commits", next, after.committedFrames());
+            assertDiscardedByClosingConnection("failover to a server without rollback", after);
         });
+    }
+
+    @Test
+    public void testRollbackBeforeFirstConnectDiscardsStrictTransaction() throws Exception {
+        // rollback() used to throw and abort the transaction when no server had been
+        // reached yet, as if the server could not roll back: every later row and flush
+        // threw, even once a server that supports rollback came up.
+        assertDiscardBeforeFirstConnect("transaction=strict;", Sender::rollback);
+    }
+
+    @Test
+    public void testRollbackBeforeFirstConnectDiscardsTransaction() throws Exception {
+        assertDiscardBeforeFirstConnect("transaction=on;", Sender::rollback);
     }
 
     @Test
@@ -787,24 +946,54 @@ public class QwpLargeTransactionTest {
     }
 
     @Test
-    public void testRollbackUnsupportedAbortsTransaction() throws Exception {
-        assertMemoryLeak(() -> {
-            TxnServer h = new TxnServer();
-            try (TestWebSocketServer server = start(h, CAP)) {
-                try (Sender s = Sender.fromConfig(conf(server) + "transaction=on;")) {
-                    Assert.assertFalse(((QwpWebSocketSender) s).isServerRollbackEnabled());
-                    writeRows(s, "t", 0, 1_000);
-                    Assert.assertTrue(h.awaitFrames(2));
-                    assertAborted(s::rollback);
-                    assertAborted(s::flush);
-                    assertAborted(() -> s.table("t").longColumn("v", 1).atNow());
-                    assertAborted(s::rollback);
+    public void testRollbackWithoutServerRollbackDiscardsTransaction() throws Exception {
+        // A server without rollback support cannot discard the rows already sent on
+        // request. rollback() used to throw and abort the transaction, so every later row
+        // and flush threw until the sender was closed. The sender now closes the
+        // connection that holds those rows, which makes the server discard them, and
+        // carries on; a second rollback() finds nothing to discard.
+        for (String mode : new String[]{"transaction=strict;", "transaction=on;"}) {
+            assertMemoryLeak(() -> {
+                TxnServer h = new TxnServer();
+                try (TestWebSocketServer server = start(h, CAP)) {
+                    try (Sender s = Sender.fromConfig(conf(server) + mode)) {
+                        writeRows(s, "t", 0, 1_000);
+                        Assert.assertTrue(mode, h.awaitFrames(2));
+                        s.rollback();
+                        s.rollback();
+                        writeRows(s, "t", 0, 10);
+                        s.flush();
+                        Assert.assertTrue(mode, s.drain(5_000));
+                    }
+                    Assert.assertEquals(mode, 2, server.upgradeRequestCount());
                 }
-                // close() of an aborted transaction must not commit it either.
-                Assert.assertEquals(0, h.commitFrames());
-                Assert.assertEquals(0, h.rollbackFrames());
-            }
-        });
+                assertDiscardedByClosingConnection(mode, h);
+            });
+        }
+    }
+
+    @Test
+    public void testResetWithoutSentFramesSendsNothing() throws Exception {
+        // reset() discards a transaction's frames already sent without asking whether the
+        // server supports rollback. With none sent there is nothing to discard on the
+        // server: no rollback frame, and no reconnect on a server without rollback support.
+        for (String mode : new String[]{"transaction=strict;", "transaction=on;"}) {
+            assertMemoryLeak(() -> {
+                TxnServer h = new TxnServer();
+                try (TestWebSocketServer server = start(h, CAP)) {
+                    try (Sender s = Sender.fromConfig(conf(server) + mode)) {
+                        writeRows(s, "t", 0, 10);
+                        s.reset();
+                        writeRows(s, "t", 0, 5);
+                        s.flush();
+                        Assert.assertTrue(mode, s.drain(5_000));
+                    }
+                    Assert.assertEquals(mode, 1, server.upgradeRequestCount());
+                }
+                Assert.assertEquals(mode + ": " + h.frames, 1, h.frames.size());
+                Assert.assertTrue(mode, h.frames.get(0).isCommit());
+            });
+        }
     }
 
     @Test
@@ -874,7 +1063,7 @@ public class QwpLargeTransactionTest {
         // A sender with no auto-flush trigger used to commit on close(). Now close()
         // discards its open transaction, and says so once, counting the rows already
         // sent with those still buffered. A committed transaction leaves nothing to
-        // discard, and an aborted one already failed every flush.
+        // discard, and neither does one that reset() already discarded.
         assertMemoryLeak(() -> {
             ListAppender<ILoggingEvent> log = captureSenderLog();
             try {
@@ -894,9 +1083,11 @@ public class QwpLargeTransactionTest {
                     }
                     try (Sender s = Sender.fromConfig(conf(server) + "transaction=strict;")) {
                         writeRows(s, "t", 0, 1_000);
-                        // Frames went out and the server cannot roll them back.
+                        // Frames went out and the server cannot roll them back: reset()
+                        // discards them by closing the connection, and flush() then has
+                        // nothing to commit.
                         s.reset();
-                        assertAborted(s::flush);
+                        s.flush();
                     }
                     Assert.assertEquals(Collections.emptyList(), discardWarnings(log));
                     Assert.assertEquals(1, h.commitFrames());
@@ -1114,9 +1305,10 @@ public class QwpLargeTransactionTest {
     public void testStrictResetAfterRefusedLaterAutoFlushDiscardsSentFrames() throws Exception {
         // 64 KiB segments, 256 KiB budget: the transaction's first frames go out before
         // the client buffer refuses a row. reset() discards them as for any open
-        // transaction: a server with rollback support rolls them back and the next
-        // transaction commits alone; without that support the transaction is aborted,
-        // so nothing can commit them, and a repeated reset() leaves it aborted.
+        // transaction: a server with rollback support rolls them back, and on one without
+        // that support the sender closes the connection that holds them. Either way the
+        // refusal ends with the transaction, the next transaction commits alone, and a
+        // repeated reset() finds nothing left to discard.
         assertMemoryLeak(() -> {
             for (boolean isRollbackSupported : new boolean[]{true, false}) {
                 String context = "rollback supported: " + isRollbackSupported;
@@ -1128,22 +1320,17 @@ public class QwpLargeTransactionTest {
                         writeUntilRefused(s, 262_144);
                         Assert.assertTrue(context + ": frames were sent before the refusal", h.awaitFrames(2));
                         s.reset();
-                        if (isRollbackSupported) {
-                            writeRows(s, "t", 0, 10);
-                            s.flush();
-                            Assert.assertTrue(context, s.drain(5_000));
-                        } else {
-                            assertAborted(() -> s.table("t").longColumn("v", 1).atNow());
-                            s.reset();
-                            assertAborted(s::flush);
-                        }
+                        s.reset();
+                        writeRows(s, "t", 0, 10);
+                        s.flush();
+                        Assert.assertTrue(context, s.drain(5_000));
                     }
-                    if (isRollbackSupported) {
-                        assertRolledBackThenCommitted(h);
-                    } else {
-                        Assert.assertEquals(context + ": " + h.frames, 0, h.commitFrames());
-                        Assert.assertEquals(context + ": " + h.frames, 0, h.rollbackFrames());
-                    }
+                    Assert.assertEquals(context, isRollbackSupported ? 1 : 2, server.upgradeRequestCount());
+                }
+                if (isRollbackSupported) {
+                    assertRolledBackThenCommitted(h);
+                } else {
+                    assertDiscardedByClosingConnection(context, h);
                 }
             }
         });
@@ -1437,6 +1624,21 @@ public class QwpLargeTransactionTest {
         return spellings;
     }
 
+    // The warnings reset() logged since the last clearLog() about keeping the rows a
+    // transaction=on transaction already sent.
+    private static List<String> resetKeepsRowsWarnings(ListAppender<ILoggingEvent> log) {
+        List<String> warnings = new ArrayList<>();
+        synchronized (log) {
+            for (ILoggingEvent e : log.list) {
+                String message = e.getFormattedMessage();
+                if (e.getLevel() == Level.WARN && message.startsWith("reset() discarded")) {
+                    warnings.add(message);
+                }
+            }
+        }
+        return warnings;
+    }
+
     private static void releaseSenderLog(ListAppender<ILoggingEvent> log) {
         senderLogger().detachAppender(log);
         log.stop();
@@ -1446,13 +1648,81 @@ public class QwpLargeTransactionTest {
         return (Logger) LoggerFactory.getLogger(QwpWebSocketSender.class);
     }
 
-    private static void assertAborted(ThrowingRunnable r) {
-        try {
-            r.run();
-            Assert.fail("expected the aborted-transaction error");
-        } catch (LineSenderException e) {
-            TestUtils.assertContains(e.getMessage(), "transaction aborted");
+    // Asserts that the server committed only the given number of flushes, each a single
+    // commit frame, so that no frame of a discarded transaction committed.
+    private static void assertCommittedFlushesOnly(TxnServer h, int flushes) {
+        List<TxnFrame> committed = h.committedFrames();
+        Assert.assertEquals("committed " + committed + " of " + h.frames, flushes, committed.size());
+        for (TxnFrame f : committed) {
+            Assert.assertTrue("a deferred frame committed: " + committed, f.isCommit());
         }
+    }
+
+    // The server is down when the sender starts, so the sender cannot know yet whether it
+    // supports rollback. A transaction's frames go to store-and-forward, the transaction is
+    // discarded and the next one committed, and then a server that supports rollback, or
+    // one that predates it, comes up. The sender must keep working throughout, and only
+    // the next transaction may commit.
+    private static void assertDiscardBeforeFirstConnect(String mode, Consumer<Sender> discard) throws Exception {
+        for (boolean isRollbackSupported : new boolean[]{true, false}) {
+            assertMemoryLeak(() -> {
+                int port = TestPorts.findUnusedPort();
+                TxnServer h = new TxnServer();
+                TestWebSocketServer server = null;
+                ListAppender<ILoggingEvent> log = captureSenderLog();
+                try {
+                    try (Sender s = Sender.fromConfig(outageConf(port) + mode
+                            + "initial_connect_retry=async;" + SMALL_FRAMES)) {
+                        writeRows(s, "t", 0, 600);
+                        // Must neither fail nor wait: no server has been reached yet.
+                        discard.accept(s);
+                        // Nor may it claim that the server lacks rollback support.
+                        Assert.assertEquals(Collections.emptyList(), resetKeepsRowsWarnings(log));
+                        writeRows(s, "t", 0, 10);
+                        s.flush();
+                        server = start(h, CAP, port, isRollbackSupported);
+                        Assert.assertTrue(s.drain(10_000));
+                    }
+                } finally {
+                    releaseSenderLog(log);
+                    if (server != null) {
+                        server.close();
+                    }
+                }
+                if (isRollbackSupported) {
+                    assertRolledBackThenCommitted(h);
+                } else {
+                    assertDiscardedByClosingConnection(mode, h);
+                }
+            });
+        }
+    }
+
+    // Asserts what a server without rollback support received when the client discarded a
+    // transaction whose frames had reached it: those frames, all deferred, on a connection
+    // the client closed instead of sending the rollback frame, and on a second connection
+    // what came after the discard, which alone commits.
+    private static void assertDiscardedByClosingConnection(String name, TxnServer h) {
+        Assert.assertEquals(name + ": the rollback frame must not reach a server without rollback support: "
+                + h.frames, 0, h.rollbackFrames());
+        List<List<TxnFrame>> connections = h.framesByConnection();
+        Assert.assertEquals(name + ": one connection for the discarded transaction, one for what came next: "
+                + h.frames, 2, connections.size());
+        // The reader threads of the two connections may log their first frames in
+        // either order: tell them apart by what they carry.
+        List<TxnFrame> discarded = connections.get(0);
+        List<TxnFrame> next = connections.get(1);
+        if (next.get(next.size() - 1).isDeferred()) {
+            discarded = connections.get(1);
+            next = connections.get(0);
+        }
+        Assert.assertTrue(name + ": the discarded transaction reached the server: " + h.frames,
+                discarded.size() >= 2);
+        for (TxnFrame f : discarded) {
+            Assert.assertTrue(name + ": frame must be deferred: " + h.frames, f.isDeferred());
+        }
+        Assert.assertTrue(name + ": " + h.frames, next.get(next.size() - 1).isCommit());
+        Assert.assertEquals(name + ": only what came after the discard commits", next, h.committedFrames());
     }
 
     // Asserts the error of a strict transaction the client buffer cannot hold, with
@@ -1655,11 +1925,6 @@ public class QwpLargeTransactionTest {
         }
         Assert.fail("the client buffer must refuse a row");
         return -1;
-    }
-
-    @FunctionalInterface
-    private interface ThrowingRunnable {
-        void run();
     }
 
     private static final class NoTriggerSpelling {

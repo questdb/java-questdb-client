@@ -775,7 +775,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * <br>
      * In WebSocket transactional mode ({@code transaction=on} or {@code strict}) it also
      * discards the rows of the open transaction that auto-flush already sent, as
-     * {@link #rollback()} does, when the server supports QWP rollback.
+     * {@link #rollback()} does. The exception is a {@code transaction=on} sender that last
+     * connected to a server without QWP rollback support: it keeps those rows, and the next
+     * flush commits them, as before rollback existed.
      * <br>
      * Note: the ILP TCP and UDP transports don't support this operation.
      *
@@ -799,15 +801,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * {@link LineSenderBuilder#transactional(boolean)}) keeps the parts it committed;
      * this discards only the rest.
      * <br>
-     * Discarding rows already sent needs a server that supports QWP rollback. When
-     * the server does not, this method throws and aborts the transaction: every
-     * later flush throws too, and closing the sender discards the rows, because the
-     * server rolls back uncommitted rows when the connection closes.
+     * A server without QWP rollback support cannot discard rows already sent on request,
+     * so the sender closes the connection that holds them instead, which makes the server
+     * roll them back, and reconnects.
      * <br>
      * Only the WebSocket transport supports this method.
      *
-     * @throws LineSenderException if the transport does not support rollback, or the
-     *                             server cannot discard rows already sent
+     * @throws LineSenderException if the transport does not support rollback
      */
     default void rollback() {
         throw new LineSenderException("rollback is only supported for WebSocket transport");
