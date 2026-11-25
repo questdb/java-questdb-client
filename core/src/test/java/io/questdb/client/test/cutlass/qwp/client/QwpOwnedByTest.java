@@ -190,6 +190,8 @@ public class QwpOwnedByTest {
                 server.setRejectWithStatus(400, "Bad Request");
                 // body, Content-Type (null for text/plain), Content-Length (null for the length of the body)
                 String[][] cases = {
+                        // one byte more than the 16 of the body: the first Content-Length past the bytes received
+                        {"owned_by refused", null, "17"},
                         {"owned_by refused", null, "1000"},
                         {"owned_by refused", null, "abc"},
                         {"owned_by refused", null, "-1"},
@@ -227,11 +229,8 @@ public class QwpOwnedByTest {
                 server.setRejectBodyHeaders("text/plain; charset=utf-8", null);
                 assertBadRequestReason(server, "owned_by refused:bob is not part of group caf\u00e9");
 
-                StringBuilder body = new StringBuilder();
-                for (int i = 0; i < 300; i++) {
-                    body.append('x');
-                }
-                server.setRejectBody(body.toString());
+                String body = TestUtils.repeat("x", 300);
+                server.setRejectBody(body);
                 server.setRejectBodyHeaders(null, null);
                 // cut to 256 characters, the last three of which mark the cut
                 assertBadRequestReason(server, body.substring(0, 253) + "...");
