@@ -35,12 +35,35 @@ import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
  * clears: an orphan drainer gives it the same settle budget before it quarantines the slot, and a round that
  * also met a 421 role reject does not take it for part of a failover, unlike a plain
  * {@link WebSocketUpgradeException}, but reports it instead of a missing primary. Carries no status
- * ({@link #STATUS_NONE}), as the server answered 101.
+ * ({@link #STATUS_NONE}), as the server answered 101. Names the endpoint that answered, in its message and in
+ * {@link #getHost()} and {@link #getPort()}, as a client that walks several addresses may meet the gap on any of
+ * them.
  */
 public final class QwpOwnedByMismatchException extends WebSocketUpgradeException {
-    public QwpOwnedByMismatchException(String ownedBy, String echo) {
+    private final String host;
+    private final int port;
+
+    /**
+     * @param host    host of the endpoint that answered 101 without confirming the owner
+     * @param port    port of that endpoint
+     * @param ownedBy the owner the client named
+     * @param echo    the {@code X-QWP-Owned-By} value the server echoed, or null when it sent none
+     */
+    public QwpOwnedByMismatchException(String host, int port, String ownedBy, String echo) {
         super(STATUS_NONE, null, "WebSocket upgrade failed: server did not confirm owned_by, "
-                + "it cannot set the owner of auto-created tables and columns [owned_by=");
-        put(ownedBy).put(", echoed=").put(echo != null ? echo : "<no X-QWP-Owned-By header>").put(']');
+                + "it cannot set the owner of auto-created tables and columns [host=");
+        put(host).put(", port=").put(port)
+                .put(", owned_by=").put(ownedBy)
+                .put(", echoed=").put(echo != null ? echo : "<no X-QWP-Owned-By header>").put(']');
+        this.host = host;
+        this.port = port;
+    }
+
+    public String getHost() {
+        return host;
+    }
+
+    public int getPort() {
+        return port;
     }
 }

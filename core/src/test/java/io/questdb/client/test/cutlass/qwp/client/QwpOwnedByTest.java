@@ -45,6 +45,8 @@ import static io.questdb.client.test.cutlass.auth.TokenTestKit.await;
  * {@code X-QWP-Owned-By} on every WebSocket upgrade, and confirmed by the server's echo.
  */
 public class QwpOwnedByTest {
+    // what QwpOwnedByMismatchException names as the echo when the 101 carried no X-QWP-Owned-By
+    private static final String NO_ECHO = "<no X-QWP-Owned-By header>";
     private static final String OWNER = "caf\u00e9 team";
     private static final String OWNER_ENCODED = "caf%C3%A9%20team";
 
@@ -80,6 +82,9 @@ public class QwpOwnedByTest {
                     Assert.assertEquals(health.toString(), ConnectionHealth.FailureClass.OTHER,
                             health.getLastFailure().getFailureClass());
                     Assert.assertEquals(health.toString(), 0, health.getLastFailure().getStatusCode());
+                    // the failure names the endpoint that left the echo out
+                    Assert.assertEquals(unconfirmedOwnerMessage("localhost", server.getPort(), NO_ECHO),
+                            health.getLastFailure().getMessage());
                 }
             }
         });
@@ -116,9 +121,7 @@ public class QwpOwnedByTest {
                 try (Sender ignored = Sender.fromConfig(mixedRoundConfig(replica, primary))) {
                     Assert.fail("expected build to fail");
                 } catch (QwpOwnedByMismatchException e) {
-                    TestUtils.assertContains(e.getMessage(), "WebSocket upgrade failed: server did not confirm owned_by, "
-                            + "it cannot set the owner of auto-created tables and columns [owned_by=" + OWNER
-                            + ", echoed=<no X-QWP-Owned-By header>]");
+                    Assert.assertEquals(unconfirmedOwnerMessage("localhost", primary.getPort(), NO_ECHO), e.getMessage());
                 }
                 Assert.assertEquals(OWNER_ENCODED, primary.pollOwnedByRequest(5, TimeUnit.SECONDS));
             }
@@ -143,9 +146,10 @@ public class QwpOwnedByTest {
                 try (Sender ignored = Sender.fromConfig(mixedRoundConfig(proxy, primary, replica))) {
                     Assert.fail("expected build to fail");
                 } catch (QwpOwnedByMismatchException e) {
-                    TestUtils.assertContains(e.getMessage(), "WebSocket upgrade failed: server did not confirm owned_by, "
-                            + "it cannot set the owner of auto-created tables and columns [owned_by=" + OWNER
-                            + ", echoed=<no X-QWP-Owned-By header>]");
+                    Assert.assertEquals(unconfirmedOwnerMessage("localhost", primary.getPort(), NO_ECHO), e.getMessage());
+                    // the primary, not the proxy that answered 503 or the replica
+                    Assert.assertEquals("localhost", e.getHost());
+                    Assert.assertEquals(primary.getPort(), e.getPort());
                     Assert.assertEquals(1, e.getSuppressed().length);
                     Assert.assertEquals(503, ((WebSocketUpgradeException) e.getSuppressed()[0]).getStatusCode());
                 }
@@ -172,19 +176,7 @@ public class QwpOwnedByTest {
             try (TestWebSocketServer server = startServer()) {
                 server.setRejectWithStatus(400, "Bad Request");
                 server.setRejectBody("owned_by refused: access control is disabled\r\n");
-                try (WebSocketClient client = WebSocketClientFactory.newPlainTextInstance()) {
-                    client.setQwpOwnedBy(OWNER);
-                    client.connect("127.0.0.1", server.getPort());
-                    try {
-                        client.upgrade("/write/v4", null);
-                        Assert.fail("expected the upgrade to fail");
-                    } catch (WebSocketUpgradeException e) {
-                        Assert.assertEquals(400, e.getStatusCode());
-                        Assert.assertEquals("owned_by refused: access control is disabled", client.getUpgradeRejectReason());
-                        TestUtils.assertContains(e.getMessage(),
-                                "WebSocket upgrade failed: HTTP/1.1 400 Bad Request [reason=owned_by refused: access control is disabled]");
-                    }
-                }
+                assertBadRequestReason(server, "owned_by refused: access control is disabled");
             }
         });
     }
@@ -219,16 +211,7 @@ public class QwpOwnedByTest {
         TestUtils.assertMemoryLeak(() -> {
             try (TestWebSocketServer server = startServer()) {
                 server.setRejectWithStatus(400, "Bad Request");
-                try (WebSocketClient client = WebSocketClientFactory.newPlainTextInstance()) {
-                    client.connect("127.0.0.1", server.getPort());
-                    try {
-                        client.upgrade("/write/v4", null);
-                        Assert.fail("expected the upgrade to fail");
-                    } catch (WebSocketUpgradeException e) {
-                        Assert.assertNull(client.getUpgradeRejectReason());
-                        Assert.assertEquals("WebSocket upgrade failed: HTTP/1.1 400 Bad Request", e.getMessage());
-                    }
-                }
+                assertBadRequestReason(server, null);
             }
         });
     }
@@ -287,9 +270,7 @@ public class QwpOwnedByTest {
                 try (Sender ignored = Sender.fromConfig(senderConfig(server))) {
                     Assert.fail("expected build to fail");
                 } catch (QwpOwnedByMismatchException e) {
-                    TestUtils.assertContains(fullMessage(e), "WebSocket upgrade failed: server did not confirm owned_by, "
-                            + "it cannot set the owner of auto-created tables and columns [owned_by=" + OWNER
-                            + ", echoed=<no X-QWP-Owned-By header>]");
+                    Assert.assertEquals(unconfirmedOwnerMessage("localhost", server.getPort(), NO_ECHO), e.getMessage());
                 }
                 Assert.assertEquals(OWNER_ENCODED, server.pollOwnedByRequest(5, TimeUnit.SECONDS));
             }
@@ -345,7 +326,7 @@ public class QwpOwnedByTest {
         TestUtils.assertMemoryLeak(() -> {
             try (TestWebSocketServer server = startServer()) {
                 server.setOwnedByEchoValue("other");
-                assertUpgradeFailsOnEcho(server, "echoed=other]");
+                assertUpgradeFailsOnEcho(server, "other");
             }
         });
     }
@@ -355,7 +336,7 @@ public class QwpOwnedByTest {
         TestUtils.assertMemoryLeak(() -> {
             try (TestWebSocketServer server = startServer()) {
                 server.setOwnedByEchoSuppressed(true);
-                assertUpgradeFailsOnEcho(server, "echoed=<no X-QWP-Owned-By header>]");
+                assertUpgradeFailsOnEcho(server, NO_ECHO);
             }
         });
     }
@@ -390,18 +371,11 @@ public class QwpOwnedByTest {
                 Assert.assertEquals(WebSocketUpgradeException.STATUS_NONE, e.getStatusCode());
                 Assert.assertFalse(e.isRoleMismatch());
                 Assert.assertFalse(client.isConnected());
-                TestUtils.assertContains(e.getMessage(), "WebSocket upgrade failed: server did not confirm owned_by, "
-                        + "it cannot set the owner of auto-created tables and columns [owned_by=" + OWNER + ", " + expectedEcho);
+                Assert.assertEquals("127.0.0.1", e.getHost());
+                Assert.assertEquals(server.getPort(), e.getPort());
+                Assert.assertEquals(unconfirmedOwnerMessage("127.0.0.1", server.getPort(), expectedEcho), e.getMessage());
             }
         }
-    }
-
-    private static String fullMessage(Throwable e) {
-        StringBuilder sb = new StringBuilder();
-        for (Throwable t = e; t != null; t = t.getCause()) {
-            sb.append(t.getMessage()).append(" <- ");
-        }
-        return sb.toString();
     }
 
     // A connect string that walks the servers in the order given, in one round.
@@ -426,6 +400,13 @@ public class QwpOwnedByTest {
         server.start();
         Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
         return server;
+    }
+
+    // The message an upgrade to host:port fails with when the server does not confirm OWNER: it echoed echo, or
+    // NO_ECHO for none.
+    private static String unconfirmedOwnerMessage(String host, int port, String echo) {
+        return "WebSocket upgrade failed: server did not confirm owned_by, it cannot set the owner of auto-created "
+                + "tables and columns [host=" + host + ", port=" + port + ", owned_by=" + OWNER + ", echoed=" + echo + ']';
     }
 
     private static WebSocketClient upgradedClient(TestWebSocketServer server, String ownedBy) {

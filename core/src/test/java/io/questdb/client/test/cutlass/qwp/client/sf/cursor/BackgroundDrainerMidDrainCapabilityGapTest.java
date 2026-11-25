@@ -367,7 +367,7 @@ public class BackgroundDrainerMidDrainCapabilityGapTest {
                 // No endpoint ever confirms the owner: every sweep after the drop throws.
                 ScriptedWireFactory factory = new ScriptedWireFactory(
                         server.getPort(), 2, Integer.MAX_VALUE,
-                        () -> new QwpOwnedByMismatchException("team_a", null));
+                        () -> new QwpOwnedByMismatchException("h", 1234, "team_a", null));
                 BackgroundDrainer drainer = newDrainer(factory);
                 CountingListener listener = new CountingListener();
                 drainer.setListener(listener);
@@ -433,7 +433,7 @@ public class BackgroundDrainerMidDrainCapabilityGapTest {
                 // Call 1: healthy connect, then the drop. Calls 2-4: no owner confirmation. Call 5+: healthy.
                 ScriptedWireFactory factory = new ScriptedWireFactory(
                         server.getPort(), 2, 4,
-                        () -> new QwpOwnedByMismatchException("team_a", null));
+                        () -> new QwpOwnedByMismatchException("h", 1234, "team_a", null));
                 BackgroundDrainer drainer = newDrainer(factory);
                 CountingListener listener = new CountingListener();
                 drainer.setListener(listener);

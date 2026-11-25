@@ -812,7 +812,7 @@ public class BackgroundDrainerDurableAckRetryTest {
             CountingListener listener = new CountingListener();
             int failTimes = 5;
             ScriptedFactory factory = ScriptedFactory.failingTimes(failTimes,
-                    () -> new QwpOwnedByMismatchException("team_a", null));
+                    () -> new QwpOwnedByMismatchException("h", 1234, "team_a", null));
             BackgroundDrainer drainer = newDrainer(factory);
             drainer.setListener(listener);
             List<SenderError> captured = Collections.synchronizedList(new ArrayList<SenderError>());
@@ -834,11 +834,11 @@ public class BackgroundDrainerDurableAckRetryTest {
     @Test(timeout = 60_000)
     public void testUnconfirmedOwnedByEscalatesAfterTheSettleBudget() throws Exception {
         // A cluster that never confirms the owner is quarantined once the settle budget runs out, with a reason
-        // that names owned_by.
+        // that names owned_by and the endpoint that left the echo out.
         assertMemoryLeak(() -> {
             CountingListener listener = new CountingListener();
             ScriptedFactory factory = ScriptedFactory.alwaysFailing(
-                    () -> new QwpOwnedByMismatchException("team_a", null));
+                    () -> new QwpOwnedByMismatchException("h", 1234, "team_a", null));
             BackgroundDrainer drainer = newDrainer(factory);
             drainer.setListener(listener);
             List<SenderError> captured = Collections.synchronizedList(new ArrayList<SenderError>());
@@ -855,9 +855,11 @@ public class BackgroundDrainerDurableAckRetryTest {
             SenderError err = captured.get(0);
             assertEquals(SenderError.Category.DATA_LOSS, err.getCategory());
             assertEquals(SenderError.Policy.ABANDONED, err.getAppliedPolicy());
-            assertTrue("reason must name the unconfirmed owner [msg=" + err.getServerMessage() + ']',
-                    err.getServerMessage() != null && err.getServerMessage().startsWith(
-                            "owned_by persistently unconfirmed after " + threshold + " attempts: "));
+            assertEquals("owned_by persistently unconfirmed after " + threshold + " attempts: "
+                            + "WebSocket upgrade failed: server did not confirm owned_by, it cannot set the owner of "
+                            + "auto-created tables and columns "
+                            + "[host=h, port=1234, owned_by=team_a, echoed=<no X-QWP-Owned-By header>]",
+                    err.getServerMessage());
             assertEquals(0, listener.unavailableAttempts.size());
             assertEquals(0, listener.persistentFailures.get());
         });
@@ -871,7 +873,7 @@ public class BackgroundDrainerDurableAckRetryTest {
             CountingListener listener = new CountingListener();
             AtomicInteger sweep = new AtomicInteger();
             ScriptedFactory factory = ScriptedFactory.alwaysFailing(() -> sweep.incrementAndGet() % 2 == 1
-                    ? new QwpOwnedByMismatchException("team_a", null)
+                    ? new QwpOwnedByMismatchException("h", 1234, "team_a", null)
                     : new QwpDurableAckMismatchException("h", 1234, "primary"));
             BackgroundDrainer drainer = newDrainer(factory);
             drainer.setListener(listener);

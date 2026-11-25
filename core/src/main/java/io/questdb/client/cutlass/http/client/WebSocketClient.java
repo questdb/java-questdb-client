@@ -1662,7 +1662,7 @@ public abstract class WebSocketClient implements QuietCloseable {
         if (qwpOwnedByHeaderValue != null) {
             String echo = extractHeaderValues(response, QWP_OWNED_BY_HEADER_NAME);
             if (!qwpOwnedByHeaderValue.equals(echo)) {
-                throw new QwpOwnedByMismatchException(qwpOwnedBy, echo);
+                throw new QwpOwnedByMismatchException(String.valueOf(host), port, qwpOwnedBy, echo);
             }
         }
     }
