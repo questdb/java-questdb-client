@@ -31,6 +31,7 @@ import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketClientFactory;
 import io.questdb.client.cutlass.qwp.client.QwpAuthFailedException;
 import io.questdb.client.cutlass.qwp.client.QwpDurableAckMismatchException;
+import io.questdb.client.cutlass.qwp.client.QwpOwnedByMismatchException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.network.PlainSocketFactory;
@@ -75,6 +76,13 @@ public class CursorWebSocketSendLoopForegroundReconnectPolicyTest {
         assertAsyncInitialForegroundSurfacesTerminal(true,
                 () -> new QwpDurableAckMismatchException("localhost", 1, "primary"),
                 "durable-ack-mismatch");
+    }
+
+    @Test
+    public void testAsyncInitialOwnedByMismatchSurfacesTerminalToTheCaller() throws Exception {
+        assertAsyncInitialForegroundSurfacesTerminal(false,
+                () -> new QwpOwnedByMismatchException("localhost", 1, "team_a", null),
+                "ws-upgrade-failed: WebSocket upgrade failed: server did not confirm owned_by");
     }
 
     @Test
@@ -134,6 +142,12 @@ public class CursorWebSocketSendLoopForegroundReconnectPolicyTest {
     public void testPostStartDurableAckMismatchRetriesUntilCapabilityRecovers() throws Exception {
         assertForegroundRecovers(true,
                 () -> new QwpDurableAckMismatchException("localhost", 1, "primary"));
+    }
+
+    @Test
+    public void testPostStartOwnedByMismatchRetriesUntilCapabilityRecovers() throws Exception {
+        assertForegroundRecovers(false,
+                () -> new QwpOwnedByMismatchException("localhost", 1, "team_a", null));
     }
 
     /**

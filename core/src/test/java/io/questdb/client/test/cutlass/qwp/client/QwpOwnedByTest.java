@@ -278,6 +278,26 @@ public class QwpOwnedByTest {
     }
 
     @Test
+    public void testSenderFailsWhenServerIgnoresOwnedByInSyncMode() throws Exception {
+        // A SYNC initial connect retries a failed connect within its budget, but not a server that does not confirm
+        // the owner: like a rejected credential, that is the caller's to see at startup. The short budget bounds a run
+        // that wrongly retries.
+        TestUtils.assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = startServer()) {
+                server.setOwnedByEchoSuppressed(true);
+                try (Sender ignored = Sender.fromConfig(senderConfig(server) + "initial_connect_retry=sync;"
+                        + "reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=20;"
+                        + "reconnect_max_duration_millis=1000;")) {
+                    Assert.fail("expected build to fail");
+                } catch (QwpOwnedByMismatchException e) {
+                    Assert.assertEquals(unconfirmedOwnerMessage("localhost", server.getPort(), NO_ECHO), e.getMessage());
+                }
+                Assert.assertEquals("the initial connect must not retry", 1, server.upgradeRequestCount());
+            }
+        });
+    }
+
+    @Test
     public void testSenderResendsOwnedByOnReconnect() throws Exception {
         // The owner travels in every upgrade, not only in the first one, so the tables and columns auto-created
         // over a re-established connection get it too.
