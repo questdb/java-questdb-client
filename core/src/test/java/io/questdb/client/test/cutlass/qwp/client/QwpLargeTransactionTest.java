@@ -525,7 +525,7 @@ public class QwpLargeTransactionTest {
                     writeRows(lease, "t", 0, 1_000);
                     Assert.assertTrue(before.awaitFrames(2));
                     first.close();
-                    lease.close();
+                    assertDiscardDoesNotWait(lease, Sender::close);
                     Sender next = db.borrowSender();
                     writeRows(next, "t", 0, 10);
                     next.flush();
@@ -1613,6 +1613,34 @@ public class QwpLargeTransactionTest {
     }
 
     @Test
+    public void testStrictRowLimitIsServerDefaultWhenNotAdvertised() throws Exception {
+        // A server that does not advertise X-QWP-Max-Uncommitted-Rows commits a table on
+        // its own once its default qwp.max.uncommitted.rows of 1,000,000 rows are
+        // uncommitted, so a strict transaction holds at most 999,999 rows of a table.
+        // Rows of one LONG column keep the transaction small.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                try (QwpWebSocketSender s = (QwpWebSocketSender) Sender.fromConfig(conf(server) + "transaction=strict;")) {
+                    Assert.assertEquals(0, s.getServerMaxUncommittedRows());
+                    for (int i = 0; i < 999_999; i++) {
+                        s.table("a").longColumn("v", i).atNow();
+                    }
+                    try {
+                        s.table("a").longColumn("v", 999_999).atNow();
+                        Assert.fail("the 1,000,000th row of a table must be refused");
+                    } catch (TransactionTooLargeException e) {
+                        Assert.assertEquals(serverRowLimitError("a", 1_000_000), e.getMessage());
+                    }
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                }
+                assertOneTransaction(h);
+            }
+        });
+    }
+
+    @Test
     public void testStrictRowLimitCountsEverySpellingOfATable() throws Exception {
         // The server writes the rows of names that differ only in letter case to one
         // table and commits it on its own once the advertised 100 of its rows are
@@ -2020,7 +2048,7 @@ public class QwpLargeTransactionTest {
                 try (Sender s = Sender.fromConfig(conf(server) + "transaction=strict;")) {
                     writeRows(s, "t", 0, 1_000);
                     Assert.assertTrue(h.awaitFrames(2));
-                    s.rollback();
+                    assertDiscardDoesNotWait(s, Sender::rollback);
                     writeRows(s, "t", 0, 10);
                     s.flush();
                     Assert.assertTrue(s.drain(5_000));
@@ -2457,7 +2485,7 @@ public class QwpLargeTransactionTest {
                             + "initial_connect_retry=async;" + SMALL_FRAMES)) {
                         writeRows(s, "t", 0, 600);
                         // Must neither fail nor wait: no server has been reached yet.
-                        discard.accept(s);
+                        assertDiscardDoesNotWait(s, discard);
                         // Nor may it claim that the server lacks rollback support.
                         Assert.assertEquals(Collections.emptyList(), resetKeepsRowsWarnings(log));
                         writeRows(s, "t", 0, 10);
@@ -2478,6 +2506,16 @@ public class QwpLargeTransactionTest {
                 }
             });
         }
+    }
+
+    // Discards a transaction whose rollback frame no server acks: the server is down, or
+    // never acks the frame. A discard publishes the frame and returns, as flush() does;
+    // rollback() used to wait up to 30 s for the ack.
+    private static void assertDiscardDoesNotWait(Sender s, Consumer<Sender> discard) {
+        long start = System.nanoTime();
+        discard.accept(s);
+        long millis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+        Assert.assertTrue("the discard must not wait for the server [millis=" + millis + ']', millis < 2_000);
     }
 
     // Asserts what a server without rollback support received when the client discarded a
@@ -2607,7 +2645,7 @@ public class QwpLargeTransactionTest {
                     Assert.assertTrue(before.awaitFrames(2));
                     first.close();
                     // Must neither wait for the server nor fail: the server is away.
-                    discard.accept(s);
+                    assertDiscardDoesNotWait(s, discard);
                     writeRows(s, "t", 0, 10);
                     s.flush();
                     revived = start(after, CAP, port, true);
