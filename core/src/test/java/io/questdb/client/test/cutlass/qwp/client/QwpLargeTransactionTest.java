@@ -1,0 +1,3475 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.client.test.cutlass.qwp.client;
+
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
+import io.questdb.client.LineSenderServerException;
+import io.questdb.client.QuestDB;
+import io.questdb.client.Sender;
+import io.questdb.client.SenderError;
+import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.BatchTooLargeForCapException;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
+import io.questdb.client.cutlass.qwp.client.TransactionTooLargeException;
+import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentBudget;
+import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
+import io.questdb.client.impl.SenderPool;
+import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
+import io.questdb.client.test.tools.TestUtils;
+import org.junit.Assert;
+import org.junit.Assume;
+import org.junit.Test;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.lang.management.ManagementFactory;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.IdentityHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+import java.util.function.Function;
+
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
+
+/**
+ * Batches of any size over QWP/WebSocket: the byte trigger that keeps every batch
+ * within one frame, transactional and strict transactional mode, and rollback.
+ * <p>
+ * {@link TxnServer} answers frames the way the QuestDB server does: a
+ * FLAG_DEFER_COMMIT frame gets no ack until a commit frame closes its group, a
+ * commit frame gets a cumulative OK ack, and the rollback control frame gets a
+ * cumulative OK ack once the server negotiated rollback.
+ */
+public class QwpLargeTransactionTest {
+    private static final int CAP = 32 * 1024;
+    // Row trigger past the batches here: only flush() sends them.
+    private static final int NO_ROW_TRIGGER = 100_000;
+    // OUTAGE_SPLIT_RING's fillers of ~39 KB fit this cap; a split of ~68 KB does not.
+    private static final int OUTAGE_SPLIT_CAP = 48 * 1024;
+    // Committed fillers of ~39 KB take a 64 KiB segment each and leave ~26 KB of it free,
+    // and 256 KiB hold a few of them. A refused append fails after 500 ms.
+    private static final String OUTAGE_SPLIT_RING = "auto_flush_bytes=off;auto_flush_rows=100000;"
+            + "auto_flush_interval=off;sf_max_segment_bytes=64k;sf_max_total_bytes=256k;"
+            + "sf_append_deadline_millis=500;";
+    // Twice the 64 KiB segments of SPLIT_PAST_SEGMENT: a split frame can fit the cap but
+    // not a segment.
+    private static final int SPLIT_CAP = 128 * 1024;
+    // No byte trigger, so a batch grows past SPLIT_CAP and flush() splits it per table.
+    private static final String SPLIT_PAST_SEGMENT = "auto_flush_bytes=off;auto_flush_interval=off;"
+            + "sf_max_segment_bytes=64k;";
+    // Rows sendPartOfSplit writes.
+    private static final int SPLIT_ROWS = 1_400;
+    // The settings a refusal at the client buffer names.
+    private static final String CLIENT_BUFFER_REMEDY = "Raise sf_max_total_bytes, or set sf_dir to keep the "
+            + "transaction on disk";
+    // What closing a sender or returning a pooled lease logs when it discards an open
+    // strict transaction of 1000 rows, behind the action that discarded it.
+    private static final String DISCARD_WARNING = " discarded an uncommitted transaction of 1000 rows: a strict "
+            + "transactional sender (transaction=strict, or one with no auto-flush trigger) commits only on "
+            + "flush(). Call flush() before close() to keep the rows, or ignore this if the discard is intentional";
+    private static final String NO_TRIGGER_TRANSACTION_OFF_ERROR = "auto-flush is off (auto_flush=off, or "
+            + "auto_flush_rows=off and auto_flush_interval=off), which on WebSocket selects strict transactional "
+            + "mode and cannot be combined with transaction=off; set transaction=on or turn on an auto-flush trigger";
+    // ~100 encoded bytes per row: 1000 rows (the default row trigger) are ~100 KB,
+    // three times the 32 KiB cap.
+    private static final String PAD = TestUtils.repeat("x", 90);
+    // What reset() of a transaction=on transaction logs, once per sender, when it keeps the
+    // rows already sent because the server of the last handshake lacks rollback support.
+    private static final String RESET_KEEPS_ROWS_WARNING = "reset() discarded the rows not yet sent, but the "
+            + "server does not support QWP rollback, so the open transaction's rows already sent stay on the "
+            + "server and the next flush() commits them. Close the sender to discard them instead";
+    // The settings a refusal at a sender's share of a shared client buffer names.
+    private static final String SHARE_REMEDY = "Raise sf_max_total_bytes, lower sender_pool_max, or set sf_dir to "
+            + "keep the transaction on disk";
+    // Before its first connection the sender sizes frames for the server's default frame
+    // cap, not for this mock's CAP: 200 rows (~20 KB) keep each such frame within CAP.
+    private static final String SMALL_FRAMES = "auto_flush_rows=200;";
+    // A strict transaction in frames of exactly 280 rows (~28 KB): two share a 64 KiB
+    // segment. A deferred frame also keeps room for the commit, three 32 KiB frames: one
+    // fits next to a single frame of 280 rows, none next to two. So k frames span
+    // ceil(k/2) segments, and with the room for the commit they need 2 more segments for
+    // odd k and 3 more for even k. A blocked append would wait 30 s.
+    private static final String STRICT_FRAMES_OF_280 = "transaction=strict;auto_flush_rows=280;auto_flush_bytes=off;"
+            + "auto_flush_interval=off;sf_max_segment_bytes=64k;sf_append_deadline_millis=30000;";
+    // transaction=on in frames of exactly 280 rows (~28 KB): two fill a 64 KiB segment,
+    // so the 256 KiB client buffer holds eight frames of a transaction. A blocked
+    // append would wait 30 s.
+    private static final String TXN_ON_FRAMES_OF_280 = "transaction=on;auto_flush_rows=280;auto_flush_bytes=off;"
+            + "auto_flush_interval=off;sf_max_segment_bytes=64k;sf_max_total_bytes=256k;"
+            + "sf_append_deadline_millis=30000;";
+
+    @Test
+    public void testAutoFlushBytesAloneCommitsEachBatch() throws Exception {
+        // A positive auto_flush_bytes is an auto-flush trigger: with the row and
+        // interval triggers off, every batch it cuts commits on its own, as before.
+        // transaction=off may say so explicitly.
+        assertMemoryLeak(() -> {
+            String[] configs = {
+                    "auto_flush_rows=off;auto_flush_interval=off;auto_flush_bytes=8192;",
+                    "auto_flush_rows=off;auto_flush_interval=off;auto_flush_bytes=8192;transaction=off;"
+            };
+            for (String config : configs) {
+                TxnServer h = new TxnServer();
+                try (TestWebSocketServer server = start(h, CAP)) {
+                    try (Sender s = Sender.fromConfig(conf(server) + config)) {
+                        QwpWebSocketSender ws = (QwpWebSocketSender) s;
+                        Assert.assertFalse(config, ws.isTransactional());
+                        Assert.assertEquals(config, 8_192, ws.getEffectiveAutoFlushBytes());
+                        // ~20 KB: the byte trigger sends at least two batches, and each
+                        // commits before any flush().
+                        writeRows(s, "t", 0, 200);
+                        Assert.assertTrue(config, h.awaitFrames(2));
+                        for (TxnFrame f : h.frames) {
+                            Assert.assertTrue(config + ": " + h.frames, f.isCommit());
+                        }
+                    }
+                    // close() commits the rest.
+                    Assert.assertEquals(config, h.frames, h.committedFrames());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testAutoFlushOffRejectsPositiveAutoFlushBytes() throws Exception {
+        // auto_flush=off turns every auto-flush trigger off, so a byte trigger
+        // contradicts it, as a row or interval trigger already does. The ws:: parser
+        // applies the trigger keys before auto_flush, whatever their order.
+        // auto_flush_bytes=off is no trigger; see
+        // testNoAutoFlushTriggerWithAutoFlushBytesOffSendsOneFramePerFlush.
+        assertMemoryLeak(() -> {
+            assertConfigRejected("auto_flush=off;auto_flush_bytes=65536;",
+                    "auto flush bytes was already configured [autoFlushBytes=65536]");
+            assertConfigRejected("auto_flush_bytes=65536;auto_flush=off;",
+                    "auto flush bytes was already configured [autoFlushBytes=65536]");
+        });
+    }
+
+    @Test
+    public void testDefaultSenderSplitsWideRowsIntoFrames() throws Exception {
+        // Before: no byte trigger by default, so the 1000-row batch outgrew the cap
+        // and flush threw BatchTooLargeForCapException.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                try (Sender s = Sender.fromConfig(conf(server))) {
+                    writeRows(s, "t", 0, 2_000);
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                    QwpWebSocketSender ws = (QwpWebSocketSender) s;
+                    Assert.assertEquals((long) CAP * 9 / 10, ws.getEffectiveAutoFlushBytes());
+                }
+                assertFramesWithinCap(h, CAP);
+                Assert.assertTrue("rows must span frames: " + h.frames, h.frames.size() >= 7);
+                // Not transactional: every frame commits on its own.
+                Assert.assertEquals(h.frames.size(), h.commitFrames());
+            }
+        });
+    }
+
+    @Test
+    public void testExplicitAutoFlushBytesOffKeepsNoByteTrigger() throws Exception {
+        // auto_flush_bytes=off still opts out of the byte trigger, as documented.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                try (Sender s = Sender.fromConfig(conf(server) + "auto_flush_bytes=off;")) {
+                    Assert.assertEquals(0, ((QwpWebSocketSender) s).getEffectiveAutoFlushBytes());
+                    try {
+                        writeRows(s, "t", 0, 1_000);
+                        Assert.fail("a 1000-row batch over the cap must be rejected");
+                    } catch (BatchTooLargeForCapException expected) {
+                        TestUtils.assertContains(expected.getMessage(), "serverMaxBatchSize=" + CAP);
+                    }
+                    s.reset();
+                }
+                Assert.assertEquals(0, h.frames.size());
+            }
+        });
+    }
+
+    @Test
+    public void testByteTriggerFollowsSegmentSize() throws Exception {
+        // The server accepts 48 KiB frames, but a 16 KiB segment cannot hold them:
+        // batches must be sized to the segment, not fail at the append.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, 48 * 1024)) {
+                try (Sender s = Sender.fromConfig(conf(server) + "sf_max_segment_bytes=16k;")) {
+                    writeRows(s, "t", 0, 600);
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                    int segmentPayload = 16 * 1024 - 24 - 8;
+                    Assert.assertEquals(segmentPayload * 9 / 10, ((QwpWebSocketSender) s).getEffectiveAutoFlushBytes());
+                }
+                assertFramesWithinCap(h, 16 * 1024 - 24 - 8);
+                Assert.assertTrue(h.frames.size() >= 4);
+            }
+        });
+    }
+
+    @Test
+    public void testNewSymbolsCountTowardByteTrigger() throws Exception {
+        // Symbol columns buffer 4-byte ids; the 300-byte strings ride in the frame's
+        // dictionary section. Counting them keeps the frame within the cap.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                try (Sender s = Sender.fromConfig(conf(server))) {
+                    String prefix = TestUtils.repeat("s", 290);
+                    for (int i = 0; i < 1_000; i++) {
+                        s.table("t").symbol("sym", prefix + i).longColumn("v", i).atNow();
+                    }
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                }
+                assertFramesWithinCap(h, CAP);
+                Assert.assertTrue(h.frames.size() >= 10);
+            }
+        });
+    }
+
+    @Test
+    public void testNoAutoFlushTriggerIsStrictTransactionOfAnySize() throws Exception {
+        // Every way to turn off all auto-flush triggers builds the same sender: a
+        // strict transaction of any size, which only flush() commits.
+        // auto_flush_rows=off with auto_flush_interval=off used to send each flush as
+        // one batch, which failed past the frame cap, and to commit on close().
+        assertMemoryLeak(() -> {
+            for (NoTriggerSpelling spelling : noTriggerSpellings()) {
+                TxnServer h = new TxnServer();
+                List<TxnFrame> committed = null;
+                try (TestWebSocketServer server = start(h, CAP)) {
+                    try (Sender s = spelling.build(conf(server))) {
+                        QwpWebSocketSender ws = (QwpWebSocketSender) s;
+                        Assert.assertTrue(spelling.name, ws.isStrictTransactional());
+                        Assert.assertEquals(spelling.name, CAP * 9 / 10, ws.getEffectiveAutoFlushBytes());
+                        writeRows(s, "t", 0, 2_000);
+                        // ~200 KB went out as deferred frames before flush(); none commits.
+                        Assert.assertTrue(spelling.name, h.awaitFrames(5));
+                        Assert.assertEquals(spelling.name, 0, h.commitFrames());
+                        s.flush();
+                        Assert.assertTrue(spelling.name, s.drain(5_000));
+                        assertFramesWithinCap(h, CAP);
+                        assertOneTransaction(h);
+                        committed = h.committedFrames();
+                        Assert.assertEquals(spelling.name, h.frames, committed);
+                        // close() without flush() discards the next transaction, its
+                        // frames already sent included.
+                        writeRows(s, "t", 2_000, 1_000);
+                        Assert.assertTrue(spelling.name, h.awaitFrames(committed.size() + 2));
+                    }
+                    Assert.assertEquals(spelling.name, committed, h.committedFrames());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testNoAutoFlushTriggerRejectsTransactionOff() throws Exception {
+        // With no auto-flush trigger only flush() commits, and a non-transactional
+        // flush has to fit one frame, so every spelling refuses transaction=off.
+        assertMemoryLeak(() -> {
+            assertConfigRejected("auto_flush=off;transaction=off;", NO_TRIGGER_TRANSACTION_OFF_ERROR);
+            assertConfigRejected("auto_flush_rows=off;auto_flush_interval=off;transaction=off;",
+                    NO_TRIGGER_TRANSACTION_OFF_ERROR);
+            assertConfigRejected("auto_flush_rows=off;auto_flush_interval=off;auto_flush_bytes=off;transaction=off;",
+                    NO_TRIGGER_TRANSACTION_OFF_ERROR);
+        });
+    }
+
+    @Test
+    public void testNoAutoFlushTriggerWithAutoFlushBytesOffSendsOneFramePerFlush() throws Exception {
+        // auto_flush_bytes=off opts out of sizing batches to the frame: the
+        // transaction still commits only on flush(), but the application keeps it
+        // within one frame per table, and a flush past the cap is refused and keeps
+        // the rows, as auto_flush_bytes=off documents.
+        assertMemoryLeak(() -> {
+            String[] configs = {
+                    "auto_flush=off;auto_flush_bytes=off;",
+                    "auto_flush_rows=off;auto_flush_interval=off;auto_flush_bytes=off;"
+            };
+            for (String config : configs) {
+                TxnServer h = new TxnServer();
+                try (TestWebSocketServer server = start(h, CAP)) {
+                    try (Sender s = Sender.fromConfig(conf(server) + config)) {
+                        QwpWebSocketSender ws = (QwpWebSocketSender) s;
+                        Assert.assertTrue(config, ws.isStrictTransactional());
+                        Assert.assertEquals(config, 0, ws.getEffectiveAutoFlushBytes());
+                        // ~20 KB fits the 32 KiB cap: one frame, which commits.
+                        writeRows(s, "t", 0, 200);
+                        s.flush();
+                        Assert.assertTrue(config, s.drain(5_000));
+                        Assert.assertEquals(config, 1, h.frames.size());
+                        Assert.assertTrue(config, h.frames.get(0).isCommit());
+                        // ~100 KB does not.
+                        writeRows(s, "t", 200, 1_000);
+                        try {
+                            s.flush();
+                            Assert.fail(config + ": a flush past the cap must be refused");
+                        } catch (BatchTooLargeForCapException e) {
+                            TestUtils.assertContains(e.getMessage(), "serverMaxBatchSize=" + CAP);
+                        }
+                        s.reset();
+                    }
+                    Assert.assertEquals(config, 1, h.frames.size());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testNoAutoFlushTriggerWithTransactionOnCommitsOnClose() throws Exception {
+        // An explicit transaction=on wins over the strict mode a sender with no
+        // auto-flush trigger otherwise gets: close() commits, as transaction=on does.
+        assertMemoryLeak(() -> {
+            for (NoTriggerSpelling spelling : noTriggerSpellings()) {
+                TxnServer h = new TxnServer();
+                try (TestWebSocketServer server = start(h, CAP)) {
+                    try (Sender s = spelling.build(conf(server) + "transaction=on;")) {
+                        QwpWebSocketSender ws = (QwpWebSocketSender) s;
+                        Assert.assertTrue(spelling.name, ws.isTransactional());
+                        Assert.assertFalse(spelling.name, ws.isStrictTransactional());
+                        writeRows(s, "t", 0, 2_000);
+                        Assert.assertTrue(spelling.name, h.awaitFrames(5));
+                        Assert.assertEquals(spelling.name, 0, h.commitFrames());
+                    }
+                    assertFramesWithinCap(h, CAP);
+                    assertOneTransaction(h);
+                    Assert.assertEquals(spelling.name, h.frames, h.committedFrames());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testOneAutoFlushTriggerLeftKeepsEveryBatchCommitting() throws Exception {
+        // Turning off the row or the interval trigger alone leaves the other one, so
+        // the sender is not transactional: every batch it sends commits on its own.
+        assertMemoryLeak(() -> {
+            String[] configs = {"auto_flush_rows=off;", "auto_flush_interval=off;"};
+            for (String config : configs) {
+                TxnServer h = new TxnServer();
+                try (TestWebSocketServer server = start(h, CAP)) {
+                    try (Sender s = Sender.fromConfig(conf(server) + config)) {
+                        QwpWebSocketSender ws = (QwpWebSocketSender) s;
+                        Assert.assertFalse(config, ws.isTransactional());
+                        Assert.assertEquals(config, CAP * 9 / 10, ws.getEffectiveAutoFlushBytes());
+                        // ~100 KB: the byte trigger sends at least three batches before
+                        // any flush(), and each commits.
+                        writeRows(s, "t", 0, 1_000);
+                        Assert.assertTrue(config, h.awaitFrames(3));
+                        for (TxnFrame f : h.frames) {
+                            Assert.assertTrue(config + ": " + h.frames, f.isCommit());
+                        }
+                    }
+                    Assert.assertEquals(config, h.frames, h.committedFrames());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testPooledLeaseResetWithoutServerRollbackKeepsWorking() throws Exception {
+        // reset() on a lease of a pool with no auto-flush trigger, against a server without
+        // rollback support, used to abort the transaction: every flush threw until the pool
+        // retired the connection. The sender now discards the rows already sent by closing
+        // the connection that holds them, and the lease carries on, without warning about
+        // rows it discarded on purpose.
+        assertMemoryLeak(() -> {
+            ListAppender<ILoggingEvent> log = captureSenderLog();
+            try {
+                TxnServer h = new TxnServer();
+                try (TestWebSocketServer server = start(h, CAP)) {
+                    try (QuestDB db = QuestDB.connect(conf(server)
+                            + "auto_flush_rows=off;auto_flush_interval=off;query_pool_min=0;")) {
+                        Sender lease = db.borrowSender();
+                        writeRows(lease, "t", 0, 1_000);
+                        Assert.assertTrue(h.awaitFrames(2));
+                        lease.reset();
+                        writeRows(lease, "t", 0, 10);
+                        lease.flush();
+                        lease.close();
+                        Sender next = db.borrowSender();
+                        writeRows(next, "t", 0, 10);
+                        next.flush();
+                        Assert.assertTrue(next.drain(5_000));
+                        next.close();
+                    }
+                    Assert.assertEquals("one reconnect discards the transaction", 2, server.upgradeRequestCount());
+                }
+                assertDiscardedByClosingConnection("reset() on a lease", h);
+                Assert.assertEquals("both leases commit: " + h.frames, 2, h.committedFrames().size());
+                Assert.assertEquals(Collections.emptyList(), discardWarnings(log));
+            } finally {
+                releaseSenderLog(log);
+            }
+        });
+    }
+
+    @Test
+    public void testPooledLeaseRollbackWithoutServerRollbackClosesQuietly() throws Exception {
+        // rollback() on a transaction=on lease, against a server without rollback support,
+        // used to throw and abort the transaction, and returning the lease then threw the
+        // same error again: the flush that returns a transaction=on lease hit the aborted
+        // transaction. Now neither throws, and the next lease commits.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                try (QuestDB db = QuestDB.connect(conf(server) + "transaction=on;query_pool_min=0;")) {
+                    Sender lease = db.borrowSender();
+                    writeRows(lease, "t", 0, 1_000);
+                    Assert.assertTrue(h.awaitFrames(2));
+                    lease.rollback();
+                    lease.close();
+                    Sender next = db.borrowSender();
+                    writeRows(next, "t", 0, 10);
+                    next.flush();
+                    Assert.assertTrue(next.drain(5_000));
+                    next.close();
+                }
+                Assert.assertEquals("one reconnect discards the transaction", 2, server.upgradeRequestCount());
+            }
+            assertDiscardedByClosingConnection("rollback() on a lease", h);
+        });
+    }
+
+    @Test
+    public void testPooledLeaseWithoutAutoFlushTriggerDiscardsOnReturn() throws Exception {
+        // Returning a lease of a pool with no auto-flush trigger used to commit its rows.
+        // The lease now holds a strict transaction, which only flush() commits, so
+        // returning it discards the rows, and says so once: whether the server rolls
+        // back the frames already sent, or the pool retires the connection to discard them.
+        assertMemoryLeak(() -> {
+            ListAppender<ILoggingEvent> log = captureSenderLog();
+            try {
+                String[] spellings = {"auto_flush=off;", "auto_flush_rows=off;auto_flush_interval=off;"};
+                for (String spelling : spellings) {
+                    for (boolean isRollbackSupported : new boolean[]{false, true}) {
+                        String name = spelling + " rollback=" + isRollbackSupported;
+                        clearLog(log);
+                        TxnServer h = new TxnServer();
+                        try (TestWebSocketServer server = start(h, CAP)) {
+                            server.setRollbackSupported(isRollbackSupported);
+                            try (QuestDB db = QuestDB.connect(conf(server) + spelling + "query_pool_min=0;")) {
+                                Sender lease = db.borrowSender();
+                                writeRows(lease, "t", 0, 1_000);
+                                Assert.assertTrue(name, h.awaitFrames(2));
+                                lease.close();
+                                Sender next = db.borrowSender();
+                                writeRows(next, "t", 0, 10);
+                                next.flush();
+                                Assert.assertTrue(name, next.drain(5_000));
+                                next.close();
+                            }
+                            List<TxnFrame> committed = h.committedFrames();
+                            Assert.assertEquals(name + ": only the next lease commits", 1, committed.size());
+                            Assert.assertTrue(name, committed.get(0).isCommit());
+                            Assert.assertEquals(name, isRollbackSupported ? 1 : 0, h.rollbackFrames());
+                        }
+                        Assert.assertEquals(name,
+                                Collections.singletonList("returning the sender to the pool" + DISCARD_WARNING),
+                                discardWarnings(log));
+                    }
+                }
+            } finally {
+                releaseSenderLog(log);
+            }
+        });
+    }
+
+    @Test
+    public void testPooledStrictLeaseCloseDuringOutageKeepsTheConnection() throws Exception {
+        // Returning a strict lease discards its open transaction. During an outage that
+        // must neither wait for the server nor cost the pool its connection: the next
+        // borrower's transaction goes out behind the rollback frame once the server is back.
+        assertMemoryLeak(() -> {
+            int port = TestPorts.findUnusedPort();
+            TxnServer before = new TxnServer();
+            TxnServer after = new TxnServer();
+            TestWebSocketServer revived = null;
+            try (TestWebSocketServer first = start(before, CAP, port, true)) {
+                try (QuestDB db = QuestDB.connect(outageConf(port) + "transaction=strict;query_pool_min=0;")) {
+                    Sender lease = db.borrowSender();
+                    writeRows(lease, "t", 0, 1_000);
+                    Assert.assertTrue(before.awaitFrames(2));
+                    first.close();
+                    assertDiscardDoesNotWait(lease, Sender::close);
+                    Sender next = db.borrowSender();
+                    writeRows(next, "t", 0, 10);
+                    next.flush();
+                    revived = start(after, CAP, port, true);
+                    Assert.assertTrue(next.drain(10_000));
+                    next.close();
+                }
+            } finally {
+                if (revived != null) {
+                    revived.close();
+                }
+            }
+            assertDiscardedThenCommitted(before, after);
+        });
+    }
+
+    @Test
+    public void testPooledStrictLeaseCloseRetiresConnectionWithoutServerRollback() throws Exception {
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                try (QuestDB db = QuestDB.connect(conf(server) + "transaction=strict;query_pool_min=0;")) {
+                    Sender lease = db.borrowSender();
+                    writeRows(lease, "t", 0, 1_000);
+                    Assert.assertTrue(h.awaitFrames(2));
+                    // The server cannot roll back the frames already sent: the sender
+                    // closes the connection that holds them, which makes the server
+                    // discard them, and sends the next lease's rows on a new one.
+                    lease.close();
+                    Sender next = db.borrowSender();
+                    writeRows(next, "t", 0, 10);
+                    next.flush();
+                    Assert.assertTrue(next.drain(5_000));
+                    next.close();
+                }
+                Assert.assertEquals(1, h.commitFrames());
+                Assert.assertEquals(0, h.rollbackFrames());
+                Assert.assertEquals(2, server.upgradeRequestCount());
+            }
+            assertDiscardedByClosingConnection("strict lease returned", h);
+        });
+    }
+
+    @Test
+    public void testPooledStrictLeaseReturnBeforeFirstConnectKeepsEarlierCommits() throws Exception {
+        // The server is down when the pool starts. Returning a strict lease whose frames
+        // were already sent used to retire the pooled sender, as if the server could not
+        // roll them back, and closing it dropped the rows an earlier lease had committed,
+        // which no server had acknowledged yet. The pool now keeps the sender: once a
+        // server is reached the transaction is discarded, and both commits land.
+        for (boolean isRollbackSupported : new boolean[]{true, false}) {
+            assertMemoryLeak(() -> {
+                int port = TestPorts.findUnusedPort();
+                TxnServer h = new TxnServer();
+                TestWebSocketServer server = null;
+                try {
+                    try (QuestDB db = QuestDB.connect(outageConf(port)
+                            + "transaction=strict;lazy_connect=true;" + SMALL_FRAMES)) {
+                        Sender lease = db.borrowSender();
+                        writeRows(lease, "t", 0, 10);
+                        lease.flush();
+                        lease.close();
+                        lease = db.borrowSender();
+                        writeRows(lease, "t", 0, 600);
+                        lease.close();
+                        server = start(h, CAP, port, isRollbackSupported);
+                        lease = db.borrowSender();
+                        writeRows(lease, "t", 0, 5);
+                        lease.flush();
+                        Assert.assertTrue(lease.drain(10_000));
+                        lease.close();
+                    }
+                } finally {
+                    if (server != null) {
+                        server.close();
+                    }
+                }
+                assertCommittedFlushesOnly(h, 2);
+                Assert.assertEquals(h.frames.toString(), isRollbackSupported ? 1 : 0, h.rollbackFrames());
+                Assert.assertEquals(h.frames.toString(), isRollbackSupported ? 1 : 2, h.connectionCount());
+            });
+        }
+    }
+
+    @Test
+    public void testPooledStrictLeaseReturnDuringOutageKeepsEarlierCommits() throws Exception {
+        // A pool connected to a server without rollback support, which then goes down.
+        // Returning a strict lease whose frames were already sent used to retire the pooled
+        // sender, and closing it dropped the rows an earlier lease had committed during the
+        // outage. The pool now keeps the sender, and both commits land once the server is
+        // back.
+        assertMemoryLeak(() -> {
+            int port = TestPorts.findUnusedPort();
+            TxnServer before = new TxnServer();
+            TxnServer after = new TxnServer();
+            TestWebSocketServer revived = null;
+            try (TestWebSocketServer first = start(before, CAP, port, false)) {
+                try (QuestDB db = QuestDB.connect(outageConf(port) + "transaction=strict;query_pool_min=0;")) {
+                    Sender lease = db.borrowSender();
+                    writeRows(lease, "t", 0, 10);
+                    lease.flush();
+                    Assert.assertTrue(lease.drain(5_000));
+                    lease.close();
+                    first.close();
+                    lease = db.borrowSender();
+                    writeRows(lease, "t", 0, 10);
+                    lease.flush();
+                    lease.close();
+                    lease = db.borrowSender();
+                    writeRows(lease, "t", 0, 600);
+                    lease.close();
+                    revived = start(after, CAP, port, false);
+                    lease = db.borrowSender();
+                    writeRows(lease, "t", 0, 5);
+                    lease.flush();
+                    Assert.assertTrue(lease.drain(10_000));
+                    lease.close();
+                }
+            } finally {
+                if (revived != null) {
+                    revived.close();
+                }
+            }
+            assertCommittedFlushesOnly(before, 1);
+            assertCommittedFlushesOnly(after, 2);
+            Assert.assertEquals(after.frames.toString(), 0, after.rollbackFrames());
+        });
+    }
+
+    @Test
+    public void testPooledStrictLeaseCloseRollsBackUncommitted() throws Exception {
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                server.setRollbackSupported(true);
+                try (QuestDB db = QuestDB.connect(conf(server) + "transaction=strict;query_pool_min=0;")) {
+                    Sender lease = db.borrowSender();
+                    writeRows(lease, "t", 0, 1_000);
+                    Assert.assertTrue(h.awaitFrames(2));
+                    // Returning a strict lease without flush() discards the transaction,
+                    // without waiting for the server.
+                    lease.close();
+                    Assert.assertTrue(h.awaitRollbackFrames(1));
+                    Assert.assertTrue(h.frames.get(h.frames.size() - 1).isRollback());
+                    Sender next = db.borrowSender();
+                    writeRows(next, "t", 0, 10);
+                    next.flush();
+                    Assert.assertTrue(next.drain(5_000));
+                    next.close();
+                }
+                Assert.assertEquals(1, h.commitFrames());
+                Assert.assertEquals(1, h.rollbackFrames());
+                assertRolledBackThenCommitted(h);
+            }
+        });
+    }
+
+    @Test
+    public void testPooledStrictLeaseCloseWithOnlyPendingRowsKeepsConnection() throws Exception {
+        // Nothing reached the server yet: returning the lease drops the pending
+        // rows without a rollback frame and keeps the connection pooled.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                try (QuestDB db = QuestDB.connect(conf(server) + "transaction=strict;query_pool_min=0;")) {
+                    Sender lease = db.borrowSender();
+                    writeRows(lease, "t", 0, 10);
+                    lease.close();
+                    Sender next = db.borrowSender();
+                    writeRows(next, "t", 0, 5);
+                    next.flush();
+                    Assert.assertTrue(next.drain(5_000));
+                    next.close();
+                }
+                Assert.assertEquals(1, h.frames.size());
+                Assert.assertTrue(h.frames.get(0).isCommit());
+                Assert.assertEquals(1, server.upgradeRequestCount());
+            }
+        });
+    }
+
+    @Test
+    public void testPooledStrictCommitPastTheShareIsNotSent() throws Exception {
+        // With no auto-flush trigger at all, flush() sends the whole transaction, one
+        // frame per table, two to a 64 KiB segment. Two senders share 512 KiB, so each
+        // can count on four segments: nine tables need five, and flush() sends nothing,
+        // while eight fit and commit as one transaction. The refused transaction stays
+        // open, and once it outgrows the whole buffer, at seventeen tables in nine
+        // segments, the refusal says so: only a larger buffer could take it.
+        assertMemoryLeak(() -> {
+            String config = "auto_flush=off;auto_flush_bytes=off;sf_max_segment_bytes=64k;sf_max_total_bytes=512k;"
+                    + "sender_pool_max=2;query_pool_min=0;";
+            TxnServer h = new TxnServer();
+            long refusedBytes = -1;
+            try (TestWebSocketServer server = start(h, CAP)) {
+                try (QuestDB db = QuestDB.connect(conf(server) + config)) {
+                    Sender lease = db.borrowSender();
+                    writeTables(lease, 0, 9);
+                    try {
+                        lease.flush();
+                        Assert.fail("the sender's share cannot hold the commit");
+                    } catch (TransactionTooLargeException e) {
+                        refusedBytes = assertShareRefusal(e, 524_288, 2, "so the flush was not sent");
+                    }
+                    writeTables(lease, 9, 8);
+                    try {
+                        lease.flush();
+                        Assert.fail("the client buffer cannot hold the commit");
+                    } catch (TransactionTooLargeException e) {
+                        assertClientBufferRefusal(e, 524_288, "so the flush was not sent");
+                    }
+                    Assert.assertEquals("nothing was sent", 0, h.frames.size());
+                    lease.rollback();
+                    // The same rows, one table per transaction: the refusal reported what
+                    // these frames add up to.
+                    for (int t = 0; t < 9; t++) {
+                        writeTables(lease, t, 1);
+                        lease.flush();
+                    }
+                    Assert.assertTrue(lease.drain(5_000));
+                    lease.close();
+                }
+                Assert.assertEquals("CCCCCCCCC", frameKinds(h));
+                Assert.assertEquals(refusedBytes, frameBytes(h));
+            }
+            h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                try (QuestDB db = QuestDB.connect(conf(server) + config)) {
+                    Sender lease = db.borrowSender();
+                    writeTables(lease, 0, 8);
+                    lease.flush();
+                    Assert.assertTrue(lease.drain(5_000));
+                    lease.close();
+                }
+                Assert.assertEquals("DDDDDDDC", frameKinds(h));
+                Assert.assertEquals(h.frames.size(), h.committedFrames().size());
+            }
+        });
+    }
+
+    @Test
+    public void testPooledStrictLeaseOfPoolOfOneKeepsTheWholeBuffer() throws Exception {
+        // A pool of one sender shares its client buffer with no other sender, so its
+        // lease's strict transaction may fill all of it, like that of a sender built on
+        // its own, on disk too: no other sender's pre-created segment can take its room.
+        // 520 KiB holds eight segments: eleven frames of 280 rows and the room for their
+        // commit, so the twelfth frame is refused.
+        assertMemoryLeak(() -> {
+            String dir = TestUtils.createTmpDir("qwp-txn-share-");
+            try {
+                for (boolean isDiskMode : new boolean[]{false, true}) {
+                    String context = isDiskMode ? "sf_dir" : "memory";
+                    TxnServer h = new TxnServer();
+                    try (TestWebSocketServer server = start(h, CAP)) {
+                        String config = conf(server) + STRICT_FRAMES_OF_280 + "sf_max_total_bytes=520k;"
+                                + (isDiskMode ? "sf_dir=" + dir + ";" : "");
+                        try (SenderPool pool = new SenderPool(config, 1, 1, 5_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                            Sender lease = pool.borrow();
+                            Refusal refusal = writeUntilTooLarge(lease, "t");
+                            Assert.assertEquals(context, 3_360, refusal.row);
+                            // On disk the budget also charges the symbol dictionary files.
+                            SegmentBudget budget = pool.getSegmentBudgetForTesting();
+                            assertClientBufferRefusal(refusal.error,
+                                    budget.getCapacityBytes() - budget.getSideFileBytes(), "so the row was not added");
+                            lease.flush();
+                            Assert.assertTrue(context, lease.drain(5_000));
+                            lease.close();
+                        }
+                        if (!isDiskMode) {
+                            // A sender built on its own refuses the same row.
+                            try (Sender s = Sender.fromConfig(config)) {
+                                Assert.assertEquals(3_360, writeUntilRefused(s, 532_480));
+                                s.flush();
+                                Assert.assertTrue(s.drain(5_000));
+                            }
+                        }
+                    }
+                    Assert.assertEquals(context, isDiskMode ? "DDDDDDDDDDDC" : "DDDDDDDDDDDCDDDDDDDDDDDC", frameKinds(h));
+                    Assert.assertEquals(context, h.frames.size(), h.committedFrames().size());
+                }
+            } finally {
+                TestUtils.removeTmpDirRec(dir);
+            }
+        });
+    }
+
+    @Test
+    public void testPooledStrictLeaseReturnEndsTheShareRefusal() throws Exception {
+        // Returning a lease whose transaction its share refused discards the transaction:
+        // the next borrower of the same sender starts with the whole share again.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                server.setRollbackSupported(true);
+                try (QuestDB db = QuestDB.connect(conf(server) + STRICT_FRAMES_OF_280
+                        + "sf_max_total_bytes=512k;query_pool_min=0;")) {
+                    Sender lease = db.borrowSender();
+                    Refusal first = writeUntilTooLarge(lease, "t");
+                    Assert.assertEquals(840, first.row);
+                    assertShareRefusal(first.error, 524_288, 4, "so the row was not added");
+                    lease.close();
+                    Sender next = db.borrowSender();
+                    Refusal second = writeUntilTooLarge(next, "t");
+                    Assert.assertEquals(840, second.row);
+                    long refusedBytes = assertShareRefusal(second.error, 524_288, 4, "so the row was not added");
+                    next.flush();
+                    Assert.assertTrue(next.drain(5_000));
+                    next.close();
+                    Assert.assertEquals("DDRDDC", frameKinds(h));
+                    Assert.assertEquals(refusedBytes, frameBytes(h, 3, 6));
+                }
+                assertRolledBackThenCommitted(h);
+            }
+        });
+    }
+
+    @Test
+    public void testPooledStrictLeasesRefuseRowsPastTheirShare() throws Exception {
+        // The senders of a pool share sf_max_total_bytes, and each may hold a strict
+        // transaction until the server commits it. Two leases used to size their
+        // transactions against the whole 512 KiB: both sent frames until together they
+        // filled it, then each commit waited for room the other held, threw after
+        // sf_append_deadline_millis, and nothing committed. A transaction that spans
+        // segments now counts only on its sender's share: two of the eight segments with
+        // four senders, and two with sixteen, whose share is less than a segment, as the
+        // budget grants every sender two segments past its cap. The third frame of 280
+        // rows spans a second segment and needs four with the room for its commit, so it
+        // is refused, and row 840 with it. Each lease commits the rows it accepted, as one
+        // transaction, in the two segments its share holds.
+        assertMemoryLeak(() -> {
+            for (int senders : new int[]{4, 16}) {
+                String context = "senders: " + senders;
+                TxnServer h = new TxnServer();
+                try (TestWebSocketServer server = start(h, CAP)) {
+                    long[] refusedBytes = new long[2];
+                    try (QuestDB db = QuestDB.connect(conf(server) + STRICT_FRAMES_OF_280
+                            + "sf_max_total_bytes=512k;sender_pool_max=" + senders + ";query_pool_min=0;")) {
+                        Sender[] leases = {db.borrowSender(), db.borrowSender()};
+                        long start = System.nanoTime();
+                        // Both transactions are open before either commits.
+                        for (int i = 0; i < 2; i++) {
+                            Refusal refusal = writeUntilTooLarge(leases[i], "t" + i);
+                            Assert.assertEquals(context, 840, refusal.row);
+                            refusedBytes[i] = assertShareRefusal(refusal.error, 524_288, senders, "so the row was not added");
+                        }
+                        for (Sender lease : leases) {
+                            lease.flush();
+                        }
+                        Assert.assertTrue(context + ": must not wait for sf_append_deadline_millis",
+                                System.nanoTime() - start < TimeUnit.SECONDS.toNanos(10));
+                        for (Sender lease : leases) {
+                            Assert.assertTrue(context, lease.drain(5_000));
+                            lease.close();
+                        }
+                    }
+                    List<List<TxnFrame>> byConnection = h.framesByConnection();
+                    Assert.assertEquals(context + ": " + h.frames, 2, byConnection.size());
+                    for (int i = 0; i < 2; i++) {
+                        Assert.assertEquals(context, "DDC", frameKinds(byConnection.get(i)));
+                        // The refusal reported the size of the transaction that committed.
+                        Assert.assertEquals(context, refusedBytes[i], frameBytes(byConnection.get(i)));
+                    }
+                    Assert.assertEquals(context, h.frames.size(), h.committedFrames().size());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testPooledStrictLeasesRefuseRowsPastTheirShareConcurrently() throws Exception {
+        // Two leases fill their transactions on two threads at once, so their frames
+        // compete for the shared client buffer. Each counts only on its own share, so
+        // neither waits for room the other holds, even with both transactions at their
+        // share's limit: with two senders and 1 MiB the share is eight segments, which
+        // hold eleven frames of 280 rows and the room for their commit, so the twelfth
+        // frame is refused.
+        assertMemoryLeak(() -> {
+            String[] configs = {"sf_max_total_bytes=512k;", "sf_max_total_bytes=1m;sender_pool_max=2;"};
+            long[] capacities = {524_288, 1_048_576};
+            int[] senders = {4, 2};
+            int[] refusedRows = {840, 3_360};
+            String[] kinds = {"DDC", "DDDDDDDDDDDC"};
+            for (int c = 0; c < configs.length; c++) {
+                String context = configs[c];
+                TxnServer h = new TxnServer();
+                try (TestWebSocketServer server = start(h, CAP)) {
+                    Refusal[] refusals = new Refusal[2];
+                    try (QuestDB db = QuestDB.connect(conf(server) + STRICT_FRAMES_OF_280 + configs[c] + "query_pool_min=0;")) {
+                        Sender[] leases = {db.borrowSender(), db.borrowSender()};
+                        CyclicBarrier barrier = new CyclicBarrier(2);
+                        Throwable[] errors = new Throwable[2];
+                        Thread[] threads = new Thread[2];
+                        long start = System.nanoTime();
+                        for (int i = 0; i < 2; i++) {
+                            final int lease = i;
+                            threads[i] = new Thread(() -> {
+                                try {
+                                    barrier.await(30, TimeUnit.SECONDS);
+                                    refusals[lease] = writeUntilTooLarge(leases[lease], "t" + lease);
+                                    // Both transactions are open, each at its largest, before
+                                    // either commits.
+                                    barrier.await(30, TimeUnit.SECONDS);
+                                    leases[lease].flush();
+                                } catch (Throwable t) {
+                                    errors[lease] = t;
+                                    barrier.reset();
+                                }
+                            });
+                            threads[i].start();
+                        }
+                        for (Thread thread : threads) {
+                            thread.join();
+                        }
+                        for (Throwable error : errors) {
+                            if (error != null) {
+                                throw new AssertionError(context, error);
+                            }
+                        }
+                        Assert.assertTrue(context + ": must not wait for sf_append_deadline_millis",
+                                System.nanoTime() - start < TimeUnit.SECONDS.toNanos(10));
+                        for (Sender lease : leases) {
+                            Assert.assertTrue(context, lease.drain(5_000));
+                            lease.close();
+                        }
+                    }
+                    List<List<TxnFrame>> byConnection = h.framesByConnection();
+                    Assert.assertEquals(context + ": " + h.frames, 2, byConnection.size());
+                    // Connections are numbered by their first frame, not by lease: compare
+                    // the sizes each refusal reported with the transactions that committed
+                    // as sets.
+                    long[] refusedBytes = new long[2];
+                    long[] committedBytes = new long[2];
+                    for (int i = 0; i < 2; i++) {
+                        Assert.assertEquals(context, refusedRows[c], refusals[i].row);
+                        refusedBytes[i] = assertShareRefusal(refusals[i].error, capacities[c], senders[c],
+                                "so the row was not added");
+                        Assert.assertEquals(context, kinds[c], frameKinds(byConnection.get(i)));
+                        committedBytes[i] = frameBytes(byConnection.get(i));
+                    }
+                    Arrays.sort(refusedBytes);
+                    Arrays.sort(committedBytes);
+                    Assert.assertArrayEquals(context, refusedBytes, committedBytes);
+                    Assert.assertEquals(context, h.frames.size(), h.committedFrames().size());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testPooledStrictShareLeavesRoomForPrefetchedSegment() throws Exception {
+        // With sf_dir, the segment manager creates each sender's next segment ahead of
+        // time, charged to the budget until the sender moves into it, which it may not do
+        // while it holds a transaction: that segment comes out of the share too. Two
+        // senders and 648 KiB: in memory the share is five segments, which hold five
+        // frames of 280 rows and the room for their commit, so the sixth frame is
+        // refused; on disk it is four, so the fourth frame is.
+        assertMemoryLeak(() -> {
+            String dir = TestUtils.createTmpDir("qwp-txn-share-");
+            try {
+                for (boolean isDiskMode : new boolean[]{false, true}) {
+                    String context = isDiskMode ? "sf_dir" : "memory";
+                    TxnServer h = new TxnServer();
+                    long refusedBytes;
+                    try (TestWebSocketServer server = start(h, CAP)) {
+                        String config = conf(server) + STRICT_FRAMES_OF_280 + "sf_max_total_bytes=648k;"
+                                + (isDiskMode ? "sf_dir=" + dir + ";" : "");
+                        try (SenderPool pool = new SenderPool(config, 1, 2, 5_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                            Sender lease = pool.borrow();
+                            Refusal refusal = writeUntilTooLarge(lease, "t");
+                            Assert.assertEquals(context, isDiskMode ? 1_120 : 1_680, refusal.row);
+                            // On disk the budget also charges the symbol dictionary files.
+                            SegmentBudget budget = pool.getSegmentBudgetForTesting();
+                            refusedBytes = assertShareRefusal(refusal.error,
+                                    budget.getCapacityBytes() - budget.getSideFileBytes(), 2, "so the row was not added");
+                            lease.flush();
+                            Assert.assertTrue(context, lease.drain(5_000));
+                            lease.close();
+                        }
+                    }
+                    Assert.assertEquals(context, isDiskMode ? "DDDC" : "DDDDDC", frameKinds(h));
+                    Assert.assertEquals(context, refusedBytes, frameBytes(h));
+                }
+            } finally {
+                TestUtils.removeTmpDirRec(dir);
+            }
+        });
+    }
+
+    @Test
+    public void testPooledStrictTransactionOfOneSegmentKeepsTheWholeBuffer() throws Exception {
+        // The share bounds only a transaction whose frames span segments. One whose
+        // frames fit a single segment needs, with its commit, at most the two segments
+        // the budget grants every sender past its cap, whatever the others hold. Held to
+        // its share, a lease of a pool of four sharing 256 KiB, whose share is less than a
+        // segment, would refuse the first frame of every strict transaction: next to the
+        // room for its commit it needs three segments. A batch that fits one frame, all a
+        // sender with no auto-flush trigger could send before, would no longer go out.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                try (QuestDB db = QuestDB.connect(conf(server) + STRICT_FRAMES_OF_280
+                        + "sf_max_total_bytes=256k;query_pool_min=0;")) {
+                    Sender lease = db.borrowSender();
+                    // Two frames, one segment.
+                    writeRows(lease, "t", 0, 560);
+                    lease.flush();
+                    // The third frame spans a second segment: the share refuses it.
+                    Refusal refusal = writeUntilTooLarge(lease, "t");
+                    Assert.assertEquals(840, refusal.row);
+                    long refusedBytes = assertShareRefusal(refusal.error, 262_144, 4, "so the row was not added");
+                    lease.flush();
+                    Assert.assertTrue(lease.drain(5_000));
+                    lease.close();
+                    Assert.assertEquals("DDcDDC", frameKinds(h));
+                    Assert.assertEquals(refusedBytes, frameBytes(h, 3, 6));
+                }
+                Assert.assertEquals(h.frames.size(), h.committedFrames().size());
+            }
+        });
+    }
+
+    @Test
+    public void testPooledStrictTransactionPastTheWholeBufferIsRefusedForIt() throws Exception {
+        // A transaction the whole client buffer cannot hold is refused for that, share or
+        // not, as on a sender of its own, since only a larger buffer can take it: with
+        // 128 KiB, two segments, the first frame of 280 rows needs three next to the room
+        // for its commit; with 256 KiB, four segments, nine tables sent by one flush()
+        // need five, more than both the buffer and the share of two segments.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                try (QuestDB db = QuestDB.connect(conf(server) + STRICT_FRAMES_OF_280
+                        + "sf_max_total_bytes=128k;sender_pool_max=2;query_pool_min=0;")) {
+                    Sender lease = db.borrowSender();
+                    Assert.assertEquals(280, writeUntilRefused(lease, 131_072));
+                    lease.flush();
+                    Assert.assertTrue(lease.drain(5_000));
+                    lease.close();
+                }
+                Assert.assertEquals("C", frameKinds(h));
+            }
+            h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                try (QuestDB db = QuestDB.connect(conf(server) + "auto_flush=off;auto_flush_bytes=off;"
+                        + "sf_max_segment_bytes=64k;sf_max_total_bytes=256k;sender_pool_max=2;query_pool_min=0;")) {
+                    Sender lease = db.borrowSender();
+                    writeTables(lease, 0, 9);
+                    try {
+                        lease.flush();
+                        Assert.fail("the client buffer cannot hold the commit");
+                    } catch (TransactionTooLargeException e) {
+                        assertClientBufferRefusal(e, 262_144, "so the flush was not sent");
+                    }
+                    lease.rollback();
+                    lease.close();
+                }
+                Assert.assertEquals("nothing was sent", 0, h.frames.size());
+            }
+        });
+    }
+
+    @Test
+    public void testPooledTransactionalLeaseCommitsInPartsAtTheWholeBuffer() throws Exception {
+        // transaction=on keeps sizing a transaction against the whole client buffer, and
+        // commits it in parts when that cannot hold it. Held to its share in a pool of
+        // four, a quarter of 256 KiB, it would split transactions that a sender of its
+        // own commits whole.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                try (QuestDB db = QuestDB.connect(conf(server) + TXN_ON_FRAMES_OF_280 + "query_pool_min=0;")) {
+                    Sender lease = db.borrowSender();
+                    writeRows(lease, "t", 0, 5_000);
+                    lease.flush();
+                    Assert.assertTrue(lease.drain(5_000));
+                    lease.close();
+                }
+                // As on a sender of its own: the buffer holds eight frames, so the ninth
+                // and the seventeenth each start a new part.
+                Assert.assertEquals("DDDDDDDDcDDDDDDDDcDC", frameKinds(h));
+                Assert.assertEquals("every frame commits", h.frames.size(), h.committedFrames().size());
+            }
+        });
+    }
+
+    @Test
+    public void testStrictMultiTableFlushSplitsWithinTheCap() throws Exception {
+        // Ten tables in one batch carry ten schemas, so the batch the byte trigger
+        // cuts outgrows the cap and splits per table. Every split frame of the
+        // open transaction stays deferred.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, 4_096)) {
+                try (Sender s = Sender.fromConfig(conf(server) + "transaction=strict;")) {
+                    for (int i = 0; i < 400; i++) {
+                        s.table("table_with_a_long_name_" + (i % 10))
+                                .longColumn("first_long_column_name", i)
+                                .longColumn("second_long_column_name", i)
+                                .stringColumn("s", "abc")
+                                .atNow();
+                    }
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                }
+                assertFramesWithinCap(h, 4_096);
+                assertOneTransaction(h);
+                Assert.assertTrue(h.frames.size() > 10);
+            }
+        });
+    }
+
+    @Test
+    public void testResetBeforeFirstConnectDiscardsStrictTransaction() throws Exception {
+        // reset() used to abort a strict transaction silently when no server had been
+        // reached yet, as if the server could not roll back: every later row and flush
+        // threw, even once a server that supports rollback came up.
+        assertDiscardBeforeFirstConnect("transaction=strict;", Sender::reset);
+    }
+
+    @Test
+    public void testResetBeforeFirstConnectDiscardsTransaction() throws Exception {
+        // reset() of a transaction=on transaction used to keep the rows already sent when
+        // no server had been reached yet, and warned that the server does not support
+        // rollback: the next flush committed them even on a server that supports it.
+        assertDiscardBeforeFirstConnect("transaction=on;", Sender::reset);
+    }
+
+    @Test
+    public void testResetDiscardsStrictTransactionWithoutServerRollback() throws Exception {
+        // A server without rollback support cannot discard the rows already sent on
+        // request. reset() used to abort a strict transaction silently, so every later row
+        // and flush threw until the sender was closed, which also hit a sender with no
+        // auto-flush trigger once its byte trigger had sent a frame. The sender now closes
+        // the connection that holds those rows, which makes the server discard them, and
+        // carries on.
+        List<NoTriggerSpelling> spellings = noTriggerSpellings();
+        spellings.add(new NoTriggerSpelling("transaction=strict", c -> Sender.builder(c + "transaction=strict;")));
+        for (NoTriggerSpelling spelling : spellings) {
+            assertMemoryLeak(() -> {
+                TxnServer h = new TxnServer();
+                try (TestWebSocketServer server = start(h, CAP)) {
+                    try (Sender s = spelling.build(conf(server))) {
+                        writeRows(s, "t", 0, 1_000);
+                        Assert.assertTrue(spelling.name, h.awaitFrames(2));
+                        s.reset();
+                        writeRows(s, "t", 0, 10);
+                        s.flush();
+                        Assert.assertTrue(spelling.name, s.drain(5_000));
+                    }
+                    Assert.assertEquals(spelling.name, 2, server.upgradeRequestCount());
+                }
+                assertDiscardedByClosingConnection(spelling.name, h);
+            });
+        }
+    }
+
+    @Test
+    public void testResetDuringOutageDoesNotStallTheSender() throws Exception {
+        // Store-and-forward keeps every producer call working through an outage. reset()
+        // used to wait 30 s for the rollback ack and then abort the transaction, so every
+        // later row and flush threw, even after the server came back.
+        assertDiscardDuringOutage("transaction=on;", Sender::reset);
+    }
+
+    @Test
+    public void testResetKeepsDeferredFramesOfNonTransactionalSender() throws Exception {
+        // Outside transactional mode reset() discards only the buffered rows, as before,
+        // also on a server with rollback support: a frame setDeferCommit(true) already
+        // sent stays deferred, and the next commit commits it.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                server.setRollbackSupported(true);
+                try (QwpWebSocketSender s = (QwpWebSocketSender) Sender.fromConfig(conf(server) + "transaction=off;")) {
+                    s.setDeferCommit(true);
+                    writeRows(s, "t", 0, 10);
+                    s.flush();
+                    writeRows(s, "t", 10, 10);
+                    s.reset();
+                    Assert.assertTrue(s.hasDeferredMessagesForTesting());
+                    s.setDeferCommit(false);
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                }
+                Assert.assertEquals("Dc", frameKinds(h));
+                Assert.assertEquals(h.frames, h.committedFrames());
+            }
+        });
+    }
+
+    @Test
+    public void testResetKeepsLegacyBehaviourWithoutServerRollback() throws Exception {
+        // transaction=on against a server that the handshake showed to lack rollback:
+        // reset() keeps the frames already sent, and the next flush() commits them, as
+        // before rollback existed. It says so once per sender.
+        assertMemoryLeak(() -> {
+            ListAppender<ILoggingEvent> log = captureSenderLog();
+            try {
+                TxnServer h = new TxnServer();
+                try (TestWebSocketServer server = start(h, CAP)) {
+                    try (Sender s = Sender.fromConfig(conf(server) + "transaction=on;")) {
+                        writeRows(s, "t", 0, 1_000);
+                        Assert.assertTrue(h.awaitFrames(2));
+                        s.reset();
+                        s.reset();
+                        s.flush();
+                        Assert.assertTrue(s.drain(5_000));
+                    }
+                    // The frames sent before reset() are deferred, and the flush after it
+                    // committed them with an empty commit frame.
+                    assertOneTransaction(h);
+                    Assert.assertEquals(1, server.upgradeRequestCount());
+                }
+                Assert.assertEquals(Collections.singletonList(RESET_KEEPS_ROWS_WARNING), resetKeepsRowsWarnings(log));
+            } finally {
+                releaseSenderLog(log);
+            }
+        });
+    }
+
+    @Test
+    public void testResetRollsBackSentFramesWhenServerSupportsIt() throws Exception {
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                server.setRollbackSupported(true);
+                try (Sender s = Sender.fromConfig(conf(server) + "transaction=on;")) {
+                    writeRows(s, "t", 0, 1_000);
+                    Assert.assertTrue(h.awaitFrames(2));
+                    s.reset();
+                    // reset() does not wait for the server; drain() returns once the server
+                    // acked the rollback frame, which follows every frame of the transaction.
+                    Assert.assertTrue(s.drain(5_000));
+                    int rollbackIndex = h.frames.size() - 1;
+                    Assert.assertTrue(h.frames.get(rollbackIndex).isRollback());
+                    for (int i = 0; i < rollbackIndex; i++) {
+                        Assert.assertTrue(h.frames.get(i).isDeferred());
+                    }
+                    Assert.assertEquals(1, h.rolledBackGroups);
+                    // The sender stays usable for the next transaction.
+                    writeRows(s, "t", 0, 10);
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                    Assert.assertTrue(h.frames.get(h.frames.size() - 1).isCommit());
+                }
+                assertRolledBackThenCommitted(h);
+            }
+        });
+    }
+
+    @Test
+    public void testRollbackFrameNeverReachesServerWithoutRollbackSupport() throws Exception {
+        // The transaction is discarded while the server that confirmed rollback is away,
+        // and the endpoint comes back as a server without rollback support, as after a
+        // failover to an older node. That server would read the rollback frame as an
+        // empty deferred frame and commit the discarded rows with the next transaction.
+        // The client closes the connection that holds them instead, and sends the next
+        // transaction on a new one.
+        assertMemoryLeak(() -> {
+            int port = TestPorts.findUnusedPort();
+            TxnServer before = new TxnServer();
+            TxnServer after = new TxnServer();
+            TestWebSocketServer revived = null;
+            try (TestWebSocketServer first = start(before, CAP, port, true)) {
+                try (Sender s = Sender.fromConfig(outageConf(port) + "transaction=on;")) {
+                    writeRows(s, "t", 0, 1_000);
+                    Assert.assertTrue(before.awaitFrames(2));
+                    first.close();
+                    s.rollback();
+                    writeRows(s, "t", 0, 10);
+                    s.flush();
+                    revived = start(after, CAP, port, false);
+                    Assert.assertTrue(s.drain(10_000));
+                    Assert.assertFalse(((QwpWebSocketSender) s).isServerRollbackEnabled());
+                }
+            } finally {
+                if (revived != null) {
+                    revived.close();
+                }
+            }
+            Assert.assertEquals(0, before.committedFrames().size());
+            assertDiscardedByClosingConnection("failover to a server without rollback", after);
+        });
+    }
+
+    @Test
+    public void testRollbackBeforeFirstConnectDiscardsStrictTransaction() throws Exception {
+        // rollback() used to throw and abort the transaction when no server had been
+        // reached yet, as if the server could not roll back: every later row and flush
+        // threw, even once a server that supports rollback came up.
+        assertDiscardBeforeFirstConnect("transaction=strict;", Sender::rollback);
+    }
+
+    @Test
+    public void testRollbackBeforeFirstConnectDiscardsTransaction() throws Exception {
+        assertDiscardBeforeFirstConnect("transaction=on;", Sender::rollback);
+    }
+
+    @Test
+    public void testRollbackDuringOutageDoesNotStallTheSender() throws Exception {
+        assertDiscardDuringOutage("transaction=strict;", Sender::rollback);
+    }
+
+    @Test
+    public void testRollbackDiscardsSentFrames() throws Exception {
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                server.setRollbackSupported(true);
+                try (Sender s = Sender.fromConfig(conf(server) + "transaction=strict;")) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) s;
+                    Assert.assertTrue(ws.isServerRollbackEnabled());
+                    writeRows(s, "t", 0, 1_000);
+                    Assert.assertTrue(h.awaitFrames(2));
+                    Assert.assertEquals(0, h.commitFrames());
+                    s.rollback();
+                    // rollback() does not wait for the server; drain() returns once the
+                    // server acked the rollback frame, which follows every frame of the
+                    // transaction.
+                    Assert.assertTrue(s.drain(5_000));
+                    int sent = h.frames.size() - 1;
+                    TxnFrame rollback = h.frames.get(sent);
+                    Assert.assertTrue(rollback.isRollback());
+                    for (int i = 0; i < sent; i++) {
+                        Assert.assertTrue(h.frames.get(i).isDeferred());
+                    }
+                    Assert.assertEquals(QwpConstants.HEADER_SIZE, rollback.size);
+                    Assert.assertEquals(1, h.rolledBackGroups);
+                    Assert.assertFalse(ws.hasDeferredMessagesForTesting());
+                    // Nothing pending is left behind: an empty flush sends nothing.
+                    s.flush();
+                    Assert.assertEquals(sent + 1, h.frames.size());
+                    // The next transaction starts clean and commits.
+                    writeRows(s, "t", 0, 10);
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                    Assert.assertTrue(h.frames.get(h.frames.size() - 1).isCommit());
+                }
+                assertRolledBackThenCommitted(h);
+            }
+        });
+    }
+
+    @Test
+    public void testRollbackOnNonWebSocketSenderThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            try (Sender s = Sender.fromConfig("http::addr=localhost:1;protocol_version=2;")) {
+                s.rollback();
+                Assert.fail("rollback must be WebSocket-only");
+            } catch (LineSenderException e) {
+                TestUtils.assertContains(e.getMessage(), "rollback is only supported for WebSocket transport");
+            }
+        });
+    }
+
+    @Test
+    public void testRollbackWithoutServerRollbackDiscardsTransaction() throws Exception {
+        // A server without rollback support cannot discard the rows already sent on
+        // request. rollback() used to throw and abort the transaction, so every later row
+        // and flush threw until the sender was closed. The sender now closes the
+        // connection that holds those rows, which makes the server discard them, and
+        // carries on; a second rollback() finds nothing to discard.
+        for (String mode : new String[]{"transaction=strict;", "transaction=on;"}) {
+            assertMemoryLeak(() -> {
+                TxnServer h = new TxnServer();
+                try (TestWebSocketServer server = start(h, CAP)) {
+                    try (Sender s = Sender.fromConfig(conf(server) + mode)) {
+                        writeRows(s, "t", 0, 1_000);
+                        Assert.assertTrue(mode, h.awaitFrames(2));
+                        s.rollback();
+                        s.rollback();
+                        writeRows(s, "t", 0, 10);
+                        s.flush();
+                        Assert.assertTrue(mode, s.drain(5_000));
+                    }
+                    Assert.assertEquals(mode, 2, server.upgradeRequestCount());
+                }
+                assertDiscardedByClosingConnection(mode, h);
+            });
+        }
+    }
+
+    @Test
+    public void testResetWithoutSentFramesSendsNothing() throws Exception {
+        // reset() discards a transaction's frames already sent without asking whether the
+        // server supports rollback. With none sent there is nothing to discard on the
+        // server: no rollback frame, and no reconnect on a server without rollback support.
+        for (String mode : new String[]{"transaction=strict;", "transaction=on;"}) {
+            assertMemoryLeak(() -> {
+                TxnServer h = new TxnServer();
+                try (TestWebSocketServer server = start(h, CAP)) {
+                    try (Sender s = Sender.fromConfig(conf(server) + mode)) {
+                        writeRows(s, "t", 0, 10);
+                        s.reset();
+                        writeRows(s, "t", 0, 5);
+                        s.flush();
+                        Assert.assertTrue(mode, s.drain(5_000));
+                    }
+                    Assert.assertEquals(mode, 1, server.upgradeRequestCount());
+                }
+                Assert.assertEquals(mode + ": " + h.frames, 1, h.frames.size());
+                Assert.assertTrue(mode, h.frames.get(0).isCommit());
+            });
+        }
+    }
+
+    @Test
+    public void testRollbackWithoutSentFramesSendsNothing() throws Exception {
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                server.setRollbackSupported(true);
+                try (Sender s = Sender.fromConfig(conf(server) + "transaction=strict;")) {
+                    writeRows(s, "t", 0, 10);
+                    s.rollback();
+                    s.flush();
+                    writeRows(s, "t", 0, 5);
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                }
+                // Only the second transaction reached the server, as one commit frame.
+                Assert.assertEquals(1, h.frames.size());
+                Assert.assertTrue(h.frames.get(0).isCommit());
+            }
+        });
+    }
+
+    @Test
+    public void testServerLimitsReachTheSender() throws Exception {
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                server.setAdvertisedMaxUncommittedRows(12_345);
+                server.setRollbackSupported(true);
+                try (Sender s = Sender.fromConfig(conf(server))) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) s;
+                    Assert.assertEquals(12_345, ws.getServerMaxUncommittedRows());
+                    Assert.assertTrue(ws.isServerRollbackEnabled());
+                }
+                Assert.assertEquals("true", server.pollRollbackRequest(5, TimeUnit.SECONDS));
+
+                // A server that does not confirm rollback, nor advertise its row limit.
+                server.setAdvertisedMaxUncommittedRows(0);
+                server.setRollbackSupported(false);
+                try (Sender s = Sender.fromConfig(conf(server))) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) s;
+                    Assert.assertEquals(0, ws.getServerMaxUncommittedRows());
+                    Assert.assertFalse(ws.isServerRollbackEnabled());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testStrictCloseWithoutFlushDiscardsTransaction() throws Exception {
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                try (Sender s = Sender.fromConfig(conf(server) + "transaction=strict;close_flush_timeout_millis=1000;")) {
+                    writeRows(s, "t", 0, 1_000);
+                    Assert.assertTrue(h.awaitFrames(2));
+                }
+                Assert.assertEquals("close() must not commit a strict transaction", 0, h.commitFrames());
+                Assert.assertEquals(0, h.rollbackFrames());
+            }
+        });
+    }
+
+    @Test
+    public void testStrictCloseWithoutFlushWarnsOfDiscardedRows() throws Exception {
+        // A sender with no auto-flush trigger used to commit on close(). Now close()
+        // discards its open transaction, and says so once, counting the rows already
+        // sent with those still buffered. A committed transaction leaves nothing to
+        // discard, and neither does one that reset() already discarded.
+        assertMemoryLeak(() -> {
+            ListAppender<ILoggingEvent> log = captureSenderLog();
+            try {
+                TxnServer h = new TxnServer();
+                try (TestWebSocketServer server = start(h, CAP)) {
+                    try (Sender s = Sender.fromConfig(conf(server) + "auto_flush_rows=off;auto_flush_interval=off;")) {
+                        writeRows(s, "t", 0, 1_000);
+                        Assert.assertTrue(h.awaitFrames(2));
+                    }
+                    Assert.assertEquals(Collections.singletonList("close()" + DISCARD_WARNING), discardWarnings(log));
+                    clearLog(log);
+
+                    try (Sender s = Sender.fromConfig(conf(server) + "auto_flush_rows=off;auto_flush_interval=off;")) {
+                        writeRows(s, "t", 0, 1_000);
+                        s.flush();
+                        Assert.assertTrue(s.drain(5_000));
+                    }
+                    try (Sender s = Sender.fromConfig(conf(server) + "transaction=strict;")) {
+                        writeRows(s, "t", 0, 1_000);
+                        // Frames went out and the server cannot roll them back: reset()
+                        // discards them by closing the connection, and flush() then has
+                        // nothing to commit.
+                        s.reset();
+                        s.flush();
+                    }
+                    Assert.assertEquals(Collections.emptyList(), discardWarnings(log));
+                    Assert.assertEquals(1, h.commitFrames());
+                }
+            } finally {
+                releaseSenderLog(log);
+            }
+        });
+    }
+
+    @Test
+    public void testStrictCloseWithoutFlushRollsBackWhenServerSupportsIt() throws Exception {
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                server.setRollbackSupported(true);
+                try (Sender s = Sender.fromConfig(conf(server) + "transaction=strict;")) {
+                    writeRows(s, "t", 0, 1_000);
+                    Assert.assertTrue(h.awaitFrames(2));
+                }
+                // close() drained until the rollback frame's ack.
+                Assert.assertTrue(h.frames.get(h.frames.size() - 1).isRollback());
+                Assert.assertEquals(0, h.commitFrames());
+                Assert.assertEquals(1, h.rolledBackGroups);
+            }
+        });
+    }
+
+    @Test
+    public void testStrictRowLimitFromServer() throws Exception {
+        // The server advertises 100: a strict transaction holds at most 99 rows
+        // of a table, since the server would commit the 100th on its own.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, 4_096)) {
+                server.setAdvertisedMaxUncommittedRows(100);
+                try (Sender s = Sender.fromConfig(conf(server) + "transaction=strict;")) {
+                    // 4 KiB frames: the 99 rows of "a" go out over several deferred frames.
+                    writeRows(s, "a", 0, 99);
+                    Assert.assertTrue(h.awaitFrames(2));
+                    try {
+                        writeRows(s, "a", 99, 1);
+                        Assert.fail("the 100th row of a table must be refused");
+                    } catch (TransactionTooLargeException e) {
+                        Assert.assertEquals(serverRowLimitError("a", 100), e.getMessage());
+                    }
+                    // Other tables keep their own count.
+                    writeRows(s, "b", 0, 99);
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                    // A new transaction starts from zero again.
+                    writeRows(s, "a", 0, 99);
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                }
+                Assert.assertEquals(0, h.rollbackFrames());
+                Assert.assertEquals(2, h.commitFrames());
+            }
+        });
+    }
+
+    @Test
+    public void testStrictRowLimitDefaultsWhenNotAdvertised() throws Exception {
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                try (Sender s = Sender.fromConfig(conf(server) + "transaction=strict;")) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) s;
+                    Assert.assertEquals(0, ws.getServerMaxUncommittedRows());
+                    // Pretend the server default is small to keep the test fast: the
+                    // assumed default applies only while nothing is advertised.
+                    ws.applyServerTransactionLimits(10, false);
+                    writeRows(s, "a", 0, 9);
+                    try {
+                        writeRows(s, "a", 9, 1);
+                        Assert.fail("the 10th row must be refused");
+                    } catch (TransactionTooLargeException e) {
+                        Assert.assertEquals(serverRowLimitError("a", 10), e.getMessage());
+                    }
+                    ws.applyServerTransactionLimits(0, false);
+                    // 0 means "not advertised": the server default applies.
+                    writeRows(s, "a", 9, 1);
+                    s.flush();
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testStrictRowLimitIsServerDefaultWhenNotAdvertised() throws Exception {
+        // A server that does not advertise X-QWP-Max-Uncommitted-Rows commits a table on
+        // its own once its default qwp.max.uncommitted.rows of 1,000,000 rows are
+        // uncommitted, so a strict transaction holds at most 999,999 rows of a table.
+        // Rows of one LONG column keep the transaction small.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                try (QwpWebSocketSender s = (QwpWebSocketSender) Sender.fromConfig(conf(server) + "transaction=strict;")) {
+                    Assert.assertEquals(0, s.getServerMaxUncommittedRows());
+                    for (int i = 0; i < 999_999; i++) {
+                        s.table("a").longColumn("v", i).atNow();
+                    }
+                    try {
+                        s.table("a").longColumn("v", 999_999).atNow();
+                        Assert.fail("the 1,000,000th row of a table must be refused");
+                    } catch (TransactionTooLargeException e) {
+                        Assert.assertEquals(serverRowLimitError("a", 1_000_000), e.getMessage());
+                    }
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                }
+                assertOneTransaction(h);
+            }
+        });
+    }
+
+    @Test
+    public void testStrictRowLimitCountsEverySpellingOfATable() throws Exception {
+        // The server writes the rows of names that differ only in letter case to one
+        // table and commits it on its own once the advertised 100 of its rows are
+        // uncommitted. Each spelling used to keep its own count, so a transaction that
+        // wrote "tab" and "TAB" took 99 rows of each, and the server committed it in
+        // parts.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, 4_096)) {
+                server.setAdvertisedMaxUncommittedRows(100);
+                try (Sender s = Sender.fromConfig(conf(server) + "transaction=strict;")) {
+                    // 4 KiB frames: the rows go out over several deferred frames, and
+                    // the last of them are still pending.
+                    writeRows(s, "tab", 0, 40);
+                    writeRows(s, "TAB", 40, 40);
+                    writeRows(s, "Tab", 80, 19);
+                    Assert.assertTrue(h.awaitFrames(2));
+                    // "tAB" is new to the sender: its first row is the 100th of the table.
+                    for (String spelling : new String[]{"tab", "TAB", "Tab", "tAB"}) {
+                        try {
+                            writeRows(s, spelling, 99, 1);
+                            Assert.fail("the 100th row of the table must be refused as " + spelling);
+                        } catch (TransactionTooLargeException e) {
+                            Assert.assertEquals(spellingsRowLimitError(spelling, 100), e.getMessage());
+                        }
+                    }
+                    // Other tables keep their own count.
+                    writeRows(s, "other", 0, 99);
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                    // A new transaction starts from zero again, for every spelling.
+                    writeRows(s, "TAB", 0, 50);
+                    writeRows(s, "tAB", 50, 49);
+                    try {
+                        writeRows(s, "tab", 99, 1);
+                        Assert.fail("the 100th row of the table must be refused");
+                    } catch (TransactionTooLargeException e) {
+                        Assert.assertEquals(spellingsRowLimitError("tab", 100), e.getMessage());
+                    }
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                }
+                Assert.assertEquals(0, h.rollbackFrames());
+                Assert.assertEquals(2, h.commitFrames());
+            }
+        });
+    }
+
+    @Test
+    public void testStrictRowLimitCheckAllocatesNothingPerRow() throws Exception {
+        // The check runs for every row of a strict transaction and walks every spelling
+        // of the row's table, here two that alternate row by row. It only reads counts
+        // the buffers keep.
+        Assume.assumeTrue(ManagementFactory.getThreadMXBean() instanceof com.sun.management.ThreadMXBean);
+        com.sun.management.ThreadMXBean mx = (com.sun.management.ThreadMXBean) ManagementFactory.getThreadMXBean();
+        Assume.assumeTrue(mx.isThreadAllocatedMemorySupported());
+        mx.setThreadAllocatedMemoryEnabled(true);
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                // Nothing goes out before flush(), so only the row path runs.
+                try (Sender s = Sender.fromConfig(conf(server) + "auto_flush=off;auto_flush_bytes=off;")) {
+                    Assert.assertTrue(((QwpWebSocketSender) s).isStrictTransactional());
+                    long tid = Thread.currentThread().getId();
+                    // The first pass creates both buffers and grows their columns.
+                    writeAlternatingSpellings(s, 20_000);
+                    s.reset();
+                    long before = mx.getThreadAllocatedBytes(tid);
+                    writeAlternatingSpellings(s, 20_000);
+                    long allocated = mx.getThreadAllocatedBytes(tid) - before;
+                    // An object per row would take at least 16 bytes each, 320 KB in all.
+                    // The allowance covers one-off costs, such as a coverage agent's probes.
+                    Assert.assertTrue("the row path allocated " + allocated + " bytes", allocated < 8_192);
+                    s.reset();
+                }
+                Assert.assertEquals("nothing was sent", 0, h.frames.size());
+            }
+        });
+    }
+
+    @Test
+    public void testStrictRowLimitCountsPendingRowsOfEverySpelling() throws Exception {
+        // Nothing goes out before flush(), which then sends the rows of both spellings
+        // to the same table: their pending rows count together too.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                server.setAdvertisedMaxUncommittedRows(100);
+                try (Sender s = Sender.fromConfig(conf(server) + "auto_flush=off;")) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) s;
+                    Assert.assertTrue(ws.isStrictTransactional());
+                    writeRows(s, "t", 0, 50);
+                    writeRows(s, "T", 50, 49);
+                    try {
+                        writeRows(s, "t", 99, 1);
+                        Assert.fail("the 100th row of the table must be refused");
+                    } catch (TransactionTooLargeException e) {
+                        Assert.assertEquals(spellingsRowLimitError("t", 100), e.getMessage());
+                    }
+                    Assert.assertFalse("no frame went out before flush()", ws.hasDeferredMessagesForTesting());
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                }
+                Assert.assertEquals("one commit frame", "C", frameKinds(h));
+            }
+        });
+    }
+
+    @Test
+    public void testStrictRowLimitResetsEverySpellingWithTheTransaction() throws Exception {
+        // rollback(), reset() and returning a pooled lease end the transaction for every
+        // spelling of a table, whichever of them the transaction wrote last.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, 4_096)) {
+                server.setAdvertisedMaxUncommittedRows(100);
+                server.setRollbackSupported(true);
+                try (QuestDB db = QuestDB.connect(conf(server) + "transaction=strict;query_pool_min=0;")) {
+                    try (Sender lease = db.borrowSender()) {
+                        assertSpellingsRefuseRow100(lease);
+                        lease.rollback();
+                        assertSpellingsRefuseRow100(lease);
+                        lease.reset();
+                        assertSpellingsRefuseRow100(lease);
+                    }
+                    // The pool discarded that transaction, so the next lease of the same
+                    // sender starts from zero.
+                    try (Sender lease = db.borrowSender()) {
+                        assertSpellingsRefuseRow100(lease);
+                        lease.flush();
+                        Assert.assertTrue(lease.drain(5_000));
+                    }
+                }
+                Assert.assertEquals("one connection, so one sender", 1, server.upgradeRequestCount());
+                Assert.assertEquals(3, h.rollbackFrames());
+                Assert.assertEquals(1, h.commitFrames());
+            }
+        });
+    }
+
+    @Test
+    public void testStrictRowLimitFoldsLetterCaseAsTheEngine() throws Exception {
+        // The server counts the rows of the names the engine resolves to one table
+        // together, and the engine folds each char with Character.toLowerCase(): "t\u00e4"
+        // and "t\u00c4" are one table, and so are "ti" and "t\u0130", whose \u0130 folds to
+        // an ASCII i. That leaves apart the cases of a letter outside the Basic
+        // Multilingual Plane, a surrogate pair, and "\u00df" against "SS".
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, 4_096)) {
+                server.setAdvertisedMaxUncommittedRows(100);
+                try (Sender s = Sender.fromConfig(conf(server) + "transaction=strict;")) {
+                    writeRows(s, "t\u00e4", 0, 50);
+                    writeRows(s, "t\u00c4", 50, 49);
+                    writeRows(s, "ti", 0, 50);
+                    writeRows(s, "t\u0130", 50, 49);
+                    writeRows(s, "t\uD801\uDC00", 0, 99);
+                    writeRows(s, "t\uD801\uDC28", 0, 99);
+                    writeRows(s, "stra\u00dfe", 0, 99);
+                    writeRows(s, "STRASSE", 0, 99);
+                    for (String spelling : new String[]{"T\u00c4", "TI", "T\u0130"}) {
+                        try {
+                            writeRows(s, spelling, 99, 1);
+                            Assert.fail("the 100th row of the table must be refused as " + spelling);
+                        } catch (TransactionTooLargeException e) {
+                            Assert.assertEquals(spellingsRowLimitError(spelling, 100), e.getMessage());
+                        }
+                    }
+                    for (String table : new String[]{"t\uD801\uDC00", "t\uD801\uDC28", "stra\u00dfe", "STRASSE"}) {
+                        try {
+                            writeRows(s, table, 99, 1);
+                            Assert.fail("the 100th row of " + table + " must be refused");
+                        } catch (TransactionTooLargeException e) {
+                            Assert.assertEquals(serverRowLimitError(table, 100), e.getMessage());
+                        }
+                    }
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                }
+                Assert.assertEquals(1, h.commitFrames());
+            }
+        });
+    }
+
+    @Test
+    public void testClosingARefusedTransactionDiscardsIt() throws Exception {
+        // close() discards a strict transaction, the one the server refused too: the
+        // sender discards its frames, so close() returns without an error, and nothing of
+        // the transaction commits. This server refuses without a message.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            h.refusingStrictDeferredFrame = 2;
+            h.refusalMessage = null;
+            try (TestWebSocketServer server = start(h, CAP)) {
+                server.setRollbackSupported(true);
+                QwpWebSocketSender s = (QwpWebSocketSender) Sender.fromConfig(conf(server)
+                        + "transaction=strict;auto_flush_rows=10;");
+                try {
+                    writeRows(s, "t", 0, 35);
+                    awaitRefusalReachesSender(s);
+                    assertRefused(serverRefusalError(null), () -> writeRows(s, "t", 35, 1));
+                } finally {
+                    s.close();
+                }
+                Assert.assertTrue(h.committedFrames().isEmpty());
+                Assert.assertEquals(1, h.refusals());
+            }
+        });
+    }
+
+    @Test
+    public void testServerRefusalFailsTheOpenTransactionUntilRollback() throws Exception {
+        // The server refuses the open strict transaction's second frame, as it does one
+        // that would take a table to qwp.max.uncommitted.rows, where it would commit the
+        // transaction in parts. From then on every row, flush() and drain() of the
+        // transaction fails with the refusal, and nothing more of it reaches the server.
+        // rollback() ends it: the sender discards its frames, reconnects, and the next
+        // transaction commits.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            h.refusingStrictDeferredFrame = 2;
+            try (TestWebSocketServer server = start(h, CAP)) {
+                server.setRollbackSupported(true);
+                try (QwpWebSocketSender s = (QwpWebSocketSender) Sender.fromConfig(conf(server)
+                        + "transaction=strict;auto_flush_rows=10;")) {
+                    writeRows(s, "t", 0, 35);
+                    awaitRefusalReachesSender(s);
+                    String refusal = serverRefusalError(TxnServer.REFUSAL);
+                    assertRefused(refusal, () -> writeRows(s, "t", 35, 1));
+                    assertRefused(refusal, () -> writeRows(s, "other", 0, 1));
+                    assertRefused(refusal, s::flush);
+                    assertRefused(refusal, () -> s.drain(1_000));
+                    s.rollback();
+                    writeRows(s, "t", 100, 5);
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                }
+                Assert.assertEquals(1, h.refusals());
+                Assert.assertEquals("only the next transaction commits", "C", frameKinds(h.committedFrames()));
+                Assert.assertEquals(2, h.connectionCount());
+            }
+        });
+    }
+
+    @Test
+    public void testServerRefusalOfACommittedTransactionHaltsTheSender() throws Exception {
+        // The server refuses the commit frame of a strict transaction that flush() had
+        // published. The transaction can commit neither as one nor in parts, so the
+        // sender halts with the refusal over the transaction's frames, which it keeps.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            h.isRefusingStrictCommit = true;
+            try (TestWebSocketServer server = start(h, CAP)) {
+                server.setRollbackSupported(true);
+                try (Sender s = Sender.fromConfig(conf(server) + "transaction=strict;auto_flush_rows=10;")) {
+                    // Two deferred frames of 10 rows, then the commit frame with 5.
+                    writeRows(s, "t", 0, 25);
+                    s.flush();
+                    try {
+                        s.drain(5_000);
+                        Assert.fail("the sender must halt");
+                    } catch (LineSenderServerException e) {
+                        SenderError err = e.getServerError();
+                        Assert.assertEquals(SenderError.Category.TRANSACTION_TOO_LARGE, err.getCategory());
+                        Assert.assertEquals(SenderError.Policy.TERMINAL, err.getAppliedPolicy());
+                        Assert.assertEquals(TxnServer.REFUSAL, err.getServerMessage());
+                        Assert.assertEquals(0L, err.getFromFsn());
+                        Assert.assertEquals(2L, err.getToFsn());
+                    }
+                }
+                Assert.assertEquals("DDC", frameKinds(h));
+                Assert.assertTrue(h.committedFrames().isEmpty());
+                Assert.assertEquals(1, h.connectionCount());
+            }
+        });
+    }
+
+    @Test
+    public void testStrictFlushChecksTheTransactionAgainstALimitLearnedLate() throws Exception {
+        // A row is checked against the limit when it is added, and flush() commits the
+        // whole transaction, so once the server's limit drops flush() checks every table.
+        // Here the 40 rows of "t" and "T", one table to the server, held under the default
+        // limit, but not under the 30 a handshake then advertised, though the row of a
+        // added after that fits it.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                server.setRollbackSupported(true);
+                try (QwpWebSocketSender s = (QwpWebSocketSender) Sender.fromConfig(conf(server) + "auto_flush=off;")) {
+                    Assert.assertTrue(s.isStrictTransactional());
+                    writeRows(s, "t", 0, 20);
+                    writeRows(s, "T", 20, 20);
+                    writeRows(s, "c", 0, 10);
+                    s.applyServerTransactionLimits(30, true);
+                    writeRows(s, "a", 0, 1);
+                    String refusal = overLimitError("t", 40, 30, true);
+                    assertRefused(refusal, s::flush);
+                    assertRefused(refusal, () -> writeRows(s, "a", 1, 1));
+                    s.rollback();
+                    // Checked under 30; the limit drops to 20, which the 10 rows still fit.
+                    writeRows(s, "c", 0, 10);
+                    s.applyServerTransactionLimits(20, true);
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                }
+                Assert.assertEquals("C", frameKinds(h));
+            }
+        });
+    }
+
+    @Test
+    public void testStrictTransactionPastALimitLearnedLateFailsUntilRollback() throws Exception {
+        // The sender accepted 40 rows of a under the default limit, then a handshake
+        // advertised 30, as after the server restarted with a lower
+        // qwp.max.uncommitted.rows. a already holds more than that, so the transaction
+        // cannot commit as one: the next row of a fails, and so does every later row and
+        // flush() of the transaction, until rollback() ends it. A row of b, below the new
+        // limit, still goes in before that. The next transaction starts from zero.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, 4_096)) {
+                server.setRollbackSupported(true);
+                try (QwpWebSocketSender s = (QwpWebSocketSender) Sender.fromConfig(conf(server) + "transaction=strict;")) {
+                    writeRows(s, "a", 0, 40);
+                    writeRows(s, "b", 0, 5);
+                    s.applyServerTransactionLimits(30, true);
+                    writeRows(s, "b", 5, 1);
+                    String refusal = overLimitError("a", 40, 30, false);
+                    assertRefused(refusal, () -> writeRows(s, "a", 40, 1));
+                    assertRefused(refusal, () -> writeRows(s, "b", 6, 1));
+                    assertRefused(refusal, s::flush);
+                    s.rollback();
+                    writeRows(s, "a", 0, 29);
+                    try {
+                        writeRows(s, "a", 29, 1);
+                        Assert.fail("the 30th row of a must be refused");
+                    } catch (TransactionTooLargeException e) {
+                        Assert.assertEquals(serverRowLimitError("a", 30), e.getMessage());
+                    }
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                }
+                Assert.assertEquals("only the second transaction commits", 1, h.commitFrames());
+            }
+        });
+    }
+
+    @Test
+    public void testStrictSenderMarksItsDataFramesStrict() throws Exception {
+        // A strict sender marks its data frames, deferred and commit, with FLAG_STRICT, so
+        // that the server refuses its transaction rather than commit it in parts; never
+        // the rollback frame, which the server matches by its exact flags. A
+        // transaction=on sender marks none.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, 4_096)) {
+                server.setRollbackSupported(true);
+                try (Sender s = Sender.fromConfig(conf(server) + "transaction=strict;")) {
+                    writeRows(s, "t", 0, 99);
+                    s.flush();
+                    writeRows(s, "t", 0, 50);
+                    s.rollback();
+                    Assert.assertTrue(s.drain(5_000));
+                }
+                try (Sender s = Sender.fromConfig(conf(server) + "transaction=on;")) {
+                    writeRows(s, "t", 0, 99);
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                }
+                List<List<TxnFrame>> byConnection = h.framesByConnection();
+                Assert.assertEquals(2, byConnection.size());
+                String strictKinds = frameKinds(byConnection.get(0));
+                Assert.assertTrue(strictKinds, strictKinds.matches("D+[Cc]D+R"));
+                for (TxnFrame f : byConnection.get(0)) {
+                    Assert.assertEquals(f.toString(), !f.isRollback(), f.isStrict());
+                }
+                String onKinds = frameKinds(byConnection.get(1));
+                Assert.assertTrue(onKinds, onKinds.matches("D+[Cc]"));
+                for (TxnFrame f : byConnection.get(1)) {
+                    Assert.assertFalse(f.toString(), f.isStrict());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testStrictCommitTooLargeForClientBufferIsNotSent() throws Exception {
+        // With auto_flush_bytes=off on top of auto_flush=off, the whole transaction
+        // waits for flush(), which sends one frame per table. Ten tables of ~28 KB need five 64 KiB
+        // segments, and sf_max_total_bytes holds four: flush() sends nothing.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                try (Sender s = Sender.fromConfig(conf(server) + "auto_flush=off;auto_flush_bytes=off;"
+                        + "sf_max_segment_bytes=64k;sf_max_total_bytes=256k;")) {
+                    writeTables(s, 0, 10);
+                    long refusedBytes = -1;
+                    try {
+                        s.flush();
+                        Assert.fail("the client buffer cannot hold the commit");
+                    } catch (TransactionTooLargeException e) {
+                        refusedBytes = assertClientBufferRefusal(e, 262_144, "so the flush was not sent");
+                    }
+                    Assert.assertEquals("nothing was sent", 0, h.frames.size());
+                    s.rollback();
+                    // The same rows, one table per transaction: the refusal reported
+                    // what these frames add up to.
+                    for (int t = 0; t < 10; t++) {
+                        writeTables(s, t, 1);
+                        s.flush();
+                    }
+                    Assert.assertTrue(s.drain(5_000));
+                    Assert.assertEquals(10, h.commitFrames());
+                    Assert.assertEquals(refusedBytes, frameBytes(h));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testStrictDeferredFlushTooLargeForClientBufferIsNotSent() throws Exception {
+        // setDeferCommit(true) makes flush() send rows without committing them. A
+        // strict transaction keeps room for its commit next to such a frame. With
+        // frames as large as a segment that takes four segments, and
+        // sf_max_total_bytes holds three: flush() sends nothing, and the transaction
+        // takes no further rows. The commit itself fits.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, 64 * 1024)) {
+                long refusedBytes = -1;
+                try (QwpWebSocketSender s = (QwpWebSocketSender) Sender.fromConfig(conf(server)
+                        + "transaction=strict;sf_max_segment_bytes=64k;sf_max_total_bytes=192k;")) {
+                    s.setDeferCommit(true);
+                    writeRows(s, "t", 0, 1);
+                    try {
+                        s.flush();
+                        Assert.fail("the client buffer cannot hold a deferred frame and the commit");
+                    } catch (TransactionTooLargeException e) {
+                        refusedBytes = assertClientBufferRefusal(e, 196_608, "so the flush was not sent");
+                    }
+                    Assert.assertEquals("nothing was sent", 0, h.frames.size());
+                    try {
+                        writeRows(s, "t", 1, 1);
+                        Assert.fail("the transaction must take no further rows");
+                    } catch (TransactionTooLargeException e) {
+                        Assert.assertEquals(refusedBytes,
+                                assertClientBufferRefusal(e, 196_608, "so the row was not added"));
+                    }
+                    s.setDeferCommit(false);
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                }
+                // The commit carries the row the refused flush held, and only that row.
+                Assert.assertEquals(1, h.frames.size());
+                Assert.assertTrue(h.frames.get(0).isCommit());
+                Assert.assertEquals(refusedBytes, h.frames.get(0).size);
+            }
+        });
+    }
+
+    @Test
+    public void testStrictDiscardAfterRefusedFirstAutoFlushStartsNewTransaction() throws Exception {
+        // 64 KiB segments, 128 KiB budget: too small for a strict transaction's first
+        // deferred frame next to the room it keeps for its commit, so the first
+        // auto-flush is refused and nothing is sent. reset() used to keep the refusal,
+        // so the sender refused every later row until rollback() or close(). Both
+        // discards must end the transaction, whether or not the server supports
+        // rollback: there is nothing to roll back. With the interval trigger off, the
+        // byte trigger alone decides which row the client buffer refuses.
+        assertMemoryLeak(() -> {
+            int expectedFrameSize = commitFrameSize(10);
+            for (String action : new String[]{"reset()", "rollback()"}) {
+                for (boolean isRollbackSupported : new boolean[]{true, false}) {
+                    String context = action + ", rollback supported: " + isRollbackSupported;
+                    TxnServer h = new TxnServer();
+                    try (TestWebSocketServer server = start(h, CAP)) {
+                        server.setRollbackSupported(isRollbackSupported);
+                        try (Sender s = Sender.fromConfig(conf(server) + "transaction=strict;auto_flush_interval=off;"
+                                + "sf_max_segment_bytes=64k;sf_max_total_bytes=128k;")) {
+                            int refused = writeUntilRefused(s, 131_072);
+                            Assert.assertTrue(context, refused > 0);
+                            Assert.assertEquals(context + ": nothing was sent", 0, h.frames.size());
+                            if ("reset()".equals(action)) {
+                                s.reset();
+                                // A repeated reset() finds nothing left to discard.
+                                s.reset();
+                            } else {
+                                s.rollback();
+                            }
+                            writeRows(s, "t", 0, 10);
+                            s.flush();
+                            Assert.assertTrue(context, s.drain(5_000));
+                            // Only the transaction after the discard reached the server, as one
+                            // commit frame with only its rows; nothing needed a rollback frame.
+                            Assert.assertEquals(context + ": " + h.frames, 1, h.frames.size());
+                            Assert.assertTrue(context, h.frames.get(0).isCommit());
+                            Assert.assertEquals(context, expectedFrameSize, h.frames.get(0).size);
+                            // The next transaction has the whole client buffer again: the same
+                            // rows meet the same refusal.
+                            Assert.assertEquals(context, refused, writeUntilRefused(s, 131_072));
+                            s.rollback();
+                        }
+                        Assert.assertEquals(context + ": " + h.frames, 1, h.frames.size());
+                        Assert.assertEquals(context, 0, h.rollbackFrames());
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testStrictResetAfterRefusedLaterAutoFlushDiscardsSentFrames() throws Exception {
+        // 64 KiB segments, 256 KiB budget: the transaction's first frames go out before
+        // the client buffer refuses a row. reset() discards them as for any open
+        // transaction: a server with rollback support rolls them back, and on one without
+        // that support the sender closes the connection that holds them. Either way the
+        // refusal ends with the transaction, the next transaction commits alone, and a
+        // repeated reset() finds nothing left to discard.
+        assertMemoryLeak(() -> {
+            for (boolean isRollbackSupported : new boolean[]{true, false}) {
+                String context = "rollback supported: " + isRollbackSupported;
+                TxnServer h = new TxnServer();
+                try (TestWebSocketServer server = start(h, CAP)) {
+                    server.setRollbackSupported(isRollbackSupported);
+                    try (Sender s = Sender.fromConfig(conf(server) + "transaction=strict;auto_flush_interval=off;"
+                            + "sf_max_segment_bytes=64k;sf_max_total_bytes=256k;")) {
+                        writeUntilRefused(s, 262_144);
+                        Assert.assertTrue(context + ": frames were sent before the refusal", h.awaitFrames(2));
+                        s.reset();
+                        s.reset();
+                        writeRows(s, "t", 0, 10);
+                        s.flush();
+                        Assert.assertTrue(context, s.drain(5_000));
+                    }
+                    Assert.assertEquals(context, isRollbackSupported ? 1 : 2, server.upgradeRequestCount());
+                }
+                if (isRollbackSupported) {
+                    assertRolledBackThenCommitted(h);
+                } else {
+                    assertDiscardedByClosingConnection(context, h);
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testStrictTransactionTooLargeForClientBufferFailsFast() throws Exception {
+        // 64 KiB segments, 256 KiB budget: four segments. A strict transaction keeps
+        // room for its commit, so once its frames fill the rest it must refuse rows
+        // instead of blocking for sf_append_deadline_millis.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                try (Sender s = Sender.fromConfig(conf(server) + "transaction=strict;"
+                        + "sf_max_segment_bytes=64k;sf_max_total_bytes=256k;sf_append_deadline_millis=30000;")) {
+                    long start = System.nanoTime();
+                    long refusedBytes = -1;
+                    try {
+                        for (int row = 0; row < 100_000; row++) {
+                            s.table("t").longColumn("v", row).stringColumn("s", PAD).atNow();
+                        }
+                        Assert.fail("a transaction larger than the client buffer must be refused");
+                    } catch (TransactionTooLargeException e) {
+                        // As at the server's row limit, the row that hit the limit is not
+                        // in the transaction.
+                        refusedBytes = assertClientBufferRefusal(e, 262_144, "so the row was not added");
+                    }
+                    Assert.assertTrue("must fail fast, not wait for the append deadline",
+                            System.nanoTime() - start < TimeUnit.SECONDS.toNanos(10));
+                    // Further rows are refused the same way.
+                    try {
+                        s.table("t").longColumn("v", -1).stringColumn("s", PAD).atNow();
+                        Assert.fail("a full transaction must refuse rows");
+                    } catch (TransactionTooLargeException e) {
+                        Assert.assertEquals(refusedBytes,
+                                assertClientBufferRefusal(e, 262_144, "so the row was not added"));
+                    }
+                    // The reserved room lets the transaction commit.
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                    Assert.assertTrue(h.frames.get(h.frames.size() - 1).isCommit());
+                    Assert.assertEquals(1, h.commitFrames());
+                    // The refusal reported the size of the transaction that committed:
+                    // the rows accepted before it, the last of which filled the buffer.
+                    Assert.assertEquals(refusedBytes, frameBytes(h));
+                    // And the next transaction starts with an empty buffer.
+                    writeRows(s, "t", 0, 100);
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testUnacknowledgedRollbackDoesNotStallTheSender() throws Exception {
+        // The server never acks the rollback frame on its own. rollback() used to wait
+        // for that ack and abort the transaction when it did not come. Nothing waits for
+        // it now: the next transaction goes out behind it, and the commit's cumulative
+        // ack covers it.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            h.isAckingRollback = false;
+            try (TestWebSocketServer server = start(h, CAP)) {
+                server.setRollbackSupported(true);
+                try (Sender s = Sender.fromConfig(conf(server) + "transaction=strict;")) {
+                    writeRows(s, "t", 0, 1_000);
+                    Assert.assertTrue(h.awaitFrames(2));
+                    assertDiscardDoesNotWait(s, Sender::rollback);
+                    writeRows(s, "t", 0, 10);
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                }
+                assertRolledBackThenCommitted(h);
+            }
+        });
+    }
+
+    @Test
+    public void testTransactionalCommitsInPartsAtClientBuffer() throws Exception {
+        // The client holds a transaction's frames until the server commits it. The row
+        // whose frame found no room used to block for sf_append_deadline_millis and then
+        // throw, and close() then committed the frames already sent and dropped the rest.
+        // Now the sender commits the frames already sent and carries on, as the server
+        // does at qwp.max.uncommitted.rows.
+        assertMemoryLeak(() -> {
+            ListAppender<ILoggingEvent> log = captureSenderLog();
+            try {
+                TxnServer h = new TxnServer();
+                try (TestWebSocketServer server = start(h, CAP)) {
+                    try (QwpWebSocketSender s = (QwpWebSocketSender) Sender.fromConfig(conf(server) + TXN_ON_FRAMES_OF_280)) {
+                        long start = System.nanoTime();
+                        // 17 frames of 280 rows, then 240 rows that flush() commits.
+                        writeRows(s, "t", 0, 5_000);
+                        Assert.assertEquals("two parts of eight frames", 4_480, s.getTxnRowsCommittedInPartsForTesting());
+                        s.flush();
+                        Assert.assertEquals(0, s.getTxnRowsCommittedInPartsForTesting());
+                        Assert.assertTrue("must not wait for sf_append_deadline_millis",
+                                System.nanoTime() - start < TimeUnit.SECONDS.toNanos(10));
+                        Assert.assertTrue(s.drain(5_000));
+                    }
+                    // The buffer holds eight frames, so the ninth and the seventeenth each
+                    // start a new part, behind a bare commit frame for the frames before them.
+                    Assert.assertEquals("DDDDDDDDcDDDDDDDDcDC", frameKinds(h));
+                    Assert.assertEquals("every frame commits", h.frames, h.committedFrames());
+                    // Logged once for the transaction, with what the first commit covered.
+                    Assert.assertEquals(Collections.singletonList(commitInPartsWarning(2_240, frameBytes(h, 0, 8))),
+                            commitInPartsWarnings(log));
+                }
+            } finally {
+                releaseSenderLog(log);
+            }
+        });
+    }
+
+    @Test
+    public void testTransactionalCommitsInPartsBeforeFlushThatDoesNotFit() throws Exception {
+        // Eight frames fill the client buffer, and the frame flush() sends with the last
+        // 279 rows, which commits the transaction, does not fit beside them. flush() used
+        // to block for sf_append_deadline_millis and throw. Now it commits the eight
+        // frames first. Each transaction that commits in parts logs once.
+        assertMemoryLeak(() -> {
+            ListAppender<ILoggingEvent> log = captureSenderLog();
+            try {
+                TxnServer h = new TxnServer();
+                try (TestWebSocketServer server = start(h, CAP)) {
+                    try (Sender s = Sender.fromConfig(conf(server) + TXN_ON_FRAMES_OF_280)) {
+                        writeRows(s, "t", 0, 2_519);
+                        Assert.assertTrue(h.awaitFrames(8));
+                        long start = System.nanoTime();
+                        s.flush();
+                        Assert.assertTrue("must not wait for sf_append_deadline_millis",
+                                System.nanoTime() - start < TimeUnit.SECONDS.toNanos(10));
+                        Assert.assertTrue(s.drain(5_000));
+                        Assert.assertEquals("DDDDDDDDcC", frameKinds(h));
+                        Assert.assertEquals(Collections.singletonList(
+                                commitInPartsWarning(2_240, frameBytes(h, 0, 8))), commitInPartsWarnings(log));
+
+                        // The next transaction's first frame shares a segment with the
+                        // previous commit frame, so seven frames fill the buffer this time.
+                        writeRows(s, "t", 0, 2_519);
+                        s.flush();
+                        Assert.assertTrue(s.drain(5_000));
+                    }
+                    Assert.assertEquals("DDDDDDDDcC" + "DDDDDDDcDC", frameKinds(h));
+                    Assert.assertEquals("every frame commits", h.frames, h.committedFrames());
+                    Assert.assertEquals(Arrays.asList(
+                            commitInPartsWarning(2_240, frameBytes(h, 0, 8)),
+                            commitInPartsWarning(1_960, frameBytes(h, 10, 17))
+                    ), commitInPartsWarnings(log));
+                }
+            } finally {
+                releaseSenderLog(log);
+            }
+        });
+    }
+
+    @Test
+    public void testTransactionalDiscardAfterCommitInPartsWarns() throws Exception {
+        // The frames committed when the transaction outgrew the client buffer cannot be
+        // rolled back. rollback() and reset() discard the rest of the transaction, and
+        // say that the part already committed stays.
+        assertMemoryLeak(() -> {
+            ListAppender<ILoggingEvent> log = captureSenderLog();
+            try {
+                String[] actions = {"rollback()", "reset()"};
+                for (String action : actions) {
+                    clearLog(log);
+                    TxnServer h = new TxnServer();
+                    try (TestWebSocketServer server = start(h, CAP)) {
+                        server.setRollbackSupported(true);
+                        try (QwpWebSocketSender s = (QwpWebSocketSender) Sender.fromConfig(conf(server) + TXN_ON_FRAMES_OF_280)) {
+                            // Nine frames, the ninth in a new part, and 100 rows pending.
+                            writeRows(s, "t", 0, 2_620);
+                            Assert.assertEquals(action, 2_240, s.getTxnRowsCommittedInPartsForTesting());
+                            if ("rollback()".equals(action)) {
+                                s.rollback();
+                            } else {
+                                s.reset();
+                            }
+                            Assert.assertEquals(action, 0, s.getTxnRowsCommittedInPartsForTesting());
+                            writeRows(s, "t", 0, 10);
+                            s.flush();
+                            Assert.assertTrue(action, s.drain(5_000));
+                        }
+                        Assert.assertEquals(action, "DDDDDDDDcDRC", frameKinds(h));
+                        Assert.assertEquals(action, 1, h.rolledBackGroups);
+                        // The first part and the next transaction commit, the ninth frame does not.
+                        List<TxnFrame> committed = new ArrayList<>(h.frames.subList(0, 9));
+                        committed.add(h.frames.get(11));
+                        Assert.assertEquals(action, committed, h.committedFrames());
+                        Assert.assertEquals(action, Arrays.asList(
+                                commitInPartsWarning(2_240, frameBytes(h, 0, 8)),
+                                action + " discarded the rows of the open transaction sent since the sender last "
+                                        + "committed part of it, but the 2240 rows it committed when the transaction "
+                                        + "outgrew the client buffer stay committed"
+                        ), commitInPartsWarnings(log));
+                    }
+                }
+            } finally {
+                releaseSenderLog(log);
+            }
+        });
+    }
+
+    @Test
+    public void testTransactionalDefaultTriggersSplitWideRows() throws Exception {
+        // Before: transaction=on with the default triggers threw
+        // BatchTooLargeForCapException at the 1000th wide row.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                try (Sender s = Sender.fromConfig(conf(server) + "transaction=on;")) {
+                    writeRows(s, "t", 0, 2_000);
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                }
+                assertFramesWithinCap(h, CAP);
+                assertOneTransaction(h);
+            }
+        });
+    }
+
+    @Test
+    public void testPartlySentAutoFlushSplitRollbackDiscardsSentTables() throws Exception {
+        // The row trigger fires on the batch's last row, so auto-flush sends the split, and
+        // the frame that reached the ring holds rows auto-flush sent.
+        assertPartlySentSplitDiscarded("transaction=on;", SPLIT_ROWS, Sender::rollback);
+    }
+
+    @Test
+    public void testPartlySentSplitDuringOutageResetDiscardsSentTables() throws Exception {
+        assertPartlySentSplitDuringOutageDiscarded("transaction=on;", Sender::reset);
+    }
+
+    @Test
+    public void testPartlySentSplitDuringOutageRollbackDiscardsSentTables() throws Exception {
+        // The server is down and the client buffer full, so the split sends its first
+        // table's frame into the room left in the last segment and fails on the second.
+        // rollback() used to find no open transaction and publish nothing, so once the
+        // server was back, the next transaction's commit committed the first table.
+        assertPartlySentSplitDuringOutageDiscarded("transaction=on;", Sender::rollback);
+    }
+
+    @Test
+    public void testPartlySentSplitResetDiscardsSentTables() throws Exception {
+        assertPartlySentSplitDiscarded("transaction=on;", NO_ROW_TRIGGER, Sender::reset);
+    }
+
+    @Test
+    public void testPartlySentSplitRetryDuringOutageSendsEachTableOnce() throws Exception {
+        // flush() of a split that failed partway used to send the whole batch again, so
+        // the tables that had reached the ring committed twice.
+        assertRetryOfPartlySentSplitSendsEachTableOnce("transaction=on;");
+    }
+
+    @Test
+    public void testPartlySentSplitRollbackDiscardsSentTables() throws Exception {
+        assertPartlySentSplitDiscarded("transaction=on;", NO_ROW_TRIGGER, Sender::rollback);
+    }
+
+    @Test
+    public void testPooledStrictLeaseReturnDiscardsPartlySentSplit() throws Exception {
+        // Returning the lease discards the strict transaction: the table the split sent
+        // must not commit with the next borrower's transaction. The warning counts the
+        // rows of the table that reached the ring and of the two still in the batch, once.
+        assertMemoryLeak(() -> {
+            ListAppender<ILoggingEvent> log = captureSenderLog();
+            try {
+                TxnServer h = new TxnServer();
+                try (TestWebSocketServer server = start(h, SPLIT_CAP)) {
+                    server.setRollbackSupported(true);
+                    try (QuestDB db = QuestDB.connect(conf(server) + "transaction=strict;sender_pool_max=1;"
+                            + "query_pool_min=0;" + SPLIT_PAST_SEGMENT + "auto_flush_rows=" + NO_ROW_TRIGGER + ';')) {
+                        Sender lease = db.borrowSender();
+                        sendPartOfSplit(lease, NO_ROW_TRIGGER);
+                        lease.close();
+                        Assert.assertEquals(Collections.singletonList("returning the sender to the pool"
+                                        + DISCARD_WARNING.replace("of 1000 rows", "of " + SPLIT_ROWS + " rows")),
+                                discardWarnings(log));
+                        Sender next = db.borrowSender();
+                        writeRows(next, "t", 0, 10);
+                        next.flush();
+                        Assert.assertTrue(next.drain(5_000));
+                        next.close();
+                    }
+                    assertSentTablesRolledBack(h);
+                }
+            } finally {
+                releaseSenderLog(log);
+            }
+        });
+    }
+
+    @Test
+    public void testResetKeepsPartlySentSplitOfNonTransactionalSender() throws Exception {
+        // Outside transactional mode reset() discards only the rows not yet sent, as it
+        // does for frames setDeferCommit(true) sent: the frame of the split that reached
+        // the ring stays in the deferred group, and the next commit commits it. The sender
+        // used to lose track of that frame, so a flush() with no rows sent no commit, and
+        // drain() waited for an ack the server withholds until one.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, SPLIT_CAP)) {
+                server.setRollbackSupported(true);
+                try (QwpWebSocketSender s = (QwpWebSocketSender) Sender.fromConfig(conf(server) + "transaction=off;"
+                        + SPLIT_PAST_SEGMENT + "auto_flush_rows=" + NO_ROW_TRIGGER + ';')) {
+                    sendPartOfSplit(s, NO_ROW_TRIGGER);
+                    s.reset();
+                    Assert.assertTrue(s.hasDeferredMessagesForTesting());
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                    Assert.assertFalse(s.hasDeferredMessagesForTesting());
+                }
+                Assert.assertEquals("Dc", frameKinds(h));
+                Assert.assertEquals(h.frames, h.committedFrames());
+            }
+        });
+    }
+
+    @Test
+    public void testSplitThatFailsOnItsFirstFrameKeepsTheWholeBatch() throws Exception {
+        // Nothing of the split reached the ring, so nothing leaves the batch, and the
+        // transaction has no frame to roll back.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, SPLIT_CAP)) {
+                server.setRollbackSupported(true);
+                try (QwpWebSocketSender s = (QwpWebSocketSender) Sender.fromConfig(conf(server) + "transaction=on;"
+                        + SPLIT_PAST_SEGMENT + "auto_flush_rows=" + NO_ROW_TRIGGER + ';')) {
+                    // b, ~80 KB, goes first now: the first frame fits the cap but no segment.
+                    writeRows(s, "b", 0, 800);
+                    writeRows(s, "a", 0, 300);
+                    writeRows(s, "c", 0, 300);
+                    long batchBytes = s.getPendingBytes();
+                    try {
+                        s.flush();
+                        Assert.fail("the split's first frame cannot fit a segment");
+                    } catch (LineSenderException e) {
+                        TestUtils.assertContains(e.getCause().getMessage(), "payload too large for segment");
+                    }
+                    Assert.assertEquals(-1L, s.getCursorEngineForTesting().publishedFsn());
+                    Assert.assertFalse(s.hasDeferredMessagesForTesting());
+                    Assert.assertEquals(batchBytes, s.getPendingBytes());
+                    Assert.assertEquals(s.totalBufferedBytes(), s.getPendingBytes());
+                    Assert.assertEquals(800, s.getTableBuffer("b").getRowCount());
+                    Assert.assertEquals(300, s.getTableBuffer("a").getRowCount());
+                    Assert.assertEquals(300, s.getTableBuffer("c").getRowCount());
+                    s.rollback();
+                    writeRows(s, "t", 0, 10);
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                }
+                Assert.assertEquals("C", frameKinds(h));
+                Assert.assertEquals(h.frames, h.committedFrames());
+            }
+        });
+    }
+
+    @Test
+    public void testStrictPartlySentSplitDuringOutageRollbackDiscardsSentTables() throws Exception {
+        assertPartlySentSplitDuringOutageDiscarded("transaction=strict;", Sender::rollback);
+    }
+
+    @Test
+    public void testStrictPartlySentSplitResetDiscardsSentTables() throws Exception {
+        assertPartlySentSplitDiscarded("transaction=strict;", NO_ROW_TRIGGER, Sender::reset);
+    }
+
+    @Test
+    public void testStrictPartlySentSplitRetryDuringOutageSendsEachTableOnce() throws Exception {
+        assertRetryOfPartlySentSplitSendsEachTableOnce("transaction=strict;");
+    }
+
+    @Test
+    public void testStrictPartlySentSplitRollbackDiscardsSentTables() throws Exception {
+        assertPartlySentSplitDiscarded("transaction=strict;", NO_ROW_TRIGGER, Sender::rollback);
+    }
+
+    @Test
+    public void testTransactionOffPartlySentSplitRetryDuringOutageSendsEachTableOnce() throws Exception {
+        assertRetryOfPartlySentSplitSendsEachTableOnce("transaction=off;");
+    }
+
+    // Captures what QwpWebSocketSender logs, so a test can assert its warnings.
+    private static ListAppender<ILoggingEvent> captureSenderLog() {
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        senderLogger().addAppender(appender);
+        return appender;
+    }
+
+    // The appender appends under its own lock, and I/O threads log into it too.
+    private static void clearLog(ListAppender<ILoggingEvent> log) {
+        synchronized (log) {
+            log.list.clear();
+        }
+    }
+
+    // What a transaction=on sender logs the first time a transaction outgrows the
+    // 256 KiB client buffer and it commits the part already sent.
+    private static String commitInPartsWarning(long rows, long transactionBytes) {
+        return "the open transaction outgrew the client buffer, so the sender committed the " + rows
+                + " rows it had already sent, and the rest of the transaction commits separately [transactionBytes="
+                + transactionBytes + ", ringCapacityBytes=262144]. A transaction=on transaction commits in parts when "
+                + "sf_max_total_bytes cannot hold it: raise sf_max_total_bytes or set sf_dir to keep such transactions "
+                + "whole, or use transaction=strict to refuse their rows instead. Logged once per transaction";
+    }
+
+    // The warnings about a transaction the sender committed in parts at the client
+    // buffer logged since the last clearLog(), in order.
+    private static List<String> commitInPartsWarnings(ListAppender<ILoggingEvent> log) {
+        List<String> warnings = new ArrayList<>();
+        synchronized (log) {
+            for (ILoggingEvent e : log.list) {
+                String message = e.getFormattedMessage();
+                if (e.getLevel() == Level.WARN && message.contains("outgrew the client buffer")) {
+                    warnings.add(message);
+                }
+            }
+        }
+        return warnings;
+    }
+
+    // The discarded-transaction warnings logged since the last clearLog().
+    private static List<String> discardWarnings(ListAppender<ILoggingEvent> log) {
+        List<String> warnings = new ArrayList<>();
+        synchronized (log) {
+            for (ILoggingEvent e : log.list) {
+                String message = e.getFormattedMessage();
+                if (e.getLevel() == Level.WARN && message.contains("discarded an uncommitted transaction")) {
+                    warnings.add(message);
+                }
+            }
+        }
+        return warnings;
+    }
+
+    // Every way to configure a WebSocket sender with no auto-flush trigger, applied
+    // on top of a config string.
+    private static List<NoTriggerSpelling> noTriggerSpellings() {
+        List<NoTriggerSpelling> spellings = new ArrayList<>();
+        spellings.add(new NoTriggerSpelling("auto_flush=off", c -> Sender.builder(c + "auto_flush=off;")));
+        spellings.add(new NoTriggerSpelling("auto_flush_rows=off;auto_flush_interval=off",
+                c -> Sender.builder(c + "auto_flush_rows=off;auto_flush_interval=off;")));
+        spellings.add(new NoTriggerSpelling("auto_flush_interval=off;auto_flush_rows=off",
+                c -> Sender.builder(c + "auto_flush_interval=off;auto_flush_rows=off;")));
+        spellings.add(new NoTriggerSpelling("disableAutoFlush()",
+                c -> Sender.builder(c).disableAutoFlush()));
+        spellings.add(new NoTriggerSpelling("autoFlushRows(0).autoFlushIntervalMillis(Integer.MAX_VALUE)",
+                c -> Sender.builder(c).autoFlushRows(0).autoFlushIntervalMillis(Integer.MAX_VALUE)));
+        return spellings;
+    }
+
+    // The warnings reset() logged since the last clearLog() about keeping the rows a
+    // transaction=on transaction already sent.
+    private static List<String> resetKeepsRowsWarnings(ListAppender<ILoggingEvent> log) {
+        List<String> warnings = new ArrayList<>();
+        synchronized (log) {
+            for (ILoggingEvent e : log.list) {
+                String message = e.getFormattedMessage();
+                if (e.getLevel() == Level.WARN && message.startsWith("reset() discarded")) {
+                    warnings.add(message);
+                }
+            }
+        }
+        return warnings;
+    }
+
+    private static void releaseSenderLog(ListAppender<ILoggingEvent> log) {
+        senderLogger().detachAppender(log);
+        log.stop();
+    }
+
+    private static Logger senderLogger() {
+        return (Logger) LoggerFactory.getLogger(QwpWebSocketSender.class);
+    }
+
+    // Asserts that the server committed only the given number of flushes, each a single
+    // commit frame, so that no frame of a discarded transaction committed.
+    private static void assertCommittedFlushesOnly(TxnServer h, int flushes) {
+        List<TxnFrame> committed = h.committedFrames();
+        Assert.assertEquals("committed " + committed + " of " + h.frames, flushes, committed.size());
+        for (TxnFrame f : committed) {
+            Assert.assertTrue("a deferred frame committed: " + committed, f.isCommit());
+        }
+    }
+
+    // The server is down when the sender starts, so the sender cannot know yet whether it
+    // supports rollback. A transaction's frames go to store-and-forward, the transaction is
+    // discarded and the next one committed, and then a server that supports rollback, or
+    // one that predates it, comes up. The sender must keep working throughout, and only
+    // the next transaction may commit.
+    private static void assertDiscardBeforeFirstConnect(String mode, Consumer<Sender> discard) throws Exception {
+        for (boolean isRollbackSupported : new boolean[]{true, false}) {
+            assertMemoryLeak(() -> {
+                int port = TestPorts.findUnusedPort();
+                TxnServer h = new TxnServer();
+                TestWebSocketServer server = null;
+                ListAppender<ILoggingEvent> log = captureSenderLog();
+                try {
+                    try (Sender s = Sender.fromConfig(outageConf(port) + mode
+                            + "initial_connect_retry=async;" + SMALL_FRAMES)) {
+                        writeRows(s, "t", 0, 600);
+                        // Must neither fail nor wait: no server has been reached yet.
+                        assertDiscardDoesNotWait(s, discard);
+                        // Nor may it claim that the server lacks rollback support.
+                        Assert.assertEquals(Collections.emptyList(), resetKeepsRowsWarnings(log));
+                        writeRows(s, "t", 0, 10);
+                        s.flush();
+                        server = start(h, CAP, port, isRollbackSupported);
+                        Assert.assertTrue(s.drain(10_000));
+                    }
+                } finally {
+                    releaseSenderLog(log);
+                    if (server != null) {
+                        server.close();
+                    }
+                }
+                if (isRollbackSupported) {
+                    assertRolledBackThenCommitted(h);
+                } else {
+                    assertDiscardedByClosingConnection(mode, h);
+                }
+            });
+        }
+    }
+
+    // Discards a transaction whose rollback frame no server acks: the server is down, or
+    // never acks the frame. A discard publishes the frame and returns, as flush() does;
+    // rollback() used to wait up to 30 s for the ack.
+    private static void assertDiscardDoesNotWait(Sender s, Consumer<Sender> discard) {
+        long start = System.nanoTime();
+        discard.accept(s);
+        long millis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+        Assert.assertTrue("the discard must not wait for the server [millis=" + millis + ']', millis < 2_000);
+    }
+
+    // Asserts what a server without rollback support received when the client discarded a
+    // transaction whose frames had reached it: those frames, all deferred, on a connection
+    // the client closed instead of sending the rollback frame, and on a second connection
+    // what came after the discard, which alone commits.
+    private static void assertDiscardedByClosingConnection(String name, TxnServer h) {
+        Assert.assertEquals(name + ": the rollback frame must not reach a server without rollback support: "
+                + h.frames, 0, h.rollbackFrames());
+        List<List<TxnFrame>> connections = h.framesByConnection();
+        Assert.assertEquals(name + ": one connection for the discarded transaction, one for what came next: "
+                + h.frames, 2, connections.size());
+        // The reader threads of the two connections may log their first frames in
+        // either order: tell them apart by what they carry.
+        List<TxnFrame> discarded = connections.get(0);
+        List<TxnFrame> next = connections.get(1);
+        if (next.get(next.size() - 1).isDeferred()) {
+            discarded = connections.get(1);
+            next = connections.get(0);
+        }
+        Assert.assertTrue(name + ": the discarded transaction reached the server: " + h.frames,
+                discarded.size() >= 2);
+        for (TxnFrame f : discarded) {
+            Assert.assertTrue(name + ": frame must be deferred: " + h.frames, f.isDeferred());
+        }
+        Assert.assertTrue(name + ": " + h.frames, next.get(next.size() - 1).isCommit());
+        Assert.assertEquals(name + ": only what came after the discard commits", next, h.committedFrames());
+    }
+
+    // Asserts the error of a strict transaction the client buffer cannot hold, with
+    // 64 KiB segments, and returns the transaction size it reports.
+    private static long assertClientBufferRefusal(TransactionTooLargeException e, long ringCapacityBytes, String outcome) {
+        String message = e.getMessage();
+        String prefix = "transaction too large for the client buffer [transactionBytes=";
+        Assert.assertTrue(message, message.startsWith(prefix));
+        long transactionBytes = Long.parseLong(message.substring(prefix.length(), message.indexOf(',')));
+        Assert.assertTrue(message, transactionBytes > 0);
+        Assert.assertEquals(prefix + transactionBytes + ", ringCapacityBytes=" + ringCapacityBytes
+                + ", segmentBytes=65536]; the client holds a strict transaction until the server commits it, "
+                + "and sf_max_total_bytes cannot hold this one, " + outcome + ". " + CLIENT_BUFFER_REMEDY, message);
+        return transactionBytes;
+    }
+
+    // Asserts the error of a strict transaction that its sender's share of a client
+    // buffer shared by several senders cannot hold, with 64 KiB segments, and returns
+    // the transaction size it reports.
+    private static long assertShareRefusal(TransactionTooLargeException e, long ringCapacityBytes, int senders, String outcome) {
+        String message = e.getMessage();
+        String prefix = "transaction too large for this sender's share of the client buffer [transactionBytes=";
+        Assert.assertTrue(message, message.startsWith(prefix));
+        long transactionBytes = Long.parseLong(message.substring(prefix.length(), message.indexOf(',')));
+        Assert.assertTrue(message, transactionBytes > 0);
+        Assert.assertEquals(prefix + transactionBytes + ", ringCapacityBytes=" + ringCapacityBytes
+                + ", senders=" + senders + ", segmentBytes=65536]; the client holds a strict transaction until the "
+                + "server commits it, and the " + senders + " senders that share sf_max_total_bytes may each hold "
+                + "one at the same time, so a transaction that spans segments can count only on this sender's "
+                + "share, which cannot hold this one, " + outcome + ". " + SHARE_REMEDY, message);
+        return transactionBytes;
+    }
+
+    // Build-time validation runs before the sender connects, so no server is needed.
+    private static void assertConfigRejected(String config, String expectedMessage) {
+        try {
+            Sender.fromConfig("ws::addr=localhost:1;" + config).close();
+            Assert.fail(config + " must be rejected");
+        } catch (LineSenderException e) {
+            TestUtils.assertContains(e.getMessage(), expectedMessage);
+        }
+    }
+
+    private static void assertFramesWithinCap(TxnServer h, int cap) {
+        for (TxnFrame f : h.frames) {
+            Assert.assertTrue("frame of " + f.size + " bytes exceeds " + cap, f.size <= cap);
+        }
+    }
+
+    private static void assertOneTransaction(TxnServer h) {
+        Assert.assertTrue(h.frames.size() > 1);
+        for (int i = 0, n = h.frames.size() - 1; i < n; i++) {
+            Assert.assertTrue("frame " + i + " must be deferred", h.frames.get(i).isDeferred());
+        }
+        Assert.assertTrue(h.frames.get(h.frames.size() - 1).isCommit());
+    }
+
+    // Asserts what the server that came back after an outage received and committed: the
+    // discarded transaction's frames, replayed and then rolled back, and behind the rollback
+    // frame the next transaction, which alone commits.
+    private static void assertDiscardedThenCommitted(TxnServer before, TxnServer after) {
+        Assert.assertEquals("nothing commits before the outage", 0, before.committedFrames().size());
+        assertRolledBackThenCommitted(after);
+    }
+
+    // Asserts what one connection received: a transaction's frames, the rollback frame
+    // that discarded them, and behind it the next transaction, which alone commits.
+    private static void assertRolledBackThenCommitted(TxnServer h) {
+        Assert.assertEquals("one connection: " + h.frames, 1, h.connectionCount());
+        int rollbackAt = -1;
+        for (int i = 0, n = h.frames.size(); i < n; i++) {
+            if (h.frames.get(i).isRollback()) {
+                Assert.assertEquals("one rollback frame: " + h.frames, -1, rollbackAt);
+                rollbackAt = i;
+            }
+        }
+        Assert.assertTrue("the discarded transaction goes out ahead of the rollback frame: " + h.frames,
+                rollbackAt >= 2);
+        for (int i = 0; i < rollbackAt; i++) {
+            Assert.assertTrue("frame " + i + " must be deferred: " + h.frames, h.frames.get(i).isDeferred());
+        }
+        Assert.assertEquals(1, h.rolledBackGroups);
+        Assert.assertTrue(h.frames.get(h.frames.size() - 1).isCommit());
+        Assert.assertEquals("only the next transaction commits",
+                h.frames.subList(rollbackAt + 1, h.frames.size()), h.committedFrames());
+    }
+
+    // The server confirmed rollback, received the first frames of a transaction and went
+    // away. The transaction is discarded during the outage, the next one is committed, and
+    // the server comes back on the same endpoint.
+    private static void assertDiscardDuringOutage(String mode, Consumer<Sender> discard) throws Exception {
+        assertMemoryLeak(() -> {
+            int port = TestPorts.findUnusedPort();
+            TxnServer before = new TxnServer();
+            TxnServer after = new TxnServer();
+            TestWebSocketServer revived = null;
+            try (TestWebSocketServer first = start(before, CAP, port, true)) {
+                try (Sender s = Sender.fromConfig(outageConf(port) + mode)) {
+                    writeRows(s, "t", 0, 1_000);
+                    Assert.assertTrue(before.awaitFrames(2));
+                    first.close();
+                    // Must neither wait for the server nor fail: the server is away.
+                    assertDiscardDoesNotWait(s, discard);
+                    writeRows(s, "t", 0, 10);
+                    s.flush();
+                    revived = start(after, CAP, port, true);
+                    Assert.assertTrue(s.drain(10_000));
+                }
+            } finally {
+                if (revived != null) {
+                    revived.close();
+                }
+            }
+            assertDiscardedThenCommitted(before, after);
+        });
+    }
+
+    // Size of the commit frame a fresh strict sender sends for rows [0, count) of
+    // table t: what a transaction of only those rows sends.
+    private static int commitFrameSize(int count) throws Exception {
+        TxnServer h = new TxnServer();
+        try (TestWebSocketServer server = start(h, CAP)) {
+            try (Sender s = Sender.fromConfig(conf(server) + "transaction=strict;")) {
+                writeRows(s, "t", 0, count);
+                s.flush();
+                Assert.assertTrue(s.drain(5_000));
+            }
+            Assert.assertEquals(h.frames.toString(), 1, h.frames.size());
+            Assert.assertTrue(h.frames.get(0).isCommit());
+            return h.frames.get(0).size;
+        }
+    }
+
+    private static String conf(TestWebSocketServer server) {
+        return "ws::addr=localhost:" + server.getPort() + ";";
+    }
+
+    // Reconnects within milliseconds once the server is back. Each test drains before it
+    // closes, so the short close drain only bounds how long a failing test takes.
+    private static String outageConf(int port) {
+        return "ws::addr=localhost:" + port
+                + ";reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=50;close_flush_timeout_millis=1000;";
+    }
+
+    private static TestWebSocketServer start(TxnServer h, int cap) throws Exception {
+        TestWebSocketServer server = new TestWebSocketServer(h);
+        server.setAdvertisedMaxBatchSize(cap);
+        server.start();
+        Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+        return server;
+    }
+
+    // A server on a fixed port, so a test can take it down and bring it back on the same
+    // endpoint, as one that supports rollback or as one that predates it.
+    private static TestWebSocketServer start(TxnServer h, int cap, int port, boolean isRollbackSupported) throws Exception {
+        TestWebSocketServer server = new TestWebSocketServer(h, false, null, port);
+        server.setAdvertisedMaxBatchSize(cap);
+        server.setRollbackSupported(isRollbackSupported);
+        server.start();
+        Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+        return server;
+    }
+
+    private static long frameBytes(TxnServer h) {
+        return frameBytes(h, 0, h.frames.size());
+    }
+
+    private static long frameBytes(List<TxnFrame> frames) {
+        long bytes = 0;
+        for (int i = 0, n = frames.size(); i < n; i++) {
+            bytes += frames.get(i).size;
+        }
+        return bytes;
+    }
+
+    // Bytes of the frames [from, to) the server received.
+    private static long frameBytes(TxnServer h, int from, int to) {
+        long bytes = 0;
+        for (int i = from; i < to; i++) {
+            bytes += h.frames.get(i).size;
+        }
+        return bytes;
+    }
+
+    // One letter per frame the server received: D deferred, c bare commit, C commit
+    // with rows, R rollback.
+    private static String frameKinds(TxnServer h) {
+        return frameKinds(h.frames);
+    }
+
+    private static String frameKinds(List<TxnFrame> frames) {
+        StringBuilder kinds = new StringBuilder();
+        for (TxnFrame f : frames) {
+            kinds.append(f.isRollback() ? 'R' : f.isDeferred() ? 'D' : f.isBareCommit() ? 'c' : 'C');
+        }
+        return kinds.toString();
+    }
+
+    private static void assertRefused(String expectedMessage, Runnable action) {
+        try {
+            action.run();
+            Assert.fail("the transaction must be refused");
+        } catch (TransactionTooLargeException e) {
+            Assert.assertEquals(expectedMessage, e.getMessage());
+        }
+    }
+
+    // The I/O thread learns of the server's refusal first; a row added before the sender
+    // learns of it still goes in.
+    private static void awaitRefusalReachesSender(QwpWebSocketSender s) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (s.cursorSendLoopForTest().getRefusedTransactionFsn() < 0) {
+            if (System.nanoTime() > deadline) {
+                Assert.fail("the sender never learned of the refusal");
+            }
+            Thread.sleep(1);
+        }
+    }
+
+    // The refusal of a transaction one table of which holds rows, at or past a limit the
+    // sender learned after it accepted them.
+    private static String overLimitError(String table, long rows, long maxUncommittedRows, boolean isSpellings) {
+        return "transaction too large for the server [table=" + table + ", rows=" + rows
+                + ", maxUncommittedRows=" + maxUncommittedRows + "]; the sender accepted these rows of the table "
+                + "before it learned the server's qwp.max.uncommitted.rows, at which the server commits a table's "
+                + "rows on its own, so the transaction cannot commit as one."
+                + (isSpellings ? " Rows sent under names that differ only in letter case count together: the "
+                + "server counts them as one table." : "")
+                + " Call rollback() to discard it, and raise qwp.max.uncommitted.rows on the server";
+    }
+
+    // The refusal of a transaction the server refused, with or without a message.
+    private static String serverRefusalError(String serverMessage) {
+        return "transaction refused by the server" + (serverMessage != null ? ": " + serverMessage + '.' : ".")
+                + " The sender accepted the transaction's rows before it learned the server's "
+                + "qwp.max.uncommitted.rows, and the transaction cannot commit as one. Call rollback() to discard it";
+    }
+
+    private static String serverRowLimitError(String table, long maxUncommittedRows) {
+        return "transaction too large for the server [table=" + table + ", rows=" + maxUncommittedRows
+                + ", maxUncommittedRows=" + maxUncommittedRows + "]; the server commits a table's rows on its "
+                + "own once qwp.max.uncommitted.rows of them are uncommitted, which would split the transaction, "
+                + "so the row was not added. Raise qwp.max.uncommitted.rows on the server";
+    }
+
+    // Writes 99 rows of a table under two spellings, which send some of them in deferred
+    // frames of 4 KiB, and checks that a 100th row is refused under each.
+    private static void assertSpellingsRefuseRow100(Sender s) {
+        writeRows(s, "x", 0, 60);
+        writeRows(s, "X", 60, 39);
+        for (String spelling : new String[]{"x", "X"}) {
+            try {
+                writeRows(s, spelling, 99, 1);
+                Assert.fail("the 100th row of the table must be refused as " + spelling);
+            } catch (TransactionTooLargeException e) {
+                Assert.assertEquals(spellingsRowLimitError(spelling, 100), e.getMessage());
+            }
+        }
+    }
+
+    // Writes count rows of one table, alternating between two spellings of its name.
+    private static void writeAlternatingSpellings(Sender s, int count) {
+        for (int i = 0; i < count; i++) {
+            s.table(i % 2 == 0 ? "t" : "T").longColumn("v", i).atNow();
+        }
+    }
+
+    // The refusal at the server's row limit of a table the transaction wrote under names
+    // that differ only in letter case.
+    private static String spellingsRowLimitError(String table, long maxUncommittedRows) {
+        return "transaction too large for the server [table=" + table + ", rows=" + maxUncommittedRows
+                + ", maxUncommittedRows=" + maxUncommittedRows + "]; the server commits a table's rows on its "
+                + "own once qwp.max.uncommitted.rows of them are uncommitted, which would split the transaction, "
+                + "so the row was not added. Rows sent under names that differ only in letter case count together: "
+                + "the server counts them as one table. Raise qwp.max.uncommitted.rows on the server";
+    }
+
+    private static void writeRows(Sender s, String table, int from, int count) {
+        for (int i = from, n = from + count; i < n; i++) {
+            s.table(table).longColumn("v", i).stringColumn("s", PAD).atNow();
+        }
+    }
+
+    // A split of three tables past SPLIT_CAP whose first frame reaches the ring and
+    // whose second, ~80 KB, fits the cap but not a 64 KiB segment. A discard follows,
+    // then the next transaction commits: only that one may land.
+    private static void assertPartlySentSplitDiscarded(String mode, int autoFlushRows, Consumer<Sender> discard) throws Exception {
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, SPLIT_CAP)) {
+                server.setRollbackSupported(true);
+                try (QwpWebSocketSender s = (QwpWebSocketSender) Sender.fromConfig(conf(server) + mode
+                        + SPLIT_PAST_SEGMENT + "auto_flush_rows=" + autoFlushRows + ';')) {
+                    sendPartOfSplit(s, autoFlushRows);
+                    // a reached the ring and left the batch, which keeps b and c, and the
+                    // batch's byte count, which the byte trigger reads, covers only them.
+                    Assert.assertTrue(s.hasDeferredMessagesForTesting());
+                    Assert.assertEquals(0, s.getTableBuffer("a").getRowCount());
+                    Assert.assertEquals(800, s.getTableBuffer("b").getRowCount());
+                    Assert.assertEquals(300, s.getTableBuffer("c").getRowCount());
+                    Assert.assertEquals(s.getTableBuffer("b").getBufferedBytes() + s.getTableBuffer("c").getBufferedBytes(),
+                            s.getPendingBytes());
+                    discard.accept(s);
+                    Assert.assertFalse(s.hasDeferredMessagesForTesting());
+                    writeRows(s, "t", 0, 10);
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                }
+                assertSentTablesRolledBack(h);
+            }
+        });
+    }
+
+    // The server goes down, committed fillers fill the client buffer, and a split sends
+    // its first table's frame into the room left in the last segment and fails on the
+    // second. A discard follows, then the server comes back and the next transaction
+    // commits: only the fillers and that transaction may land.
+    private static void assertPartlySentSplitDuringOutageDiscarded(String mode, Consumer<Sender> discard) throws Exception {
+        assertMemoryLeak(() -> {
+            int port = TestPorts.findUnusedPort();
+            TxnServer before = new TxnServer();
+            TxnServer after = new TxnServer();
+            TestWebSocketServer revived = null;
+            int fillers;
+            try (TestWebSocketServer first = start(before, OUTAGE_SPLIT_CAP, port, true)) {
+                try (Sender s = Sender.fromConfig(outageConf(port) + mode + OUTAGE_SPLIT_RING)) {
+                    first.close();
+                    fillers = fillRingDuringOutage(s);
+                    sendPartOfSplitDuringOutage(s);
+                    // Must not wait for the server: the rollback frame fits the room the
+                    // first table's frame left in the last segment.
+                    discard.accept(s);
+                    revived = start(after, OUTAGE_SPLIT_CAP, port, true);
+                    writeRows(s, "t", 0, 10);
+                    s.flush();
+                    Assert.assertTrue(s.drain(10_000));
+                }
+            } finally {
+                if (revived != null) {
+                    revived.close();
+                }
+            }
+            Assert.assertEquals(0, before.frames.size());
+            Assert.assertEquals(after.frames.toString(), TestUtils.repeat("C", fillers) + "DRC", frameKinds(after));
+            Assert.assertEquals(1, after.rolledBackGroups);
+            List<TxnFrame> committed = new ArrayList<>(after.frames.subList(0, fillers));
+            committed.add(after.frames.get(after.frames.size() - 1));
+            Assert.assertEquals(committed, after.committedFrames());
+        });
+    }
+
+    // As assertPartlySentSplitDuringOutageDiscarded, but the caller retries flush() once
+    // the server is back: the retry sends only the tables that had not reached the ring,
+    // and every frame commits once.
+    private static void assertRetryOfPartlySentSplitSendsEachTableOnce(String mode) throws Exception {
+        assertMemoryLeak(() -> {
+            int port = TestPorts.findUnusedPort();
+            TxnServer before = new TxnServer();
+            TxnServer after = new TxnServer();
+            TestWebSocketServer revived = null;
+            int fillers;
+            try (TestWebSocketServer first = start(before, OUTAGE_SPLIT_CAP, port, true)) {
+                try (Sender s = Sender.fromConfig(outageConf(port) + mode + OUTAGE_SPLIT_RING)) {
+                    first.close();
+                    fillers = fillRingDuringOutage(s);
+                    sendPartOfSplitDuringOutage(s);
+                    revived = start(after, OUTAGE_SPLIT_CAP, port, true);
+                    // The ring replays to the server, whose acks of the fillers make room.
+                    Assert.assertTrue(after.awaitFrames(fillers + 1));
+                    s.flush();
+                    Assert.assertTrue(s.drain(10_000));
+                }
+            } finally {
+                if (revived != null) {
+                    revived.close();
+                }
+            }
+            Assert.assertEquals(0, before.frames.size());
+            // The fillers, the first table's frame replayed, then the other two tables.
+            Assert.assertEquals(after.frames.toString(), TestUtils.repeat("C", fillers) + "DDC", frameKinds(after));
+            Assert.assertEquals(after.frames, after.committedFrames());
+        });
+    }
+
+    // The server received the first table's frame of the split, the rollback frame that
+    // discarded it, and the next transaction's commit, which alone committed.
+    private static void assertSentTablesRolledBack(TxnServer h) {
+        Assert.assertEquals(h.frames.toString(), "DRC", frameKinds(h));
+        Assert.assertEquals(1, h.rolledBackGroups);
+        Assert.assertEquals(h.frames.subList(2, 3), h.committedFrames());
+    }
+
+    // With the server down, commits filler frames, one per segment, until the client
+    // buffer refuses one, discards that one, and returns how many reached the ring. The
+    // last segment keeps ~26 KB free.
+    private static int fillRingDuringOutage(Sender s) {
+        for (int frames = 0; frames < 100; frames++) {
+            writeRows(s, "filler", 0, 390);
+            try {
+                s.flush();
+            } catch (LineSenderException e) {
+                TestUtils.assertContains(e.getMessage(), "cursor SF append failed");
+                s.reset();
+                Assert.assertTrue("the ring must take a filler", frames > 0);
+                return frames;
+            }
+        }
+        Assert.fail("the ring must fill");
+        return -1;
+    }
+
+    // Writes tables a (~30 KB), b (~80 KB) and c (~30 KB), SPLIT_ROWS rows past SPLIT_CAP.
+    // The split sends a, and b fits the cap but not a 64 KiB segment, so its append fails
+    // at once. A row trigger of SPLIT_ROWS sends the batch on its last row, as auto-flush;
+    // flush() sends it otherwise.
+    private static void sendPartOfSplit(Sender s, int autoFlushRows) {
+        Assert.assertTrue(autoFlushRows >= SPLIT_ROWS);
+        try {
+            writeRows(s, "a", 0, 300);
+            writeRows(s, "b", 0, 800);
+            writeRows(s, "c", 0, 300);
+            s.flush();
+            Assert.fail("the split's second frame cannot fit a segment");
+        } catch (LineSenderException e) {
+            TestUtils.assertContains(e.getMessage(), "cursor SF append failed");
+            TestUtils.assertContains(e.getCause().getMessage(), "payload too large for segment");
+        }
+    }
+
+    // Writes tables a (~19 KB), b (~39 KB) and c (~10 KB), past OUTAGE_SPLIT_CAP, into a
+    // ring fillRingDuringOutage filled. The split sends a into the room left in the last
+    // segment, and b needs a segment the full ring cannot add.
+    private static void sendPartOfSplitDuringOutage(Sender s) {
+        writeRows(s, "a", 0, 190);
+        writeRows(s, "b", 0, 390);
+        writeRows(s, "c", 0, 100);
+        try {
+            s.flush();
+            Assert.fail("the split's second frame cannot reach the full ring");
+        } catch (LineSenderException e) {
+            TestUtils.assertContains(e.getMessage(), "cursor SF append failed");
+            TestUtils.assertContains(e.getCause().getMessage(), "cursor ring backpressured");
+        }
+    }
+
+    // ~28 KB in each of count tables, from table t<first>: each fits a 32 KiB frame.
+    private static void writeTables(Sender s, int first, int count) {
+        for (int t = first, n = first + count; t < n; t++) {
+            writeRows(s, "t" + t, 0, 280);
+        }
+    }
+
+    // Writes rows 0, 1, ... of the table until the client buffer refuses one, and
+    // returns the refusal.
+    private static Refusal writeUntilTooLarge(Sender s, String table) {
+        for (int row = 0; row < 100_000; row++) {
+            try {
+                s.table(table).longColumn("v", row).stringColumn("s", PAD).atNow();
+            } catch (TransactionTooLargeException e) {
+                return new Refusal(row, e);
+            }
+        }
+        Assert.fail("the client buffer must refuse a row");
+        return null;
+    }
+
+    // Writes rows 0, 1, ... of table t until the client buffer refuses one, with 64 KiB
+    // segments, and returns the refused row.
+    private static int writeUntilRefused(Sender s, long ringCapacityBytes) {
+        for (int row = 0; row < 100_000; row++) {
+            try {
+                s.table("t").longColumn("v", row).stringColumn("s", PAD).atNow();
+            } catch (TransactionTooLargeException e) {
+                assertClientBufferRefusal(e, ringCapacityBytes, "so the row was not added");
+                return row;
+            }
+        }
+        Assert.fail("the client buffer must refuse a row");
+        return -1;
+    }
+
+    // A row the client buffer refused, and why.
+    private static final class Refusal {
+        final TransactionTooLargeException error;
+        final int row;
+
+        Refusal(int row, TransactionTooLargeException error) {
+            this.row = row;
+            this.error = error;
+        }
+    }
+
+    private static final class NoTriggerSpelling {
+        final String name;
+        private final Function<String, Sender.LineSenderBuilder> builder;
+
+        NoTriggerSpelling(String name, Function<String, Sender.LineSenderBuilder> builder) {
+            this.name = name;
+            this.builder = builder;
+        }
+
+        Sender build(String config) {
+            return builder.apply(config).build();
+        }
+    }
+
+    private static final class TxnFrame {
+        // Index of the connection the frame arrived on, in connection order.
+        final int connection;
+        final byte flags;
+        final int size;
+
+        TxnFrame(byte flags, int size, int connection) {
+            this.flags = flags;
+            this.size = size;
+            this.connection = connection;
+        }
+
+        // A commit frame with no table: the header and an empty symbol delta.
+        boolean isBareCommit() {
+            return isCommit() && size <= QwpConstants.HEADER_SIZE + 6;
+        }
+
+        boolean isCommit() {
+            return (flags & QwpConstants.FLAG_DEFER_COMMIT) == 0;
+        }
+
+        boolean isDeferred() {
+            return !isRollback() && (flags & QwpConstants.FLAG_DEFER_COMMIT) != 0;
+        }
+
+        boolean isRollback() {
+            return size == QwpConstants.HEADER_SIZE && flags == QwpConstants.ROLLBACK_FRAME_FLAGS;
+        }
+
+        boolean isStrict() {
+            return (flags & QwpConstants.FLAG_STRICT) != 0;
+        }
+
+        @Override
+        public String toString() {
+            return connection + ":" + (isRollback() ? "R" : isDeferred() ? "D" : "C") + size;
+        }
+    }
+
+    /**
+     * Acks frames the way the QuestDB server does, per connection: wire sequences
+     * restart at 0 on every connection, deferred frames wait for the commit frame
+     * that closes their group, which acks them cumulatively, and the rollback frame
+     * discards the group and acks it too.
+     * <p>
+     * It also models what the server commits: a commit frame commits the group open
+     * on its connection, while a rollback frame or a closed connection leaves that
+     * group uncommitted. On a connection that did not confirm rollback the rollback
+     * frame is what a server without rollback support makes of it, an empty deferred
+     * frame: the group stays open, and the next commit on the connection commits it.
+     */
+    private static final class TxnServer implements TestWebSocketServer.WebSocketServerHandler {
+        // The message the server refuses a strict frame with.
+        static final String REFUSAL = "strict transaction too large";
+        // Every frame received, over all connections, in arrival order.
+        final List<TxnFrame> frames = new CopyOnWriteArrayList<>();
+        volatile boolean isAckingRollback = true;
+        // Refuses a strict commit frame, as the QuestDB server does one whose rows take a
+        // table to qwp.max.uncommitted.rows.
+        volatile boolean isRefusingStrictCommit;
+        // Refuses the strict deferred frame at this position in its group, 0 for none.
+        volatile int refusingStrictDeferredFrame;
+        // The message of a refusal; null sends none.
+        volatile String refusalMessage = REFUSAL;
+        volatile int rolledBackGroups;
+        private int refusals;
+        // Frames a commit frame committed, in commit order.
+        private final List<TxnFrame> committed = new ArrayList<>();
+        private final Map<TestWebSocketServer.ClientHandler, Connection> connections = new IdentityHashMap<>();
+
+        @Override
+        public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            Connection connection = connections.get(client);
+            if (connection == null) {
+                connection = new Connection(connections.size());
+                connections.put(client, connection);
+            }
+            long seq = connection.nextSeq++;
+            TxnFrame frame = new TxnFrame(data[QwpConstants.HEADER_OFFSET_FLAGS], data.length, connection.index);
+            frames.add(frame);
+            notifyAll();
+            try {
+                // A refusal discards the group and, as on the QuestDB server, stops the
+                // processing of everything the connection sends after it.
+                if (connection.isRefused) {
+                    return;
+                }
+                if (frame.isStrict() && (frame.isCommit() ? isRefusingStrictCommit
+                        : ++connection.strictDeferredFrames == refusingStrictDeferredFrame)) {
+                    refusals++;
+                    connection.group.clear();
+                    connection.isRefused = true;
+                    client.sendBinary(refusal(seq, refusalMessage));
+                    return;
+                }
+                if (frame.isCommit()) {
+                    committed.addAll(connection.group);
+                    committed.add(frame);
+                    connection.group.clear();
+                    connection.strictDeferredFrames = 0;
+                    client.sendBinary(ack(seq));
+                } else if (frame.isRollback() && client.isRollbackConfirmed()) {
+                    rolledBackGroups++;
+                    connection.group.clear();
+                    connection.strictDeferredFrames = 0;
+                    if (isAckingRollback) {
+                        client.sendBinary(ack(seq));
+                    }
+                } else {
+                    connection.group.add(frame);
+                }
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        }
+
+        synchronized int refusals() {
+            return refusals;
+        }
+
+        // STATUS_TRANSACTION_TOO_LARGE for the frame at seq.
+        private static byte[] refusal(long seq, String message) {
+            byte[] text = message == null ? new byte[0] : message.getBytes(StandardCharsets.UTF_8);
+            byte[] buf = new byte[1 + 8 + 2 + text.length];
+            ByteBuffer bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN);
+            bb.put(WebSocketResponse.STATUS_TRANSACTION_TOO_LARGE);
+            bb.putLong(seq);
+            bb.putShort((short) text.length);
+            bb.put(text);
+            return buf;
+        }
+
+        synchronized boolean awaitRollbackFrames(int count) throws InterruptedException {
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (rollbackFrames() < count) {
+                long left = deadline - System.nanoTime();
+                if (left <= 0) {
+                    return false;
+                }
+                TimeUnit.NANOSECONDS.timedWait(this, left);
+            }
+            return true;
+        }
+
+        synchronized List<TxnFrame> committedFrames() {
+            return new ArrayList<>(committed);
+        }
+
+        synchronized int connectionCount() {
+            return connections.size();
+        }
+
+        // The frames of each connection, in arrival order, by connection index.
+        synchronized List<List<TxnFrame>> framesByConnection() {
+            List<List<TxnFrame>> byConnection = new ArrayList<>();
+            for (int i = 0, n = connections.size(); i < n; i++) {
+                byConnection.add(new ArrayList<>());
+            }
+            for (TxnFrame f : frames) {
+                byConnection.get(f.connection).add(f);
+            }
+            return byConnection;
+        }
+
+        synchronized boolean awaitFrames(int count) throws InterruptedException {
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (frames.size() < count) {
+                long left = deadline - System.nanoTime();
+                if (left <= 0) {
+                    return false;
+                }
+                TimeUnit.NANOSECONDS.timedWait(this, left);
+            }
+            return true;
+        }
+
+        synchronized int commitFrames() {
+            int n = 0;
+            for (TxnFrame f : frames) {
+                if (f.isCommit()) {
+                    n++;
+                }
+            }
+            return n;
+        }
+
+        synchronized int rollbackFrames() {
+            int n = 0;
+            for (TxnFrame f : frames) {
+                if (f.isRollback()) {
+                    n++;
+                }
+            }
+            return n;
+        }
+
+        private static byte[] ack(long seq) {
+            byte[] buf = new byte[1 + 8 + 2];
+            ByteBuffer bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN);
+            bb.put((byte) 0x00);
+            bb.putLong(seq);
+            bb.putShort((short) 0);
+            return buf;
+        }
+
+        private static final class Connection {
+            // Deferred frames the connection holds uncommitted.
+            final List<TxnFrame> group = new ArrayList<>();
+            final int index;
+            boolean isRefused;
+            long nextSeq;
+            int strictDeferredFrames;
+
+            Connection(int index) {
+                this.index = index;
+            }
+        }
+    }
+}

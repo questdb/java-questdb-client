@@ -669,6 +669,49 @@ public class QwpWebSocketSenderTest {
     }
 
     @Test
+    public void testNamesDifferingOnlyInLetterCaseAreSpellingsOfOneTable() throws Exception {
+        // The server counts the rows of such names as one table. Each keeps its own
+        // buffer, so its rows go out under the name they were written under, and the
+        // buffers form the spellings of that table. Names differ only in letter case
+        // when each char folds to the same one with Character.toLowerCase(), as the
+        // engine compares table names.
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = createUnconnectedSender()) {
+                QwpTableBuffer first = sender.getTableBuffer("Trades");
+                sender.table("TRADES");
+                QwpTableBuffer upper = sender.getTableBuffer("TRADES");
+                QwpTableBuffer lower = sender.getTableBuffer("trades");
+                QwpTableBuffer other = sender.getTableBuffer("trades2");
+                QwpTableBuffer umlaut = sender.getTableBuffer("tr\u00c4des");
+                QwpTableBuffer umlautUpper = sender.getTableBuffer("TR\u00c4DES");
+                QwpTableBuffer umlautLower = sender.getTableBuffer("TR\u00e4DES");
+                // The dotted capital I folds to an ASCII i, and the Kelvin sign to an ASCII k.
+                QwpTableBuffer dotless = sender.getTableBuffer("ti");
+                QwpTableBuffer dotted = sender.getTableBuffer("t\u0130");
+                QwpTableBuffer kelvinSign = sender.getTableBuffer("\u212Aelvin");
+                QwpTableBuffer kelvin = sender.getTableBuffer("KELVIN");
+                // Chars fold one by one: the surrogates of a supplementary letter keep its
+                // case, and a sharp s is no double s.
+                QwpTableBuffer deseretUpper = sender.getTableBuffer("t\uD801\uDC00");
+                QwpTableBuffer deseretLower = sender.getTableBuffer("t\uD801\uDC28");
+                QwpTableBuffer sharpS = sender.getTableBuffer("stra\u00dfe");
+                QwpTableBuffer doubleS = sender.getTableBuffer("STRASSE");
+
+                Assert.assertEquals("TRADES", upper.getTableName());
+                assertSpellings(first, first, upper, lower);
+                assertSpellings(other, other);
+                assertSpellings(umlaut, umlaut, umlautUpper, umlautLower);
+                assertSpellings(dotless, dotless, dotted);
+                assertSpellings(kelvinSign, kelvinSign, kelvin);
+                assertSpellings(deseretUpper, deseretUpper);
+                assertSpellings(deseretLower, deseretLower);
+                assertSpellings(sharpS, sharpS);
+                assertSpellings(doubleS, doubleS);
+            }
+        });
+    }
+
+    @Test
     public void testNullArgsAfterCloseAllThrowSenderClosed() throws Exception {
         // Several column setters short-circuit (return this or throw "cannot
         // be null") before delegating to an overload that calls
@@ -1055,6 +1098,20 @@ public class QwpWebSocketSenderTest {
      */
     private QwpWebSocketSender createUnconnectedSender() {
         return QwpWebSocketSender.createForTesting("localhost", 9000);
+    }
+
+    // Checks that the chain from firstSpelling lists exactly the expected buffers, in
+    // any order, each naming firstSpelling as its table's first spelling.
+    private static void assertSpellings(QwpTableBuffer firstSpelling, QwpTableBuffer... expected) {
+        List<QwpTableBuffer> spellings = new ArrayList<>();
+        for (QwpTableBuffer spelling = firstSpelling; spelling != null; spelling = spelling.getNextSpelling()) {
+            Assert.assertSame(firstSpelling, spelling.getFirstSpelling());
+            spellings.add(spelling);
+        }
+        Assert.assertEquals(expected.length, spellings.size());
+        for (QwpTableBuffer spelling : expected) {
+            Assert.assertTrue(spelling.getTableName(), spellings.contains(spelling));
+        }
     }
 
     /**

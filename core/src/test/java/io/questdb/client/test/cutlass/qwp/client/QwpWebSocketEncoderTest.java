@@ -1424,6 +1424,50 @@ public class QwpWebSocketEncoderTest {
     }
 
     @Test
+    public void testStrictFlagMarksEveryDataFrame() throws Exception {
+        // A strict sender marks its frames with FLAG_STRICT, so the server refuses rather
+        // than commits its transaction in parts: frames encode() writes, deferred
+        // delta-dictionary frames, the split frames copied from them and the bare commit
+        // frame. Never the rollback frame, which the server matches by its exact flags.
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 MicrobatchBuffer target = new MicrobatchBuffer(256);
+                 QwpTableBuffer table = new QwpTableBuffer("t")) {
+                table.getOrCreateColumn("x", TYPE_LONG, false).addLong(1);
+                table.nextRow();
+                encoder.setStrict(true);
+                encoder.encode(table);
+                Assert.assertEquals(FLAG_GORILLA | FLAG_STRICT, headerFlags(encoder.getBuffer().getBufferPtr()));
+
+                GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+                encoder.setDeferCommit(true);
+                encoder.beginMessage(1, dict, -1, -1);
+                int tableBodyOffset = encoder.getBuffer().getPosition();
+                encoder.addTable(table);
+                int tableBodyLength = encoder.getBuffer().getPosition() - tableBodyOffset;
+                encoder.finishMessage();
+                Assert.assertEquals(FLAG_GORILLA | FLAG_DELTA_SYMBOL_DICT | FLAG_DEFER_COMMIT | FLAG_STRICT,
+                        headerFlags(encoder.getBuffer().getBufferPtr()));
+                encoder.copySplitMessage(target, tableBodyOffset, tableBodyLength, false, -1, -1);
+                Assert.assertEquals(FLAG_GORILLA | FLAG_DELTA_SYMBOL_DICT | FLAG_STRICT, headerFlags(target.getBufferPtr()));
+
+                encoder.setDeferCommit(false);
+                encoder.beginMessage(0, dict, -1, -1);
+                encoder.finishMessage();
+                Assert.assertEquals(FLAG_GORILLA | FLAG_DELTA_SYMBOL_DICT | FLAG_STRICT,
+                        headerFlags(encoder.getBuffer().getBufferPtr()));
+
+                encoder.encodeRollbackMessage();
+                Assert.assertEquals(ROLLBACK_FRAME_FLAGS, headerFlags(encoder.getBuffer().getBufferPtr()));
+
+                encoder.setStrict(false);
+                encoder.encode(table);
+                Assert.assertEquals(FLAG_GORILLA, headerFlags(encoder.getBuffer().getBufferPtr()));
+            }
+        });
+    }
+
+    @Test
     public void testTableHeaderMatchesTheWireLayout() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
@@ -1477,6 +1521,11 @@ public class QwpWebSocketEncoderTest {
                 Assert.assertEquals(3, Unsafe.getUnsafe().getByte(ptr + 4));
             }
         });
+    }
+
+    // The flags byte of the QWP header at ptr, unsigned.
+    private static int headerFlags(long ptr) {
+        return Unsafe.getUnsafe().getByte(ptr + HEADER_OFFSET_FLAGS) & 0xFF;
     }
 
     private static void assertFailure(

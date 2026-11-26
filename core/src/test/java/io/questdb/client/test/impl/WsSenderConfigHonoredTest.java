@@ -54,11 +54,12 @@ public class WsSenderConfigHonoredTest {
         assertHonored("auto_flush_interval=250", "auto_flush_interval", 250);
         // auto_flush=off reaches disableAutoFlush(), which sets the interval to
         // MAX_VALUE; auto_flush_rows=off leaves the interval unset, so this field
-        // distinguishes the two. That config is build-rejected on WebSocket; see
-        // QuestDBBuilderTest.testMalformedIngressConfigRejectedAtBuildWithMinZero.
+        // distinguishes the two. On WebSocket it selects strict transactional mode
+        // at build(); see QwpLargeTransactionTest.
         assertHonored("auto_flush=off", "auto_flush_interval", Integer.MAX_VALUE);
         assertHonored("max_name_len=99", "max_name_len", 99);
-        assertHonored("transaction=on", "transaction", true);
+        assertHonored("transaction=on", "transaction", "on");
+        assertHonored("transaction=strict", "transaction", "strict");
         assertHonored("request_durable_ack=on", "request_durable_ack", "on");
         assertHonored("request_durable_ack=local", "request_durable_ack", "local");
         assertHonored("request_durable_ack=replicated", "request_durable_ack", "replicated");

@@ -258,6 +258,29 @@ public class WebSocketResponseTest {
     }
 
     @Test
+    public void testTransactionTooLargeRoundTrip() throws Exception {
+        assertMemoryLeak(() -> {
+            WebSocketResponse original = WebSocketResponse.error(
+                    5L, WebSocketResponse.STATUS_TRANSACTION_TOO_LARGE, "strict transaction too large");
+            int size = original.serializedSize();
+            long ptr = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
+            try {
+                original.writeTo(ptr);
+
+                WebSocketResponse parsed = new WebSocketResponse();
+                Assert.assertTrue(parsed.readFrom(ptr, size));
+                Assert.assertFalse(parsed.isSuccess());
+                Assert.assertEquals(0x0F, parsed.getStatus());
+                Assert.assertEquals("TRANSACTION_TOO_LARGE", parsed.getStatusName());
+                Assert.assertEquals(5L, parsed.getSequence());
+                Assert.assertEquals("strict transaction too large", parsed.getErrorMessage());
+            } finally {
+                Unsafe.free(ptr, size, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
     public void testLargeTableCountWithInsufficientPayload() throws Exception {
         assertMemoryLeak(() -> {
             int size = WebSocketResponse.MIN_OK_RESPONSE_SIZE;

@@ -101,6 +101,13 @@ public class WebSocketResponse {
     public static final byte STATUS_PARSE_ERROR = 0x05;
     public static final byte STATUS_SCHEMA_MISMATCH = 0x03;
     public static final byte STATUS_SECURITY_ERROR = 0x08;
+    /**
+     * A frame with {@link io.questdb.client.cutlass.qwp.protocol.QwpConstants#FLAG_STRICT}
+     * would take a table to the server's {@code qwp.max.uncommitted.rows}, where the server
+     * commits it on its own. The server refused the frame and discarded the rows the
+     * connection held uncommitted, so the strict transaction did not commit in parts.
+     */
+    public static final byte STATUS_TRANSACTION_TOO_LARGE = 0x0F;
     public static final byte STATUS_WRITE_ERROR = 0x09;
     private final DirectUtf8String lookupKey = new DirectUtf8String();
     // Caches decoded table names so the same native-memory byte sequence resolves to
@@ -255,6 +262,8 @@ public class WebSocketResponse {
                 return "NOT_WRITABLE";
             case STATUS_DICTIONARY_GAP:
                 return "DICTIONARY_GAP";
+            case STATUS_TRANSACTION_TOO_LARGE:
+                return "TRANSACTION_TOO_LARGE";
             default:
                 return "UNKNOWN(" + (status & 0xFF) + ")";
         }

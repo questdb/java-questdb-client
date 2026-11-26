@@ -279,6 +279,16 @@ public final class SenderError {
          */
         PROTOCOL_VIOLATION,
         /**
+         * The server cannot commit a strict transaction as one: a table of it would
+         * reach the server's {@code qwp.max.uncommitted.rows}, where the server commits
+         * on its own, because the sender accepted the transaction's rows before it
+         * learned that limit. Wire {@code 0x0F}. The server discarded the rows it had
+         * received. When the producer rolled the transaction back, the sender discards
+         * its frames and reports nothing; when the producer committed it, the sender
+         * halts with this category, and the frames stay in the store-and-forward log.
+         */
+        TRANSACTION_TOO_LARGE,
+        /**
          * Rows this client had durably buffered will never be sent, and no retry
          * will change that. The only category with no server involvement: the
          * server never saw these bytes and issued no verdict on them, so

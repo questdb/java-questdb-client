@@ -1052,7 +1052,10 @@ public class DeltaDictRecoveryTest {
                 // Small segment; a heavily padded row's frame cannot fit, so
                 // appendBlocking throws PAYLOAD_TOO_LARGE deterministically -- no
                 // backpressure timing needed. The server never acks (SilentHandler).
-                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";sf_max_segment_bytes=1024;";
+                // auto_flush_bytes=off: the oversized row must reach flush() whole,
+                // as the byte trigger would otherwise publish it from at().
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";sf_max_segment_bytes=1024;auto_flush_bytes=off;";
                 String pad = TestUtils.repeat("x", 2000); // frame >> 1024-byte segment
                 Sender sender = Sender.fromConfig(cfg);
                 try {
@@ -1187,9 +1190,12 @@ public class DeltaDictRecoveryTest {
                 int port = silent.getPort();
                 silent.start();
                 Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                // auto_flush_bytes=off: the oversized row must reach flush() whole,
+                // as the byte trigger would otherwise publish it from at().
                 String cfg = "ws::addr=localhost:" + port
                         + ";sf_dir=" + sfDir
                         + ";sf_max_segment_bytes=4096"
+                        + ";auto_flush_bytes=off"
                         + ";close_flush_timeout_millis=0;";
                 Sender s1 = Sender.fromConfig(cfg);
                 try {

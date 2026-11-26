@@ -38,7 +38,9 @@ import java.util.function.LongSupplier;
  * hands one budget to every sender it builds, so {@code sf_max_total_bytes}
  * caps the pool as a whole: growing the pool adds connections, not buffer
  * memory. Each {@link SegmentManager} keeps its own worker thread and charges
- * the budget as it provisions and trims segments.
+ * the budget as it provisions and trims segments. The pool declares its maximum
+ * size as the budget's sharers ({@link #getMaxSharers()}), against whose share
+ * each sender sizes its strict transactions.
  * <p>
  * The cap is enforced when a ring's {@link SegmentProvisioner} creates the
  * segment a rotation needs, and a pre-created one only ever takes free room;
@@ -57,6 +59,10 @@ import java.util.function.LongSupplier;
 public final class SegmentBudget {
 
     private final long capacityBytes;
+    // The most senders that charge this budget at once: 1 for the budget of a
+    // sender built on its own, the maximum size of a pool for the pool's budget.
+    // Immutable, so a sender can size what it may pin without consulting the others.
+    private final int maxSharers;
     // Live gauges of each charged slot's .symbol-dict side-file bytes. Read on
     // every cap check rather than folded into segmentBytes: a dictionary
     // grows out-of-band on producer threads, so an incremental mirror would
@@ -69,10 +75,22 @@ public final class SegmentBudget {
     private long segmentBytes;
 
     public SegmentBudget(long capacityBytes) {
+        this(capacityBytes, 1);
+    }
+
+    /**
+     * A budget that at most {@code maxSharers} senders charge at once, as the
+     * senders of a pool of that maximum size do. See {@link #getMaxSharers()}.
+     */
+    public SegmentBudget(long capacityBytes, int maxSharers) {
         if (capacityBytes <= 0) {
             throw new IllegalArgumentException("capacityBytes must be positive: " + capacityBytes);
         }
+        if (maxSharers < 1) {
+            throw new IllegalArgumentException("maxSharers must be positive: " + maxSharers);
+        }
         this.capacityBytes = capacityBytes;
+        this.maxSharers = maxSharers;
     }
 
     /**
@@ -84,6 +102,18 @@ public final class SegmentBudget {
 
     public long getCapacityBytes() {
         return capacityBytes;
+    }
+
+    /**
+     * The most senders that charge this budget at once. A strict transaction pins
+     * its segments until the server commits it, and trim cannot release them, so
+     * all sharers may pin segments at the same time: a sender sizes a strict
+     * transaction that spans segments against its share of the capacity, or the
+     * transactions of several senders could fill the budget together and leave
+     * each other's commits no room.
+     */
+    public int getMaxSharers() {
+        return maxSharers;
     }
 
     public synchronized long getSegmentBytes() {

@@ -41,7 +41,7 @@ public class SenderErrorTest {
         // Pin the public enum values — adding/removing requires a deliberate spec change
         // (and an update to wire-classification mapping in the I/O loop).
         SenderError.Category[] cats = SenderError.Category.values();
-        Assert.assertEquals(10, cats.length);
+        Assert.assertEquals(11, cats.length);
         Assert.assertEquals(SenderError.Category.SCHEMA_MISMATCH, SenderError.Category.valueOf("SCHEMA_MISMATCH"));
         Assert.assertEquals(SenderError.Category.PARSE_ERROR, SenderError.Category.valueOf("PARSE_ERROR"));
         Assert.assertEquals(SenderError.Category.INTERNAL_ERROR, SenderError.Category.valueOf("INTERNAL_ERROR"));
@@ -50,6 +50,7 @@ public class SenderErrorTest {
         Assert.assertEquals(SenderError.Category.NOT_WRITABLE, SenderError.Category.valueOf("NOT_WRITABLE"));
         Assert.assertEquals(SenderError.Category.DICTIONARY_GAP, SenderError.Category.valueOf("DICTIONARY_GAP"));
         Assert.assertEquals(SenderError.Category.PROTOCOL_VIOLATION, SenderError.Category.valueOf("PROTOCOL_VIOLATION"));
+        Assert.assertEquals(SenderError.Category.TRANSACTION_TOO_LARGE, SenderError.Category.valueOf("TRANSACTION_TOO_LARGE"));
         Assert.assertEquals(SenderError.Category.DATA_LOSS, SenderError.Category.valueOf("DATA_LOSS"));
         Assert.assertEquals(SenderError.Category.UNKNOWN, SenderError.Category.valueOf("UNKNOWN"));
     }

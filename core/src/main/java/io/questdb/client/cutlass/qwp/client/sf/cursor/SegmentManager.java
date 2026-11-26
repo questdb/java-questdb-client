@@ -473,6 +473,14 @@ public final class SegmentManager implements QuietCloseable {
     }
 
     /**
+     * The {@code sf_max_total_bytes} budget this manager charges its rings'
+     * segments to; shared with other managers in a sender pool.
+     */
+    public SegmentBudget getBudget() {
+        return budget;
+    }
+
+    /**
      * Stop tracking {@code ring}. Idempotent; safe to call from any thread.
      * <p>
      * Non-blocking: a worker service pass already in flight for this ring

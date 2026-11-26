@@ -73,11 +73,22 @@ public class QwpTableBuffer implements QuietCloseable {
     private int committedColumnCount; // columns that existed at last nextRow()
     private byte[] encodedColumnDefs;
     private ColumnBuffer[] fastColumns; // plain array for O(1) sequential access
+    // The spellings of this buffer's table: buffers of names that differ only in
+    // letter case, each char folded by Character.toLowerCase() as the engine compares
+    // table names, whose rows the server counts as one table's. firstSpelling is the
+    // one the sender created first, this buffer if no other, and nextSpelling chains
+    // the rest behind it. Producer thread only.
+    private QwpTableBuffer firstSpelling = this;
     private int inProgressColumnCount;
     // Set while the sender's pending-tables list holds this buffer, so the
     // buffer is listed once. Producer thread only.
     private boolean listedPending;
+    private QwpTableBuffer nextSpelling;
     private int rowCount;
+    // Rows of this buffer the sender already shipped in FLAG_DEFER_COMMIT frames
+    // of the open transaction, not counting the other spellings of its table.
+    // Producer thread only.
+    private long txnSentRows;
 
     public QwpTableBuffer(String tableName) {
         this(tableName, null);
@@ -97,6 +108,19 @@ public class QwpTableBuffer implements QuietCloseable {
         this.columnNameToIndex = new LowerCaseCharSequenceIntHashMap();
         this.rowCount = 0;
         this.columnDefsCacheValid = false;
+    }
+
+    /**
+     * Makes {@code spelling}, a buffer new to the sender, another spelling of this
+     * buffer's table: its name differs from this one's only in letter case, and this
+     * buffer is the table's first spelling.
+     */
+    public void addSpelling(QwpTableBuffer spelling) {
+        assert firstSpelling == this : "spellings join the first spelling";
+        assert spelling.firstSpelling == spelling && spelling.nextSpelling == null : "a spelling joins one table once";
+        spelling.firstSpelling = this;
+        spelling.nextSpelling = nextSpelling;
+        nextSpelling = spelling;
     }
 
     /**
@@ -217,6 +241,22 @@ public class QwpTableBuffer implements QuietCloseable {
     }
 
     /**
+     * Returns the first spelling of this buffer's table, this buffer itself when the
+     * sender has no buffer of a name that differs from this one's only in letter case.
+     * Its {@link #getNextSpelling()} chain lists the other spellings.
+     */
+    public QwpTableBuffer getFirstSpelling() {
+        return firstSpelling;
+    }
+
+    /**
+     * Returns the next spelling of this buffer's table, or {@code null} after the last.
+     */
+    public QwpTableBuffer getNextSpelling() {
+        return nextSpelling;
+    }
+
+    /**
      * Gets or creates a column with the given name and type.
      * <p>
      * Optimized for the common case where columns are accessed in the same
@@ -280,6 +320,15 @@ public class QwpTableBuffer implements QuietCloseable {
      */
     public String getTableName() {
         return tableName;
+    }
+
+    /**
+     * Rows of this buffer already shipped in FLAG_DEFER_COMMIT frames of the
+     * sender's open transaction, not counting the other spellings of its table
+     * (see {@link #getFirstSpelling()}); 0 outside a transaction.
+     */
+    public long getTxnSentRows() {
+        return txnSentRows;
     }
 
     /**
@@ -424,6 +473,13 @@ public class QwpTableBuffer implements QuietCloseable {
      */
     public void setListedPending(boolean listedPending) {
         this.listedPending = listedPending;
+    }
+
+    /**
+     * Sets the count reported by {@link #getTxnSentRows()}.
+     */
+    public void setTxnSentRows(long txnSentRows) {
+        this.txnSentRows = txnSentRows;
     }
 
     private static void assertColumnType(CharSequence name, byte type, ColumnBuffer column) {

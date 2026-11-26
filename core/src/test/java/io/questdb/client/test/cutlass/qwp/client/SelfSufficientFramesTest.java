@@ -487,8 +487,10 @@ public class SelfSufficientFramesTest {
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
+                // auto_flush_bytes=off: the batch must reach flush() whole, as the
+                // byte trigger would otherwise publish it from at().
                 String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
-                        + ";sf_max_segment_bytes=64;";
+                        + ";sf_max_segment_bytes=64;auto_flush_bytes=off;";
                 String pad = TestUtils.repeat("x", 60);
                 Sender sender = Sender.fromConfig(config);
                 try {
@@ -1342,6 +1344,93 @@ public class SelfSufficientFramesTest {
     }
 
     @Test
+    public void testDictionaryChunkThatFailsToPublishCommitsTheOrphanedChunksOutsideTransactions() throws Exception {
+        // Outside transactional mode nothing but this flush owns the deferred group, so
+        // a chunk that fails after an earlier one reached the ring commits that one.
+        assertDictionaryChunkFailsToPublish(false);
+    }
+
+    @Test
+    public void testDictionaryChunkThatFailsToPublishLeavesTheOpenTransactionToTheCaller() throws Exception {
+        // In strict transactional mode a dictionary chunk that fails after an earlier one
+        // reached the ring must not commit: the earlier chunk joins the caller's open
+        // transaction, and only the caller ends it. Committing the orphaned chunk used to
+        // commit the transaction's earlier frame too, row included.
+        assertDictionaryChunkFailsToPublish(true);
+    }
+
+    @Test
+    public void testDictionaryChunksStayInTheOpenTransactionWhenTheDataFrameFailsToPublish() throws Exception {
+        // The strict transactional twin of testDictionaryChunksAreCommittedWhenTheData-
+        // FrameFailsToPublish. There the chunks join the caller's open transaction, next to
+        // its earlier frames, and only the caller ends it: flush() commits it, rollback()
+        // or reset() discards it. Committing the orphaned chunks used to commit the whole
+        // open transaction behind the caller's back, the row of its earlier frame
+        // included, although a strict transaction never commits in parts.
+        Path sfDir = temporaryFolder.newFolder("qwp-sf-chunk-open-txn").toPath();
+        String slot = sfDir.resolve("default").toString();
+        assertMemoryLeak(() -> {
+            CapturingHandler handler = new CapturingHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.setAdvertisedMaxBatchSize(150);
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                UnopenableDictFacade dictFf = new UnopenableDictFacade();
+                CursorSendEngine engine = new CursorSendEngine(
+                        slot, 100L, 4L * 1024 * 1024,
+                        CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, dictFf);
+                QwpWebSocketSender sender = (QwpWebSocketSender) QwpWebSocketSender.connect(
+                        "localhost", port, null, 1_000_000, 0, 0L, null, DurableAckTiers.NONE, engine);
+                try {
+                    sender.setStrictTransactional(true);
+                    // A deferred frame with a row opens the transaction.
+                    sender.setDeferCommit(true);
+                    sender.table("u").longColumn("v", 1L).atNow();
+                    sender.flush();
+                    sender.setDeferCommit(false);
+                    Assert.assertEquals("the transaction's first frame", 0L, engine.publishedFsn());
+
+                    // As in the twin: the chunks publish, and the data frame does not fit
+                    // the 100-byte segment.
+                    String sym = TestUtils.repeat("s", 40);
+                    String rowPad = TestUtils.repeat("x", 96);
+                    sender.table("t").symbol("s", sym).stringColumn("p", rowPad).atNow();
+                    try {
+                        sender.flush();
+                        Assert.fail("the data frame must fail to publish");
+                    } catch (LineSenderException expected) {
+                        Assert.assertTrue(expected.getMessage(),
+                                expected.getMessage().contains("cursor SF append failed"));
+                    }
+                    long published = engine.publishedFsn();
+                    Assert.assertTrue("the chunker must have published at least one chunk", published >= 1L);
+                    Assert.assertTrue("the transaction stays open", sender.hasDeferredMessagesForTesting());
+
+                    // Everything published reaches the server: the transaction's frame and
+                    // the chunks, and no commit frame.
+                    waitFor(() -> handler.batches.size() == published + 1, 5_000);
+                    for (int i = 0; i < handler.batches.size(); i++) {
+                        Assert.assertEquals("frame " + i + " must not commit the open transaction",
+                                QwpConstants.FLAG_DEFER_COMMIT,
+                                handler.batches.get(i)[QwpConstants.HEADER_OFFSET_FLAGS]
+                                        & QwpConstants.FLAG_DEFER_COMMIT);
+                    }
+                    Assert.assertEquals("the transaction's frame carries its row",
+                            1, QwpWireTestUtils.tableCount(handler.batches.get(0)));
+                } finally {
+                    try {
+                        sender.close();
+                    } catch (LineSenderException ignored) {
+                        // Not what this test is about.
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
     public void testFullDictCommitFrameCarriesNoDictionaryAfterACancelledRow() throws Exception {
         // sendCommitMessage bounded its delta with currentBatchMaxSymbolId in full-dict
         // mode, on the premise -- stated in its own comment -- that "the prior flush
@@ -1501,6 +1590,79 @@ public class SelfSufficientFramesTest {
         public int openCleanRW(String path) {
             return -1;
         }
+    }
+
+    // A deferred frame with a row, then a batch whose four 40-byte symbols take two
+    // dictionary chunks of the 150-byte cap in full-dict mode. The second chunk fails
+    // before it reaches the ring.
+    private void assertDictionaryChunkFailsToPublish(boolean isTransactional) throws Exception {
+        Path sfDir = temporaryFolder.newFolder("qwp-sf-chunk-fault-" + isTransactional).toPath();
+        String slot = sfDir.resolve("default").toString();
+        assertMemoryLeak(() -> {
+            CapturingHandler handler = new CapturingHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.setAdvertisedMaxBatchSize(150);
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                UnopenableDictFacade dictFf = new UnopenableDictFacade();
+                CursorSendEngine engine = new CursorSendEngine(
+                        slot, 4096L, 4L * 1024 * 1024,
+                        CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, dictFf);
+                QwpWebSocketSender sender = (QwpWebSocketSender) QwpWebSocketSender.connect(
+                        "localhost", port, null, 1_000_000, 0, 0L, null, DurableAckTiers.NONE, engine);
+                try {
+                    sender.setStrictTransactional(isTransactional);
+                    sender.setDeferCommit(true);
+                    sender.table("u").longColumn("v", 1L).atNow();
+                    sender.flush();
+                    sender.setDeferCommit(false);
+
+                    for (int i = 0; i < 4; i++) {
+                        sender.table("t").symbol("s", TestUtils.repeat(String.valueOf(i), 40)).atNow();
+                    }
+                    int[] chunkCalls = {0};
+                    sender.setChunkPublishFaultForTesting(() -> {
+                        if (++chunkCalls[0] == 2) {
+                            throw new LineSenderException("injected chunk publish failure");
+                        }
+                    });
+                    try {
+                        sender.flush();
+                        Assert.fail("the second chunk must fail to publish");
+                    } catch (LineSenderException expected) {
+                        Assert.assertEquals("injected chunk publish failure", expected.getMessage());
+                    } finally {
+                        sender.setChunkPublishFaultForTesting(null);
+                    }
+                    Assert.assertEquals(2, chunkCalls[0]);
+                    // The deferred frame and the first chunk, and outside transactional
+                    // mode the commit that closes their group.
+                    long published = engine.publishedFsn();
+                    Assert.assertEquals(isTransactional ? 1L : 2L, published);
+                    Assert.assertEquals(isTransactional, sender.hasDeferredMessagesForTesting());
+                    waitFor(() -> handler.batches.size() == published + 1, 5_000);
+                    Assert.assertEquals("the deferred frame carries its row",
+                            1, QwpWireTestUtils.tableCount(handler.batches.get(0)));
+                    Assert.assertEquals("a chunk carries no table",
+                            0, QwpWireTestUtils.tableCount(handler.batches.get(1)));
+                    for (int i = 0; i <= published; i++) {
+                        boolean isCommit = !isTransactional && i == published;
+                        Assert.assertEquals("frame " + i,
+                                isCommit ? 0 : QwpConstants.FLAG_DEFER_COMMIT,
+                                handler.batches.get(i)[QwpConstants.HEADER_OFFSET_FLAGS]
+                                        & QwpConstants.FLAG_DEFER_COMMIT);
+                    }
+                } finally {
+                    try {
+                        sender.close();
+                    } catch (LineSenderException ignored) {
+                        // The retained batch can rethrow here; not what this test is about.
+                    }
+                }
+            }
+        });
     }
 
     private static void waitFor(BoolCondition cond, long timeoutMillis) {

@@ -82,6 +82,22 @@ public class SenderPoolSharedBudgetTest {
     }
 
     @Test
+    public void testBudgetIsDeclaredForThePoolMaximumSize() throws Exception {
+        // Every sender the pool may build at once can hold a strict transaction
+        // until the server commits it, so the budget is declared for maxSize senders:
+        // each sizes its transactions against its share.
+        TestUtils.assertMemoryLeak(() -> {
+            for (int maxSize : new int[]{1, POOL_SIZE, 9}) {
+                // min=0 builds no sender, so nothing connects to this address.
+                try (SenderPool pool = new SenderPool("ws::addr=127.0.0.1:1;", 0, maxSize, 1_000,
+                        Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    Assert.assertEquals(maxSize, pool.getSegmentBudgetForTesting().getMaxSharers());
+                }
+            }
+        });
+    }
+
+    @Test
     public void testPooledSendersShareOneBudget() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             // The server never acknowledges, so everything the senders write stays

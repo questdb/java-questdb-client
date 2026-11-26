@@ -184,6 +184,26 @@ public class QwpWebSocketEncoder implements QuietCloseable {
         return finishMessage();
     }
 
+    /**
+     * Encodes the rollback control frame into the buffer: a bare header with
+     * {@code ROLLBACK_FRAME_FLAGS}, no table blocks and an empty payload. The
+     * server matches it on exactly that shape.
+     *
+     * @return the frame size in bytes
+     */
+    public int encodeRollbackMessage() {
+        buffer.reset();
+        buffer.putByte((byte) 'Q');
+        buffer.putByte((byte) 'W');
+        buffer.putByte((byte) 'P');
+        buffer.putByte((byte) '1');
+        buffer.putByte(version);
+        buffer.putByte(ROLLBACK_FRAME_FLAGS);
+        buffer.putShort((short) 0);
+        buffer.putInt(0);
+        return buffer.getPosition();
+    }
+
     public int finishMessage() {
         int payloadLength = buffer.getPosition() - payloadStart;
         buffer.patchInt(8, payloadLength);
@@ -226,6 +246,19 @@ public class QwpWebSocketEncoder implements QuietCloseable {
             flags |= FLAG_DEFER_COMMIT;
         } else {
             flags &= ~FLAG_DEFER_COMMIT;
+        }
+    }
+
+    /**
+     * Marks every data frame encoded from now on with {@code FLAG_STRICT}: its rows
+     * belong to a strict transaction, which the server refuses rather than commit in
+     * parts. The rollback control frame never carries it.
+     */
+    public void setStrict(boolean strict) {
+        if (strict) {
+            flags |= FLAG_STRICT;
+        } else {
+            flags &= ~FLAG_STRICT;
         }
     }
 
