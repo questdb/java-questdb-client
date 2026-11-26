@@ -734,8 +734,11 @@ The ingest side also accepts store-and-forward and reconnection tuning keys (`au
 is the minimum working set every live sender keeps: two segments (`2 × sf_max_segment_bytes`, 8 MiB by default).
 `sf_durability=periodic` checkpoints mmap-published data in the background; `sf_sync_interval_millis` defaults to `5000`
 in that mode. The interval is a target cadence: JVM scheduling and storage-sync latency add to the actual loss window.
-Use `request_durable_ack=on` when end-to-end server durability is also required. See the
-[QuestDB documentation](https://questdb.com/docs/) for the full reference.
+Use `request_durable_ack=on` when end-to-end server durability is also required. `owned_by=<group>` names the owner
+of the tables and columns the sender auto-creates, like `OWNED BY` in SQL (QuestDB Enterprise): the server grants them to
+that group instead of the authenticated user, and an external user, such as one signed in with OpenID Connect, must name
+one of its groups to auto-create anything. See the [QuestDB documentation](https://questdb.com/docs/) for the full
+reference.
 
 ## Requirements
 

@@ -74,6 +74,7 @@ import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.bytes.DirectByteSlice;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -645,6 +646,9 @@ public class QwpWebSocketSender implements Sender {
     private long reconnectMaxDurationMillis =
             CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_DURATION_MILLIS;
     private int durableAckTiers;
+    // Owner of the tables and columns this sender auto-creates, sent as X-QWP-Owned-By on every upgrade, or
+    // null. Set once before the first connect, like durableAckTiers.
+    private String ownedBy;
     // Monotonic per-attempt counter snapshotted onto every connection event
     // fired from buildAndConnect. Counts every FOREGROUND endpoint try --
     // successes and failures alike -- across this sender's lifetime.
@@ -1244,6 +1248,58 @@ public class QwpWebSocketSender implements Sender {
             long symbolDictResetMaxWaitMillis,
             long keepaliveIntervalMillis
     ) {
+        return connectWithCredentialSupplier(endpoints, tlsConfig, autoFlushRows, autoFlushBytes,
+                autoFlushIntervalNanos, authorizationHeaderSupplier, durableAckTiers,
+                cursorEngine, closeFlushTimeoutMillis, reconnectMaxDurationMillis,
+                reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
+                initialConnectMode, errorHandler, errorInboxCapacity,
+                durableAckKeepaliveIntervalMillis, authTimeoutMs, connectTimeoutMs,
+                connectionListener, connectionListenerInboxCapacity,
+                maxFrameRejections, poisonMinEscalationWindowMillis,
+                catchUpCapGapMinEscalationWindowMillis, symbolDictResetEnabled,
+                symbolDictResetThresholdSymbols, symbolDictResetMaxWaitMillis,
+                keepaliveIntervalMillis, null);
+    }
+
+    /**
+     * As the master overload above, but also names the owner of the tables and columns the sender
+     * auto-creates ({@code owned_by}): the server grants them to {@code ownedBy} instead of the
+     * authenticated principal. Sent as {@code X-QWP-Owned-By} on every upgrade; an upgrade the server does
+     * not confirm it on fails with a {@link WebSocketUpgradeException}. {@code null} names no owner. The
+     * overload above is kept, delegating here, so a caller compiled before {@code ownedBy} keeps linking.
+     *
+     * @throws LineSenderException if a symbol-dictionary recycle setting is out of range
+     */
+    public static QwpWebSocketSender connectWithCredentialSupplier(
+            List<Endpoint> endpoints,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            Supplier<String> authorizationHeaderSupplier,
+            int durableAckTiers,
+            CursorSendEngine cursorEngine,
+            long closeFlushTimeoutMillis,
+            long reconnectMaxDurationMillis,
+            long reconnectInitialBackoffMillis,
+            long reconnectMaxBackoffMillis,
+            Sender.InitialConnectMode initialConnectMode,
+            SenderErrorHandler errorHandler,
+            int errorInboxCapacity,
+            long durableAckKeepaliveIntervalMillis,
+            long authTimeoutMs,
+            int connectTimeoutMs,
+            SenderConnectionListener connectionListener,
+            int connectionListenerInboxCapacity,
+            int maxFrameRejections,
+            long poisonMinEscalationWindowMillis,
+            long catchUpCapGapMinEscalationWindowMillis,
+            boolean symbolDictResetEnabled,
+            int symbolDictResetThresholdSymbols,
+            long symbolDictResetMaxWaitMillis,
+            long keepaliveIntervalMillis,
+            @Nullable String ownedBy
+    ) {
         if (symbolDictResetThresholdSymbols <= 0
                 || symbolDictResetThresholdSymbols > QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE / 2) {
             throw new LineSenderException("symbol_dict_reset_threshold must be > 0 and <= ")
@@ -1264,6 +1320,7 @@ public class QwpWebSocketSender implements Sender {
         );
         try {
             sender.durableAckTiers = durableAckTiers;
+            sender.ownedBy = ownedBy;
             sender.authTimeoutMs = authTimeoutMs;
             sender.connectTimeoutMs = connectTimeoutMs;
             sender.closeFlushTimeoutMillis = closeFlushTimeoutMillis;
@@ -4172,6 +4229,11 @@ public class QwpWebSocketSender implements Sender {
         // -- they throw immediately because a rejected credential is uniformly
         // rejected across the cluster.
         HttpClientException terminalUpgradeError = null;
+        // The first capability gap of the round: a writable endpoint that answered 101 without the durable ack or the
+        // owner the sender asked for. Usually terminalUpgradeError latches it, but a plain non-421 upgrade error met
+        // earlier takes the latch first, and the epilogue demotes that error when the round also met a 421. The gap
+        // must still stand then, see the epilogue.
+        HttpClientException capabilityGapError = null;
         QwpIngressRoleRejectedException lastRoleReject = null;
         Endpoint lastEndpoint = null;
         // Honor a close/stop that raced this (re)connect before doing any work - a token pull can make a
@@ -4256,6 +4318,7 @@ public class QwpWebSocketSender implements Sender {
                 newClient.setQwpMaxVersion(QwpConstants.VERSION);
                 newClient.setQwpClientId(QwpConstants.CLIENT_ID);
                 newClient.setQwpDurableAckTiers(durableAckTiers);
+                newClient.setQwpOwnedBy(ownedBy);
                 newClient.setConnectTimeout(effectiveConnectTimeoutMs(background, connectTimeoutMs));
                 if (cancellation != null) {
                     // Publish the client we are about to block on so a
@@ -4347,6 +4410,9 @@ public class QwpWebSocketSender implements Sender {
                                 && !((WebSocketUpgradeException) classified).isRoleMismatch()))) {
                     terminalUpgradeError = classified;
                 }
+                if (capabilityGapError == null && classified instanceof QwpOwnedByMismatchException) {
+                    capabilityGapError = classified;
+                }
                 hostTracker.recordTransportError(idx, !background);
                 lastError = classified;
                 if (!background) {
@@ -4404,6 +4470,9 @@ public class QwpWebSocketSender implements Sender {
                             ep.host, ep.port, durableAckTiers, newClient.getServerDurableAckEcho());
                     if (terminalUpgradeError == null) {
                         terminalUpgradeError = ackErr;
+                    }
+                    if (capabilityGapError == null) {
+                        capabilityGapError = ackErr;
                     }
                     lastError = ackErr;
                     if (!background) {
@@ -4491,11 +4560,27 @@ public class QwpWebSocketSender implements Sender {
         // extend HttpClientException directly, so they fall through this
         // check and stay terminal even when replicas role-rejected in the
         // same sweep -- the contract the durable-ack paragraph below
-        // documents and relies on.
+        // documents and relies on. QwpOwnedByMismatchException stays terminal
+        // too: a writable endpoint answered 101 without confirming the owner,
+        // so the round did find a primary, one that cannot set the owner, and
+        // demoting the failure would report a missing primary instead.
         if (terminalUpgradeError != null
                 && !(lastRoleReject != null
-                && terminalUpgradeError instanceof WebSocketUpgradeException)) {
+                && terminalUpgradeError instanceof WebSocketUpgradeException
+                && !(terminalUpgradeError instanceof QwpOwnedByMismatchException))) {
             throw terminalUpgradeError;
+        }
+        if (capabilityGapError != null) {
+            // A plain non-421 upgrade error met before the capability gap took
+            // the latch, and the round's 421 demoted it above. The demotion
+            // holds for that error, which may be part of a failover window,
+            // but not for the gap: the round did find a writable endpoint, one
+            // that lacks the capability, so it reports that rather than a
+            // missing primary, as it does when it meets the gap first. The
+            // demoted error rides along as a suppressed diagnostic.
+            assert lastRoleReject != null && terminalUpgradeError != null;
+            capabilityGapError.addSuppressed(terminalUpgradeError);
+            throw capabilityGapError;
         }
         if (lastRoleReject != null) {
             // Every endpoint either role-rejected the /write/v4 upgrade or

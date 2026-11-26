@@ -791,6 +791,51 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
+    public void testOwnedByBuilder() {
+        Assert.assertEquals("team_a", Sender.builder(Sender.Transport.WEBSOCKET)
+                .address(LOCALHOST)
+                .ownedBy("team_a")
+                .wsConfigSnapshotForTest()
+                .get("owned_by"));
+        Assert.assertNull(Sender.builder(Sender.Transport.WEBSOCKET)
+                .address(LOCALHOST)
+                .wsConfigSnapshotForTest()
+                .get("owned_by"));
+    }
+
+    @Test
+    public void testOwnedByBuilderRejectsBlank() {
+        assertThrows("owned_by cannot be empty nor null", () -> Sender.builder(Sender.Transport.WEBSOCKET).ownedBy(null));
+        assertThrows("owned_by cannot be empty nor null", () -> Sender.builder(Sender.Transport.WEBSOCKET).ownedBy(""));
+        assertThrows("owned_by cannot be empty nor null", () -> Sender.builder(Sender.Transport.WEBSOCKET).ownedBy("  "));
+    }
+
+    @Test
+    public void testOwnedByBuilderRejectsNonWebSocketTransports() {
+        for (Sender.Transport transport : new Sender.Transport[]{Sender.Transport.HTTP, Sender.Transport.TCP, Sender.Transport.UDP}) {
+            assertThrows("owned_by is only supported for WebSocket transport",
+                    () -> Sender.builder(transport).ownedBy("team_a"));
+        }
+    }
+
+    @Test
+    public void testOwnedByBuilderRejectsReconfiguration() {
+        assertThrows("owned_by was already configured [ownedBy=team_a]",
+                () -> Sender.builder(Sender.Transport.WEBSOCKET).ownedBy("team_a").ownedBy("team_b"));
+    }
+
+    @Test
+    public void testOwnedByConfigString() {
+        Assert.assertEquals("caf\u00e9 team", Sender.builder("wss::addr=localhost:9000;owned_by=caf\u00e9 team;")
+                .wsConfigSnapshotForTest()
+                .get("owned_by"));
+        assertBadConfig("ws::addr=localhost:9000;owned_by=;", "owned_by cannot be empty nor null");
+        assertBadConfig("http::addr=localhost:9000;owned_by=team_a;", "owned_by is only supported for WebSocket transport");
+        assertBadConfig("tcp::addr=localhost:9009;owned_by=team_a;", "owned_by is only supported for WebSocket transport");
+        assertBadConfig("udp::addr=localhost:9007;owned_by=team_a;", "owned_by is only supported for WebSocket transport");
+    }
+
+    @Test
     public void testPortMismatch_fails() {
         assertThrowsAny(
                 Sender.builder(Sender.Transport.WEBSOCKET)
