@@ -239,6 +239,62 @@ try (Query q = db.borrowQuery()) {
 > A borrowed `Query` handle is **single-flight**: submit one query at a time on it, then submit again or close it. To
 > run queries concurrently, borrow one handle per concurrent query (up to `query_pool_max`).
 
+### Page Through a Result
+
+`QwpQueryOptions` asks the server for one page of the result set, and for what the `/exec` HTTP endpoint reports
+besides the rows: the row count of the whole result set, execution statistics, and the position of an error in the SQL
+text. The handler receives them through the detailed overloads of its callbacks, and a failed `await()` throws a
+`QueryException` whose `getPosition()` carries the position. The options need a QuestDB server that supports them; an
+older server fails a query that sets `skipRows` or `maxRows`, and runs the others without the details.
+
+```java
+import io.questdb.client.cutlass.qwp.client.QwpQueryDetails;
+import io.questdb.client.cutlass.qwp.client.QwpQueryOptions;
+
+QwpQueryOptions page = new QwpQueryOptions()
+        .skipRows(100)        // leave out the first 100 rows
+        .maxRows(50)          // stream at most 50 rows
+        .countRows(true)      // count the rows of the whole result set
+        .stats(true)          // report compile and execution times
+        .errorPosition(true); // report where in the SQL text an error is
+
+QwpColumnBatchHandler pageHandler = new QwpColumnBatchHandler() {
+    @Override
+    public void onBatch(QwpColumnBatch batch) {
+        // the rows of the page
+    }
+
+    @Override
+    public void onEnd(long totalRows) {
+        // not called: the overload below receives the end of the result
+    }
+
+    @Override
+    public void onEnd(long requestId, long totalRows, QwpQueryDetails details) {
+        System.out.println(totalRows + " of " + details.getRowCount() + " rows in "
+                + details.getExecuteNanos() / 1_000 + " us");
+    }
+
+    @Override
+    public void onError(byte status, String message) {
+        // not called: the overload below receives the error
+    }
+
+    @Override
+    public void onError(long requestId, byte status, String message, int position) {
+        System.err.println("error at position " + position + ": " + message);
+    }
+};
+
+try (Query q = db.borrowQuery()) {
+    q.sql("SELECT * FROM trades ORDER BY ts DESC")
+            .options(page)
+            .handler(pageHandler)
+            .submit()
+            .await();
+}
+```
+
 ### Custom Pool Sizing and Timeouts
 
 Use the builder to override the defaults. `senderPoolSize`/`queryPoolSize` set a fixed pool size; `*Min`/`*Max` allow
