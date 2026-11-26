@@ -774,8 +774,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * After calling this method, you can start building a new row by calling {@link #table(CharSequence)}.
      * <br>
      * In WebSocket transactional mode ({@code transaction=on} or {@code strict}) it also
-     * discards the rows of the open transaction that auto-flush already sent, as
-     * {@link #rollback()} does. The exception is a {@code transaction=on} sender that last
+     * discards the rows of the open transaction already sent, by auto-flush or by a
+     * {@link #flush()} that failed partway, as {@link #rollback()} does. The exception is a {@code transaction=on} sender that last
      * connected to a server without QWP rollback support: it keeps those rows, and the next
      * flush commits them, as before rollback existed.
      * <br>
@@ -788,8 +788,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     /**
      * Discard the open transaction: the rows buffered since the last flush and, in
      * WebSocket transactional mode ({@code transaction=on} or {@code strict}), the
-     * rows of the transaction that auto-flush already sent to the server, which
-     * the server discards on request.
+     * rows of the transaction already sent to the server, by auto-flush or by a
+     * {@link #flush()} that failed partway, which the server discards on request.
      * <br>
      * Like {@link #flush()}, this returns without waiting for the server, so a
      * server outage makes it fail only when the store-and-forward buffer is full,

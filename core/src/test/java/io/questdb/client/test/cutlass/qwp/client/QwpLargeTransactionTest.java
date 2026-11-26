@@ -73,6 +73,23 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  */
 public class QwpLargeTransactionTest {
     private static final int CAP = 32 * 1024;
+    // Row trigger past the batches here: only flush() sends them.
+    private static final int NO_ROW_TRIGGER = 100_000;
+    // OUTAGE_SPLIT_RING's fillers of ~39 KB fit this cap; a split of ~68 KB does not.
+    private static final int OUTAGE_SPLIT_CAP = 48 * 1024;
+    // Committed fillers of ~39 KB take a 64 KiB segment each and leave ~26 KB of it free,
+    // and 256 KiB hold a few of them. A refused append fails after 500 ms.
+    private static final String OUTAGE_SPLIT_RING = "auto_flush_bytes=off;auto_flush_rows=100000;"
+            + "auto_flush_interval=off;sf_max_segment_bytes=64k;sf_max_total_bytes=256k;"
+            + "sf_append_deadline_millis=500;";
+    // Twice the 64 KiB segments of SPLIT_PAST_SEGMENT: a split frame can fit the cap but
+    // not a segment.
+    private static final int SPLIT_CAP = 128 * 1024;
+    // No byte trigger, so a batch grows past SPLIT_CAP and flush() splits it per table.
+    private static final String SPLIT_PAST_SEGMENT = "auto_flush_bytes=off;auto_flush_interval=off;"
+            + "sf_max_segment_bytes=64k;";
+    // Rows sendPartOfSplit writes.
+    private static final int SPLIT_ROWS = 1_400;
     // The settings a refusal at the client buffer names.
     private static final String CLIENT_BUFFER_REMEDY = "Raise sf_max_total_bytes, or set sf_dir to keep the "
             + "transaction on disk";
@@ -2158,6 +2175,167 @@ public class QwpLargeTransactionTest {
         });
     }
 
+    @Test
+    public void testPartlySentAutoFlushSplitRollbackDiscardsSentTables() throws Exception {
+        // The row trigger fires on the batch's last row, so auto-flush sends the split, and
+        // the frame that reached the ring holds rows auto-flush sent.
+        assertPartlySentSplitDiscarded("transaction=on;", SPLIT_ROWS, Sender::rollback);
+    }
+
+    @Test
+    public void testPartlySentSplitDuringOutageResetDiscardsSentTables() throws Exception {
+        assertPartlySentSplitDuringOutageDiscarded("transaction=on;", Sender::reset);
+    }
+
+    @Test
+    public void testPartlySentSplitDuringOutageRollbackDiscardsSentTables() throws Exception {
+        // The server is down and the client buffer full, so the split sends its first
+        // table's frame into the room left in the last segment and fails on the second.
+        // rollback() used to find no open transaction and publish nothing, so once the
+        // server was back, the next transaction's commit committed the first table.
+        assertPartlySentSplitDuringOutageDiscarded("transaction=on;", Sender::rollback);
+    }
+
+    @Test
+    public void testPartlySentSplitResetDiscardsSentTables() throws Exception {
+        assertPartlySentSplitDiscarded("transaction=on;", NO_ROW_TRIGGER, Sender::reset);
+    }
+
+    @Test
+    public void testPartlySentSplitRetryDuringOutageSendsEachTableOnce() throws Exception {
+        // flush() of a split that failed partway used to send the whole batch again, so
+        // the tables that had reached the ring committed twice.
+        assertRetryOfPartlySentSplitSendsEachTableOnce("transaction=on;");
+    }
+
+    @Test
+    public void testPartlySentSplitRollbackDiscardsSentTables() throws Exception {
+        assertPartlySentSplitDiscarded("transaction=on;", NO_ROW_TRIGGER, Sender::rollback);
+    }
+
+    @Test
+    public void testPooledStrictLeaseReturnDiscardsPartlySentSplit() throws Exception {
+        // Returning the lease discards the strict transaction: the table the split sent
+        // must not commit with the next borrower's transaction. The warning counts the
+        // rows of the table that reached the ring and of the two still in the batch, once.
+        assertMemoryLeak(() -> {
+            ListAppender<ILoggingEvent> log = captureSenderLog();
+            try {
+                TxnServer h = new TxnServer();
+                try (TestWebSocketServer server = start(h, SPLIT_CAP)) {
+                    server.setRollbackSupported(true);
+                    try (QuestDB db = QuestDB.connect(conf(server) + "transaction=strict;sender_pool_max=1;"
+                            + "query_pool_min=0;" + SPLIT_PAST_SEGMENT + "auto_flush_rows=" + NO_ROW_TRIGGER + ';')) {
+                        Sender lease = db.borrowSender();
+                        sendPartOfSplit(lease, NO_ROW_TRIGGER);
+                        lease.close();
+                        Assert.assertEquals(Collections.singletonList("returning the sender to the pool"
+                                        + DISCARD_WARNING.replace("of 1000 rows", "of " + SPLIT_ROWS + " rows")),
+                                discardWarnings(log));
+                        Sender next = db.borrowSender();
+                        writeRows(next, "t", 0, 10);
+                        next.flush();
+                        Assert.assertTrue(next.drain(5_000));
+                        next.close();
+                    }
+                    assertSentTablesRolledBack(h);
+                }
+            } finally {
+                releaseSenderLog(log);
+            }
+        });
+    }
+
+    @Test
+    public void testResetKeepsPartlySentSplitOfNonTransactionalSender() throws Exception {
+        // Outside transactional mode reset() discards only the rows not yet sent, as it
+        // does for frames setDeferCommit(true) sent: the frame of the split that reached
+        // the ring stays in the deferred group, and the next commit commits it. The sender
+        // used to lose track of that frame, so a flush() with no rows sent no commit, and
+        // drain() waited for an ack the server withholds until one.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, SPLIT_CAP)) {
+                server.setRollbackSupported(true);
+                try (QwpWebSocketSender s = (QwpWebSocketSender) Sender.fromConfig(conf(server) + "transaction=off;"
+                        + SPLIT_PAST_SEGMENT + "auto_flush_rows=" + NO_ROW_TRIGGER + ';')) {
+                    sendPartOfSplit(s, NO_ROW_TRIGGER);
+                    s.reset();
+                    Assert.assertTrue(s.hasDeferredMessagesForTesting());
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                    Assert.assertFalse(s.hasDeferredMessagesForTesting());
+                }
+                Assert.assertEquals("Dc", frameKinds(h));
+                Assert.assertEquals(h.frames, h.committedFrames());
+            }
+        });
+    }
+
+    @Test
+    public void testSplitThatFailsOnItsFirstFrameKeepsTheWholeBatch() throws Exception {
+        // Nothing of the split reached the ring, so nothing leaves the batch, and the
+        // transaction has no frame to roll back.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, SPLIT_CAP)) {
+                server.setRollbackSupported(true);
+                try (QwpWebSocketSender s = (QwpWebSocketSender) Sender.fromConfig(conf(server) + "transaction=on;"
+                        + SPLIT_PAST_SEGMENT + "auto_flush_rows=" + NO_ROW_TRIGGER + ';')) {
+                    // b, ~80 KB, goes first now: the first frame fits the cap but no segment.
+                    writeRows(s, "b", 0, 800);
+                    writeRows(s, "a", 0, 300);
+                    writeRows(s, "c", 0, 300);
+                    long batchBytes = s.getPendingBytes();
+                    try {
+                        s.flush();
+                        Assert.fail("the split's first frame cannot fit a segment");
+                    } catch (LineSenderException e) {
+                        TestUtils.assertContains(e.getCause().getMessage(), "payload too large for segment");
+                    }
+                    Assert.assertEquals(-1L, s.getCursorEngineForTesting().publishedFsn());
+                    Assert.assertFalse(s.hasDeferredMessagesForTesting());
+                    Assert.assertEquals(batchBytes, s.getPendingBytes());
+                    Assert.assertEquals(s.totalBufferedBytes(), s.getPendingBytes());
+                    Assert.assertEquals(800, s.getTableBuffer("b").getRowCount());
+                    Assert.assertEquals(300, s.getTableBuffer("a").getRowCount());
+                    Assert.assertEquals(300, s.getTableBuffer("c").getRowCount());
+                    s.rollback();
+                    writeRows(s, "t", 0, 10);
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                }
+                Assert.assertEquals("C", frameKinds(h));
+                Assert.assertEquals(h.frames, h.committedFrames());
+            }
+        });
+    }
+
+    @Test
+    public void testStrictPartlySentSplitDuringOutageRollbackDiscardsSentTables() throws Exception {
+        assertPartlySentSplitDuringOutageDiscarded("transaction=strict;", Sender::rollback);
+    }
+
+    @Test
+    public void testStrictPartlySentSplitResetDiscardsSentTables() throws Exception {
+        assertPartlySentSplitDiscarded("transaction=strict;", NO_ROW_TRIGGER, Sender::reset);
+    }
+
+    @Test
+    public void testStrictPartlySentSplitRetryDuringOutageSendsEachTableOnce() throws Exception {
+        assertRetryOfPartlySentSplitSendsEachTableOnce("transaction=strict;");
+    }
+
+    @Test
+    public void testStrictPartlySentSplitRollbackDiscardsSentTables() throws Exception {
+        assertPartlySentSplitDiscarded("transaction=strict;", NO_ROW_TRIGGER, Sender::rollback);
+    }
+
+    @Test
+    public void testTransactionOffPartlySentSplitRetryDuringOutageSendsEachTableOnce() throws Exception {
+        assertRetryOfPartlySentSplitSendsEachTableOnce("transaction=off;");
+    }
+
     // Captures what QwpWebSocketSender logs, so a test can assert its warnings.
     private static ListAppender<ILoggingEvent> captureSenderLog() {
         ListAppender<ILoggingEvent> appender = new ListAppender<>();
@@ -2567,6 +2745,168 @@ public class QwpLargeTransactionTest {
     private static void writeRows(Sender s, String table, int from, int count) {
         for (int i = from, n = from + count; i < n; i++) {
             s.table(table).longColumn("v", i).stringColumn("s", PAD).atNow();
+        }
+    }
+
+    // A split of three tables past SPLIT_CAP whose first frame reaches the ring and
+    // whose second, ~80 KB, fits the cap but not a 64 KiB segment. A discard follows,
+    // then the next transaction commits: only that one may land.
+    private static void assertPartlySentSplitDiscarded(String mode, int autoFlushRows, Consumer<Sender> discard) throws Exception {
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, SPLIT_CAP)) {
+                server.setRollbackSupported(true);
+                try (QwpWebSocketSender s = (QwpWebSocketSender) Sender.fromConfig(conf(server) + mode
+                        + SPLIT_PAST_SEGMENT + "auto_flush_rows=" + autoFlushRows + ';')) {
+                    sendPartOfSplit(s, autoFlushRows);
+                    // a reached the ring and left the batch, which keeps b and c, and the
+                    // batch's byte count, which the byte trigger reads, covers only them.
+                    Assert.assertTrue(s.hasDeferredMessagesForTesting());
+                    Assert.assertEquals(0, s.getTableBuffer("a").getRowCount());
+                    Assert.assertEquals(800, s.getTableBuffer("b").getRowCount());
+                    Assert.assertEquals(300, s.getTableBuffer("c").getRowCount());
+                    Assert.assertEquals(s.getTableBuffer("b").getBufferedBytes() + s.getTableBuffer("c").getBufferedBytes(),
+                            s.getPendingBytes());
+                    discard.accept(s);
+                    Assert.assertFalse(s.hasDeferredMessagesForTesting());
+                    writeRows(s, "t", 0, 10);
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                }
+                assertSentTablesRolledBack(h);
+            }
+        });
+    }
+
+    // The server goes down, committed fillers fill the client buffer, and a split sends
+    // its first table's frame into the room left in the last segment and fails on the
+    // second. A discard follows, then the server comes back and the next transaction
+    // commits: only the fillers and that transaction may land.
+    private static void assertPartlySentSplitDuringOutageDiscarded(String mode, Consumer<Sender> discard) throws Exception {
+        assertMemoryLeak(() -> {
+            int port = TestPorts.findUnusedPort();
+            TxnServer before = new TxnServer();
+            TxnServer after = new TxnServer();
+            TestWebSocketServer revived = null;
+            int fillers;
+            try (TestWebSocketServer first = start(before, OUTAGE_SPLIT_CAP, port, true)) {
+                try (Sender s = Sender.fromConfig(outageConf(port) + mode + OUTAGE_SPLIT_RING)) {
+                    first.close();
+                    fillers = fillRingDuringOutage(s);
+                    sendPartOfSplitDuringOutage(s);
+                    // Must not wait for the server: the rollback frame fits the room the
+                    // first table's frame left in the last segment.
+                    discard.accept(s);
+                    revived = start(after, OUTAGE_SPLIT_CAP, port, true);
+                    writeRows(s, "t", 0, 10);
+                    s.flush();
+                    Assert.assertTrue(s.drain(10_000));
+                }
+            } finally {
+                if (revived != null) {
+                    revived.close();
+                }
+            }
+            Assert.assertEquals(0, before.frames.size());
+            Assert.assertEquals(after.frames.toString(), TestUtils.repeat("C", fillers) + "DRC", frameKinds(after));
+            Assert.assertEquals(1, after.rolledBackGroups);
+            List<TxnFrame> committed = new ArrayList<>(after.frames.subList(0, fillers));
+            committed.add(after.frames.get(after.frames.size() - 1));
+            Assert.assertEquals(committed, after.committedFrames());
+        });
+    }
+
+    // As assertPartlySentSplitDuringOutageDiscarded, but the caller retries flush() once
+    // the server is back: the retry sends only the tables that had not reached the ring,
+    // and every frame commits once.
+    private static void assertRetryOfPartlySentSplitSendsEachTableOnce(String mode) throws Exception {
+        assertMemoryLeak(() -> {
+            int port = TestPorts.findUnusedPort();
+            TxnServer before = new TxnServer();
+            TxnServer after = new TxnServer();
+            TestWebSocketServer revived = null;
+            int fillers;
+            try (TestWebSocketServer first = start(before, OUTAGE_SPLIT_CAP, port, true)) {
+                try (Sender s = Sender.fromConfig(outageConf(port) + mode + OUTAGE_SPLIT_RING)) {
+                    first.close();
+                    fillers = fillRingDuringOutage(s);
+                    sendPartOfSplitDuringOutage(s);
+                    revived = start(after, OUTAGE_SPLIT_CAP, port, true);
+                    // The ring replays to the server, whose acks of the fillers make room.
+                    Assert.assertTrue(after.awaitFrames(fillers + 1));
+                    s.flush();
+                    Assert.assertTrue(s.drain(10_000));
+                }
+            } finally {
+                if (revived != null) {
+                    revived.close();
+                }
+            }
+            Assert.assertEquals(0, before.frames.size());
+            // The fillers, the first table's frame replayed, then the other two tables.
+            Assert.assertEquals(after.frames.toString(), TestUtils.repeat("C", fillers) + "DDC", frameKinds(after));
+            Assert.assertEquals(after.frames, after.committedFrames());
+        });
+    }
+
+    // The server received the first table's frame of the split, the rollback frame that
+    // discarded it, and the next transaction's commit, which alone committed.
+    private static void assertSentTablesRolledBack(TxnServer h) {
+        Assert.assertEquals(h.frames.toString(), "DRC", frameKinds(h));
+        Assert.assertEquals(1, h.rolledBackGroups);
+        Assert.assertEquals(h.frames.subList(2, 3), h.committedFrames());
+    }
+
+    // With the server down, commits filler frames, one per segment, until the client
+    // buffer refuses one, discards that one, and returns how many reached the ring. The
+    // last segment keeps ~26 KB free.
+    private static int fillRingDuringOutage(Sender s) {
+        for (int frames = 0; frames < 100; frames++) {
+            writeRows(s, "filler", 0, 390);
+            try {
+                s.flush();
+            } catch (LineSenderException e) {
+                TestUtils.assertContains(e.getMessage(), "cursor SF append failed");
+                s.reset();
+                Assert.assertTrue("the ring must take a filler", frames > 0);
+                return frames;
+            }
+        }
+        Assert.fail("the ring must fill");
+        return -1;
+    }
+
+    // Writes tables a (~30 KB), b (~80 KB) and c (~30 KB), SPLIT_ROWS rows past SPLIT_CAP.
+    // The split sends a, and b fits the cap but not a 64 KiB segment, so its append fails
+    // at once. A row trigger of SPLIT_ROWS sends the batch on its last row, as auto-flush;
+    // flush() sends it otherwise.
+    private static void sendPartOfSplit(Sender s, int autoFlushRows) {
+        Assert.assertTrue(autoFlushRows >= SPLIT_ROWS);
+        try {
+            writeRows(s, "a", 0, 300);
+            writeRows(s, "b", 0, 800);
+            writeRows(s, "c", 0, 300);
+            s.flush();
+            Assert.fail("the split's second frame cannot fit a segment");
+        } catch (LineSenderException e) {
+            TestUtils.assertContains(e.getMessage(), "cursor SF append failed");
+            TestUtils.assertContains(e.getCause().getMessage(), "payload too large for segment");
+        }
+    }
+
+    // Writes tables a (~19 KB), b (~39 KB) and c (~10 KB), past OUTAGE_SPLIT_CAP, into a
+    // ring fillRingDuringOutage filled. The split sends a into the room left in the last
+    // segment, and b needs a segment the full ring cannot add.
+    private static void sendPartOfSplitDuringOutage(Sender s) {
+        writeRows(s, "a", 0, 190);
+        writeRows(s, "b", 0, 390);
+        writeRows(s, "c", 0, 100);
+        try {
+            s.flush();
+            Assert.fail("the split's second frame cannot reach the full ring");
+        } catch (LineSenderException e) {
+            TestUtils.assertContains(e.getMessage(), "cursor SF append failed");
+            TestUtils.assertContains(e.getCause().getMessage(), "cursor ring backpressured");
         }
     }
 

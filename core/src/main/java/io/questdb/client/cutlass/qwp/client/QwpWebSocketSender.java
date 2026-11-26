@@ -433,6 +433,12 @@ public class QwpWebSocketSender implements Sender {
     // polls through getAckedFsn), so the recycle's engine=null -> base roll ->
     // engine=fresh write order can never pair the old engine with the new base.
     private volatile long fsnEpochBase = 0;
+    // True while the ring holds an open FLAG_DEFER_COMMIT group: the last frame
+    // published carried the flag, and no commit or rollback frame has closed the group
+    // since. sealAndSwapBuffer() sets it from the flags of every frame it appends, the
+    // one place frames reach the ring, so a run of frames that fails partway, such as a
+    // split flush or dictionary chunks, leaves it exactly as far as the ring got.
+    // Producer thread only.
     private boolean hasDeferredMessages;
     // Latched true the first time ensureConnected() completes. Once set,
     // every later ensureConnected() -- today only the recycle's step 7 and
@@ -1897,7 +1903,6 @@ public class QwpWebSocketSender implements Sender {
                     if (hasDeferredMessages && serverRollbackEnabled) {
                         try {
                             publishRollbackFrame();
-                            hasDeferredMessages = false;
                             lastCommitBoundaryFsn = cursorEngine.publishedFsn();
                             clearTransactionState();
                         } catch (Throwable t) {
@@ -3564,7 +3569,6 @@ public class QwpWebSocketSender implements Sender {
     private void rollbackOpenTransaction(String action) {
         long committedRows = txnRowsCommittedInParts;
         publishRollbackFrame();
-        hasDeferredMessages = false;
         // The rollback frame gets an OK ack covering the transaction's frames, or the
         // I/O loop acknowledges it when it discards the transaction itself, so
         // close-time drains may wait for it like for a commit.
@@ -5078,9 +5082,13 @@ public class QwpWebSocketSender implements Sender {
      * themselves: they carry no rows, and re-registering the same ids with the same
      * strings is not a redefinition. When the failure came from the SPLIT path the
      * group may also contain some of the batch's table frames, so the commit can apply
-     * a partial batch -- accepted deliberately, because the retained batch's retry
-     * re-sends every table and dedup collapses the overlap, whereas leaving the group
-     * open kills ingestion outright.
+     * a partial batch -- accepted deliberately, because the split took those tables
+     * out of the retained batch, so its retry sends only the others and every row
+     * still lands once, whereas leaving the group open kills ingestion outright.
+     * <p>
+     * Never in transactional mode: there the group belongs to the caller's open
+     * transaction, whose flush() commits it and whose rollback() or reset() discards
+     * it, so committing it here would commit the transaction behind the caller's back.
      * <p>
      * Best-effort: the commit publishes through the same seal path that just failed, so
      * it can fail too. Its failure is attached to the original as a suppressed cause
@@ -5618,7 +5626,9 @@ public class QwpWebSocketSender implements Sender {
         // backpressure deadline (the ring at sf_max_total_bytes), and neither is
         // reachable from a size check. Once a chunk is on the ring the flush owns a
         // commit debt that only its own data frame closes, so track that and close it
-        // on any failure below.
+        // on any failure below -- outside transactional mode only: there the group is
+        // the caller's open transaction, which its flush() commits and its rollback()
+        // or reset() discards.
         boolean dictionaryChunksAwaitCommit = false;
         if (cap > 0 && messageSize > cap
                 && !deltaDictEnabled && currentBatchMaxSymbolId > deltaBaseline
@@ -5653,7 +5663,6 @@ public class QwpWebSocketSender implements Sender {
             // advance the delta baseline so the next frame ships only newer ids.
             advanceSentMaxSymbolId();
 
-            hasDeferredMessages = deferCommit;
             if (!deferCommit) {
                 lastCommitBoundaryFsn = cursorEngine.publishedFsn();
             }
@@ -5661,7 +5670,7 @@ public class QwpWebSocketSender implements Sender {
 
             resetTableBuffersAfterFlush();
         } catch (Throwable t) {
-            if (dictionaryChunksAwaitCommit) {
+            if (dictionaryChunksAwaitCommit && !transactional) {
                 commitOrphanedDictionaryChunks(t);
             }
             throw t;
@@ -5727,21 +5736,25 @@ public class QwpWebSocketSender implements Sender {
      * so the server appends rows without committing until the final
      * message arrives.
      * <p>
-     * <b>Not atomic across frames.</b> The frames publish one at a time, so a
-     * publish failure partway through -- {@link #sealAndSwapBuffer()} throwing on
-     * frame k&gt;1, e.g. a backpressure deadline or the buffer-recycle timeout --
-     * leaves frames 1..k-1 already on the ring as deferred (appended, not yet
-     * committed). The throw propagates past the {@code resetTableBuffersAfterFlush}
-     * at the end of the loop, so the source rows survive in their table buffers
-     * and the NEXT flush re-emits the whole batch; the eventual commit then
-     * commits the already-published prefix alongside the re-sent copies,
-     * delivering those rows at-least-once (duplicated), not exactly-once. This is
-     * within store-and-forward's at-least-once contract -- a DEDUP table or a
-     * durable-ack await absorbs the duplicate, and the symbol-dict state stays
-     * consistent on the retry (the re-sent frames carry empty deltas and the
-     * write-ahead persist is a {@code pd.size()} no-op). Making the split atomic
-     * (rolling back the published prefix, or skipping it on retry) would be a
-     * larger change.
+     * The frames reach the ring one at a time, so a publish can fail partway:
+     * {@link #sealAndSwapBuffer()} can throw on frame k&gt;1, for example at a
+     * backpressure deadline or for a frame that fits the cap but not a
+     * store-and-forward segment. So each
+     * frame that reaches the ring moves its table out of the batch at once and, when
+     * deferred, into the open transaction, and a failure leaves every row in exactly
+     * one place:
+     * <ul>
+     *   <li>tables 1..k-1 are on the ring, in the open deferred group that
+     *   sealAndSwapBuffer() recorded, and counted in the transaction;</li>
+     *   <li>tables k..n stay in the batch.</li>
+     * </ul>
+     * The next flush sends only tables k..n, and its last frame commits the group,
+     * so every row commits once. rollback() and reset() find the group open and
+     * publish the rollback frame, which discards tables 1..k-1, and they discard
+     * tables k..n with the batch. The symbol dictionary stays consistent on either
+     * path: the first frame carried the batch's new symbols and advanced the
+     * baseline, so the next flush sends an empty delta and the write-ahead persist
+     * is a {@code pd.size()} no-op.
      *
      * @param deferCommit when true, ALL messages (including the last)
      *                    carry FLAG_DEFER_COMMIT. When false, only the
@@ -5832,63 +5845,109 @@ public class QwpWebSocketSender implements Sender {
         // pre-registration, which advances the baseline without touching
         // sentMaxSymbolId (full-dict mode never advances it).
         int frameBaseline = deltaBaseline;
-        for (int i = 0; i < nonEmptyCount; i++) {
-            CharSequence tableName = flushTableNames.getQuick(i);
+        // Tables whose frames reached the ring.
+        int sentTables = 0;
+        try {
+            for (int i = 0; i < nonEmptyCount; i++) {
+                CharSequence tableName = flushTableNames.getQuick(i);
 
-            boolean isLast = (i == nonEmptyCount - 1);
-            boolean deferThis = deferCommit || !isLast;
+                boolean isLast = (i == nonEmptyCount - 1);
+                boolean deferThis = deferCommit || !isLast;
 
-            int tableBodyLength = splitFrameBodyBytes.getQuick(i);
-            // Persist before touching activeBuffer. If the write-ahead fails, the
-            // caller can retry with both the source rows and active microbatch
-            // unchanged. The first frame carries the batch's new symbols; later
-            // frames are no-ops once the baseline has advanced.
-            persistNewSymbolsBeforePublish();
-            ensureActiveBufferReady();
-            // The combined encoder buffer remains immutable for the whole split.
-            // Assemble this frame directly into the active microbatch: patched
-            // header + staged delta bytes + the staged table-body slice. No row or
-            // column is encoded a second time.
-            int messageSize = encoder.copySplitMessage(
-                    activeBuffer,
-                    tableBodyOffset,
-                    tableBodyLength,
-                    deferThis,
-                    frameBaseline,
-                    currentBatchMaxSymbolId
-            );
-            tableBodyOffset += tableBodyLength;
-            // The pre-flight pass above already verified every split frame fits the
-            // cap, so none can be found oversized here -- which is what keeps this
-            // loop from publishing (and stranding) a deferred prefix before an
-            // oversized table. Both passes size against the SAME snapshot cap, so a
-            // mid-flush failover cannot make them disagree; the assert therefore only
-            // catches a genuine divergence between the pre-flight arithmetic and the
-            // staged assembler (a future bug), not a cap race. It deliberately does NOT
-            // reset+throw here, because by this point a prefix may already be on the ring.
-            assert messageSize <= cap
-                    : "split frame exceeded serverMaxBatchSize after pre-flight [table=" + tableName
-                    + ", messageSize=" + messageSize + ", serverMaxBatchSize=" + cap + ']';
+                int tableBodyLength = splitFrameBodyBytes.getQuick(i);
+                // Persist before touching activeBuffer. If the write-ahead fails, the
+                // caller can retry with both the source rows and active microbatch
+                // unchanged. The first frame carries the batch's new symbols; later
+                // frames are no-ops once the baseline has advanced.
+                persistNewSymbolsBeforePublish();
+                ensureActiveBufferReady();
+                // The combined encoder buffer remains immutable for the whole split.
+                // Assemble this frame directly into the active microbatch: patched
+                // header + staged delta bytes + the staged table-body slice. No row or
+                // column is encoded a second time.
+                int messageSize = encoder.copySplitMessage(
+                        activeBuffer,
+                        tableBodyOffset,
+                        tableBodyLength,
+                        deferThis,
+                        frameBaseline,
+                        currentBatchMaxSymbolId
+                );
+                tableBodyOffset += tableBodyLength;
+                // The pre-flight pass above already verified every split frame fits the
+                // cap, so none can be found oversized here -- which is what keeps this
+                // loop from publishing (and stranding) a deferred prefix before an
+                // oversized table. Both passes size against the SAME snapshot cap, so a
+                // mid-flush failover cannot make them disagree; the assert therefore only
+                // catches a genuine divergence between the pre-flight arithmetic and the
+                // staged assembler (a future bug), not a cap race. It deliberately does NOT
+                // reset+throw here, because by this point a prefix may already be on the ring.
+                assert messageSize <= cap
+                        : "split frame exceeded serverMaxBatchSize after pre-flight [table=" + tableName
+                        + ", messageSize=" + messageSize + ", serverMaxBatchSize=" + cap + ']';
 
-            activeBuffer.incrementRowCount();
-            sealAndSwapBuffer();
-            // Frame queued: advance so the next split frame's delta starts above
-            // the ids this one just registered.
-            advanceSentMaxSymbolId();
-            if (deltaDictEnabled && currentBatchMaxSymbolId > frameBaseline) {
-                frameBaseline = currentBatchMaxSymbolId;
+                activeBuffer.incrementRowCount();
+                sealAndSwapBuffer();
+                // The frame is on the ring, and sealAndSwapBuffer() recorded the group it
+                // opened or closed. Its rows leave the batch now rather than after the
+                // loop, so if a later frame fails to publish, the next flush does not send
+                // them again and rollback() still discards them. The frame body was copied
+                // from the encoder, so the table buffer is free to reset.
+                QwpTableBuffer table = flushTableBuffers.getQuick(i);
+                if (deferThis) {
+                    accountTransactionTable(table);
+                }
+                table.reset();
+                sentTables++;
+                // Frame queued: advance so the next split frame's delta starts above
+                // the ids this one just registered.
+                advanceSentMaxSymbolId();
+                if (deltaDictEnabled && currentBatchMaxSymbolId > frameBaseline) {
+                    frameBaseline = currentBatchMaxSymbolId;
+                }
             }
+        } catch (Throwable t) {
+            if (sentTables > 0) {
+                keepUnsentTables(sentTables);
+            }
+            throw t;
         }
 
         encoder.setDeferCommit(false);
-        hasDeferredMessages = deferCommit;
         if (!deferCommit) {
             // The last message of the split carried no defer flag -- it
             // committed the whole group.
             lastCommitBoundaryFsn = cursorEngine.publishedFsn();
+            clearTransactionState();
         }
-        accountTransactionRows(deferCommit);
-        resetTableBuffersAfterFlush();
+        // The loop emptied every table already.
+        clearFlushedBatch();
+    }
+
+    /**
+     * After a split that failed once the frames of its first {@code sentTables}
+     * tables reached the ring, which also emptied those tables: makes the batch's
+     * counters cover only the tables still in it. A split publishes no frame before
+     * the first table's, so the batch's new symbols left with that frame. The byte
+     * count, which only the byte trigger reads, is the unsent tables' buffered bytes:
+     * a few bytes above the running count for a table that keeps empty column state
+     * from an earlier flush, which can only make the trigger fire marginally early.
+     */
+    private void keepUnsentTables(int sentTables) {
+        int rows = 0;
+        long bytes = 0;
+        for (int i = sentTables, n = flushTableBuffers.size(); i < n; i++) {
+            QwpTableBuffer table = flushTableBuffers.getQuick(i);
+            rows += table.getRowCount();
+            bytes += table.getBufferedBytes();
+        }
+        pendingRowCount = rows;
+        pendingBytes = bytes;
+        pendingSymbolDictBytes = 0;
+        // A row of the batch selected a table, and no row is in progress during a flush:
+        // the snapshot is the current table's bytes, 0 when the split emptied it.
+        assert currentTableBuffer != null;
+        currentTableBufferSnapshotBytes = currentTableBuffer.getBufferedBytes();
     }
 
     /**
@@ -5922,6 +5981,13 @@ public class QwpWebSocketSender implements Sender {
         for (int i = 0, n = flushTableBuffers.size(); i < n; i++) {
             flushTableBuffers.getQuick(i).reset();
         }
+        clearFlushedBatch();
+    }
+
+    /**
+     * Ends the batch a flush published, once its tables are empty.
+     */
+    private void clearFlushedBatch() {
         // The next row lists its table again.
         clearPendingTables();
         // The next flush re-collects. setPos(0) rather than clear(), which fills the
@@ -6836,7 +6902,6 @@ public class QwpWebSocketSender implements Sender {
         activeBuffer.write(buffer.getBufferPtr(), messageSize);
         activeBuffer.incrementRowCount();
         sealAndSwapBuffer();
-        hasDeferredMessages = false;
         lastCommitBoundaryFsn = cursorEngine.publishedFsn();
         clearTransactionState();
     }
@@ -7142,9 +7207,11 @@ public class QwpWebSocketSender implements Sender {
             // Pass two publishes. Every chunk is a DEFERRED frame, so from the first
             // successful publish onward this method owns a commit debt: if a later chunk
             // throws (sealAndSwapBuffer's buffer-recycle timeout, or appendBlocking's
-            // backpressure deadline when the ring is at sf_max_total_bytes), the chunks
-            // already on the ring have no rollback and nothing downstream will close their
-            // group. Close it in the catch instead -- see commitOrphanedDictionaryChunks.
+            // backpressure deadline when the ring is at sf_max_total_bytes), nothing
+            // downstream closes the group of the chunks already on the ring. Close it in
+            // the catch instead -- see commitOrphanedDictionaryChunks -- outside
+            // transactional mode: there the chunks belong to the caller's open
+            // transaction, which the caller commits or rolls back.
             for (int id = from; id <= batchMaxId; id++) {
                 int entryBytes = dictionaryEntryWireBytes(id);
                 // Size the frame this entry WOULD produce, with the count varint the
@@ -7180,7 +7247,7 @@ public class QwpWebSocketSender implements Sender {
                 // watermark as a baseline and never reclaims -- leave it alone.
                 sentMaxSymbolId = Math.min(sentMaxSymbolId, chunkStart - 1);
             }
-            if (anyChunkPublished) {
+            if (anyChunkPublished && !transactional) {
                 commitOrphanedDictionaryChunks(t);
             }
             throw t;
@@ -7220,17 +7287,12 @@ public class QwpWebSocketSender implements Sender {
         activeBuffer.ensureCapacity(messageSize);
         activeBuffer.write(buffer.getBufferPtr(), messageSize);
         activeBuffer.incrementRowCount();
-        sealAndSwapBuffer();
-        // The chunk is on the ring carrying FLAG_DEFER_COMMIT, so the server withholds
+        // The chunk reaches the ring carrying FLAG_DEFER_COMMIT, so the server withholds
         // its ack and clamps the connection's cumulative-ack watermark until the group
-        // commits. Record that debt here rather than leaving it to the caller: when the
-        // batch meant to close the group throws instead -- an oversized table body
-        // reaching the split pre-flight -- flushPendingRows never reaches its own
-        // hasDeferredMessages assignment, close() skips sendCommitMessage, and the group
-        // never commits. ackedFsn then freezes for the connection's whole life, so trim
-        // stops for every frame and the ring fills. A later successful flush reassigns
-        // this from its own deferCommit, which is correct: its data frame closes the group.
-        hasDeferredMessages = true;
+        // commits. sealAndSwapBuffer() records the open group, so when the batch meant
+        // to close it throws instead, close() and the next flush still commit it, and
+        // ackedFsn does not freeze for the connection's whole life.
+        sealAndSwapBuffer();
     }
 
     /**
@@ -7488,16 +7550,23 @@ public class QwpWebSocketSender implements Sender {
         // (durable mmap append, returns once published).
         try {
             toSend.markSending();
+            long payloadAddr = toSend.getBufferPtr();
+            int payloadLen = toSend.getBufferPos();
+            boolean isDeferredFrame = isDeferredGroupFrame(payloadAddr, payloadLen);
             // Transactional mode tracks how the open transaction's frames pack
             // into segments; the first frame's placement depends on the active
             // segment's room before the append.
-            boolean isTxnFrame = transactional
-                    && isTransactionFrame(toSend.getBufferPtr(), toSend.getBufferPos());
+            boolean isTxnFrame = transactional && isDeferredFrame;
             long activeRemaining = isTxnFrame && txnSimSegments == 0
                     ? cursorEngine.activeSegment().capacityRemaining() : 0;
-            cursorEngine.appendBlocking(toSend.getBufferPtr(), toSend.getBufferPos());
+            cursorEngine.appendBlocking(payloadAddr, payloadLen);
+            // The frame is on the ring: a deferred frame opens or extends the group, and
+            // a commit or rollback frame closes it. Every frame passes here, so the group
+            // follows the ring even when a run of frames fails partway, and rollback(),
+            // reset() and close() see every deferred frame that went out.
+            hasDeferredMessages = isDeferredFrame;
             if (isTxnFrame) {
-                recordTransactionFrame(toSend.getBufferPos(), activeRemaining);
+                recordTransactionFrame(payloadLen, activeRemaining);
             }
             toSend.markRecycled();
         } catch (Throwable t) {
@@ -7505,8 +7574,8 @@ public class QwpWebSocketSender implements Sender {
             // payload never reached the engine, so no I/O thread will
             // recycle toSend. Recycle it here so a later flush can swap
             // back to it; flushPendingRows aborts its post-enqueue state
-            // updates after this throw, so the source rows stay intact and the
-            // next batch re-emits the same rows along with the full inline
+            // updates after this throw, so the rows of this frame stay intact
+            // and the next batch re-emits them along with the full inline
             // schema and the symbol-dict delta the batch requires.
             if (toSend.isSending()) {
                 toSend.markRecycled();
@@ -7534,13 +7603,21 @@ public class QwpWebSocketSender implements Sender {
             return;
         }
         for (int i = 0, n = flushTableBuffers.size(); i < n; i++) {
-            QwpTableBuffer table = flushTableBuffers.getQuick(i);
-            long sentRows = table.getTxnSentRows();
-            if (sentRows == 0) {
-                txnTables.add(table);
-            }
-            table.setTxnSentRows(sentRows + table.getRowCount());
+            accountTransactionTable(flushTableBuffers.getQuick(i));
         }
+    }
+
+    /**
+     * Adds the rows of {@code table} that a just-published FLAG_DEFER_COMMIT frame
+     * shipped to the table's open-transaction count. Call before the table's buffer
+     * resets.
+     */
+    private void accountTransactionTable(QwpTableBuffer table) {
+        long sentRows = table.getTxnSentRows();
+        if (sentRows == 0) {
+            txnTables.add(table);
+        }
+        table.setTxnSentRows(sentRows + table.getRowCount());
     }
 
     private void checkTransactionAcceptsRow() {
@@ -7740,14 +7817,15 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * True for a QWP frame that joins the open transaction: FLAG_DEFER_COMMIT
-     * set, and not the rollback control frame (which also carries the flag).
+     * True for a frame that joins the open deferred group, and so the open
+     * transaction: FLAG_DEFER_COMMIT set, and not the rollback control frame (which
+     * also carries the flag). Every frame the producer publishes comes from the
+     * encoder, so it starts with a QWP header.
      */
-    private static boolean isTransactionFrame(long payloadAddr, int payloadLen) {
-        if (payloadLen < QwpConstants.HEADER_SIZE
-                || Unsafe.getUnsafe().getInt(payloadAddr) != QwpConstants.MAGIC_MESSAGE) {
-            return false;
-        }
+    private static boolean isDeferredGroupFrame(long payloadAddr, int payloadLen) {
+        assert payloadLen >= QwpConstants.HEADER_SIZE
+                && Unsafe.getUnsafe().getInt(payloadAddr) == QwpConstants.MAGIC_MESSAGE
+                : "not a QWP frame [payloadLen=" + payloadLen + ']';
         byte flags = Unsafe.getUnsafe().getByte(payloadAddr + QwpConstants.HEADER_OFFSET_FLAGS);
         return (flags & QwpConstants.FLAG_DEFER_COMMIT) != 0 && (flags & QwpConstants.FLAG_ROLLBACK) == 0;
     }
