@@ -40,7 +40,9 @@ public final class QwpConstants {
      * Default of the server's {@code qwp.max.uncommitted.rows}: the per-table
      * count of rows a deferred-commit group may hold before the server commits
      * them on its own. A strict transaction assumes this value when the server
-     * does not advertise {@code X-QWP-Max-Uncommitted-Rows}.
+     * does not advertise {@code X-QWP-Max-Uncommitted-Rows}, and before its first
+     * connection. A server whose limit turns out lower refuses a strict transaction
+     * past it rather than commit it in parts (see {@link #FLAG_STRICT}).
      */
     public static final long DEFAULT_SERVER_MAX_UNCOMMITTED_ROWS = 1_000_000L;
     /**
@@ -63,6 +65,17 @@ public final class QwpConstants {
      * the client sends only after the server confirmed {@code X-QWP-Rollback}.
      */
     public static final byte FLAG_ROLLBACK = 0x20;
+    /**
+     * Flag bit: the frame belongs to a strict transaction, which must commit as one or
+     * not at all. A strict sender sets it on every data frame. The server then never
+     * commits the transaction's rows on its own at {@code qwp.max.uncommitted.rows}: it
+     * answers the frame that would get there with
+     * {@link io.questdb.client.cutlass.qwp.client.WebSocketResponse#STATUS_TRANSACTION_TOO_LARGE}
+     * and discards the rows the connection holds uncommitted. A server that predates the
+     * bit ignores it, like every flag bit it does not know. Mirror of the server-side
+     * constant.
+     */
+    public static final byte FLAG_STRICT = 0x40;
     /**
      * Flag bit: payload region after the prelude is zstd-compressed. Set only
      * when the handshake negotiated zstd compression. Mirror of the server-side

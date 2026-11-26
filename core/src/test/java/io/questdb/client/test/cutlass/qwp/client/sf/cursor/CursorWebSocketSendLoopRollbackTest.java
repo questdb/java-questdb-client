@@ -25,13 +25,17 @@
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.DefaultHttpClientConfiguration;
+import io.questdb.client.LineSenderServerException;
+import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
+import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
 import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Rnd;
@@ -47,6 +51,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
@@ -75,6 +80,8 @@ import java.util.function.Consumer;
 public class CursorWebSocketSendLoopRollbackTest {
     // Random transaction logs per run of the fuzz test; raise it for a local soak.
     private static final int FUZZ_ITERATIONS = Integer.getInteger("questdb.fuzz.rollback.iterations", 100);
+    // The message the model server refuses a strict frame with.
+    private static final String REFUSAL = "strict transaction too large";
     private static final long SEGMENT_SIZE_BYTES = 64 * 1024;
     private static final String TABLE = "t";
 
@@ -343,6 +350,391 @@ public class CursorWebSocketSendLoopRollbackTest {
         assertRollbackWaitsForAckOf(false, engine -> appendForeign(engine, 8), "X8");
     }
 
+    @Test
+    public void testCommittedRefusedTransactionHaltsTheLoop() throws Exception {
+        // The producer committed the transaction before the refusal of its frame 3
+        // arrived. Being strict, the transaction cannot commit in parts either, so the
+        // loop halts with the refusal over its frames, which stay in the log, unacked.
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                appendStrict(engine, false, 1, 1);
+                appendStrict(engine, true, 2, 6);
+                appendStrict(engine, true, 3, 6);
+                appendStrict(engine, false, 4, 1);
+                ServerModel server = new ServerModel();
+                server.setCap(10);
+                List<ModelClient> clients = new ArrayList<>();
+                CursorWebSocketSendLoop loop = newLoop(engine, server, clients, true);
+                try {
+                    loop.start();
+                    awaitTrue("the loop halts", () -> loop.getTerminalError() != null);
+                    assertRefusalHalted(loop, 1L, 3L, 2L);
+                    Assert.assertEquals(-1L, loop.getRefusedTransactionFsn());
+                } finally {
+                    loop.close();
+                }
+                Assert.assertEquals("the transaction stays in the log", 0L, engine.ackedFsn());
+                Assert.assertEquals(Arrays.asList("0:C1", "0:D2", "0:D3", "0:C4"), server.received());
+                Assert.assertEquals(Collections.singletonList("0:D3"), server.refused());
+                Assert.assertEquals(Collections.singletonList("C1"), server.committed());
+                Assert.assertEquals(1, clientCount(clients));
+            }
+        });
+    }
+
+    @Test
+    public void testRefusalOfAFrameTheServerAckedHalts() throws Exception {
+        // A server that acked a frame cannot refuse it: there is no transaction to walk,
+        // so the loop halts rather than guess which frames the refusal covers. In
+        // durable-ack mode the OK moves only the OK watermark, so the refusal does not
+        // read as one of a dictionary catch-up below the replay start.
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                appendStrict(engine, true, 1, 1);
+                appendStrict(engine, false, 2, 1);
+                RecordingClient client = new RecordingClient();
+                CursorWebSocketSendLoop loop = newManualLoop(engine, client, null, DurableAckTiers.REPLICATED);
+                try {
+                    loop.setRunningForTest(true);
+                    loop.positionCursorForStartForTest();
+                    Assert.assertTrue(loop.trySendBatchForTest());
+                    deliverOk(loop, 1L);
+                    deliverRefusal(loop, 1L);
+                    assertRefusalHalted(loop, 1L, 1L, 1L);
+                    Assert.assertEquals(-1L, loop.getRefusedTransactionFsn());
+                } finally {
+                    loop.close();
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testRefusalPastTheEndOfTheTransactionHalts() throws Exception {
+        // The server refuses frame 2, but the unacked transaction that starts at frame 0
+        // ends at the rollback frame 1, ahead of it: the refusal is not about the frames
+        // the loop would discard, so it halts instead.
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                appendStrict(engine, true, 1, 1);
+                appendRollback(engine);
+                appendStrict(engine, true, 2, 1);
+                RecordingClient client = new RecordingClient();
+                CursorWebSocketSendLoop loop = newManualLoop(engine, client, null, DurableAckTiers.NONE);
+                try {
+                    loop.setRunningForTest(true);
+                    loop.positionCursorForStartForTest();
+                    Assert.assertTrue(loop.trySendBatchForTest());
+                    Assert.assertEquals(Arrays.asList("D1", "R", "D2"), client.log);
+                    deliverRefusal(loop, 2L);
+                    Assert.assertEquals(0L, loop.getRefusedTransactionFsn());
+                    Assert.assertEquals(REFUSAL, loop.getRefusedTransactionMessage());
+                    Assert.assertFalse(loop.trySendBatchForTest());
+                    assertRefusalHalted(loop, 0L, 1L, 2L);
+                    Assert.assertEquals("nothing goes out again", 3, client.log.size());
+                } finally {
+                    loop.close();
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testRefusedOpenTransactionWaitsForItsEnd() throws Exception {
+        // The refusal arrives while the transaction is open. The loop sends nothing more
+        // and reports the refusal to the producer, which ends the transaction: here with
+        // a rollback frame, after which the loop discards the transaction and the next
+        // connection carries on with the next transaction.
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                appendStrict(engine, false, 1, 1);
+                appendStrict(engine, true, 2, 6);
+                appendStrict(engine, true, 3, 6);
+                ServerModel server = new ServerModel();
+                server.setCap(10);
+                List<ModelClient> clients = new ArrayList<>();
+                CursorWebSocketSendLoop loop = newLoop(engine, server, clients, true);
+                try {
+                    loop.start();
+                    awaitTrue("the server refuses frame 3", () -> loop.getRefusedTransactionFsn() == 1L);
+                    Assert.assertEquals(REFUSAL, loop.getRefusedTransactionMessage());
+                    ModelClient first = client(clients, 0);
+                    int polls = first.polls;
+                    awaitTrue("the loop keeps waiting", () -> first.polls >= polls + 50);
+                    Assert.assertEquals(1, clientCount(clients));
+                    Assert.assertEquals(0L, engine.ackedFsn());
+                    loop.checkError();
+
+                    appendRollback(engine);
+                    appendStrict(engine, true, 4, 2);
+                    appendStrict(engine, false, 5, 1);
+                    awaitAckedFsn(engine, 5L);
+                    Assert.assertEquals(-1L, loop.getRefusedTransactionFsn());
+                    Assert.assertNull(loop.getRefusedTransactionMessage());
+                } finally {
+                    loop.close();
+                }
+                Assert.assertEquals(Arrays.asList("0:C1", "0:D2", "0:D3", "1:D4", "1:C5"), server.received());
+                Assert.assertEquals(Collections.singletonList("0:D3"), server.refused());
+                Assert.assertEquals(Arrays.asList("C1", "D4", "C5"), server.committed());
+                Assert.assertEquals(2, clientCount(clients));
+            }
+        });
+    }
+
+    @Test
+    public void testRefusedTransactionRolledBackIsDiscarded() throws Exception {
+        // The server refuses strict frame 3, whose rows take the transaction to its cap of
+        // 10, and processes nothing after it on that connection. The producer had rolled
+        // the transaction back already: the loop discards the transaction's frames and
+        // the rollback frame, and the next connection starts with the next transaction.
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                appendStrict(engine, false, 1, 1);
+                appendStrict(engine, true, 2, 6);
+                appendStrict(engine, true, 3, 6);
+                appendRollback(engine);
+                appendStrict(engine, true, 4, 2);
+                appendStrict(engine, false, 5, 1);
+                ServerModel server = new ServerModel();
+                server.setCap(10);
+                List<ModelClient> clients = new ArrayList<>();
+                runToAck(engine, newLoop(engine, server, clients, true), 5L);
+                Assert.assertEquals(Arrays.asList("0:C1", "0:D2", "0:D3", "0:R", "0:D4", "0:C5", "1:D4", "1:C5"),
+                        server.received());
+                Assert.assertEquals(Collections.singletonList("0:D3"), server.refused());
+                Assert.assertEquals(Arrays.asList("C1", "D4", "C5"), server.committed());
+                Assert.assertEquals(2, clientCount(clients));
+            }
+        });
+    }
+
+    @Test
+    public void testRefusedTransactionStaysUnsentAcrossReconnects() throws Exception {
+        // The connection drops while the loop waits for the refused transaction to end.
+        // The next connection replays from the transaction's first frame, which the loop
+        // walks again instead of sending it.
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                appendStrict(engine, false, 1, 1);
+                appendStrict(engine, true, 2, 6);
+                appendStrict(engine, true, 3, 6);
+                ServerModel server = new ServerModel();
+                server.setCap(10);
+                List<ModelClient> clients = new ArrayList<>();
+                CursorWebSocketSendLoop loop = newLoop(engine, server, clients, true);
+                try {
+                    loop.start();
+                    awaitTrue("the server refuses frame 3", () -> loop.getRefusedTransactionFsn() == 1L);
+                    client(clients, 0).closeFromServer();
+                    awaitTrue("the loop reconnects", () -> clientCount(clients) == 2);
+                    ModelClient second = client(clients, 1);
+                    int polls = second.polls;
+                    awaitTrue("the loop keeps waiting on the new connection", () -> second.polls >= polls + 50);
+                    Assert.assertEquals("the refused transaction does not go out again", 0, second.flushedFrames);
+                    Assert.assertEquals(1L, loop.getRefusedTransactionFsn());
+
+                    appendRollback(engine);
+                    appendStrict(engine, true, 4, 2);
+                    appendStrict(engine, false, 5, 1);
+                    awaitAckedFsn(engine, 5L);
+                } finally {
+                    loop.close();
+                }
+                Assert.assertEquals(Arrays.asList("0:C1", "0:D2", "0:D3", "2:D4", "2:C5"), server.received());
+                Assert.assertEquals(Arrays.asList("C1", "D4", "C5"), server.committed());
+                Assert.assertEquals(3, clientCount(clients));
+            }
+        });
+    }
+
+    @Test
+    public void testRefusedTransactionWaitsForDurableAckBeforeDiscarding() throws Exception {
+        // Discarding the refused transaction acknowledges its frames, an acknowledgement
+        // that also covers commit 1 ahead of them. In durable-ack mode the loop waits for
+        // commit 1's durable ack first, which the server holds back here.
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                appendStrict(engine, false, 1, 1);
+                appendStrict(engine, true, 2, 6);
+                appendStrict(engine, true, 3, 6);
+                appendRollback(engine);
+                appendStrict(engine, true, 4, 2);
+                appendStrict(engine, false, 5, 1);
+                ServerModel server = new ServerModel();
+                server.setCap(10);
+                List<ModelClient> clients = new ArrayList<>();
+                ModelClient first = newClient(server, clients, true, true);
+                first.isHoldingAcks = true;
+                AtomicBoolean isFirstConnect = new AtomicBoolean(true);
+                CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
+                        null, engine, 0L,
+                        () -> isFirstConnect.getAndSet(false) ? first : newClient(server, clients, true, true),
+                        1L, 5L, DurableAckTiers.REPLICATED, 0L);
+                try {
+                    loop.start();
+                    awaitTrue("the server refuses frame 3", () -> loop.getRefusedTransactionFsn() == 1L);
+                    int polls = first.polls;
+                    awaitTrue("the loop keeps waiting on its connection", () -> first.polls >= polls + 50);
+                    Assert.assertEquals("no recycle before commit 1 is durable", 1, clientCount(clients));
+                    Assert.assertEquals(-1L, engine.ackedFsn());
+                    first.releaseAcks();
+                    awaitAckedFsn(engine, 5L);
+                } finally {
+                    loop.close();
+                }
+                Assert.assertEquals(Arrays.asList("0:C1", "0:D2", "0:D3", "0:R", "0:D4", "0:C5", "1:D4", "1:C5"),
+                        server.received());
+                Assert.assertEquals(Arrays.asList("C1", "D4", "C5"), server.committed());
+                Assert.assertEquals(2, clientCount(clients));
+            }
+        });
+    }
+
+    @Test
+    public void testRefusedTransactionWalkStartsBehindReplayedCommits() throws Exception {
+        // In durable-ack mode a reconnect replays from the durable watermark, here from
+        // commit 1, whose durable ack the first connection held back. The loop sends
+        // commit 1 again, as any replay does, then walks the refused transaction behind it
+        // without sending it, and discards it once commit 1 is durable.
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                appendStrict(engine, false, 1, 1);
+                appendStrict(engine, true, 2, 6);
+                appendStrict(engine, true, 3, 6);
+                ServerModel server = new ServerModel();
+                server.setCap(10);
+                List<ModelClient> clients = new ArrayList<>();
+                ModelClient first = newClient(server, clients, true, true);
+                first.isHoldingAcks = true;
+                AtomicBoolean isFirstConnect = new AtomicBoolean(true);
+                CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
+                        null, engine, 0L,
+                        () -> isFirstConnect.getAndSet(false) ? first : newClient(server, clients, true, true),
+                        1L, 5L, DurableAckTiers.REPLICATED, 0L);
+                try {
+                    loop.start();
+                    awaitTrue("the server refuses frame 3", () -> loop.getRefusedTransactionFsn() == 1L);
+                    first.closeFromServer();
+                    awaitTrue("commit 1 becomes durable on the next connection", () -> engine.ackedFsn() == 0L);
+                    Assert.assertEquals("only commit 1 goes out again", 1, client(clients, 1).flushedFrames);
+
+                    appendRollback(engine);
+                    appendStrict(engine, true, 4, 2);
+                    appendStrict(engine, false, 5, 1);
+                    awaitAckedFsn(engine, 5L);
+                } finally {
+                    loop.close();
+                }
+                Assert.assertEquals(Arrays.asList("0:C1", "0:D2", "0:D3", "1:C1", "2:D4", "2:C5"), server.received());
+                Assert.assertEquals(Arrays.asList("C1", "C1", "D4", "C5"), server.committed());
+                Assert.assertEquals(3, clientCount(clients));
+            }
+        });
+    }
+
+    @Test
+    public void testRefusedTransactionWalkCrossesSegments() throws Exception {
+        // The refused transaction's frames fill several store-and-forward segments, which
+        // the walk follows up to the rollback frame. Frame 6 is the fifth of 2 rows each,
+        // so it takes the transaction to the cap of 10.
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                appendStrict(engine, false, 1, 1);
+                for (int id = 2; id < 8; id++) {
+                    appendStrict(engine, true, id, 2, 20_000);
+                }
+                appendRollback(engine);
+                appendStrict(engine, false, 9, 1);
+                ServerModel server = new ServerModel();
+                server.setCap(10);
+                List<ModelClient> clients = new ArrayList<>();
+                runToAck(engine, newLoop(engine, server, clients, true), 8L);
+                Assert.assertTrue("the transaction spans segments", engine.activeSegment().baseSeq() > 1L);
+                Assert.assertEquals(Collections.singletonList("0:D6"), server.refused());
+                Assert.assertEquals(Arrays.asList("C1", "C9"), server.committed());
+                Assert.assertEquals(2, clientCount(clients));
+                List<String> secondConnection = new ArrayList<>();
+                for (String frame : server.received()) {
+                    if (frame.startsWith("1:")) {
+                        secondConnection.add(frame);
+                    }
+                }
+                Assert.assertEquals(Collections.singletonList("1:C9"), secondConnection);
+            }
+        });
+    }
+
+    @Test
+    public void testRetiredTransactionSymbolsReachTheNextConnection() throws Exception {
+        // Frames of the next transaction reference the refused transaction's symbols
+        // without registering them again. Frame 1 of the refused transaction never went
+        // out: the walk adds its symbol to the dictionary mirror, so the next
+        // connection's catch-up registers it with the one frame 0 sent.
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                appendStrictDelta(engine, true, 0, 'a');
+                RecordingClient first = new RecordingClient();
+                List<RecordingClient> next = new ArrayList<>();
+                CursorWebSocketSendLoop loop = newManualLoop(engine, first, next, DurableAckTiers.NONE);
+                try {
+                    loop.setRunningForTest(true);
+                    loop.positionCursorForStartForTest();
+                    Assert.assertTrue(loop.trySendBatchForTest());
+                    deliverRefusal(loop, 0L);
+                    appendStrictDelta(engine, true, 1, 'b');
+                    appendRollback(engine);
+                    appendStrictDelta(engine, false, 2, 'c');
+
+                    Assert.assertFalse("the walk discards the transaction", loop.trySendBatchForTest());
+                    Assert.assertEquals(2L, engine.ackedFsn());
+                    Assert.assertEquals(-1L, loop.getRefusedTransactionFsn());
+                    Assert.assertEquals(Collections.singletonList("D delta 0: a"), first.log);
+                    Assert.assertEquals(1, next.size());
+                    Assert.assertTrue(loop.trySendBatchForTest());
+                    Assert.assertEquals(Arrays.asList("catch-up 0: a b", "C delta 2: c"), next.get(0).log);
+                    loop.checkError();
+                } finally {
+                    loop.close();
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testWalkStopsAtATornDictionary() throws Exception {
+        // The torn-dictionary guard holds in the walk too: a frame whose delta starts
+        // above every id the mirror holds halts the loop, as it does when sending.
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                appendStrictDelta(engine, true, 0, 'a');
+                RecordingClient client = new RecordingClient();
+                CursorWebSocketSendLoop loop = newManualLoop(engine, client, null, DurableAckTiers.NONE);
+                try {
+                    loop.setRunningForTest(true);
+                    loop.positionCursorForStartForTest();
+                    Assert.assertTrue(loop.trySendBatchForTest());
+                    Assert.assertEquals(1, loop.sentDictCount());
+                    deliverRefusal(loop, 0L);
+                    appendStrictDelta(engine, true, 5, 'f');
+                    Assert.assertFalse(loop.trySendBatchForTest());
+                    try {
+                        loop.checkError();
+                        Assert.fail("the walk must halt at the gap");
+                    } catch (LineSenderException e) {
+                        Assert.assertEquals("recovered store-and-forward symbol dictionary is incomplete (likely a "
+                                        + "host crash): frame delta start 5 exceeds recovered dictionary size 1; "
+                                        + "cannot replay without corrupting data -- resend required",
+                                e.getMessage());
+                    }
+                    Assert.assertEquals(Collections.singletonList("D delta 0: a"), client.log);
+                } finally {
+                    loop.close();
+                }
+            }
+        });
+    }
+
     private static void appendCommit(CursorSendEngine engine, int id) {
         appendFrame(engine, (byte) 0, id);
     }
@@ -396,6 +788,136 @@ public class CursorWebSocketSendLoopRollbackTest {
     // The rollback control frame, as QwpWebSocketEncoder.encodeRollbackMessage writes it.
     private static void appendRollback(CursorSendEngine engine) {
         appendHeader(engine, QwpConstants.MAGIC_MESSAGE, QwpConstants.ROLLBACK_FRAME_FLAGS);
+    }
+
+    private static void appendStrict(CursorSendEngine engine, boolean isDeferred, int id, int rows) {
+        appendStrict(engine, isDeferred, id, rows, 0);
+    }
+
+    // A frame of a strict sender: its flags carry FLAG_STRICT, and its id and its row
+    // count, which the model server counts toward its cap, follow the header.
+    private static void appendStrict(CursorSendEngine engine, boolean isDeferred, int id, int rows, int padding) {
+        int size = QwpConstants.HEADER_SIZE + 8 + padding;
+        long buf = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
+        try {
+            Unsafe.getUnsafe().setMemory(buf, size, (byte) 0);
+            Unsafe.getUnsafe().putInt(buf, QwpConstants.MAGIC_MESSAGE);
+            Unsafe.getUnsafe().putByte(buf + 4, QwpConstants.VERSION);
+            Unsafe.getUnsafe().putByte(buf + QwpConstants.HEADER_OFFSET_FLAGS, strictFlags(isDeferred));
+            Unsafe.getUnsafe().putInt(buf + QwpConstants.HEADER_SIZE, id);
+            Unsafe.getUnsafe().putInt(buf + QwpConstants.HEADER_SIZE + 4, rows);
+            engine.appendBlocking(buf, size);
+        } finally {
+            Unsafe.free(buf, size, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    // A strict frame with a symbol-dictionary delta that registers one symbol at
+    // deltaStart, and no table blocks.
+    private static void appendStrictDelta(CursorSendEngine engine, boolean isDeferred, int deltaStart, char symbol) {
+        int size = QwpConstants.HEADER_SIZE + 4;
+        long buf = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
+        try {
+            Unsafe.getUnsafe().setMemory(buf, size, (byte) 0);
+            Unsafe.getUnsafe().putInt(buf, QwpConstants.MAGIC_MESSAGE);
+            Unsafe.getUnsafe().putByte(buf + 4, QwpConstants.VERSION);
+            Unsafe.getUnsafe().putByte(buf + QwpConstants.HEADER_OFFSET_FLAGS,
+                    (byte) (strictFlags(isDeferred) | QwpConstants.FLAG_DELTA_SYMBOL_DICT));
+            long p = buf + QwpConstants.HEADER_SIZE;
+            Unsafe.getUnsafe().putByte(p, (byte) deltaStart);
+            Unsafe.getUnsafe().putByte(p + 1, (byte) 1);
+            Unsafe.getUnsafe().putByte(p + 2, (byte) 1);
+            Unsafe.getUnsafe().putByte(p + 3, (byte) symbol);
+            engine.appendBlocking(buf, size);
+        } finally {
+            Unsafe.free(buf, size, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    // The loop halted with the server's refusal, reported over the FSNs from..to.
+    private static void assertRefusalHalted(CursorWebSocketSendLoop loop, long fromFsn, long toFsn, long seq) {
+        try {
+            loop.checkError();
+            Assert.fail("the loop must halt");
+        } catch (LineSenderServerException e) {
+            SenderError err = e.getServerError();
+            Assert.assertSame(err, loop.getLastTerminalServerError());
+            Assert.assertEquals(SenderError.Category.TRANSACTION_TOO_LARGE, err.getCategory());
+            Assert.assertEquals(SenderError.Policy.TERMINAL, err.getAppliedPolicy());
+            Assert.assertEquals(WebSocketResponse.STATUS_TRANSACTION_TOO_LARGE, err.getServerStatusByte());
+            Assert.assertEquals(REFUSAL, err.getServerMessage());
+            Assert.assertEquals(seq, err.getMessageSequence());
+            Assert.assertEquals(fromFsn, err.getFromFsn());
+            Assert.assertEquals(toFsn, err.getToFsn());
+        }
+    }
+
+    private static ModelClient client(List<ModelClient> clients, int connection) {
+        synchronized (clients) {
+            return clients.get(connection);
+        }
+    }
+
+    // An OK covering wire sequence seq, for a commit of table TABLE at seqTxn 1. In
+    // durable-ack mode it waits for a durable ack, which never comes here.
+    private static void deliverOk(CursorWebSocketSendLoop loop, long seq) {
+        byte[] name = TABLE.getBytes(StandardCharsets.UTF_8);
+        int size = 1 + 8 + 2 + 2 + name.length + 8;
+        long ptr = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
+        try {
+            Unsafe.getUnsafe().putByte(ptr, WebSocketResponse.STATUS_OK);
+            Unsafe.getUnsafe().putLong(ptr + 1, seq);
+            Unsafe.getUnsafe().putShort(ptr + 9, (short) 1);
+            Unsafe.getUnsafe().putShort(ptr + 11, (short) name.length);
+            for (int i = 0; i < name.length; i++) {
+                Unsafe.getUnsafe().putByte(ptr + 13 + i, name[i]);
+            }
+            Unsafe.getUnsafe().putLong(ptr + 13 + name.length, 1L);
+            loop.deliverResponseForTest(ptr, size);
+        } finally {
+            Unsafe.free(ptr, size, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    private static void deliverRefusal(CursorWebSocketSendLoop loop, long seq) {
+        byte[] message = REFUSAL.getBytes(StandardCharsets.UTF_8);
+        int size = 1 + 8 + 2 + message.length;
+        long ptr = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
+        try {
+            Unsafe.getUnsafe().putByte(ptr, WebSocketResponse.STATUS_TRANSACTION_TOO_LARGE);
+            Unsafe.getUnsafe().putLong(ptr + 1, seq);
+            Unsafe.getUnsafe().putShort(ptr + 9, (short) message.length);
+            for (int i = 0; i < message.length; i++) {
+                Unsafe.getUnsafe().putByte(ptr + 11 + i, message[i]);
+            }
+            loop.deliverResponseForTest(ptr, size);
+        } finally {
+            Unsafe.free(ptr, size, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    // A loop the test drives by hand, without starting its I/O thread: it sends to
+    // client, and the test delivers the server's responses. A reconnect connects a new
+    // RecordingClient, which it adds to next; with next null, it fails the test.
+    private static CursorWebSocketSendLoop newManualLoop(
+            CursorSendEngine engine,
+            RecordingClient client,
+            List<RecordingClient> next,
+            int durableAckTiers
+    ) {
+        return new CursorWebSocketSendLoop(
+                client, engine, 0L,
+                () -> {
+                    Assert.assertNotNull("no reconnect expected", next);
+                    RecordingClient reconnected = new RecordingClient();
+                    next.add(reconnected);
+                    return reconnected;
+                },
+                0L, 1L, durableAckTiers, 0L);
+    }
+
+    private static byte strictFlags(boolean isDeferred) {
+        return (byte) (QwpConstants.FLAG_STRICT | (isDeferred ? QwpConstants.FLAG_DEFER_COMMIT : 0));
     }
 
     // The frame appendAhead writes is the only commit-bearing frame ahead of the rolled-back
@@ -567,9 +1089,11 @@ public class CursorWebSocketSendLoopRollbackTest {
         volatile int flushedFrames;
         volatile int flushes;
         volatile boolean isHoldingAcks;
+        volatile boolean isServerClosing;
         volatile int polls;
         private long durableReported;
         private long nextSeq;
+        private long pendingErrorSeq = -1L;
         private long pendingOkSeq = -1L;
         private long pendingOkSeqTxn;
 
@@ -607,6 +1131,11 @@ public class CursorWebSocketSendLoopRollbackTest {
             return isRollbackConfirmed;
         }
 
+        // The server goes away, as on a restart: the next poll delivers its close.
+        void closeFromServer() {
+            isServerClosing = true;
+        }
+
         synchronized void releaseAcks() {
             isHoldingAcks = false;
         }
@@ -618,20 +1147,35 @@ public class CursorWebSocketSendLoopRollbackTest {
         @Override
         public synchronized boolean tryReceiveFrame(WebSocketFrameHandler handler) {
             polls++;
+            if (isServerClosing) {
+                isServerClosing = false;
+                handler.onClose(WebSocketCloseCode.GOING_AWAY, "server restarts");
+                return true;
+            }
             // Durable mode: the server processes and OKs at once and holds back the
             // durable ack. Otherwise holding back the acks means not processing at all.
             if (isDurable || !isHoldingAcks) {
                 for (Frame frame; (frame = inFlight.pollFirst()) != null; ) {
                     long seq = nextSeq++;
-                    if (server.process(connection, isRollbackConfirmed, frame)) {
+                    int outcome = server.process(connection, isRollbackConfirmed, frame);
+                    if (outcome == ServerModel.ACK) {
                         pendingOkSeq = seq;
                         pendingOkSeqTxn = frame.kind == 'R' ? 0 : server.seqTxn();
+                    } else if (outcome == ServerModel.REFUSE) {
+                        pendingErrorSeq = seq;
                     }
                 }
             }
+            // As the QuestDB server: the acks of the frames ahead of a refused frame go
+            // out before the refusal.
             if (pendingOkSeq >= 0) {
                 sendOk(handler, pendingOkSeq, isDurable && pendingOkSeqTxn > 0 ? pendingOkSeqTxn : 0);
                 pendingOkSeq = -1L;
+                return true;
+            }
+            if (pendingErrorSeq >= 0) {
+                sendRefusal(handler, pendingErrorSeq);
+                pendingErrorSeq = -1L;
                 return true;
             }
             if (isDurable && !isHoldingAcks && server.seqTxn() > durableReported) {
@@ -650,6 +1194,24 @@ public class CursorWebSocketSendLoopRollbackTest {
             try {
                 Unsafe.getUnsafe().putByte(ptr, WebSocketResponse.STATUS_DURABLE_ACK);
                 putTableEntry(ptr + 1, name, seqTxn);
+                handler.onBinaryMessage(ptr, size);
+            } finally {
+                Unsafe.free(ptr, size, MemoryTag.NATIVE_DEFAULT);
+            }
+        }
+
+        // STATUS_TRANSACTION_TOO_LARGE: status, the refused frame's wire sequence, the message.
+        private static void sendRefusal(WebSocketFrameHandler handler, long seq) {
+            byte[] message = REFUSAL.getBytes(StandardCharsets.UTF_8);
+            int size = 1 + 8 + 2 + message.length;
+            long ptr = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
+            try {
+                Unsafe.getUnsafe().putByte(ptr, WebSocketResponse.STATUS_TRANSACTION_TOO_LARGE);
+                Unsafe.getUnsafe().putLong(ptr + 1, seq);
+                Unsafe.getUnsafe().putShort(ptr + 9, (short) message.length);
+                for (int i = 0; i < message.length; i++) {
+                    Unsafe.getUnsafe().putByte(ptr + 11 + i, message[i]);
+                }
                 handler.onBinaryMessage(ptr, size);
             } finally {
                 Unsafe.free(ptr, size, MemoryTag.NATIVE_DEFAULT);
@@ -694,16 +1256,97 @@ public class CursorWebSocketSendLoopRollbackTest {
         }
     }
 
+    /**
+     * A connection the test drives by hand: it logs what the loop writes to it, and the
+     * test delivers the server's responses through deliverResponseForTest. It confirms
+     * rollback, so the loop sends the rollback frame like any other.
+     */
+    private static final class RecordingClient extends TestWebSocketClient {
+        final List<String> log = new ArrayList<>();
+
+        RecordingClient() {
+            super(DefaultHttpClientConfiguration.INSTANCE, PlainSocketFactory.INSTANCE);
+        }
+
+        @Override
+        public void batchAppendBinary(long dataPtr, int length) {
+            byte flags = Unsafe.getUnsafe().getByte(dataPtr + QwpConstants.HEADER_OFFSET_FLAGS);
+            if (length == QwpConstants.HEADER_SIZE && flags == QwpConstants.ROLLBACK_FRAME_FLAGS) {
+                log.add("R");
+                return;
+            }
+            String kind = (flags & QwpConstants.FLAG_DEFER_COMMIT) != 0 ? "D" : "C";
+            if ((flags & QwpConstants.FLAG_DELTA_SYMBOL_DICT) != 0) {
+                long p = dataPtr + QwpConstants.HEADER_SIZE;
+                log.add(kind + " delta " + Unsafe.getUnsafe().getByte(p) + ":" + symbols(p + 2, Unsafe.getUnsafe().getByte(p + 1)));
+            } else {
+                log.add(kind + Unsafe.getUnsafe().getInt(dataPtr + QwpConstants.HEADER_SIZE));
+            }
+        }
+
+        @Override
+        public void batchFlush() {
+        }
+
+        @Override
+        public int getServerMaxBatchSize() {
+            return 16_384;
+        }
+
+        @Override
+        public int getServerQwpVersion() {
+            return 1;
+        }
+
+        @Override
+        public boolean isServerRollbackEnabled() {
+            return true;
+        }
+
+        // The dictionary catch-up: a header and the delta's start and count, then the
+        // symbols, in two parts.
+        @Override
+        public void sendBinary(long firstPtr, int firstLength, long secondPtr, int secondLength) {
+            long p = firstPtr + QwpConstants.HEADER_SIZE;
+            log.add("catch-up " + Unsafe.getUnsafe().getByte(p) + ":" + symbols(secondPtr, Unsafe.getUnsafe().getByte(p + 1)));
+        }
+
+        @Override
+        protected void ioWait(int timeout, int op) {
+        }
+
+        @Override
+        protected void setupIoWait() {
+        }
+
+        // Symbols of one ASCII char each, every one after its length byte.
+        private static String symbols(long p, int count) {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < count; i++, p += 2) {
+                sb.append(' ').append((char) Unsafe.getUnsafe().getByte(p + 1));
+            }
+            return sb.toString();
+        }
+    }
+
     // A frame as the server sees it: D (deferred), C (commit), R (the rollback frame), or
     // X, a payload that is not a QWP message, labelled with its size. A frame's id
-    // follows its header; a bare header has id 0.
+    // follows its header; a bare header has id 0. A strict frame's rows follow its id.
     private static final class Frame {
+        final boolean isStrict;
         final char kind;
         final String label;
+        final int rows;
 
         Frame(char kind, String label) {
+            this(kind, label, false, 0);
+        }
+
+        Frame(char kind, String label, boolean isStrict, int rows) {
             this.kind = kind;
             this.label = label;
+            this.isStrict = isStrict;
+            this.rows = rows;
         }
 
         static Frame read(long ptr, int length) {
@@ -716,7 +1359,10 @@ public class CursorWebSocketSendLoopRollbackTest {
             }
             char kind = (flags & QwpConstants.FLAG_DEFER_COMMIT) != 0 ? 'D' : 'C';
             int id = length > QwpConstants.HEADER_SIZE ? Unsafe.getUnsafe().getInt(ptr + QwpConstants.HEADER_SIZE) : 0;
-            return new Frame(kind, kind + Integer.toString(id));
+            boolean isStrict = (flags & QwpConstants.FLAG_STRICT) != 0;
+            int rows = isStrict && length >= QwpConstants.HEADER_SIZE + 8
+                    ? Unsafe.getUnsafe().getInt(ptr + QwpConstants.HEADER_SIZE + 4) : 0;
+            return new Frame(kind, kind + Integer.toString(id), isStrict, rows);
         }
 
         @Override
@@ -733,47 +1379,84 @@ public class CursorWebSocketSendLoopRollbackTest {
      * frame as an empty deferred frame, so the group stays open and the next commit on
      * the connection commits it. A closed connection leaves its group uncommitted. A
      * foreign payload is acked like a commit, so the loop's wait for it ends.
+     * <p>
+     * With a cap, a strict frame whose rows would take its connection's group to the
+     * cap is refused with STATUS_TRANSACTION_TOO_LARGE instead: the group is discarded,
+     * and no later frame of the connection is processed, nor acked.
      */
     private static final class ServerModel {
+        static final int ACK = 1;
+        static final int NONE = 0;
+        static final int REFUSE = 2;
+        private final List<Integer> broken = new ArrayList<>();
         private final List<String> committed = new ArrayList<>();
+        private final List<Integer> groupRows = new ArrayList<>();
         private final List<List<String>> groups = new ArrayList<>();
         private final List<String> received = new ArrayList<>();
+        private final List<String> refused = new ArrayList<>();
+        private int cap;
         private int rollbacksReceived;
         private int rollbacksToServerWithoutRollback;
         private long seqTxn;
 
         synchronized void close(int connection) {
-            group(connection).clear();
+            discardGroup(connection);
         }
 
         synchronized List<String> committed() {
             return new ArrayList<>(committed);
         }
 
-        // Whether the server acks the frame.
-        synchronized boolean process(int connection, boolean isRollbackConfirmed, Frame frame) {
+        // Whether the server acks the frame, refuses it, or neither.
+        synchronized int process(int connection, boolean isRollbackConfirmed, Frame frame) {
             received.add(connection + ":" + frame);
             List<String> group = group(connection);
+            if (broken.contains(connection)) {
+                return NONE;
+            }
+            if (frame.isStrict && cap > 0) {
+                int rows = groupRows.get(connection) + frame.rows;
+                if (rows >= cap) {
+                    refused.add(connection + ":" + frame);
+                    discardGroup(connection);
+                    broken.add(connection);
+                    return REFUSE;
+                }
+                groupRows.set(connection, rows);
+            }
             switch (frame.kind) {
                 case 'C':
                 case 'X':
                     committed.addAll(group);
                     committed.add(frame.label);
-                    group.clear();
+                    discardGroup(connection);
                     seqTxn++;
-                    return true;
+                    return ACK;
                 case 'R':
                     rollbacksReceived++;
                     if (isRollbackConfirmed) {
-                        group.clear();
-                        return true;
+                        discardGroup(connection);
+                        return ACK;
                     }
                     rollbacksToServerWithoutRollback++;
-                    return false;
+                    return NONE;
                 default:
                     group.add(frame.label);
-                    return false;
+                    return NONE;
             }
+        }
+
+        synchronized List<String> refused() {
+            return new ArrayList<>(refused);
+        }
+
+        synchronized void setCap(int cap) {
+            this.cap = cap;
+        }
+
+        private void discardGroup(int connection) {
+            group(connection).clear();
+            groupRows.set(connection, 0);
         }
 
         synchronized List<String> received() {
@@ -795,6 +1478,7 @@ public class CursorWebSocketSendLoopRollbackTest {
         private List<String> group(int connection) {
             while (groups.size() <= connection) {
                 groups.add(new ArrayList<>());
+                groupRows.add(0);
             }
             return groups.get(connection);
         }

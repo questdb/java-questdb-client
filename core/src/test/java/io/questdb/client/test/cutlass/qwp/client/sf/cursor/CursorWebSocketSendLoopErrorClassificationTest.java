@@ -83,6 +83,17 @@ public class CursorWebSocketSendLoopErrorClassificationTest {
     }
 
     @Test
+    public void testClassifyTransactionTooLarge() {
+        // Wire byte 0x0F: the server refused a strict transaction it cannot commit as
+        // one. Deterministic on that server, so TERMINAL by default; the loop discards
+        // the transaction instead when the producer rolled it back.
+        Assert.assertEquals(SenderError.Category.TRANSACTION_TOO_LARGE,
+                CursorWebSocketSendLoop.classify(WebSocketResponse.STATUS_TRANSACTION_TOO_LARGE));
+        Assert.assertEquals(SenderError.Policy.TERMINAL,
+                CursorWebSocketSendLoop.defaultPolicyFor(SenderError.Category.TRANSACTION_TOO_LARGE));
+    }
+
+    @Test
     public void testClassifyUnknownStatusByte() {
         // Forward-compat: any byte the client doesn't recognize → UNKNOWN.
         // Don't crash, don't misclassify — the policy resolver fails open to

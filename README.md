@@ -735,7 +735,9 @@ is the minimum working set every live sender keeps: two segments (`2 × sf_max_s
 A strict transaction (`transaction=strict`, or no auto-flush trigger) stays in that buffer until the server commits
 it, and every pooled sender may hold one at once, so a strict transaction that spans more than one segment can use
 only its sender's share: `sf_max_total_bytes / sender_pool_max`, one segment less with `sf_dir`. A larger one fails
-with `TransactionTooLargeException`.
+with `TransactionTooLargeException`. So does one that holds more rows of a table than the server's
+`qwp.max.uncommitted.rows` when the sender learns that limit only after accepting them, as before its first connection:
+the server refuses such a transaction rather than commit it in parts, and `rollback()` discards it.
 `sf_durability=periodic` checkpoints mmap-published data in the background; `sf_sync_interval_millis` defaults to `5000`
 in that mode. The interval is a target cadence: JVM scheduling and storage-sync latency add to the actual loss window.
 Use `request_durable_ack=on` when end-to-end server durability is also required. See the

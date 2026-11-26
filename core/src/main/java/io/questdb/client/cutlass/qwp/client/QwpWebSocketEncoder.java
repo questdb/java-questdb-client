@@ -249,6 +249,19 @@ public class QwpWebSocketEncoder implements QuietCloseable {
         }
     }
 
+    /**
+     * Marks every data frame encoded from now on with {@code FLAG_STRICT}: its rows
+     * belong to a strict transaction, which the server refuses rather than commit in
+     * parts. The rollback control frame never carries it.
+     */
+    public void setStrict(boolean strict) {
+        if (strict) {
+            flags |= FLAG_STRICT;
+        } else {
+            flags &= ~FLAG_STRICT;
+        }
+    }
+
     public void setVersion(byte version) {
         this.version = version;
     }

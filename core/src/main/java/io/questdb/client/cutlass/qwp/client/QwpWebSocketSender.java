@@ -211,6 +211,8 @@ public class QwpWebSocketSender implements Sender {
     // past any transient disk/NFS stall the deferred-close machinery exists
     // to survive.
     private static final long RECYCLE_DEFERRED_CLOSE_MAX_WAIT_MILLIS = 30_000L;
+    private static final String SPELLINGS_COUNT_TOGETHER = " Rows sent under names that differ only in letter case "
+            + "count together: the server counts them as one table.";
     private static final String WRITE_PATH = "/write/v4";
     // Yields the Authorization header value presented on each WebSocket upgrade. A constant for a
     // fixed token or Basic credential; for an httpTokenProvider it pulls a freshly refreshed token,
@@ -743,6 +745,19 @@ public class QwpWebSocketSender implements Sender {
     // it stay in the transaction, including the one whose auto-flush found no
     // room: the room kept for the commit holds them.
     private boolean txnBufferFull;
+    // Strict mode only: why the open transaction can no longer commit as one, null while
+    // it can. Set when the I/O loop reports that the server refused the transaction, or
+    // when a table of the transaction already holds a lower qwp.max.uncommitted.rows the
+    // sender learned after it accepted the rows. Every row and flush() throws it until
+    // rollback(), reset() or close() ends the transaction.
+    private String txnRefusal;
+    // FSN of the open transaction's first frame, -1 while it has sent none: the I/O loop
+    // names a transaction the server refused by it. sealAndSwapBuffer() keeps it.
+    private long txnFirstFsn = -1L;
+    // Strict mode only: the largest qwp.max.uncommitted.rows a row of the open transaction
+    // was checked against. flush() rechecks the whole transaction only once the server's
+    // limit has dropped below it. Reset with the transaction.
+    private long txnMaxCheckedRows;
     // Transactional mode: simulation of how the ring packs the open transaction's
     // frames, mirroring MmapSegment's append rule. txnSimSegments counts the
     // segments the transaction's frames occupy (0 = no frame yet) and
@@ -2397,6 +2412,12 @@ public class QwpWebSocketSender implements Sender {
 
         long beforeFsn = cursorEngine != null ? cursorEngine.publishedFsn() : -1L;
 
+        if (strictTransactional) {
+            // Before anything goes out: a commit the server would refuse must not.
+            checkTransactionNotRefused();
+            checkTransactionFitsServerLimit();
+        }
+
         // Cursor SF: append happens on the user thread inside
         // sealAndSwapBuffer, so by the time we reach here every encoded batch
         // is published in its mmap'd segment. PERIODIC stable-storage barriers
@@ -3858,11 +3879,17 @@ public class QwpWebSocketSender implements Sender {
      * open transaction past what the client buffer can hold alongside the commit,
      * throws {@link TransactionTooLargeException} instead and is not added.
      * {@link #close()} discards an uncommitted transaction rather than committing
-     * it. Enabling it enables transactional mode; disabling it leaves transactional
-     * mode on.
+     * it. Its frames carry {@code FLAG_STRICT}, so a server never commits the
+     * transaction in parts either: when the sender learned the server's limit only
+     * after it accepted rows past it, the server refuses the transaction, and every
+     * row and flush of it fails until it is rolled back. Enabling it enables
+     * transactional mode; disabling it leaves transactional mode on.
      */
     public void setStrictTransactional(boolean strict) {
         this.strictTransactional = strict;
+        // The server refuses a strict frame that would reach its limit, rather than
+        // commit the transaction in parts.
+        encoder.setStrict(strict);
         if (strict) {
             this.transactional = true;
         }
@@ -3880,6 +3907,7 @@ public class QwpWebSocketSender implements Sender {
         this.transactional = transactional;
         if (!transactional) {
             this.strictTransactional = false;
+            encoder.setStrict(false);
         }
     }
 
@@ -7564,6 +7592,11 @@ public class QwpWebSocketSender implements Sender {
             // a commit or rollback frame closes it. Every frame passes here, so the group
             // follows the ring even when a run of frames fails partway, and rollback(),
             // reset() and close() see every deferred frame that went out.
+            if (!isDeferredFrame) {
+                txnFirstFsn = -1L;
+            } else if (!hasDeferredMessages) {
+                txnFirstFsn = cursorEngine.publishedFsn();
+            }
             hasDeferredMessages = isDeferredFrame;
             if (isTxnFrame) {
                 recordTransactionFrame(payloadLen, activeRemaining);
@@ -7624,13 +7657,11 @@ public class QwpWebSocketSender implements Sender {
         if (!strictTransactional) {
             return;
         }
+        checkTransactionNotRefused();
         if (txnBufferFull) {
             throw transactionTooLargeForClientBuffer("so the row was not added");
         }
-        long maxRows = serverMaxUncommittedRows;
-        if (maxRows <= 0) {
-            maxRows = QwpConstants.DEFAULT_SERVER_MAX_UNCOMMITTED_ROWS;
-        }
+        long maxRows = serverMaxUncommittedRowsOrDefault();
         // The server commits a table on its own once its uncommitted rows reach
         // maxRows, so a strict transaction holds at most maxRows - 1 rows per table.
         // The server counts the rows of every spelling of the table, the names that
@@ -7642,7 +7673,12 @@ public class QwpWebSocketSender implements Sender {
         for (QwpTableBuffer spelling = firstSpelling; spelling != null; spelling = spelling.getNextSpelling()) {
             rows += spelling.getTxnSentRows() + spelling.getRowCount();
         }
-        if (rows >= maxRows) {
+        if (rows > maxRows) {
+            // The table already holds the limit without this row: the sender accepted the
+            // rows under a higher limit, before it learned this one.
+            throw refuseTransactionOverLimit(currentTableName, rows - 1, maxRows, firstSpelling);
+        }
+        if (rows == maxRows) {
             LineSenderException e = new TransactionTooLargeException("transaction too large for the server")
                     .put(" [table=").put(currentTableName)
                     .put(", rows=").put(rows)
@@ -7651,10 +7687,95 @@ public class QwpWebSocketSender implements Sender {
                             + "of them are uncommitted, which would split the transaction, so the row was "
                             + "not added.");
             if (firstSpelling.getNextSpelling() != null) {
-                e.put(" Rows sent under names that differ only in letter case count together: the server "
-                        + "counts them as one table.");
+                e.put(SPELLINGS_COUNT_TOGETHER);
             }
             throw e.put(" Raise qwp.max.uncommitted.rows on the server");
+        }
+        if (maxRows > txnMaxCheckedRows) {
+            txnMaxCheckedRows = maxRows;
+        }
+    }
+
+    /**
+     * A strict flush() commits the open transaction, which the server commits as one only
+     * while every table of it stays below qwp.max.uncommitted.rows. Each row was checked
+     * against the limit the sender knew when the row was added. Once the sender learned a
+     * lower one, as from a server that restarted with a lower setting, this checks every
+     * table of the transaction against it, so that no commit goes out that the server
+     * would refuse.
+     */
+    private void checkTransactionFitsServerLimit() {
+        long maxRows = serverMaxUncommittedRowsOrDefault();
+        if (maxRows >= txnMaxCheckedRows) {
+            return;
+        }
+        ObjList<CharSequence> keys = tableBuffers.keys();
+        for (int i = 0, n = keys.size(); i < n; i++) {
+            QwpTableBuffer table = tableBuffers.get(keys.getQuick(i));
+            // Count each table once, from its first spelling.
+            if (table.getFirstSpelling() != table) {
+                continue;
+            }
+            long rows = 0;
+            for (QwpTableBuffer spelling = table; spelling != null; spelling = spelling.getNextSpelling()) {
+                rows += spelling.getTxnSentRows() + spelling.getRowCount();
+            }
+            if (rows >= maxRows) {
+                throw refuseTransactionOverLimit(table.getTableName(), rows, maxRows, table);
+            }
+        }
+        txnMaxCheckedRows = maxRows;
+    }
+
+    /**
+     * Records that the open strict transaction can no longer commit as one, because a
+     * table of it already holds {@code rows} rows, at least the server's limit of
+     * {@code maxRows} that the sender learned after it accepted them, and returns the
+     * error to throw. The refusal sticks until the transaction ends.
+     */
+    private TransactionTooLargeException refuseTransactionOverLimit(
+            CharSequence tableName,
+            long rows,
+            long maxRows,
+            QwpTableBuffer firstSpelling
+    ) {
+        StringBuilder message = new StringBuilder(512)
+                .append("transaction too large for the server [table=").append(tableName)
+                .append(", rows=").append(rows)
+                .append(", maxUncommittedRows=").append(maxRows)
+                .append("]; the sender accepted these rows of the table before it learned the server's "
+                        + "qwp.max.uncommitted.rows, at which the server commits a table's rows on its own, so the "
+                        + "transaction cannot commit as one.");
+        if (firstSpelling.getNextSpelling() != null) {
+            message.append(SPELLINGS_COUNT_TOGETHER);
+        }
+        txnRefusal = message.append(" Call rollback() to discard it, and raise qwp.max.uncommitted.rows on the server")
+                .toString();
+        return new TransactionTooLargeException(txnRefusal);
+    }
+
+    /**
+     * Throws the refusal of the open strict transaction, if it has one. The I/O loop
+     * reports a transaction the server refused by the FSN of its first frame; when that
+     * is the open transaction, the refusal sticks until the transaction ends.
+     */
+    private void checkTransactionNotRefused() {
+        if (txnRefusal == null && hasDeferredMessages) {
+            // Both callers connect first, and the loop the frames went out on stays while
+            // they are unacked: a symbol-dictionary recycle waits for a drained ring.
+            CursorWebSocketSendLoop loop = cursorSendLoop;
+            assert loop != null : "a sender with frames out has no I/O loop";
+            if (loop.getRefusedTransactionFsn() == txnFirstFsn) {
+                String serverMessage = loop.getRefusedTransactionMessage();
+                txnRefusal = "transaction refused by the server"
+                        + (serverMessage != null ? ": " + serverMessage + '.' : ".")
+                        + " The sender accepted the transaction's rows before it learned the server's "
+                        + "qwp.max.uncommitted.rows, and the transaction cannot commit as one. Call rollback() to "
+                        + "discard it";
+            }
+        }
+        if (txnRefusal != null) {
+            throw new TransactionTooLargeException(txnRefusal);
         }
     }
 
@@ -7669,6 +7790,8 @@ public class QwpWebSocketSender implements Sender {
         }
         txnTables.setPos(0);
         txnBufferFull = false;
+        txnRefusal = null;
+        txnMaxCheckedRows = 0;
         txnBytes = 0;
         txnRefusedBytes = 0;
         isTxnRefusedAtShare = false;
@@ -7902,6 +8025,15 @@ public class QwpWebSocketSender implements Sender {
             rows += txnTables.getQuick(i).getTxnSentRows();
         }
         return rows;
+    }
+
+    /**
+     * The server's qwp.max.uncommitted.rows as its last handshake advertised it, or the
+     * server default when it advertised none.
+     */
+    private long serverMaxUncommittedRowsOrDefault() {
+        long maxRows = serverMaxUncommittedRows;
+        return maxRows > 0 ? maxRows : QwpConstants.DEFAULT_SERVER_MAX_UNCOMMITTED_ROWS;
     }
 
     /**

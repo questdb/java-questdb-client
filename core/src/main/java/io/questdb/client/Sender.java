@@ -2834,6 +2834,16 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * {@link io.questdb.client.cutlass.qwp.client.TransactionTooLargeException}
          * and is not added, and {@code close()} without {@code flush()} discards the
          * transaction instead of committing it.
+         * The sender may learn the server's {@code qwp.max.uncommitted.rows} only after it
+         * accepted rows past it: before its first connection, or on a reconnect to a
+         * server that restarted with a lower setting or to another endpoint. The server
+         * refuses such a transaction instead of committing it in parts, so every row and
+         * {@code flush()} of the transaction throws
+         * {@link io.questdb.client.cutlass.qwp.client.TransactionTooLargeException} until
+         * {@code rollback()}, {@code reset()} or {@code close()} discards it. If
+         * {@code flush()} had already committed it, the sender halts with a
+         * {@link io.questdb.client.SenderError.Category#TRANSACTION_TOO_LARGE} error and
+         * keeps the transaction in its store-and-forward buffer.
          * The senders of a pool share {@code sf_max_total_bytes} and may all hold
          * strict transactions at once, so there a transaction that spans more than
          * one segment counts only on its sender's share: {@code sf_max_total_bytes}

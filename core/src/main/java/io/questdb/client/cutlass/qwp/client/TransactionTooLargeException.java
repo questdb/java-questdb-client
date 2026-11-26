@@ -46,6 +46,13 @@ import io.questdb.client.cutlass.line.LineSenderException;
  * {@code flush()} throws it when the client buffer cannot hold the flush, and
  * sends nothing. Either way nothing past the limit reaches the server, and the
  * transaction keeps the rows accepted before the error.
+ * <p>
+ * The sender may learn the server's {@code qwp.max.uncommitted.rows} only after it
+ * accepted rows past it: before its first connection, or on a reconnect to a server
+ * with a lower setting. Then the transaction as a whole cannot commit as one, and the
+ * server refuses it rather than commit it in parts: every row, {@code flush()} and
+ * {@code drain()} of the transaction throws this exception until {@code rollback()},
+ * {@code reset()} or {@code close()} discards the transaction.
  */
 public class TransactionTooLargeException extends LineSenderException {
 

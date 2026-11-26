@@ -601,6 +601,24 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // Tracked only while !isRollbackConfirmed, for retireRollbackFrame. Reset with
     // isRollbackConfirmed; same threading.
     private long lastSentCommitBearingFsn = -1L;
+    // A strict transaction the server refused with STATUS_TRANSACTION_TOO_LARGE: the FSN of
+    // its first frame, -1 when none. The server discarded the transaction's rows and processes
+    // no later frame of the connection. None of the transaction's frames goes out again:
+    // trySendBatch walks them instead, see tryResolveRefusedTransaction. I/O thread only;
+    // survives reconnects until the walk resolves the transaction.
+    private long refusedTxnStartFsn = -1L;
+    // The frame the server refused, and the refusal, reported as the terminal error when
+    // the producer turns out to have committed the transaction. Same threading.
+    private long refusedTxnFrameFsn = -1L;
+    private SenderError refusedTxnError;
+    // FSN of the frame at the cursor while walking the refused transaction, -1 until the
+    // cursor reaches its first frame; a reconnect resets it. Same threading.
+    private long refusedTxnScanFsn = -1L;
+    // The refusal as the producer sees it: the FSN of the refused transaction's first frame,
+    // -1 when none, and the server's message, which the I/O thread writes first. The producer
+    // refuses rows and commits of its open transaction when that transaction starts there.
+    private volatile long refusedTransactionFsn = -1L;
+    private volatile String refusedTransactionMessage;
     // Poison-frame detector state (I/O thread only). poisonFsn is the FSN of the
     // frame implicated by the most recent server-active rejection: the NACK-named
     // frame, or the OK-level head-of-line frame (highestOkFsn+1) for a
@@ -1107,6 +1125,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 return SenderError.Category.NOT_WRITABLE;
             case WebSocketResponse.STATUS_DICTIONARY_GAP:
                 return SenderError.Category.DICTIONARY_GAP;
+            case WebSocketResponse.STATUS_TRANSACTION_TOO_LARGE:
+                return SenderError.Category.TRANSACTION_TOO_LARGE;
             default:
                 return SenderError.Category.UNKNOWN;
         }
@@ -1281,6 +1301,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 return SenderError.Policy.ABANDONED;
             case SCHEMA_MISMATCH: // deterministic: same bytes, same mismatch
             case PARSE_ERROR:     // deterministic: malformed bytes never parse
+            case TRANSACTION_TOO_LARGE: // deterministic on this server; the loop discards a rolled-back one
             case SECURITY_ERROR:  // ACL denial on a writable node (read-only refusals arrive as role-change closes)
             case PROTOCOL_VIOLATION:
             default:
@@ -1615,6 +1636,24 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         LineSenderException e = terminalError;
         return e instanceof LineSenderServerException
                 ? ((LineSenderServerException) e).getServerError() : null;
+    }
+
+    /**
+     * FSN of the first frame of a strict transaction the server refused with
+     * STATUS_TRANSACTION_TOO_LARGE, or {@code -1}. The producer compares it with the first
+     * frame of its open transaction: when they match, that transaction can no longer
+     * commit. The loop clears it once it discarded the transaction.
+     */
+    public long getRefusedTransactionFsn() {
+        return refusedTransactionFsn;
+    }
+
+    /**
+     * The server's message for the transaction {@link #getRefusedTransactionFsn()} names.
+     * Read it after that FSN: the I/O thread writes it first.
+     */
+    public String getRefusedTransactionMessage() {
+        return refusedTransactionMessage;
     }
 
     /**
@@ -3162,6 +3201,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         long replayStart = engine.ackedFsn() + 1L;
         this.fsnAtZero = replayStart;
         this.nextWireSeq = 0L;
+        // A refused transaction the walk has not resolved yet is never acked, so the
+        // replay starts at or ahead of it, and the walk starts over when the cursor gets
+        // there.
+        refusedTxnScanFsn = -1L;
         // snapshotReplayTarget froze the completed-send boundary when the
         // outage began. ACK progress can move replayStart past that boundary;
         // in that case no frame needs re-sending on this connection.
@@ -3933,6 +3976,21 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         int batchReplayed = 0;
         long batchBytes = 0;
         while (true) {
+            if (refusedTxnStartFsn >= 0 && (refusedTxnScanFsn >= 0 || fsnAtZero + nextWireSeq >= refusedTxnStartFsn)) {
+                if (batchFrames > 0) {
+                    break;
+                }
+                // The cursor reached the strict transaction the server refused: none of its
+                // frames goes out again. After a reconnect the frames ahead of it went out
+                // first, and the walk starts at its first frame.
+                if (refusedTxnScanFsn < 0) {
+                    assert fsnAtZero + nextWireSeq == refusedTxnStartFsn
+                            : "the cursor passed the refused transaction [cursorFsn=" + (fsnAtZero + nextWireSeq)
+                            + ", startFsn=" + refusedTxnStartFsn + ']';
+                    refusedTxnScanFsn = refusedTxnStartFsn;
+                }
+                return tryResolveRefusedTransaction();
+            }
             if (orphanSkipTipFsn >= 0 && fsnAtZero + nextWireSeq >= orphanSkipStartFsn) {
                 if (batchFrames > 0) {
                     break;
@@ -4067,10 +4125,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 if (batchFrames > 0) {
                     break;
                 }
-                recordFatal(new LineSenderException(
-                        "recovered store-and-forward symbol dictionary is incomplete (likely a host crash): "
-                                + "frame delta start " + deltaStart + " exceeds recovered dictionary size "
-                                + sentDictCount + "; cannot replay without corrupting data -- resend required"));
+                recordFatal(incompleteDictionary(deltaStart));
                 return false;
             }
             try {
@@ -4198,6 +4253,178 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         dispatchProgress(rollbackFsn);
         fail(new LineSenderException(
                 "recycling connection to discard a rolled-back transaction the server cannot roll back"));
+    }
+
+    // The terminal for a frame whose symbol-dictionary delta starts above the ids the
+    // mirror holds: those below it are lost, and no frame from here on can go out.
+    private LineSenderException incompleteDictionary(int deltaStart) {
+        return new LineSenderException(
+                "recovered store-and-forward symbol dictionary is incomplete (likely a host crash): "
+                        + "frame delta start " + deltaStart + " exceeds recovered dictionary size "
+                        + sentDictCount + "; cannot replay without corrupting data -- resend required");
+    }
+
+    /**
+     * Ends the walk of a refused strict transaction: clears the I/O thread's state and the
+     * producer's view of the refusal.
+     */
+    private void clearRefusedTransaction() {
+        refusedTxnStartFsn = -1L;
+        refusedTxnFrameFsn = -1L;
+        refusedTxnError = null;
+        refusedTxnScanFsn = -1L;
+        refusedTransactionFsn = -1L;
+        refusedTransactionMessage = null;
+    }
+
+    /**
+     * The producer committed a strict transaction the server refused, so it can commit
+     * neither as one nor, being strict, in parts. Halts with the refusal over the
+     * transaction's frames, which stay in the store-and-forward log, as any rejection that
+     * replaying cannot fix does: on a server with a higher qwp.max.uncommitted.rows, a
+     * sender recovering the log commits the transaction as one.
+     */
+    private void haltOnRefusedTransaction(long endFsn) {
+        SenderError refusal = refusedTxnError;
+        SenderError err = new SenderError(
+                refusal.getCategory(),
+                SenderError.Policy.TERMINAL,
+                refusal.getServerStatusByte(),
+                refusal.getServerMessage(),
+                refusal.getMessageSequence(),
+                externalFsnBase + refusedTxnStartFsn,
+                externalFsnBase + endFsn,
+                refusal.getTableName(),
+                refusal.getDetectedAtNanos()
+        );
+        clearRefusedTransaction();
+        recordFatal(new LineSenderServerException(err));
+        dispatchError(err);
+    }
+
+    /**
+     * The server refused the frame at {@code fsn} with STATUS_TRANSACTION_TOO_LARGE: a
+     * table of a strict transaction would reach the server's qwp.max.uncommitted.rows,
+     * where the server commits on its own, because the producer accepted the rows before
+     * it learned that limit. The server rolled back every row the connection held
+     * uncommitted, which are the transaction's, and processes no later frame of this
+     * connection. The transaction's first frame follows the last one the server acked:
+     * the server acks everything ahead of a refused frame before it refuses it, and
+     * acks none of a transaction's frames before the transaction commits.
+     * <p>
+     * None of the transaction's frames goes out again. The producer learns that its open
+     * transaction can no longer commit, and the cursor goes back to the transaction's
+     * first frame to walk it, see {@link #tryResolveRefusedTransaction}.
+     */
+    private void refuseTransaction(long fsn, SenderError err) {
+        long startFsn = Math.max(engine.ackedFsn(), highestOkFsn) + 1L;
+        if (startFsn > fsn) {
+            // The server acked the frame it now refuses: no transaction to walk. Halt
+            // rather than guess which frames the refusal covers.
+            recordFatal(new LineSenderServerException(err));
+            dispatchError(err);
+            return;
+        }
+        LOG.warn("server refused a strict transaction, which cannot commit as one [fsn={}, refusedFsn={}]: {}",
+                externalFsnBase + startFsn, externalFsnBase + fsn, err.getServerMessage());
+        refusedTxnStartFsn = startFsn;
+        refusedTxnFrameFsn = fsn;
+        refusedTxnError = err;
+        refusedTransactionMessage = err.getServerMessage();
+        refusedTransactionFsn = startFsn;
+        positionCursorAt(startFsn);
+        refusedTxnScanFsn = startFsn;
+    }
+
+    /**
+     * The producer rolled back the refused strict transaction, whose rollback frame is at
+     * {@code rollbackFsn}. Like {@link #retireRollbackFrame}, acknowledges the
+     * transaction's frames and the rollback frame here, which the cumulative acknowledge
+     * may do only once the server acked every frame ahead of them, and recycles the
+     * connection: the walk skipped frames this connection never sent, so the wire
+     * mapping cannot go on past them, and the server processes no later frame of the
+     * connection anyway. The next connection starts past the rollback frame.
+     *
+     * @return always false: nothing went out
+     */
+    private boolean retireRefusedTransaction(long rollbackFsn) {
+        if (engine.ackedFsn() < refusedTxnStartFsn - 1L) {
+            return false;
+        }
+        LOG.info("discarding the strict transaction the server refused and the producer rolled back [fsn {}..{}]",
+                externalFsnBase + refusedTxnStartFsn, externalFsnBase + rollbackFsn);
+        boolean isAdvanced = engine.acknowledge(rollbackFsn);
+        assert isAdvanced : "refused transaction already acknowledged [fsn=" + rollbackFsn + ']';
+        dispatchProgress(rollbackFsn);
+        clearRefusedTransaction();
+        fail(new LineSenderException("recycling connection after discarding a refused strict transaction"));
+        return false;
+    }
+
+    /**
+     * Walks the refused strict transaction's frames from the cursor, sending none, up to
+     * the frame that ends it, which the producer publishes once it learned of the refusal:
+     * <ul>
+     *   <li>the rollback frame: the producer discarded the transaction, see
+     *   {@link #retireRefusedTransaction};</li>
+     *   <li>a commit-bearing frame: the producer committed it, see
+     *   {@link #haltOnRefusedTransaction}.</li>
+     * </ul>
+     * The deferred frames between carry symbols that frames published later reference,
+     * so the walk adds them to the dictionary mirror, which the catch-up of the next
+     * connection registers on the server.
+     *
+     * @return always false: nothing goes out
+     */
+    private boolean tryResolveRefusedTransaction() {
+        while (true) {
+            // The producer publishes every frame of a segment before it seals the segment
+            // and makes a new one active. So once the walk sees the segment sealed, the
+            // published offset it reads after that is final, and no frame can be skipped.
+            boolean isSealed = sendingSegment != engine.activeSegment();
+            long pub = sendingSegment.publishedOffset();
+            if (sendOffset >= pub) {
+                if (!isSealed) {
+                    // The producer has not published the frame that ends the transaction.
+                    return false;
+                }
+                MmapSegment next = advanceSegment();
+                assert next != sendingSegment : "a sealed segment has a successor";
+                sendingSegment = next;
+                continue;
+            }
+            long base = sendingSegment.address();
+            int payloadLen = Unsafe.getUnsafe().getInt(base + sendOffset + 4);
+            long frameEnd = sendOffset + MmapSegment.FRAME_HEADER_SIZE + payloadLen;
+            assert frameEnd <= pub : "the producer publishes whole frames";
+            long frameAddr = base + sendOffset + MmapSegment.FRAME_HEADER_SIZE;
+            long fsn = refusedTxnScanFsn;
+            // Both checks bound the payload length first, so a frame they cannot read
+            // counts as commit-bearing: the safe side, as for retireRollbackFrame.
+            boolean isRollback = isRollbackFrame(frameAddr, payloadLen);
+            if (isRollback || !isDeferredFrame(frameAddr, payloadLen)) {
+                // The frame ends the transaction. An end ahead of the frame the server
+                // refused would mean the refusal is not about these frames: halt rather
+                // than discard them.
+                if (isRollback && fsn >= refusedTxnFrameFsn) {
+                    return retireRefusedTransaction(fsn);
+                }
+                haltOnRefusedTransaction(fsn);
+                return false;
+            }
+            int deltaStart = frameDeltaStart(frameAddr, payloadLen);
+            if (deltaStart > sentDictCount) {
+                // As trySendBatch's torn-dictionary guard: ids below this frame's delta
+                // were never registered, so nothing published later can go out either.
+                recordFatal(incompleteDictionary(deltaStart));
+                return false;
+            }
+            if (deltaStart >= 0) {
+                accumulateSentDict(frameAddr, payloadLen, deltaStart);
+            }
+            sendOffset = frameEnd;
+            refusedTxnScanFsn = fsn + 1L;
+        }
     }
 
     /**
@@ -4793,6 +5020,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             );
             counters.serverErrors.incrementAndGet();
 
+            if (category == SenderError.Category.TRANSACTION_TOO_LARGE) {
+                refuseTransaction(fsn, err);
+                return;
+            }
             if (policy == SenderError.Policy.TERMINAL) {
                 // Terminal: stash the typed payload BEFORE dispatching to the
                 // handler. The spec requires signal.terminalError to be latched

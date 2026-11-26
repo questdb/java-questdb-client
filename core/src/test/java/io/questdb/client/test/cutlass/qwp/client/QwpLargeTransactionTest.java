@@ -28,12 +28,15 @@ import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
+import io.questdb.client.LineSenderServerException;
 import io.questdb.client.QuestDB;
 import io.questdb.client.Sender;
+import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.BatchTooLargeForCapException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.TransactionTooLargeException;
+import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentBudget;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.impl.SenderPool;
@@ -48,6 +51,7 @@ import java.io.IOException;
 import java.lang.management.ManagementFactory;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -1826,6 +1830,207 @@ public class QwpLargeTransactionTest {
     }
 
     @Test
+    public void testClosingARefusedTransactionDiscardsIt() throws Exception {
+        // close() discards a strict transaction, the one the server refused too: the
+        // sender discards its frames, so close() returns without an error, and nothing of
+        // the transaction commits. This server refuses without a message.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            h.refusingStrictDeferredFrame = 2;
+            h.refusalMessage = null;
+            try (TestWebSocketServer server = start(h, CAP)) {
+                server.setRollbackSupported(true);
+                QwpWebSocketSender s = (QwpWebSocketSender) Sender.fromConfig(conf(server)
+                        + "transaction=strict;auto_flush_rows=10;");
+                try {
+                    writeRows(s, "t", 0, 35);
+                    awaitRefusalReachesSender(s);
+                    assertRefused(serverRefusalError(null), () -> writeRows(s, "t", 35, 1));
+                } finally {
+                    s.close();
+                }
+                Assert.assertTrue(h.committedFrames().isEmpty());
+                Assert.assertEquals(1, h.refusals());
+            }
+        });
+    }
+
+    @Test
+    public void testServerRefusalFailsTheOpenTransactionUntilRollback() throws Exception {
+        // The server refuses the open strict transaction's second frame, as it does one
+        // that would take a table to qwp.max.uncommitted.rows, where it would commit the
+        // transaction in parts. From then on every row, flush() and drain() of the
+        // transaction fails with the refusal, and nothing more of it reaches the server.
+        // rollback() ends it: the sender discards its frames, reconnects, and the next
+        // transaction commits.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            h.refusingStrictDeferredFrame = 2;
+            try (TestWebSocketServer server = start(h, CAP)) {
+                server.setRollbackSupported(true);
+                try (QwpWebSocketSender s = (QwpWebSocketSender) Sender.fromConfig(conf(server)
+                        + "transaction=strict;auto_flush_rows=10;")) {
+                    writeRows(s, "t", 0, 35);
+                    awaitRefusalReachesSender(s);
+                    String refusal = serverRefusalError(TxnServer.REFUSAL);
+                    assertRefused(refusal, () -> writeRows(s, "t", 35, 1));
+                    assertRefused(refusal, () -> writeRows(s, "other", 0, 1));
+                    assertRefused(refusal, s::flush);
+                    assertRefused(refusal, () -> s.drain(1_000));
+                    s.rollback();
+                    writeRows(s, "t", 100, 5);
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                }
+                Assert.assertEquals(1, h.refusals());
+                Assert.assertEquals("only the next transaction commits", "C", frameKinds(h.committedFrames()));
+                Assert.assertEquals(2, h.connectionCount());
+            }
+        });
+    }
+
+    @Test
+    public void testServerRefusalOfACommittedTransactionHaltsTheSender() throws Exception {
+        // The server refuses the commit frame of a strict transaction that flush() had
+        // published. The transaction can commit neither as one nor in parts, so the
+        // sender halts with the refusal over the transaction's frames, which it keeps.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            h.isRefusingStrictCommit = true;
+            try (TestWebSocketServer server = start(h, CAP)) {
+                server.setRollbackSupported(true);
+                try (Sender s = Sender.fromConfig(conf(server) + "transaction=strict;auto_flush_rows=10;")) {
+                    // Two deferred frames of 10 rows, then the commit frame with 5.
+                    writeRows(s, "t", 0, 25);
+                    s.flush();
+                    try {
+                        s.drain(5_000);
+                        Assert.fail("the sender must halt");
+                    } catch (LineSenderServerException e) {
+                        SenderError err = e.getServerError();
+                        Assert.assertEquals(SenderError.Category.TRANSACTION_TOO_LARGE, err.getCategory());
+                        Assert.assertEquals(SenderError.Policy.TERMINAL, err.getAppliedPolicy());
+                        Assert.assertEquals(TxnServer.REFUSAL, err.getServerMessage());
+                        Assert.assertEquals(0L, err.getFromFsn());
+                        Assert.assertEquals(2L, err.getToFsn());
+                    }
+                }
+                Assert.assertEquals("DDC", frameKinds(h));
+                Assert.assertTrue(h.committedFrames().isEmpty());
+                Assert.assertEquals(1, h.connectionCount());
+            }
+        });
+    }
+
+    @Test
+    public void testStrictFlushChecksTheTransactionAgainstALimitLearnedLate() throws Exception {
+        // A row is checked against the limit when it is added, and flush() commits the
+        // whole transaction, so once the server's limit drops flush() checks every table.
+        // Here the 40 rows of "t" and "T", one table to the server, held under the default
+        // limit, but not under the 30 a handshake then advertised, though the row of a
+        // added after that fits it.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, CAP)) {
+                server.setRollbackSupported(true);
+                try (QwpWebSocketSender s = (QwpWebSocketSender) Sender.fromConfig(conf(server) + "auto_flush=off;")) {
+                    Assert.assertTrue(s.isStrictTransactional());
+                    writeRows(s, "t", 0, 20);
+                    writeRows(s, "T", 20, 20);
+                    writeRows(s, "c", 0, 10);
+                    s.applyServerTransactionLimits(30, true);
+                    writeRows(s, "a", 0, 1);
+                    String refusal = overLimitError("t", 40, 30, true);
+                    assertRefused(refusal, s::flush);
+                    assertRefused(refusal, () -> writeRows(s, "a", 1, 1));
+                    s.rollback();
+                    // Checked under 30; the limit drops to 20, which the 10 rows still fit.
+                    writeRows(s, "c", 0, 10);
+                    s.applyServerTransactionLimits(20, true);
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                }
+                Assert.assertEquals("C", frameKinds(h));
+            }
+        });
+    }
+
+    @Test
+    public void testStrictTransactionPastALimitLearnedLateFailsUntilRollback() throws Exception {
+        // The sender accepted 40 rows of a under the default limit, then a handshake
+        // advertised 30, as after the server restarted with a lower
+        // qwp.max.uncommitted.rows. a already holds more than that, so the transaction
+        // cannot commit as one: the next row of a fails, and so does every later row and
+        // flush() of the transaction, until rollback() ends it. A row of b, below the new
+        // limit, still goes in before that. The next transaction starts from zero.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, 4_096)) {
+                server.setRollbackSupported(true);
+                try (QwpWebSocketSender s = (QwpWebSocketSender) Sender.fromConfig(conf(server) + "transaction=strict;")) {
+                    writeRows(s, "a", 0, 40);
+                    writeRows(s, "b", 0, 5);
+                    s.applyServerTransactionLimits(30, true);
+                    writeRows(s, "b", 5, 1);
+                    String refusal = overLimitError("a", 40, 30, false);
+                    assertRefused(refusal, () -> writeRows(s, "a", 40, 1));
+                    assertRefused(refusal, () -> writeRows(s, "b", 6, 1));
+                    assertRefused(refusal, s::flush);
+                    s.rollback();
+                    writeRows(s, "a", 0, 29);
+                    try {
+                        writeRows(s, "a", 29, 1);
+                        Assert.fail("the 30th row of a must be refused");
+                    } catch (TransactionTooLargeException e) {
+                        Assert.assertEquals(serverRowLimitError("a", 30), e.getMessage());
+                    }
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                }
+                Assert.assertEquals("only the second transaction commits", 1, h.commitFrames());
+            }
+        });
+    }
+
+    @Test
+    public void testStrictSenderMarksItsDataFramesStrict() throws Exception {
+        // A strict sender marks its data frames, deferred and commit, with FLAG_STRICT, so
+        // that the server refuses its transaction rather than commit it in parts; never
+        // the rollback frame, which the server matches by its exact flags. A
+        // transaction=on sender marks none.
+        assertMemoryLeak(() -> {
+            TxnServer h = new TxnServer();
+            try (TestWebSocketServer server = start(h, 4_096)) {
+                server.setRollbackSupported(true);
+                try (Sender s = Sender.fromConfig(conf(server) + "transaction=strict;")) {
+                    writeRows(s, "t", 0, 99);
+                    s.flush();
+                    writeRows(s, "t", 0, 50);
+                    s.rollback();
+                    Assert.assertTrue(s.drain(5_000));
+                }
+                try (Sender s = Sender.fromConfig(conf(server) + "transaction=on;")) {
+                    writeRows(s, "t", 0, 99);
+                    s.flush();
+                    Assert.assertTrue(s.drain(5_000));
+                }
+                List<List<TxnFrame>> byConnection = h.framesByConnection();
+                Assert.assertEquals(2, byConnection.size());
+                String strictKinds = frameKinds(byConnection.get(0));
+                Assert.assertTrue(strictKinds, strictKinds.matches("D+[Cc]D+R"));
+                for (TxnFrame f : byConnection.get(0)) {
+                    Assert.assertEquals(f.toString(), !f.isRollback(), f.isStrict());
+                }
+                String onKinds = frameKinds(byConnection.get(1));
+                Assert.assertTrue(onKinds, onKinds.matches("D+[Cc]"));
+                for (TxnFrame f : byConnection.get(1)) {
+                    Assert.assertFalse(f.toString(), f.isStrict());
+                }
+            }
+        });
+    }
+
+    @Test
     public void testStrictCommitTooLargeForClientBufferIsNotSent() throws Exception {
         // With auto_flush_bytes=off on top of auto_flush=off, the whole transaction
         // waits for flush(), which sends one frame per table. Ten tables of ~28 KB need five 64 KiB
@@ -2741,6 +2946,46 @@ public class QwpLargeTransactionTest {
         return kinds.toString();
     }
 
+    private static void assertRefused(String expectedMessage, Runnable action) {
+        try {
+            action.run();
+            Assert.fail("the transaction must be refused");
+        } catch (TransactionTooLargeException e) {
+            Assert.assertEquals(expectedMessage, e.getMessage());
+        }
+    }
+
+    // The I/O thread learns of the server's refusal first; a row added before the sender
+    // learns of it still goes in.
+    private static void awaitRefusalReachesSender(QwpWebSocketSender s) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (s.cursorSendLoopForTest().getRefusedTransactionFsn() < 0) {
+            if (System.nanoTime() > deadline) {
+                Assert.fail("the sender never learned of the refusal");
+            }
+            Thread.sleep(1);
+        }
+    }
+
+    // The refusal of a transaction one table of which holds rows, at or past a limit the
+    // sender learned after it accepted them.
+    private static String overLimitError(String table, long rows, long maxUncommittedRows, boolean isSpellings) {
+        return "transaction too large for the server [table=" + table + ", rows=" + rows
+                + ", maxUncommittedRows=" + maxUncommittedRows + "]; the sender accepted these rows of the table "
+                + "before it learned the server's qwp.max.uncommitted.rows, at which the server commits a table's "
+                + "rows on its own, so the transaction cannot commit as one."
+                + (isSpellings ? " Rows sent under names that differ only in letter case count together: the "
+                + "server counts them as one table." : "")
+                + " Call rollback() to discard it, and raise qwp.max.uncommitted.rows on the server";
+    }
+
+    // The refusal of a transaction the server refused, with or without a message.
+    private static String serverRefusalError(String serverMessage) {
+        return "transaction refused by the server" + (serverMessage != null ? ": " + serverMessage + '.' : ".")
+                + " The sender accepted the transaction's rows before it learned the server's "
+                + "qwp.max.uncommitted.rows, and the transaction cannot commit as one. Call rollback() to discard it";
+    }
+
     private static String serverRowLimitError(String table, long maxUncommittedRows) {
         return "transaction too large for the server [table=" + table + ", rows=" + maxUncommittedRows
                 + ", maxUncommittedRows=" + maxUncommittedRows + "]; the server commits a table's rows on its "
@@ -3038,6 +3283,10 @@ public class QwpLargeTransactionTest {
             return size == QwpConstants.HEADER_SIZE && flags == QwpConstants.ROLLBACK_FRAME_FLAGS;
         }
 
+        boolean isStrict() {
+            return (flags & QwpConstants.FLAG_STRICT) != 0;
+        }
+
         @Override
         public String toString() {
             return connection + ":" + (isRollback() ? "R" : isDeferred() ? "D" : "C") + size;
@@ -3057,10 +3306,20 @@ public class QwpLargeTransactionTest {
      * frame: the group stays open, and the next commit on the connection commits it.
      */
     private static final class TxnServer implements TestWebSocketServer.WebSocketServerHandler {
+        // The message the server refuses a strict frame with.
+        static final String REFUSAL = "strict transaction too large";
         // Every frame received, over all connections, in arrival order.
         final List<TxnFrame> frames = new CopyOnWriteArrayList<>();
         volatile boolean isAckingRollback = true;
+        // Refuses a strict commit frame, as the QuestDB server does one whose rows take a
+        // table to qwp.max.uncommitted.rows.
+        volatile boolean isRefusingStrictCommit;
+        // Refuses the strict deferred frame at this position in its group, 0 for none.
+        volatile int refusingStrictDeferredFrame;
+        // The message of a refusal; null sends none.
+        volatile String refusalMessage = REFUSAL;
         volatile int rolledBackGroups;
+        private int refusals;
         // Frames a commit frame committed, in commit order.
         private final List<TxnFrame> committed = new ArrayList<>();
         private final Map<TestWebSocketServer.ClientHandler, Connection> connections = new IdentityHashMap<>();
@@ -3077,14 +3336,29 @@ public class QwpLargeTransactionTest {
             frames.add(frame);
             notifyAll();
             try {
+                // A refusal discards the group and, as on the QuestDB server, stops the
+                // processing of everything the connection sends after it.
+                if (connection.isRefused) {
+                    return;
+                }
+                if (frame.isStrict() && (frame.isCommit() ? isRefusingStrictCommit
+                        : ++connection.strictDeferredFrames == refusingStrictDeferredFrame)) {
+                    refusals++;
+                    connection.group.clear();
+                    connection.isRefused = true;
+                    client.sendBinary(refusal(seq, refusalMessage));
+                    return;
+                }
                 if (frame.isCommit()) {
                     committed.addAll(connection.group);
                     committed.add(frame);
                     connection.group.clear();
+                    connection.strictDeferredFrames = 0;
                     client.sendBinary(ack(seq));
                 } else if (frame.isRollback() && client.isRollbackConfirmed()) {
                     rolledBackGroups++;
                     connection.group.clear();
+                    connection.strictDeferredFrames = 0;
                     if (isAckingRollback) {
                         client.sendBinary(ack(seq));
                     }
@@ -3094,6 +3368,22 @@ public class QwpLargeTransactionTest {
             } catch (IOException e) {
                 throw new RuntimeException(e);
             }
+        }
+
+        synchronized int refusals() {
+            return refusals;
+        }
+
+        // STATUS_TRANSACTION_TOO_LARGE for the frame at seq.
+        private static byte[] refusal(long seq, String message) {
+            byte[] text = message == null ? new byte[0] : message.getBytes(StandardCharsets.UTF_8);
+            byte[] buf = new byte[1 + 8 + 2 + text.length];
+            ByteBuffer bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN);
+            bb.put(WebSocketResponse.STATUS_TRANSACTION_TOO_LARGE);
+            bb.putLong(seq);
+            bb.putShort((short) text.length);
+            bb.put(text);
+            return buf;
         }
 
         synchronized boolean awaitRollbackFrames(int count) throws InterruptedException {
@@ -3173,7 +3463,9 @@ public class QwpLargeTransactionTest {
             // Deferred frames the connection holds uncommitted.
             final List<TxnFrame> group = new ArrayList<>();
             final int index;
+            boolean isRefused;
             long nextSeq;
+            int strictDeferredFrames;
 
             Connection(int index) {
                 this.index = index;
