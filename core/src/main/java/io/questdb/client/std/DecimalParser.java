@@ -196,9 +196,9 @@ public final class DecimalParser {
         int literalScale = dot == -1 ? 0 : (digitHi - dot - 1);
         int literalDigits = digitHi - digitLo - (dot == -1 ? 0 : 1);
 
-        int virtualScale = literalScale;
+        long virtualScale = literalScale;
 
-        int exp = 0;
+        long exp = 0;
         if (lo != hi) {
             // Parses exponent
             if ((cs.charAt(lo) | 32) == 'e') {
@@ -222,7 +222,7 @@ public final class DecimalParser {
 
         // If lossy is enabled, we can strip digits after the provided scale (as long as it is provided)
         if (lossy && scale >= 0 && virtualScale > scale) {
-            int drop = virtualScale - scale;
+            long drop = virtualScale - scale;
             while (drop > 0 && digitHi > digitLo) {
                 digitHi--;
                 if (digitHi == dot) {
@@ -237,7 +237,12 @@ public final class DecimalParser {
 
         // We still need to adjust the exponent if the user specifies a target scale.
         if (scale == -1) {
-            scale = virtualScale;
+            if (virtualScale > decimal.getMaxScale()) {
+                throw NumericException.instance()
+                        .put("decimal '").put(cs)
+                        .put("' exceeds maximum allowed scale of ").put(decimal.getMaxScale());
+            }
+            scale = (int) virtualScale;
         } else if (virtualScale <= scale) {
             exp += scale - virtualScale;
         } else {
@@ -258,8 +263,8 @@ public final class DecimalParser {
         // precision, as long as it's lower.
 
         // Compute the final precision of the decimal
-        int pow = literalDigits + exp;
-        final int finalPrecision = Math.max(pow, scale + 1);
+        long pow = literalDigits + exp;
+        final long finalPrecision = Math.max(pow, (long) scale + 1);
         if (precision != -1 && finalPrecision > precision) {
             throw NumericException.instance()
                     .put("decimal '").put(cs)
@@ -278,7 +283,7 @@ public final class DecimalParser {
                 continue;
             }
 
-            decimal.addPowerOfTenMultiple(--pow, cs.charAt(p) - '0');
+            decimal.addPowerOfTenMultiple((int) --pow, cs.charAt(p) - '0');
         }
         decimal.setScale(scale);
 
@@ -286,7 +291,7 @@ public final class DecimalParser {
             decimal.negate();
         }
 
-        return Numbers.encodeLowHighInts(finalPrecision, scale);
+        return Numbers.encodeLowHighInts((int) finalPrecision, scale);
     }
 
     /**
