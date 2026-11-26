@@ -24,6 +24,9 @@
 
 package io.questdb.client;
 
+import io.questdb.client.cutlass.qwp.client.QwpEgressMsgKind;
+import io.questdb.client.cutlass.qwp.client.QwpQueryOptions;
+
 /**
  * Thrown from {@link Completion#await()} / {@link Completion#await(long, java.util.concurrent.TimeUnit)}
  * when the server reported an error for the corresponding {@link Query},
@@ -32,20 +35,40 @@ package io.questdb.client;
  * <p>
  * The original wire-level status byte is exposed via {@link #getStatus()} so
  * callers can distinguish cancellation from schema errors etc. without
- * string-matching the message.
+ * string-matching the message. When the query asked for the error position
+ * with {@link QwpQueryOptions#errorPosition(boolean)}, {@link #getPosition()}
+ * points at the offending character of the SQL text.
  */
 public class QueryException extends RuntimeException {
 
+    private final int position;
     private final byte status;
 
     public QueryException(byte status, String message) {
+        this(status, message, QwpEgressMsgKind.NO_ERROR_POSITION);
+    }
+
+    public QueryException(byte status, String message, int position) {
         super(message);
         this.status = status;
+        this.position = position;
     }
 
     public QueryException(byte status, String message, Throwable cause) {
         super(message, cause);
         this.status = status;
+        this.position = QwpEgressMsgKind.NO_ERROR_POSITION;
+    }
+
+    /**
+     * Returns the {@code char} index into the SQL text the server-reported
+     * error points at, or {@link QwpEgressMsgKind#NO_ERROR_POSITION} when the
+     * query did not ask for it with {@link QwpQueryOptions#errorPosition(boolean)},
+     * the server did not report it, or the error does not come from the SQL
+     * text.
+     */
+    public int getPosition() {
+        return position;
     }
 
     /**

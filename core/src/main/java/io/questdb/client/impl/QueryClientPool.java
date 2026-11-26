@@ -604,6 +604,24 @@ public final class QueryClientPool implements AutoCloseable {
         return closed;
     }
 
+    /**
+     * Installs {@code hook} on every worker the pool has created so far. Each
+     * worker runs it on its own thread after a query returns and before the
+     * worker takes the next one, which lets a test park a worker between two
+     * queries. Null removes it.
+     */
+    @TestOnly
+    public void setBusyWorkerHookForTesting(Runnable hook) {
+        lock.lock();
+        try {
+            for (int i = 0, n = all.size(); i < n; i++) {
+                all.get(i).busyWorkerTestHook = hook;
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
     @TestOnly
     public void setCreationWaitRetryHookForTesting(Runnable hook) {
         this.creationWaitRetryHook = hook;
