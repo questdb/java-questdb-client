@@ -79,6 +79,8 @@ public final class QueryWorker {
     // classes involved (QueryWorker, QueryImpl) are final and QwpQueryClient
     // has no test seam, so this is the only race-free reproduction point. See
     // QueryWorkerTest.testBusyWorkerShutdownStrandsReDispatchedCurrent.
+    // QueryClientPool.setBusyWorkerHookForTesting() installs it too, for tests
+    // that park the worker between two queries.
     volatile Runnable busyWorkerTestHook;
     // Monotonic lease id. Mutated only under the QueryClientPool lock
     // (bumped once in acquire() when the worker is handed out and once in
