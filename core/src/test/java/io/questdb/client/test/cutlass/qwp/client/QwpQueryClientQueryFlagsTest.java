@@ -314,6 +314,32 @@ public class QwpQueryClientQueryFlagsTest {
      * (c-questdb-client 7.2.0 and py-questdb-client 6.0.0).
      */
     @Test
+    public void testTimeoutGoesAheadOfTheRowWindow() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (QwpEgressMockServer server = new QwpEgressMockServer(
+                    ALL_CAPABILITIES | QwpEgressMsgKind.CAP_QUERY_TIMEOUT, QwpQueryClientQueryFlagsTest::execDone);
+                 QwpQueryClient client = newClient(server)) {
+                client.connect();
+                RecordingQueryHandler handler = new RecordingQueryHandler();
+                client.execute(SQL, null, handler, new QwpQueryOptions().skipRows(300).maxRows(16_384), 30_000);
+                Assert.assertEquals("the query must complete", 1, handler.execDoneCount);
+                server.assertNoFailure();
+                Assert.assertEquals(1, server.getRequests().size());
+                QwpEgressFrames.QueryRequest r = server.getRequests().get(0);
+                Assert.assertEquals(QwpEgressMsgKind.QUERY_FLAG_TIMEOUT | QwpEgressMsgKind.QUERY_FLAG_SKIP_ROWS
+                        | QwpEgressMsgKind.QUERY_FLAG_MAX_ROWS, r.queryFlags);
+                // fields follow the flags in ascending order of their bits:
+                // timeout_ms, skip_rows, max_rows
+                Assert.assertTrue("timeout_ms must carry the budget left: " + r.timeoutMs,
+                        r.timeoutMs > 29_000 && r.timeoutMs <= 30_000);
+                Assert.assertEquals(300, r.skipRows);
+                Assert.assertEquals(16_384, r.maxRows);
+                Assert.assertEquals(0, r.trailingBytes);
+            }
+        });
+    }
+
+    @Test
     public void testWireBitsAreDistinctAndLeaveTimeoutBitsFree() {
         Assert.assertEquals(0x08, QwpEgressMsgKind.CAP_QUERY_TIMEOUT);
         Assert.assertEquals(0x02, QwpEgressMsgKind.QUERY_FLAG_TIMEOUT);

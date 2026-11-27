@@ -56,11 +56,16 @@ public final class QwpEgressMsgKind {
      */
     public static final int CAP_QUERY_FLAGS = 0x00000002;
     /**
-     * {@code SERVER_INFO.capabilities} bit reserved for per-query timeouts, which
-     * this client does not send. Released clients (c-questdb-client 7.2.0 and
-     * later, and the Python client built on it) read the bit as "the server
-     * honours {@link #QUERY_FLAG_TIMEOUT}", so no other capability may take it.
-     * Mirrors the server-side constant
+     * {@code SERVER_INFO.capabilities} bit: the server enforces a per-query
+     * timeout carried on {@code QUERY_REQUEST}. When set (together with
+     * {@link #CAP_QUERY_FLAGS}), a client that wants a timeout sets
+     * {@link #QUERY_FLAG_TIMEOUT} and appends {@code timeout_ms:varint} after the
+     * {@code query_flags} trailer; the server then ends an over-budget query with
+     * a {@code QUERY_ERROR} carrying
+     * {@link io.questdb.client.cutlass.qwp.protocol.QwpConstants#STATUS_QUERY_TIMEOUT},
+     * leaving the connection open. Released clients (c-questdb-client 7.2.0 and
+     * later, and the Python client built on it) read the bit the same way, so no
+     * other capability may take it. Mirrors the server-side constant
      * {@code io.questdb.cutlass.qwp.codec.QwpEgressMsgKind#CAP_QUERY_TIMEOUT}.
      */
     public static final int CAP_QUERY_TIMEOUT = 0x00000008;
@@ -127,7 +132,8 @@ public final class QwpEgressMsgKind {
      * {@code QUERY_REQUEST.query_flags} bit: leave out the first
      * {@code skip_rows} rows of the result set. The request carries
      * {@code skip_rows:varint} after {@code query_flags}, behind the fields of
-     * the lower flag bits, of which this client sends none. Statements that do
+     * the lower flag bits: after {@code timeout_ms} when
+     * {@link #QUERY_FLAG_TIMEOUT} is set too. Statements that do
      * not produce rows ignore it. Sent only when the server advertised
      * {@link #CAP_QUERY_DETAILS}.
      */
@@ -143,14 +149,13 @@ public final class QwpEgressMsgKind {
      */
     public static final int QUERY_FLAG_STATS = 0x08;
     /**
-     * {@code QUERY_REQUEST.query_flags} bit reserved for per-query timeouts, which
-     * this client does not send. Released clients (c-questdb-client 7.2.0 and
-     * later, and the Python client built on it) send it, followed by a
-     * {@code timeout_ms:varint}, to a server that advertises
-     * {@link #CAP_QUERY_TIMEOUT}, so no other flag may take this bit. A flag that
-     * carries a field appends it after {@code query_flags} in ascending order of
-     * the flag bits, so {@code timeout_ms} goes ahead of {@code skip_rows} and
-     * {@code max_rows}. Mirrors the server-side constant
+     * {@code QUERY_REQUEST.query_flags} bit: a {@code timeout_ms:varint} field
+     * follows the {@code query_flags} varint. A flag that carries a field appends
+     * it after {@code query_flags} in ascending order of the flag bits, so
+     * {@code timeout_ms} goes ahead of {@code skip_rows} and {@code max_rows}.
+     * The server runs the query under that timeout instead of its default
+     * {@code query.timeout}. Sent only when the server advertised
+     * {@link #CAP_QUERY_TIMEOUT}. Mirrors the server-side constant
      * {@code io.questdb.cutlass.qwp.codec.QwpEgressMsgKind#QUERY_FLAG_TIMEOUT}.
      */
     public static final int QUERY_FLAG_TIMEOUT = 0x02;

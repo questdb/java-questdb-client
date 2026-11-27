@@ -19,6 +19,9 @@ import java.util.concurrent.TimeUnit;
  * blocking {@link Completion#await()} throws {@link QueryException} carrying
  * that status. If the query finished before the cancel landed, {@code await()}
  * returns normally -- {@code cancel()} is a no-op on an already-terminal query.
+ * <p>
+ * To stop queries that run too long without driving the cancel yourself, give
+ * them a timeout instead; see {@link QueryTimeoutExample}.
  */
 public class QueryCancellationExample {
 

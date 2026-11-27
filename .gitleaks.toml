@@ -1,0 +1,16 @@
+# Gitleaks configuration, picked up from the repository root by the Gitleaks workflow.
+#
+# Keep every default rule and only add narrow exceptions for known false positives.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Known false positives"
+regexTarget = "secret"
+regexes = [
+    # The example Sec-WebSocket-Key value from RFC 6455 section 1.3, base64 of
+    # "the sample nonce". Tests send it in hand-written WebSocket upgrade requests.
+    # It is a public handshake nonce, not a credential.
+    '''dGhlIHNhbXBsZSBub25jZQ==''',
+]

@@ -61,8 +61,8 @@ public final class QwpEgressFrames {
 
     /**
      * Parses a {@code QUERY_REQUEST} payload. Supports the LONG binds tests
-     * send; the {@code query_flags} trailer and the row-window values follow
-     * the binds.
+     * send; the {@code query_flags} trailer, the timeout and the row-window
+     * values follow the binds.
      */
     public static QueryRequest parseQueryRequest(byte[] payload) {
         Reader rd = new Reader(payload);
@@ -79,9 +79,10 @@ public final class QwpEgressFrames {
         }
         boolean hasQueryFlags = rd.remaining() > 0;
         long queryFlags = hasQueryFlags ? rd.varint() : 0;
+        long timeoutMs = (queryFlags & QwpEgressMsgKind.QUERY_FLAG_TIMEOUT) != 0 ? rd.varint() : -1;
         long skipRows = (queryFlags & QwpEgressMsgKind.QUERY_FLAG_SKIP_ROWS) != 0 ? rd.varint() : -1;
         long maxRows = (queryFlags & QwpEgressMsgKind.QUERY_FLAG_MAX_ROWS) != 0 ? rd.varint() : -1;
-        return new QueryRequest(payload, requestId, sql, longBinds, hasQueryFlags, queryFlags, skipRows, maxRows, rd.remaining());
+        return new QueryRequest(payload, requestId, sql, longBinds, hasQueryFlags, queryFlags, timeoutMs, skipRows, maxRows, rd.remaining());
     }
 
     /**
@@ -212,6 +213,7 @@ public final class QwpEgressFrames {
         public final long requestId;
         public final long skipRows;
         public final String sql;
+        public final long timeoutMs;
         public final int trailingBytes;
 
         QueryRequest(
@@ -221,6 +223,7 @@ public final class QwpEgressFrames {
                 long[] longBinds,
                 boolean hasQueryFlags,
                 long queryFlags,
+                long timeoutMs,
                 long skipRows,
                 long maxRows,
                 int trailingBytes
@@ -231,6 +234,7 @@ public final class QwpEgressFrames {
             this.longBinds = longBinds;
             this.hasQueryFlags = hasQueryFlags;
             this.queryFlags = queryFlags;
+            this.timeoutMs = timeoutMs;
             this.skipRows = skipRows;
             this.maxRows = maxRows;
             this.trailingBytes = trailingBytes;
@@ -246,6 +250,7 @@ public final class QwpEgressFrames {
                     + ", sql='" + sql + '\''
                     + ", hasQueryFlags=" + hasQueryFlags
                     + ", queryFlags=0x" + Long.toHexString(queryFlags)
+                    + ", timeoutMs=" + timeoutMs
                     + ", skipRows=" + skipRows
                     + ", maxRows=" + maxRows
                     + ", trailingBytes=" + trailingBytes

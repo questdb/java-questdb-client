@@ -63,6 +63,10 @@ public interface Completion {
     /**
      * Blocks up to the given timeout. Returns {@code true} if the query
      * completed, {@code false} on timeout.
+     * <p>
+     * This bounds only how long the caller waits: on {@code false} the query
+     * keeps running. To stop queries that run too long, set a query timeout
+     * ({@link Query#timeout(long, TimeUnit)} or {@code query_timeout_ms}).
      *
      * @throws QueryException       if the server reported an error or
      *                              {@link #cancel()} won the race

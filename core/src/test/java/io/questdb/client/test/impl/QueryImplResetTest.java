@@ -71,10 +71,12 @@ public class QueryImplResetTest {
             Field bindsF = queryImplClass.getDeclaredField("userBinds");
             Field sqlBufF = queryImplClass.getDeclaredField("sqlBuffer");
             Field doneF = queryImplClass.getDeclaredField("done");
+            Field timeoutF = queryImplClass.getDeclaredField("timeoutMillis");
             handlerF.setAccessible(true);
             bindsF.setAccessible(true);
             sqlBufF.setAccessible(true);
             doneF.setAccessible(true);
+            timeoutF.setAccessible(true);
 
             // Seed builder state as a prior borrow would have left it.
             handlerF.set(q, new NoopHandler());
@@ -82,6 +84,7 @@ public class QueryImplResetTest {
                 // no-op
             });
             ((StringSink) sqlBufF.get(q)).put("SELECT 1");
+            timeoutF.setLong(q, 0L); // a prior borrow disabled the timeout
             doneF.setBoolean(q, false);
 
             Method reset = queryImplClass.getDeclaredMethod("resetForBorrow");
@@ -97,6 +100,8 @@ public class QueryImplResetTest {
                     0, sqlBuffer.length());
             Assert.assertTrue("done must be true so the handle starts idle, not in flight",
                     doneF.getBoolean(q));
+            Assert.assertEquals("the query timeout must fall back to the configured default (-1)",
+                    -1L, timeoutF.getLong(q));
         });
     }
 
