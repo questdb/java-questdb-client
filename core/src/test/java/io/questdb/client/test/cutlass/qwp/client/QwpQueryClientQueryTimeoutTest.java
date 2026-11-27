@@ -41,6 +41,7 @@ import org.junit.Test;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -693,6 +694,37 @@ public class QwpQueryClientQueryTimeoutTest {
                 script.close();
             }
         });
+    }
+
+    @Test
+    public void testReconnectStepBoundOutlastsTheQueryDeadline() throws Exception {
+        // A reconnect step counts whole milliseconds and may give up to 1ms before
+        // its bound: the native connect truncates its remaining time. A step the
+        // query deadline cuts short must still end past that deadline, or the
+        // failure reads as a failed reconnect instead of the query's timeout.
+        try (QwpQueryClient client = QwpQueryClient.fromConfig("ws::addr=localhost:1;")) {
+            Field active = QwpQueryClient.class.getDeclaredField("connectDeadlineActive");
+            active.setAccessible(true);
+            Field deadline = QwpQueryClient.class.getDeclaredField("connectDeadlineNanos");
+            deadline.setAccessible(true);
+            Method bound = QwpQueryClient.class.getDeclaredMethod("boundToConnectDeadline", long.class);
+            bound.setAccessible(true);
+            active.setBoolean(client, true);
+            for (long leftMicros : new long[]{1, 100, 500, 999, 1_000, 1_001, 1_500, 2_999}) {
+                for (long configuredMs : new long[]{0, 5_000}) {
+                    long deadlineNanos = System.nanoTime() + TimeUnit.MICROSECONDS.toNanos(leftMicros);
+                    deadline.setLong(client, deadlineNanos);
+                    int boundMs = (int) bound.invoke(client, configuredMs);
+                    long afterNanos = System.nanoTime();
+                    Assert.assertTrue("left=" + leftMicros + "us, configured=" + configuredMs
+                                    + "ms: a step that gives up 1ms early must still end past the deadline, bound="
+                                    + boundMs + "ms",
+                            afterNanos + TimeUnit.MILLISECONDS.toNanos(boundMs - 1) - deadlineNanos >= 0);
+                    Assert.assertTrue("the bound must stay near the time left, bound=" + boundMs + "ms",
+                            boundMs <= TimeUnit.MICROSECONDS.toMillis(leftMicros) + 2);
+                }
+            }
+        }
     }
 
     @Test(timeout = 30_000)

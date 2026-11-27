@@ -1781,11 +1781,18 @@ public class QwpQueryClient implements QuietCloseable {
      * configured timeout. {@code configuredMs <= 0} means the step has no bound
      * of its own ({@code connect_timeout}'s OS-default sentinel) and passes
      * through unchanged when no reconnect deadline is active.
+     * <p>
+     * The bound is the time left plus 1ms. The steps count whole milliseconds
+     * and can give up to 1ms before their budget runs out: the native connect
+     * truncates its remaining time, the {@code SERVER_INFO} wait reads
+     * {@link System#currentTimeMillis()}. Without the extra millisecond, a step
+     * the deadline cuts short could fail just before the deadline, and the
+     * failure would read as a failed reconnect rather than the query's timeout.
      */
     private int boundToConnectDeadline(long configuredMs) {
         long boundedMs = configuredMs;
         if (connectDeadlineActive) {
-            long remainingMs = Math.max(1L, remainingMillisCeil(connectDeadlineNanos));
+            long remainingMs = remainingMillisCeil(connectDeadlineNanos) + 1L;
             boundedMs = configuredMs > 0L ? Math.min(configuredMs, remainingMs) : remainingMs;
         }
         return (int) Math.min(boundedMs, Integer.MAX_VALUE);
