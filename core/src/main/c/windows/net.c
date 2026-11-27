@@ -325,6 +325,66 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_setTcpNoDelay
     return set_int_sockopt((SOCKET) fd, IPPROTO_TCP, TCP_NODELAY, noDelay);
 }
 
+// The doorbell is a manual-reset kernel Event (kernel handles fit in 32 bits
+// on 64-bit Windows). The wait is WSAEventSelect + WaitForMultipleObjects,
+// because WSAPoll cannot wait on anything that is not a socket.
+JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_doorbellCreate
+        (JNIEnv *e, jclass cl) {
+    HANDLE h = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (h == NULL) {
+        SaveLastError();
+        return -1;
+    }
+    return (jint) (uintptr_t) h;
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_doorbellRing
+        (JNIEnv *e, jclass cl, jint doorbell) {
+    if (!SetEvent((HANDLE) (uintptr_t) (uint32_t) doorbell)) {
+        SaveLastError();
+        return -1;
+    }
+    return 0;
+}
+
+JNIEXPORT void JNICALL Java_io_questdb_client_network_Net_doorbellClose
+        (JNIEnv *e, jclass cl, jint doorbell) {
+    CloseHandle((HANDLE) (uintptr_t) (uint32_t) doorbell);
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_awaitReadableOrRing
+        (JNIEnv *e, jclass cl, jint socketFd, jint doorbell, jint timeoutMillis) {
+    WSAEVENT sockEvent = WSACreateEvent();
+    if (sockEvent == WSA_INVALID_EVENT) {
+        SaveLastError();
+        return -1;
+    }
+    // FD_READ is recorded immediately when data is already pending, so this is
+    // a level-triggered readability wait.
+    if (WSAEventSelect((SOCKET) socketFd, sockEvent, FD_READ | FD_CLOSE) == SOCKET_ERROR) {
+        SaveLastError();
+        WSACloseEvent(sockEvent);
+        return -1;
+    }
+    HANDLE handles[2] = {sockEvent, (HANDLE) (uintptr_t) (uint32_t) doorbell};
+    DWORD r = WaitForMultipleObjects(2, handles, FALSE, timeoutMillis < 0 ? INFINITE : (DWORD) timeoutMillis);
+    // Detach the event; the socket stays non-blocking, which it already was.
+    WSAEventSelect((SOCKET) socketFd, NULL, 0);
+    WSACloseEvent(sockEvent);
+    if (r == WAIT_TIMEOUT) {
+        return 0;
+    }
+    if (r == WAIT_OBJECT_0 + 1) {
+        // Consume the ring (manual-reset event).
+        ResetEvent((HANDLE) (uintptr_t) (uint32_t) doorbell);
+    }
+    if (r == WAIT_FAILED) {
+        SaveLastError();
+        return -1;
+    }
+    return 1;
+}
+
 JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_socketUdp
         (JNIEnv *e, jclass cl) {
     SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);

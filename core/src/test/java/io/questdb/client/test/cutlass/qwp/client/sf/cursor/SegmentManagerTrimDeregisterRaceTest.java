@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentBudget;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
 import io.questdb.client.std.Files;
@@ -88,12 +89,12 @@ public class SegmentManagerTrimDeregisterRaceTest {
             long segSize = MmapSegment.HEADER_SIZE + (MmapSegment.FRAME_HEADER_SIZE + 32);
             long maxTotal = segSize * 8L;
 
-            // Large pollNanos: the worker parks until explicitly woken, so we
-            // own the tick boundaries. SegmentRing fires managerWakeup on
+            // The worker parks until explicitly woken, so we own the tick
+            // boundaries. SegmentRing fires managerWakeup on
             // appendOrFsn whenever a spare is needed, so the producer-driven
             // setup phase still gets prompt service.
             try (SegmentManager mgr = new SegmentManager(
-                    segSize, TimeUnit.SECONDS.toNanos(60), maxTotal)) {
+                    segSize, new SegmentBudget(maxTotal))) {
                 mgr.start();
 
                 String dir = tmpDir + "/single-ring";
@@ -109,14 +110,12 @@ public class SegmentManagerTrimDeregisterRaceTest {
                     // provision a spare; wait for that spare so the next
                     // append can rotate.
                     ring.appendOrFsn(buf, 32);
-                    awaitSpare(ring, "after seg0 fill");
                     // Rotate: seg0 joins sealedSegments, the spare becomes
                     // active. Worker auto-wakes again to provision the next
                     // spare; whether that completes before we install the
                     // hook does not matter for the test (the hook fires only
                     // on a worker tick we trigger explicitly below).
                     ring.appendOrFsn(buf, 32);
-                    awaitSpare(ring, "after rotation");
                     // FSN 0 acked: seg0 (baseSeq=0, lastSeq=0) is now
                     // trimmable. Acknowledge does NOT wake the worker, so the
                     // trim does not happen until we wakeWorker() below.
@@ -167,9 +166,9 @@ public class SegmentManagerTrimDeregisterRaceTest {
                     // Wait for the worker to park again, which is our signal
                     // that the trim block following the hook has finished
                     // (drain + maybe-subtract + lock release + iteration
-                    // exit). The 60 s pollNanos means TIMED_WAITING is a
-                    // strong signal; with the entry deregistered, no further
-                    // wakeups arrive.
+                    // exit). The worker parks indefinitely between wakeups, so a
+                    // parked state is a strong signal; with the entry
+                    // deregistered, no further wakeups arrive.
                     Thread worker = workerThread(mgr);
                     awaitParked(worker);
 
@@ -207,16 +206,6 @@ public class SegmentManagerTrimDeregisterRaceTest {
             if (s == Thread.State.TIMED_WAITING || s == Thread.State.WAITING) return;
             if (System.nanoTime() > deadline) {
                 throw new AssertionError("worker did not park within 5 s; state=" + s);
-            }
-            io.questdb.client.std.Compat.onSpinWait();
-        }
-    }
-
-    private static void awaitSpare(SegmentRing ring, String where) {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-        while (ring.needsHotSpare()) {
-            if (System.nanoTime() > deadline) {
-                throw new AssertionError("spare never installed " + where);
             }
             io.questdb.client.std.Compat.onSpinWait();
         }

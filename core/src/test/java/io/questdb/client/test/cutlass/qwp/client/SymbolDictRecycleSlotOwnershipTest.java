@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.Sender;
 import io.questdb.client.SenderErrorHandler;
 import io.questdb.client.cutlass.line.LineSenderException;
@@ -378,7 +379,7 @@ public class SymbolDictRecycleSlotOwnershipTest {
     private static void assertUnlockableSlotKeepsIngesting(TestWebSocketServer server, String slot) throws Exception {
         CursorSendEngine engine = new CursorSendEngine(slot, SEGMENT_BYTES);
         try (QwpWebSocketSender sender = QwpWebSocketSender.connect(
-                "localhost", server.getPort(), null, 0, 0, 0L, null, false, engine)) {
+                "localhost", server.getPort(), null, 0, 0, 0L, null, DurableAckTiers.NONE, engine)) {
             sender.setEngineRebuildFactory(() -> new CursorSendEngine(slot, SEGMENT_BYTES));
             sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
             Assert.assertTrue(sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));

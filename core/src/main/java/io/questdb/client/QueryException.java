@@ -24,6 +24,8 @@
 
 package io.questdb.client;
 
+import io.questdb.client.cutlass.qwp.client.QwpEgressMsgKind;
+import io.questdb.client.cutlass.qwp.client.QwpQueryOptions;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 
 /**
@@ -37,19 +39,40 @@ import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
  * string-matching the message. A query that ran past its timeout (see
  * {@link Query#timeout(long, java.util.concurrent.TimeUnit)}) reports
  * {@link QwpConstants#STATUS_QUERY_TIMEOUT}; {@link #isTimeout()} tests for it.
+ * When the query asked for the error position with
+ * {@link QwpQueryOptions#errorPosition(boolean)}, {@link #getPosition()} points
+ * at the offending character of the SQL text.
  */
 public class QueryException extends RuntimeException {
 
+    private final int position;
     private final byte status;
 
     public QueryException(byte status, String message) {
+        this(status, message, QwpEgressMsgKind.NO_ERROR_POSITION);
+    }
+
+    public QueryException(byte status, String message, int position) {
         super(message);
         this.status = status;
+        this.position = position;
     }
 
     public QueryException(byte status, String message, Throwable cause) {
         super(message, cause);
         this.status = status;
+        this.position = QwpEgressMsgKind.NO_ERROR_POSITION;
+    }
+
+    /**
+     * Returns the {@code char} index into the SQL text the server-reported
+     * error points at, or {@link QwpEgressMsgKind#NO_ERROR_POSITION} when the
+     * query did not ask for it with {@link QwpQueryOptions#errorPosition(boolean)},
+     * the server did not report it, or the error does not come from the SQL
+     * text.
+     */
+    public int getPosition() {
+        return position;
     }
 
     /**

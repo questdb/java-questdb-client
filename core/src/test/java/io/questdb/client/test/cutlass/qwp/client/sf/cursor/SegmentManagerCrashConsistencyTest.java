@@ -15,6 +15,7 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentBudget;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
 import io.questdb.client.std.Files;
@@ -63,10 +64,10 @@ public class SegmentManagerCrashConsistencyTest {
             ring = new SegmentRing(MmapSegment.create(root + "/sf-0.sfa", 0, segmentSize), segmentSize);
             Assert.assertEquals(0L, ring.appendOrFsn(payload, 1));
             for (int i = 1; i <= sealedCount; i++) {
-                ring.installHotSpare(MmapSegment.create(root + "/sf-" + i + ".sfa", i, segmentSize));
+                QueueSegmentSource.install(ring, MmapSegment.create(root + "/sf-" + i + ".sfa", i, segmentSize));
                 Assert.assertEquals(i, ring.appendOrFsn(payload, 1));
             }
-            ring.installHotSpare(MmapSegment.create(root + "/sf-" + (sealedCount + 1) + ".sfa",
+            QueueSegmentSource.install(ring, MmapSegment.create(root + "/sf-" + (sealedCount + 1) + ".sfa",
                     sealedCount + 1L, segmentSize));
             Assert.assertTrue(ring.acknowledge(sealedCount - 1L));
             success = true;
@@ -116,7 +117,7 @@ public class SegmentManagerCrashConsistencyTest {
                 watermark = openWatermark(ff, root);
                 Assert.assertNotNull(watermark);
                 try (SegmentManager manager = new SegmentManager(
-                        segmentSize, TimeUnit.SECONDS.toNanos(60), segmentSize * 8L, ff, ff::ticks)) {
+                        segmentSize, segmentSize * 8L, ff, ff::ticks)) {
                     manager.register(ring, root, watermark);
                     ff.active = true;
                     manager.start();
@@ -151,7 +152,7 @@ public class SegmentManagerCrashConsistencyTest {
                     watermark = openWatermark(ff, root);
                     Assert.assertNotNull(watermark);
                     try (SegmentManager manager = new SegmentManager(
-                            segmentSize, TimeUnit.SECONDS.toNanos(60), segmentSize * 8L, ff, ff::ticks)) {
+                            segmentSize, segmentSize * 8L, ff, ff::ticks)) {
                         manager.register(ring, root, watermark);
                         ff.active = true;
                         manager.start();
@@ -203,7 +204,7 @@ public class SegmentManagerCrashConsistencyTest {
                 ring = createRing(root, segmentSize, payload, 1);
                 CountDownLatch servicePass = new CountDownLatch(1);
                 try (SegmentManager manager = new SegmentManager(
-                        segmentSize, TimeUnit.SECONDS.toNanos(60), segmentSize * 8L)) {
+                        segmentSize, new SegmentBudget(segmentSize * 8L))) {
                     manager.setBeforeTrimSyncHook(servicePass::countDown);
                     manager.register(ring, root, null);
                     manager.start();
@@ -237,7 +238,7 @@ public class SegmentManagerCrashConsistencyTest {
                 watermark = openWatermark(ff, root);
                 Assert.assertNotNull(watermark);
                 try (SegmentManager manager = new SegmentManager(
-                        segmentSize, TimeUnit.SECONDS.toNanos(60), segmentSize * 70L, ff, ff::ticks)) {
+                        segmentSize, segmentSize * 70L, ff, ff::ticks)) {
                     manager.register(ring, root, watermark);
                     ff.active = true;
                     manager.start();
@@ -279,7 +280,7 @@ public class SegmentManagerCrashConsistencyTest {
                 badWatermark = openWatermark(ff, badRoot);
                 goodWatermark = openWatermark(ff, goodRoot);
                 try (SegmentManager manager = new SegmentManager(
-                        segmentSize, TimeUnit.SECONDS.toNanos(60), segmentSize * 16L, ff, ff::ticks)) {
+                        segmentSize, segmentSize * 16L, ff, ff::ticks)) {
                     manager.register(badRing, badRoot, badWatermark);
                     manager.register(goodRing, goodRoot, goodWatermark);
                     ff.active = true;
@@ -326,7 +327,7 @@ public class SegmentManagerCrashConsistencyTest {
                     AtomicInteger logs = new AtomicInteger();
                     AtomicInteger passes = new AtomicInteger();
                     try (SegmentManager manager = new SegmentManager(
-                            segmentSize, TimeUnit.SECONDS.toNanos(60), segmentSize * 8L, ff, ff::ticks)) {
+                            segmentSize, segmentSize * 8L, ff, ff::ticks)) {
                         manager.setBeforeTrimSyncHook(passes::incrementAndGet);
                         manager.setRetryLogHook(logs::incrementAndGet);
                         manager.register(ring, root, watermark);
@@ -493,6 +494,10 @@ public class SegmentManagerCrashConsistencyTest {
                 if (failed) return -1;
             }
             return INSTANCE.fsyncDir(dir);
+        }
+        @Override
+        public int fsyncDir(long dirPtr) {
+            return fsyncDir(Files.utf8ToString(dirPtr));
         }
         @Override public long length(int fd) { return INSTANCE.length(fd); }
         @Override public long length(String path) { return INSTANCE.length(path); }

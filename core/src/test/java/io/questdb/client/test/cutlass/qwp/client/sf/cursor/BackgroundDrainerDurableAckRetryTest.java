@@ -24,6 +24,8 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
+import io.questdb.client.test.tools.TestWebSocketClient;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
@@ -1540,7 +1542,7 @@ public class BackgroundDrainerDurableAckRetryTest {
                 reconnectMaxDurationMillis,
                 backoffInitMillis,
                 backoffMaxMillis,
-                /* requestDurableAck */ true,
+                /* durableAckTiers */ DurableAckTiers.REPLICATED,
                 /* durableAckKeepaliveIntervalMillis */ 200L);
     }
 
@@ -1689,7 +1691,7 @@ public class BackgroundDrainerDurableAckRetryTest {
      * Minimal concrete {@link WebSocketClient} returned as the success
      * sentinel — tests only need referential identity, never invoke I/O.
      */
-    private static final class StubWebSocketClient extends WebSocketClient {
+    private static final class StubWebSocketClient extends TestWebSocketClient {
         StubWebSocketClient() {
             super(DefaultHttpClientConfiguration.INSTANCE, PlainSocketFactory.INSTANCE);
         }

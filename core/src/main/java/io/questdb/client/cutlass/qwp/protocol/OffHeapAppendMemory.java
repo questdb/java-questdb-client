@@ -44,6 +44,8 @@ public class OffHeapAppendMemory implements ArrayBufferAppender, QuietCloseable 
     private static final int DEFAULT_INITIAL_CAPACITY = 128;
     private long appendAddress;
     private long capacity;
+    // pageAddress + capacity, so the hot capacity check is one compare.
+    private long limitAddress;
     private long pageAddress;
 
     public OffHeapAppendMemory() {
@@ -54,6 +56,7 @@ public class OffHeapAppendMemory implements ArrayBufferAppender, QuietCloseable 
         this.capacity = Math.max(initialCapacity, 8);
         this.pageAddress = Unsafe.malloc(this.capacity, MemoryTag.NATIVE_ILP_RSS);
         this.appendAddress = pageAddress;
+        this.limitAddress = pageAddress + this.capacity;
     }
 
     /**
@@ -68,6 +71,7 @@ public class OffHeapAppendMemory implements ArrayBufferAppender, QuietCloseable 
         if (pageAddress != 0) {
             Unsafe.free(pageAddress, capacity, MemoryTag.NATIVE_ILP_RSS);
             pageAddress = 0;
+            limitAddress = 0;
             appendAddress = 0;
             capacity = 0;
         }
@@ -169,33 +173,22 @@ public class OffHeapAppendMemory implements ArrayBufferAppender, QuietCloseable 
         }
         int len = value.length();
         ensureCapacity((long) len * 4); // worst case: all supplementary chars
-        for (int i = 0; i < len; i++) {
+        // ASCII fast path on a local cursor: writing the appendAddress field
+        // per char, interleaved with Unsafe stores, kept the JIT from holding
+        // the address in a register. Most values never leave this loop.
+        long addr = appendAddress;
+        int i = 0;
+        for (; i < len; i++) {
             char c = value.charAt(i);
-            if (c < 0x80) {
-                Unsafe.getUnsafe().putByte(appendAddress++, (byte) c);
-            } else if (c < 0x800) {
-                Unsafe.getUnsafe().putByte(appendAddress++, (byte) (0xC0 | (c >> 6)));
-                Unsafe.getUnsafe().putByte(appendAddress++, (byte) (0x80 | (c & 0x3F)));
-            } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < len) {
-                char c2 = value.charAt(++i);
-                if (Character.isLowSurrogate(c2)) {
-                    int codePoint = 0x10000 + ((c - 0xD800) << 10) + (c2 - 0xDC00);
-                    Unsafe.getUnsafe().putByte(appendAddress++, (byte) (0xF0 | (codePoint >> 18)));
-                    Unsafe.getUnsafe().putByte(appendAddress++, (byte) (0x80 | ((codePoint >> 12) & 0x3F)));
-                    Unsafe.getUnsafe().putByte(appendAddress++, (byte) (0x80 | ((codePoint >> 6) & 0x3F)));
-                    Unsafe.getUnsafe().putByte(appendAddress++, (byte) (0x80 | (codePoint & 0x3F)));
-                } else {
-                    Unsafe.getUnsafe().putByte(appendAddress++, (byte) '?');
-                    i--;
-                }
-            } else if (Character.isSurrogate(c)) {
-                Unsafe.getUnsafe().putByte(appendAddress++, (byte) '?');
-            } else {
-                Unsafe.getUnsafe().putByte(appendAddress++, (byte) (0xE0 | (c >> 12)));
-                Unsafe.getUnsafe().putByte(appendAddress++, (byte) (0x80 | ((c >> 6) & 0x3F)));
-                Unsafe.getUnsafe().putByte(appendAddress++, (byte) (0x80 | (c & 0x3F)));
+            if (c >= 0x80) {
+                break;
             }
+            Unsafe.getUnsafe().putByte(addr++, (byte) c);
         }
+        if (i < len) {
+            addr = putUtf8NonAscii(value, i, len, addr);
+        }
+        appendAddress = addr;
     }
 
     /**
@@ -213,13 +206,53 @@ public class OffHeapAppendMemory implements ArrayBufferAppender, QuietCloseable 
         appendAddress = pageAddress;
     }
 
-    private void ensureCapacity(long needed) {
-        long used = appendAddress - pageAddress;
-        if (used + needed > capacity) {
-            long newCapacity = Math.max(capacity * 2, used + needed);
-            pageAddress = Unsafe.realloc(pageAddress, capacity, newCapacity, MemoryTag.NATIVE_ILP_RSS);
-            capacity = newCapacity;
-            appendAddress = pageAddress + used;
+    // From the first non-ASCII char on; returns the address past the last byte.
+    private static long putUtf8NonAscii(CharSequence value, int i, int len, long addr) {
+        for (; i < len; i++) {
+            char c = value.charAt(i);
+            if (c < 0x80) {
+                Unsafe.getUnsafe().putByte(addr++, (byte) c);
+            } else if (c < 0x800) {
+                Unsafe.getUnsafe().putByte(addr++, (byte) (0xC0 | (c >> 6)));
+                Unsafe.getUnsafe().putByte(addr++, (byte) (0x80 | (c & 0x3F)));
+            } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < len) {
+                char c2 = value.charAt(++i);
+                if (Character.isLowSurrogate(c2)) {
+                    int codePoint = 0x10000 + ((c - 0xD800) << 10) + (c2 - 0xDC00);
+                    Unsafe.getUnsafe().putByte(addr++, (byte) (0xF0 | (codePoint >> 18)));
+                    Unsafe.getUnsafe().putByte(addr++, (byte) (0x80 | ((codePoint >> 12) & 0x3F)));
+                    Unsafe.getUnsafe().putByte(addr++, (byte) (0x80 | ((codePoint >> 6) & 0x3F)));
+                    Unsafe.getUnsafe().putByte(addr++, (byte) (0x80 | (codePoint & 0x3F)));
+                } else {
+                    Unsafe.getUnsafe().putByte(addr++, (byte) '?');
+                    i--;
+                }
+            } else if (Character.isSurrogate(c)) {
+                Unsafe.getUnsafe().putByte(addr++, (byte) '?');
+            } else {
+                Unsafe.getUnsafe().putByte(addr++, (byte) (0xE0 | (c >> 12)));
+                Unsafe.getUnsafe().putByte(addr++, (byte) (0x80 | ((c >> 6) & 0x3F)));
+                Unsafe.getUnsafe().putByte(addr++, (byte) (0x80 | (c & 0x3F)));
+            }
         }
+        return addr;
+    }
+
+    private void ensureCapacity(long needed) {
+        // Fast path kept tiny so the JIT inlines it into every put: the
+        // realloc lives in grow(). This check ran once per column per row and
+        // was 15% of the producer's cycles as one body with the slow path.
+        if (appendAddress + needed > limitAddress) {
+            grow(needed);
+        }
+    }
+
+    private void grow(long needed) {
+        long used = appendAddress - pageAddress;
+        long newCapacity = Math.max(capacity * 2, used + needed);
+        pageAddress = Unsafe.realloc(pageAddress, capacity, newCapacity, MemoryTag.NATIVE_ILP_RSS);
+        capacity = newCapacity;
+        appendAddress = pageAddress + used;
+        limitAddress = pageAddress + capacity;
     }
 }

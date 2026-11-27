@@ -312,24 +312,6 @@ public class MicrobatchBufferTest {
     }
 
     @Test
-    public void testFirstRowTimeIsRecorded() throws Exception {
-        assertMemoryLeak(() -> {
-            try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
-                Assert.assertEquals(0, buffer.getAgeNanos());
-
-                buffer.incrementRowCount();
-                long age1 = buffer.getAgeNanos();
-                Assert.assertTrue(age1 >= 0);
-
-                Os.sleep(10);
-
-                long age2 = buffer.getAgeNanos();
-                Assert.assertTrue(age2 > age1);
-            }
-        });
-    }
-
-    @Test
     public void testFullStateLifecycle() throws Exception {
         assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {

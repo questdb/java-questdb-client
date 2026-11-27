@@ -146,7 +146,8 @@ public class LineHttpSenderConstructorTest {
                         0,
                         0,
                         Long.MAX_VALUE,
-                        Sender.PROTOCOL_VERSION_V2
+                        Sender.PROTOCOL_VERSION_V2,
+                        null
                 ));
                 Assert.fail("expected HttpClientException");
             } catch (HttpClientException ignore) {

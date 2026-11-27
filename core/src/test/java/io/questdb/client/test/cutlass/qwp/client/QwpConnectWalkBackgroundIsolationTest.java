@@ -24,8 +24,8 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.test.tools.TestWebSocketClient;
 import io.questdb.client.DefaultHttpClientConfiguration;
-import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
@@ -183,7 +183,7 @@ public class QwpConnectWalkBackgroundIsolationTest {
      * path, the connect-walk lock — then always throws, so no walk ever
      * "succeeds" and reaches upgrade or lifecycle commits.
      */
-    private static final class StubClient extends WebSocketClient {
+    private static final class StubClient extends TestWebSocketClient {
         private final CountDownLatch entered;
         private final CountDownLatch release;
 

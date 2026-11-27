@@ -24,6 +24,8 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
+import io.questdb.client.test.tools.TestWebSocketClient;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
@@ -150,11 +152,10 @@ public class CursorWebSocketSendLoopConnectPhaseCloseTest {
                     null,
                     engine,
                     0L,
-                    CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                     factory,
                     /* reconnectInitialBackoffMillis */ 1_000L,
                     /* reconnectMaxBackoffMillis */ 5_000L,
-                    false
+                    DurableAckTiers.NONE
             );
             // Shrink the bounded-await backstop so the timeout branch fires fast
             // (no multi-second real wait); production uses the 30s default.
@@ -268,11 +269,10 @@ public class CursorWebSocketSendLoopConnectPhaseCloseTest {
                     initialClient,
                     engine,
                     0L,
-                    CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                     factory,
                     /* reconnectInitialBackoffMillis */ 1_000L,
                     /* reconnectMaxBackoffMillis */ 5_000L,
-                    false
+                    DurableAckTiers.NONE
             );
 
             final AtomicReference<Throwable> closeFailure = new AtomicReference<>();
@@ -342,7 +342,7 @@ public class CursorWebSocketSendLoopConnectPhaseCloseTest {
      * {@link #awaitTrafficBreak()} until {@link #closeTraffic()} releases it,
      * which is the ONLY path out -- neither unpark nor interrupt can cancel it.
      */
-    private static final class InFlightConnectClient extends WebSocketClient {
+    private static final class InFlightConnectClient extends TestWebSocketClient {
         final CountDownLatch trafficBroken = new CountDownLatch(1);
         final AtomicInteger trafficCloseCount = new AtomicInteger();
         final AtomicReference<Thread> trafficCloseThread = new AtomicReference<>();
@@ -394,7 +394,7 @@ public class CursorWebSocketSendLoopConnectPhaseCloseTest {
      * the ONLY release is the test-owned {@code release} latch, counted down
      * AFTER the backstop assertions.
      */
-    private static final class UninterruptibleInFlightClient extends WebSocketClient {
+    private static final class UninterruptibleInFlightClient extends TestWebSocketClient {
         final AtomicInteger trafficCloseCount = new AtomicInteger();
         private final CountDownLatch release;
 
@@ -443,7 +443,7 @@ public class CursorWebSocketSendLoopConnectPhaseCloseTest {
      * into a reconnect so the in-flight client is published while the
      * {@code client} field still points here (the mid-flight-reconnect path).
      */
-    private static final class FailingInitialClient extends WebSocketClient {
+    private static final class FailingInitialClient extends TestWebSocketClient {
 
         private FailingInitialClient() {
             super(DefaultHttpClientConfiguration.INSTANCE, PlainSocketFactory.INSTANCE);

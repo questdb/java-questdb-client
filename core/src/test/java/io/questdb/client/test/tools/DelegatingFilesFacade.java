@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.tools;
 
+import io.questdb.client.std.Files;
 import io.questdb.client.std.FilesFacade;
 
 /**
@@ -96,6 +97,12 @@ public class DelegatingFilesFacade implements FilesFacade {
     @Override
     public int fsync(int fd) {
         return INSTANCE.fsync(fd);
+    }
+
+    // Preserve String-based directory fault injection for native-path callers.
+    @Override
+    public int fsyncDir(long dirPtr) {
+        return fsyncDir(Files.utf8ToString(dirPtr));
     }
 
     @Override

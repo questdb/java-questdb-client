@@ -77,7 +77,12 @@ public class IoThreadErrorSurfacedOnRowApiTest {
                 // handler routes the rejection through recordFatal, marking
                 // the loop terminal.
                 sender.table("foo").longColumn("v", 1L).atNow();
-                sender.flush();
+                try {
+                    sender.flush();
+                } catch (LineSenderException ignored) {
+                    // The error ACK may arrive before flush() checks for errors; without this catch
+                    // the outer catch would swallow it and skip every assertion below.
+                }
 
                 // Wait for the I/O thread to record the error. After this,
                 // cursorSendLoop.terminalError is populated and the loop has

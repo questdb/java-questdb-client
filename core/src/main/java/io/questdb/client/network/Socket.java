@@ -108,6 +108,17 @@ public interface Socket extends QuietCloseable {
     boolean supportsTls();
 
     /**
+     * True when a {@link #recv} call would make progress without the kernel:
+     * input already read from the fd sits in user-space buffers (decrypted
+     * plaintext, or a complete TLS record not yet unwrapped). A caller that is
+     * about to block on fd readability must check this first; the kernel
+     * cannot see those bytes.
+     */
+    default boolean hasBufferedInput() {
+        return false;
+    }
+
+    /**
      * Reads or writes encrypted data to/from the internal buffer from/to
      * the socket. Can be called safely even if the socket doesn't
      * support TLS.

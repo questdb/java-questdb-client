@@ -27,6 +27,7 @@ package io.questdb.client.cutlass.qwp.client;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
+import io.questdb.client.std.Vect;
 import io.questdb.client.std.str.Utf8s;
 
 /**
@@ -183,7 +184,7 @@ public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
         }
         int intLen = (int) len;
         ensureCapacity(intLen);
-        Unsafe.getUnsafe().copyMemory(from, bufferPtr + position, intLen);
+        Vect.memcpy(bufferPtr + position, from, intLen);
         position += intLen;
     }
 

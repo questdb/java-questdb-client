@@ -247,7 +247,12 @@ public class SymbolDictRecycleFsnContinuityTest {
                 sender.setErrorHandler(e -> asyncError.compareAndSet(null, e));
                 try {
                     sender.table("foo").longColumn("v", 1L).atNow();
-                    sender.flush();
+                    try {
+                        sender.flush();
+                    } catch (LineSenderServerException ignored) {
+                        // The terminal NACK may arrive before flush() checks for errors.
+                        // The error is sticky, so the next batch below must still throw it.
+                    }
 
                     waitFor(() -> handler.totalBinaryReceived.get() >= 1, 5_000);
                     waitFor(() -> sender.getLastTerminalError() != null, 5_000);
@@ -349,7 +354,12 @@ public class SymbolDictRecycleFsnContinuityTest {
                 QwpWebSocketSender sender2 = createRolledSender(server, fsn1);
                 try {
                     sender2.table("foo").longColumn("v", 2L).atNow();
-                    sender2.flush();
+                    try {
+                        sender2.flush();
+                    } catch (LineSenderException ignored) {
+                        // The terminal NACK may arrive before flush() checks for errors.
+                        // The error is sticky, so awaitAckedFsn() below must still throw.
+                    }
                     waitFor(() -> sender2.getLastTerminalError() != null, 5_000);
 
                     LineSenderException thrown = null;
@@ -383,9 +393,8 @@ public class SymbolDictRecycleFsnContinuityTest {
      * resetSymbolDictionary() so the test does not depend on threshold or
      * anti-thrash floor arithmetic; auto-flush stays off so no interval
      * flush can inject frames on a slow CI box. WebSocket rejects
-     * {@code auto_flush=off} outright (it also zeroes the auto-flush
-     * interval, which {@code validateParameters} disallows for this
-     * transport), so this pins the same large-finite-interval idiom already
+     * {@code auto_flush=off} outright, so this pins the same
+     * large-finite-interval idiom already
      * used by {@code DeltaDictRecoveryTest} / {@code SelfSufficientFramesTest}
      * to fully suppress auto-flush on WS.
      */
@@ -470,13 +479,73 @@ public class SymbolDictRecycleFsnContinuityTest {
                     Assert.assertEquals("the fresh epoch's first FSN continues the external scale",
                             target, ws.flushAndGetSequence());
 
+                    long t0 = System.nanoTime();
                     monitor.join(15_000);
                     Assert.assertFalse("monitor still parked", monitor.isAlive());
+                    long joinMillis = (System.nanoTime() - t0) / 1_000_000L;
+                    Assert.assertTrue("monitor returned " + joinMillis + " ms after the ack: it slept to its "
+                            + "deadline instead of being woken across the recycle", joinMillis < 2_000);
                     if (monitorError.get() != null) {
                         throw new AssertionError("monitor failed", monitorError.get());
                     }
                     Assert.assertEquals("the parked wait must see the fresh epoch's ack",
                             Boolean.TRUE, outcome.get());
+                }
+            }
+        });
+    }
+
+    /**
+     * Several threads may wait for the same ack (the producer plus monitors);
+     * every one of them must be woken by it, not just the last to register.
+     */
+    @Test(timeout = 60_000L)
+    public void testEveryWaiterIsWokenByTheAck() throws Exception {
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = ackingServer()) {
+                String config = cfg(server) + "auto_flush_bytes=off;auto_flush_rows=1000000;auto_flush_interval=60000;";
+                try (QwpWebSocketSender ws = (QwpWebSocketSender) Sender.fromConfig(config)) {
+                    ws.table("t").longColumn("v", 1L).atNow();
+                    long ext0 = ws.flushAndGetSequence();
+                    Assert.assertTrue(ws.awaitAckedFsn(ext0, 5_000));
+                    final long target = ext0 + 1;
+
+                    Thread[] monitors = new Thread[3];
+                    long[] returnedAtNanos = new long[monitors.length];
+                    AtomicReference<Throwable> monitorError = new AtomicReference<>();
+                    for (int i = 0; i < monitors.length; i++) {
+                        final int idx = i;
+                        monitors[i] = new Thread(() -> {
+                            try {
+                                if (!ws.awaitAckedFsn(target, 10_000)) {
+                                    monitorError.compareAndSet(null, new AssertionError("monitor timed out"));
+                                }
+                                returnedAtNanos[idx] = System.nanoTime();
+                            } catch (Throwable t) {
+                                monitorError.compareAndSet(null, t);
+                            }
+                        }, "acked-fsn-monitor-" + i);
+                        monitors[i].start();
+                    }
+                    for (Thread m : monitors) {
+                        waitFor(() -> m.getState() == Thread.State.TIMED_WAITING, 5_000);
+                    }
+
+                    ws.table("t").longColumn("v", 2L).atNow();
+                    long ackedAtNanos = System.nanoTime();
+                    Assert.assertEquals(target, ws.flushAndGetSequence());
+                    for (Thread m : monitors) {
+                        m.join(15_000);
+                        Assert.assertFalse("monitor still parked", m.isAlive());
+                    }
+                    if (monitorError.get() != null) {
+                        throw new AssertionError("monitor failed", monitorError.get());
+                    }
+                    for (int i = 0; i < monitors.length; i++) {
+                        long lateMillis = (returnedAtNanos[i] - ackedAtNanos) / 1_000_000L;
+                        Assert.assertTrue("monitor " + i + " returned " + lateMillis + " ms after the ack",
+                                lateMillis < 2_000);
+                    }
                 }
             }
         });

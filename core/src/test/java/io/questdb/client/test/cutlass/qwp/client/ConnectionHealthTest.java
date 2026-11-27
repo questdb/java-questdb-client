@@ -32,6 +32,7 @@ import io.questdb.client.cutlass.auth.TokenUnavailableException;
 import io.questdb.client.cutlass.http.client.HttpClientException;
 import io.questdb.client.cutlass.http.client.WebSocketClientFactory;
 import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
 import io.questdb.client.cutlass.qwp.client.QwpConnectionHealthTracker;
@@ -461,7 +462,11 @@ public class ConnectionHealthTest {
                 Assert.assertEquals(ConnectionHealth.NONE, h.getOutageSinceEpochMillis());
 
                 sender.table("t").longColumn("v", 1).atNow();
-                sender.flush();
+                try {
+                    sender.flush();
+                } catch (LineSenderException ignored) {
+                    // The terminal NACK may arrive before flush() checks for errors.
+                }
                 // the I/O thread latches FAILED before it hands the terminal error to the handler
                 await(() -> errors.terminalCount() >= 1, 10_000, "the terminal rejection");
                 h = sender.health();

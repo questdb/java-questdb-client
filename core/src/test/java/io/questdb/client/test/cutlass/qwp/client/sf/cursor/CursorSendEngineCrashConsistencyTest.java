@@ -59,7 +59,7 @@ public class CursorSendEngineCrashConsistencyTest {
                     Assert.assertEquals(0, Files.mkdir(root, Files.DIR_MODE_DEFAULT));
                     CrashImageFilesFacade ff = new CrashImageFilesFacade(slot, failAt);
                     long segmentSize = MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + 32L;
-                    manager = new SegmentManager(segmentSize, TimeUnit.SECONDS.toNanos(60),
+                    manager = new SegmentManager(segmentSize,
                             SegmentManager.UNLIMITED_TOTAL_BYTES, ff);
                     payload = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
                     engine = new CursorSendEngine(slot, segmentSize, manager);
@@ -114,7 +114,7 @@ public class CursorSendEngineCrashConsistencyTest {
                     Assert.assertEquals(0, Files.mkdir(root, Files.DIR_MODE_DEFAULT));
                     ff = new CrashImageFilesFacade(slot, -1);
                     long segmentSize = MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + 32L;
-                    manager = new SegmentManager(segmentSize, TimeUnit.SECONDS.toNanos(60),
+                    manager = new SegmentManager(segmentSize,
                             SegmentManager.UNLIMITED_TOTAL_BYTES, ff);
                     payload = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
                     predecessor = new CursorSendEngine(slot, segmentSize, manager);
@@ -183,7 +183,7 @@ public class CursorSendEngineCrashConsistencyTest {
                 Assert.assertEquals(0, Files.mkdir(root, Files.DIR_MODE_DEFAULT));
                 CrashImageFilesFacade ff = new CrashImageFilesFacade(slot, -1);
                 long segmentSize = MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + 32L;
-                manager = new SegmentManager(segmentSize, TimeUnit.SECONDS.toNanos(60),
+                manager = new SegmentManager(segmentSize,
                         SegmentManager.UNLIMITED_TOTAL_BYTES, ff);
                 payload = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
                 predecessor = new CursorSendEngine(slot, segmentSize, manager);
@@ -398,6 +398,10 @@ public class CursorSendEngineCrashConsistencyTest {
                 }
             }
             return INSTANCE.fsyncDir(dir);
+        }
+        @Override
+        public int fsyncDir(long dirPtr) {
+            return fsyncDir(Files.utf8ToString(dirPtr));
         }
         @Override
         public long length(int fd) { return INSTANCE.length(fd); }

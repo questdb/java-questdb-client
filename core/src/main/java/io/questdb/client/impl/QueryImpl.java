@@ -29,7 +29,10 @@ import io.questdb.client.cutlass.qwp.client.QwpBindSetter;
 import io.questdb.client.cutlass.qwp.client.QwpBindValues;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
+import io.questdb.client.cutlass.qwp.client.QwpEgressMsgKind;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
+import io.questdb.client.cutlass.qwp.client.QwpQueryDetails;
+import io.questdb.client.cutlass.qwp.client.QwpQueryOptions;
 import io.questdb.client.cutlass.qwp.client.QwpServerInfo;
 import io.questdb.client.std.str.StringSink;
 
@@ -39,7 +42,7 @@ import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Reusable per-{@link QueryWorker} query state: the configured SQL, optional
- * binds, handler, terminal-event signalling, and a wrapping
+ * binds and options, handler, terminal-event signalling, and a wrapping
  * {@link QwpColumnBatchHandler} that forwards callbacks to the user handler and
  * signals completion on terminal events. One instance is pre-allocated per
  * worker in the constructor and reused across every borrow.
@@ -68,7 +71,16 @@ final class QueryImpl {
 
     private final Condition doneCondition;
     private final ReentrantLock doneLock = new ReentrantLock();
+    // The handle's own copy of the user's options: Query.options() copies into it,
+    // so the user may reuse the instance. submit() copies it into submittedOptions.
+    private final QwpQueryOptions options = new QwpQueryOptions();
     private final StringSink sqlBuffer = new StringSink();
+    // The options of the submitted query, which execute() reads on the worker
+    // thread when it starts the query. That can be after options() has already
+    // set up the next query, so the worker never reads the handle's options.
+    // submit() overwrites it only once the previous query is done, long after
+    // its execute() read it.
+    private final QwpQueryOptions submittedOptions = new QwpQueryOptions();
     private final QueryWorker worker;
     private final QwpBindSetter wireBinds = this::applyBinds;
     private final WrappingHandler wrappingHandler = new WrappingHandler();
@@ -78,6 +90,7 @@ final class QueryImpl {
     private volatile boolean cancelRequested;
     private volatile boolean done = true;
     private volatile String resultMessage;
+    private volatile int resultPosition = QwpEgressMsgKind.NO_ERROR_POSITION;
     private volatile byte resultStatus;
     // Counts submit() calls. Written under doneLock; volatile so runOn() can read
     // it without the lock. Lets runOn() tell its own submission from a later one,
@@ -108,6 +121,7 @@ final class QueryImpl {
         }
         userBinds = null;
         userHandler = null;
+        options.clear();
         sqlBuffer.clear();
     }
 
@@ -248,6 +262,11 @@ final class QueryImpl {
         this.userHandler = handler;
     }
 
+    void setOptions(long gen, QwpQueryOptions options) {
+        checkLive(gen);
+        this.options.copyFrom(options);
+    }
+
     void setSql(long gen, CharSequence sql) {
         checkLive(gen);
         sqlBuffer.clear();
@@ -301,10 +320,12 @@ final class QueryImpl {
             submissionSeq++;
             resultStatus = 0;
             resultMessage = null;
+            resultPosition = QwpEgressMsgKind.NO_ERROR_POSITION;
             unexpectedError = null;
         } finally {
             doneLock.unlock();
         }
+        submittedOptions.copyFrom(options);
         worker.dispatch(this);
     }
 
@@ -378,6 +399,10 @@ final class QueryImpl {
     }
 
     private void signalDone(byte status, String message, Throwable unexpected) {
+        signalDone(status, message, QwpEgressMsgKind.NO_ERROR_POSITION, unexpected);
+    }
+
+    private void signalDone(byte status, String message, int position, Throwable unexpected) {
         doneLock.lock();
         try {
             if (done) {
@@ -385,6 +410,7 @@ final class QueryImpl {
             }
             this.resultStatus = status;
             this.resultMessage = message;
+            this.resultPosition = position;
             this.unexpectedError = unexpected;
             this.done = true;
             doneCondition.signalAll();
@@ -422,7 +448,7 @@ final class QueryImpl {
             throw new QueryException(resultStatus, resultMessage, unexpected);
         }
         if (resultStatus != 0) {
-            throw new QueryException(resultStatus, resultMessage);
+            throw new QueryException(resultStatus, resultMessage, resultPosition);
         }
     }
 
@@ -440,11 +466,13 @@ final class QueryImpl {
     void resetForBorrow() {
         userBinds = null;
         userHandler = null;
+        options.clear();
         sqlBuffer.clear();
         timeoutMillis = -1;
         cancelRequested = false;
         resultStatus = 0;
         resultMessage = null;
+        resultPosition = QwpEgressMsgKind.NO_ERROR_POSITION;
         unexpectedError = null;
         done = true;
     }
@@ -465,12 +493,17 @@ final class QueryImpl {
         client.withQueryTimeoutGrace(worker.closeQueryTimeoutMillis());
         // Pass the StringSink directly as a CharSequence -- the wire encoder
         // reads chars and writes UTF-8 bytes straight into the send buffer.
-        // sqlBuffer must stay stable until the request is encoded: the caller
-        // can call sql(...) again only once done==true, which execute() signals
-        // either at the terminal event or, after a query timeout, once the I/O
-        // thread has encoded the request (see QwpQueryClient.executeOnce).
+        // The query reads sqlBuffer, the binds and the handler while it runs;
+        // the Query contract tells the caller not to change them before
+        // await() returns, but nothing enforces it. sqlBuffer must stay stable
+        // until the request is encoded: after a query timeout, execute()
+        // releases the caller once the I/O thread has encoded the request (see
+        // QwpQueryClient.executeOnce). The options come from submittedOptions
+        // instead, which submit() filled: execute() reads them once, when it
+        // starts, and options() may change the handle's options for the next
+        // query meanwhile.
         try {
-            client.execute(sqlBuffer, wireBinds, wrappingHandler, false, timeoutArg);
+            client.execute(sqlBuffer, wireBinds, wrappingHandler, submittedOptions, timeoutArg);
         } catch (Throwable t) {
             signalUnexpected(submission, t);
         }
@@ -510,6 +543,15 @@ final class QueryImpl {
         }
 
         @Override
+        public void onEnd(long requestId, long totalRows, QwpQueryDetails details) {
+            try {
+                userHandler.onEnd(requestId, totalRows, details);
+            } finally {
+                signalDone((byte) 0, null, null);
+            }
+        }
+
+        @Override
         public void onError(byte status, String message) {
             try {
                 userHandler.onError(status, message);
@@ -528,6 +570,15 @@ final class QueryImpl {
         }
 
         @Override
+        public void onError(long requestId, byte status, String message, int position) {
+            try {
+                userHandler.onError(requestId, status, message, position);
+            } finally {
+                signalDone(status, message, position, null);
+            }
+        }
+
+        @Override
         public void onExecDone(short opType, long rowsAffected) {
             try {
                 userHandler.onExecDone(opType, rowsAffected);
@@ -540,6 +591,15 @@ final class QueryImpl {
         public void onExecDone(long requestId, short opType, long rowsAffected) {
             try {
                 userHandler.onExecDone(requestId, opType, rowsAffected);
+            } finally {
+                signalDone((byte) 0, null, null);
+            }
+        }
+
+        @Override
+        public void onExecDone(long requestId, short opType, long rowsAffected, QwpQueryDetails details) {
+            try {
+                userHandler.onExecDone(requestId, opType, rowsAffected, details);
             } finally {
                 signalDone((byte) 0, null, null);
             }

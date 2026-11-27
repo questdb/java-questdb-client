@@ -114,6 +114,13 @@ import java.util.concurrent.locks.LockSupport;
  * truncated / unknown frame, decoder out of sync, I/O thread interrupt) all
  * surface with {@link WebSocketResponse#STATUS_INTERNAL_ERROR} and the
  * specific cause in the message.
+ * <p>
+ * Per-query options:
+ * {@link #execute(CharSequence, QwpBindSetter, QwpColumnBatchHandler, QwpQueryOptions)}
+ * pages through a result set with a row window, and asks the server for what
+ * the {@code /exec} HTTP endpoint reports besides the rows: the row count of
+ * the whole result set, execution statistics and the error position. See
+ * {@link QwpQueryOptions}.
  */
 public class QwpQueryClient implements QuietCloseable {
 
@@ -184,9 +191,18 @@ public class QwpQueryClient implements QuietCloseable {
     // deadline arithmetic (deadline + 2 * grace) on System.nanoTime() values
     // clear of overflow; ~73 years is "no limit" for every practical purpose.
     private static final long MAX_TIMEOUT_NANOS = Long.MAX_VALUE / 8;
+    // query_flags bits a server honours only when it advertises CAP_QUERY_DETAILS
+    private static final int QUERY_DETAILS_FLAGS = QwpEgressMsgKind.QUERY_FLAG_ERROR_POSITION
+            | QwpEgressMsgKind.QUERY_FLAG_STATS
+            | QwpEgressMsgKind.QUERY_FLAG_COUNT_ROWS
+            | QwpEgressMsgKind.QUERY_FLAG_SKIP_ROWS
+            | QwpEgressMsgKind.QUERY_FLAG_MAX_ROWS;
     // How often an interrupted execute() checks whether the I/O thread has
     // encoded its request (see retractRequest).
     private static final long REQUEST_ENCODED_POLL_NANOS = TimeUnit.MICROSECONDS.toNanos(100);
+    // query_flags bits of the row window, which change what the server streams
+    private static final int ROW_WINDOW_QUERY_FLAGS = QwpEgressMsgKind.QUERY_FLAG_SKIP_ROWS
+            | QwpEgressMsgKind.QUERY_FLAG_MAX_ROWS;
     // States of a query running under a timeout (see executeOnce).
     // RUNNING: before the deadline, events are delivered normally.
     private static final int TIMEOUT_PHASE_RUNNING = 0;
@@ -212,6 +228,16 @@ public class QwpQueryClient implements QuietCloseable {
     private final Random failoverRandom = new Random();
     // Connection health (design/qwp-token-provider-spec.md, section 8.4).
     private final QwpConnectionHealthTracker healthTracker = new QwpConnectionHealthTracker();
+    // Deterministic barrier used by failover tests. Null in production. execute()
+    // runs it after it tore down the connection of a failed attempt and before
+    // it backs off and reconnects, the window in which the failover deadline
+    // can otherwise run out only by chance.
+    private volatile Runnable afterFailoverCleanupHook;
+    // Deterministic barrier used by shutdown tests. Null in production. execute()
+    // runs it after an attempt intercepted a transport failure and before it
+    // checks for a stop request, the window a requestShutdown() from another
+    // thread can otherwise only hit by chance.
+    private volatile Runnable afterTransportFailureHook;
     private long authTimeoutMs = DEFAULT_AUTH_TIMEOUT_MS;
     private String authorizationHeader;
     // Deterministic lifecycle barrier used by facade shutdown tests. Null in
@@ -821,6 +847,15 @@ public class QwpQueryClient implements QuietCloseable {
     }
 
     /**
+     * As {@link #execute(CharSequence, QwpColumnBatchHandler)}, with per-query
+     * {@code options}. See
+     * {@link #execute(CharSequence, QwpBindSetter, QwpColumnBatchHandler, QwpQueryOptions)}.
+     */
+    public void execute(CharSequence sql, QwpColumnBatchHandler handler, QwpQueryOptions options) {
+        execute(sql, null, handler, options);
+    }
+
+    /**
      * Executes {@code sql} with typed bind parameters supplied by the given
      * {@link QwpBindSetter}. The setter runs on the calling thread before the
      * query is dispatched; bind values must be assigned in strictly ascending
@@ -886,26 +921,55 @@ public class QwpQueryClient implements QuietCloseable {
             boolean resetSymbolDict,
             long timeoutMs
     ) {
-        if (timeoutMs < 0) {
-            throw new IllegalArgumentException("timeoutMs must be >= 0");
-        }
-        // The clock starts on entry, so binding, dispatch and any failover all
-        // count against the timeout.
-        final long deadlineNanos = System.nanoTime() + toBoundedNanos(timeoutMs);
-        if (!executing.compareAndSet(false, true)) {
-            throw new IllegalStateException(
-                    "QwpQueryClient.execute called while another execute is in flight; one query at a time per client");
-        }
-        // Drop any cancel latched between calls (e.g., a watchdog that fired
-        // while no request was in flight, or a previous pooled user that
-        // released the client without ever calling execute). Failover retries
-        // inside this execute() must still honor a fresh cancel, so the latch
-        // is intentionally NOT cleared inside executeOnce().
-        pendingCancel = false;
-        try {
-            executeImpl(sql, binds, handler, resetSymbolDict, timeoutMs, deadlineNanos);
-        } finally {
-            executing.set(false);
+        executeExclusive(sql, binds, handler, resetSymbolDict ? QwpEgressMsgKind.QUERY_FLAG_RESET_DICT : 0, 0, Long.MAX_VALUE, timeoutMs);
+    }
+
+    /**
+     * As {@link #execute(CharSequence, QwpBindSetter, QwpColumnBatchHandler)},
+     * with per-query {@code options}: a row window that pages through the
+     * result set, and what the server reports besides the rows -- the row count
+     * of the whole result set and execution statistics, which reach
+     * {@link QwpColumnBatchHandler#onEnd(long, long, QwpQueryDetails)} and
+     * {@link QwpColumnBatchHandler#onExecDone(long, short, long, QwpQueryDetails)},
+     * and the error position, which reaches
+     * {@link QwpColumnBatchHandler#onError(long, byte, String, int)}. The client
+     * reads {@code options} when the call starts; null runs the query without
+     * options.
+     * <p>
+     * The options need a server that advertises
+     * {@link QwpEgressMsgKind#CAP_QUERY_DETAILS}. Against any other, a row
+     * window fails the query through
+     * {@link QwpColumnBatchHandler#onError(long, byte, String, int)} with
+     * {@link WebSocketResponse#STATUS_INTERNAL_ERROR} before it is sent, since
+     * the server would stream every row; the other options are left out and the
+     * query runs without them. After a failover reconnect the client checks the
+     * new server again.
+     */
+    public void execute(CharSequence sql, QwpBindSetter binds, QwpColumnBatchHandler handler, QwpQueryOptions options) {
+        execute(sql, binds, handler, options, queryTimeoutMs);
+    }
+
+    /**
+     * As {@link #execute(CharSequence, QwpBindSetter, QwpColumnBatchHandler, QwpQueryOptions)},
+     * with an explicit query timeout that overrides the client default. See
+     * {@link #execute(CharSequence, QwpBindSetter, QwpColumnBatchHandler, boolean, long)}
+     * for how the timeout works.
+     *
+     * @param timeoutMs query timeout in milliseconds; {@code 0} runs the query
+     *                  without a timeout
+     * @throws IllegalArgumentException when {@code timeoutMs} is negative
+     */
+    public void execute(
+            CharSequence sql,
+            QwpBindSetter binds,
+            QwpColumnBatchHandler handler,
+            QwpQueryOptions options,
+            long timeoutMs
+    ) {
+        if (options == null) {
+            executeExclusive(sql, binds, handler, 0, 0, Long.MAX_VALUE, timeoutMs);
+        } else {
+            executeExclusive(sql, binds, handler, options.toQueryFlags(), options.getSkipRows(), options.getMaxRows(), timeoutMs);
         }
     }
 
@@ -1135,6 +1199,16 @@ public class QwpQueryClient implements QuietCloseable {
         synchronized (failoverRandom) {
             failoverRandom.setSeed(seed);
         }
+    }
+
+    @TestOnly
+    public void setAfterFailoverCleanupHookForTest(Runnable hook) {
+        afterFailoverCleanupHook = hook;
+    }
+
+    @TestOnly
+    public void setAfterTransportFailureHookForTest(Runnable hook) {
+        afterTransportFailureHook = hook;
     }
 
     @TestOnly
@@ -1549,6 +1623,20 @@ public class QwpQueryClient implements QuietCloseable {
     }
 
     /**
+     * Reports a failure that {@code execute()} detected itself, rather than one
+     * the server sent: a failed reconnect, an exhausted failover, a stop
+     * request, a bind error. Every such failure goes through this method, so it
+     * reaches the position-aware
+     * {@link QwpColumnBatchHandler#onError(long, byte, String, int)}, as the
+     * server's errors do, and a handler that overrides only that overload sees
+     * them all. The failure does not come from the SQL text, so its position is
+     * {@link QwpEgressMsgKind#NO_ERROR_POSITION}.
+     */
+    private static void deliverClientError(QwpColumnBatchHandler handler, long requestId, byte status, String message) {
+        handler.onError(requestId, status, message, QwpEgressMsgKind.NO_ERROR_POSITION);
+    }
+
+    /**
      * Hands an event the executing thread does not deliver back to the I/O
      * thread, with its batch buffer: the I/O thread waits for each published
      * batch to be released.
@@ -1589,6 +1677,28 @@ public class QwpQueryClient implements QuietCloseable {
     private static long remainingMillisCeil(long deadlineNanos) {
         long remainingNanos = deadlineNanos - System.nanoTime();
         return remainingNanos <= 0L ? 0L : (remainingNanos + 999_999L) / 1_000_000L;
+    }
+
+    /**
+     * Returns the bits of {@code queryFlags} a server with {@code capabilities}
+     * honours: {@link QwpEgressMsgKind#QUERY_FLAG_RESET_DICT} needs
+     * {@link QwpEgressMsgKind#CAP_QUERY_FLAGS},
+     * {@link QwpEgressMsgKind#QUERY_FLAG_TIMEOUT} needs
+     * {@link QwpEgressMsgKind#CAP_QUERY_TIMEOUT}, and the query-details bits need
+     * {@link QwpEgressMsgKind#CAP_QUERY_DETAILS}.
+     */
+    private static long resolveQueryFlags(long queryFlags, int capabilities) {
+        long resolved = queryFlags;
+        if ((capabilities & QwpEgressMsgKind.CAP_QUERY_FLAGS) == 0) {
+            resolved &= ~QwpEgressMsgKind.QUERY_FLAG_RESET_DICT;
+        }
+        if ((capabilities & QwpEgressMsgKind.CAP_QUERY_TIMEOUT) == 0) {
+            resolved &= ~QwpEgressMsgKind.QUERY_FLAG_TIMEOUT;
+        }
+        if ((capabilities & QwpEgressMsgKind.CAP_QUERY_DETAILS) == 0) {
+            resolved &= ~QUERY_DETAILS_FLAGS;
+        }
+        return resolved;
     }
 
     /**
@@ -2014,11 +2124,50 @@ public class QwpQueryClient implements QuietCloseable {
         throw failure;
     }
 
+    /**
+     * Runs one {@link #execute} at a time on this client. {@code queryFlags} are
+     * the {@code query_flags} bits the caller asks for, before
+     * {@link #resolveQueryFlags} drops those the server does not advertise.
+     */
+    private void executeExclusive(
+            CharSequence sql,
+            QwpBindSetter binds,
+            QwpColumnBatchHandler handler,
+            long queryFlags,
+            long skipRows,
+            long maxRows,
+            long timeoutMs
+    ) {
+        if (timeoutMs < 0) {
+            throw new IllegalArgumentException("timeoutMs must be >= 0");
+        }
+        // The clock starts on entry, so binding, dispatch and any failover all
+        // count against the timeout.
+        final long deadlineNanos = System.nanoTime() + toBoundedNanos(timeoutMs);
+        if (!executing.compareAndSet(false, true)) {
+            throw new IllegalStateException(
+                    "QwpQueryClient.execute called while another execute is in flight; one query at a time per client");
+        }
+        // Drop any cancel latched between calls (e.g., a watchdog that fired
+        // while no request was in flight, or a previous pooled user that
+        // released the client without ever calling execute). Failover retries
+        // inside this execute() must still honor a fresh cancel, so the latch
+        // is intentionally NOT cleared inside executeOnce().
+        pendingCancel = false;
+        try {
+            executeImpl(sql, binds, handler, queryFlags, skipRows, maxRows, timeoutMs, deadlineNanos);
+        } finally {
+            executing.set(false);
+        }
+    }
+
     private void executeImpl(
             CharSequence sql,
             QwpBindSetter binds,
             QwpColumnBatchHandler handler,
-            boolean resetSymbolDict,
+            long queryFlags,
+            long skipRows,
+            long maxRows,
             long timeoutMs,
             long deadlineNanos
     ) {
@@ -2052,12 +2201,12 @@ public class QwpQueryClient implements QuietCloseable {
         int attempt = 0;
         while (true) {
             if (isShutdownRequested) {
-                handler.onError(-1L, WebSocketResponse.STATUS_INTERNAL_ERROR, "query client shut down");
+                deliverClientError(handler, -1L, WebSocketResponse.STATUS_INTERNAL_ERROR, "query client shut down");
                 return;
             }
             attempt++;
             FailoverProbeHandler probe = new FailoverProbeHandler(handler);
-            executeOnce(sql, binds, probe, resetSymbolDict, timeoutMs, deadlineNanos);
+            executeOnce(sql, binds, probe, queryFlags, skipRows, maxRows, timeoutMs, deadlineNanos);
             // A timeout can end the attempt without a failover after losing or abandoning the connection.
             if (probe.transportFailureIntercepted || hasTerminalFailure()) {
                 healthTracker.connectionLost();
@@ -2072,24 +2221,28 @@ public class QwpQueryClient implements QuietCloseable {
             if (!probe.transportFailureIntercepted) {
                 return;
             }
+            Runnable hook = afterTransportFailureHook;
+            if (hook != null) {
+                hook.run();
+            }
             if (isShutdownRequested) {
-                handler.onError(probe.interceptedRequestId, probe.interceptedStatus, "query client shut down");
+                deliverClientError(handler, probe.interceptedRequestId, probe.interceptedStatus, "query client shut down");
                 return;
             }
             if (!failoverEnabled) {
                 // With failover off the transport failure stays latched: every later execute() reports it.
-                handler.onError(probe.interceptedRequestId, probe.interceptedStatus, probe.interceptedMessage);
+                deliverClientError(handler, probe.interceptedRequestId, probe.interceptedStatus, probe.interceptedMessage);
                 return;
             }
             if (timed && isPast(deadlineNanos)) {
-                handler.onError(probe.interceptedRequestId, QwpConstants.STATUS_QUERY_TIMEOUT,
+                deliverClientError(handler, probe.interceptedRequestId, QwpConstants.STATUS_QUERY_TIMEOUT,
                         queryTimeoutMessage(timeoutMs) + " before failover could replay the query; last error: "
                                 + probe.interceptedMessage);
                 return;
             }
             if (attempt >= failoverMaxAttempts || System.nanoTime() - failoverDeadlineNanos >= 0) {
                 int failovers = Math.max(0, attempt - 1);
-                handler.onError(probe.interceptedRequestId, probe.interceptedStatus,
+                deliverClientError(handler, probe.interceptedRequestId, probe.interceptedStatus,
                         "transport failure after " + attempt + " execute attempt"
                                 + (attempt == 1 ? "" : "s") + " ("
                                 + failovers + " failover reconnect"
@@ -2106,6 +2259,10 @@ public class QwpQueryClient implements QuietCloseable {
             // Every exit from here on - an exhausted deadline, an interrupted backoff, a failed reconnect - leaves
             // the client disconnected; the next execute() reconnects rather than throw "not connected".
             isReconnectOnNextExecute = true;
+            Runnable cleanupHook = afterFailoverCleanupHook;
+            if (cleanupHook != null) {
+                cleanupHook.run();
+            }
             if (failoverInitialBackoffMs > 0L) {
                 long base = failoverInitialBackoffMs << Math.min(attempt - 1, 30);
                 if (base < 0L) base = failoverMaxBackoffMs;
@@ -2122,7 +2279,7 @@ public class QwpQueryClient implements QuietCloseable {
                 long remaining = remainingNanos <= 0L ? 0L : remainingNanos / 1_000_000L;
                 if (remainingNanos <= 0L) {
                     int failovers = Math.max(0, attempt - 1);
-                    handler.onError(probe.interceptedRequestId, probe.interceptedStatus,
+                    deliverClientError(handler, probe.interceptedRequestId, probe.interceptedStatus,
                             "transport failure after " + attempt + " execute attempt"
                                     + (attempt == 1 ? "" : "s") + " ("
                                     + failovers + " failover reconnect"
@@ -2145,7 +2302,7 @@ public class QwpQueryClient implements QuietCloseable {
                         Thread.sleep(delay);
                     } catch (InterruptedException ie) {
                         Thread.currentThread().interrupt();
-                        handler.onError(probe.interceptedRequestId, probe.interceptedStatus,
+                        deliverClientError(handler, probe.interceptedRequestId, probe.interceptedStatus,
                                 "failover interrupted while backing off after attempt "
                                         + attempt + "; last error: " + probe.interceptedMessage);
                         return;
@@ -2160,7 +2317,7 @@ public class QwpQueryClient implements QuietCloseable {
                 // without recovery. Surface a distinct message so monitoring
                 // can pull auth incidents apart from generic transport failures;
                 // it names the failure class (design/qwp-token-provider-spec.md, 8.3).
-                handler.onError(probe.interceptedRequestId, probe.interceptedStatus,
+                deliverClientError(handler, probe.interceptedRequestId, probe.interceptedStatus,
                         "auth-rejected during failover reconnect [host="
                                 + authErr.getHost() + ':' + authErr.getPort()
                                 + ", status=" + authErr.getStatusCode()
@@ -2168,19 +2325,19 @@ public class QwpQueryClient implements QuietCloseable {
                 return;
             } catch (QwpCredentialUnavailableException credentialErr) {
                 // The token provider could not supply a credential; no endpoint was contacted.
-                handler.onError(probe.interceptedRequestId, probe.interceptedStatus,
+                deliverClientError(handler, probe.interceptedRequestId, probe.interceptedStatus,
                         "failover reconnect failed: " + credentialErr.getMessage()
                                 + " [last error: " + probe.interceptedMessage + ']');
                 return;
             } catch (RuntimeException reconnectErr) {
                 if (timed && isPast(deadlineNanos)) {
-                    handler.onError(probe.interceptedRequestId, QwpConstants.STATUS_QUERY_TIMEOUT,
+                    deliverClientError(handler, probe.interceptedRequestId, QwpConstants.STATUS_QUERY_TIMEOUT,
                             queryTimeoutMessage(timeoutMs) + " while reconnecting for failover [last error: "
                                     + probe.interceptedMessage + ", reconnect error: "
                                     + reconnectErr.getMessage() + ']');
                     return;
                 }
-                handler.onError(probe.interceptedRequestId, probe.interceptedStatus,
+                deliverClientError(handler, probe.interceptedRequestId, probe.interceptedStatus,
                         "failover reconnect failed after " + attempt + " attempt"
                                 + (attempt == 1 ? "" : "s") + " [last error: "
                                 + probe.interceptedMessage + ", reconnect error: "
@@ -2188,13 +2345,13 @@ public class QwpQueryClient implements QuietCloseable {
                 return;
             }
             if (isShutdownRequested) {
-                handler.onError(probe.interceptedRequestId, probe.interceptedStatus, "query client shut down");
+                deliverClientError(handler, probe.interceptedRequestId, probe.interceptedStatus, "query client shut down");
                 return;
             }
             if (timed && isPast(deadlineNanos)) {
                 // Reconnected, but no budget is left to replay the query. The new
                 // connection is idle and serves the next query.
-                handler.onError(probe.interceptedRequestId, QwpConstants.STATUS_QUERY_TIMEOUT,
+                deliverClientError(handler, probe.interceptedRequestId, QwpConstants.STATUS_QUERY_TIMEOUT,
                         queryTimeoutMessage(timeoutMs) + " before failover could replay the query; last error: "
                                 + probe.interceptedMessage);
                 return;
@@ -2234,7 +2391,9 @@ public class QwpQueryClient implements QuietCloseable {
             CharSequence sql,
             QwpBindSetter binds,
             FailoverProbeHandler probe,
-            boolean resetSymbolDict,
+            long queryFlags,
+            long skipRows,
+            long maxRows,
             long timeoutMs,
             long deadlineNanos
     ) {
@@ -2245,13 +2404,32 @@ public class QwpQueryClient implements QuietCloseable {
         // before close() returns.
         QwpEgressIoThread io = ioThread;
         if (io == null) {
-            probe.onError(-1L, WebSocketResponse.STATUS_INTERNAL_ERROR, "QwpQueryClient is closed");
+            probe.deliverFinal(-1L, "QwpQueryClient is closed");
             return;
         }
         GenerationListener listener = currentGenerationListener;
         TerminalFailure tf = listener != null ? listener.get() : null;
         if (tf != null) {
             probe.markTransportFailure(-1L, tf.status, tf.message);
+            return;
+        }
+        // Resolved per attempt: a failover reconnect may land on a server that
+        // advertises other capabilities. Every bound connection has its
+        // SERVER_INFO; only a connect() racing this query from another thread
+        // could clear it, and then no flag goes out.
+        final QwpServerInfo info = serverInfo;
+        final int capabilities = info != null ? info.getCapabilities() : 0;
+        final boolean timed = timeoutMs > 0;
+        final long requestedQueryFlags = timed
+                ? queryFlags | QwpEgressMsgKind.QUERY_FLAG_TIMEOUT
+                : queryFlags & ~QwpEgressMsgKind.QUERY_FLAG_TIMEOUT;
+        final long wireQueryFlags = resolveQueryFlags(requestedQueryFlags, capabilities);
+        if ((wireQueryFlags & ROW_WINDOW_QUERY_FLAGS) != (queryFlags & ROW_WINDOW_QUERY_FLAGS)) {
+            // A server that does not know the row window would stream every
+            // row of the result set. Like a bind error, this is deterministic
+            // on this server, not a transport failure.
+            probe.deliverFinal(-1L, "server does not support skipRows and maxRows [capabilities=0x"
+                    + Integer.toHexString(capabilities) + "]; they need a server that advertises CAP_QUERY_DETAILS");
             return;
         }
         bindValues.reset();
@@ -2275,7 +2453,6 @@ public class QwpQueryClient implements QuietCloseable {
             probe.deliverFinal(-1L, "query client shut down");
             return;
         }
-        final boolean timed = timeoutMs > 0;
         long wireTimeoutMs = 0L;
         if (timed) {
             wireTimeoutMs = remainingMillisCeil(deadlineNanos);
@@ -2284,17 +2461,16 @@ public class QwpQueryClient implements QuietCloseable {
                 // setter, or a failover reconnect that used it up). Nothing is on
                 // the wire, so the connection is untouched.
                 bindValues.reset();
-                probe.onError(-1L, QwpConstants.STATUS_QUERY_TIMEOUT,
+                deliverClientError(probe, -1L, QwpConstants.STATUS_QUERY_TIMEOUT,
                         queryTimeoutMessage(timeoutMs) + " before the query was sent");
                 return;
             }
         }
-        final long queryFlags = resolveQueryFlags(resetSymbolDict, timed);
         // A server that advertised CAP_QUERY_TIMEOUT receives the remaining budget
         // with the query and ends it itself with STATUS_QUERY_TIMEOUT. The
         // client-side deadline is then only a backstop and must not race the
         // server's own report with a CANCEL.
-        final boolean serverEnforcesTimeout = (queryFlags & QwpEgressMsgKind.QUERY_FLAG_TIMEOUT) != 0;
+        final boolean serverEnforcesTimeout = (wireQueryFlags & QwpEgressMsgKind.QUERY_FLAG_TIMEOUT) != 0;
         final long graceNanos = timed ? toBoundedNanos(queryTimeoutGraceMs) : 0L;
         long requestId = nextRequestId++;
         currentRequestId = requestId;
@@ -2319,7 +2495,7 @@ public class QwpQueryClient implements QuietCloseable {
         boolean settled = false;
         try {
             io.submitQuery(sql, requestId, initialCreditBytes, bindValues.count(), bindValues.bufferPtr(), bindValues.bufferLen(),
-                    queryFlags, wireTimeoutMs);
+                    wireQueryFlags, wireTimeoutMs, skipRows, maxRows);
             submitted = true;
             boolean isBatchSkipped = false;
             while (true) {
@@ -2368,7 +2544,7 @@ public class QwpQueryClient implements QuietCloseable {
                     abandonUnresponsiveConnection(io);
                     settled = true;
                     if (callerWaiting) {
-                        probe.onError(requestId, QwpConstants.STATUS_QUERY_TIMEOUT, queryTimeoutMessage(timeoutMs)
+                        deliverClientError(probe, requestId, QwpConstants.STATUS_QUERY_TIMEOUT, queryTimeoutMessage(timeoutMs)
                                 + "; the connection did not respond and was closed");
                     }
                     return;
@@ -2419,16 +2595,16 @@ public class QwpQueryClient implements QuietCloseable {
                                     || (phase == TIMEOUT_PHASE_TIMED_OUT && !discardedBatch)) {
                                 // Past the deadline, a complete result that withheld
                                 // nothing from the handler still counts as success.
-                                probe.onEnd(requestId, ev.totalRows);
+                                probe.onEnd(requestId, ev.totalRows, ev.details);
                             } else if (phase == TIMEOUT_PHASE_TIMED_OUT) {
-                                probe.onError(requestId, QwpConstants.STATUS_QUERY_TIMEOUT, queryTimeoutMessage(timeoutMs));
+                                deliverClientError(probe, requestId, QwpConstants.STATUS_QUERY_TIMEOUT, queryTimeoutMessage(timeoutMs));
                             }
                             return;
                         case QueryEvent.KIND_EXEC_DONE:
                             if (phase != TIMEOUT_PHASE_DRAINING) {
                                 // A statement that completed took effect; report it as
                                 // done even when the reply came past the deadline.
-                                probe.onExecDone(requestId, ev.opType, ev.rowsAffected);
+                                probe.onExecDone(requestId, ev.opType, ev.rowsAffected, ev.details);
                             }
                             return;
                         case QueryEvent.KIND_ERROR:
@@ -2436,10 +2612,10 @@ public class QwpQueryClient implements QuietCloseable {
                                     && ev.errorStatus == QwpConstants.STATUS_CANCELLED
                                     && !cancelledByUser) {
                                 // The server honoured the cancel the deadline sent.
-                                probe.onError(requestId, QwpConstants.STATUS_QUERY_TIMEOUT, queryTimeoutMessage(timeoutMs));
+                                deliverClientError(probe, requestId, QwpConstants.STATUS_QUERY_TIMEOUT, queryTimeoutMessage(timeoutMs));
                             } else if (phase != TIMEOUT_PHASE_DRAINING) {
                                 // Includes the server's own STATUS_QUERY_TIMEOUT report.
-                                probe.onError(requestId, ev.errorStatus, ev.errorMessage);
+                                probe.onError(requestId, ev.errorStatus, ev.errorMessage, ev.errorPosition);
                             }
                             return;
                         case QueryEvent.KIND_TRANSPORT_ERROR:
@@ -2449,13 +2625,15 @@ public class QwpQueryClient implements QuietCloseable {
                                 // Past the deadline there is nothing left to fail over
                                 // for. The I/O thread latched the failure, so the next
                                 // execute() replaces the connection.
-                                probe.onError(requestId, QwpConstants.STATUS_QUERY_TIMEOUT, queryTimeoutMessage(timeoutMs)
+                                deliverClientError(probe, requestId, QwpConstants.STATUS_QUERY_TIMEOUT, queryTimeoutMessage(timeoutMs)
                                         + "; the connection then failed: " + ev.errorMessage);
                             }
                             return;
                         default:
+                            // Unreachable: the I/O thread emits only the kinds above.
+                            assert false : "unknown event kind " + ev.kind;
                             if (phase != TIMEOUT_PHASE_DRAINING) {
-                                probe.onError(requestId, WebSocketResponse.STATUS_INTERNAL_ERROR, "unknown event kind " + ev.kind);
+                                probe.deliverFinal(requestId, "unknown event kind " + ev.kind);
                             }
                             return;
                     }
@@ -2575,11 +2753,11 @@ public class QwpQueryClient implements QuietCloseable {
             return true;
         } catch (RuntimeException e) {
             if (timed && isPast(deadlineNanos)) {
-                handler.onError(-1L, QwpConstants.STATUS_QUERY_TIMEOUT,
+                deliverClientError(handler, -1L, QwpConstants.STATUS_QUERY_TIMEOUT,
                         queryTimeoutMessage(timeoutMs) + " while reconnecting [reconnect error: "
                                 + e.getMessage() + ']');
             } else {
-                handler.onError(-1L, WebSocketResponse.STATUS_INTERNAL_ERROR,
+                deliverClientError(handler, -1L, WebSocketResponse.STATUS_INTERNAL_ERROR,
                         "reconnect failed: " + e.getMessage());
             }
         }
@@ -2770,24 +2948,6 @@ public class QwpQueryClient implements QuietCloseable {
         return authorizationHeader;
     }
 
-    private long resolveQueryFlags(boolean resetSymbolDict, boolean timed) {
-        if (!resetSymbolDict && !timed) {
-            return 0L;
-        }
-        QwpServerInfo info = serverInfo;
-        if (info == null || (info.getCapabilities() & QwpEgressMsgKind.CAP_QUERY_FLAGS) == 0) {
-            return 0L;
-        }
-        long flags = 0L;
-        if (resetSymbolDict) {
-            flags |= QwpEgressMsgKind.QUERY_FLAG_RESET_DICT;
-        }
-        if (timed && (info.getCapabilities() & QwpEgressMsgKind.CAP_QUERY_TIMEOUT) != 0) {
-            flags |= QwpEgressMsgKind.QUERY_FLAG_TIMEOUT;
-        }
-        return flags;
-    }
-
     /**
      * Makes sure the I/O thread no longer reads the request {@code requestId},
      * which an interrupted {@code execute()} stops waiting for before the I/O
@@ -2943,6 +3103,11 @@ public class QwpQueryClient implements QuietCloseable {
         }
 
         @Override
+        public void onEnd(long requestId, long totalRows, QwpQueryDetails details) {
+            delegate.onEnd(requestId, totalRows, details);
+        }
+
+        @Override
         public void onError(byte status, String message) {
             // Server-emitted QUERY_ERROR. Pass straight through. Transport
             // failures are delivered via markTransportFailure, not here.
@@ -2955,6 +3120,11 @@ public class QwpQueryClient implements QuietCloseable {
         }
 
         @Override
+        public void onError(long requestId, byte status, String message, int position) {
+            delegate.onError(requestId, status, message, position);
+        }
+
+        @Override
         public void onExecDone(short opType, long rowsAffected) {
             delegate.onExecDone(opType, rowsAffected);
         }
@@ -2962,6 +3132,11 @@ public class QwpQueryClient implements QuietCloseable {
         @Override
         public void onExecDone(long requestId, short opType, long rowsAffected) {
             delegate.onExecDone(requestId, opType, rowsAffected);
+        }
+
+        @Override
+        public void onExecDone(long requestId, short opType, long rowsAffected, QwpQueryDetails details) {
+            delegate.onExecDone(requestId, opType, rowsAffected, details);
         }
 
         @Override
@@ -2980,7 +3155,7 @@ public class QwpQueryClient implements QuietCloseable {
          * errors, interrupts) so they don't trigger a spurious failover.
          */
         void deliverFinal(long requestId, String message) {
-            delegate.onError(requestId, WebSocketResponse.STATUS_INTERNAL_ERROR, message);
+            deliverClientError(delegate, requestId, WebSocketResponse.STATUS_INTERNAL_ERROR, message);
         }
 
         /**
@@ -3008,7 +3183,7 @@ public class QwpQueryClient implements QuietCloseable {
          */
         void onErrorWhileDraining(long requestId, byte status, String message) {
             try {
-                delegate.onError(requestId, status, message);
+                deliverClientError(delegate, requestId, status, message);
             } catch (Throwable t) {
                 deferredFailure = t;
             }

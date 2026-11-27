@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
 import io.questdb.client.LineSenderServerException;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
@@ -193,11 +194,11 @@ public class CursorWebSocketSendLoopDurableAckFuzzTest {
                         engine.appendBlocking(buf, 8);
                     }
                     CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
-                            null, engine, 0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                            null, engine, 0L,
                             () -> {
                                 throw new UnsupportedOperationException();
                             },
-                            100L, 5_000L, true);
+                            100L, 5_000L, DurableAckTiers.REPLICATED);
                     Field f = CursorWebSocketSendLoop.class.getDeclaredField("nextWireSeq");
                     f.setAccessible(true);
                     f.setLong(loop, frames);

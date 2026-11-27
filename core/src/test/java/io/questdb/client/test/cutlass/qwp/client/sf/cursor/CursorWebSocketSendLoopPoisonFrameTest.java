@@ -24,6 +24,8 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
+import io.questdb.client.test.tools.TestWebSocketClient;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.LineSenderServerException;
 import io.questdb.client.SenderError;
@@ -345,10 +347,9 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                 };
                 CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
                         new NackingClient(), engine, 0L,
-                        CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                         factory,
                         initialBackoffMillis, 1_000L,
-                        false,
+                        DurableAckTiers.NONE,
                         CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                         // Keep the detector out of the way: this test measures
                         // pacing, not escalation.
@@ -412,10 +413,9 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                 };
                 CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
                         new ClosingMiddleboxClient(), engine, 0L,
-                        CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                         factory,
                         initialBackoffMillis, 1_000L,
-                        false,
+                        DurableAckTiers.NONE,
                         CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                         // Keep the detector out of the way: this test measures
                         // close-path pacing, not escalation -- escalation is
@@ -479,10 +479,9 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                 };
                 CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
                         new OrderlyClosingClient(), engine, 0L,
-                        CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                         factory,
                         initialBackoffMillis, 1_000L,
-                        false,
+                        DurableAckTiers.NONE,
                         CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                         // Detector out of the way -- orderly closes must not
                         // strike anyway; this test measures pacing.
@@ -549,10 +548,9 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                 };
                 CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
                         new PreSendClosingClient(), engine, 0L,
-                        CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                         factory,
                         initialBackoffMillis, 1_000L,
-                        false,
+                        DurableAckTiers.NONE,
                         CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                         1_000_000);
                 try {
@@ -886,7 +884,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
      * this connection, then delivers exactly one WRITE_ERROR (RETRIABLE)
      * rejection for wireSeq 0.
      */
-    private static final class NackingClient extends WebSocketClient {
+    private static final class NackingClient extends TestWebSocketClient {
         private boolean nackDelivered;
         private volatile int sentCount;
 
@@ -895,7 +893,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
         }
 
         @Override
-        public void sendBinary(long dataPtr, int length) {
+        public void batchAppendBinary(long dataPtr, int length) {
             sentCount++;
         }
 
@@ -933,7 +931,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
      * close. No OK ever arrives, so the poison suspect FSN never advances --
      * the accepting-middlebox outage scenario.
      */
-    private static final class ClosingMiddleboxClient extends WebSocketClient {
+    private static final class ClosingMiddleboxClient extends TestWebSocketClient {
         private boolean closeDelivered;
         private volatile int sentCount;
 
@@ -942,7 +940,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
         }
 
         @Override
-        public void sendBinary(long dataPtr, int length) {
+        public void batchAppendBinary(long dataPtr, int length) {
             sentCount++;
         }
 
@@ -972,7 +970,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
      * Orderly closes are strike-exempt by design, so before the zero-progress
      * pacer the recycle loop churned at connect+close RTT rate.
      */
-    private static final class OrderlyClosingClient extends WebSocketClient {
+    private static final class OrderlyClosingClient extends TestWebSocketClient {
         private boolean closeDelivered;
 
         OrderlyClosingClient() {
@@ -980,7 +978,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
         }
 
         @Override
-        public void sendBinary(long dataPtr, int length) {
+        public void batchAppendBinary(long dataPtr, int length) {
         }
 
         @Override
@@ -1010,7 +1008,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
      * connection (nextWireSeq == 0) the close is strike-exempt -- the
      * exemption re-arms every cycle because swapClient resets nextWireSeq.
      */
-    private static final class PreSendClosingClient extends WebSocketClient {
+    private static final class PreSendClosingClient extends TestWebSocketClient {
         private boolean closeDelivered;
 
         PreSendClosingClient() {
@@ -1018,7 +1016,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
         }
 
         @Override
-        public void sendBinary(long dataPtr, int length) {
+        public void batchAppendBinary(long dataPtr, int length) {
         }
 
         @Override
@@ -1206,13 +1204,13 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
     private CursorWebSocketSendLoop newDurableLoop(CursorSendEngine engine,
                                                    List<WebSocketClient> clients) throws Exception {
         CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
-                null, engine, 0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                null, engine, 0L,
                 () -> {
                     NackingClient c = new NackingClient();
                     clients.add(c);
                     return c;
                 },
-                5L, 10L, true,
+                5L, 10L, DurableAckTiers.REPLICATED,
                 CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                 MAX_REJECTIONS);
         // The loop is driven directly by the test, not by its own I/O thread,
@@ -1233,13 +1231,13 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                                                        List<WebSocketClient> clients,
                                                        long initialBackoffMillis) throws Exception {
         CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
-                null, engine, 0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                null, engine, 0L,
                 () -> {
                     NackingClient c = new NackingClient();
                     clients.add(c);
                     return c;
                 },
-                initialBackoffMillis, 5 * initialBackoffMillis, true,
+                initialBackoffMillis, 5 * initialBackoffMillis, DurableAckTiers.REPLICATED,
                 CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                 1_000_000);
         loop.setRunningForTest(true);
@@ -1257,13 +1255,13 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                                                              int maxRejections,
                                                              long windowMillis) throws Exception {
         CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
-                null, engine, 0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                null, engine, 0L,
                 () -> {
                     NackingClient c = new NackingClient();
                     clients.add(c);
                     return c;
                 },
-                5L, 10L, true,
+                5L, 10L, DurableAckTiers.REPLICATED,
                 CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                 maxRejections, windowMillis);
         loop.setRunningForTest(true);

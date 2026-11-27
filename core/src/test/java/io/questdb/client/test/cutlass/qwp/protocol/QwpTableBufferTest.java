@@ -28,6 +28,7 @@ import io.questdb.client.cairo.CairoException;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketEncoder;
 import io.questdb.client.cutlass.qwp.protocol.OffHeapAppendMemory;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
@@ -903,6 +904,101 @@ public class QwpTableBufferTest {
     }
 
     @Test
+    public void testEncodedColumnDefsDropAColumnOfACancelledRow() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false).addLong(1);
+                table.nextRow();
+
+                table.getOrCreateColumn("c", QwpConstants.TYPE_DOUBLE, false).addDouble(1.5);
+                assertArrayEquals(new byte[]{
+                        2,
+                        1, 'a', QwpConstants.TYPE_LONG,
+                        1, 'c', QwpConstants.TYPE_DOUBLE
+                }, table.getEncodedColumnDefs());
+
+                table.cancelCurrentRow();
+                table.rollbackUncommittedColumns();
+                assertArrayEquals(new byte[]{
+                        1,
+                        1, 'a', QwpConstants.TYPE_LONG
+                }, table.getEncodedColumnDefs());
+
+                table.getOrCreateColumn("d", QwpConstants.TYPE_VARCHAR, true).addString("x");
+                assertArrayEquals(new byte[]{
+                        2,
+                        1, 'a', QwpConstants.TYPE_LONG,
+                        1, 'd', QwpConstants.TYPE_VARCHAR
+                }, table.getEncodedColumnDefs());
+            }
+        });
+    }
+
+    @Test
+    public void testEncodedColumnDefsTrackTheSchema() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false).addLong(1);
+                table.getOrCreateColumn("b", QwpConstants.TYPE_VARCHAR, true).addString("x");
+                table.nextRow();
+
+                byte[] before = table.getEncodedColumnDefs();
+                assertArrayEquals(new byte[]{
+                        2,
+                        1, 'a', QwpConstants.TYPE_LONG,
+                        1, 'b', QwpConstants.TYPE_VARCHAR
+                }, before);
+
+                table.getOrCreateColumn("c", QwpConstants.TYPE_DOUBLE, false).addDouble(1.5);
+                assertArrayEquals(new byte[]{
+                        3,
+                        1, 'a', QwpConstants.TYPE_LONG,
+                        1, 'b', QwpConstants.TYPE_VARCHAR,
+                        1, 'c', QwpConstants.TYPE_DOUBLE
+                }, table.getEncodedColumnDefs());
+                assertArrayEquals(new byte[]{
+                        2,
+                        1, 'a', QwpConstants.TYPE_LONG,
+                        1, 'b', QwpConstants.TYPE_VARCHAR
+                }, before);
+            }
+        });
+    }
+
+    @Test
+    public void testEncodedColumnNameLengthCountsUtf8Bytes() throws Exception {
+        assertMemoryLeak(() -> {
+            StringBuilder name = new StringBuilder();
+            for (int i = 0; i < 100; i++) {
+                name.append('ö');
+            }
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                table.getOrCreateColumn(name.toString(), QwpConstants.TYPE_LONG, false).addLong(1);
+                table.nextRow();
+
+                byte[] encoded = table.getEncodedColumnDefs();
+                assertEquals(1 + 2 + 200 + 1, encoded.length);
+                assertEquals(1, encoded[0]);
+                assertEquals((byte) 0xC8, encoded[1]);
+                assertEquals(0x01, encoded[2]);
+                assertEquals(QwpConstants.TYPE_LONG, encoded[encoded.length - 1]);
+            }
+        });
+    }
+
+    @Test
+    public void testEncodedTableNameIsUtf8LengthThenBytes() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("tëst")) {
+                assertArrayEquals(
+                        new byte[]{5, 't', (byte) 0xC3, (byte) 0xAB, 's', 't'},
+                        table.getEncodedTableName()
+                );
+            }
+        });
+    }
+
+    @Test
     public void testGetExistingColumnReturnsNullWithoutCreatingColumn() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpTableBuffer table = new QwpTableBuffer("test")) {
@@ -1389,6 +1485,137 @@ public class QwpTableBufferTest {
     }
 
     @Test
+    public void testResetAfterACancelledNullRowLeavesNoStaleBit() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                QwpTableBuffer.ColumnBuffer col = table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, true);
+                col.addLong(1L);
+                table.nextRow();
+                col.addNull();
+                table.cancelCurrentRow();
+                table.reset();
+
+                col.addLong(1L);
+                table.nextRow();
+                col.addLong(2L);
+                table.nextRow();
+                col.addNull();
+                table.nextRow();
+
+                assertFalse(col.isNull(0));
+                assertFalse(col.isNull(1));
+                assertTrue(col.isNull(2));
+                int[] header = readNullHeader(table);
+                assertEquals(1, header[0]);
+                assertEquals(0b100, header[1]);
+            }
+        });
+    }
+
+    @Test
+    public void testResetAfterNullsBeyondTheInitialBitmapCapacityClearsEveryBit() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                QwpTableBuffer.ColumnBuffer col = table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, true);
+                for (int i = 0; i < 100; i++) {
+                    if (i == 90) {
+                        col.addNull();
+                    } else {
+                        col.addLong(i);
+                    }
+                    table.nextRow();
+                }
+                assertTrue(col.isNull(90));
+                table.reset();
+
+                for (int i = 0; i < 100; i++) {
+                    col.addLong(i);
+                    table.nextRow();
+                }
+
+                assertFalse(col.isNull(90));
+                assertEquals(100, col.getValueCount());
+                assertEquals(0, readNullHeader(table)[0]);
+            }
+        });
+    }
+
+    @Test
+    public void testResetAfterNullsClearsTheBitmapForTheNextBatch() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                QwpTableBuffer.ColumnBuffer col = table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, true);
+                col.addNull();
+                table.nextRow();
+                col.addLong(1L);
+                table.nextRow();
+                assertTrue(col.isNull(0));
+                table.reset();
+
+                col.addLong(1L);
+                table.nextRow();
+                col.addLong(2L);
+                table.nextRow();
+                col.addNull();
+                table.nextRow();
+
+                assertFalse(col.isNull(0));
+                assertFalse(col.isNull(1));
+                assertTrue(col.isNull(2));
+                int[] header = readNullHeader(table);
+                assertEquals(1, header[0]);
+                assertEquals(0b100, header[1]);
+            }
+        });
+    }
+
+    @Test
+    public void testResetKeepsAnEmptyLocalDictionaryAndClearsAPopulatedOne() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                QwpTableBuffer.ColumnBuffer col = table.getOrCreateColumn("sym", QwpConstants.TYPE_SYMBOL, true);
+                col.addSymbolWithGlobalId("a", 7);
+                table.nextRow();
+                table.reset();
+                assertEquals(0, col.getSymbolDictionarySize());
+                assertEquals(-1, col.getMaxGlobalSymbolId());
+
+                col.addSymbol("x");
+                table.nextRow();
+                assertEquals(1, col.getSymbolDictionarySize());
+                table.reset();
+                assertEquals(0, col.getSymbolDictionarySize());
+                assertFalse(col.hasSymbol("x"));
+            }
+        });
+    }
+
+    @Test
+    public void testResetWithoutNullsThenANullInTheNextBatch() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("t")) {
+                QwpTableBuffer.ColumnBuffer col = table.getOrCreateColumn("v", QwpConstants.TYPE_LONG, true);
+                col.addLong(1L);
+                table.nextRow();
+                col.addLong(2L);
+                table.nextRow();
+                table.reset();
+
+                col.addLong(1L);
+                table.nextRow();
+                col.addNull();
+                table.nextRow();
+
+                assertFalse(col.isNull(0));
+                assertTrue(col.isNull(1));
+                int[] header = readNullHeader(table);
+                assertEquals(1, header[0]);
+                assertEquals(0b10, header[1]);
+            }
+        });
+    }
+
+    @Test
     public void testRetainInProgressRowFastClearsUnstagedNullableColumn() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpTableBuffer table = new QwpTableBuffer("test")) {
@@ -1545,5 +1772,41 @@ public class QwpTableBufferTest {
             }
         }
         return result;
+    }
+
+    /**
+     * Encodes a single-column table and returns {null-header marker, first bitmap byte
+     * or 0 when the marker is 0}.
+     */
+    private static int[] readNullHeader(QwpTableBuffer table) {
+        try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder()) {
+            encoder.encode(table);
+            long ptr = encoder.getBuffer().getBufferPtr() + 12;
+            long[] pos = {ptr};
+            long nameLen = readVarint(pos);
+            pos[0] += nameLen;
+            readVarint(pos); // row count
+            long colCount = readVarint(pos);
+            for (long c = 0; c < colCount; c++) {
+                long len = readVarint(pos);
+                pos[0] += len + 1; // name + type byte
+            }
+            int marker = Unsafe.getUnsafe().getByte(pos[0]) & 0xFF;
+            int bitmap = marker == 1 ? Unsafe.getUnsafe().getByte(pos[0] + 1) & 0xFF : 0;
+            return new int[]{marker, bitmap};
+        }
+    }
+
+    private static long readVarint(long[] pos) {
+        long value = 0;
+        int shift = 0;
+        while (true) {
+            int b = Unsafe.getUnsafe().getByte(pos[0]++) & 0xFF;
+            value |= (long) (b & 0x7F) << shift;
+            if ((b & 0x80) == 0) {
+                return value;
+            }
+            shift += 7;
+        }
     }
 }

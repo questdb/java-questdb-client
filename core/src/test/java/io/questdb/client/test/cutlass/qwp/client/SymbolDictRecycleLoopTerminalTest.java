@@ -24,6 +24,8 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
+import io.questdb.client.test.tools.TestWebSocketClient;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.LineSenderServerException;
 import io.questdb.client.SenderError;
@@ -210,13 +212,12 @@ public class SymbolDictRecycleLoopTerminalTest {
                 client,
                 engine,
                 0L,
-                CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                 () -> {
                     throw new LineSenderException("no reconnect expected");
                 },
                 /* reconnectInitialBackoffMillis */ 1_000L,
                 /* reconnectMaxBackoffMillis */ 5_000L,
-                false
+                DurableAckTiers.NONE
         );
     }
 
@@ -226,7 +227,7 @@ public class SymbolDictRecycleLoopTerminalTest {
      * {@code closeTraffic()} does not break, and can run a hook inside a
      * link check made from a named caller.
      */
-    private static final class NackOnDemandClient extends WebSocketClient {
+    private static final class NackOnDemandClient extends TestWebSocketClient {
         private final CountDownLatch receiveBlocked = new CountDownLatch(1);
         private final CountDownLatch receiveRelease = new CountDownLatch(1);
         private volatile boolean blockNextReceive;

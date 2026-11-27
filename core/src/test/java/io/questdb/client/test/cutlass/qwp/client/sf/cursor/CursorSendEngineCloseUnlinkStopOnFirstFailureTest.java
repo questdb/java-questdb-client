@@ -124,7 +124,6 @@ public class CursorSendEngineCloseUnlinkStopOnFirstFailureTest {
 
                 manager = new SegmentManager(
                         SEGMENT_SIZE,
-                        SegmentManager.DEFAULT_POLL_NANOS,
                         SEGMENT_SIZE * 4L,
                         faultFacade,
                         System::nanoTime);

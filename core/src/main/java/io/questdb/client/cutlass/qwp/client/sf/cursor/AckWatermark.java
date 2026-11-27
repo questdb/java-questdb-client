@@ -64,20 +64,23 @@ import org.slf4j.LoggerFactory;
  * segment-derived seed.
  * <p>
  * <b>Zero-alloc, store-only ACK writes:</b> {@link #open(String)} maps both
- * records once. Ordinary ACK-only manager updates mutate the inactive record
- * in the mapping and require no malloc/free, read/write syscalls, or rename.
+ * records once. The I/O thread's per-ACK {@link #write(long)} mutates the
+ * inactive record in the mapping and needs no malloc/free, syscall or rename.
  * <p>
- * <b>fsync cadence:</b> ordinary ACK-only manager updates call
- * {@link #write(long)} and stay syscall-free. Each non-empty background disk-trim
- * quantum calls {@link #sync()} once (one mmap msync and one fd fsync), fsyncs
- * the slot directory before unlinking, and fsyncs it again after the batch. A
- * fully drained close uses the same covering order so the durable watermark
- * guards any acknowledged segment that a host crash restores.
+ * <b>fsync cadence:</b> each non-empty background disk-trim quantum calls
+ * {@link #sync()} once (one mmap msync and one fd fsync), fsyncs the slot
+ * directory before unlinking, and fsyncs it again after the batch. A fully
+ * drained close uses the same covering order so the durable watermark guards
+ * any acknowledged segment that a host crash restores. A write racing the
+ * msync can tear either record, or both; recovery then falls back to the older
+ * valid record or the segment-derived seed, which only costs duplicates.
  * <p>
- * <b>Lifecycle:</b> single-writer (the {@link SegmentManager} worker thread)
- * after construction. Read once at engine startup (any thread, before the
- * manager observes the entry). Close releases the mapping and fd. Not
- * thread-safe for concurrent writers.
+ * <b>Lifecycle:</b> single-writer: the engine's I/O thread
+ * ({@link CursorSendEngine#acknowledge}); the engine constructor (recovery
+ * seed) and a fully drained close write from the owning thread while no I/O
+ * thread runs. {@link #sync()} may run concurrently on the
+ * {@link SegmentManager} worker. Read once at engine startup. Close releases
+ * the mapping and fd. Not thread-safe for concurrent writers.
  */
 public final class AckWatermark implements QuietCloseable {
 
@@ -237,8 +240,10 @@ public final class AckWatermark implements QuietCloseable {
      * has been stored. The next {@link #sync()} makes the complete update
      * durable before any covered segment is deleted.
      * <p>
-     * Caller responsibility: monotonic ordering. The manager's tick loop only
-     * calls this when {@code fsn} has advanced past the last write.
+     * Caller responsibility: monotonic ordering and a single writer. The
+     * engine's I/O thread calls this on every ACK advance; {@link #sync()}
+     * may run concurrently on the manager thread -- a record torn by that
+     * race fails its CRC and recovery falls back to the other slot.
      */
     public void write(long fsn) {
         if (closed) return;

@@ -26,6 +26,7 @@ package io.questdb.client;
 
 import io.questdb.client.cutlass.qwp.client.QwpBindSetter;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
+import io.questdb.client.cutlass.qwp.client.QwpQueryOptions;
 import io.questdb.client.cutlass.qwp.client.QwpServerInfo;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 
@@ -45,9 +46,13 @@ import java.util.concurrent.TimeUnit;
  * creates one small lease handle per borrow (often scalar-replaced by the JIT
  * when used with try-with-resources).
  * <p>
- * Lifecycle: configure with {@link #sql}, optional {@link #binds} and
- * {@link #timeout}, and {@link #handler}, then call {@link #submit()} to obtain
- * a {@link Completion} and {@code await()} it before the next {@link #submit()}.
+ * Lifecycle: configure with {@link #sql}, optional {@link #binds},
+ * {@link #timeout} and {@link #options}, and {@link #handler}, then call
+ * {@link #submit()} to obtain a {@link Completion} and {@code await()} it before
+ * the next {@link #submit()}. The query reads its SQL text, binds and handler
+ * while it runs, so do not change them before {@code await()} returns. It takes
+ * its timeout and options when it is submitted, so {@link #timeout} and
+ * {@link #options} may set up the next query in the meantime.
  * <p>
  * Thread safety: not thread-safe and single-flight -- one in-flight query per
  * handle. To run queries concurrently, borrow one handle per concurrent query.
@@ -109,6 +114,18 @@ public interface Query extends Closeable {
      * thread); use {@link #cancel()} to stop from inside a handler.
      */
     Query handler(QwpColumnBatchHandler handler);
+
+    /**
+     * Sets the per-query options: a row window that pages through the result
+     * set, and what the server reports besides the rows -- the row count of the
+     * whole result set, execution statistics and the error position. See
+     * {@link QwpQueryOptions}. The handle copies the values, so the instance can
+     * be reused right away; they apply to every {@link #submit()} until changed.
+     * Each {@link #submit()} runs with the options set when it is called, so
+     * changing them while a query is in flight affects only the next one. Pass
+     * null to drop them.
+     */
+    Query options(QwpQueryOptions options);
 
     /**
      * Sets the SQL text. The buffer is not retained past {@link #submit()}.

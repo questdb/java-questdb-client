@@ -34,6 +34,11 @@
 #include <stdint.h>
 #include <string.h>
 #include <poll.h>
+#ifdef __linux__
+#include <sys/eventfd.h>
+#else
+#include <sys/event.h>
+#endif
 #include <time.h>
 #include "glibc_compat.h"
 #include "net.h"
@@ -438,6 +443,107 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_socketUdp
 
     return fd;
 }
+
+// Doorbell + idle wait for the QWP I/O thread.
+//   Linux:         eventfd; the wait is poll(2) on socket + eventfd.
+//   macOS/FreeBSD: a kqueue holding an EVFILT_USER; the kqueue is both the
+//                  doorbell and the wait, the socket is (re)armed per wait.
+// A ring is one syscall on the producer and touches no network stack. EINTR
+// in a wait returns 0: the caller re-checks its inputs and waits again.
+#ifdef __linux__
+
+JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_doorbellCreate
+        (JNIEnv *e, jclass cl) {
+    return eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_doorbellRing
+        (JNIEnv *e, jclass cl, jint fd) {
+    uint64_t one = 1;
+    ssize_t n;
+    RESTARTABLE(write((int) fd, &one, sizeof(one)), n);
+    // EAGAIN = counter saturated = already ringing.
+    return (n == (ssize_t) sizeof(one) || (n < 0 && errno == EAGAIN)) ? 0 : -1;
+}
+
+JNIEXPORT void JNICALL Java_io_questdb_client_network_Net_doorbellClose
+        (JNIEnv *e, jclass cl, jint fd) {
+    close((int) fd);
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_awaitReadableOrRing
+        (JNIEnv *e, jclass cl, jint socketFd, jint doorbell, jint timeoutMillis) {
+    struct pollfd fds[2];
+    fds[0].fd = (int) socketFd;
+    fds[0].events = POLLIN;
+    fds[0].revents = 0;
+    fds[1].fd = (int) doorbell;
+    fds[1].events = POLLIN;
+    fds[1].revents = 0;
+    int n = poll(fds, 2, (int) timeoutMillis);
+    if (n > 0 && (fds[1].revents & POLLIN)) {
+        // Consume the ring here: a wait that ended on the socket alone skips
+        // the (would-be EAGAIN) read entirely.
+        uint64_t v;
+        ssize_t r;
+        RESTARTABLE(read((int) doorbell, &v, sizeof(v)), r);
+    }
+    return (n < 0 && errno == EINTR) ? 0 : n;
+}
+
+#else // kqueue platforms
+
+JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_doorbellCreate
+        (JNIEnv *e, jclass cl) {
+    int kq = kqueue();
+    if (kq < 0) {
+        return -1;
+    }
+    struct kevent ev;
+    // EV_CLEAR: a delivered ring resets itself, an undelivered one stays pending.
+    EV_SET(&ev, 0, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
+    if (kevent(kq, &ev, 1, NULL, 0, NULL) < 0) {
+        int saved = errno;
+        close(kq);
+        errno = saved;
+        return -1;
+    }
+    return kq;
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_doorbellRing
+        (JNIEnv *e, jclass cl, jint kq) {
+    struct kevent ev;
+    EV_SET(&ev, 0, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
+    int n;
+    RESTARTABLE(kevent((int) kq, &ev, 1, NULL, 0, NULL), n);
+    return n < 0 ? -1 : 0;
+}
+
+JNIEXPORT void JNICALL Java_io_questdb_client_network_Net_doorbellClose
+        (JNIEnv *e, jclass cl, jint kq) {
+    close((int) kq);
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_awaitReadableOrRing
+        (JNIEnv *e, jclass cl, jint socketFd, jint kq, jint timeoutMillis) {
+    // Re-armed on every wait; a closed (reconnected) socket drops out of the
+    // kqueue by itself, so there is nothing to unregister.
+    struct kevent change;
+    EV_SET(&change, (uintptr_t) socketFd, EVFILT_READ, EV_ADD | EV_ONESHOT, 0, 0, NULL);
+    struct timespec ts;
+    struct timespec *pts = NULL;
+    if (timeoutMillis >= 0) {
+        ts.tv_sec = timeoutMillis / 1000;
+        ts.tv_nsec = (long) (timeoutMillis % 1000) * 1000000L;
+        pts = &ts;
+    }
+    struct kevent out[2];
+    int n = kevent((int) kq, &change, 1, out, 2, pts);
+    return (n < 0 && errno == EINTR) ? 0 : n;
+}
+
+#endif
 
 JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_setMulticastInterface
         (JNIEnv *e, jclass cl, jint fd, jint ipv4address) {

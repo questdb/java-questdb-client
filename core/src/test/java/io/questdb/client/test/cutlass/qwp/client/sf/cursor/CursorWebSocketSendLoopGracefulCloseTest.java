@@ -24,6 +24,8 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.DurableAckTiers;
+import io.questdb.client.test.tools.TestWebSocketClient;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
@@ -79,11 +81,10 @@ public class CursorWebSocketSendLoopGracefulCloseTest {
                     null,
                     engine,
                     0L,
-                    CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                     factory,
                     1_000L,
                     5_000L,
-                    false
+                    DurableAckTiers.NONE
             );
             // Far beyond the test timeout: waiting it out here would fail the test.
             loop.setGracefulStopMillis(TimeUnit.MINUTES.toMillis(5));
@@ -122,11 +123,10 @@ public class CursorWebSocketSendLoopGracefulCloseTest {
                     client,
                     engine,
                     0L,
-                    CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                     null,
                     1_000L,
                     5_000L,
-                    false
+                    DurableAckTiers.NONE
             );
             // Far above any scheduling delay, so a loaded machine cannot flip the outcome.
             loop.setGracefulStopMillis(TimeUnit.SECONDS.toMillis(20));
@@ -154,7 +154,7 @@ public class CursorWebSocketSendLoopGracefulCloseTest {
      * Connected client with nothing to receive. Records which thread closes it
      * first and whether anyone broke its traffic.
      */
-    private static final class IdleClient extends WebSocketClient {
+    private static final class IdleClient extends TestWebSocketClient {
         final AtomicReference<Thread> firstCloseThread = new AtomicReference<>();
         final AtomicReference<Thread> pollThread = new AtomicReference<>();
         final CountDownLatch polled = new CountDownLatch(1);
@@ -197,7 +197,7 @@ public class CursorWebSocketSendLoopGracefulCloseTest {
      * Fake in-flight connect: parks until {@link #closeTraffic()} releases it,
      * like a native connect that neither unpark nor interrupt can cancel.
      */
-    private static final class InFlightConnectClient extends WebSocketClient {
+    private static final class InFlightConnectClient extends TestWebSocketClient {
         final CountDownLatch trafficBroken = new CountDownLatch(1);
         final AtomicInteger trafficCloseCount = new AtomicInteger();
 
